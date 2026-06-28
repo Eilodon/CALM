@@ -130,14 +130,63 @@ class ConservativeResolver:
             return self._get_go_assignment_lhs_rhs(node)
         return None, None
 
-    def _get_python_assignment_lhs_rhs(self, node):
-        pass
+    def _get_python_assignment_lhs_rhs(self, node) -> tuple[str | None, str | None]:
+        """
+        Handle: x = y  (tree-sitter: assignment)
+        Skip: augmented_assignment (x += y), tuple/subscript/attribute LHS,
+              chained assignment (a = b = c — right would be 'assignment' node),
+              annotated assignment handled by separate 'annotated_assignment' node type.
+        Safe case ONLY: bare identifier on both sides.
+        """
+        if node.type == "augmented_assignment":
+            return None, None
+        left = node.child_by_field_name("left")
+        right = node.child_by_field_name("right")
+        if not left or not right:
+            return None, None
+        if left.type != "identifier" or right.type != "identifier":
+            return None, None
+        return left.text.decode("utf-8"), right.text.decode("utf-8")
 
-    def _get_ts_js_assignment_lhs_rhs(self, node):
-        pass
+    def _get_ts_js_assignment_lhs_rhs(self, node) -> tuple[str | None, str | None]:
+        """
+        Handle: const x = y / let x = y / var x = y
+                (tree-sitter: variable_declarator, child of lexical_declaration/variable_declaration)
+        Skip: destructuring (array_pattern, object_pattern LHS), no initializer,
+              RHS that is not a bare identifier.
+        Safe case ONLY: name field is 'identifier', value field is 'identifier'.
+        Note: type annotations (const x: T = y) are tolerated — the value check is
+        the conservative gate, not the type annotation presence.
+        """
+        # node.type == "variable_declarator"
+        name = node.child_by_field_name("name")
+        value = node.child_by_field_name("value")
+        if not name or not value:
+            return None, None
+        if name.type != "identifier" or value.type != "identifier":
+            return None, None
+        return name.text.decode("utf-8"), value.text.decode("utf-8")
 
-    def _get_java_assignment_lhs_rhs(self, node):
-        pass
+    def _get_java_assignment_lhs_rhs(self, node) -> tuple[str | None, str | None]:
+        """
+        Handle: SomeType x = y  (tree-sitter: local_variable_declaration → variable_declarator)
+        Skip: multiple declarators in one statement (int a = b, c = d),
+              array/generic types (they don't affect alias detection but we stay conservative),
+              no initializer, RHS not a bare identifier.
+        Safe case ONLY: exactly one declarator, name is 'identifier', value is 'identifier'.
+        """
+        # node.type == "local_variable_declaration"
+        declarators = [c for c in node.children if c.type == "variable_declarator"]
+        if len(declarators) != 1:
+            return None, None
+        decl = declarators[0]
+        name = decl.child_by_field_name("name")
+        value = decl.child_by_field_name("value")
+        if not name or not value:
+            return None, None
+        if name.type != "identifier" or value.type != "identifier":
+            return None, None
+        return name.text.decode("utf-8"), value.text.decode("utf-8")
 
     def _resolve_tier1(self, callee_name: str, file_symbols: set[str], import_map: dict[str, str], alias_map: dict[str, str]) -> tuple[str, str | None]:
         if callee_name in file_symbols:
