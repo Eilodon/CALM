@@ -59,6 +59,21 @@ CREATE TABLE IF NOT EXISTS file_index (
     last_indexed  REAL NOT NULL,
     mtime         REAL
 );
+
+CREATE TABLE IF NOT EXISTS symbol_metrics_history (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    qualified_name  TEXT NOT NULL,
+    snapshot_at     TEXT NOT NULL,
+    caller_count    INTEGER NOT NULL DEFAULT 0,
+    callee_count    INTEGER NOT NULL DEFAULT 0,
+    coreness        INTEGER NOT NULL DEFAULT 0,
+    is_hub          INTEGER NOT NULL DEFAULT 0,
+    churn_count     INTEGER NOT NULL DEFAULT 0,
+    complexity      REAL,
+    UNIQUE(qualified_name, snapshot_at)
+);
+CREATE INDEX IF NOT EXISTS idx_smh_symbol ON symbol_metrics_history(qualified_name);
+CREATE INDEX IF NOT EXISTS idx_smh_time   ON symbol_metrics_history(snapshot_at);
 ";
 
 const FTS5_SQL: &str = "
@@ -174,6 +189,53 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_symbol_metrics_history_table() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        let table_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='symbol_metrics_history'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(table_count, 1);
+
+        conn.execute(
+            "INSERT INTO symbol_metrics_history (qualified_name, snapshot_at, caller_count) \
+             VALUES ('mod.foo', '2026-01-01T00:00:00Z', 3)",
+            [],
+        )
+        .unwrap();
+
+        let caller_count: i64 = conn
+            .query_row(
+                "SELECT caller_count FROM symbol_metrics_history WHERE qualified_name = 'mod.foo'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(caller_count, 3);
+
+        // UNIQUE constraint: same (qualified_name, snapshot_at) must fail
+        let dup = conn.execute(
+            "INSERT INTO symbol_metrics_history (qualified_name, snapshot_at, caller_count) \
+             VALUES ('mod.foo', '2026-01-01T00:00:00Z', 5)",
+            [],
+        );
+        assert!(dup.is_err());
+
+        // Different snapshot_at must succeed
+        conn.execute(
+            "INSERT INTO symbol_metrics_history (qualified_name, snapshot_at, caller_count) \
+             VALUES ('mod.foo', '2026-01-02T00:00:00Z', 5)",
+            [],
+        )
+        .unwrap();
     }
 
     #[test]

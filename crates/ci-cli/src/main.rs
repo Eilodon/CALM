@@ -36,6 +36,24 @@ enum Commands {
         #[arg(long, default_value = ".")]
         project_root: PathBuf,
     },
+    /// Check codebase fitness against thresholds (exits 1 if any threshold exceeded)
+    FitnessCheck {
+        /// Project root directory
+        #[arg(long, default_value = ".")]
+        project_root: PathBuf,
+        /// Path to thresholds.toml (uses defaults if not provided)
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Output results as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Initialize .codeindex/ config for a project
+    Init {
+        /// Project root directory
+        #[arg(long, default_value = ".")]
+        project_root: PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -68,6 +86,82 @@ async fn main() -> Result<()> {
         Commands::Doctor { project_root } => {
             let root = std::fs::canonicalize(&project_root)?;
             ci_server::doctor(&root)?;
+        }
+        Commands::FitnessCheck {
+            project_root,
+            config,
+            json,
+        } => {
+            let root = std::fs::canonicalize(&project_root)?;
+            let db_path = ci_server::default_db_path(&root);
+
+            let thresholds = ci_core::fitness::load_thresholds(config.as_deref())?;
+
+            let conn = rusqlite::Connection::open(&db_path)
+                .unwrap_or_else(|_| rusqlite::Connection::open_in_memory().expect("in-memory DB"));
+            ci_core::db::schema::init_db(&conn)?;
+
+            let result = ci_core::fitness::run_fitness_check(&conn, &thresholds)?;
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                println!(
+                    "Fitness check — {}",
+                    if result.passed { "PASS" } else { "FAIL" }
+                );
+                println!();
+                for check in &result.checks {
+                    let status = if check.passed { "✓" } else { "✗" };
+                    println!("  {status} {}", check.message);
+                }
+                println!();
+                if result.passed {
+                    println!("All checks passed.");
+                } else {
+                    let failed: Vec<&str> = result
+                        .checks
+                        .iter()
+                        .filter(|c| !c.passed)
+                        .map(|c| c.metric.as_str())
+                        .collect();
+                    println!("Failed checks: {}", failed.join(", "));
+                }
+            }
+
+            if !result.passed {
+                std::process::exit(1);
+            }
+        }
+        Commands::Init { project_root } => {
+            let root = if project_root.exists() {
+                std::fs::canonicalize(&project_root)?
+            } else {
+                project_root.clone()
+            };
+
+            let codeindex_dir = root.join(".codeindex");
+            std::fs::create_dir_all(&codeindex_dir)?;
+
+            let config_path = codeindex_dir.join("config.json");
+            if config_path.exists() {
+                println!("Config already exists at {}", config_path.display());
+                println!("Remove it first if you want to reset to defaults.");
+            } else {
+                std::fs::write(&config_path, ci_core::config::default_config_json())?;
+                println!("Created {}", config_path.display());
+            }
+
+            println!();
+            println!("Next steps:");
+            println!(
+                "  ci index  --project-root {}  # build the index",
+                root.display()
+            );
+            println!(
+                "  ci serve  --project-root {}  # start MCP server",
+                root.display()
+            );
         }
     }
 
