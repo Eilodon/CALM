@@ -17,12 +17,10 @@ pub struct ParsedSymbol {
 use crate::graph::tokenize::tokenize_identifier;
 use crate::indexer::lang_constants::get_lang_constants;
 
-pub fn extract_symbols(
-    source: &str,
-    language: &str,
-    path: &str,
-) -> Result<Vec<ParsedSymbol>, String> {
-    let mut parser = tree_sitter::Parser::new();
+/// Parse `source` for a tier-0 `language` into a tree-sitter tree, or `None` if
+/// the language is unsupported or parsing fails. Single source of the per-language
+/// grammar mapping.
+pub fn parse_tree(source: &str, language: &str) -> Option<tree_sitter::Tree> {
     let lang: tree_sitter::Language = match language {
         "python" => tree_sitter_python::LANGUAGE.into(),
         "rust" => tree_sitter_rust::LANGUAGE.into(),
@@ -30,12 +28,20 @@ pub fn extract_symbols(
         "javascript" => tree_sitter_javascript::LANGUAGE.into(),
         "typescript" => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
         "java" => tree_sitter_java::LANGUAGE.into(),
-        _ => return Err(format!("Unsupported language: {}", language)),
+        _ => return None,
     };
-    parser.set_language(&lang).map_err(|e| e.to_string())?;
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&lang).ok()?;
+    parser.parse(source, None)
+}
 
+pub fn extract_symbols(
+    source: &str,
+    language: &str,
+    path: &str,
+) -> Result<Vec<ParsedSymbol>, String> {
     let lang_consts = get_lang_constants(language).ok_or("No lang constants")?;
-    let tree = parser.parse(source, None).ok_or("Failed to parse")?;
+    let tree = parse_tree(source, language).ok_or("Failed to parse")?;
     let mut symbols = Vec::new();
 
     let root = tree.root_node();
@@ -164,23 +170,38 @@ fn walk_calls(
 /// Extract call sites from a source file, each attributed to its enclosing function.
 /// Top-level calls (outside any function) are skipped — they have no caller symbol.
 pub fn extract_calls(source: &str, language: &str, _path: &str) -> Result<Vec<RawCall>, String> {
-    let mut parser = tree_sitter::Parser::new();
-    let lang: tree_sitter::Language = match language {
-        "python" => tree_sitter_python::LANGUAGE.into(),
-        "rust" => tree_sitter_rust::LANGUAGE.into(),
-        "go" => tree_sitter_go::LANGUAGE.into(),
-        "javascript" => tree_sitter_javascript::LANGUAGE.into(),
-        "typescript" => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-        "java" => tree_sitter_java::LANGUAGE.into(),
-        _ => return Err(format!("Unsupported language: {}", language)),
-    };
-    parser.set_language(&lang).map_err(|e| e.to_string())?;
     let consts = get_lang_constants(language).ok_or("No lang constants")?;
-    let tree = parser.parse(source, None).ok_or("Failed to parse")?;
+    let tree = parse_tree(source, language).ok_or("Failed to parse")?;
 
     let mut out = Vec::new();
     walk_calls(tree.root_node(), source, &consts, None, &mut out);
     Ok(out)
+}
+
+/// File-local alias map (`x = helper` → `x` ↦ `helper`) via the conservative
+/// resolver, so calls through simple aliases resolve to the real target.
+///
+/// Only `file_symbols` is supplied as context (no import/type map yet), so this
+/// covers aliases to symbols defined in the same file — the common local case.
+pub fn extract_file_aliases(
+    source: &str,
+    language: &str,
+    file_symbols: &std::collections::HashSet<String>,
+) -> std::collections::HashMap<String, String> {
+    let Some(tree) = parse_tree(source, language) else {
+        return std::collections::HashMap::new();
+    };
+    let ctx = crate::resolver::FileContext {
+        file_symbols: file_symbols.clone(),
+        import_map: std::collections::HashMap::new(),
+        type_map: std::collections::HashMap::new(),
+    };
+    crate::resolver::conservative::ConservativeResolver::new().extract_aliases(
+        tree.root_node(),
+        source.as_bytes(),
+        language,
+        &ctx,
+    )
 }
 
 #[cfg(test)]

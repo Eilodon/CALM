@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use crate::indexer::edges::{CallEdge, insert_call_edges_batch, insert_symbols_batch};
 use crate::indexer::lang_constants::language_for_extension;
-use crate::indexer::parser::{extract_calls, extract_symbols};
+use crate::indexer::parser::{extract_calls, extract_file_aliases, extract_symbols};
 
 /// Directories never descended into during a project scan.
 const IGNORE_DIRS: &[&str] = &[
@@ -145,17 +145,22 @@ fn index_one_file(
         .iter()
         .map(|s| ((s.name.clone(), s.line_start), s.qualified_name.clone()))
         .collect();
+    let file_symbols: HashSet<String> = syms.iter().map(|s| s.name.clone()).collect();
 
     let count = syms.len();
     insert_symbols_batch(tx, &syms)?;
 
+    // De-reference simple local aliases (`x = helper; x()` → helper) before storing
+    // call sites, so the graph attributes the call to the real target.
+    let aliases = extract_file_aliases(source, lang, &file_symbols);
     let calls = extract_calls(source, lang, rel).unwrap_or_default();
     let mut stmt = tx.prepare(
         "INSERT INTO call_sites (from_path, enclosing_qn, callee_name, call_line) VALUES (?1, ?2, ?3, ?4)",
     )?;
     for c in &calls {
         if let Some(enc_qn) = qn_by_loc.get(&(c.enclosing_name.clone(), c.enclosing_line)) {
-            stmt.execute(rusqlite::params![rel, enc_qn, c.callee, c.line as i64])?;
+            let callee = aliases.get(&c.callee).unwrap_or(&c.callee);
+            stmt.execute(rusqlite::params![rel, enc_qn, callee, c.line as i64])?;
         }
     }
     Ok(count)
@@ -433,6 +438,34 @@ mod tests {
             1
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_alias_resolution_edge() {
+        let dir = std::env::temp_dir().join(format!("ci_idx_alias_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // main calls helper indirectly through a local alias `x = helper`.
+        std::fs::write(
+            dir.join("a.py"),
+            "def helper():\n    pass\n\ndef main():\n    x = helper\n    x()\n",
+        )
+        .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        run_indexing_pipeline(&mut conn, &dir).unwrap();
+
+        // The alias is de-referenced, so the edge points at helper.
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM call_edges WHERE from_symbol = 'a.py::main' AND to_symbol = 'a.py::helper'",
+            ),
+            1,
+            "alias x=helper should resolve the call to helper"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

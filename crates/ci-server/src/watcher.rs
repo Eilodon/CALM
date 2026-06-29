@@ -72,23 +72,37 @@ pub fn run_watch_loop(project_root: PathBuf, db_path: PathBuf, ct: CancellationT
         if ct.is_cancelled() {
             break;
         }
-        // Re-check cancellation roughly once a second when idle.
-        let first = match rx.recv_timeout(Duration::from_secs(1)) {
-            Ok(res) => res,
+        // Wait for the next *relevant* event. Irrelevant noise (DB/WAL writes
+        // under .codeindex, editor temp files) is dropped here so it can neither
+        // trigger nor — critically — delay a reindex.
+        match rx.recv_timeout(Duration::from_secs(1)) {
+            Ok(res) if event_is_relevant(&res) => {}
+            Ok(_) => continue,
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
-        };
-
-        // Debounce: drain the burst, tracking whether any event touched source.
-        let mut relevant = event_is_relevant(&first);
-        while let Ok(res) = rx.recv_timeout(DEBOUNCE) {
-            if ct.is_cancelled() {
-                return;
-            }
-            relevant |= event_is_relevant(&res);
         }
-        if !relevant {
-            continue;
+
+        // Debounce: reindex once the tree has been quiet (no relevant events) for
+        // DEBOUNCE. Only relevant events extend the window — a steady stream of
+        // irrelevant events must not starve it.
+        let mut deadline = std::time::Instant::now() + DEBOUNCE;
+        loop {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            match rx.recv_timeout(deadline - now) {
+                Ok(res) => {
+                    if ct.is_cancelled() {
+                        return;
+                    }
+                    if event_is_relevant(&res) {
+                        deadline = std::time::Instant::now() + DEBOUNCE;
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => break,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
         }
 
         match rusqlite::Connection::open(&db_path) {
