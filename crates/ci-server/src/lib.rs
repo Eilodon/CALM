@@ -1,3 +1,4 @@
+pub mod telemetry;
 pub mod tools;
 
 use std::path::PathBuf;

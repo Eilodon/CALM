@@ -1,7 +1,7 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
     pub preset: String,
@@ -52,7 +52,7 @@ impl Default for Config {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct HubThresholdConfig {
     pub top_pct: f64,
@@ -72,7 +72,7 @@ impl Default for HubThresholdConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct CallGraphConfig {
     pub resolver: String,
@@ -88,7 +88,7 @@ impl Default for CallGraphConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct SemanticSearchConfig {
     pub enabled: bool,
@@ -108,7 +108,7 @@ impl Default for SemanticSearchConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct SearchConfig {
     pub text_chunk_context_lines: usize,
@@ -126,7 +126,7 @@ impl Default for SearchConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct PathConfig {
     pub default_max_hops: usize,
@@ -144,7 +144,7 @@ impl Default for PathConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct DepthConfig {
     pub max_depth_cap: usize,
@@ -160,7 +160,7 @@ impl Default for DepthConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct HotspotsConfig {
     pub default_top_n: usize,
@@ -195,4 +195,8 @@ pub fn load_config(project_root: &Path) -> anyhow::Result<Config> {
         }
     }
     Ok(Config::default())
+}
+
+pub fn default_config_json() -> String {
+    serde_json::to_string_pretty(&Config::default()).unwrap_or_default()
 }
