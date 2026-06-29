@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use crate::indexer::edges::{CallEdge, insert_call_edges_batch, insert_symbols_batch};
 use crate::indexer::lang_constants::language_for_extension;
-use crate::indexer::parser::{ParsedSymbol, extract_calls, extract_symbols};
+use crate::indexer::parser::{extract_calls, extract_symbols};
 
 /// Directories never descended into during a project scan.
 const IGNORE_DIRS: &[&str] = &[
@@ -17,6 +17,10 @@ const IGNORE_DIRS: &[&str] = &[
     "venv",
     "legacy",
 ];
+
+/// Maximum number of same-named symbols a call may resolve to before it is
+/// dropped as too ambiguous (conservative).
+const MAX_CALLEE_CANDIDATES: usize = 20;
 
 /// Recursively collect tier-0 source files under `root`, skipping ignored and
 /// dot-prefixed directories. Deterministic order is imposed by the caller.
@@ -67,31 +71,195 @@ fn now_secs() -> f64 {
         .unwrap_or(0.0)
 }
 
-struct FileRow {
-    rel: String,
-    lang: &'static str,
-    hash: String,
+/// Relative path of `file` under `project_root`, normalised to forward slashes.
+fn rel_path(project_root: &Path, file: &Path) -> String {
+    file.strip_prefix(project_root)
+        .unwrap_or(file)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+/// Result of an incremental reindex pass.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ReindexSummary {
+    pub changed: usize,
+    pub deleted: usize,
+}
+
+impl ReindexSummary {
+    pub fn is_noop(&self) -> bool {
+        self.changed == 0 && self.deleted == 0
+    }
+}
+
+/// Drop all rows belonging to a single file (symbols, call sites, file_index).
+/// Call edges are rebuilt globally by [`rebuild_graph`], so they are not touched here.
+fn remove_file_rows(tx: &rusqlite::Transaction, rel: &str) -> rusqlite::Result<()> {
+    tx.execute("DELETE FROM symbols WHERE path = ?1", [rel])?;
+    tx.execute("DELETE FROM call_sites WHERE from_path = ?1", [rel])?;
+    tx.execute("DELETE FROM file_index WHERE path = ?1", [rel])?;
+    Ok(())
+}
+
+fn upsert_file_index(
+    tx: &rusqlite::Transaction,
+    rel: &str,
+    lang: &str,
+    hash: &str,
     mtime: f64,
     symbol_count: usize,
+    now: f64,
+) -> rusqlite::Result<()> {
+    tx.execute(
+        "INSERT OR REPLACE INTO file_index (path, hash, language, symbol_count, last_indexed, mtime) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![rel, hash, lang, symbol_count as i64, now, mtime],
+    )?;
+    Ok(())
+}
+
+/// Extract and persist one file's symbols and call sites. The caller must have
+/// already removed any prior rows for this path. Returns the symbol count.
+///
+/// `qualified_name` is `relpath::name` (`#line` suffix on intra-file collision)
+/// so the UNIQUE(qualified_name) index never rejects a real symbol.
+fn index_one_file(
+    tx: &rusqlite::Transaction,
+    rel: &str,
+    lang: &str,
+    source: &str,
+) -> rusqlite::Result<usize> {
+    let mut syms = extract_symbols(source, lang, rel).unwrap_or_default();
+    let mut seen: HashSet<String> = HashSet::new();
+    for s in &mut syms {
+        s.path = rel.to_string();
+        s.qualified_name = format!("{}::{}", rel, s.name);
+        if !seen.insert(s.qualified_name.clone()) {
+            s.qualified_name = format!("{}#{}", s.qualified_name, s.line_start);
+            seen.insert(s.qualified_name.clone());
+        }
+    }
+
+    // (bare name, line_start) → qualified_name, for attributing call sites.
+    let qn_by_loc: HashMap<(String, usize), String> = syms
+        .iter()
+        .map(|s| ((s.name.clone(), s.line_start), s.qualified_name.clone()))
+        .collect();
+
+    let count = syms.len();
+    insert_symbols_batch(tx, &syms)?;
+
+    let calls = extract_calls(source, lang, rel).unwrap_or_default();
+    let mut stmt = tx.prepare(
+        "INSERT INTO call_sites (from_path, enclosing_qn, callee_name, call_line) VALUES (?1, ?2, ?3, ?4)",
+    )?;
+    for c in &calls {
+        if let Some(enc_qn) = qn_by_loc.get(&(c.enclosing_name.clone(), c.enclosing_line)) {
+            stmt.execute(rusqlite::params![rel, enc_qn, c.callee, c.line as i64])?;
+        }
+    }
+    Ok(count)
+}
+
+/// Rebuild the call graph from the persisted `call_sites` against the current
+/// symbol table, then refresh caller_count, coreness, and is_hub.
+///
+/// This is pure DB work (no file parsing), so incremental passes only re-parse
+/// the files that actually changed while the graph stays globally consistent.
+fn rebuild_graph(tx: &rusqlite::Transaction) -> rusqlite::Result<()> {
+    // name → [(qualified_name, path)]
+    let mut qns_by_name: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    {
+        let mut stmt = tx.prepare("SELECT name, qualified_name, path FROM symbols")?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (name, qn, path) in rows {
+            qns_by_name.entry(name).or_default().push((qn, path));
+        }
+    }
+
+    let sites: Vec<(String, String, String, Option<i64>)> = {
+        let mut stmt =
+            tx.prepare("SELECT from_path, enclosing_qn, callee_name, call_line FROM call_sites")?;
+        stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<i64>>(3)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    // One edge per (caller, callee) pair; the first call site supplies the line.
+    let mut edges: Vec<CallEdge> = Vec::new();
+    let mut seen_pairs: HashSet<(String, String)> = HashSet::new();
+    for (from_path, enc_qn, callee, line) in &sites {
+        let Some(targets) = qns_by_name.get(callee) else {
+            continue;
+        };
+        if targets.len() > MAX_CALLEE_CANDIDATES {
+            continue;
+        }
+        for (to_qn, to_path) in targets {
+            if !seen_pairs.insert((enc_qn.clone(), to_qn.clone())) {
+                continue;
+            }
+            let confidence = if to_path == from_path {
+                "resolved"
+            } else {
+                "textual"
+            };
+            edges.push(CallEdge {
+                from_symbol: enc_qn.clone(),
+                to_symbol: to_qn.clone(),
+                call_site_line: line.map(|l| l as i32),
+                edge_confidence: confidence.to_string(),
+                from_path: Some(from_path.clone()),
+                to_path: Some(to_path.clone()),
+            });
+        }
+    }
+
+    tx.execute("DELETE FROM call_edges", [])?;
+    insert_call_edges_batch(tx, &edges)?;
+    tx.execute(
+        "UPDATE symbols SET caller_count = \
+            (SELECT COUNT(DISTINCT from_symbol) FROM call_edges WHERE to_symbol = symbols.qualified_name)",
+        [],
+    )?;
+    crate::graph::coreness::compute_coreness(tx)?;
+    let hub_config = crate::config::HubThresholdConfig::default();
+    crate::graph::hub::update_is_hub_flags(tx, &hub_config)?;
+    Ok(())
 }
 
 /// Full (re)index of a project tree into `conn`.
 ///
-/// Pipeline: scan files → extract symbols (tree-sitter) → resolve call edges
-/// (conservative, name-based) → persist atomically → compute caller_count,
-/// coreness, and is_hub flags. Everything happens in one transaction so the
-/// graph is never observed in a half-built state.
-///
-/// Phase I does a full reindex each run; incremental updates are Phase II.
+/// Scan → extract symbols + call sites (tree-sitter) → rebuild graph
+/// (caller_count, coreness, is_hub). Everything is one transaction so the graph
+/// is never observed half-built.
 pub fn run_indexing_pipeline(conn: &mut Connection, project_root: &Path) -> rusqlite::Result<()> {
     let mut files = Vec::new();
     collect_source_files(project_root, &mut files);
     files.sort();
 
-    let mut file_rows: Vec<FileRow> = Vec::new();
-    let mut all_symbols: Vec<ParsedSymbol> = Vec::new();
-    // (relative file path, raw call site)
-    let mut all_calls: Vec<(String, crate::indexer::parser::RawCall)> = Vec::new();
+    let now = now_secs();
+    let tx = conn.transaction()?;
+
+    // Full reindex: clear everything. (Triggers keep the FTS tables in sync.)
+    tx.execute("DELETE FROM call_sites", [])?;
+    tx.execute("DELETE FROM import_edges", [])?;
+    tx.execute("DELETE FROM symbols", [])?;
+    tx.execute("DELETE FROM file_index", [])?;
 
     for file in &files {
         let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("");
@@ -101,136 +269,80 @@ pub fn run_indexing_pipeline(conn: &mut Connection, project_root: &Path) -> rusq
         let Ok(source) = std::fs::read_to_string(file) else {
             continue;
         };
-
-        let rel = file
-            .strip_prefix(project_root)
-            .unwrap_or(file)
-            .to_string_lossy()
-            .replace('\\', "/");
-
-        let mut syms = extract_symbols(&source, lang, &rel).unwrap_or_default();
-        let symbol_count = syms.len();
-        for s in &mut syms {
-            s.path = rel.clone();
-            s.qualified_name = format!("{}::{}", rel, s.name);
-        }
-        all_symbols.append(&mut syms);
-
-        if let Ok(calls) = extract_calls(&source, lang, &rel) {
-            for c in calls {
-                all_calls.push((rel.clone(), c));
-            }
-        }
-
-        file_rows.push(FileRow {
-            rel,
+        let rel = rel_path(project_root, file);
+        let count = index_one_file(&tx, &rel, lang, &source)?;
+        upsert_file_index(
+            &tx,
+            &rel,
             lang,
-            hash: hash_content(&source),
-            mtime: mtime_secs(file),
-            symbol_count,
-        });
+            &hash_content(&source),
+            mtime_secs(file),
+            count,
+            now,
+        )?;
     }
 
-    // Disambiguate qualified_name collisions (same bare name within one file) so the
-    // UNIQUE(qualified_name) index never rejects a real symbol.
-    let mut seen: HashSet<String> = HashSet::new();
-    for s in &mut all_symbols {
-        if !seen.insert(s.qualified_name.clone()) {
-            s.qualified_name = format!("{}#{}", s.qualified_name, s.line_start);
-            seen.insert(s.qualified_name.clone());
-        }
-    }
+    rebuild_graph(&tx)?;
+    tx.commit()?;
+    Ok(())
+}
 
-    // Lookup maps for edge resolution.
-    let mut qn_by_loc: HashMap<(String, String, usize), String> = HashMap::new();
-    let mut qns_by_name: HashMap<String, Vec<(String, String)>> = HashMap::new();
-    for s in &all_symbols {
-        qn_by_loc.insert(
-            (s.path.clone(), s.name.clone(), s.line_start),
-            s.qualified_name.clone(),
-        );
-        qns_by_name
-            .entry(s.name.clone())
-            .or_default()
-            .push((s.qualified_name.clone(), s.path.clone()));
-    }
+/// Incremental reindex: re-parse only files whose content hash changed (or are
+/// new), drop rows for deleted files, then rebuild the graph once if anything
+/// changed. Cheap to call repeatedly — the basis for the file watcher.
+pub fn reindex_changed(
+    conn: &mut Connection,
+    project_root: &Path,
+) -> rusqlite::Result<ReindexSummary> {
+    let existing: HashMap<String, String> = {
+        let mut stmt = conn.prepare("SELECT path, hash FROM file_index")?;
+        stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .collect()
+    };
 
-    // Resolve call edges conservatively: bare-name match. Same-file target →
-    // "resolved", otherwise "textual". Skip wildly ambiguous names (>20 matches).
-    let mut call_edges: Vec<CallEdge> = Vec::new();
-    for (path, c) in &all_calls {
-        let Some(from_qn) =
-            qn_by_loc.get(&(path.clone(), c.enclosing_name.clone(), c.enclosing_line))
-        else {
-            continue;
-        };
-        let Some(targets) = qns_by_name.get(&c.callee) else {
-            continue;
-        };
-        if targets.len() > 20 {
-            continue;
-        }
-        for (to_qn, to_path) in targets {
-            let confidence = if to_path == path {
-                "resolved"
-            } else {
-                "textual"
-            };
-            call_edges.push(CallEdge {
-                from_symbol: from_qn.clone(),
-                to_symbol: to_qn.clone(),
-                call_site_line: Some(c.line as i32),
-                edge_confidence: confidence.to_string(),
-                from_path: Some(path.clone()),
-                to_path: Some(to_path.clone()),
-            });
-        }
-    }
+    let mut files = Vec::new();
+    collect_source_files(project_root, &mut files);
+    files.sort();
 
     let now = now_secs();
     let tx = conn.transaction()?;
+    let mut summary = ReindexSummary::default();
+    let mut seen_paths: HashSet<String> = HashSet::new();
 
-    // Full reindex: clear prior state. (Triggers keep the FTS tables in sync.)
-    tx.execute("DELETE FROM call_edges", [])?;
-    tx.execute("DELETE FROM import_edges", [])?;
-    tx.execute("DELETE FROM symbols", [])?;
-    tx.execute("DELETE FROM file_index", [])?;
+    for file in &files {
+        let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("");
+        let Some(lang) = language_for_extension(ext) else {
+            continue;
+        };
+        let Ok(source) = std::fs::read_to_string(file) else {
+            continue;
+        };
+        let rel = rel_path(project_root, file);
+        seen_paths.insert(rel.clone());
+        let hash = hash_content(&source);
+        if existing.get(&rel) == Some(&hash) {
+            continue; // unchanged — skip the parse
+        }
+        remove_file_rows(&tx, &rel)?;
+        let count = index_one_file(&tx, &rel, lang, &source)?;
+        upsert_file_index(&tx, &rel, lang, &hash, mtime_secs(file), count, now)?;
+        summary.changed += 1;
+    }
 
-    insert_symbols_batch(&tx, &all_symbols)?;
-    insert_call_edges_batch(&tx, &call_edges)?;
-
-    {
-        let mut stmt = tx.prepare(
-            "INSERT OR REPLACE INTO file_index (path, hash, language, symbol_count, last_indexed, mtime) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        )?;
-        for f in &file_rows {
-            stmt.execute(rusqlite::params![
-                f.rel,
-                f.hash,
-                f.lang,
-                f.symbol_count as i64,
-                now,
-                f.mtime
-            ])?;
+    for path in existing.keys() {
+        if !seen_paths.contains(path) {
+            remove_file_rows(&tx, path)?;
+            summary.deleted += 1;
         }
     }
 
-    // caller_count = number of distinct callers (must precede hub flagging).
-    tx.execute(
-        "UPDATE symbols SET caller_count = \
-            (SELECT COUNT(DISTINCT from_symbol) FROM call_edges WHERE to_symbol = symbols.qualified_name)",
-        [],
-    )?;
-
-    // Graph metrics on the freshly-built edges. compute_coreness persists
-    // symbols.coreness; update_is_hub_flags reads caller_count + coreness.
-    crate::graph::coreness::compute_coreness(&tx)?;
-    let hub_config = crate::config::HubThresholdConfig::default();
-    crate::graph::hub::update_is_hub_flags(&tx, &hub_config)?;
-
+    if !summary.is_noop() {
+        rebuild_graph(&tx)?;
+    }
     tx.commit()?;
-    Ok(())
+    Ok(summary)
 }
 
 pub struct IndexStateMachine {
@@ -267,6 +379,10 @@ mod tests {
     use super::*;
     use crate::db::schema::init_db;
 
+    fn count(conn: &Connection, sql: &str) -> i64 {
+        conn.query_row(sql, [], |r| r.get(0)).unwrap()
+    }
+
     #[test]
     fn test_phase_transition() {
         let mut sm = IndexStateMachine::new();
@@ -300,37 +416,89 @@ mod tests {
         init_db(&conn).unwrap();
         run_indexing_pipeline(&mut conn, &dir).unwrap();
 
-        // Symbols extracted and inserted (not a mock).
-        let sym_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(sym_count, 2, "expected helper + main");
-
-        // file_index populated.
-        let file_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM file_index", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(file_count, 1);
-
-        // main → helper edge resolved within the same file.
-        let edge_count: i64 = conn
-            .query_row(
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM symbols"), 2);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM file_index"), 1);
+        assert_eq!(
+            count(
+                &conn,
                 "SELECT COUNT(*) FROM call_edges WHERE from_symbol = 'a.py::main' AND to_symbol = 'a.py::helper'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert!(edge_count >= 1, "expected main→helper call edge");
-
-        // helper has exactly one distinct caller (main).
-        let helper_callers: i64 = conn
-            .query_row(
+            ),
+            1
+        );
+        assert_eq!(
+            count(
+                &conn,
                 "SELECT caller_count FROM symbols WHERE qualified_name = 'a.py::helper'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(helper_callers, 1);
+            ),
+            1
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_reindex_incremental_add_modify_delete() {
+        let dir = std::env::temp_dir().join(format!("ci_idx_inc_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.py"), "def helper():\n    pass\n").unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        run_indexing_pipeline(&mut conn, &dir).unwrap();
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM symbols"), 1);
+
+        // No change → no-op.
+        assert!(reindex_changed(&mut conn, &dir).unwrap().is_noop());
+
+        // Add a second file that calls helper → new symbol + cross-file edge.
+        std::fs::write(dir.join("b.py"), "def caller():\n    helper()\n").unwrap();
+        let s = reindex_changed(&mut conn, &dir).unwrap();
+        assert_eq!(
+            s,
+            ReindexSummary {
+                changed: 1,
+                deleted: 0
+            }
+        );
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM symbols"), 2);
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT caller_count FROM symbols WHERE qualified_name = 'a.py::helper'",
+            ),
+            1
+        );
+
+        // Modify b.py to no longer call helper → edge drops, caller_count → 0.
+        std::fs::write(dir.join("b.py"), "def caller():\n    pass\n").unwrap();
+        let s = reindex_changed(&mut conn, &dir).unwrap();
+        assert_eq!(
+            s,
+            ReindexSummary {
+                changed: 1,
+                deleted: 0
+            }
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT caller_count FROM symbols WHERE qualified_name = 'a.py::helper'",
+            ),
+            0
+        );
+
+        // Delete b.py → its symbol disappears.
+        std::fs::remove_file(dir.join("b.py")).unwrap();
+        let s = reindex_changed(&mut conn, &dir).unwrap();
+        assert_eq!(
+            s,
+            ReindexSummary {
+                changed: 0,
+                deleted: 1
+            }
+        );
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM symbols"), 1);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

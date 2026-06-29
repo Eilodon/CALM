@@ -74,6 +74,16 @@ CREATE TABLE IF NOT EXISTS symbol_metrics_history (
 );
 CREATE INDEX IF NOT EXISTS idx_smh_symbol ON symbol_metrics_history(qualified_name);
 CREATE INDEX IF NOT EXISTS idx_smh_time   ON symbol_metrics_history(snapshot_at);
+
+CREATE TABLE IF NOT EXISTS call_sites (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    from_path    TEXT NOT NULL,
+    enclosing_qn TEXT NOT NULL,
+    callee_name  TEXT NOT NULL,
+    call_line    INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_call_sites_from   ON call_sites(from_path);
+CREATE INDEX IF NOT EXISTS idx_call_sites_callee ON call_sites(callee_name);
 ";
 
 const FTS5_SQL: &str = "

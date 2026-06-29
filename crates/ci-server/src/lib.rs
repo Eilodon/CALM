@@ -1,5 +1,6 @@
 pub mod telemetry;
 pub mod tools;
+pub mod watcher;
 
 use std::path::PathBuf;
 
@@ -22,6 +23,7 @@ pub async fn serve_stdio(project_root: PathBuf, db_path: PathBuf) -> Result<()> 
 
     let indexer_db_path = db_path.clone();
     let indexer_root = project_root.clone();
+    let watch_ct = ct.clone();
     tokio::task::spawn_blocking(move || {
         tracing::info!("Background indexer thread started");
         if let Ok(mut conn) = rusqlite::Connection::open(&indexer_db_path) {
@@ -34,6 +36,8 @@ pub async fn serve_stdio(project_root: PathBuf, db_path: PathBuf) -> Result<()> 
                 tracing::info!("Background indexing completed");
             }
         }
+        // Watch for edits and incrementally reindex until shutdown.
+        watcher::run_watch_loop(indexer_root, indexer_db_path, watch_ct);
     });
 
     let transport = stdio();
