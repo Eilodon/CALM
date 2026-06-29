@@ -1,0 +1,41 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ci-core",
+    "crates/ci-server",
+    "crates/ci-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# Core
+rusqlite = { version = "0.34", features = ["bundled", "vtab"] }
+tree-sitter = "0.24"
+tree-sitter-python = "0.23"
+tree-sitter-typescript = "0.23"
+tree-sitter-javascript = "0.23"
+tree-sitter-java = "0.23"
+tree-sitter-rust = "0.23"
+tree-sitter-go = "0.23"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+regex = "1"
+thiserror = "2"
+anyhow = "1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Internal
+ci-core = { path = "crates/ci-core" }
+ci-server = { path = "crates/ci-server" }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

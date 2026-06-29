@@ -141,7 +141,7 @@ def update_is_hub_flags(conn: sqlite3.Connection, config) -> None:
         all_coreness.sort()
         pct = config.hub_threshold.coreness_pct
         idx = max(0, int(len(all_coreness) * pct / 100) - 1)
-        p75_coreness = max(all_coreness[idx], config.hub_threshold.min_callers)
+        p75_coreness = max(all_coreness[idx], config.hub_threshold.min_callers_bridge)
 
     top_threshold = 1.0 - config.hub_threshold.top_pct / 100.0
 
@@ -177,8 +177,9 @@ def init_schema(conn: sqlite3.Connection) -> None:
     ''')
     conn.execute('''
         CREATE VIRTUAL TABLE IF NOT EXISTS fts_tokens USING fts5(
-            symbol_id UNINDEXED,
             name_tokens,
+            content='symbols',
+            content_rowid='id',
             tokenize='unicode61'
         )
     ''')
