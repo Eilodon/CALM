@@ -1,11 +1,24 @@
 use crate::types::IndexingPhase;
 use rusqlite::Connection;
 
+use crate::indexer::edges::{insert_call_edges_batch, insert_import_edges_batch, CallEdge, ImportEdge};
+
 pub fn run_indexing_pipeline(conn: &mut Connection) -> rusqlite::Result<()> {
     let tx = conn.transaction()?;
-    // Insert symbols...
+    // Insert symbols... (Skipped in this mock)
+    
     // Build edges...
+    // Mock resolving edges from conservative resolver
+    let call_edges = vec![];
+    let import_edges = vec![];
+    
+    insert_call_edges_batch(&tx, &call_edges)?;
+    insert_import_edges_batch(&tx, &import_edges)?;
+    
     // Call coreness & update_is_hub_flags...
+    crate::graph::coreness::compute_coreness(&tx)?;
+    let hub_config = crate::config::HubThresholdConfig::default();
+    crate::graph::hub::update_is_hub_flags(&tx, &hub_config)?;
     
     // Only commit if ALL steps succeed, avoiding corrupted intermediate graph states
     tx.commit()?;
