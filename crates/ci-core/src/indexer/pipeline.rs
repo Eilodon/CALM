@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 
 use crate::indexer::edges::{CallEdge, insert_call_edges_batch, insert_symbols_batch};
 use crate::indexer::lang_constants::language_for_extension;
-use crate::indexer::parser::{extract_calls, extract_file_aliases, extract_symbols};
+use crate::indexer::parser::{
+    extract_calls, extract_file_aliases, extract_symbols, extract_type_map,
+};
 
 /// Directories never descended into during a project scan.
 const IGNORE_DIRS: &[&str] = &[
@@ -97,6 +99,7 @@ impl ReindexSummary {
 fn remove_file_rows(tx: &rusqlite::Transaction, rel: &str) -> rusqlite::Result<()> {
     tx.execute("DELETE FROM symbols WHERE path = ?1", [rel])?;
     tx.execute("DELETE FROM call_sites WHERE from_path = ?1", [rel])?;
+    tx.execute("DELETE FROM import_edges WHERE from_path = ?1", [rel])?;
     tx.execute("DELETE FROM file_index WHERE path = ?1", [rel])?;
     Ok(())
 }
@@ -150,17 +153,54 @@ fn index_one_file(
     let count = syms.len();
     insert_symbols_batch(tx, &syms)?;
 
-    // De-reference simple local aliases (`x = helper; x()` → helper) before storing
-    // call sites, so the graph attributes the call to the real target.
-    let aliases = extract_file_aliases(source, lang, &file_symbols);
+    // Imports → import_edges (to_path resolved later, globally) + import_map.
+    let imports = crate::indexer::imports::extract_imports(source, lang);
+    let mut import_map: HashMap<String, String> = HashMap::new();
+    {
+        let mut istmt = tx.prepare(
+            "INSERT INTO import_edges (from_path, to_path, module_name, symbols_used) \
+             VALUES (?1, NULL, ?2, ?3)",
+        )?;
+        for imp in &imports {
+            let symbols_used =
+                serde_json::to_string(&imp.imported_names).unwrap_or_else(|_| "[]".to_string());
+            istmt.execute(rusqlite::params![rel, imp.module_name, symbols_used])?;
+            for n in &imp.imported_names {
+                import_map
+                    .entry(n.clone())
+                    .or_insert_with(|| imp.module_name.clone());
+            }
+        }
+    }
+
+    // Full resolver context: file symbols + imports + type annotations.
+    let ctx = crate::resolver::FileContext {
+        file_symbols,
+        import_map,
+        type_map: extract_type_map(source, lang),
+    };
+    let resolver = crate::resolver::conservative::ConservativeResolver::new();
+    let aliases = extract_file_aliases(source, lang, &ctx);
+
+    // Calls → call_sites. Confidence comes from the conservative resolver
+    // (file symbol / import / alias → "resolved", otherwise "textual"); the
+    // callee is de-aliased so the graph attributes the call to the real target.
     let calls = extract_calls(source, lang, rel).unwrap_or_default();
     let mut stmt = tx.prepare(
-        "INSERT INTO call_sites (from_path, enclosing_qn, callee_name, call_line) VALUES (?1, ?2, ?3, ?4)",
+        "INSERT INTO call_sites (from_path, enclosing_qn, callee_name, call_line, confidence) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
     )?;
     for c in &calls {
         if let Some(enc_qn) = qn_by_loc.get(&(c.enclosing_name.clone(), c.enclosing_line)) {
+            let confidence = resolver.resolve_tier1(&c.callee, &ctx, &aliases).confidence;
             let callee = aliases.get(&c.callee).unwrap_or(&c.callee);
-            stmt.execute(rusqlite::params![rel, enc_qn, callee, c.line as i64])?;
+            stmt.execute(rusqlite::params![
+                rel,
+                enc_qn,
+                callee,
+                c.line as i64,
+                confidence
+            ])?;
         }
     }
     Ok(count)
@@ -190,24 +230,27 @@ fn rebuild_graph(tx: &rusqlite::Transaction) -> rusqlite::Result<()> {
         }
     }
 
-    let sites: Vec<(String, String, String, Option<i64>)> = {
-        let mut stmt =
-            tx.prepare("SELECT from_path, enclosing_qn, callee_name, call_line FROM call_sites")?;
+    let sites: Vec<(String, String, String, Option<i64>, String)> = {
+        let mut stmt = tx.prepare(
+            "SELECT from_path, enclosing_qn, callee_name, call_line, confidence FROM call_sites",
+        )?;
         stmt.query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
                 r.get::<_, String>(2)?,
                 r.get::<_, Option<i64>>(3)?,
+                r.get::<_, String>(4)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?
     };
 
     // One edge per (caller, callee) pair; the first call site supplies the line.
+    // Confidence is the resolver's verdict recorded at extraction time.
     let mut edges: Vec<CallEdge> = Vec::new();
     let mut seen_pairs: HashSet<(String, String)> = HashSet::new();
-    for (from_path, enc_qn, callee, line) in &sites {
+    for (from_path, enc_qn, callee, line, confidence) in &sites {
         let Some(targets) = qns_by_name.get(callee) else {
             continue;
         };
@@ -218,16 +261,11 @@ fn rebuild_graph(tx: &rusqlite::Transaction) -> rusqlite::Result<()> {
             if !seen_pairs.insert((enc_qn.clone(), to_qn.clone())) {
                 continue;
             }
-            let confidence = if to_path == from_path {
-                "resolved"
-            } else {
-                "textual"
-            };
             edges.push(CallEdge {
                 from_symbol: enc_qn.clone(),
                 to_symbol: to_qn.clone(),
                 call_site_line: line.map(|l| l as i32),
-                edge_confidence: confidence.to_string(),
+                edge_confidence: confidence.clone(),
                 from_path: Some(from_path.clone()),
                 to_path: Some(to_path.clone()),
             });
@@ -241,10 +279,158 @@ fn rebuild_graph(tx: &rusqlite::Transaction) -> rusqlite::Result<()> {
             (SELECT COUNT(DISTINCT from_symbol) FROM call_edges WHERE to_symbol = symbols.qualified_name)",
         [],
     )?;
+    resolve_import_targets(tx)?;
     crate::graph::coreness::compute_coreness(tx)?;
     let hub_config = crate::config::HubThresholdConfig::default();
     crate::graph::hub::update_is_hub_flags(tx, &hub_config)?;
     Ok(())
+}
+
+/// Best-effort resolution of `import_edges.to_path` against indexed files, so the
+/// `dependencies` tool's `imported_by` direction works for in-project imports.
+/// External modules (no matching file) keep `to_path = NULL`.
+fn resolve_import_targets(tx: &rusqlite::Transaction) -> rusqlite::Result<()> {
+    let known: HashSet<String> = {
+        let mut stmt = tx.prepare("SELECT path FROM file_index")?;
+        stmt.query_map([], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .collect()
+    };
+    let rows: Vec<(i64, String, String)> = {
+        let mut stmt = tx.prepare("SELECT id, from_path, module_name FROM import_edges")?;
+        stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let mut ustmt = tx.prepare("UPDATE import_edges SET to_path = ?1 WHERE id = ?2")?;
+    for (id, from_path, module) in &rows {
+        if let Some(target) = resolve_module_to_path(from_path, module, &known) {
+            ustmt.execute(rusqlite::params![target, id])?;
+        }
+    }
+    Ok(())
+}
+
+/// Map a module/path string to an indexed file path, trying the conventions of
+/// all six languages (dotted, scoped, and JS-relative) plus common index files.
+fn resolve_module_to_path(
+    from_path: &str,
+    module: &str,
+    known: &HashSet<String>,
+) -> Option<String> {
+    let m = module.trim().trim_matches(|c| c == '"' || c == '\'');
+    if m.is_empty() {
+        return None;
+    }
+
+    // Build candidate base paths (without extension), forward-slash normalised.
+    let mut bases: Vec<String> = Vec::new();
+    let from_dir = std::path::Path::new(from_path)
+        .parent()
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_default();
+
+    if m.starts_with("./") || m.starts_with("../") {
+        // JS/TS relative import, resolved against the importing file's directory.
+        bases.push(normalize_rel(&from_dir, m));
+    } else if let Some(stripped) = m.strip_prefix('.') {
+        // Python relative import: leading dots climb packages.
+        let ups = m.len() - m.trim_start_matches('.').len();
+        let tail = stripped.trim_start_matches('.').replace('.', "/");
+        let mut dir = from_dir.clone();
+        for _ in 1..ups {
+            dir = parent_of(&dir);
+        }
+        bases.push(if tail.is_empty() {
+            dir
+        } else {
+            join_rel(&dir, &tail)
+        });
+    } else {
+        // Absolute/dotted/scoped module, relative to project root.
+        let norm = m.replace("::", "/").replace('.', "/");
+        let norm = norm
+            .trim_start_matches("crate/")
+            .trim_start_matches("self/")
+            .trim_start_matches("super/")
+            .to_string();
+        // The full path, and — for item imports like `use a::b::Item` — its parent.
+        // Also try a conventional `src/` source root.
+        bases.push(norm.clone());
+        if let Some((parent, _)) = norm.rsplit_once('/') {
+            bases.push(parent.to_string());
+            bases.push(format!("src/{parent}"));
+        }
+        bases.push(format!("src/{norm}"));
+    }
+
+    const EXTS: &[&str] = &[".py", ".rs", ".go", ".ts", ".tsx", ".js", ".jsx", ".java"];
+    const INDEX_SUFFIXES: &[&str] = &[
+        "/__init__.py",
+        "/mod.rs",
+        "/index.ts",
+        "/index.tsx",
+        "/index.js",
+    ];
+    for base in &bases {
+        let base = base.trim_start_matches("./");
+        if known.contains(base) {
+            return Some(base.to_string());
+        }
+        for e in EXTS {
+            let c = format!("{base}{e}");
+            if known.contains(&c) {
+                return Some(c);
+            }
+        }
+        for s in INDEX_SUFFIXES {
+            let c = format!("{base}{s}");
+            if known.contains(&c) {
+                return Some(c);
+            }
+        }
+    }
+    None
+}
+
+fn parent_of(dir: &str) -> String {
+    std::path::Path::new(dir)
+        .parent()
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_default()
+}
+
+fn join_rel(dir: &str, tail: &str) -> String {
+    if dir.is_empty() {
+        tail.to_string()
+    } else {
+        format!("{dir}/{tail}")
+    }
+}
+
+/// Resolve `./`, `../` and `.` components of a JS-style relative path against a base dir.
+fn normalize_rel(base_dir: &str, rel: &str) -> String {
+    let mut parts: Vec<&str> = if base_dir.is_empty() {
+        Vec::new()
+    } else {
+        base_dir.split('/').filter(|s| !s.is_empty()).collect()
+    };
+    for seg in rel.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            other => parts.push(other),
+        }
+    }
+    parts.join("/")
 }
 
 /// Full (re)index of a project tree into `conn`.
@@ -466,6 +652,53 @@ mod tests {
             1,
             "alias x=helper should resolve the call to helper"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_imports_and_cross_file_resolved_confidence() {
+        let dir = std::env::temp_dir().join(format!("ci_idx_imp_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("helper.py"), "def helper():\n    pass\n").unwrap();
+        std::fs::write(
+            dir.join("main.py"),
+            "from helper import helper\n\ndef run():\n    helper()\n",
+        )
+        .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        run_indexing_pipeline(&mut conn, &dir).unwrap();
+
+        // import_edges populated and to_path resolved to the in-project file.
+        let (to_path, module): (String, String) = conn
+            .query_row(
+                "SELECT COALESCE(to_path,''), module_name FROM import_edges WHERE from_path = 'main.py'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(module, "helper");
+        assert_eq!(
+            to_path, "helper.py",
+            "import target resolved to in-project file"
+        );
+
+        // The cross-file call through the import is labelled "resolved".
+        let confidence: String = conn
+            .query_row(
+                "SELECT edge_confidence FROM call_edges \
+                 WHERE from_symbol = 'main.py::run' AND to_symbol = 'helper.py::helper'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            confidence, "resolved",
+            "imported call should be resolved, not textual"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

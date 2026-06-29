@@ -181,27 +181,69 @@ pub fn extract_calls(source: &str, language: &str, _path: &str) -> Result<Vec<Ra
 /// File-local alias map (`x = helper` → `x` ↦ `helper`) via the conservative
 /// resolver, so calls through simple aliases resolve to the real target.
 ///
-/// Only `file_symbols` is supplied as context (no import/type map yet), so this
-/// covers aliases to symbols defined in the same file — the common local case.
+/// The full `FileContext` (file_symbols + import_map + type_map) is supplied so
+/// the resolver's multi-assignment and symbol/import/type guards apply.
 pub fn extract_file_aliases(
     source: &str,
     language: &str,
-    file_symbols: &std::collections::HashSet<String>,
+    ctx: &crate::resolver::FileContext,
 ) -> std::collections::HashMap<String, String> {
     let Some(tree) = parse_tree(source, language) else {
         return std::collections::HashMap::new();
-    };
-    let ctx = crate::resolver::FileContext {
-        file_symbols: file_symbols.clone(),
-        import_map: std::collections::HashMap::new(),
-        type_map: std::collections::HashMap::new(),
     };
     crate::resolver::conservative::ConservativeResolver::new().extract_aliases(
         tree.root_node(),
         source.as_bytes(),
         language,
-        &ctx,
+        ctx,
     )
+}
+
+/// Best-effort `name → type` map from explicit annotations, used by the resolver
+/// as an alias guard (a typed binding is not treated as a simple alias) and as a
+/// basis for future type-directed resolution.
+///
+/// Covers the languages where annotations are idiomatic and cheap to read
+/// (Python typed parameters, TypeScript parameter annotations); other languages
+/// yield an empty map, matching the conservative resolver's coverage.
+pub fn extract_type_map(source: &str, language: &str) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    let Some(tree) = parse_tree(source, language) else {
+        return map;
+    };
+    let (param_kind, type_field) = match language {
+        "python" => ("typed_parameter", "type"),
+        "typescript" => ("required_parameter", "type"),
+        _ => return map,
+    };
+
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.kind() == param_kind {
+            // Python `typed_parameter` holds the name as its first identifier
+            // child; TS `required_parameter` exposes a `pattern` field.
+            let name_node = node
+                .child_by_field_name("pattern")
+                .or_else(|| node.named_child(0));
+            let type_node = node.child_by_field_name(type_field);
+            if let (Some(n), Some(t)) = (name_node, type_node) {
+                let name = source[n.byte_range()].trim().to_string();
+                // Strip a leading `:` that TS type_annotation includes.
+                let ty = source[t.byte_range()]
+                    .trim_start_matches(':')
+                    .trim()
+                    .to_string();
+                if !name.is_empty() && !ty.is_empty() {
+                    map.insert(name, ty);
+                }
+            }
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    map
 }
 
 #[cfg(test)]

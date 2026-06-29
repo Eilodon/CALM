@@ -80,7 +80,8 @@ CREATE TABLE IF NOT EXISTS call_sites (
     from_path    TEXT NOT NULL,
     enclosing_qn TEXT NOT NULL,
     callee_name  TEXT NOT NULL,
-    call_line    INTEGER
+    call_line    INTEGER,
+    confidence   TEXT NOT NULL DEFAULT 'textual'
 );
 CREATE INDEX IF NOT EXISTS idx_call_sites_from   ON call_sites(from_path);
 CREATE INDEX IF NOT EXISTS idx_call_sites_callee ON call_sites(callee_name);
