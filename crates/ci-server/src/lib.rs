@@ -24,6 +24,7 @@ pub async fn serve_stdio(project_root: PathBuf, db_path: PathBuf) -> Result<()> 
     let indexer_db_path = db_path.clone();
     let indexer_root = project_root.clone();
     let watch_ct = ct.clone();
+    let phase = server.phase_handle();
     tokio::task::spawn_blocking(move || {
         tracing::info!("Background indexer thread started");
         if let Ok(mut conn) = rusqlite::Connection::open(&indexer_db_path) {
@@ -33,6 +34,8 @@ pub async fn serve_stdio(project_root: PathBuf, db_path: PathBuf) -> Result<()> 
             {
                 tracing::error!("Background indexer failed: {}", e);
             } else {
+                // Graph is fully built — tools may now report edges_ready.
+                *phase.write().unwrap() = ci_core::types::IndexingPhase::Ready;
                 tracing::info!("Background indexing completed");
             }
         }

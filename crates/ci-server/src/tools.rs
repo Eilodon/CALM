@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use rmcp::handler::server::tool::Parameters;
 use rmcp::tool;
@@ -7,6 +7,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use ci_core::sanitize::sanitize_source_output;
+use ci_core::types::IndexingPhase;
 
 // ---------------------------------------------------------------------------
 // Server state
@@ -18,6 +19,10 @@ pub struct CodeIntelligenceServer {
     #[allow(dead_code)]
     db_path: PathBuf,
     conn: Arc<Mutex<rusqlite::Connection>>,
+    /// Current indexing phase, shared with the background indexer thread.
+    /// Tools read it to report `indexing_phase` / `edges_ready` honestly instead
+    /// of assuming the graph is built.
+    phase: Arc<RwLock<IndexingPhase>>,
 }
 
 impl CodeIntelligenceServer {
@@ -31,11 +36,31 @@ impl CodeIntelligenceServer {
             project_root,
             db_path,
             conn: Arc::new(Mutex::new(conn)),
+            phase: Arc::new(RwLock::new(IndexingPhase::Scanning)),
         })
     }
 
     fn db(&self) -> std::sync::MutexGuard<'_, rusqlite::Connection> {
         self.conn.lock().unwrap()
+    }
+
+    /// A handle the background indexer uses to advance the phase as it works.
+    pub fn phase_handle(&self) -> Arc<RwLock<IndexingPhase>> {
+        Arc::clone(&self.phase)
+    }
+
+    fn current_phase(&self) -> IndexingPhase {
+        *self.phase.read().unwrap()
+    }
+
+    /// Canonical `indexing_phase` string for tool responses.
+    fn phase_str(&self) -> String {
+        self.current_phase().as_str().to_string()
+    }
+
+    /// `edges_ready` is true only once the full graph is built.
+    fn edges_ready(&self) -> bool {
+        self.current_phase() == IndexingPhase::Ready
     }
 }
 
@@ -495,7 +520,7 @@ impl CodeIntelligenceServer {
 
             serde_json::to_string_pretty(&RepoOverviewOutput {
                 languages,
-                indexing_phase: "ready".into(),
+                indexing_phase: self.phase_str(),
                 embeddings_status: "disabled".into(),
                 total_modules: total_files,
                 total_symbols,
@@ -1017,12 +1042,12 @@ impl CodeIntelligenceServer {
             }
 
             serde_json::to_string_pretty(&IndexingStatusOutput {
-                indexing_phase: "ready".into(),
+                indexing_phase: self.phase_str(),
                 files_indexed: files,
                 symbols_indexed: symbols,
                 edges_indexed: edges,
                 embeddings_status: "disabled".into(),
-                edges_ready: true,
+                edges_ready: self.edges_ready(),
             })
             .unwrap_or_default()
         })
@@ -1212,7 +1237,7 @@ impl CodeIntelligenceServer {
                 symbol: symbol_info,
                 source: source_output,
                 callers_summary: callers,
-                edges_ready: Some(true),
+                edges_ready: Some(self.edges_ready()),
             })
             .unwrap_or_default()
         })
@@ -1226,5 +1251,29 @@ impl rmcp::ServerHandler for CodeIntelligenceServer {
             instructions: Some("Code Intelligence MCP server — codebase analysis tools".into()),
             ..Default::default()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn edges_ready_follows_indexing_phase() {
+        let dir = std::env::temp_dir().join(format!("ci_phase_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        // Fresh server: still scanning, so tools must report edges not ready.
+        assert_eq!(server.phase_str(), "scanning");
+        assert!(!server.edges_ready());
+
+        // Indexer signals completion via the shared handle.
+        *server.phase_handle().write().unwrap() = IndexingPhase::Ready;
+        assert_eq!(server.phase_str(), "ready");
+        assert!(server.edges_ready());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
