@@ -81,9 +81,7 @@ pub fn bidirectional_bfs_path(
         // [F2+F10] Vertex-balanced expansion
         let expand_forward = if forward_exhausted {
             false
-        } else if backward_exhausted {
-            true
-        } else if forward_frontier.len() < backward_frontier.len() {
+        } else if backward_exhausted || forward_frontier.len() < backward_frontier.len() {
             true
         } else if backward_frontier.len() < forward_frontier.len() {
             false
@@ -102,10 +100,7 @@ pub fn bidirectional_bfs_path(
                 if let Some(callees) = callee_map.get(node) {
                     for (callee, edge) in callees {
                         if !forward_pred.contains_key(callee) {
-                            forward_pred.insert(
-                                callee.clone(),
-                                Some((node.clone(), edge.clone())),
-                            );
+                            forward_pred.insert(callee.clone(), Some((node.clone(), edge.clone())));
                             new_f.insert(callee.clone());
                             if backward_pred.contains_key(callee) {
                                 meeting_nodes.insert(callee.clone());
@@ -122,8 +117,7 @@ pub fn bidirectional_bfs_path(
                 f_depth += 1;
             }
         } else {
-            let frontier_refs: Vec<&str> =
-                backward_frontier.iter().map(|s| s.as_str()).collect();
+            let frontier_refs: Vec<&str> = backward_frontier.iter().map(|s| s.as_str()).collect();
             let caller_map = queries::batch_callers(conn, &frontier_refs)?; // [F1]
             let mut new_b: HashSet<String> = HashSet::new();
 
@@ -131,10 +125,8 @@ pub fn bidirectional_bfs_path(
                 if let Some(callers) = caller_map.get(node) {
                     for (caller, edge) in callers {
                         if !backward_pred.contains_key(caller) {
-                            backward_pred.insert(
-                                caller.clone(),
-                                Some((node.clone(), edge.clone())),
-                            );
+                            backward_pred
+                                .insert(caller.clone(), Some((node.clone(), edge.clone())));
                             new_b.insert(caller.clone());
                             if forward_pred.contains_key(caller) {
                                 meeting_nodes.insert(caller.clone());
@@ -186,11 +178,7 @@ pub fn bidirectional_bfs_path(
         // Reconstruct backward path (meeting -> ... -> to_sym)
         let mut bwd: Vec<PathStep> = Vec::new();
         let mut node = meeting.clone();
-        loop {
-            let pred = match backward_pred.get(&node) {
-                Some(Some(p)) => p,
-                _ => break,
-            };
+        while let Some(Some(pred)) = backward_pred.get(&node) {
             bwd.push(PathStep {
                 symbol: pred.0.clone(),
                 edge_confidence: Some(pred.1.clone()),

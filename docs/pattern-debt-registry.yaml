@@ -1,0 +1,54 @@
+version: 1
+generated: "2026-06-29"
+
+items:
+  DEBT-001-parity-harness:
+    status: open
+    urgency: high
+    description: >
+      Parity test harness Python↔Rust chưa tồn tại.
+      Kế hoạch v1 coi đây là safety net chính của migration,
+      nhưng chưa có fixture, oracle, hay diff runner nào.
+    current_control: "Unit tests riêng lẻ cho từng module Rust"
+    remaining:
+      - "Synthetic fixture (~50 files, ~200 symbols, mixed languages)"
+      - "Python oracle đã fix C-1/C-2"
+      - "Diff runner so sánh JSON output"
+    owner_hint: testing
+
+  DEBT-002-analysis-modules:
+    status: resolved
+    urgency: done
+    resolved_at: "2026-06-29"
+    description: >
+      5 analysis modules đã port từ Python sang Rust:
+      coverage_reader, dead_code, codeowners, hotspot, diff_impact.
+      53 tests pass, clippy clean.
+    current_control: "Full Rust implementation with unit tests"
+    remaining: []
+    owner_hint: ci-core
+
+  DEBT-003-bug-fixes:
+    status: partial
+    urgency: medium
+    description: >
+      Bug fixes từ audit:
+      H-1 (last_changed) đã fix trong hotspot.rs (Option<String>).
+      H-3 và H-4 chờ MCP tool layer (Phase 3+).
+    current_control: "H-1 fixed; H-3, H-4 documented"
+    remaining:
+      - "H-3: understand response thêm edges_ready: bool"
+      - "H-4: AmbiguousResult.signature → Option<String>"
+    owner_hint: ci-core
+
+  DEBT-004-c1-regression:
+    status: resolved
+    urgency: done
+    resolved_at: "2026-06-29"
+    description: >
+      C-1 regression test added in coreness.rs:
+      test_c1_regression_coreness_recomputed_after_edge_change.
+      Triangle → remove edge → recompute → assert coreness drops.
+    current_control: "Explicit regression test"
+    remaining: []
+    owner_hint: testing

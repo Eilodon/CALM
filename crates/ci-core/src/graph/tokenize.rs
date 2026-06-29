@@ -55,6 +55,9 @@ mod tests {
 
     #[test]
     fn test_kebab_case() {
-        assert_eq!(tokenize_identifier("my-component-name"), "my component name");
+        assert_eq!(
+            tokenize_identifier("my-component-name"),
+            "my component name"
+        );
     }
 }

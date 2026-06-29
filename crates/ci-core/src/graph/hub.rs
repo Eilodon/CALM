@@ -8,10 +8,7 @@ use crate::config::HubThresholdConfig;
 /// Bridge-hub: caller_count >= min_callers_bridge AND coreness >= p75.
 ///
 /// Bug fix vs Python (C-2): p75_coreness floor uses min_callers_bridge, not min_callers.
-pub fn update_is_hub_flags(
-    conn: &Connection,
-    config: &HubThresholdConfig,
-) -> rusqlite::Result<()> {
+pub fn update_is_hub_flags(conn: &Connection, config: &HubThresholdConfig) -> rusqlite::Result<()> {
     let mut stmt = conn.prepare(
         "SELECT qualified_name, caller_count, coreness \
          FROM symbols WHERE caller_count >= 1 OR coreness > 0",
@@ -61,13 +58,11 @@ pub fn update_is_hub_flags(
 
     let top_threshold = 1.0 - config.top_pct / 100.0;
 
-    let mut update_stmt =
-        conn.prepare("UPDATE symbols SET is_hub = ? WHERE qualified_name = ?")?;
+    let mut update_stmt = conn.prepare("UPDATE symbols SET is_hub = ? WHERE qualified_name = ?")?;
 
     for (qname, caller_count, coreness) in &rows {
         let caller_pct = percentile_rank(*caller_count);
-        let is_degree_hub =
-            *caller_count >= config.min_callers && caller_pct >= top_threshold;
+        let is_degree_hub = *caller_count >= config.min_callers && caller_pct >= top_threshold;
         let is_bridge_hub =
             *caller_count >= config.min_callers_bridge && (*coreness as f64) >= p75_coreness;
         let is_hub = is_degree_hub || is_bridge_hub;

@@ -15,8 +15,10 @@ pub fn batch_callees(
          FROM call_edges WHERE from_symbol IN ({placeholders})"
     );
     let mut stmt = conn.prepare(&sql)?;
-    let params: Vec<&dyn rusqlite::types::ToSql> =
-        nodes.iter().map(|s| s as &dyn rusqlite::types::ToSql).collect();
+    let params: Vec<&dyn rusqlite::types::ToSql> = nodes
+        .iter()
+        .map(|s| s as &dyn rusqlite::types::ToSql)
+        .collect();
 
     let mut result: HashMap<String, Vec<(String, String)>> = HashMap::new();
     let rows = stmt.query_map(params.as_slice(), |row| {
@@ -47,8 +49,10 @@ pub fn batch_callers(
          FROM call_edges WHERE to_symbol IN ({placeholders})"
     );
     let mut stmt = conn.prepare(&sql)?;
-    let params: Vec<&dyn rusqlite::types::ToSql> =
-        nodes.iter().map(|s| s as &dyn rusqlite::types::ToSql).collect();
+    let params: Vec<&dyn rusqlite::types::ToSql> = nodes
+        .iter()
+        .map(|s| s as &dyn rusqlite::types::ToSql)
+        .collect();
 
     let mut result: HashMap<String, Vec<(String, String)>> = HashMap::new();
     let rows = stmt.query_map(params.as_slice(), |row| {

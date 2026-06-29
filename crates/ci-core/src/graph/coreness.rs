@@ -170,6 +170,50 @@ mod tests {
     }
 
     #[test]
+    fn test_c1_regression_coreness_recomputed_after_edge_change() {
+        let conn = setup_db();
+        for s in ["a", "b", "c"] {
+            insert_symbol(&conn, s);
+        }
+        // Triangle: coreness = 2 for all
+        insert_edge(&conn, "a", "b");
+        insert_edge(&conn, "b", "c");
+        insert_edge(&conn, "c", "a");
+
+        let result1 = compute_coreness(&conn).unwrap();
+        assert_eq!(result1.get("a"), Some(&2));
+
+        // Remove one edge → breaks triangle → coreness drops to 1
+        conn.execute(
+            "DELETE FROM call_edges WHERE from_symbol = 'c' AND to_symbol = 'a'",
+            [],
+        )
+        .unwrap();
+
+        let result2 = compute_coreness(&conn).unwrap();
+        assert_eq!(
+            result2.get("a"),
+            Some(&1),
+            "C-1: coreness must update after edge removal"
+        );
+        assert_eq!(result2.get("b"), Some(&1));
+        assert_eq!(result2.get("c"), Some(&1));
+
+        // Verify DB was updated too
+        let db_coreness: i64 = conn
+            .query_row(
+                "SELECT coreness FROM symbols WHERE qualified_name = 'a'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            db_coreness, 1,
+            "C-1: DB coreness must reflect recomputed value"
+        );
+    }
+
+    #[test]
     fn test_star_graph() {
         let conn = setup_db();
         for s in ["hub", "a", "b", "c", "d"] {

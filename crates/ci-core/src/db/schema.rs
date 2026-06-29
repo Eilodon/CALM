@@ -118,12 +118,15 @@ pub fn init_db(conn: &Connection) -> rusqlite::Result<()> {
 
 fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
     migrate_add_column(conn, "symbols", "name_tokens", "TEXT NOT NULL DEFAULT ''")?;
-    migrate_add_column(conn, "symbols", "is_entry_point", "INTEGER NOT NULL DEFAULT 0")?;
+    migrate_add_column(
+        conn,
+        "symbols",
+        "is_entry_point",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
     migrate_add_column(conn, "symbols", "coreness", "INTEGER")?;
     migrate_add_column(conn, "file_index", "mtime", "REAL")?;
-    conn.execute_batch(
-        "CREATE INDEX IF NOT EXISTS idx_call_edges_to ON call_edges(to_symbol);",
-    )?;
+    conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_call_edges_to ON call_edges(to_symbol);")?;
     Ok(())
 }
 
