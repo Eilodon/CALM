@@ -36,7 +36,8 @@ fn secs_to_ymd_hms(secs: u64) -> (u64, u64, u64, u64, u64, u64) {
 fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {
     let mut year = 1970u64;
     loop {
-        let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+        let leap =
+            (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400);
         let days_in_year = if leap { 366 } else { 365 };
         if days < days_in_year {
             break;
@@ -44,7 +45,8 @@ fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {
         days -= days_in_year;
         year += 1;
     }
-    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    let leap =
+        (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400);
     let month_days: &[u64] = if leap {
         &[31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
     } else {
@@ -513,7 +515,7 @@ fn resolve_symbol_candidates(
 enum SymbolResolution {
     NotFound,
     Ambiguous(Vec<CandidateRow>),
-    Found(CandidateRow),
+    Found(Box<CandidateRow>),
 }
 
 /// Resolve a bare symbol name (+ optional path) to exactly one row.
@@ -527,7 +529,7 @@ fn resolve_symbol(conn: &rusqlite::Connection, name: &str, path: Option<&str>) -
     if candidates.is_empty() {
         SymbolResolution::NotFound
     } else if candidates.len() == 1 {
-        SymbolResolution::Found(candidates.remove(0))
+        SymbolResolution::Found(Box::new(candidates.remove(0)))
     } else {
         SymbolResolution::Ambiguous(candidates)
     }
@@ -1667,6 +1669,7 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
                 SymbolResolution::NotFound => not_found_json(&p.symbol),
                 SymbolResolution::Ambiguous(candidates) => ambiguous_json(&candidates),
                 SymbolResolution::Found(c) => {
+                    let c = *c;
                     self.track_symbol(&c.qualified_name);
                     self.track_file(&c.path);
                     let mut out = c.to_symbol_info();
@@ -1704,7 +1707,7 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
             let c = match resolution {
                 SymbolResolution::NotFound => return not_found_json(&p.symbol),
                 SymbolResolution::Ambiguous(candidates) => return ambiguous_json(&candidates),
-                SymbolResolution::Found(c) => c,
+                SymbolResolution::Found(c) => *c,
             };
             self.track_symbol(&c.qualified_name);
             self.track_file(&c.path);
@@ -1767,7 +1770,7 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
             let c = match resolution {
                 SymbolResolution::NotFound => return not_found_json(&p.symbol),
                 SymbolResolution::Ambiguous(candidates) => return ambiguous_json(&candidates),
-                SymbolResolution::Found(c) => c,
+                SymbolResolution::Found(c) => *c,
             };
             self.track_symbol(&c.qualified_name);
             self.track_file(&c.path);
@@ -1850,7 +1853,7 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
             let c = match resolution {
                 SymbolResolution::NotFound => return not_found_json(&p.symbol),
                 SymbolResolution::Ambiguous(candidates) => return ambiguous_json(&candidates),
-                SymbolResolution::Found(c) => c,
+                SymbolResolution::Found(c) => *c,
             };
             self.track_symbol(&c.qualified_name);
             self.track_file(&c.path);
@@ -1992,7 +1995,7 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
             let from = match from {
                 SymbolResolution::NotFound => return not_found_json(&p.from_symbol),
                 SymbolResolution::Ambiguous(candidates) => return ambiguous_json(&candidates),
-                SymbolResolution::Found(c) => c,
+                SymbolResolution::Found(c) => *c,
             };
             self.track_symbol(&from.qualified_name);
             self.track_file(&from.path);
@@ -2003,7 +2006,7 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
             let to = match to {
                 SymbolResolution::NotFound => return not_found_json(&p.to_symbol),
                 SymbolResolution::Ambiguous(candidates) => return ambiguous_json(&candidates),
-                SymbolResolution::Found(c) => c,
+                SymbolResolution::Found(c) => *c,
             };
             self.track_symbol(&to.qualified_name);
             self.track_file(&to.path);
@@ -2080,7 +2083,7 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
             let c = match resolution {
                 SymbolResolution::NotFound => return not_found_json(&p.symbol),
                 SymbolResolution::Ambiguous(candidates) => return ambiguous_json(&candidates),
-                SymbolResolution::Found(c) => c,
+                SymbolResolution::Found(c) => *c,
             };
             self.track_symbol(&c.qualified_name);
             self.track_file(&c.path);
