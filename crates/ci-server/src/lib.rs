@@ -81,8 +81,9 @@ pub async fn serve_stdio(project_root: PathBuf, db_path: PathBuf) -> Result<()> 
 
 /// Load the embedding model, create the vector table, embed all symbols, and
 /// publish the model + status. Runs on the indexer thread after the graph is
-/// built. A no-op surface when the `embeddings` feature is off (load fails).
-fn bootstrap_embeddings(
+/// built (and again from `indexing_status`'s `retry_embeddings` after a prior
+/// failure). A no-op surface when the `embeddings` feature is off (load fails).
+pub fn bootstrap_embeddings(
     conn: &rusqlite::Connection,
     semantic: &SemanticSearchConfig,
     embedder: &EmbedderHandle,

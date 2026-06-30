@@ -26,7 +26,6 @@ struct SessionLog {
 #[derive(Clone)]
 pub struct CodeIntelligenceServer {
     project_root: PathBuf,
-    #[allow(dead_code)]
     db_path: PathBuf,
     conn: Arc<Mutex<rusqlite::Connection>>,
     /// Current indexing phase, shared with the background indexer thread.
@@ -109,6 +108,37 @@ impl CodeIntelligenceServer {
 
     fn embed_status_str(&self) -> String {
         self.embed_status.read().unwrap().as_str().to_string()
+    }
+
+    /// Re-runs the embedding bootstrap in the background when it previously
+    /// failed (model load, vector-table creation, or embedding all set status
+    /// to `Failed`). No-op for any other status: `Ready`/`Embedding`/
+    /// `Downloading` are already done or in flight, and `Disabled` means
+    /// semantic search isn't turned on in config. Opens its own DB connection
+    /// so the retry doesn't hold the shared connection mutex for its duration.
+    fn retry_embeddings_if_failed(&self) {
+        // Claim the retry synchronously (Failed -> Downloading) so two
+        // overlapping `retry_embeddings` requests can't both spawn a bootstrap.
+        {
+            let mut status = self.embed_status.write().unwrap();
+            if *status != EmbedStatus::Failed {
+                return;
+            }
+            *status = EmbedStatus::Downloading;
+        }
+        let semantic = ci_core::config::load_config(&self.project_root)
+            .unwrap_or_default()
+            .semantic_search;
+        let db_path = self.db_path.clone();
+        let embedder = Arc::clone(&self.embedder);
+        let status = Arc::clone(&self.embed_status);
+        std::thread::spawn(move || match rusqlite::Connection::open(&db_path) {
+            Ok(conn) => crate::bootstrap_embeddings(&conn, &semantic, &embedder, &status),
+            Err(e) => {
+                tracing::error!("Embeddings retry: failed to open DB: {e}");
+                *status.write().unwrap() = EmbedStatus::Failed;
+            }
+        });
     }
 
     fn current_phase(&self) -> IndexingPhase {
@@ -1798,7 +1828,7 @@ impl CodeIntelligenceServer {
                 .unwrap_or(0);
 
             if p.retry_embeddings {
-                tracing::info!("Embeddings retry requested — not yet implemented");
+                self.retry_embeddings_if_failed();
             }
 
             serde_json::to_string_pretty(&IndexingStatusOutput {
@@ -2001,37 +2031,42 @@ impl CodeIntelligenceServer {
                 .ok()
                 .and_then(|o| o.results.into_iter().next());
 
-            let symbol_info = top.as_ref().and_then(|t| {
+            // Carries `language` alongside `SymbolInfoOutput` (which doesn't have
+            // a language field) so `SourceOutput.language` below isn't stubbed.
+            let symbol_info: Option<(SymbolInfoOutput, String)> = top.as_ref().and_then(|t| {
                 self.db()
                     .query_row(
-                        "SELECT name, qualified_name, kind, path, line_start, line_end, signature, docstring, caller_count, is_hub
+                        "SELECT name, qualified_name, kind, path, line_start, line_end, signature, docstring, caller_count, is_hub, language
                          FROM symbols WHERE qualified_name = ?1 LIMIT 1",
                         rusqlite::params![t.qualified_name],
                         |row| {
-                            Ok(SymbolInfoOutput {
-                                name: row.get(0)?,
-                                qualified_name: row.get(1)?,
-                                kind: row.get(2)?,
-                                path: row.get(3)?,
-                                line_start: row.get(4)?,
-                                line_end: row.get(5)?,
-                                signature: row.get::<_, String>(6).ok().filter(|s| !s.is_empty()),
-                                docstring: row.get::<_, String>(7).ok().filter(|s| !s.is_empty()),
-                                caller_count: row.get(8)?,
-                                is_hub: row.get::<_, i64>(9)? != 0,
-                                health: None,
-                            })
+                            Ok((
+                                SymbolInfoOutput {
+                                    name: row.get(0)?,
+                                    qualified_name: row.get(1)?,
+                                    kind: row.get(2)?,
+                                    path: row.get(3)?,
+                                    line_start: row.get(4)?,
+                                    line_end: row.get(5)?,
+                                    signature: row.get::<_, String>(6).ok().filter(|s| !s.is_empty()),
+                                    docstring: row.get::<_, String>(7).ok().filter(|s| !s.is_empty()),
+                                    caller_count: row.get(8)?,
+                                    is_hub: row.get::<_, i64>(9)? != 0,
+                                    health: None,
+                                },
+                                row.get::<_, String>(10).unwrap_or_default(),
+                            ))
                         },
                     )
                     .ok()
             });
 
-            if let Some(info) = symbol_info.as_ref() {
+            if let Some((info, _)) = symbol_info.as_ref() {
                 self.track_symbol(&info.qualified_name);
                 self.track_file(&info.path);
             }
 
-            let source_output = symbol_info.as_ref().and_then(|info| {
+            let source_output = symbol_info.as_ref().and_then(|(info, language)| {
                 let full_path = self.project_root.join(&info.path);
                 let content = std::fs::read_to_string(&full_path).ok()?;
                 let lines: Vec<&str> = content.lines().collect();
@@ -2044,14 +2079,14 @@ impl CodeIntelligenceServer {
                     line_start: info.line_start,
                     line_end: info.line_end,
                     source,
-                    language: "".into(),
+                    language: language.clone(),
                     metadata: None,
                 })
             });
 
             let callers = symbol_info
                 .as_ref()
-                .map(|info| {
+                .map(|(info, _)| {
                     let _conn9 = self.db();
                     let mut stmt = _conn9
                         .prepare(
@@ -2073,7 +2108,7 @@ impl CodeIntelligenceServer {
                 .unwrap_or_default();
 
             serde_json::to_string_pretty(&UnderstandOutput {
-                symbol: symbol_info,
+                symbol: symbol_info.map(|(info, _)| info),
                 source: source_output,
                 callers_summary: callers,
                 edges_ready: Some(self.edges_ready()),
@@ -2388,6 +2423,90 @@ mod tests {
         assert_eq!(v["depth_adjusted"], "with_file");
         assert!(v["top_symbol"].is_null());
         assert!(!v["file_overview"].is_null());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression test: `understand`'s inline SQL used to omit the `language`
+    /// column, so `SourceOutput.language` was always empty.
+    #[test]
+    fn understand_includes_symbol_language_in_source_output() {
+        let dir = std::env::temp_dir().join(format!("ci_understand_lang_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("foo.py"), "def foo():\n    pass\n").unwrap();
+        let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                rusqlite::params![
+                    "foo.py::foo", "foo", "function", "python", "foo.py", 1i64, 2i64, "def foo()",
+                    "", "foo", 0i64, 0i64, 0i64
+                ],
+            )
+            .unwrap();
+        }
+
+        let output = server.understand(Parameters(UnderstandParams {
+            query: "foo".into(),
+            kind: None,
+        }));
+        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+        assert_eq!(v["symbol"]["qualified_name"], "foo.py::foo");
+        assert_eq!(v["source"]["language"], "python");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression test: `retry_embeddings` used to be a no-op (logged "not yet
+    /// implemented" and did nothing). It must now reclaim a `Failed` status and
+    /// re-run `bootstrap_embeddings` in the background, while leaving any other
+    /// status untouched.
+    #[test]
+    fn retry_embeddings_if_failed_reclaims_failed_status_and_runs_bootstrap() {
+        let dir = std::env::temp_dir().join(format!("ci_retry_embed_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        // A non-Failed status is left untouched — only a prior failure is retried.
+        *server.embed_status_handle().write().unwrap() = EmbedStatus::Disabled;
+        server.retry_embeddings_if_failed();
+        assert_eq!(
+            *server.embed_status_handle().read().unwrap(),
+            EmbedStatus::Disabled
+        );
+
+        // Failed is reclaimed synchronously (-> Downloading) before the bootstrap
+        // retry is spawned in the background. With the `embeddings` feature off,
+        // `Embedder::load` always fails, so the background thread deterministically
+        // cycles Downloading -> Failed again.
+        *server.embed_status_handle().write().unwrap() = EmbedStatus::Failed;
+        server.retry_embeddings_if_failed();
+
+        let mut saw_downloading = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1000);
+        while std::time::Instant::now() < deadline {
+            if *server.embed_status_handle().read().unwrap() == EmbedStatus::Downloading {
+                saw_downloading = true;
+                break;
+            }
+        }
+        assert!(
+            saw_downloading,
+            "retry should synchronously reclaim Failed -> Downloading before spawning the retry"
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1000);
+        let mut final_status = *server.embed_status_handle().read().unwrap();
+        while final_status != EmbedStatus::Failed && std::time::Instant::now() < deadline {
+            final_status = *server.embed_status_handle().read().unwrap();
+        }
+        assert_eq!(final_status, EmbedStatus::Failed);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
