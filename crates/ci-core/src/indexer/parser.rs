@@ -259,43 +259,32 @@ pub fn extract_file_aliases(
     )
 }
 
-/// Best-effort `name → type` map from explicit annotations, used by the resolver
-/// as an alias guard (a typed binding is not treated as a simple alias) and as a
-/// basis for future type-directed resolution.
+/// Best-effort `name → type` map from explicit annotations: typed parameters
+/// plus Rust `let` and Go `var` bindings, across every tier-0 language that has
+/// them. Used by the resolver as an alias guard and for tier-2 method resolution.
 ///
-/// Covers the languages where annotations are idiomatic and cheap to read
-/// (Python typed parameters, TypeScript parameter annotations); other languages
-/// yield an empty map, matching the conservative resolver's coverage.
+/// JavaScript (dynamic) yields an empty map. Go shares one type across several
+/// names (`x, y Foo`), so each name is mapped.
 pub fn extract_type_map(source: &str, language: &str) -> std::collections::HashMap<String, String> {
     let mut map = std::collections::HashMap::new();
     let Some(tree) = parse_tree(source, language) else {
         return map;
     };
-    let (param_kind, type_field) = match language {
-        "python" => ("typed_parameter", "type"),
-        "typescript" => ("required_parameter", "type"),
-        _ => return map,
+    // Node kinds carrying a `name(s): type` (or `name(s) type`) binding.
+    let binding_kinds: &[&str] = match language {
+        "python" => &["typed_parameter"],
+        "typescript" => &["required_parameter", "optional_parameter"],
+        "rust" => &["parameter", "let_declaration"],
+        "go" => &["parameter_declaration", "var_spec"],
+        "java" => &["formal_parameter"],
+        _ => return map, // javascript: no static annotations
     };
 
     let mut stack = vec![tree.root_node()];
     while let Some(node) = stack.pop() {
-        if node.kind() == param_kind {
-            // Python `typed_parameter` holds the name as its first identifier
-            // child; TS `required_parameter` exposes a `pattern` field.
-            let name_node = node
-                .child_by_field_name("pattern")
-                .or_else(|| node.named_child(0));
-            let type_node = node.child_by_field_name(type_field);
-            if let (Some(n), Some(t)) = (name_node, type_node) {
-                let name = source[n.byte_range()].trim().to_string();
-                // Strip a leading `:` that TS type_annotation includes.
-                let ty = source[t.byte_range()]
-                    .trim_start_matches(':')
-                    .trim()
-                    .to_string();
-                if !name.is_empty() && !ty.is_empty() {
-                    map.insert(name, ty);
-                }
+        if binding_kinds.contains(&node.kind()) {
+            for (name, ty) in binding_names_and_type(node, source, language) {
+                map.insert(name, ty);
             }
         }
         let mut cursor = node.walk();
@@ -306,9 +295,85 @@ pub fn extract_type_map(source: &str, language: &str) -> std::collections::HashM
     map
 }
 
+/// `(name, type)` pairs from one typed binding node. Most languages bind a single
+/// name; Go shares one type across several names.
+fn binding_names_and_type(
+    node: tree_sitter::Node,
+    source: &str,
+    language: &str,
+) -> Vec<(String, String)> {
+    let Some(type_node) = node.child_by_field_name("type") else {
+        return Vec::new();
+    };
+    // Strip a leading `:` (TS type_annotation) and surrounding whitespace.
+    let ty = source[type_node.byte_range()]
+        .trim_start_matches(':')
+        .trim()
+        .to_string();
+    if ty.is_empty() {
+        return Vec::new();
+    }
+
+    let names: Vec<String> = match language {
+        // `x, y Foo`: every identifier child shares the type.
+        "go" => {
+            let mut cur = node.walk();
+            node.children(&mut cur)
+                .filter(|c| c.kind() == "identifier")
+                .map(|c| source[c.byte_range()].to_string())
+                .collect()
+        }
+        // Python's typed_parameter names its identifier as the first child.
+        "python" => node
+            .named_child(0)
+            .map(|n| source[n.byte_range()].to_string())
+            .into_iter()
+            .collect(),
+        // TS/Rust use a `pattern` field; Java uses `name`.
+        _ => node
+            .child_by_field_name("pattern")
+            .or_else(|| node.child_by_field_name("name"))
+            .map(|n| source[n.byte_range()].to_string())
+            .into_iter()
+            .collect(),
+    };
+
+    names
+        .into_iter()
+        .map(|n| n.trim().to_string())
+        .filter(|n| !n.is_empty())
+        .map(|n| (n, ty.clone()))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_type_map_all_languages() {
+        let cases = [
+            ("def f(x: Foo):\n    pass\n", "python"),
+            ("fn f(x: Foo) {}\n", "rust"),
+            ("package p\nfunc f(x Foo) {}\n", "go"),
+            ("class C { void m(Foo x) {} }\n", "java"),
+            ("function f(x: Foo) {}\n", "typescript"),
+        ];
+        for (src, lang) in cases {
+            let m = extract_type_map(src, lang);
+            assert_eq!(
+                m.get("x"),
+                Some(&"Foo".to_string()),
+                "type_map for {lang} should bind x: Foo"
+            );
+        }
+        // Go shares one type across several names.
+        let m = extract_type_map("package p\nfunc f(x, y Foo) {}\n", "go");
+        assert_eq!(m.get("x"), Some(&"Foo".to_string()));
+        assert_eq!(m.get("y"), Some(&"Foo".to_string()));
+        // JavaScript has no static types.
+        assert!(extract_type_map("function f(x) {}\n", "javascript").is_empty());
+    }
 
     #[test]
     fn test_python_symbol_extraction() {
