@@ -141,6 +141,10 @@ pub fn bootstrap_embeddings(
     status: &Arc<RwLock<EmbedStatus>>,
 ) {
     *status.write().unwrap() = EmbedStatus::Downloading;
+    tracing::info!(
+        "Loading embedding model `{}` (may download ~30 MB on first run)...",
+        semantic.model
+    );
     let model = match Embedder::load(&semantic.model, semantic.dimensions) {
         Ok(m) => Arc::new(m),
         Err(e) => {

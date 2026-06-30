@@ -91,7 +91,7 @@ impl Default for SemanticSearchConfig {
             // nomic CodeRankEmbed, 256-dim. Keeps the musl static binary intact.
             model: "minishlab/potion-code-16M".into(),
             dimensions: 256,
-            index_on_startup: false,
+            index_on_startup: true,
         }
     }
 }

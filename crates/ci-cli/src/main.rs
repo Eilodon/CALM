@@ -115,19 +115,29 @@ async fn main() -> Result<()> {
             tracing::info!("Indexing complete: {file_count} files, {symbol_count} symbols");
             println!("Indexed {file_count} files, {symbol_count} symbols.");
 
-            // Opt-in semantic embeddings.
+            // Semantic embeddings — active when `semantic_search.enabled: true` in
+            // config.json and compiled with `--features embeddings`.
             let semantic = ci_core::config::load_config(&root)
                 .map(|c| c.semantic_search)
                 .unwrap_or_default();
             if semantic.enabled {
+                print!("Building semantic index...");
+                std::io::Write::flush(&mut std::io::stdout()).ok();
                 match ci_core::embedding::Embedder::load(&semantic.model, semantic.dimensions) {
                     Ok(embedder) => {
                         ci_core::embedding::create_embedding_table(&conn, semantic.dimensions)?;
                         let n = ci_core::embedding::embed_pending(&conn, &embedder)?;
-                        println!("Embedded {n} symbols.");
+                        println!(" {n} symbols embedded.");
                     }
-                    Err(e) => eprintln!("Embeddings skipped: {e}"),
+                    Err(e) => eprintln!("\nEmbeddings skipped: {e}"),
                 }
+            } else {
+                // When the feature is compiled in but not enabled in config, nudge the user.
+                #[cfg(feature = "embeddings")]
+                println!(
+                    "Tip: semantic search is available — add \
+                    {{\"semantic_search\":{{\"enabled\":true}}}} to config.json to activate it."
+                );
             }
         }
         Commands::Doctor { project_root } => {

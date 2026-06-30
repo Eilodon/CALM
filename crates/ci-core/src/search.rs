@@ -248,7 +248,7 @@ fn search_semantic(
             results: Vec::new(),
             truncated: false,
             degraded: true,
-            note: Some("Embeddings not ready — semantic search unavailable".to_string()),
+            note: Some("Semantic search inactive — compile with `--features embeddings` and set `semantic_search.enabled: true` in config.json".to_string()),
         });
     };
 
@@ -307,7 +307,7 @@ fn search_hybrid(
     if embedder.is_none() {
         return Ok(SearchOutput {
             degraded: true,
-            note: Some("Embeddings not ready — hybrid degraded to FTS-only".to_string()),
+            note: Some("Hybrid search degraded to FTS-only — semantic search inactive (compile with `--features embeddings` and set `semantic_search.enabled: true` in config.json)".to_string()),
             ..fts_output
         });
     }
