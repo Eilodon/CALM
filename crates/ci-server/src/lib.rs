@@ -55,6 +55,8 @@ pub async fn serve_stdio_with_preset(project_root: PathBuf, db_path: PathBuf, pr
                 ci_core::indexer::pipeline::run_indexing_pipeline(&mut conn, &indexer_root, phase.clone())
             {
                 tracing::error!("Background indexer failed: {}", e);
+                // Reset to Scanning so callers don't see BuildingEdges forever on failure.
+                *phase.write().unwrap() = ci_core::types::IndexingPhase::Scanning;
             } else {
                 // Ready is now set inside run_indexing_pipeline (after tx.commit)
                 tracing::info!("Background indexing completed");
