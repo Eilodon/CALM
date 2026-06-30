@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 /// Build the synthetic fixture DB in-memory.
 ///
-/// Ported from the retired Python `build_synthetic_db.py` (see `legacy/`). Keeping this
+/// Ported from the retired Python `build_synthetic_db.py` oracle. Keeping this
 /// as Rust means the parity suite reproduces from a clean checkout with no Python
 /// interpreter and no committed binary `.db` blob.
 ///

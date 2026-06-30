@@ -1,46 +1,24 @@
-# Python
-__pycache__/
-*.py[cod]
-*.pyo
-*.pyd
-.Python
-*.egg-info/
-dist/
-build/
-.eggs/
-.venv/
-venv/
-env/
+# Rust build output
+/target/
 
-# SQLite / codeindex DB
+# Index database (per-project, generated)
 .codeindex/
 *.db
 *.db-wal
 *.db-shm
 
-# Coverage
+# Coverage output — but keep the committed parity-test fixture
 .coverage
 coverage.out
 coverage.xml
 lcov.info
 coverage/
 .nyc_output/
+!crates/ci-core/tests/fixtures/synthetic_project/lcov.info
 
-# Node / TypeScript
-node_modules/
-*.js.map
-dist/
-.tsbuildinfo
-
-# OS
+# OS / editor
 .DS_Store
 Thumbs.db
-
-# Rust
-target/
-Cargo.lock
-
-# Editor
 .vscode/
 .idea/
 *.swp
