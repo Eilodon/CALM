@@ -17,3 +17,6 @@ anyhow = { workspace = true }
 clap = { workspace = true }
 rusqlite = { workspace = true }
 serde_json = { workspace = true }
+
+[features]
+embeddings = ["ci-core/embeddings", "ci-server/embeddings"]

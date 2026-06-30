@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use rusqlite::Connection;
 
+use crate::embedding::Embedder;
 use crate::types::SearchKind;
 
 const BM25_EXACT_WEIGHT: f64 = 1.5;
@@ -34,14 +35,14 @@ pub fn search(
     query: &str,
     kind: SearchKind,
     limit: usize,
-    embeddings_ready: bool,
+    embedder: Option<&Embedder>,
 ) -> rusqlite::Result<SearchOutput> {
     match kind {
         SearchKind::Symbol => search_symbol(conn, query, limit),
         SearchKind::Text => search_text(conn, query, limit),
         SearchKind::File => search_file(conn, query, limit),
-        SearchKind::Semantic => search_semantic(conn, query, limit, embeddings_ready),
-        SearchKind::Hybrid => search_hybrid(conn, query, limit, embeddings_ready),
+        SearchKind::Semantic => search_semantic(conn, query, limit, embedder),
+        SearchKind::Hybrid => search_hybrid(conn, query, limit, embedder),
     }
 }
 
@@ -231,26 +232,57 @@ fn search_semantic(
     conn: &Connection,
     query: &str,
     limit: usize,
-    embeddings_ready: bool,
+    embedder: Option<&Embedder>,
 ) -> rusqlite::Result<SearchOutput> {
-    if !embeddings_ready {
+    let Some(embedder) = embedder else {
         return Ok(SearchOutput {
             results: Vec::new(),
             truncated: false,
             degraded: true,
             note: Some("Embeddings not ready — semantic search unavailable".to_string()),
         });
+    };
+
+    let qvec = embedder.embed_one(query);
+    if qvec.is_empty() {
+        return Ok(SearchOutput {
+            results: Vec::new(),
+            truncated: false,
+            degraded: true,
+            note: Some("Embedding model unavailable".to_string()),
+        });
     }
 
-    // Semantic search requires embedding the query and doing vec distance.
-    // The embedding model integration is deferred — this returns the degraded
-    // result until the embedder pipeline is wired in Phase 4+.
-    let _ = (conn, query, limit);
+    let hits = crate::embedding::knn(conn, &qvec, limit)?;
+    let mut stmt = conn.prepare(
+        "SELECT qualified_name, name, path, line_start, line_end, kind FROM symbols WHERE id = ?1",
+    )?;
+    let mut results = Vec::new();
+    for (id, dist) in &hits {
+        if let Ok(mut r) = stmt.query_row(rusqlite::params![id], |row| {
+            Ok(SearchResult {
+                qualified_name: row.get(0)?,
+                name: row.get(1)?,
+                path: row.get(2)?,
+                line_start: row.get(3)?,
+                line_end: row.get(4)?,
+                kind: row.get(5)?,
+                score: 0.0,
+                match_type: "semantic".to_string(),
+                snippet: None,
+            })
+        }) {
+            // cosine distance → similarity in [0, 1] for a friendlier score.
+            r.score = 1.0 - dist;
+            results.push(r);
+        }
+    }
+
     Ok(SearchOutput {
-        results: Vec::new(),
-        truncated: false,
-        degraded: true,
-        note: Some("Semantic search not yet wired — use symbol or hybrid".to_string()),
+        results,
+        truncated: hits.len() >= limit,
+        degraded: false,
+        note: None,
     })
 }
 
@@ -258,11 +290,11 @@ fn search_hybrid(
     conn: &Connection,
     query: &str,
     limit: usize,
-    embeddings_ready: bool,
+    embedder: Option<&Embedder>,
 ) -> rusqlite::Result<SearchOutput> {
     let fts_output = search_symbol(conn, query, limit)?;
 
-    if !embeddings_ready {
+    if embedder.is_none() {
         return Ok(SearchOutput {
             degraded: true,
             note: Some("Embeddings not ready — hybrid degraded to FTS-only".to_string()),
@@ -270,7 +302,7 @@ fn search_hybrid(
         });
     }
 
-    let semantic_output = search_semantic(conn, query, limit, embeddings_ready)?;
+    let semantic_output = search_semantic(conn, query, limit, embedder)?;
 
     if semantic_output.results.is_empty() {
         return Ok(SearchOutput {
@@ -448,7 +480,7 @@ mod tests {
     #[test]
     fn test_search_symbol_finds_results() {
         let conn = setup_db_with_symbols();
-        let output = search(&conn, "user", SearchKind::Symbol, 10, false).unwrap();
+        let output = search(&conn, "user", SearchKind::Symbol, 10, None).unwrap();
         assert!(
             output.results.len() >= 2,
             "Should find get_user and update_user, got: {:?}",
@@ -459,7 +491,7 @@ mod tests {
     #[test]
     fn test_search_symbol_respects_limit() {
         let conn = setup_db_with_symbols();
-        let output = search(&conn, "user", SearchKind::Symbol, 1, false).unwrap();
+        let output = search(&conn, "user", SearchKind::Symbol, 1, None).unwrap();
         assert_eq!(output.results.len(), 1);
         assert!(output.truncated);
     }
@@ -467,7 +499,7 @@ mod tests {
     #[test]
     fn test_search_symbol_no_results() {
         let conn = setup_db_with_symbols();
-        let output = search(&conn, "nonexistent_xyz", SearchKind::Symbol, 10, false).unwrap();
+        let output = search(&conn, "nonexistent_xyz", SearchKind::Symbol, 10, None).unwrap();
         assert!(output.results.is_empty());
         assert!(!output.truncated);
     }
@@ -475,7 +507,7 @@ mod tests {
     #[test]
     fn test_search_text() {
         let conn = setup_db_with_symbols();
-        let output = search(&conn, "database", SearchKind::Text, 10, false).unwrap();
+        let output = search(&conn, "database", SearchKind::Text, 10, None).unwrap();
         assert!(
             output.results.len() >= 2,
             "Should find symbols with 'database' in docstring, got: {:?}",
@@ -486,7 +518,7 @@ mod tests {
     #[test]
     fn test_search_file() {
         let conn = setup_db_with_symbols();
-        let output = search(&conn, "main", SearchKind::File, 10, false).unwrap();
+        let output = search(&conn, "main", SearchKind::File, 10, None).unwrap();
         assert_eq!(output.results.len(), 1);
         assert_eq!(output.results[0].path, "src/main.py");
     }
@@ -494,14 +526,14 @@ mod tests {
     #[test]
     fn test_search_file_multiple() {
         let conn = setup_db_with_symbols();
-        let output = search(&conn, "src/", SearchKind::File, 10, false).unwrap();
+        let output = search(&conn, "src/", SearchKind::File, 10, None).unwrap();
         assert_eq!(output.results.len(), 3);
     }
 
     #[test]
     fn test_search_semantic_not_ready() {
         let conn = setup_db_with_symbols();
-        let output = search(&conn, "user", SearchKind::Semantic, 10, false).unwrap();
+        let output = search(&conn, "user", SearchKind::Semantic, 10, None).unwrap();
         assert!(output.degraded);
         assert!(output.results.is_empty());
     }
@@ -509,7 +541,7 @@ mod tests {
     #[test]
     fn test_search_hybrid_degraded_to_fts() {
         let conn = setup_db_with_symbols();
-        let output = search(&conn, "user", SearchKind::Hybrid, 10, false).unwrap();
+        let output = search(&conn, "user", SearchKind::Hybrid, 10, None).unwrap();
         assert!(output.degraded);
         assert!(!output.results.is_empty());
     }
@@ -561,7 +593,7 @@ mod tests {
     #[test]
     fn test_search_symbol_scores_positive() {
         let conn = setup_db_with_symbols();
-        let output = search(&conn, "config", SearchKind::Symbol, 10, false).unwrap();
+        let output = search(&conn, "config", SearchKind::Symbol, 10, None).unwrap();
         for r in &output.results {
             assert!(r.score > 0.0, "Scores should be positive, got {}", r.score);
         }

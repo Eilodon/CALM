@@ -50,7 +50,8 @@ fn watcher_reindexes_add_and_delete() {
     let ct = CancellationToken::new();
     let handle = {
         let (root, db, ct) = (dir.clone(), db_path.clone(), ct.clone());
-        std::thread::spawn(move || ci_server::watcher::run_watch_loop(root, db, ct))
+        let embedder: ci_server::EmbedderHandle = std::sync::Arc::new(std::sync::RwLock::new(None));
+        std::thread::spawn(move || ci_server::watcher::run_watch_loop(root, db, ct, embedder))
     };
 
     // Let the watcher register before mutating the tree.

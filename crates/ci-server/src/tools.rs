@@ -6,8 +6,9 @@ use rmcp::tool;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use ci_core::embedding::Embedder;
 use ci_core::sanitize::sanitize_source_output;
-use ci_core::types::IndexingPhase;
+use ci_core::types::{EmbedStatus, IndexingPhase};
 
 // ---------------------------------------------------------------------------
 // Server state
@@ -23,6 +24,11 @@ pub struct CodeIntelligenceServer {
     /// Tools read it to report `indexing_phase` / `edges_ready` honestly instead
     /// of assuming the graph is built.
     phase: Arc<RwLock<IndexingPhase>>,
+    /// Loaded embedding model (None until/unless embeddings are enabled+ready),
+    /// shared with the background indexer that loads it.
+    embedder: Arc<RwLock<Option<Arc<Embedder>>>>,
+    /// Embedding pipeline status, surfaced as `embeddings_status`.
+    embed_status: Arc<RwLock<EmbedStatus>>,
 }
 
 impl CodeIntelligenceServer {
@@ -37,6 +43,8 @@ impl CodeIntelligenceServer {
             db_path,
             conn: Arc::new(Mutex::new(conn)),
             phase: Arc::new(RwLock::new(IndexingPhase::Scanning)),
+            embedder: Arc::new(RwLock::new(None)),
+            embed_status: Arc::new(RwLock::new(EmbedStatus::Disabled)),
         })
     }
 
@@ -47,6 +55,23 @@ impl CodeIntelligenceServer {
     /// A handle the background indexer uses to advance the phase as it works.
     pub fn phase_handle(&self) -> Arc<RwLock<IndexingPhase>> {
         Arc::clone(&self.phase)
+    }
+
+    /// Handles the background indexer uses to publish the loaded model + status.
+    pub fn embedder_handle(&self) -> Arc<RwLock<Option<Arc<Embedder>>>> {
+        Arc::clone(&self.embedder)
+    }
+    pub fn embed_status_handle(&self) -> Arc<RwLock<EmbedStatus>> {
+        Arc::clone(&self.embed_status)
+    }
+
+    /// The loaded embedder, if semantic search is ready.
+    fn embedder(&self) -> Option<Arc<Embedder>> {
+        self.embedder.read().unwrap().clone()
+    }
+
+    fn embed_status_str(&self) -> String {
+        self.embed_status.read().unwrap().as_str().to_string()
     }
 
     fn current_phase(&self) -> IndexingPhase {
@@ -521,7 +546,7 @@ impl CodeIntelligenceServer {
             serde_json::to_string_pretty(&RepoOverviewOutput {
                 languages,
                 indexing_phase: self.phase_str(),
-                embeddings_status: "disabled".into(),
+                embeddings_status: self.embed_status_str(),
                 total_modules: total_files,
                 total_symbols,
                 total_files,
@@ -548,7 +573,13 @@ impl CodeIntelligenceServer {
                 _ => ci_core::types::SearchKind::Symbol,
             };
 
-            match ci_core::search::search(&self.db(), &p.query, kind, p.limit, false) {
+            match ci_core::search::search(
+                &self.db(),
+                &p.query,
+                kind,
+                p.limit,
+                self.embedder().as_deref(),
+            ) {
                 Ok(output) => serde_json::to_string_pretty(&SearchOutput {
                     results: output
                         .results
@@ -1046,7 +1077,7 @@ impl CodeIntelligenceServer {
                 files_indexed: files,
                 symbols_indexed: symbols,
                 edges_indexed: edges,
-                embeddings_status: "disabled".into(),
+                embeddings_status: self.embed_status_str(),
                 edges_ready: self.edges_ready(),
             })
             .unwrap_or_default()
@@ -1069,20 +1100,25 @@ impl CodeIntelligenceServer {
             };
             let limit = p.limit.unwrap_or(10);
 
-            let search_output =
-                match ci_core::search::search(&self.db(), &p.query, kind, limit, false) {
-                    Ok(o) => o,
-                    Err(e) => {
-                        return serde_json::to_string_pretty(&ErrorOutput {
-                            error: ErrorDetail {
-                                code: "DB_LOCKED".into(),
-                                message: format!("Search failed: {e}"),
-                                recoverable: true,
-                            },
-                        })
-                        .unwrap_or_default();
-                    }
-                };
+            let search_output = match ci_core::search::search(
+                &self.db(),
+                &p.query,
+                kind,
+                limit,
+                self.embedder().as_deref(),
+            ) {
+                Ok(o) => o,
+                Err(e) => {
+                    return serde_json::to_string_pretty(&ErrorOutput {
+                        error: ErrorDetail {
+                            code: "DB_LOCKED".into(),
+                            message: format!("Search failed: {e}"),
+                            recoverable: true,
+                        },
+                    })
+                    .unwrap_or_default();
+                }
+            };
 
             let results: Vec<SearchResultItem> = search_output
                 .results
@@ -1163,7 +1199,8 @@ impl CodeIntelligenceServer {
                 _ => ci_core::types::SearchKind::Symbol,
             };
 
-            let search_result = ci_core::search::search(&self.db(), &p.query, kind, 1, false);
+            let search_result =
+                ci_core::search::search(&self.db(), &p.query, kind, 1, self.embedder().as_deref());
 
             let top = search_result
                 .ok()

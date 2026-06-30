@@ -190,15 +190,6 @@ fn migrate_add_column(
     Ok(())
 }
 
-pub fn create_embedding_table(conn: &Connection) -> rusqlite::Result<()> {
-    conn.execute_batch(
-        "CREATE VIRTUAL TABLE IF NOT EXISTS embedding_vecs USING vec0(
-            symbol_id INTEGER,
-            embedding FLOAT[768]
-        );",
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

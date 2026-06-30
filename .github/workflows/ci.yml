@@ -41,3 +41,22 @@ jobs:
 
       - name: Run Stack Graphs Regression Corpus
         run: cargo test --test parity_test test_formal_edges -- --nocapture
+
+  embeddings:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      # The optional `embeddings` feature (model2vec-rs + sqlite-vec). The vec0
+      # KNN test runs fully offline; model download is not exercised in CI.
+      - name: Clippy (embeddings)
+        run: cargo clippy -p ci-core --all-targets --features embeddings -- -D warnings
+
+      - name: Test (embeddings)
+        run: cargo test -p ci-core --features embeddings

@@ -47,8 +47,14 @@ fn event_is_relevant(res: &notify::Result<notify::Event>) -> bool {
 }
 
 /// Block on the watch loop until `ct` is cancelled. Intended to run inside a
-/// `spawn_blocking` task after the initial full index completes.
-pub fn run_watch_loop(project_root: PathBuf, db_path: PathBuf, ct: CancellationToken) {
+/// `spawn_blocking` task after the initial full index completes. When an embedder
+/// is loaded, newly (re)indexed symbols are embedded after each reindex.
+pub fn run_watch_loop(
+    project_root: PathBuf,
+    db_path: PathBuf,
+    ct: CancellationToken,
+    embedder: crate::EmbedderHandle,
+) {
     let (tx, rx) = mpsc::channel();
     let mut watcher = match recommended_watcher(move |res| {
         let _ = tx.send(res);
@@ -114,6 +120,12 @@ pub fn run_watch_loop(project_root: PathBuf, db_path: PathBuf, ct: CancellationT
                             s.changed,
                             s.deleted
                         );
+                        // Embed any symbols added by this reindex.
+                        if let Some(model) = embedder.read().unwrap().clone()
+                            && let Err(e) = ci_core::embedding::embed_pending(&conn, model.as_ref())
+                        {
+                            tracing::error!("Incremental embedding failed: {e}");
+                        }
                     }
                     Ok(_) => {}
                     Err(e) => tracing::error!("Incremental reindex failed: {e}"),

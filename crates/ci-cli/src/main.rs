@@ -81,6 +81,9 @@ async fn main() -> Result<()> {
         Commands::Index { project_root } => {
             let root = std::fs::canonicalize(&project_root)?;
             tracing::info!("Indexing {}", root.display());
+            // Register sqlite-vec before opening the connection (no-op unless the
+            // `embeddings` feature is built in).
+            ci_core::embedding::register_extension();
             let db_path = ci_server::default_db_path(&root);
             if let Some(parent) = db_path.parent() {
                 std::fs::create_dir_all(parent)?;
@@ -94,6 +97,21 @@ async fn main() -> Result<()> {
                 conn.query_row("SELECT COUNT(*) FROM file_index", [], |r| r.get(0))?;
             tracing::info!("Indexing complete: {file_count} files, {symbol_count} symbols");
             println!("Indexed {file_count} files, {symbol_count} symbols.");
+
+            // Opt-in semantic embeddings.
+            let semantic = ci_core::config::load_config(&root)
+                .map(|c| c.semantic_search)
+                .unwrap_or_default();
+            if semantic.enabled {
+                match ci_core::embedding::Embedder::load(&semantic.model, semantic.dimensions) {
+                    Ok(embedder) => {
+                        ci_core::embedding::create_embedding_table(&conn, semantic.dimensions)?;
+                        let n = ci_core::embedding::embed_pending(&conn, &embedder)?;
+                        println!("Embedded {n} symbols.");
+                    }
+                    Err(e) => eprintln!("Embeddings skipped: {e}"),
+                }
+            }
         }
         Commands::Doctor { project_root } => {
             let root = std::fs::canonicalize(&project_root)?;

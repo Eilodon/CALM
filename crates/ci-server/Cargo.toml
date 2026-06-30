@@ -15,3 +15,6 @@ tracing = { workspace = true }
 anyhow = { workspace = true }
 rmcp = { workspace = true }
 schemars = { workspace = true }
+
+[features]
+embeddings = ["ci-core/embeddings"]

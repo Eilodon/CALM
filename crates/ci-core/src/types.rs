@@ -96,6 +96,18 @@ pub enum EmbedStatus {
     Failed,
 }
 
+impl EmbedStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Downloading => "downloading",
+            Self::Embedding => "embedding",
+            Self::Ready => "ready",
+            Self::Failed => "failed",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TerminatedBy {

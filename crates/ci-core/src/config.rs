@@ -101,8 +101,10 @@ impl Default for SemanticSearchConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            model: "BAAI/bge-base-en-v1.5".into(),
-            dimensions: 768,
+            // Pure-Rust static code embeddings (model2vec-rs); distilled from
+            // nomic CodeRankEmbed, 256-dim. Keeps the musl static binary intact.
+            model: "minishlab/potion-code-16M".into(),
+            dimensions: 256,
             index_on_startup: false,
         }
     }

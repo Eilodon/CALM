@@ -3,14 +3,25 @@ pub mod tools;
 pub mod watcher;
 
 use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
 
 use anyhow::Result;
+use ci_core::config::SemanticSearchConfig;
+use ci_core::embedding::Embedder;
+use ci_core::types::EmbedStatus;
 use rmcp::transport::io::stdio;
 use tokio_util::sync::CancellationToken;
 
 use tools::CodeIntelligenceServer;
 
+/// Shared handle to the loaded embedder, written by the indexer, read by tools.
+pub type EmbedderHandle = Arc<RwLock<Option<Arc<Embedder>>>>;
+
 pub async fn serve_stdio(project_root: PathBuf, db_path: PathBuf) -> Result<()> {
+    // Register the sqlite-vec extension before any connection is opened (no-op
+    // unless built with the `embeddings` feature).
+    ci_core::embedding::register_extension();
+
     let server = CodeIntelligenceServer::new(project_root.clone(), db_path.clone())?;
     let ct = CancellationToken::new();
     let ct_clone = ct.clone();
@@ -21,10 +32,17 @@ pub async fn serve_stdio(project_root: PathBuf, db_path: PathBuf) -> Result<()> 
         ct_clone.cancel();
     });
 
+    let semantic = ci_core::config::load_config(&project_root)
+        .map(|c| c.semantic_search)
+        .unwrap_or_default();
+
     let indexer_db_path = db_path.clone();
     let indexer_root = project_root.clone();
     let watch_ct = ct.clone();
     let phase = server.phase_handle();
+    let embedder = server.embedder_handle();
+    let embed_status = server.embed_status_handle();
+    let watch_embedder = embedder.clone();
     tokio::task::spawn_blocking(move || {
         tracing::info!("Background indexer thread started");
         if let Ok(mut conn) = rusqlite::Connection::open(&indexer_db_path) {
@@ -38,9 +56,13 @@ pub async fn serve_stdio(project_root: PathBuf, db_path: PathBuf) -> Result<()> 
                 *phase.write().unwrap() = ci_core::types::IndexingPhase::Ready;
                 tracing::info!("Background indexing completed");
             }
+            // Opt-in semantic embeddings, after the graph is built.
+            if semantic.enabled {
+                bootstrap_embeddings(&conn, &semantic, &embedder, &embed_status);
+            }
         }
-        // Watch for edits and incrementally reindex until shutdown.
-        watcher::run_watch_loop(indexer_root, indexer_db_path, watch_ct);
+        // Watch for edits and incrementally reindex (and re-embed) until shutdown.
+        watcher::run_watch_loop(indexer_root, indexer_db_path, watch_ct, watch_embedder);
     });
 
     let transport = stdio();
@@ -55,6 +77,43 @@ pub async fn serve_stdio(project_root: PathBuf, db_path: PathBuf) -> Result<()> 
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     tracing::info!("Server shut down cleanly");
     Ok(())
+}
+
+/// Load the embedding model, create the vector table, embed all symbols, and
+/// publish the model + status. Runs on the indexer thread after the graph is
+/// built. A no-op surface when the `embeddings` feature is off (load fails).
+fn bootstrap_embeddings(
+    conn: &rusqlite::Connection,
+    semantic: &SemanticSearchConfig,
+    embedder: &EmbedderHandle,
+    status: &Arc<RwLock<EmbedStatus>>,
+) {
+    *status.write().unwrap() = EmbedStatus::Downloading;
+    let model = match Embedder::load(&semantic.model, semantic.dimensions) {
+        Ok(m) => Arc::new(m),
+        Err(e) => {
+            tracing::error!("Embedding model load failed: {e}");
+            *status.write().unwrap() = EmbedStatus::Failed;
+            return;
+        }
+    };
+    if let Err(e) = ci_core::embedding::create_embedding_table(conn, semantic.dimensions) {
+        tracing::error!("Embedding table creation failed: {e}");
+        *status.write().unwrap() = EmbedStatus::Failed;
+        return;
+    }
+    *status.write().unwrap() = EmbedStatus::Embedding;
+    match ci_core::embedding::embed_pending(conn, model.as_ref()) {
+        Ok(n) => tracing::info!("Embedded {n} symbols"),
+        Err(e) => {
+            tracing::error!("Embedding failed: {e}");
+            *status.write().unwrap() = EmbedStatus::Failed;
+            return;
+        }
+    }
+    *embedder.write().unwrap() = Some(model);
+    *status.write().unwrap() = EmbedStatus::Ready;
+    tracing::info!("Embeddings ready");
 }
 
 pub fn default_db_path(project_root: &std::path::Path) -> PathBuf {
