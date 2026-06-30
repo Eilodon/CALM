@@ -40,6 +40,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rmcp = { version = "0.1", features = ["server", "transport-io", "macros"] }
 schemars = "0.8"
 clap = { version = "4", features = ["derive"] }
+rayon = "1"
 
 # Internal
 ci-core = { path = "crates/ci-core" }

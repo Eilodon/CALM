@@ -1,10 +1,15 @@
 use std::collections::HashMap;
+use std::time::Duration;
 
-use stack_graphs::graph::StackGraph;
+use stack_graphs::CancelAfterDuration as StackGraphCancelAfterDuration;
+use stack_graphs::arena::Handle;
+use stack_graphs::graph::{File, Node, StackGraph};
 use stack_graphs::partial::{PartialPath, PartialPaths};
 use stack_graphs::stitching::{
-    Database, DatabaseCandidates, ForwardPartialPathStitcher, StitcherConfig,
+    Database, DatabaseCandidates, ForwardCandidates, ForwardPartialPathStitcher,
+    GraphEdgeCandidates,
 };
+use tree_sitter_stack_graphs::CancelAfterDuration as TsgCancelAfterDuration;
 use tree_sitter_stack_graphs::CancellationFlag as TsgCancellationFlag;
 use tree_sitter_stack_graphs::NoCancellation as TsgNoCancellation;
 use tree_sitter_stack_graphs::StackGraphLanguage;
@@ -29,6 +34,110 @@ struct FormalLanguageConfig {
 pub struct FormalEdge {
     pub reference_symbol: String,
     pub definition_symbol: String,
+}
+
+/// Per-file deadline for Tier-3 formal resolution. Stack-graphs' path
+/// stitching can take unbounded time on pathological files (e.g. one very
+/// large class with thousands of self-references creates a combinatorial
+/// blowup in the partial-path stitcher) — confirmed in practice on CPython's
+/// `_pydecimal.py` (6.4k lines, ~9800 reference nodes), which never finished
+/// stitching even after minutes. Tier-3 is a best-effort upgrade on top of
+/// Tier-1/2 results, so a file that blows this budget simply falls back to
+/// whatever Tier-1/2 already determined (see callers of `resolve_file`)
+/// rather than stalling indexing indefinitely.
+const RESOLVE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Cap on the amount of stitching work performed in a single phase before
+/// yielding control back to check the cancellation deadline. stack-graphs
+/// leaves `max_work_per_phase` unbounded (`usize::MAX`) by default and only
+/// checks cancellation *between* phases — so without this cap, a single
+/// phase on a pathological file can itself run for the file's entire blowup
+/// before the deadline check below ever gets a chance to fire.
+const MAX_WORK_PER_PHASE: usize = 4096;
+
+/// Same as `ForwardPartialPathStitcher::find_minimal_partial_path_set_in_file`
+/// (stack-graphs 0.14), but with `max_work_per_phase` bounded — see
+/// `MAX_WORK_PER_PHASE` for why.
+fn index_partial_paths_in_file(
+    graph: &StackGraph,
+    partials: &mut PartialPaths,
+    file: Handle<File>,
+    db: &mut Database,
+    cancellation_flag: &dyn stack_graphs::CancellationFlag,
+) -> Result<(), stack_graphs::CancellationError> {
+    fn as_complete_as_necessary(graph: &StackGraph, path: &PartialPath) -> bool {
+        path.starts_at_endpoint(graph) && (path.ends_at_endpoint(graph) || path.ends_in_jump(graph))
+    }
+
+    let initial_paths = graph
+        .nodes_for_file(file)
+        .chain(std::iter::once(StackGraph::root_node()))
+        .filter(|node| graph[*node].is_endpoint())
+        .map(|node| PartialPath::from_node(graph, partials, node))
+        .collect::<Vec<_>>();
+    let mut stitcher =
+        ForwardPartialPathStitcher::from_partial_paths(graph, partials, initial_paths);
+    stitcher.set_similar_path_detection(true); // matches StitcherConfig::default()
+    stitcher.set_max_work_per_phase(MAX_WORK_PER_PHASE);
+    stitcher.set_check_only_join_nodes(true);
+
+    while !stitcher.is_complete() {
+        cancellation_flag.check("indexing partial paths")?;
+        stitcher.process_next_phase(
+            &mut GraphEdgeCandidates::new(graph, partials, Some(file)),
+            |g, _ps, p| !as_complete_as_necessary(g, p),
+        );
+        for path in stitcher.previous_phase_partial_paths() {
+            if as_complete_as_necessary(graph, path) {
+                db.add_partial_path(graph, partials, path.clone());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Same as `ForwardPartialPathStitcher::find_all_complete_partial_paths`
+/// (stack-graphs 0.14), but with `max_work_per_phase` bounded — see
+/// `MAX_WORK_PER_PHASE` for why.
+fn find_all_complete_partial_paths_bounded<F>(
+    candidates: &mut DatabaseCandidates<'_>,
+    starting_nodes: Vec<Handle<Node>>,
+    cancellation_flag: &dyn stack_graphs::CancellationFlag,
+    mut visit: F,
+) -> Result<(), stack_graphs::CancellationError>
+where
+    F: FnMut(&StackGraph, &mut PartialPaths, &PartialPath),
+{
+    let (graph, partials, _) = candidates.get_graph_partials_and_db();
+    let initial_paths = starting_nodes
+        .into_iter()
+        .filter(|n| graph[*n].is_reference())
+        .map(|n| {
+            let mut p = PartialPath::from_node(graph, partials, n);
+            p.eliminate_precondition_stack_variables(partials);
+            p
+        })
+        .collect::<Vec<_>>();
+    let mut stitcher =
+        ForwardPartialPathStitcher::from_partial_paths(graph, partials, initial_paths);
+    stitcher.set_similar_path_detection(true); // matches StitcherConfig::default()
+    stitcher.set_max_work_per_phase(MAX_WORK_PER_PHASE);
+    stitcher.set_check_only_join_nodes(true);
+
+    while !stitcher.is_complete() {
+        cancellation_flag.check("finding complete partial paths")?;
+        for path in stitcher.previous_phase_partial_paths() {
+            candidates.load_forward_candidates(path, cancellation_flag)?;
+        }
+        stitcher.process_next_phase(candidates, |_, _, _| true);
+        let (graph, partials, _) = candidates.get_graph_partials_and_db();
+        for path in stitcher.previous_phase_partial_paths() {
+            if path.is_complete(graph) {
+                visit(graph, partials, path);
+            }
+        }
+    }
+    Ok(())
 }
 
 impl FormalResolver {
@@ -63,6 +172,11 @@ impl FormalResolver {
             .get(language)
             .ok_or_else(|| anyhow::anyhow!("No formal resolver for language: {language}"))?;
 
+        // Fresh per-file deadlines for both the TSG graph build and the
+        // path-stitching stages — see `RESOLVE_TIMEOUT`.
+        let tsg_deadline = TsgCancelAfterDuration::new(RESOLVE_TIMEOUT);
+        let sg_deadline = StackGraphCancelAfterDuration::new(RESOLVE_TIMEOUT);
+
         let mut graph = StackGraph::new();
 
         // Merge builtins (e.g. Python's `len`, `print`, `range`) into the working
@@ -84,38 +198,25 @@ impl FormalResolver {
 
         config
             .sgl
-            .build_stack_graph_into(&mut graph, file, source, &globals, cancellation_flag())
+            .build_stack_graph_into(&mut graph, file, source, &globals, &tsg_deadline)
             .map_err(|e| anyhow::anyhow!("Stack graph build error: {e:?}"))?;
 
         let mut partials = PartialPaths::new();
         let mut db = Database::new();
-        let stitch_config = StitcherConfig::default();
 
-        // Index: find partial paths in this file
-        ForwardPartialPathStitcher::find_minimal_partial_path_set_in_file(
-            &graph,
-            &mut partials,
-            file,
-            stitch_config,
-            &stack_graphs::NoCancellation,
-            |g, ps, p| {
-                db.add_partial_path(g, ps, p.clone());
-            },
-        )
-        .map_err(|e| anyhow::anyhow!("Partial path extraction cancelled: {e}"))?;
+        // Index: find partial paths in this file.
+        index_partial_paths_in_file(&graph, &mut partials, file, &mut db, &sg_deadline)
+            .map_err(|e| anyhow::anyhow!("Partial path extraction cancelled: {e}"))?;
 
         // Also index partial paths for the merged builtins files, so a
         // reference in `file` can stitch all the way to a builtin definition.
         for builtin_file in &builtin_files {
-            ForwardPartialPathStitcher::find_minimal_partial_path_set_in_file(
+            index_partial_paths_in_file(
                 &graph,
                 &mut partials,
                 *builtin_file,
-                stitch_config,
-                &stack_graphs::NoCancellation,
-                |g, ps, p| {
-                    db.add_partial_path(g, ps, p.clone());
-                },
+                &mut db,
+                &sg_deadline,
             )
             .map_err(|e| anyhow::anyhow!("Builtins partial path extraction cancelled: {e}"))?;
         }
@@ -131,11 +232,10 @@ impl FormalResolver {
         }
 
         let mut edges = Vec::new();
-        ForwardPartialPathStitcher::find_all_complete_partial_paths(
+        find_all_complete_partial_paths_bounded(
             &mut DatabaseCandidates::new(&graph, &mut partials, &mut db),
             reference_nodes,
-            stitch_config,
-            &stack_graphs::NoCancellation,
+            &sg_deadline,
             |g, _ps, path: &PartialPath| {
                 let start = path.start_node;
                 let end = path.end_node;
@@ -176,6 +276,34 @@ impl Default for FormalResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: a single large class with many self-references used to
+    /// make stack-graphs' path stitching run unbounded (confirmed on
+    /// CPython's `_pydecimal.py`, 6.4k lines / ~9800 reference nodes, which
+    /// never completed even after minutes of wall-clock time). `resolve_file`
+    /// must now bound this via `RESOLVE_TIMEOUT` + `MAX_WORK_PER_PHASE`
+    /// instead of hanging indefinitely — see those constants for why.
+    #[test]
+    fn test_resolve_file_bounded_on_pathological_class() {
+        let mut source = String::from("class Big:\n");
+        for m in 0..300 {
+            source.push_str(&format!("    def m{m}(self):\n        x = (\n"));
+            for a in 0..30 {
+                source.push_str(&format!("            self.a{a} +\n"));
+            }
+            source.push_str("            0\n        )\n");
+        }
+
+        let mut resolver = FormalResolver::new();
+        resolver.load_python().unwrap();
+        let t0 = std::time::Instant::now();
+        let _ = resolver.resolve_file("python", "big.py", &source);
+        assert!(
+            t0.elapsed() < RESOLVE_TIMEOUT + std::time::Duration::from_secs(2),
+            "resolve_file must respect its deadline even on pathological input, took {:?}",
+            t0.elapsed()
+        );
+    }
 
     #[test]
     fn test_formal_resolver_new() {

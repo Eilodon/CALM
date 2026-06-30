@@ -75,8 +75,23 @@ pub fn extract_symbols(
     language: &str,
     path: &str,
 ) -> Result<Vec<ParsedSymbol>, String> {
-    let lang_consts = get_lang_constants(language).ok_or("No lang constants")?;
     let tree = parse_tree(source, language).ok_or("Failed to parse")?;
+    Ok(extract_symbols_from_tree(&tree, source, language, path))
+}
+
+/// Same as [`extract_symbols`] but against an already-parsed tree, so callers
+/// that need multiple extractions from one file (symbols, calls, imports,
+/// types, aliases) can share a single tree-sitter parse instead of re-parsing
+/// the same source once per extraction.
+pub fn extract_symbols_from_tree(
+    tree: &tree_sitter::Tree,
+    source: &str,
+    language: &str,
+    path: &str,
+) -> Vec<ParsedSymbol> {
+    let Some(lang_consts) = get_lang_constants(language) else {
+        return Vec::new();
+    };
     let mut symbols = Vec::new();
     walk_symbols(
         tree.root_node(),
@@ -87,7 +102,7 @@ pub fn extract_symbols(
         None,
         &mut symbols,
     );
-    Ok(symbols)
+    symbols
 }
 
 /// Resolve the name node for `node`. Most `function_node_types` expose `name`
@@ -413,12 +428,23 @@ fn walk_calls(
 /// Extract call sites from a source file, each attributed to its enclosing function.
 /// Top-level calls (outside any function) are skipped — they have no caller symbol.
 pub fn extract_calls(source: &str, language: &str, _path: &str) -> Result<Vec<RawCall>, String> {
-    let consts = get_lang_constants(language).ok_or("No lang constants")?;
     let tree = parse_tree(source, language).ok_or("Failed to parse")?;
+    Ok(extract_calls_from_tree(&tree, source, language))
+}
 
+/// Same as [`extract_calls`] but against an already-parsed tree (see
+/// [`extract_symbols_from_tree`]).
+pub fn extract_calls_from_tree(
+    tree: &tree_sitter::Tree,
+    source: &str,
+    language: &str,
+) -> Vec<RawCall> {
+    let Some(consts) = get_lang_constants(language) else {
+        return Vec::new();
+    };
     let mut out = Vec::new();
     walk_calls(tree.root_node(), source, &consts, None, None, &mut out);
-    Ok(out)
+    out
 }
 
 /// File-local alias map (`x = helper` → `x` ↦ `helper`) via the conservative
@@ -434,6 +460,17 @@ pub fn extract_file_aliases(
     let Some(tree) = parse_tree(source, language) else {
         return std::collections::HashMap::new();
     };
+    extract_file_aliases_from_tree(&tree, source, language, ctx)
+}
+
+/// Same as [`extract_file_aliases`] but against an already-parsed tree (see
+/// [`extract_symbols_from_tree`]).
+pub fn extract_file_aliases_from_tree(
+    tree: &tree_sitter::Tree,
+    source: &str,
+    language: &str,
+    ctx: &crate::resolver::FileContext,
+) -> std::collections::HashMap<String, String> {
     crate::resolver::conservative::ConservativeResolver::new().extract_aliases(
         tree.root_node(),
         source.as_bytes(),
@@ -449,10 +486,20 @@ pub fn extract_file_aliases(
 /// JavaScript (dynamic) yields an empty map. Go shares one type across several
 /// names (`x, y Foo`), so each name is mapped.
 pub fn extract_type_map(source: &str, language: &str) -> std::collections::HashMap<String, String> {
-    let mut map = std::collections::HashMap::new();
     let Some(tree) = parse_tree(source, language) else {
-        return map;
+        return std::collections::HashMap::new();
     };
+    extract_type_map_from_tree(&tree, source, language)
+}
+
+/// Same as [`extract_type_map`] but against an already-parsed tree (see
+/// [`extract_symbols_from_tree`]).
+pub fn extract_type_map_from_tree(
+    tree: &tree_sitter::Tree,
+    source: &str,
+    language: &str,
+) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
     // Node kinds carrying a `name(s): type` (or `name(s) type`) binding.
     let binding_kinds: &[&str] = match language {
         "python" => &["typed_parameter"],

@@ -1,3 +1,4 @@
+use rayon::prelude::*;
 use rusqlite::Connection;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -7,7 +8,8 @@ use crate::indexer::edges::{
 };
 use crate::indexer::lang_constants::language_for_extension;
 use crate::indexer::parser::{
-    extract_calls, extract_file_aliases, extract_symbols, extract_type_map,
+    ParsedSymbol, extract_calls_from_tree, extract_file_aliases_from_tree,
+    extract_symbols_from_tree, extract_type_map_from_tree, parse_tree,
 };
 
 /// Built-in directories never descended into during a project scan.
@@ -25,6 +27,11 @@ const IGNORE_DIRS: &[&str] = &[
 /// Maximum number of same-named symbols a call may resolve to before it is
 /// dropped as too ambiguous (conservative).
 const MAX_CALLEE_CANDIDATES: usize = 20;
+
+/// Files are parsed+resolved (and then persisted) in chunks of this size
+/// rather than all at once, so peak memory holds at most one batch of
+/// parsed-but-not-yet-persisted files instead of an entire large repo.
+const PARSE_BATCH_SIZE: usize = 1000;
 
 /// Return true if `name` matches any pattern in `patterns`.
 /// Supports `*.ext` glob (file extension matching) and exact name matching.
@@ -157,20 +164,49 @@ fn upsert_file_index(
     Ok(())
 }
 
-/// Extract and persist one file's symbols and call sites. The caller must have
-/// already removed any prior rows for this path. Returns the symbol count.
+/// One call site's resolved fields, ready to persist into `call_sites`.
+struct CallSiteData {
+    enclosing_qn: String,
+    callee: String,
+    line: i64,
+    confidence: String,
+    receiver: Option<String>,
+    target_class: Option<String>,
+}
+
+/// Everything extracted from a single file's source, before any DB I/O.
+/// Building this is pure CPU work (tree-sitter parse + resolver tiers), so it
+/// is safe to compute for every file in parallel; only [`persist_file`] below
+/// touches the transaction, and that stays single-threaded.
+struct ExtractedFile {
+    symbols: Vec<ParsedSymbol>,
+    import_edges: Vec<crate::indexer::edges::ImportEdge>,
+    call_sites: Vec<CallSiteData>,
+    symbol_count: usize,
+}
+
+/// Parse and resolve one file's symbols, imports, and call sites. No DB access —
+/// safe to run concurrently across files (see [`run_indexing_pipeline`]).
 ///
 /// `qualified_name` is `relpath::name` (`#line` suffix on intra-file collision)
 /// so the UNIQUE(qualified_name) index never rejects a real symbol.
-fn index_one_file(
-    tx: &rusqlite::Transaction,
+fn extract_file_data(
     rel: &str,
     lang: &str,
     source: &str,
     entry_point_patterns: &[String],
     formal: &crate::resolver::formal::FormalResolver,
-) -> rusqlite::Result<usize> {
-    let mut syms = extract_symbols(source, lang, rel).unwrap_or_default();
+) -> ExtractedFile {
+    let Some(tree) = parse_tree(source, lang) else {
+        return ExtractedFile {
+            symbols: Vec::new(),
+            import_edges: Vec::new(),
+            call_sites: Vec::new(),
+            symbol_count: 0,
+        };
+    };
+
+    let mut syms = extract_symbols_from_tree(&tree, source, lang, rel);
     let mut seen: HashSet<String> = HashSet::new();
     for s in &mut syms {
         s.path = rel.to_string();
@@ -198,12 +234,10 @@ fn index_one_file(
         .map(|s| ((s.name.clone(), s.line_start), s.qualified_name.clone()))
         .collect();
     let file_symbols: HashSet<String> = syms.iter().map(|s| s.name.clone()).collect();
-
-    let count = syms.len();
-    insert_symbols_batch(tx, &syms)?;
+    let symbol_count = syms.len();
 
     // Imports → import_edges (to_path resolved later, globally) + import_map.
-    let imports = crate::indexer::imports::extract_imports(source, lang);
+    let imports = crate::indexer::imports::extract_imports_from_tree(&tree, source, lang);
     let mut import_map: HashMap<String, String> = HashMap::new();
     let mut import_edges = Vec::with_capacity(imports.len());
     for imp in &imports {
@@ -221,16 +255,15 @@ fn index_one_file(
                 .or_insert_with(|| imp.module_name.clone());
         }
     }
-    insert_import_edges_batch(tx, &import_edges)?;
 
     // Full resolver context: file symbols + imports + type annotations.
     let ctx = crate::resolver::FileContext {
         file_symbols,
         import_map,
-        type_map: extract_type_map(source, lang),
+        type_map: extract_type_map_from_tree(&tree, source, lang),
     };
     let resolver = crate::resolver::conservative::ConservativeResolver::new();
-    let aliases = extract_file_aliases(source, lang, &ctx);
+    let aliases = extract_file_aliases_from_tree(&tree, source, lang, &ctx);
 
     // Tier-3: formal scope resolution via StackGraph rules.
     // For languages with stack-graphs support (currently Python), build the set of
@@ -238,7 +271,7 @@ fn index_one_file(
     // within this file. Used below to upgrade "textual"/"inferred" call sites to
     // "formal" — a higher-confidence tier than heuristic type inference.
     // Falls back to empty on unsupported languages or parse errors (non-fatal).
-    let formally_resolved: std::collections::HashSet<String> = if formal.has_language(lang) {
+    let formally_resolved: HashSet<String> = if formal.has_language(lang) {
         formal
             .resolve_file(lang, rel, source)
             .unwrap_or_default()
@@ -246,7 +279,7 @@ fn index_one_file(
             .map(|e| e.reference_symbol)
             .collect()
     } else {
-        std::collections::HashSet::new()
+        HashSet::new()
     };
 
     // Calls → call_sites. Tier-1 (conservative resolver): file symbol / import /
@@ -254,11 +287,8 @@ fn index_one_file(
     // whose receiver type is inferable (self/this → enclosing class, or a typed
     // variable) becomes "inferred" with a target_class for the rebuild to match.
     // Tier-3: formal StackGraph resolution upgrades "textual"/"inferred" to "formal".
-    let calls = extract_calls(source, lang, rel).unwrap_or_default();
-    let mut stmt = tx.prepare(
-        "INSERT INTO call_sites (from_path, enclosing_qn, callee_name, call_line, confidence, receiver, target_class) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-    )?;
+    let calls = extract_calls_from_tree(&tree, source, lang);
+    let mut call_sites = Vec::with_capacity(calls.len());
     for c in &calls {
         if let Some(enc_qn) = qn_by_loc.get(&(c.enclosing_name.clone(), c.enclosing_line)) {
             let mut confidence = resolver
@@ -274,24 +304,57 @@ fn index_one_file(
                 confidence = "inferred".to_string();
                 target_class = Some(cls);
             }
-            let callee = aliases.get(&c.callee).unwrap_or(&c.callee);
+            let callee = aliases.get(&c.callee).unwrap_or(&c.callee).clone();
             // Tier-3: StackGraph confirmed this callee has a definition in scope.
             // Upgrades "textual" and "inferred" but not "resolved" (already correct).
             if confidence != "resolved" && formally_resolved.contains(callee.as_str()) {
                 confidence = "formal".to_string();
             }
-            stmt.execute(rusqlite::params![
-                rel,
-                enc_qn,
+            call_sites.push(CallSiteData {
+                enclosing_qn: enc_qn.clone(),
                 callee,
-                c.line as i64,
+                line: c.line as i64,
                 confidence,
-                c.receiver,
-                target_class
-            ])?;
+                receiver: c.receiver.clone(),
+                target_class,
+            });
         }
     }
-    Ok(count)
+
+    ExtractedFile {
+        symbols: syms,
+        import_edges,
+        call_sites,
+        symbol_count,
+    }
+}
+
+/// Persist one file's already-extracted symbols, imports, and call sites.
+/// Pure DB I/O — call sequentially against a single transaction, after all
+/// files have been extracted (possibly in parallel).
+fn persist_file(
+    tx: &rusqlite::Transaction,
+    rel: &str,
+    extracted: &ExtractedFile,
+) -> rusqlite::Result<()> {
+    insert_symbols_batch(tx, &extracted.symbols)?;
+    insert_import_edges_batch(tx, &extracted.import_edges)?;
+    let mut stmt = tx.prepare(
+        "INSERT INTO call_sites (from_path, enclosing_qn, callee_name, call_line, confidence, receiver, target_class) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+    )?;
+    for c in &extracted.call_sites {
+        stmt.execute(rusqlite::params![
+            rel,
+            c.enclosing_qn,
+            c.callee,
+            c.line,
+            c.confidence,
+            c.receiver,
+            c.target_class
+        ])?;
+    }
+    Ok(())
 }
 
 /// Rebuild the call graph from the persisted `call_sites` against the current
@@ -351,19 +414,30 @@ fn rebuild_graph(
     // One edge per (caller, callee) pair; the first call site supplies the line.
     // Confidence is the resolver's verdict recorded at extraction time. A tier-2
     // call (target_class set) resolves the method within that class only.
+    //
+    // Candidate lookup (HashMap reads against `by_name`/`by_name_class`) is pure
+    // CPU work independent per site, so it runs in parallel; the dedup merge
+    // below stays sequential, walking sites in their original order so the
+    // "first call site wins" line/confidence attribution is unchanged.
+    let candidates: Vec<Vec<(String, String)>> = sites
+        .par_iter()
+        .map(|(_, _, callee, _, _, target_class)| {
+            let targets = match target_class {
+                Some(cls) => by_name_class.get(&(callee.clone(), cls.clone())),
+                None => by_name.get(callee),
+            };
+            match targets {
+                Some(t) if t.len() <= MAX_CALLEE_CANDIDATES => t.clone(),
+                _ => Vec::new(),
+            }
+        })
+        .collect();
+
     let mut edges: Vec<CallEdge> = Vec::new();
     let mut seen_pairs: HashSet<(String, String)> = HashSet::new();
-    for (from_path, enc_qn, callee, line, confidence, target_class) in &sites {
-        let targets = match target_class {
-            Some(cls) => by_name_class.get(&(callee.clone(), cls.clone())),
-            None => by_name.get(callee),
-        };
-        let Some(targets) = targets else {
-            continue;
-        };
-        if targets.len() > MAX_CALLEE_CANDIDATES {
-            continue;
-        }
+    for ((from_path, enc_qn, _callee, line, confidence, _target_class), targets) in
+        sites.iter().zip(candidates.iter())
+    {
         for (to_qn, to_path) in targets {
             if !seen_pairs.insert((enc_qn.clone(), to_qn.clone())) {
                 continue;
@@ -414,9 +488,16 @@ fn resolve_import_targets(tx: &rusqlite::Transaction) -> rusqlite::Result<()> {
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?
     };
+    // Candidate-path resolution is pure CPU work against a shared, read-only
+    // `known` set, so it runs in parallel; the UPDATE loop stays sequential.
+    let targets: Vec<Option<String>> = rows
+        .par_iter()
+        .map(|(_, from_path, module)| resolve_module_to_path(from_path, module, &known))
+        .collect();
+
     let mut ustmt = tx.prepare("UPDATE import_edges SET to_path = ?1 WHERE id = ?2")?;
-    for (id, from_path, module) in &rows {
-        if let Some(target) = resolve_module_to_path(from_path, module, &known) {
+    for ((id, _, _), target) in rows.iter().zip(targets.iter()) {
+        if let Some(target) = target {
             ustmt.execute(rusqlite::params![target, id])?;
         }
     }
@@ -567,6 +648,13 @@ pub fn run_indexing_pipeline(
 
     *phase.write().unwrap() = IndexingPhase::Parsing;
 
+    // Parse + resolve + persist in bounded batches: each batch is extracted in
+    // parallel (pure CPU, no DB access) and persisted sequentially before the
+    // next batch starts, so peak memory holds at most one batch of parsed
+    // files instead of the whole project. `.map()` over an indexed parallel
+    // iterator preserves order within a batch, and batches are processed in
+    // the same sorted `files` order, so the result is byte-for-byte identical
+    // to a fully sequential pipeline.
     let now = now_secs();
     let tx = conn.transaction()?;
 
@@ -576,25 +664,28 @@ pub fn run_indexing_pipeline(
     tx.execute("DELETE FROM symbols", [])?;
     tx.execute("DELETE FROM file_index", [])?;
 
-    for file in &files {
-        let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("");
-        let Some(lang) = language_for_extension(ext) else {
-            continue;
-        };
-        let Ok(source) = std::fs::read_to_string(file) else {
-            continue;
-        };
-        let rel = rel_path(project_root, file);
-        let count = index_one_file(&tx, &rel, lang, &source, &entry_point_patterns, &formal)?;
-        upsert_file_index(
-            &tx,
-            &rel,
-            lang,
-            &hash_content(&source),
-            mtime_secs(file),
-            count,
-            now,
-        )?;
+    for batch in files.chunks(PARSE_BATCH_SIZE) {
+        let extracted: Vec<(String, &'static str, String, f64, ExtractedFile)> = batch
+            .par_iter()
+            .map(|file| {
+                let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("");
+                let lang = language_for_extension(ext)?;
+                let source = std::fs::read_to_string(file).ok()?;
+                let rel = rel_path(project_root, file);
+                let hash = hash_content(&source);
+                let mtime = mtime_secs(file);
+                let data = extract_file_data(&rel, lang, &source, &entry_point_patterns, &formal);
+                Some((rel, lang, hash, mtime, data))
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .flatten()
+            .collect();
+
+        for (rel, lang, hash, mtime, data) in &extracted {
+            persist_file(&tx, rel, data)?;
+            upsert_file_index(&tx, rel, lang, hash, *mtime, data.symbol_count, now)?;
+        }
     }
 
     *phase.write().unwrap() = IndexingPhase::BuildingEdges;
@@ -633,29 +724,72 @@ pub fn reindex_changed(
     collect_source_files(project_root, &ignore_patterns, &mut files);
     files.sort();
 
+    // Read + hash every file in parallel, then decide sequentially which ones
+    // actually changed before paying the parse+resolve cost on just those.
+    struct Candidate {
+        rel: String,
+        lang: &'static str,
+        source: String,
+        hash: String,
+        mtime: f64,
+    }
+    let candidates: Vec<Candidate> = files
+        .par_iter()
+        .map(|file| {
+            let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("");
+            let lang = language_for_extension(ext)?;
+            let source = std::fs::read_to_string(file).ok()?;
+            let rel = rel_path(project_root, file);
+            let hash = hash_content(&source);
+            Some(Candidate {
+                rel,
+                lang,
+                source,
+                hash,
+                mtime: mtime_secs(file),
+            })
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .flatten()
+        .collect();
+
+    let seen_paths: HashSet<String> = candidates.iter().map(|c| c.rel.clone()).collect();
+    let changed: Vec<Candidate> = candidates
+        .into_iter()
+        .filter(|c| existing.get(&c.rel) != Some(&c.hash)) // unchanged — skip the parse
+        .collect();
+
+    // Parse + resolve + persist in bounded batches (see run_indexing_pipeline
+    // for why: caps peak memory to one batch instead of every changed file).
     let now = now_secs();
     let tx = conn.transaction()?;
     let mut summary = ReindexSummary::default();
-    let mut seen_paths: HashSet<String> = HashSet::new();
 
-    for file in &files {
-        let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("");
-        let Some(lang) = language_for_extension(ext) else {
-            continue;
-        };
-        let Ok(source) = std::fs::read_to_string(file) else {
-            continue;
-        };
-        let rel = rel_path(project_root, file);
-        seen_paths.insert(rel.clone());
-        let hash = hash_content(&source);
-        if existing.get(&rel) == Some(&hash) {
-            continue; // unchanged — skip the parse
+    for batch in changed.chunks(PARSE_BATCH_SIZE) {
+        let extracted: Vec<(&Candidate, ExtractedFile)> = batch
+            .par_iter()
+            .map(|c| {
+                let data =
+                    extract_file_data(&c.rel, c.lang, &c.source, &entry_point_patterns, &formal);
+                (c, data)
+            })
+            .collect();
+
+        for (c, data) in &extracted {
+            remove_file_rows(&tx, &c.rel)?;
+            persist_file(&tx, &c.rel, data)?;
+            upsert_file_index(
+                &tx,
+                &c.rel,
+                c.lang,
+                &c.hash,
+                c.mtime,
+                data.symbol_count,
+                now,
+            )?;
+            summary.changed += 1;
         }
-        remove_file_rows(&tx, &rel)?;
-        let count = index_one_file(&tx, &rel, lang, &source, &entry_point_patterns, &formal)?;
-        upsert_file_index(&tx, &rel, lang, &hash, mtime_secs(file), count, now)?;
-        summary.changed += 1;
     }
 
     for path in existing.keys() {

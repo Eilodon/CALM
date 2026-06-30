@@ -41,7 +41,21 @@ pub fn extract_imports(source: &str, language: &str) -> Vec<ParsedImport> {
     let Some(tree) = parse_tree(source, language) else {
         return Vec::new();
     };
+    extract_imports_from_tree(&tree, source, language)
+}
 
+/// Same as [`extract_imports`] but against an already-parsed tree, so callers
+/// that need multiple extractions from one file can share a single
+/// tree-sitter parse instead of re-parsing the same source once per extraction.
+pub fn extract_imports_from_tree(
+    tree: &tree_sitter::Tree,
+    source: &str,
+    language: &str,
+) -> Vec<ParsedImport> {
+    let types = import_node_types(language);
+    if types.is_empty() {
+        return Vec::new();
+    }
     let mut out = Vec::new();
     let mut stack = vec![tree.root_node()];
     while let Some(node) = stack.pop() {
