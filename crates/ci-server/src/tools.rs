@@ -6,6 +6,7 @@ use rmcp::tool;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use ci_core::analysis::dead_code::{is_private_symbol, scope_clear_for_language};
 use ci_core::embedding::Embedder;
 use ci_core::sanitize::sanitize_source_output;
 use ci_core::types::{EmbedStatus, IndexingPhase};
@@ -652,6 +653,25 @@ fn compute_frontier_entries(
 // ---------------------------------------------------------------------------
 
 #[derive(Serialize, JsonSchema)]
+struct EntryPointItem {
+    qualified_name: String,
+    path: String,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct ModuleEntry {
+    name: String,
+    file_count: i64,
+    symbol_count: i64,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct HealthSummary {
+    hub_count: i64,
+    edges_ready: bool,
+}
+
+#[derive(Serialize, JsonSchema)]
 struct RepoOverviewOutput {
     languages: Vec<String>,
     indexing_phase: String,
@@ -660,6 +680,9 @@ struct RepoOverviewOutput {
     total_symbols: i64,
     total_files: i64,
     truncated: bool,
+    entry_points: Vec<EntryPointItem>,
+    module_map: Vec<ModuleEntry>,
+    health_summary: HealthSummary,
     workflow_guide: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     suggested_next: Option<SuggestedNext>,
@@ -834,30 +857,6 @@ struct HealthOutput {
     test_files: Vec<String>,
 }
 
-/// Best-effort "is this symbol private/internal" signal from name + signature
-/// conventions, per tier-0 language. Used only as a `dead_code_confidence`
-/// input — not stored, computed live from columns already in the index.
-fn is_private_symbol(language: &str, name: &str, signature: &str) -> bool {
-    match language {
-        "python" => name.starts_with('_'),
-        "rust" => !signature.contains("pub "),
-        "go" => name
-            .chars()
-            .next()
-            .map(|c| c.is_lowercase())
-            .unwrap_or(false),
-        "java" => signature.contains("private "),
-        "javascript" | "typescript" => !signature.contains("export"),
-        _ => false,
-    }
-}
-
-/// Whether `language` is a tier-0 language with full symbol extraction
-/// (vs. the generic textual-only fallback), per `get_lang_constants`.
-fn scope_clear_for_language(language: &str) -> bool {
-    ci_core::indexer::lang_constants::get_lang_constants(language).is_some()
-}
-
 fn build_health(
     conn: &rusqlite::Connection,
     coverage: &ci_core::analysis::coverage::CoverageData,
@@ -865,7 +864,7 @@ fn build_health(
     c: &CandidateRow,
     edges_ready: bool,
 ) -> HealthOutput {
-    let abs_path = project_root.join(&c.path).to_string_lossy().to_string();
+    let abs_path = ci_core::analysis::coverage::normalize_path(&project_root.join(&c.path));
     let is_private = is_private_symbol(&c.language, &c.name, &c.signature);
     let scope_clear = scope_clear_for_language(&c.language);
     let (confidence, source) = ci_core::analysis::dead_code::compute_dead_code_confidence(
@@ -1001,15 +1000,24 @@ struct CallerEntry {
     symbol: String,
     path: String,
     edge_confidence: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    line: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    preview: Option<String>,
 }
 
 #[derive(Serialize, JsonSchema)]
 struct CallersOutput {
     symbol: String,
+    edges_ready: bool,
     direct: Vec<CallerEntry>,
     direct_count: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     transitive: Option<Vec<TransitiveEntry>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transitive_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transitive_capped: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     suggested_next: Option<SuggestedNext>,
 }
@@ -1035,15 +1043,24 @@ struct CalleeEntry {
     symbol: String,
     path: String,
     edge_confidence: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    line: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    preview: Option<String>,
 }
 
 #[derive(Serialize, JsonSchema)]
 struct CalleesOutput {
     symbol: String,
+    edges_ready: bool,
     direct: Vec<CalleeEntry>,
     direct_count: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     transitive: Option<Vec<TransitiveEntry>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transitive_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transitive_capped: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     suggested_next: Option<SuggestedNext>,
 }
@@ -1064,14 +1081,17 @@ enum EdgeDirection {
 
 /// BFS over `call_edges` beyond the direct neighbors, shared by `callers` and
 /// `callees` when `transitive: true`. Bounded by `max_depth` and a wall-clock
-/// timeout so a hub symbol can't blow up the response.
+/// timeout so a hub symbol can't blow up the response. Returns `(entries,
+/// capped)` — `capped` is true when the BFS stopped early (depth limit hit
+/// with a non-empty frontier remaining, or the timeout fired) rather than
+/// because there was nothing left to explore.
 fn transitive_bfs(
     conn: &rusqlite::Connection,
     start_qualified_name: &str,
     direction: EdgeDirection,
     max_depth: usize,
     timeout_ms: u64,
-) -> Vec<TransitiveEntry> {
+) -> (Vec<TransitiveEntry>, bool) {
     let sql = match direction {
         EdgeDirection::Callers => {
             "SELECT from_symbol, from_path, edge_confidence FROM call_edges WHERE to_symbol = ?1"
@@ -1082,7 +1102,7 @@ fn transitive_bfs(
     };
     let mut stmt = match conn.prepare(sql) {
         Ok(s) => s,
-        Err(_) => return vec![],
+        Err(_) => return (vec![], false),
     };
 
     let start = std::time::Instant::now();
@@ -1093,9 +1113,11 @@ fn transitive_bfs(
     let mut frontier = vec![start_qualified_name.to_string()];
     let mut results = Vec::new();
     let mut depth = 0usize;
+    let mut capped = false;
 
     while depth < max_depth && !frontier.is_empty() {
         if start.elapsed() > deadline {
+            capped = true;
             break;
         }
         depth += 1;
@@ -1121,10 +1143,41 @@ fn transitive_bfs(
                 }
             }
         }
+        if !capped && depth >= max_depth && !next_frontier.is_empty() {
+            capped = true;
+        }
         frontier = next_frontier;
     }
 
-    results
+    (results, capped)
+}
+
+const CALL_SITE_PREVIEW_MAX_CHARS: usize = 160;
+
+/// Read the trimmed source line at `line` (1-indexed) from `project_root/path`
+/// for a `CallerEntry`/`CalleeEntry` preview. Best-effort: missing files, a
+/// line number past EOF, or a `None` line all just yield `None` rather than
+/// an error — a preview is a convenience, not load-bearing.
+fn line_preview(project_root: &std::path::Path, path: &str, line: Option<i64>) -> Option<String> {
+    let line = line?;
+    if line < 1 {
+        return None;
+    }
+    let content = std::fs::read_to_string(project_root.join(path)).ok()?;
+    let raw = content.lines().nth((line - 1) as usize)?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if raw.chars().count() > CALL_SITE_PREVIEW_MAX_CHARS {
+        Some(format!(
+            "{}…",
+            raw.chars()
+                .take(CALL_SITE_PREVIEW_MAX_CHARS)
+                .collect::<String>()
+        ))
+    } else {
+        Some(raw.to_string())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1218,10 +1271,19 @@ struct EditContextParams {
 }
 
 #[derive(Serialize, JsonSchema)]
+struct BlastRadiusInfo {
+    transitive: i64,
+    files_affected: Vec<String>,
+}
+
+#[derive(Serialize, JsonSchema)]
 struct EditContextOutput {
     symbol: String,
+    edges_ready: bool,
+    index_freshness: String,
     callers: Vec<CallerEntry>,
     callees: Vec<CalleeEntry>,
+    blast_radius: BlastRadiusInfo,
     #[serde(skip_serializing_if = "Option::is_none")]
     risk_assessment: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1515,6 +1577,72 @@ impl CodeIntelligenceServer {
                 .filter_map(|r| r.ok())
                 .collect();
 
+            const ENTRY_POINTS_LIMIT: usize = 20;
+            let entry_points: Vec<EntryPointItem> = {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT qualified_name, path FROM symbols \
+                         WHERE is_entry_point = 1 LIMIT ?1",
+                    )
+                    .unwrap();
+                stmt.query_map(rusqlite::params![ENTRY_POINTS_LIMIT as i64], |r| {
+                    Ok(EntryPointItem {
+                        qualified_name: r.get(0)?,
+                        path: r.get(1)?,
+                    })
+                })
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect()
+            };
+
+            // Top-level directory (or bare filename for root files) of each
+            // indexed file, grouped to give a coarse architectural map.
+            let module_map: Vec<ModuleEntry> = {
+                let mut stmt = conn
+                    .prepare("SELECT path, symbol_count FROM file_index")
+                    .unwrap();
+                let rows: Vec<(String, i64)> = stmt
+                    .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+                    .unwrap()
+                    .filter_map(|r| r.ok())
+                    .collect();
+
+                let mut by_module: std::collections::BTreeMap<String, (i64, i64)> =
+                    std::collections::BTreeMap::new();
+                for (path, symbol_count) in rows {
+                    let module = path
+                        .split('/')
+                        .next()
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or(&path)
+                        .to_string();
+                    let entry = by_module.entry(module).or_insert((0, 0));
+                    entry.0 += 1;
+                    entry.1 += symbol_count;
+                }
+                let mut modules: Vec<ModuleEntry> = by_module
+                    .into_iter()
+                    .map(|(name, (file_count, symbol_count))| ModuleEntry {
+                        name,
+                        file_count,
+                        symbol_count,
+                    })
+                    .collect();
+                modules.sort_by(|a, b| b.file_count.cmp(&a.file_count).then(a.name.cmp(&b.name)));
+                modules
+            };
+
+            let hub_count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM symbols WHERE is_hub = 1", [], |r| {
+                    r.get(0)
+                })
+                .unwrap_or(0);
+            let health_summary = HealthSummary {
+                hub_count,
+                edges_ready: self.edges_ready(),
+            };
+
             let phase = self.phase_str();
             let embed_status = self.embed_status_str();
             let sn = if phase != "ready" {
@@ -1533,6 +1661,9 @@ impl CodeIntelligenceServer {
                 total_symbols,
                 total_files,
                 truncated: false,
+                entry_points,
+                module_map,
+                health_summary,
                 workflow_guide: r#"WORKFLOW (8 stages) — follow suggested_next in every response:
 1 ORIENT   : repo_overview (ALWAYS first) → hotspots
 2 LOCATE   : locate(query) [= search+file_overview+symbol_info in 1 call] | search(kind="hybrid") | file_overview(path)
@@ -1783,15 +1914,19 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
             let direct: Vec<CallerEntry> = {
                 let mut stmt = conn
                     .prepare(
-                        "SELECT from_symbol, from_path, edge_confidence
+                        "SELECT from_symbol, from_path, edge_confidence, call_site_line
                          FROM call_edges WHERE to_symbol = ?1",
                     )
                     .unwrap();
                 stmt.query_map(rusqlite::params![c.qualified_name], |row| {
+                    let path: String = row.get::<_, String>(1).unwrap_or_default();
+                    let line: Option<i64> = row.get(3)?;
                     Ok(CallerEntry {
                         symbol: row.get(0)?,
-                        path: row.get::<_, String>(1).unwrap_or_default(),
+                        preview: line_preview(&self.project_root, &path, line),
+                        path,
                         edge_confidence: row.get(2)?,
+                        line,
                     })
                 })
                 .unwrap()
@@ -1799,21 +1934,23 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
                 .collect()
             };
 
-            let transitive = if p.transitive {
+            let (transitive, transitive_count, transitive_capped) = if p.transitive {
                 let config = ci_core::config::load_config(&self.project_root).unwrap_or_default();
                 let max_depth = p
                     .max_depth
                     .map(|d| (d.max(1) as usize).min(config.callers.max_depth_cap))
                     .unwrap_or(config.callers.max_depth_cap);
-                Some(transitive_bfs(
+                let (entries, capped) = transitive_bfs(
                     &conn,
                     &c.qualified_name,
                     EdgeDirection::Callers,
                     max_depth,
                     config.callers.transitive_timeout_ms,
-                ))
+                );
+                let count = entries.len();
+                (Some(entries), Some(count), Some(capped))
             } else {
-                None
+                (None, None, None)
             };
 
             let count = direct.len();
@@ -1834,9 +1971,12 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
             };
             serde_json::to_string_pretty(&CallersOutput {
                 symbol: p.symbol,
+                edges_ready: self.edges_ready(),
                 direct,
                 direct_count: count,
                 transitive,
+                transitive_count,
+                transitive_capped,
                 suggested_next: self.filter_sn(sn),
             })
             .unwrap_or_default()
@@ -1866,15 +2006,21 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
             let direct: Vec<CalleeEntry> = {
                 let mut stmt = conn
                     .prepare(
-                        "SELECT to_symbol, to_path, edge_confidence
+                        "SELECT to_symbol, to_path, edge_confidence, call_site_line
                          FROM call_edges WHERE from_symbol = ?1",
                     )
                     .unwrap();
+                // The call site lives in the symbol being inspected (`c.path`),
+                // not in the callee's own file (`to_path`).
+                let from_path = c.path.clone();
                 stmt.query_map(rusqlite::params![c.qualified_name], |row| {
+                    let line: Option<i64> = row.get(3)?;
                     Ok(CalleeEntry {
                         symbol: row.get(0)?,
                         path: row.get::<_, String>(1).unwrap_or_default(),
                         edge_confidence: row.get(2)?,
+                        preview: line_preview(&self.project_root, &from_path, line),
+                        line,
                     })
                 })
                 .unwrap()
@@ -1882,21 +2028,23 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
                 .collect()
             };
 
-            let transitive = if p.transitive {
+            let (transitive, transitive_count, transitive_capped) = if p.transitive {
                 let config = ci_core::config::load_config(&self.project_root).unwrap_or_default();
                 let max_depth = p
                     .max_depth
                     .map(|d| (d.max(1) as usize).min(config.callees.max_depth_cap))
                     .unwrap_or(config.callees.max_depth_cap);
-                Some(transitive_bfs(
+                let (entries, capped) = transitive_bfs(
                     &conn,
                     &c.qualified_name,
                     EdgeDirection::Callees,
                     max_depth,
                     config.callees.transitive_timeout_ms,
-                ))
+                );
+                let count = entries.len();
+                (Some(entries), Some(count), Some(capped))
             } else {
-                None
+                (None, None, None)
             };
 
             let count = direct.len();
@@ -1907,9 +2055,12 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
             };
             serde_json::to_string_pretty(&CalleesOutput {
                 symbol: p.symbol,
+                edges_ready: self.edges_ready(),
                 direct,
                 direct_count: count,
                 transitive,
+                transitive_count,
+                transitive_capped,
                 suggested_next: self.filter_sn(sn),
             })
             .unwrap_or_default()
@@ -2096,15 +2247,19 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
             let callers: Vec<CallerEntry> = {
                 let mut stmt = conn
                     .prepare(
-                        "SELECT from_symbol, from_path, edge_confidence
+                        "SELECT from_symbol, from_path, edge_confidence, call_site_line
                          FROM call_edges WHERE to_symbol = ?1",
                     )
                     .unwrap();
                 stmt.query_map(rusqlite::params![c.qualified_name], |row| {
+                    let path: String = row.get::<_, String>(1).unwrap_or_default();
+                    let line: Option<i64> = row.get(3)?;
                     Ok(CallerEntry {
                         symbol: row.get(0)?,
-                        path: row.get::<_, String>(1).unwrap_or_default(),
+                        preview: line_preview(&self.project_root, &path, line),
+                        path,
                         edge_confidence: row.get(2)?,
+                        line,
                     })
                 })
                 .unwrap()
@@ -2115,20 +2270,43 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
             let callees: Vec<CalleeEntry> = {
                 let mut stmt = conn
                     .prepare(
-                        "SELECT to_symbol, to_path, edge_confidence
+                        "SELECT to_symbol, to_path, edge_confidence, call_site_line
                          FROM call_edges WHERE from_symbol = ?1",
                     )
                     .unwrap();
+                let from_path = c.path.clone();
                 stmt.query_map(rusqlite::params![c.qualified_name], |row| {
+                    let line: Option<i64> = row.get(3)?;
                     Ok(CalleeEntry {
                         symbol: row.get(0)?,
                         path: row.get::<_, String>(1).unwrap_or_default(),
                         edge_confidence: row.get(2)?,
+                        preview: line_preview(&self.project_root, &from_path, line),
+                        line,
                     })
                 })
                 .unwrap()
                 .filter_map(|r| r.ok())
                 .collect()
+            };
+
+            let blast_radius = {
+                let config = ci_core::config::load_config(&self.project_root).unwrap_or_default();
+                let (entries, _capped) = transitive_bfs(
+                    &conn,
+                    &c.qualified_name,
+                    EdgeDirection::Callers,
+                    config.callers.max_depth_cap,
+                    config.callers.transitive_timeout_ms,
+                );
+                let mut files_affected: Vec<String> =
+                    entries.iter().map(|e| e.path.clone()).collect();
+                files_affected.sort();
+                files_affected.dedup();
+                BlastRadiusInfo {
+                    transitive: entries.len() as i64,
+                    files_affected,
+                }
             };
 
             let risk = if callers.len() > 10 {
@@ -2141,8 +2319,11 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
 
             serde_json::to_string_pretty(&EditContextOutput {
                 symbol: p.symbol,
+                edges_ready: self.edges_ready(),
+                index_freshness: self.phase_str(),
                 callers,
                 callees,
+                blast_radius,
                 risk_assessment: risk,
                 suggested_next: self.filter_sn(suggested(
                     "diff_impact",
@@ -2761,15 +2942,19 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
                 .map(|(info, _)| {
                     let mut stmt = conn
                         .prepare(
-                            "SELECT from_symbol, from_path, edge_confidence
+                            "SELECT from_symbol, from_path, edge_confidence, call_site_line
                              FROM call_edges WHERE to_symbol = ?1",
                         )
                         .unwrap();
                     stmt.query_map(rusqlite::params![info.qualified_name], |row| {
+                        let path: String = row.get::<_, String>(1).unwrap_or_default();
+                        let line: Option<i64> = row.get(3)?;
                         Ok(CallerEntry {
                             symbol: row.get(0)?,
-                            path: row.get::<_, String>(1).unwrap_or_default(),
+                            preview: line_preview(&self.project_root, &path, line),
+                            path,
                             edge_confidence: row.get(2)?,
+                            line,
                         })
                     })
                     .unwrap()
@@ -2905,6 +3090,201 @@ mod tests {
 
         assert_eq!(v["unindexed_files"], serde_json::json!(["src/new.rs"]));
         assert_eq!(v["aggregate_risk"], "unknown");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression for Task 10 (schema drift): `repo_overview` used to omit
+    /// `entry_points`, `module_map`, and `health_summary` entirely.
+    #[test]
+    fn repo_overview_includes_entry_points_module_map_and_health_summary() {
+        let dir = std::env::temp_dir().join(format!("ci_repo_overview_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('src.main', 'main', 'function', 'rust', 'src/main.rs', 1, 1, '', '', 'main', 0, 0, 1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('src.helper', 'helper', 'function', 'rust', 'src/lib.rs', 1, 1, '', '', 'helper', 1, 1, 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO file_index (path, hash, language, symbol_count, last_indexed) \
+                 VALUES ('src/main.rs', 'h1', 'rust', 1, 0.0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO file_index (path, hash, language, symbol_count, last_indexed) \
+                 VALUES ('src/lib.rs', 'h2', 'rust', 1, 0.0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO file_index (path, hash, language, symbol_count, last_indexed) \
+                 VALUES ('README.md', 'h3', NULL, 0, 0.0)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let output = server.repo_overview();
+        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+        assert_eq!(v["entry_points"].as_array().unwrap().len(), 1);
+        assert_eq!(v["entry_points"][0]["qualified_name"], "src.main");
+
+        let modules = v["module_map"].as_array().unwrap();
+        assert_eq!(modules[0]["name"], "src");
+        assert_eq!(modules[0]["file_count"], 2);
+        assert!(
+            modules.iter().any(|m| m["name"] == "README.md"),
+            "root-level file should appear under its own filename, got: {modules:?}"
+        );
+
+        assert_eq!(v["health_summary"]["hub_count"], 1);
+        assert_eq!(v["health_summary"]["edges_ready"], false);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression for Task 9 (schema drift): `callers` used to drop
+    /// `call_site_line` even though `call_edges` always had the column, and
+    /// never surfaced `edges_ready`/`transitive_count`/`transitive_capped`.
+    #[test]
+    fn callers_includes_call_site_line_preview_and_edges_ready() {
+        let dir = std::env::temp_dir().join(format!("ci_callers_line_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/caller.rs"), "fn bar() {\n    foo();\n}\n").unwrap();
+        let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('mod.foo', 'foo', 'function', 'rust', 'src/lib.rs', 1, 1, 'fn foo()', '', 'foo', 1, 0, 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO call_edges (from_symbol, to_symbol, from_path, to_path, edge_confidence, call_site_line)
+                 VALUES ('mod.bar', 'mod.foo', 'src/caller.rs', 'src/lib.rs', 'resolved', 2)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let output = server.callers(Parameters(CallersParams {
+            symbol: "foo".into(),
+            path: None,
+            transitive: false,
+            max_depth: None,
+        }));
+        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+        assert_eq!(v["edges_ready"], false, "edges not built yet in this test");
+        assert_eq!(v["direct"][0]["line"], 2);
+        assert_eq!(v["direct"][0]["preview"], "foo();");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression for Task 9: `transitive_count`/`transitive_capped` must
+    /// reflect the actual BFS outcome, not be silently absent.
+    #[test]
+    fn callers_transitive_reports_count_and_not_capped() {
+        let dir = std::env::temp_dir().join(format!("ci_callers_trans_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        {
+            let conn = server.db();
+            for (qn, name) in [("mod.a", "a"), ("mod.b", "b"), ("mod.c", "c")] {
+                conn.execute(
+                    "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                     VALUES (?1, ?2, 'function', 'rust', 'src/lib.rs', 1, 1, '', '', ?2, 0, 0, 0)",
+                    rusqlite::params![qn, name],
+                )
+                .unwrap();
+            }
+            // c -> b -> a (a is the target; b is a direct caller, c is transitive depth 2)
+            conn.execute(
+                "INSERT INTO call_edges (from_symbol, to_symbol, edge_confidence) VALUES ('mod.b', 'mod.a', 'resolved')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO call_edges (from_symbol, to_symbol, edge_confidence) VALUES ('mod.c', 'mod.b', 'resolved')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let output = server.callers(Parameters(CallersParams {
+            symbol: "a".into(),
+            path: None,
+            transitive: true,
+            max_depth: Some(5),
+        }));
+        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+        assert_eq!(v["transitive_count"], 2, "b at depth 1, c at depth 2");
+        assert_eq!(v["transitive_capped"], false);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression for Task 11 (schema drift): `edit_context` used to omit
+    /// `blast_radius`, `edges_ready`, and `index_freshness` entirely.
+    #[test]
+    fn edit_context_includes_blast_radius_and_freshness() {
+        let dir = std::env::temp_dir().join(format!("ci_editctx_blast_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        {
+            let conn = server.db();
+            for (qn, name, path) in [("mod.a", "a", "src/a.rs"), ("mod.b", "b", "src/b.rs")] {
+                conn.execute(
+                    "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                     VALUES (?1, ?2, 'function', 'rust', ?3, 1, 1, '', '', ?2, 0, 0, 0)",
+                    rusqlite::params![qn, name, path],
+                )
+                .unwrap();
+            }
+            conn.execute(
+                "INSERT INTO call_edges (from_symbol, to_symbol, from_path, to_path, edge_confidence)
+                 VALUES ('mod.b', 'mod.a', 'src/b.rs', 'src/a.rs', 'resolved')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let output = server.edit_context(Parameters(EditContextParams {
+            symbol: "a".into(),
+            path: None,
+        }));
+        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+        assert_eq!(v["blast_radius"]["transitive"], 1);
+        assert_eq!(
+            v["blast_radius"]["files_affected"],
+            serde_json::json!(["src/b.rs"])
+        );
+        assert_eq!(v["index_freshness"], "scanning");
+        assert_eq!(v["edges_ready"], false);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -29,6 +29,42 @@ impl RiskOrder {
     }
 }
 
+/// Run `cmd` with `args` in `dir`, aborting the wait after `timeout_secs`.
+/// `Command::output()` blocks indefinitely with no built-in timeout, so the
+/// actual process is spawned on a background thread and the caller waits on
+/// a channel with `recv_timeout`. On timeout the spawned thread (and the
+/// child process it's blocked on) is simply abandoned — it finishes in the
+/// background and its result is dropped when the channel's receiver is gone,
+/// since a single `git diff` isn't worth the extra complexity of
+/// process-group kill plumbing.
+fn run_with_timeout(
+    cmd: &str,
+    args: Vec<String>,
+    dir: &Path,
+    timeout_secs: u64,
+) -> Result<std::process::Output, String> {
+    let cmd_name = cmd.to_string();
+    let spawn_cmd = cmd_name.clone();
+    let dir = dir.to_path_buf();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = Command::new(&spawn_cmd)
+            .args(&args)
+            .current_dir(&dir)
+            .output();
+        let _ = tx.send(result);
+    });
+
+    match rx.recv_timeout(std::time::Duration::from_secs(timeout_secs)) {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err(format!("{cmd_name} not found in PATH"))
+        }
+        Ok(Err(e)) => Err(format!("failed to run {cmd_name}: {e}")),
+        Err(_) => Err(format!("{cmd_name} timed out after {timeout_secs}s")),
+    }
+}
+
 pub fn get_git_diff(
     project_root: &Path,
     staged: bool,
@@ -46,12 +82,7 @@ pub fn get_git_diff(
         );
     };
 
-    let result = Command::new("git")
-        .args(&cmd_args)
-        .current_dir(project_root)
-        .output();
-
-    match result {
+    match run_with_timeout("git", cmd_args, project_root, timeout_secs) {
         Ok(output) if output.status.success() => (
             Some(String::from_utf8_lossy(&output.stdout).to_string()),
             None,
@@ -65,13 +96,7 @@ pub fn get_git_diff(
             };
             (None, Some(msg))
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            (None, Some("git not found in PATH".into()))
-        }
-        Err(_) => (
-            None,
-            Some(format!("git diff timed out after {timeout_secs}s")),
-        ),
+        Err(msg) => (None, Some(msg)),
     }
 }
 
@@ -308,6 +333,36 @@ mod tests {
         let (diff, err) = get_git_diff(dir.path(), false, None, 10);
         assert!(diff.is_none());
         assert!(err.is_some());
+    }
+
+    /// Regression for W7: `Command::output()` blocks indefinitely with no
+    /// built-in timeout. Uses `/bin/sleep` directly (bypassing PATH/git
+    /// entirely) so the test is deterministic and doesn't depend on git
+    /// being slow or on mutating global process state like PATH/env.
+    #[test]
+    fn test_run_with_timeout_aborts_on_slow_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let start = std::time::Instant::now();
+        let result = run_with_timeout("/bin/sleep", vec!["5".into()], dir.path(), 1);
+        let elapsed = start.elapsed();
+
+        assert!(result.is_err(), "expected timeout error, got {result:?}");
+        assert!(
+            result.unwrap_err().contains("timed out"),
+            "error message should mention the timeout"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "should return well before the 5s sleep completes, took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn test_run_with_timeout_returns_output_for_fast_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = run_with_timeout("/bin/sleep", vec!["0".into()], dir.path(), 5);
+        let output = result.unwrap();
+        assert!(output.status.success());
     }
 
     #[test]

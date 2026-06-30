@@ -58,13 +58,36 @@ pub fn load_coverage(project_root: &Path) -> CoverageData {
     CoverageData::none()
 }
 
+/// Normalize a joined path into a stable string key for coverage lookups.
+/// Canonicalizes when the path exists on disk (resolves symlinks and `.`/`..`
+/// segments consistently with the lookup side in `build_health`); otherwise
+/// manually collapses `.`/`..` components so a `./src/foo.py`-style `SF:`
+/// entry still matches a plain `project_root.join("src/foo.py")` key.
+pub fn normalize_path(path: &Path) -> String {
+    if let Ok(canon) = path.canonicalize() {
+        return canon.to_string_lossy().to_string();
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized.to_string_lossy().to_string()
+}
+
 fn resolve_path(raw: &str, project_root: &Path) -> String {
     let p = PathBuf::from(raw);
-    if p.is_absolute() {
-        raw.to_string()
+    let joined = if p.is_absolute() {
+        p
     } else {
-        project_root.join(raw).to_string_lossy().to_string()
-    }
+        project_root.join(&p)
+    };
+    normalize_path(&joined)
 }
 
 fn parse_lcov(path: &Path, project_root: &Path) -> anyhow::Result<CoverageData> {
@@ -311,6 +334,51 @@ mod tests {
         assert!(cov.is_covered("/foo.py", 10, 10));
         assert!(!cov.is_covered("/foo.py", 6, 9));
         assert!(!cov.is_covered("/bar.py", 1, 100));
+    }
+
+    #[test]
+    fn test_normalize_path_strips_dot_segments_when_not_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let messy = dir.path().join("./sub/../sub/file.py");
+        let normalized = normalize_path(&messy);
+        assert_eq!(normalized, dir.path().join("sub/file.py").to_string_lossy());
+    }
+
+    #[test]
+    fn test_normalize_path_canonicalizes_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("sub")).unwrap();
+        fs::write(dir.path().join("sub/file.py"), "x").unwrap();
+        let messy = dir.path().join("./sub/../sub/file.py");
+        let normalized = normalize_path(&messy);
+        let canonical = dir
+            .path()
+            .join("sub/file.py")
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        assert_eq!(normalized, canonical);
+    }
+
+    /// Regression for B2: some LCOV tools emit `SF:./path` while the lookup
+    /// side joins `project_root` with a plain (no `./`) symbol path — both
+    /// must normalize to the same key or coverage lookups silently miss.
+    #[test]
+    fn test_parse_lcov_dot_slash_prefix_matches_plain_join() {
+        let dir = tempfile::tempdir().unwrap();
+        let lcov = dir.path().join("lcov.info");
+        fs::write(&lcov, "SF:./src/main.rs\nDA:1,1\nend_of_record\n").unwrap();
+        let data = parse_lcov(&lcov, dir.path()).unwrap();
+
+        let lookup_key = normalize_path(&dir.path().join("src/main.rs"));
+        let lines = data.covered_lines.get(&lookup_key).unwrap_or_else(|| {
+            panic!(
+                "./-prefixed SF: path didn't match plain-joined lookup key. keys: {:?}",
+                data.covered_lines.keys().collect::<Vec<_>>()
+            )
+        });
+        assert!(lines.contains(&1));
     }
 
     #[test]

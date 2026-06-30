@@ -2,6 +2,13 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+use crate::analysis::coverage::{CoverageData, normalize_path};
+use crate::analysis::dead_code::{
+    compute_dead_code_confidence, is_private_symbol, scope_clear_for_language,
+};
+use crate::analysis::hotspot::compute_hotspots;
+use crate::config::HotspotsConfig;
+
 // ---------------------------------------------------------------------------
 // Thresholds
 // ---------------------------------------------------------------------------
@@ -58,7 +65,15 @@ pub struct FitnessMetrics {
     pub edge_coverage_pct: f64,
 }
 
-pub fn collect_metrics(conn: &Connection) -> rusqlite::Result<FitnessMetrics> {
+/// Row shape needed to re-run `compute_dead_code_confidence` per symbol:
+/// (path, line_start, line_end, caller_count, is_entry_point, language, name, signature).
+type DeadCodeRow = (String, i64, i64, i64, bool, String, String, String);
+
+pub fn collect_metrics(
+    conn: &Connection,
+    project_root: &Path,
+    coverage: &CoverageData,
+) -> rusqlite::Result<FitnessMetrics> {
     let hub_count: i64 = conn
         .query_row("SELECT COUNT(*) FROM symbols WHERE is_hub = 1", [], |r| {
             r.get(0)
@@ -90,11 +105,73 @@ pub fn collect_metrics(conn: &Connection) -> rusqlite::Result<FitnessMetrics> {
         100.0
     };
 
+    let dead_code_pct = if total_symbols > 0 {
+        let mut stmt = conn.prepare(
+            "SELECT path, line_start, line_end, COALESCE(caller_count, 0), is_entry_point, \
+             language, name, signature FROM symbols",
+        )?;
+        let rows: Vec<DeadCodeRow> = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, i64>(4)? != 0,
+                    r.get::<_, String>(5)?,
+                    r.get::<_, String>(6)?,
+                    r.get::<_, String>(7)?,
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let high_confidence_dead = rows
+            .iter()
+            .filter(
+                |(path, line_start, line_end, caller_count, is_entry, lang, name, sig)| {
+                    let abs_path = normalize_path(&project_root.join(path));
+                    let is_private = is_private_symbol(lang, name, sig);
+                    let scope_clear = scope_clear_for_language(lang);
+                    let (confidence, _) = compute_dead_code_confidence(
+                        &abs_path,
+                        *line_start,
+                        *line_end,
+                        *caller_count,
+                        *is_entry,
+                        is_private,
+                        scope_clear,
+                        coverage,
+                    );
+                    confidence == "high"
+                },
+            )
+            .count();
+
+        100.0 * high_confidence_dead as f64 / rows.len().max(1) as f64
+    } else {
+        0.0
+    };
+
+    let hotspot_risk = compute_hotspots(
+        project_root,
+        conn,
+        &HotspotsConfig::default(),
+        1,
+        &HotspotsConfig::default().default_since,
+        0,
+        false,
+    )
+    .hotspots
+    .first()
+    .map(|h| h.hotspot_score)
+    .unwrap_or(0.0);
+
     Ok(FitnessMetrics {
         hub_count,
         avg_coreness,
-        dead_code_pct: 0.0,
-        hotspot_risk: 0.0,
+        dead_code_pct,
+        hotspot_risk,
         edge_coverage_pct,
     })
 }
@@ -122,8 +199,10 @@ pub struct FitnessCheckResult {
 pub fn run_fitness_check(
     conn: &Connection,
     thresholds: &FitnessThresholds,
+    project_root: &Path,
+    coverage: &CoverageData,
 ) -> rusqlite::Result<FitnessCheckResult> {
-    let metrics = collect_metrics(conn)?;
+    let metrics = collect_metrics(conn, project_root, coverage)?;
     let mut checks = Vec::new();
 
     checks.push(FitnessCheckItem {
@@ -154,7 +233,7 @@ pub fn run_fitness_check(
         threshold: thresholds.max_dead_code_pct,
         passed: metrics.dead_code_pct <= thresholds.max_dead_code_pct,
         message: format!(
-            "Dead code {:.1}% (max {:.1}%) [stub]",
+            "Dead code {:.1}% (max {:.1}%)",
             metrics.dead_code_pct, thresholds.max_dead_code_pct
         ),
     });
@@ -165,7 +244,7 @@ pub fn run_fitness_check(
         threshold: thresholds.max_hotspot_risk,
         passed: metrics.hotspot_risk <= thresholds.max_hotspot_risk,
         message: format!(
-            "Max hotspot risk {:.2} (max {:.2}) [stub]",
+            "Max hotspot risk {:.2} (max {:.2})",
             metrics.hotspot_risk, thresholds.max_hotspot_risk
         ),
     });
@@ -259,7 +338,13 @@ mod tests {
     fn test_fitness_check_empty_db_passes() {
         let conn = test_conn();
         let thresholds = FitnessThresholds::default();
-        let result = run_fitness_check(&conn, &thresholds).unwrap();
+        let result = run_fitness_check(
+            &conn,
+            &thresholds,
+            &std::env::temp_dir(),
+            &CoverageData::none(),
+        )
+        .unwrap();
         assert!(result.passed, "Empty DB should pass all checks");
         assert_eq!(result.checks.len(), 5);
     }
@@ -280,7 +365,13 @@ mod tests {
         )
         .unwrap();
 
-        let result = run_fitness_check(&conn, &thresholds).unwrap();
+        let result = run_fitness_check(
+            &conn,
+            &thresholds,
+            &std::env::temp_dir(),
+            &CoverageData::none(),
+        )
+        .unwrap();
         assert!(!result.passed);
         let check = result
             .checks
@@ -310,7 +401,13 @@ mod tests {
             .unwrap();
         }
 
-        let result = run_fitness_check(&conn, &thresholds).unwrap();
+        let result = run_fitness_check(
+            &conn,
+            &thresholds,
+            &std::env::temp_dir(),
+            &CoverageData::none(),
+        )
+        .unwrap();
         assert!(!result.passed);
         let check = result
             .checks
@@ -319,6 +416,62 @@ mod tests {
             .unwrap();
         assert!(!check.passed);
         assert_eq!(check.value, 0.0);
+    }
+
+    #[test]
+    fn test_dead_code_pct_counts_high_confidence_dead_symbols() {
+        let conn = test_conn();
+        // private (no leading-underscore check fails for python — use a name
+        // that signals private + no callers + not an entry point: "high".
+        conn.execute(
+            "INSERT INTO symbols (qualified_name, name, kind, language, path, \
+             line_start, line_end, signature, indexed_at) \
+             VALUES ('mod._helper', '_helper', 'function', 'python', 'mod.py', 1, 5, 'def _helper():', 0.0)",
+            [],
+        )
+        .unwrap();
+        // Has a caller — never dead regardless of privacy.
+        conn.execute(
+            "INSERT INTO symbols (qualified_name, name, kind, language, path, \
+             line_start, line_end, signature, caller_count, indexed_at) \
+             VALUES ('mod.used', 'used', 'function', 'python', 'mod.py', 10, 15, 'def used():', 1, 0.0)",
+            [],
+        )
+        .unwrap();
+
+        let metrics = collect_metrics(&conn, &std::env::temp_dir(), &CoverageData::none()).unwrap();
+        assert_eq!(
+            metrics.dead_code_pct, 50.0,
+            "1 of 2 symbols (the private, callerless one) should be high-confidence dead"
+        );
+    }
+
+    #[test]
+    fn test_hotspot_risk_nonzero_with_complexity_signal() {
+        let conn = test_conn();
+        // Two files; only `busy.py` has a hub symbol, so index-only complexity
+        // ranking (no git repo at temp_dir) should normalize it to score 1.0.
+        conn.execute(
+            "INSERT INTO symbols (qualified_name, name, kind, language, path, \
+             line_start, line_end, is_hub, indexed_at) \
+             VALUES ('busy.foo', 'foo', 'function', 'python', 'busy.py', 1, 5, 1, 0.0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO symbols (qualified_name, name, kind, language, path, \
+             line_start, line_end, indexed_at) \
+             VALUES ('quiet.bar', 'bar', 'function', 'python', 'quiet.py', 1, 5, 0.0)",
+            [],
+        )
+        .unwrap();
+
+        let metrics = collect_metrics(&conn, &std::env::temp_dir(), &CoverageData::none()).unwrap();
+        assert!(
+            metrics.hotspot_risk > 0.0,
+            "hub-heavy file should produce a nonzero hotspot risk, got {}",
+            metrics.hotspot_risk
+        );
     }
 
     #[test]
@@ -344,10 +497,16 @@ mod tests {
         )
         .unwrap();
 
-        let metrics = collect_metrics(&conn).unwrap();
+        let metrics = collect_metrics(&conn, &std::env::temp_dir(), &CoverageData::none()).unwrap();
         assert_eq!(metrics.edge_coverage_pct, 50.0);
 
-        let result = run_fitness_check(&conn, &thresholds).unwrap();
+        let result = run_fitness_check(
+            &conn,
+            &thresholds,
+            &std::env::temp_dir(),
+            &CoverageData::none(),
+        )
+        .unwrap();
         let check = result
             .checks
             .iter()

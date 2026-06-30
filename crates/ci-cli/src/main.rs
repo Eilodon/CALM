@@ -145,7 +145,8 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|_| rusqlite::Connection::open_in_memory().expect("in-memory DB"));
             ci_core::db::schema::init_db(&conn)?;
 
-            let result = ci_core::fitness::run_fitness_check(&conn, &thresholds)?;
+            let coverage = ci_core::analysis::coverage::load_coverage(&root);
+            let result = ci_core::fitness::run_fitness_check(&conn, &thresholds, &root, &coverage)?;
 
             if json {
                 println!("{}", serde_json::to_string_pretty(&result)?);

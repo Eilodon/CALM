@@ -1,5 +1,29 @@
 use super::coverage::CoverageData;
 
+/// Best-effort "is this symbol private/internal" signal from name + signature
+/// conventions, per tier-0 language. Used only as a `dead_code_confidence`
+/// input — not stored, computed live from columns already in the index.
+pub fn is_private_symbol(language: &str, name: &str, signature: &str) -> bool {
+    match language {
+        "python" => name.starts_with('_'),
+        "rust" => !signature.contains("pub "),
+        "go" => name
+            .chars()
+            .next()
+            .map(|c| c.is_lowercase())
+            .unwrap_or(false),
+        "java" => signature.contains("private "),
+        "javascript" | "typescript" => !signature.contains("export"),
+        _ => false,
+    }
+}
+
+/// Whether `language` is a tier-0 language with full symbol extraction
+/// (vs. the generic textual-only fallback), per `get_lang_constants`.
+pub fn scope_clear_for_language(language: &str) -> bool {
+    crate::indexer::lang_constants::get_lang_constants(language).is_some()
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn compute_dead_code_confidence(
     symbol_path: &str,
