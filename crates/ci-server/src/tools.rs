@@ -440,6 +440,99 @@ fn ambiguous_json(candidates: &[CandidateRow]) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Frontier computation helper (for session_context)
+// ---------------------------------------------------------------------------
+
+fn compute_frontier_entries(
+    conn: &rusqlite::Connection,
+    explored_files: &[String],
+    explored_symbols: &[String],
+) -> Vec<FrontierEntry> {
+    use std::collections::HashSet;
+
+    let explored_set: HashSet<&str> = explored_files.iter().map(|s| s.as_str()).collect();
+
+    // Set A: files that import any explored file
+    let mut set_a: HashSet<String> = HashSet::new();
+    if !explored_files.is_empty() {
+        let placeholders: String = explored_files
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("?{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT DISTINCT from_path FROM import_edges \
+             WHERE to_path IN ({placeholders}) AND from_path IS NOT NULL"
+        );
+        if let Ok(mut stmt) = conn.prepare(&sql) {
+            let _ = stmt
+                .query_map(rusqlite::params_from_iter(explored_files.iter()), |row| {
+                    row.get::<_, String>(0)
+                })
+                .map(|rows| {
+                    for r in rows.flatten() {
+                        set_a.insert(r);
+                    }
+                });
+        }
+    }
+
+    // Set B: files containing callers of explored symbols
+    let mut set_b: HashSet<String> = HashSet::new();
+    if !explored_symbols.is_empty() {
+        let placeholders: String = explored_symbols
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("?{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT DISTINCT from_path FROM call_edges \
+             WHERE to_symbol IN ({placeholders}) AND from_path IS NOT NULL"
+        );
+        if let Ok(mut stmt) = conn.prepare(&sql) {
+            let _ = stmt
+                .query_map(rusqlite::params_from_iter(explored_symbols.iter()), |row| {
+                    row.get::<_, String>(0)
+                })
+                .map(|rows| {
+                    for r in rows.flatten() {
+                        set_b.insert(r);
+                    }
+                });
+        }
+    }
+
+    // Union minus already-explored; tag each with reason
+    let mut result: Vec<FrontierEntry> = set_a
+        .union(&set_b)
+        .filter(|p| !explored_set.contains(p.as_str()))
+        .map(|p| {
+            let in_a = set_a.contains(p);
+            let in_b = set_b.contains(p);
+            let reason = match (in_a, in_b) {
+                (true, true) => "both",
+                (true, false) => "imported_by_explored",
+                _ => "contains_callers_of_explored",
+            };
+            FrontierEntry { path: p.clone(), reason: reason.to_string() }
+        })
+        .collect();
+
+    // Deterministic order: "both" first, then by path
+    result.sort_by(|a, b| {
+        let rank = |r: &str| match r {
+            "both" => 0,
+            "imported_by_explored" => 1,
+            _ => 2,
+        };
+        rank(&a.reason).cmp(&rank(&b.reason)).then(a.path.cmp(&b.path))
+    });
+    result
+}
+
+// ---------------------------------------------------------------------------
 // Tool 1: repo_overview
 // ---------------------------------------------------------------------------
 
@@ -1010,11 +1103,19 @@ struct EditContextOutput {
 // ---------------------------------------------------------------------------
 
 #[derive(Serialize, JsonSchema)]
+struct FrontierEntry {
+    path: String,
+    reason: String, // "imported_by_explored" | "contains_callers_of_explored" | "both"
+}
+
+#[derive(Serialize, JsonSchema)]
 struct SessionContextOutput {
     tool_calls: u64,
     explored_symbols: Vec<String>,
     explored_files: Vec<String>,
     unique_files_explored: usize,
+    frontier: Vec<FrontierEntry>,
+    frontier_degraded: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     suggested_next: Option<SuggestedNext>,
 }
@@ -1873,14 +1974,45 @@ impl CodeIntelligenceServer {
     )]
     fn session_context(&self) -> String {
         self.timed_tool("session_context", || {
-            let log = self.session_log.lock().unwrap();
-            let explored_files: Vec<String> = log.explored_files.iter().cloned().collect();
+            // Release the lock before DB queries — avoid deadlock if db() is also contended.
+            let (tool_calls, explored_symbols, explored_files) = {
+                let log = self.session_log.lock().unwrap();
+                (
+                    log.tool_calls,
+                    log.explored_symbols.iter().cloned().collect::<Vec<_>>(),
+                    log.explored_files.iter().cloned().collect::<Vec<_>>(),
+                )
+            };
+
+            let edges_ready = self.edges_ready();
+            let (frontier, frontier_degraded) =
+                if !edges_ready || (explored_files.is_empty() && explored_symbols.is_empty()) {
+                    (vec![], !edges_ready)
+                } else {
+                    let conn = self.db();
+                    let frontier =
+                        compute_frontier_entries(&conn, &explored_files, &explored_symbols);
+                    (frontier, false)
+                };
+
+            let sn = if !frontier.is_empty() {
+                self.filter_sn(suggested_with_args(
+                    "file_overview",
+                    "Explore top frontier file",
+                    serde_json::json!({"path": frontier[0].path}),
+                ))
+            } else {
+                self.filter_sn(suggested("repo_overview", "Frontier exhausted — refresh map"))
+            };
+
             serde_json::to_string_pretty(&SessionContextOutput {
-                tool_calls: log.tool_calls,
-                explored_symbols: log.explored_symbols.iter().cloned().collect(),
+                tool_calls,
+                explored_symbols,
                 unique_files_explored: explored_files.len(),
                 explored_files,
-                suggested_next: self.filter_sn(suggested("repo_overview", "Refresh map")),
+                frontier,
+                frontier_degraded,
+                suggested_next: sn,
             })
             .unwrap_or_default()
         })
@@ -2604,6 +2736,65 @@ mod tests {
         assert_eq!(v["explored_symbols"], serde_json::json!(["mod.foo"]));
         assert_eq!(v["explored_files"], serde_json::json!(["src/foo.rs"]));
         assert_eq!(v["unique_files_explored"], 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_context_includes_frontier_field() {
+        let dir = std::env::temp_dir().join(format!("ci_sc_frontier_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        let output = server.session_context();
+        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+        assert!(v.get("frontier").is_some(), "frontier field must always be present, got: {v}");
+        assert!(v["frontier"].is_array(), "frontier must be an array");
+        assert!(v.get("frontier_degraded").is_some(), "frontier_degraded must always be present");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_context_frontier_degraded_when_edges_not_ready() {
+        let dir = std::env::temp_dir().join(format!("ci_sc_deg_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
+        // Phase starts at Scanning — edges_ready() returns false
+
+        let output = server.session_context();
+        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+        assert_eq!(
+            v["frontier_degraded"], true,
+            "frontier_degraded must be true when edges not ready, got: {v}"
+        );
+        assert!(
+            v["frontier"].as_array().unwrap().is_empty(),
+            "frontier must be empty when degraded"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_context_suggests_repo_overview_when_frontier_empty() {
+        let dir = std::env::temp_dir().join(format!("ci_sc_sn_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
+        // Fresh server: no explored context, empty frontier
+
+        let output = server.session_context();
+        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+        let sn = &v["suggested_next"];
+        if let Some(tool) = sn["tool"].as_str() {
+            assert_eq!(tool, "repo_overview", "With empty frontier, must suggest repo_overview");
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }
