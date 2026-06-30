@@ -29,6 +29,8 @@ pub struct CodeIntelligenceServer {
     embedder: Arc<RwLock<Option<Arc<Embedder>>>>,
     /// Embedding pipeline status, surfaced as `embeddings_status`.
     embed_status: Arc<RwLock<EmbedStatus>>,
+    /// Coverage data loaded once at startup from lcov/cobertura/etc files, if present.
+    coverage: Arc<ci_core::analysis::coverage::CoverageData>,
 }
 
 impl CodeIntelligenceServer {
@@ -38,6 +40,7 @@ impl CodeIntelligenceServer {
         }
         let conn = rusqlite::Connection::open(&db_path)?;
         ci_core::db::schema::init_db(&conn)?;
+        let coverage = ci_core::analysis::coverage::load_coverage(&project_root);
         Ok(Self {
             project_root,
             db_path,
@@ -45,6 +48,7 @@ impl CodeIntelligenceServer {
             phase: Arc::new(RwLock::new(IndexingPhase::Scanning)),
             embedder: Arc::new(RwLock::new(None)),
             embed_status: Arc::new(RwLock::new(EmbedStatus::Disabled)),
+            coverage: Arc::new(coverage),
         })
     }
 
@@ -176,6 +180,7 @@ struct CandidateRow {
     is_hub: bool,
     language: String,
     class_context: Option<String>,
+    is_entry_point: bool,
 }
 
 impl CandidateRow {
@@ -191,6 +196,7 @@ impl CandidateRow {
             docstring: Some(self.docstring.clone()).filter(|s| !s.is_empty()),
             caller_count: self.caller_count,
             is_hub: self.is_hub,
+            health: None,
         }
     }
 
@@ -218,10 +224,10 @@ fn resolve_symbol_candidates(
     path: Option<&str>,
 ) -> Vec<CandidateRow> {
     let sql = if path.is_some() {
-        "SELECT name, qualified_name, kind, path, line_start, line_end, signature, docstring, caller_count, is_hub, language, class_context
+        "SELECT name, qualified_name, kind, path, line_start, line_end, signature, docstring, caller_count, is_hub, language, class_context, is_entry_point
          FROM symbols WHERE name = ?1 AND path = ?2"
     } else {
-        "SELECT name, qualified_name, kind, path, line_start, line_end, signature, docstring, caller_count, is_hub, language, class_context
+        "SELECT name, qualified_name, kind, path, line_start, line_end, signature, docstring, caller_count, is_hub, language, class_context, is_entry_point
          FROM symbols WHERE name = ?1"
     };
 
@@ -244,6 +250,7 @@ fn resolve_symbol_candidates(
             is_hub: row.get::<_, i64>(9)? != 0,
             language: row.get(10)?,
             class_context: row.get(11)?,
+            is_entry_point: row.get::<_, i64>(12)? != 0,
         })
     };
 
@@ -454,6 +461,58 @@ struct SymbolInfoOutput {
     docstring: Option<String>,
     caller_count: i64,
     is_hub: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    health: Option<HealthOutput>,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct HealthOutput {
+    dead_code_confidence: String,
+    dead_code_source: String,
+}
+
+/// Best-effort "is this symbol private/internal" signal from name + signature
+/// conventions, per tier-0 language. Used only as a `dead_code_confidence`
+/// input — not stored, computed live from columns already in the index.
+fn is_private_symbol(language: &str, name: &str, signature: &str) -> bool {
+    match language {
+        "python" => name.starts_with('_'),
+        "rust" => !signature.contains("pub "),
+        "go" => name.chars().next().map(|c| c.is_lowercase()).unwrap_or(false),
+        "java" => signature.contains("private "),
+        "javascript" | "typescript" => !signature.contains("export"),
+        _ => false,
+    }
+}
+
+/// Whether `language` is a tier-0 language with full symbol extraction
+/// (vs. the generic textual-only fallback), per `get_lang_constants`.
+fn scope_clear_for_language(language: &str) -> bool {
+    ci_core::indexer::lang_constants::get_lang_constants(language).is_some()
+}
+
+fn build_health(
+    coverage: &ci_core::analysis::coverage::CoverageData,
+    project_root: &std::path::Path,
+    c: &CandidateRow,
+) -> HealthOutput {
+    let abs_path = project_root.join(&c.path).to_string_lossy().to_string();
+    let is_private = is_private_symbol(&c.language, &c.name, &c.signature);
+    let scope_clear = scope_clear_for_language(&c.language);
+    let (confidence, source) = ci_core::analysis::dead_code::compute_dead_code_confidence(
+        &abs_path,
+        c.line_start,
+        c.line_end,
+        c.caller_count,
+        c.is_entry_point,
+        is_private,
+        scope_clear,
+        coverage,
+    );
+    HealthOutput {
+        dead_code_confidence: confidence.to_string(),
+        dead_code_source: source.to_string(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1056,7 +1115,9 @@ impl CodeIntelligenceServer {
                 SymbolResolution::NotFound => not_found_json(&p.symbol),
                 SymbolResolution::Ambiguous(candidates) => ambiguous_json(&candidates),
                 SymbolResolution::Found(c) => {
-                    serde_json::to_string_pretty(&c.to_symbol_info()).unwrap_or_default()
+                    let mut out = c.to_symbol_info();
+                    out.health = Some(build_health(&self.coverage, &self.project_root, &c));
+                    serde_json::to_string_pretty(&out).unwrap_or_default()
                 }
             }
         })
@@ -1589,6 +1650,7 @@ impl CodeIntelligenceServer {
                                 docstring: row.get::<_, String>(7).ok().filter(|s| !s.is_empty()),
                                 caller_count: row.get(8)?,
                                 is_hub: row.get::<_, i64>(9)? != 0,
+                                health: None,
                             })
                         },
                     )
@@ -1697,6 +1759,7 @@ impl CodeIntelligenceServer {
                                 docstring: row.get::<_, String>(7).ok().filter(|s| !s.is_empty()),
                                 caller_count: row.get(8)?,
                                 is_hub: row.get::<_, i64>(9)? != 0,
+                                health: None,
                             })
                         },
                     )
