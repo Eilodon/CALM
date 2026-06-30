@@ -184,3 +184,26 @@ pub fn load_config(project_root: &Path) -> anyhow::Result<Config> {
 pub fn default_config_json() -> String {
     serde_json::to_string_pretty(&Config::default()).unwrap_or_default()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_preset_defaults_to_full() {
+        let config = Config::default();
+        assert_eq!(config.preset, "full");
+    }
+
+    #[test]
+    fn config_preset_from_json() {
+        let tmp = std::env::temp_dir().join(format!("ci_cfg_preset_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("config.json"), r#"{"preset": "orient"}"#).unwrap();
+
+        let config = crate::config::load_config(&tmp).unwrap();
+        assert_eq!(config.preset, "orient",
+            "config.json preset must be loaded, got: {}", config.preset);
+    }
+}

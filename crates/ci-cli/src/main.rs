@@ -23,9 +23,9 @@ enum Commands {
         /// Database file path
         #[arg(long)]
         db_path: Option<PathBuf>,
-        /// Tool preset: full (all 16 tools), orient, trace, edit
-        #[arg(long, default_value = "full")]
-        preset: String,
+        /// Tool preset to register. If not provided, uses preset from config.json (default: "full").
+        #[arg(long)]
+        preset: Option<String>,
     },
     /// One-shot index of the project (stub)
     Index {
@@ -79,8 +79,11 @@ async fn main() -> Result<()> {
         } => {
             let root = std::fs::canonicalize(&project_root)?;
             let db = db_path.unwrap_or_else(|| ci_server::default_db_path(&root));
-            tracing::info!("Starting MCP server for {} (preset={})", root.display(), preset);
-            ci_server::serve_stdio_with_preset(root, db, preset).await?;
+            // CLI flag takes precedence; fall back to config.json value (default: "full")
+            let config = ci_core::config::load_config(&root).unwrap_or_default();
+            let effective_preset = preset.unwrap_or_else(|| config.preset.clone());
+            tracing::info!("Starting MCP server for {} (preset={})", root.display(), effective_preset);
+            ci_server::serve_stdio_with_preset(root, db, effective_preset).await?;
         }
         Commands::Index { project_root } => {
             let root = std::fs::canonicalize(&project_root)?;
@@ -94,7 +97,8 @@ async fn main() -> Result<()> {
             }
             let mut conn = rusqlite::Connection::open(&db_path)?;
             ci_core::db::schema::init_db(&conn)?;
-            ci_core::indexer::pipeline::run_indexing_pipeline(&mut conn, &root)?;
+            let phase = std::sync::Arc::new(std::sync::RwLock::new(ci_core::types::IndexingPhase::Scanning));
+            ci_core::indexer::pipeline::run_indexing_pipeline(&mut conn, &root, phase)?;
             let symbol_count: i64 =
                 conn.query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0))?;
             let file_count: i64 =
