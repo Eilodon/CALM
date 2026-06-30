@@ -1291,8 +1291,16 @@ impl CodeIntelligenceServer {
                 total_symbols,
                 total_files,
                 truncated: false,
-                workflow_guide:
-                    "Use locate to find symbols, then source/callers/callees to explore.".into(),
+                workflow_guide: r#"WORKFLOW (8 stages) — follow suggested_next in every response:
+1 ORIENT   : repo_overview (ALWAYS first) → hotspots
+2 LOCATE   : locate(query) [= search+file_overview+symbol_info in 1 call] | search(kind="hybrid") | file_overview(path)
+3 INSPECT  : source(symbol) | understand(query) [= locate+source+callers in 1 call]
+4 TRACE    : callers / callees / path / dependencies — map blast radius
+5 PRE-EDIT : edit_context(symbol) — MANDATORY before ANY edit, never skip
+6 EDIT     : native file tools only
+7 VERIFY   : diff_impact(staged=true) — MANDATORY before commit/push, never skip
+8 RECOVER  : session_context() after 10+ calls | indexing_status() when index unclear
+RULES: Never use native grep/read on project files. is_hub:true → extra caution. Follow suggested_next."#.into(),
                 suggested_next: self.filter_sn(sn),
             })
             .unwrap_or_default()
