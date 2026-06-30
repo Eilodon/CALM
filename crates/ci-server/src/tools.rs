@@ -2791,10 +2791,98 @@ mod tests {
         let output = server.session_context();
         let v: serde_json::Value = serde_json::from_str(&output).unwrap();
 
-        let sn = &v["suggested_next"];
-        if let Some(tool) = sn["tool"].as_str() {
-            assert_eq!(tool, "repo_overview", "With empty frontier, must suggest repo_overview");
+        assert_eq!(
+            v["suggested_next"]["tool"].as_str(),
+            Some("repo_overview"),
+            "With empty frontier, must suggest repo_overview, got: {v}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_context_frontier_includes_import_and_call_edge_entries() {
+        let dir = std::env::temp_dir().join(format!("ci_sc_frontier_contract_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        // Advance phase to Ready so edges_ready() returns true and the frontier
+        // computation path is taken (not the degraded/empty fast path).
+        *server.phase_handle().write().unwrap() = IndexingPhase::Ready;
+
+        // Insert edge data directly into the DB on the same db_path.
+        {
+            let conn = rusqlite::Connection::open(dir.join("index.db")).unwrap();
+
+            // import_edges: b.rs imports a.rs
+            conn.execute(
+                "INSERT INTO import_edges (from_path, to_path, module_name) VALUES (?1, ?2, ?3)",
+                rusqlite::params!["src/b.rs", "src/a.rs", "a"],
+            ).unwrap();
+
+            // call_edges: c.rs has a caller of fn_a (which lives in a.rs)
+            conn.execute(
+                "INSERT INTO call_edges (from_symbol, to_symbol, from_path, to_path, edge_confidence) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    "pkg::c::fn_c", "pkg::a::fn_a", "src/c.rs", "src/a.rs", "formal"
+                ],
+            ).unwrap();
         }
+
+        // Register src/a.rs as explored so the frontier logic treats it as the
+        // "explored" anchor and looks for files that import it (Set A in
+        // compute_frontier_entries).
+        server.track_file("src/a.rs");
+        // Register pkg::a::fn_a as an explored symbol so the frontier logic finds
+        // files containing callers of that symbol via call_edges (Set B).
+        server.track_symbol("pkg::a::fn_a");
+
+        let output = server.session_context();
+        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+        // frontier_degraded must be false — edges are ready
+        assert_eq!(
+            v["frontier_degraded"], false,
+            "frontier_degraded must be false when edges ready, got: {v}"
+        );
+
+        let frontier = v["frontier"].as_array().expect("frontier must be an array");
+
+        // Both b.rs (imported_by_explored) and c.rs (contains_callers_of_explored)
+        // should appear in the frontier.
+        assert_eq!(
+            frontier.len(), 2,
+            "frontier must have 2 entries (b.rs and c.rs), got: {frontier:?}"
+        );
+
+        let find_entry = |path: &str| {
+            frontier.iter().find(|e| e["path"].as_str() == Some(path))
+        };
+
+        let b_entry = find_entry("src/b.rs")
+            .expect("src/b.rs must appear in frontier");
+        assert_eq!(
+            b_entry["reason"].as_str(),
+            Some("imported_by_explored"),
+            "src/b.rs reason must be imported_by_explored, got: {b_entry}"
+        );
+
+        let c_entry = find_entry("src/c.rs")
+            .expect("src/c.rs must appear in frontier");
+        assert_eq!(
+            c_entry["reason"].as_str(),
+            Some("contains_callers_of_explored"),
+            "src/c.rs reason must be contains_callers_of_explored, got: {c_entry}"
+        );
+
+        // With a non-empty frontier the suggested_next tool must be file_overview
+        assert_eq!(
+            v["suggested_next"]["tool"].as_str(),
+            Some("file_overview"),
+            "With non-empty frontier, must suggest file_overview, got: {v}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
