@@ -2248,11 +2248,15 @@ impl CodeIntelligenceServer {
             let sn = if let Some(sym) = top_symbol.as_ref() {
                 if sym.is_hub {
                     suggested_with_args("edit_context", "Hub detected — mandatory pre-edit check", serde_json::json!({"symbol": sym.name, "path": sym.path}))
+                } else if sym.caller_count == 0 {
+                    suggested_with_args("callers", "No callers found — verify dead code before deleting", serde_json::json!({"symbol": sym.name}))
                 } else {
                     suggested_with_args("source", "Read implementation", serde_json::json!({"target": results[0].name}))
                 }
             } else if results.is_empty() {
                 suggested_with_args("search", "No match — broaden with hybrid search", serde_json::json!({"kind": "hybrid"}))
+            } else if results.len() > 1 && results[0].name == results[1].name {
+                suggested_with_args("symbol_info", "Multiple matches for same name — disambiguate", serde_json::json!({"symbol": results[0].name, "path": results[0].path}))
             } else {
                 suggested_with_args("source", "Read implementation", serde_json::json!({"target": results[0].name}))
             };
@@ -2937,5 +2941,91 @@ mod tests {
         for t in &excluded {
             assert!(!tools.contains(t), "compound must NOT include '{t}', got: {tools:?}");
         }
+    }
+
+    #[test]
+    fn locate_suggests_callers_for_zero_caller_count_symbol() {
+        let dir = std::env::temp_dir().join(format!("ci_locate_dead_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (name, qualified_name, kind, language, path, line_start, line_end,
+                 signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                rusqlite::params![
+                    "orphan_fn", "mod::orphan_fn", "function", "rust", "src/lib.rs",
+                    1i64, 5i64, "fn orphan_fn()", "An orphaned function with no callers.", "orphan fn",
+                    0i64, 0i64, 0i64  // caller_count = 0, not a hub, not an entry point
+                ],
+            ).unwrap();
+        }
+
+        let output = server.locate(Parameters(LocateParams {
+            query: "orphan_fn".into(),
+            kind: None,      // symbol kind
+            depth: None,     // defaults to with_symbol
+            limit: None,
+        }));
+        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+        let sn = &v["suggested_next"];
+        assert_eq!(
+            sn["tool"], "callers",
+            "locate should suggest callers for zero-caller symbol, got: {sn}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn locate_suggests_symbol_info_for_ambiguous_name() {
+        let dir = std::env::temp_dir().join(format!("ci_locate_amb_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        {
+            let conn = server.db();
+            // Two symbols with the same name "process" in different files
+            conn.execute(
+                "INSERT INTO symbols (name, qualified_name, kind, language, path, line_start, line_end,
+                 signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                rusqlite::params![
+                    "process", "a::process", "function", "rust", "src/a.rs",
+                    1i64, 5i64, "fn process()", "", "process",
+                    2i64, 0i64, 0i64
+                ],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO symbols (name, qualified_name, kind, language, path, line_start, line_end,
+                 signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                rusqlite::params![
+                    "process", "b::process", "function", "rust", "src/b.rs",
+                    1i64, 5i64, "fn process()", "", "process",
+                    3i64, 0i64, 0i64
+                ],
+            ).unwrap();
+        }
+
+        // Use depth="search_only" so top_symbol is None and both results are visible
+        let output = server.locate(Parameters(LocateParams {
+            query: "process".into(),
+            kind: None,
+            depth: Some("search_only".into()),
+            limit: None,
+        }));
+        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+        let sn = &v["suggested_next"];
+        assert_eq!(
+            sn["tool"], "symbol_info",
+            "locate should suggest symbol_info for ambiguous name, got: {sn}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
