@@ -107,6 +107,8 @@ fn walk_symbols(
             enclosing_class.clone()
         };
 
+        let is_entry_point = detect_entry_point(node, source, language, &name, &signature);
+
         out.push(ParsedSymbol {
             qualified_name: name.clone(),
             name,
@@ -118,7 +120,7 @@ fn walk_symbols(
             signature,
             docstring,
             name_tokens,
-            is_entry_point: false,
+            is_entry_point,
             class_context,
         });
     }
@@ -160,6 +162,75 @@ fn go_receiver_type(node: tree_sitter::Node, source: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Decorator/attribute sibling node kind that may precede a definition, per language.
+fn decorator_node_kind(language: &str) -> Option<&'static str> {
+    match language {
+        "python" => Some("decorator"),
+        "rust" => Some("attribute_item"),
+        _ => None,
+    }
+}
+
+/// Source text of every decorator/attribute immediately preceding `node` (innermost first).
+fn collect_decorators<'a>(node: tree_sitter::Node, source: &'a str, kind: &str) -> Vec<&'a str> {
+    let mut out = Vec::new();
+    let mut sib = node.prev_named_sibling();
+    while let Some(s) = sib {
+        if s.kind() != kind {
+            break;
+        }
+        out.push(source[s.byte_range()].trim());
+        sib = s.prev_named_sibling();
+    }
+    out
+}
+
+/// Per-language entry-point convention: known framework decorators/attributes,
+/// `main`/`init` functions, and `export default`.
+fn detect_entry_point(
+    node: tree_sitter::Node,
+    source: &str,
+    language: &str,
+    name: &str,
+    signature: &str,
+) -> bool {
+    let decorators = decorator_node_kind(language)
+        .map(|k| collect_decorators(node, source, k))
+        .unwrap_or_default();
+
+    match language {
+        "python" => {
+            const HOOKS: &[&str] = &[
+                ".route(", ".command(", ".get(", ".post(", ".put(", ".delete(", ".patch(",
+            ];
+            decorators
+                .iter()
+                .any(|d| HOOKS.iter().any(|h| d.contains(h)))
+        }
+        "rust" => {
+            name == "main"
+                || decorators.iter().any(|d| {
+                    let inner = d.trim_start_matches("#[").trim_end_matches(']');
+                    let path = inner.split('(').next().unwrap_or(inner).trim();
+                    path == "main" || path.ends_with("::main")
+                })
+        }
+        "go" => node.kind() == "function_declaration" && (name == "main" || name == "init"),
+        "java" => signature.contains("public static void main"),
+        "javascript" | "typescript" => {
+            name == "main"
+                || node
+                    .parent()
+                    .map(|p| {
+                        p.kind() == "export_statement"
+                            && source[p.byte_range()].trim_start().starts_with("export default")
+                    })
+                    .unwrap_or(false)
+        }
+        _ => false,
+    }
 }
 
 /// A raw call site discovered in source, attributed to its enclosing function.
@@ -434,5 +505,97 @@ pub fn hello(a: i32, b: i32) -> i32 {
         assert_eq!(symbols[0].name, "hello");
         assert!(symbols[0].signature.contains("fn hello"));
         assert_eq!(symbols[0].docstring.trim(), "/// This is a docstring");
+    }
+
+    fn find<'a>(symbols: &'a [ParsedSymbol], name: &str) -> &'a ParsedSymbol {
+        symbols
+            .iter()
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| panic!("symbol {name} not found"))
+    }
+
+    #[test]
+    fn test_python_entry_point_decorator() {
+        let code = r#"
+@app.route("/")
+def index():
+    pass
+
+def helper():
+    pass
+"#;
+        let symbols = extract_symbols(code, "python", "app.py").unwrap();
+        assert!(find(&symbols, "index").is_entry_point);
+        assert!(!find(&symbols, "helper").is_entry_point);
+    }
+
+    #[test]
+    fn test_python_entry_point_cli_command() {
+        let code = r#"
+@cli.command()
+def run():
+    pass
+"#;
+        let symbols = extract_symbols(code, "python", "cli.py").unwrap();
+        assert!(find(&symbols, "run").is_entry_point);
+    }
+
+    #[test]
+    fn test_rust_entry_point_main_name() {
+        let code = "fn main() {}\nfn helper() {}\n";
+        let symbols = extract_symbols(code, "rust", "main.rs").unwrap();
+        assert!(find(&symbols, "main").is_entry_point);
+        assert!(!find(&symbols, "helper").is_entry_point);
+    }
+
+    #[test]
+    fn test_rust_entry_point_tokio_main_attribute() {
+        let code = "#[tokio::main]\nasync fn main() {}\n";
+        let symbols = extract_symbols(code, "rust", "main.rs").unwrap();
+        assert!(find(&symbols, "main").is_entry_point);
+    }
+
+    #[test]
+    fn test_go_entry_point_main_and_init() {
+        let code = "package p\nfunc main() {}\nfunc init() {}\nfunc helper() {}\n";
+        let symbols = extract_symbols(code, "go", "main.go").unwrap();
+        assert!(find(&symbols, "main").is_entry_point);
+        assert!(find(&symbols, "init").is_entry_point);
+        assert!(!find(&symbols, "helper").is_entry_point);
+    }
+
+    #[test]
+    fn test_go_entry_point_excludes_method_receiver() {
+        let code = "package p\ntype T struct{}\nfunc (t T) main() {}\n";
+        let symbols = extract_symbols(code, "go", "main.go").unwrap();
+        assert!(!find(&symbols, "main").is_entry_point);
+    }
+
+    #[test]
+    fn test_java_entry_point_public_static_void_main() {
+        let code = r#"
+public class Main {
+    public static void main(String[] args) {}
+    void helper() {}
+}
+"#;
+        let symbols = extract_symbols(code, "java", "Main.java").unwrap();
+        assert!(find(&symbols, "main").is_entry_point);
+        assert!(!find(&symbols, "helper").is_entry_point);
+    }
+
+    #[test]
+    fn test_typescript_entry_point_export_default() {
+        let code = "export default function run() {}\nfunction helper() {}\n";
+        let symbols = extract_symbols(code, "typescript", "index.ts").unwrap();
+        assert!(find(&symbols, "run").is_entry_point);
+        assert!(!find(&symbols, "helper").is_entry_point);
+    }
+
+    #[test]
+    fn test_typescript_entry_point_main_name() {
+        let code = "function main() {}\n";
+        let symbols = extract_symbols(code, "typescript", "index.ts").unwrap();
+        assert!(find(&symbols, "main").is_entry_point);
     }
 }

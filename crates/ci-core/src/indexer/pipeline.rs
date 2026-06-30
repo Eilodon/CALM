@@ -135,6 +135,7 @@ fn index_one_file(
     rel: &str,
     lang: &str,
     source: &str,
+    entry_point_patterns: &[String],
 ) -> rusqlite::Result<usize> {
     let mut syms = extract_symbols(source, lang, rel).unwrap_or_default();
     let mut seen: HashSet<String> = HashSet::new();
@@ -148,6 +149,13 @@ fn index_one_file(
         if !seen.insert(s.qualified_name.clone()) {
             s.qualified_name = format!("{}#{}", s.qualified_name, s.line_start);
             seen.insert(s.qualified_name.clone());
+        }
+        if !s.is_entry_point
+            && entry_point_patterns
+                .iter()
+                .any(|p| s.qualified_name.contains(p.as_str()))
+        {
+            s.is_entry_point = true;
         }
     }
 
@@ -478,6 +486,10 @@ fn normalize_rel(base_dir: &str, rel: &str) -> String {
 /// (caller_count, coreness, is_hub). Everything is one transaction so the graph
 /// is never observed half-built.
 pub fn run_indexing_pipeline(conn: &mut Connection, project_root: &Path) -> rusqlite::Result<()> {
+    let entry_point_patterns = crate::config::load_config(project_root)
+        .map(|c| c.entry_points)
+        .unwrap_or_default();
+
     let mut files = Vec::new();
     collect_source_files(project_root, &mut files);
     files.sort();
@@ -500,7 +512,7 @@ pub fn run_indexing_pipeline(conn: &mut Connection, project_root: &Path) -> rusq
             continue;
         };
         let rel = rel_path(project_root, file);
-        let count = index_one_file(&tx, &rel, lang, &source)?;
+        let count = index_one_file(&tx, &rel, lang, &source, &entry_point_patterns)?;
         upsert_file_index(
             &tx,
             &rel,
@@ -524,6 +536,10 @@ pub fn reindex_changed(
     conn: &mut Connection,
     project_root: &Path,
 ) -> rusqlite::Result<ReindexSummary> {
+    let entry_point_patterns = crate::config::load_config(project_root)
+        .map(|c| c.entry_points)
+        .unwrap_or_default();
+
     let existing: HashMap<String, String> = {
         let mut stmt = conn.prepare("SELECT path, hash FROM file_index")?;
         stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
@@ -556,7 +572,7 @@ pub fn reindex_changed(
             continue; // unchanged — skip the parse
         }
         remove_file_rows(&tx, &rel)?;
-        let count = index_one_file(&tx, &rel, lang, &source)?;
+        let count = index_one_file(&tx, &rel, lang, &source, &entry_point_patterns)?;
         upsert_file_index(&tx, &rel, lang, &hash, mtime_secs(file), count, now)?;
         summary.changed += 1;
     }
@@ -661,6 +677,44 @@ mod tests {
                 "SELECT caller_count FROM symbols WHERE qualified_name = 'a.py::helper'",
             ),
             1
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_entry_points_config_escape_hatch() {
+        let dir = std::env::temp_dir().join(format!("ci_idx_entrycfg_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("a.py"),
+            "def custom_entry():\n    pass\n\ndef helper():\n    pass\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"entry_points": ["a.py::custom_entry"]}"#,
+        )
+        .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        run_indexing_pipeline(&mut conn, &dir).unwrap();
+
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT is_entry_point FROM symbols WHERE qualified_name = 'a.py::custom_entry'",
+            ),
+            1
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT is_entry_point FROM symbols WHERE qualified_name = 'a.py::helper'",
+            ),
+            0
         );
 
         let _ = std::fs::remove_dir_all(&dir);
