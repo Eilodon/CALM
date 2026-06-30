@@ -1569,6 +1569,9 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
                 Ok(c) => c,
                 Err(e) => return format!(r#"{{"error": "db connection failed: {e}"}}"#),
             };
+            let rrf_k = ci_core::config::load_config(&self.project_root)
+                .map(|c| c.search.rrf_k as f64)
+                .unwrap_or(ci_core::search::DEFAULT_RRF_K);
             let kind_str = p.kind.as_str();
             match ci_core::search::search(
                 &conn,
@@ -1576,6 +1579,7 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
                 kind,
                 p.limit,
                 self.embedder().as_deref(),
+                rrf_k,
             ) {
                 Ok(output) => {
                     let results: Vec<SearchResultItem> = output
@@ -2476,12 +2480,16 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
                 Ok(c) => c,
                 Err(e) => return format!(r#"{{"error": "db connection failed: {e}"}}"#),
             };
+            let rrf_k = ci_core::config::load_config(&self.project_root)
+                .map(|c| c.search.rrf_k as f64)
+                .unwrap_or(ci_core::search::DEFAULT_RRF_K);
             let search_output = match ci_core::search::search(
                 &conn,
                 &p.query,
                 kind,
                 limit,
                 self.embedder().as_deref(),
+                rrf_k,
             ) {
                 Ok(o) => o,
                 Err(e) => {
@@ -2679,8 +2687,14 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
                 Ok(c) => c,
                 Err(e) => return format!(r#"{{"error": "db connection failed: {e}"}}"#),
             };
-            let search_result =
-                ci_core::search::search(&conn, &p.query, kind, 1, self.embedder().as_deref());
+            let search_result = ci_core::search::search(
+                &conn,
+                &p.query,
+                kind,
+                1,
+                self.embedder().as_deref(),
+                ci_core::search::DEFAULT_RRF_K, // understand tool: single-result lookup, hybrid unused
+            );
 
             let top = search_result
                 .ok()

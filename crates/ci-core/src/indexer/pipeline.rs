@@ -9,7 +9,8 @@ use crate::indexer::parser::{
     extract_calls, extract_file_aliases, extract_symbols, extract_type_map,
 };
 
-/// Directories never descended into during a project scan.
+/// Built-in directories never descended into during a project scan.
+/// These are always ignored regardless of user config.
 const IGNORE_DIRS: &[&str] = &[
     "target",
     "node_modules",
@@ -24,13 +25,26 @@ const IGNORE_DIRS: &[&str] = &[
 /// dropped as too ambiguous (conservative).
 const MAX_CALLEE_CANDIDATES: usize = 20;
 
+/// Return true if `name` matches any pattern in `patterns`.
+/// Supports `*.ext` glob (file extension matching) and exact name matching.
+fn matches_ignore_pattern(name: &str, patterns: &[String]) -> bool {
+    patterns.iter().any(|p| {
+        if let Some(ext) = p.strip_prefix("*.") {
+            name.ends_with(&format!(".{ext}"))
+        } else {
+            p == name
+        }
+    })
+}
+
 /// A persisted call site loaded for graph rebuild:
 /// (from_path, enclosing_qn, callee_name, call_line, confidence, target_class).
 type CallSiteRow = (String, String, String, Option<i64>, String, Option<String>);
 
-/// Recursively collect tier-0 source files under `root`, skipping ignored and
-/// dot-prefixed directories. Deterministic order is imposed by the caller.
-fn collect_source_files(root: &Path, out: &mut Vec<PathBuf>) {
+/// Recursively collect tier-0 source files under `root`, skipping built-in
+/// ignored directories, dot-prefixed directories, and any user-configured
+/// `ignore` patterns. Deterministic order is imposed by the caller.
+fn collect_source_files(root: &Path, ignore: &[String], out: &mut Vec<PathBuf>) {
     let entries = match std::fs::read_dir(root) {
         Ok(e) => e,
         Err(_) => return,
@@ -40,16 +54,23 @@ fn collect_source_files(root: &Path, out: &mut Vec<PathBuf>) {
         let Ok(ft) = entry.file_type() else { continue };
         if ft.is_dir() {
             if let Some(name) = path.file_name().and_then(|n| n.to_str())
-                && (name.starts_with('.') || IGNORE_DIRS.contains(&name))
+                && (name.starts_with('.')
+                    || IGNORE_DIRS.contains(&name)
+                    || matches_ignore_pattern(name, ignore))
             {
                 continue;
             }
-            collect_source_files(&path, out);
-        } else if ft.is_file()
-            && let Some(ext) = path.extension().and_then(|e| e.to_str())
-            && language_for_extension(ext).is_some()
-        {
-            out.push(path);
+            collect_source_files(&path, ignore, out);
+        } else if ft.is_file() {
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if matches_ignore_pattern(name, ignore) {
+                continue;
+            }
+            if let Some(ext) = path.extension().and_then(|e| e.to_str())
+                && language_for_extension(ext).is_some()
+            {
+                out.push(path);
+            }
         }
     }
 }
@@ -520,6 +541,7 @@ pub fn run_indexing_pipeline(
 
     let config = crate::config::load_config(project_root).unwrap_or_default();
     let entry_point_patterns = config.entry_points;
+    let ignore_patterns = config.ignore;
 
     // Initialize FormalResolver once per pipeline run; load rules for all supported
     // languages. Non-fatal if a language fails to load — that language falls back to
@@ -528,7 +550,7 @@ pub fn run_indexing_pipeline(
     let _ = formal.load_python(); // non-fatal: falls back silently on error
 
     let mut files = Vec::new();
-    collect_source_files(project_root, &mut files);
+    collect_source_files(project_root, &ignore_patterns, &mut files);
     files.sort();
 
     *phase.write().unwrap() = IndexingPhase::Parsing;
@@ -582,6 +604,7 @@ pub fn reindex_changed(
 ) -> rusqlite::Result<ReindexSummary> {
     let config = crate::config::load_config(project_root).unwrap_or_default();
     let entry_point_patterns = config.entry_points;
+    let ignore_patterns = config.ignore;
 
     let mut formal = crate::resolver::formal::FormalResolver::new();
     let _ = formal.load_python();
@@ -595,7 +618,7 @@ pub fn reindex_changed(
     };
 
     let mut files = Vec::new();
-    collect_source_files(project_root, &mut files);
+    collect_source_files(project_root, &ignore_patterns, &mut files);
     files.sort();
 
     let now = now_secs();
@@ -752,6 +775,45 @@ mod tests {
             ),
             1
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_matches_ignore_pattern() {
+        let patterns = vec!["vendor".to_string(), "*.min.js".to_string()];
+        assert!(matches_ignore_pattern("vendor", &patterns));
+        assert!(matches_ignore_pattern("app.min.js", &patterns));
+        assert!(!matches_ignore_pattern("vendors", &patterns));
+        assert!(!matches_ignore_pattern("app.js", &patterns));
+    }
+
+    #[test]
+    fn test_config_ignore_excludes_dir_and_glob() {
+        let dir = std::env::temp_dir().join(format!("ci_idx_ignorecfg_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("vendor")).unwrap();
+        std::fs::write(dir.join("a.py"), "def kept():\n    pass\n").unwrap();
+        std::fs::write(dir.join("vendor/b.py"), "def excluded_dir():\n    pass\n").unwrap();
+        std::fs::write(dir.join("app.min.js"), "function excludedGlob() {}\n").unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"ignore": ["vendor", "*.min.js"]}"#,
+        )
+        .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
+
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM symbols WHERE qualified_name = 'a.py::kept'",
+            ),
+            1
+        );
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM file_index"), 1);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

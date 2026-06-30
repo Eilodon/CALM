@@ -20,6 +20,38 @@ pub struct ParsedSymbol {
 use crate::graph::tokenize::tokenize_identifier;
 use crate::indexer::lang_constants::get_lang_constants;
 
+/// Map a tree-sitter node kind and context to the correct `SymbolKind`.
+/// `in_class` is true when the node is a direct child of a class/impl scope,
+/// which upgrades plain function definitions to Method.
+fn node_kind_to_symbol_kind(node_kind: &str, in_class: bool) -> SymbolKind {
+    match node_kind {
+        "class_definition" | "class_declaration" => SymbolKind::Class,
+        "struct_item" => SymbolKind::Struct,
+        "trait_item" => SymbolKind::Trait,
+        // Reachable only if `resolve_name_node` ever grows an `impl_item` case (it
+        // currently doesn't: `impl_item` has no `name` field, only `type`/`trait`).
+        // `impl_item` stays in Rust's `function_node_types` purely so its children
+        // get `class_context` via `class_node_types` below — emitting impl blocks
+        // themselves as symbols would add one noisy duplicate-named entry per
+        // `impl`/`impl Trait for` block without a corresponding consumer.
+        "impl_item" => SymbolKind::Impl,
+        "interface_declaration" => SymbolKind::Interface,
+        "type_declaration" => SymbolKind::Type,
+        // Explicit method nodes are always Method regardless of scope.
+        "method_declaration" | "method_definition" => SymbolKind::Method,
+        // JS/TS `const foo = () => {}` — treated as a variable holding a function.
+        "lexical_declaration" => SymbolKind::Variable,
+        // Plain function nodes: Method when inside a class/impl, Function otherwise.
+        _ => {
+            if in_class {
+                SymbolKind::Method
+            } else {
+                SymbolKind::Function
+            }
+        }
+    }
+}
+
 /// Parse `source` for a tier-0 `language` into a tree-sitter tree, or `None` if
 /// the language is unsupported or parsing fails. Single source of the per-language
 /// grammar mapping.
@@ -58,6 +90,47 @@ pub fn extract_symbols(
     Ok(symbols)
 }
 
+/// Resolve the name node for `node`. Most `function_node_types` expose `name`
+/// directly via `lc.name_field`, but a few wrap the name on a nested child:
+/// Go `type_declaration` holds it on a `type_spec` child, and JS/TS
+/// `lexical_declaration` holds it on a `variable_declarator` child (only
+/// followed when the declarator's value is itself a function literal, so
+/// plain `const x = 5` is not treated as a symbol).
+fn resolve_name_node<'a>(
+    node: tree_sitter::Node<'a>,
+    lc: &crate::indexer::lang_constants::LangConstants,
+) -> Option<tree_sitter::Node<'a>> {
+    if let Some(n) = node.child_by_field_name(lc.name_field) {
+        return Some(n);
+    }
+    match node.kind() {
+        "type_declaration" => {
+            let mut cursor = node.walk();
+            node.children(&mut cursor)
+                .find(|c| c.kind() == "type_spec")
+                .and_then(|spec| spec.child_by_field_name("name"))
+        }
+        "lexical_declaration" => {
+            let mut cursor = node.walk();
+            node.children(&mut cursor).find_map(|decl| {
+                if decl.kind() != "variable_declarator" {
+                    return None;
+                }
+                let value = decl.child_by_field_name("value")?;
+                if matches!(
+                    value.kind(),
+                    "arrow_function" | "function_expression" | "function"
+                ) {
+                    decl.child_by_field_name("name")
+                } else {
+                    None
+                }
+            })
+        }
+        _ => None,
+    }
+}
+
 /// Recursive symbol walk tracking the enclosing class/impl so methods record
 /// their `class_context`.
 fn walk_symbols(
@@ -71,7 +144,7 @@ fn walk_symbols(
 ) {
     // A symbol defined here belongs to the class we are currently inside.
     if lc.function_node_types.contains(&node.kind())
-        && let Some(name_node) = node.child_by_field_name(lc.name_field)
+        && let Some(name_node) = resolve_name_node(node, lc)
     {
         let name = source[name_node.byte_range()].to_string();
 
@@ -112,7 +185,7 @@ fn walk_symbols(
         out.push(ParsedSymbol {
             qualified_name: name.clone(),
             name,
-            kind: SymbolKind::Function,
+            kind: node_kind_to_symbol_kind(node.kind(), enclosing_class.is_some()),
             language: language.to_string(),
             path: path.to_string(),
             line_start: node.start_position().row + 1,
@@ -520,6 +593,86 @@ pub fn hello(a: i32, b: i32) -> i32 {
             .iter()
             .find(|s| s.name == name)
             .unwrap_or_else(|| panic!("symbol {name} not found"))
+    }
+
+    #[test]
+    fn test_python_symbol_kinds() {
+        let code = r#"
+class Greeter:
+    def hello(self):
+        pass
+
+def standalone():
+    pass
+"#;
+        let symbols = extract_symbols(code, "python", "test.py").unwrap();
+        assert_eq!(find(&symbols, "Greeter").kind, SymbolKind::Class);
+        assert_eq!(find(&symbols, "hello").kind, SymbolKind::Method);
+        assert_eq!(find(&symbols, "standalone").kind, SymbolKind::Function);
+    }
+
+    #[test]
+    fn test_rust_symbol_kinds() {
+        let code = r#"
+struct Point { x: i32, y: i32 }
+trait Shape {}
+impl Point {
+    fn area(&self) -> i32 { 0 }
+}
+fn standalone() {}
+"#;
+        let symbols = extract_symbols(code, "rust", "test.rs").unwrap();
+        assert_eq!(find(&symbols, "Point").kind, SymbolKind::Struct);
+        assert_eq!(find(&symbols, "Shape").kind, SymbolKind::Trait);
+        assert_eq!(find(&symbols, "area").kind, SymbolKind::Method);
+        assert_eq!(find(&symbols, "standalone").kind, SymbolKind::Function);
+    }
+
+    #[test]
+    fn test_java_symbol_kinds() {
+        let code = r#"
+class Greeter {
+    void hello() {}
+}
+interface Shape {}
+"#;
+        let symbols = extract_symbols(code, "java", "Test.java").unwrap();
+        assert_eq!(find(&symbols, "Greeter").kind, SymbolKind::Class);
+        assert_eq!(find(&symbols, "hello").kind, SymbolKind::Method);
+        assert_eq!(find(&symbols, "Shape").kind, SymbolKind::Interface);
+    }
+
+    #[test]
+    fn test_go_symbol_kinds() {
+        let code = r#"
+package p
+
+type Service struct{}
+
+func (s *Service) Hello() {}
+
+func Standalone() {}
+"#;
+        let symbols = extract_symbols(code, "go", "test.go").unwrap();
+        assert_eq!(find(&symbols, "Service").kind, SymbolKind::Type);
+        assert_eq!(find(&symbols, "Hello").kind, SymbolKind::Method);
+        assert_eq!(find(&symbols, "Standalone").kind, SymbolKind::Function);
+    }
+
+    #[test]
+    fn test_typescript_symbol_kinds() {
+        let code = r#"
+class Greeter {
+    hello() {}
+}
+const arrow = () => {};
+function standalone() {}
+"#;
+        let symbols = extract_symbols(code, "typescript", "test.ts").unwrap();
+        assert_eq!(find(&symbols, "Greeter").kind, SymbolKind::Class);
+        assert_eq!(find(&symbols, "hello").kind, SymbolKind::Method);
+        assert_eq!(find(&symbols, "arrow").kind, SymbolKind::Variable);
+        assert_eq!(find(&symbols, "standalone").kind, SymbolKind::Function);
     }
 
     #[test]

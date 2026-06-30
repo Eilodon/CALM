@@ -7,7 +7,13 @@ use crate::types::SearchKind;
 
 const BM25_EXACT_WEIGHT: f64 = 1.5;
 const BM25_TOKENS_WEIGHT: f64 = 1.0;
-const RRF_K: f64 = 20.0;
+/// Default RRF k constant; overridden at runtime by `config.search.rrf_k`.
+/// Used as the fallback when config load fails — see `SearchConfig::default`.
+pub const DEFAULT_RRF_K: f64 = 20.0;
+/// Weight applied to the FTS source in hybrid RRF (design spec: 1.5×).
+const RRF_FTS_WEIGHT: f64 = 1.5;
+/// Weight applied to the semantic source in hybrid RRF.
+const RRF_SEMANTIC_WEIGHT: f64 = 1.0;
 
 #[derive(Debug, Clone)]
 pub struct SearchResult {
@@ -36,13 +42,14 @@ pub fn search(
     kind: SearchKind,
     limit: usize,
     embedder: Option<&Embedder>,
+    rrf_k: f64,
 ) -> rusqlite::Result<SearchOutput> {
     match kind {
         SearchKind::Symbol => search_symbol(conn, query, limit),
         SearchKind::Text => search_text(conn, query, limit),
         SearchKind::File => search_file(conn, query, limit),
         SearchKind::Semantic => search_semantic(conn, query, limit, embedder),
-        SearchKind::Hybrid => search_hybrid(conn, query, limit, embedder),
+        SearchKind::Hybrid => search_hybrid(conn, query, limit, embedder, rrf_k),
     }
 }
 
@@ -293,6 +300,7 @@ fn search_hybrid(
     query: &str,
     limit: usize,
     embedder: Option<&Embedder>,
+    rrf_k: f64,
 ) -> rusqlite::Result<SearchOutput> {
     let fts_output = search_symbol(conn, query, limit)?;
 
@@ -314,7 +322,14 @@ fn search_hybrid(
         });
     }
 
-    let merged = rrf_merge(&fts_output.results, &semantic_output.results, limit);
+    let merged = rrf_merge(
+        &fts_output.results,
+        RRF_FTS_WEIGHT,
+        &semantic_output.results,
+        RRF_SEMANTIC_WEIGHT,
+        limit,
+        rrf_k,
+    );
     let truncated = fts_output.truncated || semantic_output.truncated;
 
     Ok(SearchOutput {
@@ -327,21 +342,24 @@ fn search_hybrid(
 
 fn rrf_merge(
     fts_results: &[SearchResult],
+    fts_weight: f64,
     semantic_results: &[SearchResult],
+    semantic_weight: f64,
     limit: usize,
+    rrf_k: f64,
 ) -> Vec<SearchResult> {
     let mut scores: HashMap<String, f64> = HashMap::new();
     let mut data: HashMap<String, SearchResult> = HashMap::new();
 
     for (rank, r) in fts_results.iter().enumerate() {
-        let rrf_score = 1.0 / (RRF_K + rank as f64 + 1.0);
+        let rrf_score = fts_weight / (rrf_k + rank as f64 + 1.0);
         *scores.entry(r.qualified_name.clone()).or_default() += rrf_score;
         data.entry(r.qualified_name.clone())
             .or_insert_with(|| r.clone());
     }
 
     for (rank, r) in semantic_results.iter().enumerate() {
-        let rrf_score = 1.0 / (RRF_K + rank as f64 + 1.0);
+        let rrf_score = semantic_weight / (rrf_k + rank as f64 + 1.0);
         *scores.entry(r.qualified_name.clone()).or_default() += rrf_score;
         data.entry(r.qualified_name.clone())
             .or_insert_with(|| r.clone());
@@ -482,7 +500,7 @@ mod tests {
     #[test]
     fn test_search_symbol_finds_results() {
         let conn = setup_db_with_symbols();
-        let output = search(&conn, "user", SearchKind::Symbol, 10, None).unwrap();
+        let output = search(&conn, "user", SearchKind::Symbol, 10, None, DEFAULT_RRF_K).unwrap();
         assert!(
             output.results.len() >= 2,
             "Should find get_user and update_user, got: {:?}",
@@ -493,7 +511,7 @@ mod tests {
     #[test]
     fn test_search_symbol_respects_limit() {
         let conn = setup_db_with_symbols();
-        let output = search(&conn, "user", SearchKind::Symbol, 1, None).unwrap();
+        let output = search(&conn, "user", SearchKind::Symbol, 1, None, DEFAULT_RRF_K).unwrap();
         assert_eq!(output.results.len(), 1);
         assert!(output.truncated);
     }
@@ -501,7 +519,15 @@ mod tests {
     #[test]
     fn test_search_symbol_no_results() {
         let conn = setup_db_with_symbols();
-        let output = search(&conn, "nonexistent_xyz", SearchKind::Symbol, 10, None).unwrap();
+        let output = search(
+            &conn,
+            "nonexistent_xyz",
+            SearchKind::Symbol,
+            10,
+            None,
+            DEFAULT_RRF_K,
+        )
+        .unwrap();
         assert!(output.results.is_empty());
         assert!(!output.truncated);
     }
@@ -509,7 +535,7 @@ mod tests {
     #[test]
     fn test_search_text() {
         let conn = setup_db_with_symbols();
-        let output = search(&conn, "database", SearchKind::Text, 10, None).unwrap();
+        let output = search(&conn, "database", SearchKind::Text, 10, None, DEFAULT_RRF_K).unwrap();
         assert!(
             output.results.len() >= 2,
             "Should find symbols with 'database' in docstring, got: {:?}",
@@ -542,7 +568,15 @@ mod tests {
             ],
         ).unwrap();
 
-        let output = search(&conn, "authorize", SearchKind::Text, 10, None).unwrap();
+        let output = search(
+            &conn,
+            "authorize",
+            SearchKind::Text,
+            10,
+            None,
+            DEFAULT_RRF_K,
+        )
+        .unwrap();
         let names: Vec<&str> = output.results.iter().map(|r| r.name.as_str()).collect();
 
         assert!(
@@ -558,7 +592,7 @@ mod tests {
     #[test]
     fn test_search_file() {
         let conn = setup_db_with_symbols();
-        let output = search(&conn, "main", SearchKind::File, 10, None).unwrap();
+        let output = search(&conn, "main", SearchKind::File, 10, None, DEFAULT_RRF_K).unwrap();
         assert_eq!(output.results.len(), 1);
         assert_eq!(output.results[0].path, "src/main.py");
     }
@@ -566,14 +600,14 @@ mod tests {
     #[test]
     fn test_search_file_multiple() {
         let conn = setup_db_with_symbols();
-        let output = search(&conn, "src/", SearchKind::File, 10, None).unwrap();
+        let output = search(&conn, "src/", SearchKind::File, 10, None, DEFAULT_RRF_K).unwrap();
         assert_eq!(output.results.len(), 3);
     }
 
     #[test]
     fn test_search_semantic_not_ready() {
         let conn = setup_db_with_symbols();
-        let output = search(&conn, "user", SearchKind::Semantic, 10, None).unwrap();
+        let output = search(&conn, "user", SearchKind::Semantic, 10, None, DEFAULT_RRF_K).unwrap();
         assert!(output.degraded);
         assert!(output.results.is_empty());
     }
@@ -581,7 +615,7 @@ mod tests {
     #[test]
     fn test_search_hybrid_degraded_to_fts() {
         let conn = setup_db_with_symbols();
-        let output = search(&conn, "user", SearchKind::Hybrid, 10, None).unwrap();
+        let output = search(&conn, "user", SearchKind::Hybrid, 10, None, DEFAULT_RRF_K).unwrap();
         assert!(output.degraded);
         assert!(!output.results.is_empty());
     }
@@ -624,7 +658,7 @@ mod tests {
             snippet: None,
         }];
 
-        let merged = rrf_merge(&fts, &semantic, 10);
+        let merged = rrf_merge(&fts, 1.5, &semantic, 1.0, 10, DEFAULT_RRF_K);
         assert_eq!(merged.len(), 2);
         // "b" appears in both lists so should have higher RRF score
         assert_eq!(merged[0].qualified_name, "mod::b");
@@ -633,7 +667,7 @@ mod tests {
     #[test]
     fn test_search_symbol_scores_positive() {
         let conn = setup_db_with_symbols();
-        let output = search(&conn, "config", SearchKind::Symbol, 10, None).unwrap();
+        let output = search(&conn, "config", SearchKind::Symbol, 10, None, DEFAULT_RRF_K).unwrap();
         for r in &output.results {
             assert!(r.score > 0.0, "Scores should be positive, got {}", r.score);
         }

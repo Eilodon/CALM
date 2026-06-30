@@ -58,17 +58,54 @@ pub async fn serve_stdio_with_preset(
         tracing::info!("Background indexer thread started");
         if let Ok(mut conn) = rusqlite::Connection::open(&indexer_db_path) {
             let _ = ci_core::db::schema::init_db(&conn);
-            if let Err(e) = ci_core::indexer::pipeline::run_indexing_pipeline(
-                &mut conn,
-                &indexer_root,
-                phase.clone(),
-            ) {
-                tracing::error!("Background indexer failed: {}", e);
+
+            // Use incremental reindex when the index already has data — avoids
+            // a full re-parse of every file on every server restart.
+            let existing_files: i64 = conn
+                .query_row("SELECT COUNT(*) FROM file_index", [], |r| r.get(0))
+                .unwrap_or(0);
+
+            let index_ok = if existing_files > 0 {
+                tracing::info!(
+                    "Existing index found ({existing_files} files) — incremental reindex"
+                );
+                *phase.write().unwrap() = ci_core::types::IndexingPhase::Parsing;
+                match ci_core::indexer::pipeline::reindex_changed(&mut conn, &indexer_root) {
+                    Ok(summary) => {
+                        tracing::info!(
+                            "Incremental reindex: {} changed, {} deleted",
+                            summary.changed,
+                            summary.deleted
+                        );
+                        *phase.write().unwrap() = ci_core::types::IndexingPhase::Ready;
+                        true
+                    }
+                    Err(e) => {
+                        tracing::error!("Incremental reindex failed, falling back to full: {e}");
+                        ci_core::indexer::pipeline::run_indexing_pipeline(
+                            &mut conn,
+                            &indexer_root,
+                            phase.clone(),
+                        )
+                        .is_ok()
+                    }
+                }
+            } else {
+                tracing::info!("No existing index — running full index");
+                ci_core::indexer::pipeline::run_indexing_pipeline(
+                    &mut conn,
+                    &indexer_root,
+                    phase.clone(),
+                )
+                .is_ok()
+            };
+
+            if index_ok {
+                tracing::info!("Background indexing completed");
+            } else {
+                tracing::error!("Background indexer failed");
                 // Reset to Scanning so callers don't see BuildingEdges forever on failure.
                 *phase.write().unwrap() = ci_core::types::IndexingPhase::Scanning;
-            } else {
-                // Ready is now set inside run_indexing_pipeline (after tx.commit)
-                tracing::info!("Background indexing completed");
             }
             // Opt-in semantic embeddings, after the graph is built.
             if semantic.enabled {
