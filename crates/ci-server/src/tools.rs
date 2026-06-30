@@ -306,6 +306,7 @@ struct CandidateRow {
     language: String,
     class_context: Option<String>,
     is_entry_point: bool,
+    coreness: Option<i64>,  // from symbols.coreness column
 }
 
 impl CandidateRow {
@@ -321,6 +322,7 @@ impl CandidateRow {
             docstring: Some(self.docstring.clone()).filter(|s| !s.is_empty()),
             caller_count: self.caller_count,
             is_hub: self.is_hub,
+            coreness: None,  // set by handler based on edges_ready
             health: None,
             suggested_next: None,
         }
@@ -350,10 +352,10 @@ fn resolve_symbol_candidates(
     path: Option<&str>,
 ) -> Vec<CandidateRow> {
     let sql = if path.is_some() {
-        "SELECT name, qualified_name, kind, path, line_start, line_end, signature, docstring, caller_count, is_hub, language, class_context, is_entry_point
+        "SELECT name, qualified_name, kind, path, line_start, line_end, signature, docstring, caller_count, is_hub, language, class_context, is_entry_point, coreness
          FROM symbols WHERE name = ?1 AND path = ?2"
     } else {
-        "SELECT name, qualified_name, kind, path, line_start, line_end, signature, docstring, caller_count, is_hub, language, class_context, is_entry_point
+        "SELECT name, qualified_name, kind, path, line_start, line_end, signature, docstring, caller_count, is_hub, language, class_context, is_entry_point, coreness
          FROM symbols WHERE name = ?1"
     };
 
@@ -377,6 +379,7 @@ fn resolve_symbol_candidates(
             language: row.get(10)?,
             class_context: row.get(11)?,
             is_entry_point: row.get::<_, i64>(12)? != 0,
+            coreness: row.get(13)?,
         })
     };
 
@@ -596,6 +599,7 @@ struct SymbolInfoOutput {
     docstring: Option<String>,
     caller_count: i64,
     is_hub: bool,
+    coreness: Option<i64>,  // null when edges not yet built; 0 = isolated; >0 = k-core depth
     #[serde(skip_serializing_if = "Option::is_none")]
     health: Option<HealthOutput>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1408,8 +1412,10 @@ impl CodeIntelligenceServer {
                     self.track_symbol(&c.qualified_name);
                     self.track_file(&c.path);
                     let mut out = c.to_symbol_info();
+                    let edges_ready = self.edges_ready();
+                    out.coreness = if edges_ready { c.coreness } else { None };
                     let conn = self.db();
-                    let health = build_health(&conn, &self.coverage, &self.project_root, &c, self.edges_ready());
+                    let health = build_health(&conn, &self.coverage, &self.project_root, &c, edges_ready);
                     out.suggested_next = if c.is_hub {
                         suggested_with_args("edit_context", "Hub — check blast radius before modifying", serde_json::json!({"symbol": c.name, "path": c.path}))
                     } else if health.test_files.is_empty() {
@@ -2203,6 +2209,7 @@ impl CodeIntelligenceServer {
                                     docstring: row.get::<_, String>(7).ok().filter(|s| !s.is_empty()),
                                     caller_count: row.get(8)?,
                                     is_hub: row.get::<_, i64>(9)? != 0,
+                                    coreness: None,
                                     health: None,
                                     suggested_next: None,
                                 })
@@ -2348,6 +2355,7 @@ impl CodeIntelligenceServer {
                                     docstring: row.get::<_, String>(7).ok().filter(|s| !s.is_empty()),
                                     caller_count: row.get(8)?,
                                     is_hub: row.get::<_, i64>(9)? != 0,
+                                    coreness: None,
                                     health: None,
                                     suggested_next: None,
                                 },
@@ -2816,6 +2824,90 @@ mod tests {
             final_status = *server.embed_status_handle().read().unwrap();
         }
         assert_eq!(final_status, EmbedStatus::Failed);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn symbol_info_includes_coreness_when_edges_ready() {
+        let dir = std::env::temp_dir().join(format!("ci_coreness_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        // Set edges_ready = true by advancing phase to Ready
+        *server.phase_handle().write().unwrap() = IndexingPhase::Ready;
+
+        // Insert symbol WITH coreness value
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (name, qualified_name, kind, language, path,
+                 line_start, line_end, signature, docstring, name_tokens,
+                 caller_count, is_hub, is_entry_point, coreness)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                rusqlite::params![
+                    "my_fn", "mod::my_fn", "function", "rust", "src/lib.rs",
+                    1i64, 5i64, "fn my_fn()", "", "my fn",
+                    0i64, 0i64, 0i64, 3i64  // coreness = 3
+                ],
+            ).unwrap();
+        }
+
+        let output = server.symbol_info(Parameters(SymbolInfoParams {
+            symbol: "my_fn".into(),
+            path: None,
+        }));
+        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+        // coreness must be present and equal to 3
+        assert_eq!(
+            v["coreness"], serde_json::json!(3),
+            "coreness must be 3 when edges_ready and DB value is 3, got: {v}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn symbol_info_coreness_null_when_edges_not_ready() {
+        let dir = std::env::temp_dir().join(format!("ci_coreness_notready_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
+        // Phase stays Scanning (not Ready) — edges_ready() returns false
+
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (name, qualified_name, kind, language, path,
+                 line_start, line_end, signature, docstring, name_tokens,
+                 caller_count, is_hub, is_entry_point, coreness)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                rusqlite::params![
+                    "my_fn2", "mod::my_fn2", "function", "rust", "src/lib.rs",
+                    1i64, 5i64, "fn my_fn2()", "", "my fn2",
+                    0i64, 0i64, 0i64, 5i64
+                ],
+            ).unwrap();
+        }
+
+        let output = server.symbol_info(Parameters(SymbolInfoParams {
+            symbol: "my_fn2".into(),
+            path: None,
+        }));
+        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+        // When edges not ready, coreness must be null (not missing)
+        assert!(
+            v.get("coreness").is_some(),
+            "coreness key must be present even when null, got: {v}"
+        );
+        assert!(
+            v["coreness"].is_null(),
+            "coreness must be null when edges_ready is false, got: {}",
+            v["coreness"]
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
