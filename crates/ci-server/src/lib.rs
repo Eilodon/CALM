@@ -26,6 +26,8 @@ pub async fn serve_stdio_with_preset(project_root: PathBuf, db_path: PathBuf, pr
     // unless built with the `embeddings` feature).
     ci_core::embedding::register_extension();
 
+    ci_core::gitignore::ensure_gitignore(&project_root)?;
+
     let server = CodeIntelligenceServer::new_with_preset(project_root.clone(), db_path.clone(), preset)?;
     let ct = CancellationToken::new();
     let ct_clone = ct.clone();

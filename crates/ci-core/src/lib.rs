@@ -1,6 +1,7 @@
 pub mod analysis;
 pub mod config;
 pub mod db;
+pub mod gitignore;
 pub mod embedding;
 pub mod fitness;
 pub mod graph;
