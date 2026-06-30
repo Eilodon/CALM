@@ -105,7 +105,6 @@ struct ErrorDetail {
     recoverable: bool,
 }
 
-#[allow(dead_code)]
 fn error_json(code: &str, message: &str, recoverable: bool) -> String {
     serde_json::to_string_pretty(&ErrorOutput {
         error: ErrorDetail {
@@ -113,6 +112,187 @@ fn error_json(code: &str, message: &str, recoverable: bool) -> String {
             message: message.into(),
             recoverable,
         },
+    })
+    .unwrap_or_default()
+}
+
+fn not_found_json(symbol: &str) -> String {
+    error_json(
+        "NOT_FOUND",
+        &format!("Symbol '{symbol}' not found in index"),
+        false,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Ambiguity Contract — shared symbol resolver
+// ---------------------------------------------------------------------------
+//
+// `symbols.name` is not unique: the same bare name can appear in many files,
+// or more than once in one file (distinct classes' methods). Tools that take
+// a bare `symbol` name must not silently pick one match via `LIMIT 1` — per
+// CONTRACTS.md they return `AmbiguousResult` instead when the name has
+// multiple matches and no `path` was given to disambiguate.
+
+const MAX_AMBIGUOUS_CANDIDATES: usize = 10;
+
+#[derive(Serialize, JsonSchema)]
+struct AmbiguousCandidate {
+    name: String,
+    path: String,
+    kind: String,
+    line_start: i64,
+    line_end: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    class_context: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    caller_count: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    language: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    signature: Option<String>,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct AmbiguousResult {
+    ambiguous: bool,
+    candidates: Vec<AmbiguousCandidate>,
+}
+
+/// One `symbols` row matched by a bare-name (+ optional path) lookup.
+/// Carries enough columns to populate either a concrete tool output (e.g.
+/// `SymbolInfoOutput`) or an `AmbiguousCandidate` when the lookup turns out
+/// to match more than one row.
+struct CandidateRow {
+    name: String,
+    qualified_name: String,
+    kind: String,
+    path: String,
+    line_start: i64,
+    line_end: i64,
+    signature: String,
+    docstring: String,
+    caller_count: i64,
+    is_hub: bool,
+    language: String,
+    class_context: Option<String>,
+}
+
+impl CandidateRow {
+    fn to_symbol_info(&self) -> SymbolInfoOutput {
+        SymbolInfoOutput {
+            name: self.name.clone(),
+            qualified_name: self.qualified_name.clone(),
+            kind: self.kind.clone(),
+            path: self.path.clone(),
+            line_start: self.line_start,
+            line_end: self.line_end,
+            signature: Some(self.signature.clone()).filter(|s| !s.is_empty()),
+            docstring: Some(self.docstring.clone()).filter(|s| !s.is_empty()),
+            caller_count: self.caller_count,
+            is_hub: self.is_hub,
+        }
+    }
+
+    fn to_ambiguous_candidate(&self) -> AmbiguousCandidate {
+        AmbiguousCandidate {
+            name: self.name.clone(),
+            path: self.path.clone(),
+            kind: self.kind.clone(),
+            line_start: self.line_start,
+            line_end: self.line_end,
+            class_context: self.class_context.clone(),
+            caller_count: Some(self.caller_count),
+            language: Some(self.language.clone()).filter(|s| !s.is_empty()),
+            signature: Some(self.signature.clone()).filter(|s| !s.is_empty()),
+        }
+    }
+}
+
+/// All `symbols` rows matching `name` (and `path`, when given). Unlike the
+/// old per-tool `LIMIT 1` queries, this returns every match so callers can
+/// detect ambiguity instead of guessing.
+fn resolve_symbol_candidates(
+    conn: &rusqlite::Connection,
+    name: &str,
+    path: Option<&str>,
+) -> Vec<CandidateRow> {
+    let sql = if path.is_some() {
+        "SELECT name, qualified_name, kind, path, line_start, line_end, signature, docstring, caller_count, is_hub, language, class_context
+         FROM symbols WHERE name = ?1 AND path = ?2"
+    } else {
+        "SELECT name, qualified_name, kind, path, line_start, line_end, signature, docstring, caller_count, is_hub, language, class_context
+         FROM symbols WHERE name = ?1"
+    };
+
+    let mut stmt = match conn.prepare(sql) {
+        Ok(s) => s,
+        Err(_) => return vec![],
+    };
+
+    let map_row = |row: &rusqlite::Row| -> rusqlite::Result<CandidateRow> {
+        Ok(CandidateRow {
+            name: row.get(0)?,
+            qualified_name: row.get(1)?,
+            kind: row.get(2)?,
+            path: row.get(3)?,
+            line_start: row.get(4)?,
+            line_end: row.get(5)?,
+            signature: row.get(6)?,
+            docstring: row.get(7)?,
+            caller_count: row.get(8)?,
+            is_hub: row.get::<_, i64>(9)? != 0,
+            language: row.get(10)?,
+            class_context: row.get(11)?,
+        })
+    };
+
+    let rows = if let Some(path) = path {
+        stmt.query_map(rusqlite::params![name, path], map_row)
+    } else {
+        stmt.query_map(rusqlite::params![name], map_row)
+    };
+
+    match rows {
+        Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+        Err(_) => vec![],
+    }
+}
+
+enum SymbolResolution {
+    NotFound,
+    Ambiguous(Vec<CandidateRow>),
+    Found(CandidateRow),
+}
+
+/// Resolve a bare symbol name (+ optional path) to exactly one row.
+/// Ambiguity is only reported when `path` is absent — a `path` is treated as
+/// an explicit disambiguation choice from the caller, so it always commits
+/// to the (sole) row that matches both `name` and `path`.
+fn resolve_symbol(
+    conn: &rusqlite::Connection,
+    name: &str,
+    path: Option<&str>,
+) -> SymbolResolution {
+    let mut candidates = resolve_symbol_candidates(conn, name, path);
+    if candidates.is_empty() {
+        SymbolResolution::NotFound
+    } else if candidates.len() == 1 || path.is_some() {
+        SymbolResolution::Found(candidates.remove(0))
+    } else {
+        SymbolResolution::Ambiguous(candidates)
+    }
+}
+
+fn ambiguous_json(candidates: &[CandidateRow]) -> String {
+    let candidates = candidates
+        .iter()
+        .take(MAX_AMBIGUOUS_CANDIDATES)
+        .map(CandidateRow::to_ambiguous_candidate)
+        .collect();
+    serde_json::to_string_pretty(&AmbiguousResult {
+        ambiguous: true,
+        candidates,
     })
     .unwrap_or_default()
 }
@@ -207,6 +387,47 @@ struct FileOverviewOutput {
     symbol_count: usize,
 }
 
+/// Shared by the `file_overview` tool and `locate` (when the top result is a
+/// file match), so both surfaces build the same shape from the same query.
+fn build_file_overview(conn: &rusqlite::Connection, path: &str) -> FileOverviewOutput {
+    let symbols: Vec<FileOverviewSymbol> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT name, qualified_name, kind, line_start, line_end
+                 FROM symbols WHERE path = ?1 ORDER BY line_start",
+            )
+            .unwrap();
+        stmt.query_map(rusqlite::params![path], |row| {
+            Ok(FileOverviewSymbol {
+                name: row.get(0)?,
+                qualified_name: row.get(1)?,
+                kind: row.get(2)?,
+                line_start: row.get(3)?,
+                line_end: row.get(4)?,
+            })
+        })
+        .unwrap()
+        .filter_map(|r| r.ok())
+        .collect()
+    };
+
+    let language: Option<String> = conn
+        .query_row(
+            "SELECT language FROM file_index WHERE path = ?1",
+            rusqlite::params![path],
+            |r| r.get(0),
+        )
+        .ok();
+
+    let symbol_count = symbols.len();
+    FileOverviewOutput {
+        path: path.to_string(),
+        language,
+        symbols,
+        symbol_count,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tool 4: symbol_info
 // ---------------------------------------------------------------------------
@@ -240,13 +461,22 @@ struct SymbolInfoOutput {
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize, JsonSchema)]
-#[allow(dead_code)]
 struct SourceParams {
     symbol: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     path: Option<String>,
     #[serde(default)]
     include_metadata: bool,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct SourceMetadata {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    signature: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    docstring: Option<String>,
+    caller_count: i64,
+    is_hub: bool,
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -257,6 +487,8 @@ struct SourceOutput {
     line_end: i64,
     source: String,
     language: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata: Option<SourceMetadata>,
 }
 
 // ---------------------------------------------------------------------------
@@ -287,6 +519,8 @@ struct CallersOutput {
     symbol: String,
     direct: Vec<CallerEntry>,
     direct_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transitive: Option<Vec<TransitiveEntry>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -317,6 +551,87 @@ struct CalleesOutput {
     symbol: String,
     direct: Vec<CalleeEntry>,
     direct_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transitive: Option<Vec<TransitiveEntry>>,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct TransitiveEntry {
+    symbol: String,
+    path: String,
+    depth: i64,
+    edge_confidence: String,
+}
+
+#[derive(Clone, Copy)]
+enum EdgeDirection {
+    Callers,
+    Callees,
+}
+
+/// BFS over `call_edges` beyond the direct neighbors, shared by `callers` and
+/// `callees` when `transitive: true`. Bounded by `max_depth` and a wall-clock
+/// timeout so a hub symbol can't blow up the response.
+fn transitive_bfs(
+    conn: &rusqlite::Connection,
+    start_qualified_name: &str,
+    direction: EdgeDirection,
+    max_depth: usize,
+    timeout_ms: u64,
+) -> Vec<TransitiveEntry> {
+    let sql = match direction {
+        EdgeDirection::Callers => {
+            "SELECT from_symbol, from_path, edge_confidence FROM call_edges WHERE to_symbol = ?1"
+        }
+        EdgeDirection::Callees => {
+            "SELECT to_symbol, to_path, edge_confidence FROM call_edges WHERE from_symbol = ?1"
+        }
+    };
+    let mut stmt = match conn.prepare(sql) {
+        Ok(s) => s,
+        Err(_) => return vec![],
+    };
+
+    let start = std::time::Instant::now();
+    let deadline = std::time::Duration::from_millis(timeout_ms);
+
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    visited.insert(start_qualified_name.to_string());
+    let mut frontier = vec![start_qualified_name.to_string()];
+    let mut results = Vec::new();
+    let mut depth = 0usize;
+
+    while depth < max_depth && !frontier.is_empty() {
+        if start.elapsed() > deadline {
+            break;
+        }
+        depth += 1;
+        let mut next_frontier = Vec::new();
+        for sym in &frontier {
+            let rows = stmt.query_map(rusqlite::params![sym], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1).unwrap_or_default(),
+                    row.get::<_, String>(2)?,
+                ))
+            });
+            let Ok(rows) = rows else { continue };
+            for (sym_name, sym_path, edge_confidence) in rows.filter_map(|r| r.ok()) {
+                if visited.insert(sym_name.clone()) {
+                    results.push(TransitiveEntry {
+                        symbol: sym_name.clone(),
+                        path: sym_path,
+                        depth: depth as i64,
+                        edge_confidence,
+                    });
+                    next_frontier.push(sym_name);
+                }
+            }
+        }
+        frontier = next_frontier;
+    }
+
+    results
 }
 
 // ---------------------------------------------------------------------------
@@ -353,7 +668,32 @@ struct PathParams {
     from_symbol: String,
     to_symbol: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    from_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    to_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     max_hops: Option<i64>,
+}
+
+/// Local mirror of `ci_core::types::TerminatedBy` — that type lives in
+/// `ci-core`, which doesn't depend on `schemars`, so it can't derive
+/// `JsonSchema` itself.
+#[derive(Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum TerminatedByOutput {
+    Timeout,
+    MaxHops,
+    PathCount,
+}
+
+impl From<ci_core::types::TerminatedBy> for TerminatedByOutput {
+    fn from(t: ci_core::types::TerminatedBy) -> Self {
+        match t {
+            ci_core::types::TerminatedBy::Timeout => TerminatedByOutput::Timeout,
+            ci_core::types::TerminatedBy::MaxHops => TerminatedByOutput::MaxHops,
+            ci_core::types::TerminatedBy::PathCount => TerminatedByOutput::PathCount,
+        }
+    }
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -362,6 +702,10 @@ struct PathOutput {
     to_symbol: String,
     routes: Vec<Vec<String>>,
     route_count: usize,
+    exists: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    terminated_by: Option<TerminatedByOutput>,
+    hops_clamped: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -616,45 +960,8 @@ impl CodeIntelligenceServer {
     )]
     fn file_overview(&self, Parameters(p): Parameters<FileOverviewParams>) -> String {
         crate::telemetry::timed_tool("file_overview", || {
-            let _conn2 = self.db();
-            let mut stmt = _conn2
-                .prepare(
-                    "SELECT name, qualified_name, kind, line_start, line_end
-                     FROM symbols WHERE path = ?1 ORDER BY line_start",
-                )
-                .unwrap();
-
-            let symbols: Vec<FileOverviewSymbol> = stmt
-                .query_map(rusqlite::params![p.path], |row| {
-                    Ok(FileOverviewSymbol {
-                        name: row.get(0)?,
-                        qualified_name: row.get(1)?,
-                        kind: row.get(2)?,
-                        line_start: row.get(3)?,
-                        line_end: row.get(4)?,
-                    })
-                })
-                .unwrap()
-                .filter_map(|r| r.ok())
-                .collect();
-
-            let language: Option<String> = self
-                .db()
-                .query_row(
-                    "SELECT language FROM file_index WHERE path = ?1",
-                    rusqlite::params![p.path],
-                    |r| r.get(0),
-                )
-                .ok();
-
-            let count = symbols.len();
-            serde_json::to_string_pretty(&FileOverviewOutput {
-                path: p.path,
-                language,
-                symbols,
-                symbol_count: count,
-            })
-            .unwrap_or_default()
+            let conn = self.db();
+            serde_json::to_string_pretty(&build_file_overview(&conn, &p.path)).unwrap_or_default()
         })
     }
 
@@ -664,58 +971,16 @@ impl CodeIntelligenceServer {
     )]
     fn symbol_info(&self, Parameters(p): Parameters<SymbolInfoParams>) -> String {
         crate::telemetry::timed_tool("symbol_info", || {
-            let query = if p.path.is_some() {
-                "SELECT name, qualified_name, kind, path, line_start, line_end, signature, docstring, caller_count, is_hub
-                 FROM symbols WHERE name = ?1 AND path = ?2 LIMIT 1"
-            } else {
-                "SELECT name, qualified_name, kind, path, line_start, line_end, signature, docstring, caller_count, is_hub
-                 FROM symbols WHERE name = ?1 LIMIT 1"
+            let resolution = {
+                let conn = self.db();
+                resolve_symbol(&conn, &p.symbol, p.path.as_deref())
             };
-
-            let result = if let Some(ref path) = p.path {
-                self.db()
-                    .query_row(query, rusqlite::params![p.symbol, path], |row| {
-                        Ok(SymbolInfoOutput {
-                            name: row.get(0)?,
-                            qualified_name: row.get(1)?,
-                            kind: row.get(2)?,
-                            path: row.get(3)?,
-                            line_start: row.get(4)?,
-                            line_end: row.get(5)?,
-                            signature: row.get::<_, String>(6).ok().filter(|s| !s.is_empty()),
-                            docstring: row.get::<_, String>(7).ok().filter(|s| !s.is_empty()),
-                            caller_count: row.get(8)?,
-                            is_hub: row.get::<_, i64>(9)? != 0,
-                        })
-                    })
-            } else {
-                self.db()
-                    .query_row(query, rusqlite::params![p.symbol], |row| {
-                        Ok(SymbolInfoOutput {
-                            name: row.get(0)?,
-                            qualified_name: row.get(1)?,
-                            kind: row.get(2)?,
-                            path: row.get(3)?,
-                            line_start: row.get(4)?,
-                            line_end: row.get(5)?,
-                            signature: row.get::<_, String>(6).ok().filter(|s| !s.is_empty()),
-                            docstring: row.get::<_, String>(7).ok().filter(|s| !s.is_empty()),
-                            caller_count: row.get(8)?,
-                            is_hub: row.get::<_, i64>(9)? != 0,
-                        })
-                    })
-            };
-
-            match result {
-                Ok(info) => serde_json::to_string_pretty(&info).unwrap_or_default(),
-                Err(_) => serde_json::to_string_pretty(&ErrorOutput {
-                    error: ErrorDetail {
-                        code: "NOT_FOUND".into(),
-                        message: format!("Symbol '{}' not found in index", p.symbol),
-                        recoverable: false,
-                    },
-                })
-                .unwrap_or_default(),
+            match resolution {
+                SymbolResolution::NotFound => not_found_json(&p.symbol),
+                SymbolResolution::Ambiguous(candidates) => ambiguous_json(&candidates),
+                SymbolResolution::Found(c) => {
+                    serde_json::to_string_pretty(&c.to_symbol_info()).unwrap_or_default()
+                }
             }
         })
     }
@@ -726,54 +991,45 @@ impl CodeIntelligenceServer {
     )]
     fn source(&self, Parameters(p): Parameters<SourceParams>) -> String {
         crate::telemetry::timed_tool("source", || {
-            let row = self.db().query_row(
-                "SELECT qualified_name, path, line_start, line_end, language
-                 FROM symbols WHERE name = ?1 LIMIT 1",
-                rusqlite::params![p.symbol],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, i64>(2)?,
-                        row.get::<_, i64>(3)?,
-                        row.get::<_, String>(4)?,
-                    ))
-                },
-            );
+            let resolution = {
+                let conn = self.db();
+                resolve_symbol(&conn, &p.symbol, p.path.as_deref())
+            };
+            let c = match resolution {
+                SymbolResolution::NotFound => return not_found_json(&p.symbol),
+                SymbolResolution::Ambiguous(candidates) => return ambiguous_json(&candidates),
+                SymbolResolution::Found(c) => c,
+            };
 
-            match row {
-                Ok((_, path, line_start, line_end, language)) => {
-                    let full_path = self.project_root.join(&path);
-                    let source = match std::fs::read_to_string(&full_path) {
-                        Ok(content) => {
-                            let lines: Vec<&str> = content.lines().collect();
-                            let start = (line_start as usize).saturating_sub(1);
-                            let end = (line_end as usize).min(lines.len());
-                            lines[start..end].join("\n")
-                        }
-                        Err(_) => "(source file not readable)".into(),
-                    };
-
-                    let sanitized = sanitize_source_output(&source);
-                    serde_json::to_string_pretty(&SourceOutput {
-                        symbol: p.symbol,
-                        path,
-                        line_start,
-                        line_end,
-                        source: sanitized,
-                        language,
-                    })
-                    .unwrap_or_default()
+            let full_path = self.project_root.join(&c.path);
+            let source = match std::fs::read_to_string(&full_path) {
+                Ok(content) => {
+                    let lines: Vec<&str> = content.lines().collect();
+                    let start = (c.line_start as usize).saturating_sub(1);
+                    let end = (c.line_end as usize).min(lines.len());
+                    lines[start..end].join("\n")
                 }
-                Err(_) => serde_json::to_string_pretty(&ErrorOutput {
-                    error: ErrorDetail {
-                        code: "NOT_FOUND".into(),
-                        message: format!("Symbol '{}' not found in index", p.symbol),
-                        recoverable: false,
-                    },
-                })
-                .unwrap_or_default(),
-            }
+                Err(_) => "(source file not readable)".into(),
+            };
+            let sanitized = sanitize_source_output(&source);
+
+            let metadata = p.include_metadata.then(|| SourceMetadata {
+                signature: Some(c.signature.clone()).filter(|s| !s.is_empty()),
+                docstring: Some(c.docstring.clone()).filter(|s| !s.is_empty()),
+                caller_count: c.caller_count,
+                is_hub: c.is_hub,
+            });
+
+            serde_json::to_string_pretty(&SourceOutput {
+                symbol: p.symbol,
+                path: c.path,
+                line_start: c.line_start,
+                line_end: c.line_end,
+                source: sanitized,
+                language: c.language,
+                metadata,
+            })
+            .unwrap_or_default()
         })
     }
 
@@ -783,16 +1039,25 @@ impl CodeIntelligenceServer {
     )]
     fn callers(&self, Parameters(p): Parameters<CallersParams>) -> String {
         crate::telemetry::timed_tool("callers", || {
-            let _conn3 = self.db();
-            let mut stmt = _conn3
-                .prepare(
-                    "SELECT from_symbol, from_path, edge_confidence
-                     FROM call_edges WHERE to_symbol = ?1",
-                )
-                .unwrap();
+            let resolution = {
+                let conn = self.db();
+                resolve_symbol(&conn, &p.symbol, p.path.as_deref())
+            };
+            let c = match resolution {
+                SymbolResolution::NotFound => return not_found_json(&p.symbol),
+                SymbolResolution::Ambiguous(candidates) => return ambiguous_json(&candidates),
+                SymbolResolution::Found(c) => c,
+            };
 
-            let direct: Vec<CallerEntry> = stmt
-                .query_map(rusqlite::params![p.symbol], |row| {
+            let direct: Vec<CallerEntry> = {
+                let conn = self.db();
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT from_symbol, from_path, edge_confidence
+                         FROM call_edges WHERE to_symbol = ?1",
+                    )
+                    .unwrap();
+                stmt.query_map(rusqlite::params![c.qualified_name], |row| {
                     Ok(CallerEntry {
                         symbol: row.get(0)?,
                         path: row.get::<_, String>(1).unwrap_or_default(),
@@ -801,13 +1066,33 @@ impl CodeIntelligenceServer {
                 })
                 .unwrap()
                 .filter_map(|r| r.ok())
-                .collect();
+                .collect()
+            };
+
+            let transitive = if p.transitive {
+                let config = ci_core::config::load_config(&self.project_root).unwrap_or_default();
+                let max_depth = p
+                    .max_depth
+                    .map(|d| (d.max(1) as usize).min(config.callers.max_depth_cap))
+                    .unwrap_or(config.callers.max_depth_cap);
+                let conn = self.db();
+                Some(transitive_bfs(
+                    &conn,
+                    &c.qualified_name,
+                    EdgeDirection::Callers,
+                    max_depth,
+                    config.callers.transitive_timeout_ms,
+                ))
+            } else {
+                None
+            };
 
             let count = direct.len();
             serde_json::to_string_pretty(&CallersOutput {
                 symbol: p.symbol,
                 direct,
                 direct_count: count,
+                transitive,
             })
             .unwrap_or_default()
         })
@@ -819,16 +1104,25 @@ impl CodeIntelligenceServer {
     )]
     fn callees(&self, Parameters(p): Parameters<CalleesParams>) -> String {
         crate::telemetry::timed_tool("callees", || {
-            let _conn4 = self.db();
-            let mut stmt = _conn4
-                .prepare(
-                    "SELECT to_symbol, to_path, edge_confidence
-                     FROM call_edges WHERE from_symbol = ?1",
-                )
-                .unwrap();
+            let resolution = {
+                let conn = self.db();
+                resolve_symbol(&conn, &p.symbol, p.path.as_deref())
+            };
+            let c = match resolution {
+                SymbolResolution::NotFound => return not_found_json(&p.symbol),
+                SymbolResolution::Ambiguous(candidates) => return ambiguous_json(&candidates),
+                SymbolResolution::Found(c) => c,
+            };
 
-            let direct: Vec<CalleeEntry> = stmt
-                .query_map(rusqlite::params![p.symbol], |row| {
+            let direct: Vec<CalleeEntry> = {
+                let conn = self.db();
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT to_symbol, to_path, edge_confidence
+                         FROM call_edges WHERE from_symbol = ?1",
+                    )
+                    .unwrap();
+                stmt.query_map(rusqlite::params![c.qualified_name], |row| {
                     Ok(CalleeEntry {
                         symbol: row.get(0)?,
                         path: row.get::<_, String>(1).unwrap_or_default(),
@@ -837,13 +1131,33 @@ impl CodeIntelligenceServer {
                 })
                 .unwrap()
                 .filter_map(|r| r.ok())
-                .collect();
+                .collect()
+            };
+
+            let transitive = if p.transitive {
+                let config = ci_core::config::load_config(&self.project_root).unwrap_or_default();
+                let max_depth = p
+                    .max_depth
+                    .map(|d| (d.max(1) as usize).min(config.callees.max_depth_cap))
+                    .unwrap_or(config.callees.max_depth_cap);
+                let conn = self.db();
+                Some(transitive_bfs(
+                    &conn,
+                    &c.qualified_name,
+                    EdgeDirection::Callees,
+                    max_depth,
+                    config.callees.transitive_timeout_ms,
+                ))
+            } else {
+                None
+            };
 
             let count = direct.len();
             serde_json::to_string_pretty(&CalleesOutput {
                 symbol: p.symbol,
                 direct,
                 direct_count: count,
+                transitive,
             })
             .unwrap_or_default()
         })
@@ -910,24 +1224,53 @@ impl CodeIntelligenceServer {
     )]
     fn path(&self, Parameters(p): Parameters<PathParams>) -> String {
         crate::telemetry::timed_tool("path", || {
-            let max_hops = p.max_hops.unwrap_or(8).min(20) as usize;
-            let result = ci_core::graph::path::bidirectional_bfs_path(
-                &self.db(),
-                &p.from_symbol,
-                &p.to_symbol,
-                max_hops,
-                5,
-                5000,
-            );
+            let from = {
+                let conn = self.db();
+                resolve_symbol(&conn, &p.from_symbol, p.from_path.as_deref())
+            };
+            let from = match from {
+                SymbolResolution::NotFound => return not_found_json(&p.from_symbol),
+                SymbolResolution::Ambiguous(candidates) => return ambiguous_json(&candidates),
+                SymbolResolution::Found(c) => c,
+            };
 
-            let routes: Vec<Vec<String>> = result
-                .map(|r| {
+            let to = {
+                let conn = self.db();
+                resolve_symbol(&conn, &p.to_symbol, p.to_path.as_deref())
+            };
+            let to = match to {
+                SymbolResolution::NotFound => return not_found_json(&p.to_symbol),
+                SymbolResolution::Ambiguous(candidates) => return ambiguous_json(&candidates),
+                SymbolResolution::Found(c) => c,
+            };
+
+            let requested_hops = p.max_hops.unwrap_or(8);
+            let hops_clamped = !(0..=20).contains(&requested_hops);
+            let max_hops = requested_hops.clamp(0, 20) as usize;
+
+            let result = {
+                let conn = self.db();
+                ci_core::graph::path::bidirectional_bfs_path(
+                    &conn,
+                    &from.qualified_name,
+                    &to.qualified_name,
+                    max_hops,
+                    5,
+                    5000,
+                )
+            };
+
+            let (routes, exists, terminated_by) = match result {
+                Ok(r) => (
                     r.routes
                         .into_iter()
                         .map(|path| path.into_iter().map(|step| step.symbol).collect())
-                        .collect()
-                })
-                .unwrap_or_default();
+                        .collect::<Vec<Vec<String>>>(),
+                    r.exists,
+                    r.terminated_by.map(TerminatedByOutput::from),
+                ),
+                Err(_) => (vec![], None, None),
+            };
 
             let count = routes.len();
             serde_json::to_string_pretty(&PathOutput {
@@ -935,6 +1278,9 @@ impl CodeIntelligenceServer {
                 to_symbol: p.to_symbol,
                 routes,
                 route_count: count,
+                exists,
+                terminated_by,
+                hops_clamped,
             })
             .unwrap_or_default()
         })
@@ -946,15 +1292,25 @@ impl CodeIntelligenceServer {
     )]
     fn edit_context(&self, Parameters(p): Parameters<EditContextParams>) -> String {
         crate::telemetry::timed_tool("edit_context", || {
-            let _conn7 = self.db();
-            let mut stmt_callers = _conn7
-                .prepare(
-                    "SELECT from_symbol, from_path, edge_confidence
-                     FROM call_edges WHERE to_symbol = ?1",
-                )
-                .unwrap();
-            let callers: Vec<CallerEntry> = stmt_callers
-                .query_map(rusqlite::params![p.symbol], |row| {
+            let resolution = {
+                let conn = self.db();
+                resolve_symbol(&conn, &p.symbol, p.path.as_deref())
+            };
+            let c = match resolution {
+                SymbolResolution::NotFound => return not_found_json(&p.symbol),
+                SymbolResolution::Ambiguous(candidates) => return ambiguous_json(&candidates),
+                SymbolResolution::Found(c) => c,
+            };
+
+            let callers: Vec<CallerEntry> = {
+                let conn = self.db();
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT from_symbol, from_path, edge_confidence
+                         FROM call_edges WHERE to_symbol = ?1",
+                    )
+                    .unwrap();
+                stmt.query_map(rusqlite::params![c.qualified_name], |row| {
                     Ok(CallerEntry {
                         symbol: row.get(0)?,
                         path: row.get::<_, String>(1).unwrap_or_default(),
@@ -963,17 +1319,18 @@ impl CodeIntelligenceServer {
                 })
                 .unwrap()
                 .filter_map(|r| r.ok())
-                .collect();
+                .collect()
+            };
 
-            let _conn8 = self.db();
-            let mut stmt_callees = _conn8
-                .prepare(
-                    "SELECT to_symbol, to_path, edge_confidence
-                     FROM call_edges WHERE from_symbol = ?1",
-                )
-                .unwrap();
-            let callees: Vec<CalleeEntry> = stmt_callees
-                .query_map(rusqlite::params![p.symbol], |row| {
+            let callees: Vec<CalleeEntry> = {
+                let conn = self.db();
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT to_symbol, to_path, edge_confidence
+                         FROM call_edges WHERE from_symbol = ?1",
+                    )
+                    .unwrap();
+                stmt.query_map(rusqlite::params![c.qualified_name], |row| {
                     Ok(CalleeEntry {
                         symbol: row.get(0)?,
                         path: row.get::<_, String>(1).unwrap_or_default(),
@@ -982,7 +1339,8 @@ impl CodeIntelligenceServer {
                 })
                 .unwrap()
                 .filter_map(|r| r.ok())
-                .collect();
+                .collect()
+            };
 
             let risk = if callers.len() > 10 {
                 Some("high".into())
@@ -1160,11 +1518,22 @@ impl CodeIntelligenceServer {
                     .ok()
             });
 
+            let is_file_match =
+                kind_str == "file" || top.map(|t| t.match_type == "file").unwrap_or(false);
+            let file_overview = if is_file_match {
+                top.map(|t| {
+                    let conn = self.db();
+                    build_file_overview(&conn, &t.path)
+                })
+            } else {
+                None
+            };
+
             let truncated = search_output.truncated;
             serde_json::to_string_pretty(&LocateOutput {
                 results,
                 top_symbol,
-                file_overview: None,
+                file_overview,
                 truncated,
             })
             .unwrap_or_default()
@@ -1244,6 +1613,7 @@ impl CodeIntelligenceServer {
                     line_end: info.line_end,
                     source,
                     language: "".into(),
+                    metadata: None,
                 })
             });
 
