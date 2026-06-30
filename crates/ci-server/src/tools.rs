@@ -14,6 +14,15 @@ use ci_core::types::{EmbedStatus, IndexingPhase};
 // Server state
 // ---------------------------------------------------------------------------
 
+/// In-memory session tracking — tool call count and the set of symbols/files
+/// touched, for the `session_context` tool. Reset only when the server restarts.
+#[derive(Default)]
+struct SessionLog {
+    tool_calls: u64,
+    explored_symbols: std::collections::HashSet<String>,
+    explored_files: std::collections::HashSet<String>,
+}
+
 #[derive(Clone)]
 pub struct CodeIntelligenceServer {
     project_root: PathBuf,
@@ -31,6 +40,7 @@ pub struct CodeIntelligenceServer {
     embed_status: Arc<RwLock<EmbedStatus>>,
     /// Coverage data loaded once at startup from lcov/cobertura/etc files, if present.
     coverage: Arc<ci_core::analysis::coverage::CoverageData>,
+    session_log: Arc<Mutex<SessionLog>>,
 }
 
 impl CodeIntelligenceServer {
@@ -49,11 +59,34 @@ impl CodeIntelligenceServer {
             embedder: Arc::new(RwLock::new(None)),
             embed_status: Arc::new(RwLock::new(EmbedStatus::Disabled)),
             coverage: Arc::new(coverage),
+            session_log: Arc::new(Mutex::new(SessionLog::default())),
         })
     }
 
     fn db(&self) -> std::sync::MutexGuard<'_, rusqlite::Connection> {
         self.conn.lock().unwrap()
+    }
+
+    /// Wraps `telemetry::timed_tool`, additionally bumping the session's tool-call
+    /// counter. Kept as a method (rather than changing `timed_tool`'s signature)
+    /// since only this type has access to `session_log`.
+    fn timed_tool(&self, name: &str, body: impl FnOnce() -> String) -> String {
+        if let Ok(mut log) = self.session_log.lock() {
+            log.tool_calls += 1;
+        }
+        crate::telemetry::timed_tool(name, body)
+    }
+
+    fn track_symbol(&self, qualified_name: &str) {
+        if let Ok(mut log) = self.session_log.lock() {
+            log.explored_symbols.insert(qualified_name.to_string());
+        }
+    }
+
+    fn track_file(&self, path: &str) {
+        if let Ok(mut log) = self.session_log.lock() {
+            log.explored_files.insert(path.to_string());
+        }
     }
 
     /// A handle the background indexer uses to advance the phase as it works.
@@ -1027,7 +1060,7 @@ impl CodeIntelligenceServer {
         description = "Overview of the entire repository — languages, stats, indexing status. ALWAYS call first."
     )]
     fn repo_overview(&self) -> String {
-        crate::telemetry::timed_tool("repo_overview", || {
+        self.timed_tool("repo_overview", || {
             let total_symbols: i64 = self
                 .db()
                 .query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0))
@@ -1067,7 +1100,7 @@ impl CodeIntelligenceServer {
         description = "FTS5 dual-column search across symbols, text, files. Supports symbol, text, file, semantic, hybrid kinds."
     )]
     fn search(&self, Parameters(p): Parameters<SearchParams>) -> String {
-        crate::telemetry::timed_tool("search", || {
+        self.timed_tool("search", || {
             let kind = match p.kind.as_str() {
                 "symbol" => ci_core::types::SearchKind::Symbol,
                 "text" => ci_core::types::SearchKind::Text,
@@ -1119,7 +1152,8 @@ impl CodeIntelligenceServer {
         description = "List all symbols in a file — functions, classes, methods with line ranges."
     )]
     fn file_overview(&self, Parameters(p): Parameters<FileOverviewParams>) -> String {
-        crate::telemetry::timed_tool("file_overview", || {
+        self.timed_tool("file_overview", || {
+            self.track_file(&p.path);
             let conn = self.db();
             serde_json::to_string_pretty(&build_file_overview(&conn, &p.path)).unwrap_or_default()
         })
@@ -1130,7 +1164,7 @@ impl CodeIntelligenceServer {
         description = "Detailed info for a single symbol — signature, docstring, hub status, caller count."
     )]
     fn symbol_info(&self, Parameters(p): Parameters<SymbolInfoParams>) -> String {
-        crate::telemetry::timed_tool("symbol_info", || {
+        self.timed_tool("symbol_info", || {
             let resolution = {
                 let conn = self.db();
                 resolve_symbol(&conn, &p.symbol, p.path.as_deref())
@@ -1139,6 +1173,8 @@ impl CodeIntelligenceServer {
                 SymbolResolution::NotFound => not_found_json(&p.symbol),
                 SymbolResolution::Ambiguous(candidates) => ambiguous_json(&candidates),
                 SymbolResolution::Found(c) => {
+                    self.track_symbol(&c.qualified_name);
+                    self.track_file(&c.path);
                     let mut out = c.to_symbol_info();
                     out.health = Some(build_health(&self.coverage, &self.project_root, &c));
                     serde_json::to_string_pretty(&out).unwrap_or_default()
@@ -1152,7 +1188,7 @@ impl CodeIntelligenceServer {
         description = "Retrieve source code for a symbol. Output is sanitized for credentials."
     )]
     fn source(&self, Parameters(p): Parameters<SourceParams>) -> String {
-        crate::telemetry::timed_tool("source", || {
+        self.timed_tool("source", || {
             let resolution = {
                 let conn = self.db();
                 resolve_symbol(&conn, &p.symbol, p.path.as_deref())
@@ -1162,6 +1198,8 @@ impl CodeIntelligenceServer {
                 SymbolResolution::Ambiguous(candidates) => return ambiguous_json(&candidates),
                 SymbolResolution::Found(c) => c,
             };
+            self.track_symbol(&c.qualified_name);
+            self.track_file(&c.path);
 
             let full_path = self.project_root.join(&c.path);
             let source = match std::fs::read_to_string(&full_path) {
@@ -1200,7 +1238,7 @@ impl CodeIntelligenceServer {
         description = "Who calls this symbol? Returns direct callers with edge confidence."
     )]
     fn callers(&self, Parameters(p): Parameters<CallersParams>) -> String {
-        crate::telemetry::timed_tool("callers", || {
+        self.timed_tool("callers", || {
             let resolution = {
                 let conn = self.db();
                 resolve_symbol(&conn, &p.symbol, p.path.as_deref())
@@ -1210,6 +1248,8 @@ impl CodeIntelligenceServer {
                 SymbolResolution::Ambiguous(candidates) => return ambiguous_json(&candidates),
                 SymbolResolution::Found(c) => c,
             };
+            self.track_symbol(&c.qualified_name);
+            self.track_file(&c.path);
 
             let direct: Vec<CallerEntry> = {
                 let conn = self.db();
@@ -1265,7 +1305,7 @@ impl CodeIntelligenceServer {
         description = "What does this symbol call? Returns direct callees with edge confidence."
     )]
     fn callees(&self, Parameters(p): Parameters<CalleesParams>) -> String {
-        crate::telemetry::timed_tool("callees", || {
+        self.timed_tool("callees", || {
             let resolution = {
                 let conn = self.db();
                 resolve_symbol(&conn, &p.symbol, p.path.as_deref())
@@ -1275,6 +1315,8 @@ impl CodeIntelligenceServer {
                 SymbolResolution::Ambiguous(candidates) => return ambiguous_json(&candidates),
                 SymbolResolution::Found(c) => c,
             };
+            self.track_symbol(&c.qualified_name);
+            self.track_file(&c.path);
 
             let direct: Vec<CalleeEntry> = {
                 let conn = self.db();
@@ -1330,7 +1372,8 @@ impl CodeIntelligenceServer {
         description = "Import/export dependencies for a file — what it imports and what imports it."
     )]
     fn dependencies(&self, Parameters(p): Parameters<DependenciesParams>) -> String {
-        crate::telemetry::timed_tool("dependencies", || {
+        self.timed_tool("dependencies", || {
+            self.track_file(&p.path);
             let _conn5 = self.db();
             let mut stmt_imports = _conn5
                 .prepare(
@@ -1385,7 +1428,7 @@ impl CodeIntelligenceServer {
         description = "Find call paths between two symbols using bidirectional BFS."
     )]
     fn path(&self, Parameters(p): Parameters<PathParams>) -> String {
-        crate::telemetry::timed_tool("path", || {
+        self.timed_tool("path", || {
             let from = {
                 let conn = self.db();
                 resolve_symbol(&conn, &p.from_symbol, p.from_path.as_deref())
@@ -1395,6 +1438,8 @@ impl CodeIntelligenceServer {
                 SymbolResolution::Ambiguous(candidates) => return ambiguous_json(&candidates),
                 SymbolResolution::Found(c) => c,
             };
+            self.track_symbol(&from.qualified_name);
+            self.track_file(&from.path);
 
             let to = {
                 let conn = self.db();
@@ -1405,6 +1450,8 @@ impl CodeIntelligenceServer {
                 SymbolResolution::Ambiguous(candidates) => return ambiguous_json(&candidates),
                 SymbolResolution::Found(c) => c,
             };
+            self.track_symbol(&to.qualified_name);
+            self.track_file(&to.path);
 
             let requested_hops = p.max_hops.unwrap_or(8);
             let hops_clamped = !(0..=20).contains(&requested_hops);
@@ -1453,7 +1500,7 @@ impl CodeIntelligenceServer {
         description = "Pre-edit blast radius — callers, callees, and risk assessment for a symbol you plan to modify."
     )]
     fn edit_context(&self, Parameters(p): Parameters<EditContextParams>) -> String {
-        crate::telemetry::timed_tool("edit_context", || {
+        self.timed_tool("edit_context", || {
             let resolution = {
                 let conn = self.db();
                 resolve_symbol(&conn, &p.symbol, p.path.as_deref())
@@ -1463,6 +1510,8 @@ impl CodeIntelligenceServer {
                 SymbolResolution::Ambiguous(candidates) => return ambiguous_json(&candidates),
                 SymbolResolution::Found(c) => c,
             };
+            self.track_symbol(&c.qualified_name);
+            self.track_file(&c.path);
 
             let callers: Vec<CallerEntry> = {
                 let conn = self.db();
@@ -1527,12 +1576,14 @@ impl CodeIntelligenceServer {
         description = "Session tracking state — explored symbols, files, tool call count."
     )]
     fn session_context(&self) -> String {
-        crate::telemetry::timed_tool("session_context", || {
+        self.timed_tool("session_context", || {
+            let log = self.session_log.lock().unwrap();
+            let explored_files: Vec<String> = log.explored_files.iter().cloned().collect();
             serde_json::to_string_pretty(&SessionContextOutput {
-                tool_calls: 0,
-                explored_symbols: vec![],
-                explored_files: vec![],
-                unique_files_explored: 0,
+                tool_calls: log.tool_calls,
+                explored_symbols: log.explored_symbols.iter().cloned().collect(),
+                unique_files_explored: explored_files.len(),
+                explored_files,
             })
             .unwrap_or_default()
         })
@@ -1543,7 +1594,7 @@ impl CodeIntelligenceServer {
         description = "Post-edit blast radius — analyze a diff for affected symbols and risk level. Provide exactly one of: diff, staged, commits."
     )]
     fn diff_impact(&self, Parameters(p): Parameters<DiffImpactParams>) -> String {
-        crate::telemetry::timed_tool("diff_impact", || {
+        self.timed_tool("diff_impact", || {
             let input_count =
                 p.diff.is_some() as u8 + p.staged.is_some() as u8 + p.commits.is_some() as u8;
             if input_count != 1 {
@@ -1721,7 +1772,7 @@ impl CodeIntelligenceServer {
         description = "Current index status — files, symbols, edges, embedding state. Can retry embeddings."
     )]
     fn indexing_status(&self, Parameters(p): Parameters<IndexingStatusParams>) -> String {
-        crate::telemetry::timed_tool("indexing_status", || {
+        self.timed_tool("indexing_status", || {
             let files: i64 = self
                 .db()
                 .query_row("SELECT COUNT(*) FROM file_index", [], |r| r.get(0))
@@ -1756,7 +1807,7 @@ impl CodeIntelligenceServer {
         description = "Compound: search + file_overview + symbol_info in one call. Default depth: with_symbol."
     )]
     fn locate(&self, Parameters(p): Parameters<LocateParams>) -> String {
-        crate::telemetry::timed_tool("locate", || {
+        self.timed_tool("locate", || {
             let kind_str = p.kind.as_deref().unwrap_or("symbol");
             let kind = match kind_str {
                 "text" => ci_core::types::SearchKind::Text,
@@ -1839,6 +1890,13 @@ impl CodeIntelligenceServer {
                 None
             };
 
+            if let Some(t) = top {
+                self.track_file(&t.path);
+                if t.match_type != "file" {
+                    self.track_symbol(&t.qualified_name);
+                }
+            }
+
             let truncated = search_output.truncated;
             serde_json::to_string_pretty(&LocateOutput {
                 results,
@@ -1855,7 +1913,7 @@ impl CodeIntelligenceServer {
         description = "Churn × complexity hotspots — files most likely to cause bugs based on git history."
     )]
     fn hotspots(&self, Parameters(p): Parameters<HotspotsParams>) -> String {
-        crate::telemetry::timed_tool("hotspots", || {
+        self.timed_tool("hotspots", || {
             let config = ci_core::config::load_config(&self.project_root).unwrap_or_default();
             let hc = &config.hotspots;
             let top_n = p.top_n.unwrap_or(hc.default_top_n);
@@ -1897,7 +1955,7 @@ impl CodeIntelligenceServer {
         description = "Compound: locate + source + callers in one call. Deep understanding of a symbol."
     )]
     fn understand(&self, Parameters(p): Parameters<UnderstandParams>) -> String {
-        crate::telemetry::timed_tool("understand", || {
+        self.timed_tool("understand", || {
             let kind_str = p.kind.as_deref().unwrap_or("symbol");
             let kind = match kind_str {
                 "text" => ci_core::types::SearchKind::Text,
@@ -1936,6 +1994,11 @@ impl CodeIntelligenceServer {
                     )
                     .ok()
             });
+
+            if let Some(info) = symbol_info.as_ref() {
+                self.track_symbol(&info.qualified_name);
+                self.track_file(&info.path);
+            }
 
             let source_output = symbol_info.as_ref().and_then(|info| {
                 let full_path = self.project_root.join(&info.path);
@@ -2111,6 +2174,45 @@ mod tests {
         }));
         let v: serde_json::Value = serde_json::from_str(&output).unwrap();
         assert_eq!(v["error"]["code"], "INVALID_INPUT");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_context_tracks_tool_calls_and_explored_state() {
+        let dir = std::env::temp_dir().join(format!("ci_session_ctx_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                rusqlite::params![
+                    "mod.foo", "foo", "function", "rust", "src/foo.rs", 1i64, 5i64, "fn foo()",
+                    "", "foo", 0i64, 0i64, 0i64
+                ],
+            )
+            .unwrap();
+        }
+
+        let _ = server.symbol_info(Parameters(SymbolInfoParams {
+            symbol: "foo".into(),
+            path: None,
+        }));
+        let _ = server.file_overview(Parameters(FileOverviewParams {
+            path: "src/foo.rs".into(),
+        }));
+
+        let output = server.session_context();
+        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+        assert!(v["tool_calls"].as_u64().unwrap() >= 3); // symbol_info + file_overview + session_context itself
+        assert_eq!(v["explored_symbols"], serde_json::json!(["mod.foo"]));
+        assert_eq!(v["explored_files"], serde_json::json!(["src/foo.rs"]));
+        assert_eq!(v["unique_files_explored"], 1);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
