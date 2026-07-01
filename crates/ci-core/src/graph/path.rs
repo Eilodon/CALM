@@ -41,6 +41,18 @@ pub fn bidirectional_bfs_path(
         });
     }
 
+    // Spec (architecture-design.md §Tool 9, max_hops row): max_hops=0 only ever
+    // admits the 0-edge (self) path, already ruled out above — so the answer is
+    // certain (no path), not "inconclusive, ran out of hop budget" like the
+    // general max_hops-exceeded-mid-search case below.
+    if max_hops == 0 {
+        return Ok(PathResult {
+            routes: vec![],
+            exists: Some(false),
+            terminated_by: None,
+        });
+    }
+
     let start = Instant::now();
     let deadline = std::time::Duration::from_millis(timeout_ms);
 
@@ -284,6 +296,10 @@ mod tests {
         let conn = setup_db();
         insert_edge(&conn, "a", "b", "resolved");
         let result = bidirectional_bfs_path(&conn, "a", "b", 0, 3, 5000).unwrap();
-        assert_eq!(result.exists, None);
+        // Spec: max_hops=0 only admits the 0-edge (self) path — a != b here, so
+        // the answer is certain, not inconclusive.
+        assert_eq!(result.exists, Some(false));
+        assert!(result.terminated_by.is_none());
+        assert!(result.routes.is_empty());
     }
 }
