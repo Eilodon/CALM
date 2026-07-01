@@ -26,9 +26,16 @@ tính graph metrics (coreness/hubs), và phục vụ qua SQLite FTS5 + semantic 
 4. **Graph metrics** — `coreness` (k-core, O(V+E)) và `is_hub` để AI biết đâu là lõi hệ thống.
 5. **Incremental watcher** — hash-diff chỉ re-parse file đổi; call graph rebuild từ `call_sites` đã lưu trong DB. Quá trình parse được song song hoá (`rayon`). Khi `ci serve` khởi động và đã có index cũ, tự động chạy **incremental reindex** thay vì full index — giảm thời gian warm-up. Debounce 500ms, lọc bỏ noise (`.codeindex/`, `target/`, v.v.).
 6. **FTS5 search** — full-text search native qua SQLite triggers, BM25 dual-column.
-7. **Semantic search (Bật theo mặc định trong config)** — static code embeddings (`model2vec-rs` + `sqlite-vec`),
-   fuse với FTS bằng Reciprocal Rank Fusion (tỉ lệ 1.5x FTS / 1.0x Vector). Được kiểm soát bởi
-   `semantic_search.enabled` trong `config.json` (mặc định `true`). Tự động cấu hình trên bản build native.
+7. **Semantic search — 2 tầng (Bật theo mặc định trong config)** — static code embeddings
+   (`model2vec-rs` + `sqlite-vec`), fuse với FTS bằng Reciprocal Rank Fusion (tỉ lệ 1.5x FTS / 1.0x
+   mỗi tầng semantic). Tầng 1 embed *symbol identity* (tên + signature + docstring); Tầng 2
+   (`indexer::chunker`) embed *code body* thực tế — toàn bộ thân hàm nếu ≤30 dòng, sliding window
+   30 dòng/stride 20 nếu dài hơn, cộng với các đoạn code nằm giữa các symbol (module scaffolding,
+   field declarations) — nên một query chỉ khớp từ vựng *bên trong* thân hàm (một tên thư viện, một
+   biến, một idiom) vẫn tìm ra kết quả dù tên/docstring của symbol không chứa từ đó. `kind=semantic`
+   tự fuse 2 tầng nội bộ; `kind=hybrid` fuse cả 3 (FTS + Tầng 1 + Tầng 2) trong một lượt RRF phẳng.
+   Được kiểm soát bởi `semantic_search.enabled` trong `config.json` (mặc định `true`). Tự động cấu
+   hình trên bản build native.
 8. **`edges_ready` gating** — tool báo trung thực trạng thái index (`scanning → parsing →
    building_edges → ready`); agent không tin nhầm graph khi chưa build xong.
 
@@ -71,8 +78,10 @@ cargo build -p ci-cli # Đã bao gồm embeddings
 ```
 
 Model mặc định `minishlab/potion-code-16M` (256-dim, static code embeddings, pure-Rust, không
-ONNX). `search(kind="semantic")` và `kind="hybrid"` (RRF: FTS + vector) sẽ hoạt động; khi tắt,
-chúng degrade về FTS.
+ONNX) — dùng chung cho cả 2 tầng. Tầng 1 (`embedding_vecs`) index tên/signature/docstring; Tầng 2
+(`code_chunk_vecs`) index các đoạn code body thực tế (bảng quan hệ `code_chunks` lưu text/dòng, luôn
+được tạo; chỉ được embed khi feature `embeddings` bật). `search(kind="semantic")` và `kind="hybrid"`
+(RRF: FTS + vector) sẽ hoạt động; khi tắt, chúng degrade về FTS.
 
 > Lưu ý: feature `embeddings` kéo thêm dependency (tokenizers/TLS). Binary musl tĩnh phân phối
 > ở Phase IV build **không** bật feature này để giữ kích thước tối thiểu.

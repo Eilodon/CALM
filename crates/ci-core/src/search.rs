@@ -12,8 +12,13 @@ const BM25_TOKENS_WEIGHT: f64 = 1.0;
 pub const DEFAULT_RRF_K: f64 = 20.0;
 /// Weight applied to the FTS source in hybrid RRF (design spec: 1.5×).
 const RRF_FTS_WEIGHT: f64 = 1.5;
-/// Weight applied to the semantic source in hybrid RRF.
+/// Weight applied to the Layer-1 symbol-identity semantic source (name +
+/// signature + docstring) in RRF fusion.
 const RRF_SEMANTIC_WEIGHT: f64 = 1.0;
+/// Weight applied to the Layer-2 code-body chunk semantic source in RRF
+/// fusion — same trust tier as Layer 1; RRF's rank-based scoring already lets
+/// whichever layer actually matched a given query dominate on its own.
+const RRF_CHUNK_WEIGHT: f64 = 1.0;
 
 #[derive(Debug, Clone)]
 pub struct SearchResult {
@@ -48,7 +53,7 @@ pub fn search(
         SearchKind::Symbol => search_symbol(conn, query, limit),
         SearchKind::Text => search_text(conn, query, limit),
         SearchKind::File => search_file(conn, query, limit),
-        SearchKind::Semantic => search_semantic(conn, query, limit, embedder),
+        SearchKind::Semantic => search_semantic(conn, query, limit, embedder, rrf_k),
         SearchKind::Hybrid => search_hybrid(conn, query, limit, embedder, rrf_k),
     }
 }
@@ -237,11 +242,120 @@ fn search_file(conn: &Connection, query: &str, limit: usize) -> rusqlite::Result
     })
 }
 
+/// Layer 1: KNN over symbol-identity vectors (name + signature + docstring),
+/// resolved back to their symbol row.
+fn symbol_semantic_results(
+    conn: &Connection,
+    qvec: &[f32],
+    limit: usize,
+) -> rusqlite::Result<Vec<SearchResult>> {
+    let hits = crate::embedding::knn(conn, qvec, limit)?;
+    let mut stmt = conn.prepare(
+        "SELECT qualified_name, name, path, line_start, line_end, kind FROM symbols WHERE id = ?1",
+    )?;
+    let mut results = Vec::with_capacity(hits.len());
+    for (id, dist) in &hits {
+        if let Ok(mut r) = stmt.query_row(rusqlite::params![id], |row| {
+            Ok(SearchResult {
+                qualified_name: row.get(0)?,
+                name: row.get(1)?,
+                path: row.get(2)?,
+                line_start: row.get(3)?,
+                line_end: row.get(4)?,
+                kind: row.get(5)?,
+                score: 0.0,
+                match_type: "semantic".to_string(),
+                snippet: None,
+            })
+        }) {
+            // cosine distance → similarity in [0, 1] for a friendlier score.
+            r.score = 1.0 - dist;
+            results.push(r);
+        }
+    }
+    Ok(results)
+}
+
+/// Layer 2: KNN over code-body chunk vectors, resolved back to a
+/// `SearchResult` anchored at the chunk's own line range (the specific
+/// window that matched, not the whole enclosing symbol) — see
+/// [`chunk_hit_to_result`].
+fn chunk_semantic_results(
+    conn: &Connection,
+    qvec: &[f32],
+    limit: usize,
+) -> rusqlite::Result<Vec<SearchResult>> {
+    let hits = crate::embedding::knn_chunks(conn, qvec, limit)?;
+    let mut results = Vec::with_capacity(hits.len());
+    for (chunk_id, dist) in &hits {
+        if let Some(mut r) = chunk_hit_to_result(conn, *chunk_id)? {
+            // cosine distance → similarity in [0, 1] for a friendlier score.
+            r.score = 1.0 - dist;
+            results.push(r);
+        }
+    }
+    Ok(results)
+}
+
+/// Resolve one `code_chunks` row into a `SearchResult`. When the chunk has an
+/// enclosing symbol (`symbol_qn` set), the result carries that symbol's real
+/// `qualified_name`/`name`/`kind` — which lets RRF merging in
+/// [`rrf_merge_n`] naturally fuse a Layer-2 chunk hit with a Layer-1 hit for
+/// the *same* symbol, since both share the same dedup key. A gap chunk (no
+/// enclosing symbol) gets a synthesized key unique to its line range and
+/// falls back to the bare filename for `name`, mirroring `search_file`.
+fn chunk_hit_to_result(conn: &Connection, chunk_id: i64) -> rusqlite::Result<Option<SearchResult>> {
+    let mut chunk_stmt = conn
+        .prepare("SELECT path, line_start, line_end, symbol_qn FROM code_chunks WHERE id = ?1")?;
+    let row = chunk_stmt.query_row(rusqlite::params![chunk_id], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, i64>(2)?,
+            r.get::<_, Option<String>>(3)?,
+        ))
+    });
+    let Ok((path, line_start, line_end, symbol_qn)) = row else {
+        return Ok(None);
+    };
+
+    let (qualified_name, name, kind) = match &symbol_qn {
+        Some(qn) => {
+            let mut sym_stmt =
+                conn.prepare("SELECT name, kind FROM symbols WHERE qualified_name = ?1")?;
+            let sym = sym_stmt.query_row(rusqlite::params![qn], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+            });
+            match sym {
+                Ok((name, kind)) => (qn.clone(), name, kind),
+                Err(_) => (qn.clone(), qn.clone(), None),
+            }
+        }
+        None => {
+            let fname = path.rsplit('/').next().unwrap_or(&path).to_string();
+            (format!("{path}#chunk:{line_start}-{line_end}"), fname, None)
+        }
+    };
+
+    Ok(Some(SearchResult {
+        name,
+        qualified_name,
+        path,
+        kind,
+        line_start: Some(line_start),
+        line_end: Some(line_end),
+        score: 0.0,
+        match_type: "semantic_chunk".to_string(),
+        snippet: None,
+    }))
+}
+
 fn search_semantic(
     conn: &Connection,
     query: &str,
     limit: usize,
     embedder: Option<&Embedder>,
+    rrf_k: f64,
 ) -> rusqlite::Result<SearchOutput> {
     let Some(embedder) = embedder else {
         return Ok(SearchOutput {
@@ -262,34 +376,32 @@ fn search_semantic(
         });
     }
 
-    let hits = crate::embedding::knn(conn, &qvec, limit)?;
-    let mut stmt = conn.prepare(
-        "SELECT qualified_name, name, path, line_start, line_end, kind FROM symbols WHERE id = ?1",
-    )?;
-    let mut results = Vec::new();
-    for (id, dist) in &hits {
-        if let Ok(mut r) = stmt.query_row(rusqlite::params![id], |row| {
-            Ok(SearchResult {
-                qualified_name: row.get(0)?,
-                name: row.get(1)?,
-                path: row.get(2)?,
-                line_start: row.get(3)?,
-                line_end: row.get(4)?,
-                kind: row.get(5)?,
-                score: 0.0,
-                match_type: "semantic".to_string(),
-                snippet: None,
-            })
-        }) {
-            // cosine distance → similarity in [0, 1] for a friendlier score.
-            r.score = 1.0 - dist;
-            results.push(r);
-        }
-    }
+    // Layer 1 (symbol identity) and Layer 2 (code body) are independent
+    // vector spaces — query both and fuse. See `indexer::chunker`'s module
+    // doc for why a symbol's name+signature+docstring alone can miss a query
+    // that only matches vocabulary used *inside* its body.
+    let sym_results = symbol_semantic_results(conn, &qvec, limit)?;
+    let chunk_results = chunk_semantic_results(conn, &qvec, limit)?;
+    let truncated = sym_results.len() >= limit || chunk_results.len() >= limit;
+
+    let results = match (sym_results.is_empty(), chunk_results.is_empty()) {
+        (true, true) => Vec::new(),
+        (false, true) => sym_results,
+        (true, false) => chunk_results,
+        (false, false) => rrf_merge_n(
+            &[
+                (&sym_results, RRF_SEMANTIC_WEIGHT),
+                (&chunk_results, RRF_CHUNK_WEIGHT),
+            ],
+            limit,
+            rrf_k,
+            "semantic",
+        ),
+    };
 
     Ok(SearchOutput {
         results,
-        truncated: hits.len() >= limit,
+        truncated,
         degraded: false,
         note: None,
     })
@@ -304,17 +416,25 @@ fn search_hybrid(
 ) -> rusqlite::Result<SearchOutput> {
     let fts_output = search_symbol(conn, query, limit)?;
 
-    if embedder.is_none() {
+    let Some(embedder) = embedder else {
         return Ok(SearchOutput {
             degraded: true,
             note: Some("Hybrid search degraded to FTS-only — semantic search inactive (compile with `--features embeddings` and set `semantic_search.enabled: true` in config.json)".to_string()),
             ..fts_output
         });
-    }
+    };
 
-    let semantic_output = search_semantic(conn, query, limit, embedder)?;
+    let qvec = embedder.embed_one(query);
+    let (sym_results, chunk_results) = if qvec.is_empty() {
+        (Vec::new(), Vec::new())
+    } else {
+        (
+            symbol_semantic_results(conn, &qvec, limit)?,
+            chunk_semantic_results(conn, &qvec, limit)?,
+        )
+    };
 
-    if semantic_output.results.is_empty() {
+    if sym_results.is_empty() && chunk_results.is_empty() {
         return Ok(SearchOutput {
             degraded: true,
             note: Some("Semantic results empty — hybrid degraded to FTS-only".to_string()),
@@ -322,15 +442,23 @@ fn search_hybrid(
         });
     }
 
-    let merged = rrf_merge(
-        &fts_output.results,
-        RRF_FTS_WEIGHT,
-        &semantic_output.results,
-        RRF_SEMANTIC_WEIGHT,
+    let truncated =
+        fts_output.truncated || sym_results.len() >= limit || chunk_results.len() >= limit;
+
+    // True 3-way RRF: FTS, Layer-1 symbol-semantic, and Layer-2 chunk-semantic
+    // each contribute their own rank-based score for a given result, summed —
+    // not a nested 2-way merge, which would double-count rank for anything
+    // appearing in more than one source.
+    let merged = rrf_merge_n(
+        &[
+            (&fts_output.results, RRF_FTS_WEIGHT),
+            (&sym_results, RRF_SEMANTIC_WEIGHT),
+            (&chunk_results, RRF_CHUNK_WEIGHT),
+        ],
         limit,
         rrf_k,
+        "hybrid",
     );
-    let truncated = fts_output.truncated || semantic_output.truncated;
 
     Ok(SearchOutput {
         results: merged,
@@ -340,29 +468,28 @@ fn search_hybrid(
     })
 }
 
-fn rrf_merge(
-    fts_results: &[SearchResult],
-    fts_weight: f64,
-    semantic_results: &[SearchResult],
-    semantic_weight: f64,
+/// Reciprocal Rank Fusion across any number of ranked sources: each
+/// `(results, weight)` source contributes `weight / (rrf_k + rank + 1)` per
+/// item, summed by `qualified_name` — the standard RRF formula, generalized
+/// from 2 sources to N so hybrid search can fuse FTS + both semantic layers
+/// in one flat pass instead of nesting 2-way merges (which would compound
+/// rank-based scoring for anything present in more than one source).
+fn rrf_merge_n(
+    sources: &[(&[SearchResult], f64)],
     limit: usize,
     rrf_k: f64,
+    match_type: &str,
 ) -> Vec<SearchResult> {
     let mut scores: HashMap<String, f64> = HashMap::new();
     let mut data: HashMap<String, SearchResult> = HashMap::new();
 
-    for (rank, r) in fts_results.iter().enumerate() {
-        let rrf_score = fts_weight / (rrf_k + rank as f64 + 1.0);
-        *scores.entry(r.qualified_name.clone()).or_default() += rrf_score;
-        data.entry(r.qualified_name.clone())
-            .or_insert_with(|| r.clone());
-    }
-
-    for (rank, r) in semantic_results.iter().enumerate() {
-        let rrf_score = semantic_weight / (rrf_k + rank as f64 + 1.0);
-        *scores.entry(r.qualified_name.clone()).or_default() += rrf_score;
-        data.entry(r.qualified_name.clone())
-            .or_insert_with(|| r.clone());
+    for (results, weight) in sources {
+        for (rank, r) in results.iter().enumerate() {
+            let rrf_score = weight / (rrf_k + rank as f64 + 1.0);
+            *scores.entry(r.qualified_name.clone()).or_default() += rrf_score;
+            data.entry(r.qualified_name.clone())
+                .or_insert_with(|| r.clone());
+        }
     }
 
     let mut ranked: Vec<_> = data.into_iter().collect();
@@ -377,7 +504,7 @@ fn rrf_merge(
         .take(limit)
         .map(|(qname, mut r)| {
             r.score = *scores.get(&qname).unwrap_or(&0.0);
-            r.match_type = "hybrid".to_string();
+            r.match_type = match_type.to_string();
             r
         })
         .collect()
@@ -658,10 +785,148 @@ mod tests {
             snippet: None,
         }];
 
-        let merged = rrf_merge(&fts, 1.5, &semantic, 1.0, 10, DEFAULT_RRF_K);
+        let merged = rrf_merge_n(
+            &[(&fts, 1.5), (&semantic, 1.0)],
+            10,
+            DEFAULT_RRF_K,
+            "hybrid",
+        );
         assert_eq!(merged.len(), 2);
         // "b" appears in both lists so should have higher RRF score
         assert_eq!(merged[0].qualified_name, "mod::b");
+    }
+
+    fn stub_result(qn: &str, match_type: &str) -> SearchResult {
+        SearchResult {
+            name: qn.into(),
+            qualified_name: qn.into(),
+            path: "x.py".into(),
+            kind: None,
+            line_start: None,
+            line_end: None,
+            score: 0.0,
+            match_type: match_type.into(),
+            snippet: None,
+        }
+    }
+
+    #[test]
+    fn test_rrf_merge_n_three_way_fusion_outranks_single_source() {
+        // "shared" appears in all three sources; "fts_only"/"sym_only"/"chunk_only"
+        // each appear in exactly one. Flat 3-way RRF must rank "shared" first and
+        // relabel every result with the merge's own match_type.
+        let fts = vec![
+            stub_result("shared", "exact"),
+            stub_result("fts_only", "exact"),
+        ];
+        let sym = vec![
+            stub_result("shared", "semantic"),
+            stub_result("sym_only", "semantic"),
+        ];
+        let chunk = vec![
+            stub_result("shared", "semantic_chunk"),
+            stub_result("chunk_only", "semantic_chunk"),
+        ];
+
+        let merged = rrf_merge_n(
+            &[(&fts, 1.5), (&sym, 1.0), (&chunk, 1.0)],
+            10,
+            DEFAULT_RRF_K,
+            "hybrid",
+        );
+
+        assert_eq!(merged.len(), 4);
+        assert_eq!(merged[0].qualified_name, "shared");
+        assert!(merged.iter().all(|r| r.match_type == "hybrid"));
+    }
+
+    #[test]
+    fn test_rrf_merge_n_respects_limit() {
+        let fts = vec![
+            stub_result("a", "exact"),
+            stub_result("b", "exact"),
+            stub_result("c", "exact"),
+        ];
+        let merged = rrf_merge_n(&[(&fts, 1.0)], 2, DEFAULT_RRF_K, "semantic");
+        assert_eq!(merged.len(), 2);
+    }
+
+    /// `chunk_hit_to_result` and `rrf_merge_n` are pure DB/logic — no
+    /// `embeddings` feature or real embedder needed to test them directly
+    /// (only `knn_chunks` itself, which sits behind the vec0 extension, does).
+    #[test]
+    fn test_chunk_hit_to_result_with_symbol_qn_resolves_real_symbol() {
+        let conn = setup_db_with_symbols();
+        conn.execute(
+            "INSERT INTO code_chunks (path, line_start, line_end, chunk_text, symbol_qn, file_hash) \
+             VALUES ('src/main.py', 11, 15, 'a = 1\nreturn a', 'src/main.py::get_user', 'h')",
+            [],
+        )
+        .unwrap();
+        let chunk_id: i64 = conn
+            .query_row("SELECT id FROM code_chunks", [], |r| r.get(0))
+            .unwrap();
+
+        let r = chunk_hit_to_result(&conn, chunk_id).unwrap().unwrap();
+        assert_eq!(r.qualified_name, "src/main.py::get_user");
+        assert_eq!(r.name, "get_user");
+        assert_eq!(r.kind.as_deref(), Some("function"));
+        assert_eq!(r.path, "src/main.py");
+        // The chunk's own window, not the whole symbol's line range.
+        assert_eq!(r.line_start, Some(11));
+        assert_eq!(r.line_end, Some(15));
+        assert_eq!(r.match_type, "semantic_chunk");
+    }
+
+    #[test]
+    fn test_chunk_hit_to_result_gap_chunk_falls_back_to_filename() {
+        let conn = setup_db_with_symbols();
+        conn.execute(
+            "INSERT INTO code_chunks (path, line_start, line_end, chunk_text, symbol_qn, file_hash) \
+             VALUES ('src/main.py', 1, 2, 'import os', NULL, 'h')",
+            [],
+        )
+        .unwrap();
+        let chunk_id: i64 = conn
+            .query_row("SELECT id FROM code_chunks", [], |r| r.get(0))
+            .unwrap();
+
+        let r = chunk_hit_to_result(&conn, chunk_id).unwrap().unwrap();
+        assert_eq!(r.name, "main.py");
+        assert!(r.kind.is_none());
+        assert_eq!(r.line_start, Some(1));
+        assert_eq!(r.line_end, Some(2));
+        // Synthesized key must be unique per line range, not collide with a
+        // real qualified_name.
+        assert!(r.qualified_name.contains("#chunk:1-2"));
+    }
+
+    #[test]
+    fn test_chunk_hit_to_result_missing_chunk_returns_none() {
+        let conn = setup_db_with_symbols();
+        assert!(chunk_hit_to_result(&conn, 999).unwrap().is_none());
+    }
+
+    /// A chunk's `symbol_qn` can go stale (the symbol was renamed/removed by a
+    /// reindex that hasn't re-chunked yet) — must degrade to the synthesized
+    /// key instead of erroring.
+    #[test]
+    fn test_chunk_hit_to_result_dangling_symbol_qn_falls_back() {
+        let conn = setup_db_with_symbols();
+        conn.execute(
+            "INSERT INTO code_chunks (path, line_start, line_end, chunk_text, symbol_qn, file_hash) \
+             VALUES ('src/main.py', 1, 2, 'x', 'src/main.py::gone', 'h')",
+            [],
+        )
+        .unwrap();
+        let chunk_id: i64 = conn
+            .query_row("SELECT id FROM code_chunks", [], |r| r.get(0))
+            .unwrap();
+
+        let r = chunk_hit_to_result(&conn, chunk_id).unwrap().unwrap();
+        assert_eq!(r.qualified_name, "src/main.py::gone");
+        assert_eq!(r.name, "src/main.py::gone");
+        assert!(r.kind.is_none());
     }
 
     #[test]

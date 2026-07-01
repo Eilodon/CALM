@@ -88,6 +88,26 @@ CREATE TABLE IF NOT EXISTS call_sites (
 );
 CREATE INDEX IF NOT EXISTS idx_call_sites_from   ON call_sites(from_path);
 CREATE INDEX IF NOT EXISTS idx_call_sites_callee ON call_sites(callee_name);
+
+-- Semantic search Layer 2: raw code-body slices (whole short bodies, or a
+-- sliding window over longer ones — see indexer::chunker), embedded alongside
+-- Layer 1's symbol-identity (name+signature+docstring) vectors so a query
+-- matching only implementation vocabulary (e.g. a library name used inside a
+-- function body) still has something to match against. Always created —
+-- populated only when the `embeddings` feature is enabled at build time; the
+-- companion `code_chunk_vecs` vec0 table lives in embedding.rs (needs the
+-- sqlite-vec extension registered and a runtime-configured dimension, so it
+-- can't be part of this static schema).
+CREATE TABLE IF NOT EXISTS code_chunks (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    path       TEXT NOT NULL,
+    line_start INTEGER NOT NULL,
+    line_end   INTEGER NOT NULL,
+    chunk_text TEXT NOT NULL,
+    symbol_qn  TEXT,
+    file_hash  TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_code_chunks_path ON code_chunks(path);
 ";
 
 const FTS5_SQL: &str = "
@@ -204,6 +224,46 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_code_chunks_table() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        let table_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='code_chunks'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(table_count, 1);
+
+        conn.execute(
+            "INSERT INTO code_chunks (path, line_start, line_end, chunk_text, symbol_qn, file_hash) \
+             VALUES ('a.py', 1, 3, 'def f():\n    pass', 'a.py::f', 'deadbeef')",
+            [],
+        )
+        .unwrap();
+
+        let (path, symbol_qn): (String, Option<String>) = conn
+            .query_row(
+                "SELECT path, symbol_qn FROM code_chunks WHERE line_start = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(path, "a.py");
+        assert_eq!(symbol_qn.as_deref(), Some("a.py::f"));
+
+        // symbol_qn is nullable — gap chunks have no enclosing symbol.
+        conn.execute(
+            "INSERT INTO code_chunks (path, line_start, line_end, chunk_text, file_hash) \
+             VALUES ('a.py', 4, 4, '', 'deadbeef')",
+            [],
+        )
+        .unwrap();
     }
 
     #[test]

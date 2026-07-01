@@ -158,11 +158,27 @@ pub fn bootstrap_embeddings(
         *status.write().unwrap() = EmbedStatus::Failed;
         return;
     }
+    if let Err(e) = ci_core::embedding::create_chunk_embedding_table(conn, semantic.dimensions) {
+        tracing::error!("Chunk embedding table creation failed: {e}");
+        *status.write().unwrap() = EmbedStatus::Failed;
+        return;
+    }
     *status.write().unwrap() = EmbedStatus::Embedding;
     match ci_core::embedding::embed_pending(conn, model.as_ref()) {
         Ok(n) => tracing::info!("Embedded {n} symbols"),
         Err(e) => {
             tracing::error!("Embedding failed: {e}");
+            *status.write().unwrap() = EmbedStatus::Failed;
+            return;
+        }
+    }
+    // Layer 2: code-body chunks (see indexer::chunker). Same model, same
+    // failure handling as the symbol layer above — both draw on the same
+    // connection/model, so a real failure here is as fatal as there.
+    match ci_core::embedding::embed_pending_chunks(conn, model.as_ref()) {
+        Ok(n) => tracing::info!("Embedded {n} code chunks"),
+        Err(e) => {
+            tracing::error!("Chunk embedding failed: {e}");
             *status.write().unwrap() = EmbedStatus::Failed;
             return;
         }
