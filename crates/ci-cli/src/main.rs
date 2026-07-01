@@ -127,7 +127,12 @@ async fn main() -> Result<()> {
                     Ok(embedder) => {
                         ci_core::embedding::create_embedding_table(&conn, semantic.dimensions)?;
                         let n = ci_core::embedding::embed_pending(&conn, &embedder)?;
-                        println!(" {n} symbols embedded.");
+                        ci_core::embedding::create_chunk_embedding_table(
+                            &conn,
+                            semantic.dimensions,
+                        )?;
+                        let nc = ci_core::embedding::embed_pending_chunks(&conn, &embedder)?;
+                        println!(" {n} symbols, {nc} code chunks embedded.");
                     }
                     Err(e) => eprintln!("\nEmbeddings skipped: {e}"),
                 }

@@ -120,11 +120,18 @@ pub fn run_watch_loop(
                             s.changed,
                             s.deleted
                         );
-                        // Embed any symbols added by this reindex.
-                        if let Some(model) = embedder.read().unwrap().clone()
-                            && let Err(e) = ci_core::embedding::embed_pending(&conn, model.as_ref())
-                        {
-                            tracing::error!("Incremental embedding failed: {e}");
+                        // Embed any symbols/chunks added by this reindex (Layer 1 +
+                        // Layer 2 — see indexer::chunker for the latter).
+                        if let Some(model) = embedder.read().unwrap().clone() {
+                            if let Err(e) = ci_core::embedding::embed_pending(&conn, model.as_ref())
+                            {
+                                tracing::error!("Incremental embedding failed: {e}");
+                            }
+                            if let Err(e) =
+                                ci_core::embedding::embed_pending_chunks(&conn, model.as_ref())
+                            {
+                                tracing::error!("Incremental chunk embedding failed: {e}");
+                            }
                         }
                     }
                     Ok(_) => {}

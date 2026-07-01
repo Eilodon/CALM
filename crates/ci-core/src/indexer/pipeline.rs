@@ -3,8 +3,10 @@ use rusqlite::Connection;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use crate::indexer::chunker::{CodeChunk, chunk_file};
 use crate::indexer::edges::{
-    CallEdge, insert_call_edges_batch, insert_import_edges_batch, insert_symbols_batch,
+    CallEdge, insert_call_edges_batch, insert_code_chunks_batch, insert_import_edges_batch,
+    insert_symbols_batch,
 };
 use crate::indexer::lang_constants::language_for_extension;
 use crate::indexer::parser::{
@@ -144,6 +146,7 @@ fn remove_file_rows(tx: &rusqlite::Transaction, rel: &str) -> rusqlite::Result<(
     tx.execute("DELETE FROM call_sites WHERE from_path = ?1", [rel])?;
     tx.execute("DELETE FROM import_edges WHERE from_path = ?1", [rel])?;
     tx.execute("DELETE FROM file_index WHERE path = ?1", [rel])?;
+    tx.execute("DELETE FROM code_chunks WHERE path = ?1", [rel])?;
     Ok(())
 }
 
@@ -183,6 +186,12 @@ struct ExtractedFile {
     import_edges: Vec<crate::indexer::edges::ImportEdge>,
     call_sites: Vec<CallSiteData>,
     symbol_count: usize,
+    /// Layer-2 semantic-search code-body chunks (see `indexer::chunker`).
+    /// Always computed when the `embeddings` feature is compiled in — cheap
+    /// pure-CPU work done in the same parallel extraction pass as everything
+    /// else here — and left empty otherwise, since nothing would ever embed
+    /// or query them.
+    chunks: Vec<CodeChunk>,
 }
 
 /// Parse and resolve one file's symbols, imports, and call sites. No DB access —
@@ -202,11 +211,13 @@ fn extract_file_data(
         // via lightweight line-scan (no calls, no imports, no resolver tiers).
         let symbols = extract_symbols_shallow(source, lang, rel);
         let symbol_count = symbols.len();
+        let chunks = chunk_pending(source, &symbols);
         return ExtractedFile {
             symbols,
             import_edges: Vec::new(),
             call_sites: Vec::new(),
             symbol_count,
+            chunks,
         };
     };
 
@@ -325,20 +336,36 @@ fn extract_file_data(
         }
     }
 
+    let chunks = chunk_pending(source, &syms);
+
     ExtractedFile {
         symbols: syms,
         import_edges,
         call_sites,
         symbol_count,
+        chunks,
     }
 }
 
-/// Persist one file's already-extracted symbols, imports, and call sites.
-/// Pure DB I/O — call sequentially against a single transaction, after all
-/// files have been extracted (possibly in parallel).
+/// Chunk `source` for Layer-2 semantic search — only when the `embeddings`
+/// feature is compiled in, since chunks are otherwise never embedded or
+/// queried. `embedding::ENABLED` is a `const bool`, so the disabled branch is
+/// eliminated at compile time rather than costing a runtime check.
+fn chunk_pending(source: &str, symbols: &[ParsedSymbol]) -> Vec<CodeChunk> {
+    if crate::embedding::ENABLED {
+        chunk_file(source, symbols)
+    } else {
+        Vec::new()
+    }
+}
+
+/// Persist one file's already-extracted symbols, imports, call sites, and
+/// Layer-2 code chunks. Pure DB I/O — call sequentially against a single
+/// transaction, after all files have been extracted (possibly in parallel).
 fn persist_file(
     tx: &rusqlite::Transaction,
     rel: &str,
+    file_hash: &str,
     extracted: &ExtractedFile,
 ) -> rusqlite::Result<()> {
     insert_symbols_batch(tx, &extracted.symbols)?;
@@ -358,6 +385,7 @@ fn persist_file(
             c.target_class
         ])?;
     }
+    insert_code_chunks_batch(tx, rel, file_hash, &extracted.chunks)?;
     Ok(())
 }
 
@@ -667,6 +695,7 @@ pub fn run_indexing_pipeline(
     tx.execute("DELETE FROM import_edges", [])?;
     tx.execute("DELETE FROM symbols", [])?;
     tx.execute("DELETE FROM file_index", [])?;
+    tx.execute("DELETE FROM code_chunks", [])?;
 
     for batch in files.chunks(PARSE_BATCH_SIZE) {
         let extracted: Vec<(String, &'static str, String, f64, ExtractedFile)> = batch
@@ -687,7 +716,7 @@ pub fn run_indexing_pipeline(
             .collect();
 
         for (rel, lang, hash, mtime, data) in &extracted {
-            persist_file(&tx, rel, data)?;
+            persist_file(&tx, rel, hash, data)?;
             upsert_file_index(&tx, rel, lang, hash, *mtime, data.symbol_count, now)?;
         }
     }
@@ -782,7 +811,7 @@ pub fn reindex_changed(
 
         for (c, data) in &extracted {
             remove_file_rows(&tx, &c.rel)?;
-            persist_file(&tx, &c.rel, data)?;
+            persist_file(&tx, &c.rel, &c.hash, data)?;
             upsert_file_index(
                 &tx,
                 &c.rel,
@@ -1265,6 +1294,100 @@ mod tests {
             }
         );
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM symbols"), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Layer-2 code chunks must track incremental reindex the same way symbols
+    /// do: a changed file's stale chunks are replaced (not duplicated
+    /// alongside the new ones), and a deleted file's chunks disappear too.
+    /// Only meaningful with `embeddings` compiled in — otherwise chunking is a
+    /// no-op (see `chunk_pending`) and `code_chunks` stays empty by design.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn test_reindex_incremental_updates_code_chunks() {
+        let dir = std::env::temp_dir().join(format!("ci_idx_inc_chunks_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("a.py"),
+            "def run():\n    marker = OLD_MARKER_TERM\n    return marker\n",
+        )
+        .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM code_chunks"), 1);
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM code_chunks WHERE chunk_text LIKE '%OLD_MARKER_TERM%'",
+            ),
+            1
+        );
+
+        // Change the body's distinctive term (same line count/symbol) and add
+        // a second file.
+        std::fs::write(
+            dir.join("a.py"),
+            "def run():\n    marker = NEW_MARKER_TERM\n    return marker\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("b.py"), "def other():\n    pass\n").unwrap();
+        let s = reindex_changed(&mut conn, &dir).unwrap();
+        assert_eq!(
+            s,
+            ReindexSummary {
+                changed: 2,
+                deleted: 0
+            }
+        );
+
+        // Exactly one chunk per file — the stale a.py chunk was replaced, not
+        // accumulated alongside the new one.
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM code_chunks"), 2);
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM code_chunks WHERE chunk_text LIKE '%OLD_MARKER_TERM%'",
+            ),
+            0,
+            "stale chunk text must not survive a reindex of the same file"
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM code_chunks WHERE chunk_text LIKE '%NEW_MARKER_TERM%'",
+            ),
+            1
+        );
+
+        // Delete a.py → its chunk disappears; b.py's chunk is untouched.
+        std::fs::remove_file(dir.join("a.py")).unwrap();
+        let s = reindex_changed(&mut conn, &dir).unwrap();
+        assert_eq!(
+            s,
+            ReindexSummary {
+                changed: 0,
+                deleted: 1
+            }
+        );
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM code_chunks"), 1);
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM code_chunks WHERE path = 'a.py'"
+            ),
+            0
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM code_chunks WHERE path = 'b.py'"
+            ),
+            1
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

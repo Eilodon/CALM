@@ -1,3 +1,4 @@
+use super::chunker::CodeChunk;
 use super::parser::ParsedSymbol;
 use rusqlite::Transaction;
 
@@ -71,6 +72,32 @@ pub fn insert_import_edges_batch(tx: &Transaction, edges: &[ImportEdge]) -> rusq
             e.to_path,
             e.module_name,
             e.symbols_used
+        ])?;
+    }
+    Ok(())
+}
+
+/// Persist one file's Layer-2 semantic-search code chunks (see
+/// `indexer::chunker`). `path`/`file_hash` are shared by every row since a
+/// file is always chunked and persisted as a unit.
+pub fn insert_code_chunks_batch(
+    tx: &Transaction,
+    path: &str,
+    file_hash: &str,
+    chunks: &[CodeChunk],
+) -> rusqlite::Result<()> {
+    let mut stmt = tx.prepare(
+        "INSERT INTO code_chunks (path, line_start, line_end, chunk_text, symbol_qn, file_hash)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+    )?;
+    for c in chunks {
+        stmt.execute(rusqlite::params![
+            path,
+            c.line_start as i64,
+            c.line_end as i64,
+            c.chunk_text,
+            c.symbol_qn,
+            file_hash
         ])?;
     }
     Ok(())
@@ -164,5 +191,56 @@ mod tests {
         assert_eq!(from_path, "a.py");
         assert_eq!(module_name, "os");
         assert_eq!(symbols_used, "[\"path\"]");
+    }
+
+    #[test]
+    fn test_insert_code_chunks_transaction() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        let tx = conn.transaction().unwrap();
+        let chunks = vec![
+            CodeChunk {
+                line_start: 1,
+                line_end: 2,
+                chunk_text: "def f():\n    pass".to_string(),
+                symbol_qn: Some("a.py::f".to_string()),
+            },
+            CodeChunk {
+                line_start: 4,
+                line_end: 4,
+                chunk_text: "CONST = 1".to_string(),
+                symbol_qn: None,
+            },
+        ];
+        insert_code_chunks_batch(&tx, "a.py", "deadbeef", &chunks).unwrap();
+        tx.commit().unwrap();
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM code_chunks WHERE path = 'a.py'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2);
+
+        let symbol_qn: Option<String> = conn
+            .query_row(
+                "SELECT symbol_qn FROM code_chunks WHERE line_start = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(symbol_qn.as_deref(), Some("a.py::f"));
+
+        let gap_qn: Option<String> = conn
+            .query_row(
+                "SELECT symbol_qn FROM code_chunks WHERE line_start = 4",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(gap_qn, None);
     }
 }
