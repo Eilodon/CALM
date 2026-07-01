@@ -3141,6 +3141,13 @@ impl rmcp::ServerHandler for CodeIntelligenceServer {
     fn get_info(&self) -> rmcp::model::ServerInfo {
         rmcp::model::ServerInfo {
             instructions: Some("Code Intelligence MCP server — codebase analysis tools".into()),
+            // Without this, `capabilities.tools` is omitted from `initialize`
+            // (ServerCapabilities::default() -> tools: None), and a spec-compliant
+            // MCP client never calls tools/list at all — the server responds fine
+            // if asked directly, but no tools ever get registered.
+            capabilities: rmcp::model::ServerCapabilities::builder()
+                .enable_tools()
+                .build(),
             ..Default::default()
         }
     }
@@ -3243,6 +3250,29 @@ mod tests {
             CodeIntelligenceServer::understand_tool_attr(),
             &["query"],
         );
+    }
+
+    /// Regression: `get_info()` used to build `ServerInfo` with
+    /// `..Default::default()`, which leaves `capabilities.tools` as `None`.
+    /// A spec-compliant MCP client only calls `tools/list` when the server
+    /// advertises the `tools` capability in `initialize` — with it absent,
+    /// every tool this server implements silently never gets discovered,
+    /// even though `tools/list` itself answers correctly if ever called.
+    #[test]
+    fn get_info_advertises_tools_capability() {
+        use rmcp::ServerHandler;
+
+        let dir = std::env::temp_dir().join(format!("ci_caps_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        assert!(
+            server.get_info().capabilities.tools.is_some(),
+            "capabilities.tools must be Some, or clients never call tools/list"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
