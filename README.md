@@ -28,7 +28,7 @@ tính graph metrics (coreness/hubs), và phục vụ qua SQLite FTS5 + semantic 
    - `textual` — chỉ khớp tên (fallback).
 3. **Import graph** — `import_edges` (file→module/file) cho tool `dependencies`.
 4. **Graph metrics** — `coreness` (k-core, O(V+E)) và `is_hub` để AI biết đâu là lõi hệ thống.
-5. **Incremental watcher** — hash-diff chỉ re-parse file đổi; call graph rebuild từ `call_sites` đã lưu trong DB. Quá trình parse được song song hoá (`rayon`). Khi `ci serve` khởi động và đã có index cũ, tự động chạy **incremental reindex** thay vì full index — giảm thời gian warm-up. Debounce 500ms, lọc bỏ noise (`.codeindex/`, `target/`, v.v.).
+5. **Incremental watcher** — hash-diff chỉ re-parse file đổi; call graph rebuild từ `call_sites` đã lưu trong DB. Quá trình parse được song song hoá (`rayon`). Khi `ci serve` khởi động và đã có index cũ, tự động chạy **incremental reindex** thay vì full index — giảm thời gian warm-up. Debounce 500ms, lọc bỏ noise: mọi dir dot-prefixed (`.codeindex/`, `.git/`, ...) và `IGNORE_DIRS` (`target`, `node_modules`, `dist`, `build`, `__pycache__`, `venv`).
 6. **FTS5 search** — full-text search native qua SQLite triggers, BM25 dual-column.
 7. **Semantic search — 2 tầng (Bật theo mặc định trong config)** — static code embeddings
    (`model2vec-rs` + `sqlite-vec`), fuse với FTS bằng Reciprocal Rank Fusion (tỉ lệ 1.5x FTS / 1.0x
@@ -57,6 +57,7 @@ ci init     --project-root .   # tạo .codeindex/ + config.json
 ci index    --project-root .   # one-shot index (Scanning → Parsing → BuildingEdges → Ready)
                                # In ra: "Indexed N files, M symbols." + Tip khi embeddings sẵn có
 ci serve    --project-root .   # MCP server qua stdio + incremental reindex on startup + watcher
+ci serve    --project-root /project --db-path /data/index.db   # tùy chọn --db-path để tách DB khỏi project root (dùng trong Containerfile/compose.yaml)
 ci doctor   --project-root .   # kiểm tra config, DB, tree-sitter, git
 ci fitness-check --project-root .              # CI gate (text output, exit 1 nếu fail)
 ci fitness-check --project-root . --json       # output JSON thay vì text
@@ -92,11 +93,12 @@ ONNX) — dùng chung cho cả 2 tầng. Tầng 1 (`embedding_vecs`) index tên/
 
 ## 🏋 Fitness Check — CI Gate
 
-`ci fitness-check` đo 5 metrics và so sánh với ngưỡng trong `thresholds.toml`:
+`ci fitness-check` đo 6 metrics và so sánh với ngưỡng trong `thresholds.toml`:
 
 | Metric | Mô tả | Ngưỡng mặc định |
 |---|---|---|
 | `hub_count` | Số symbols được phân loại là hub | ≤ 50 |
+| `hub_pct` | % symbols là hub trên tổng symbol — bổ sung scale-invariant cho `hub_count` (vốn tính theo percentile nên tỉ lệ thuận với kích thước codebase) | ≤ 20.0% |
 | `avg_coreness` | Coreness trung bình (k-core) của graph | ≤ 15.0 |
 | `dead_code_pct` | % symbols có confidence "high" là dead code | ≤ 10% |
 | `hotspot_risk` | Hotspot score cao nhất trong codebase | ≤ 0.75 |

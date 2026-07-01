@@ -29,7 +29,7 @@ hotspots(top_n=10)       # find files that break most often
 
 **Signals**:
 - `indexing_phase != "ready"` → graph tools have degraded results; call `indexing_status` to monitor
-- `health_summary.undocumented_hubs > 0` → hubs without docs exist; extra caution when editing
+- `health_summary.hub_count > 0` → hub symbols exist in this repo; check `is_hub` before editing any symbol
 - `hotspots[0].risk_level == "critical"` → this file breaks often; read before touching
 
 ---
@@ -217,8 +217,8 @@ indexing_status(retry_embeddings=true)      # recover failed embeddings
 | Preset | Registered Tools | Use when |
 |--------|-----------------|----------|
 | `orient` | `repo_overview`, `locate`, `dependencies`, `hotspots`, `indexing_status` | Exploration only, no edits |
-| `trace` | `repo_overview`, `locate`, `callers`, `callees`, `path`, `session_context` | Call graph traversal |
-| `edit` | `repo_overview`, `locate`, `source`, `edit_context`, `diff_impact`, `indexing_status` | Code modification workflow |
+| `trace` | `repo_overview`, `search`, `locate`, `symbol_info`, `source`, `callers`, `callees`, `path`, `dependencies`, `indexing_status` | Call graph traversal |
+| `edit` | `repo_overview`, `search`, `locate`, `symbol_info`, `source`, `callers`, `callees`, `edit_context`, `diff_impact`, `indexing_status` | Code modification workflow |
 | `compound` | `repo_overview`, `locate`, `hotspots`, `source`, `understand`, `edit_context`, `diff_impact`, `session_context`, `indexing_status` | Full workflow, no raw graph traversal |
 | `full` | All 16 tools | Default; use when workflow spans multiple stages |
 

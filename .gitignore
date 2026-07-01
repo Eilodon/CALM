@@ -16,6 +16,9 @@ coverage/
 .nyc_output/
 !crates/ci-core/tests/fixtures/synthetic_project/lcov.info
 
+# Claude Code personal overrides (not shared with team)
+.claude/settings.local.json
+
 # OS / editor
 .DS_Store
 Thumbs.db
