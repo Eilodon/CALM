@@ -1,0 +1,56 @@
+# Task set for B4 — Token Efficiency (self-repo corpus: Code-Intelligence itself).
+#
+# Each task pairs a "naive" workflow (what an agent without call-graph tools would do)
+# against the equivalent `ci` MCP tool call. Anchors below are real symbols verified to
+# exist in this repo at the time of writing (crates/ci-core/src/indexer/pipeline.rs).
+#
+# naive.type:
+#   cat                    - read one whole file
+#   grep                   - grep -rn pattern over globs, tokenize the raw match lines
+#   grep_then_cat_matches  - grep -l to find matching files, then cat each file in full
+#                            (simulates an agent with no call graph opening every hit to
+#                            understand context)
+
+tasks:
+  - id: read_one_function
+    description: "Đọc implementation của run_indexing_pipeline"
+    naive:
+      type: cat
+      path: crates/ci-core/src/indexer/pipeline.rs
+    ci:
+      tool: source
+      arguments:
+        symbol: run_indexing_pipeline
+
+  - id: find_callers
+    description: "Tìm ai gọi collect_source_files"
+    naive:
+      type: grep
+      pattern: collect_source_files
+      globs: ["crates/**/*.rs"]
+    ci:
+      tool: callers
+      arguments:
+        symbol: collect_source_files
+
+  - id: pre_edit_blast_radius
+    description: "Kiểm tra blast radius trước khi sửa reindex_changed"
+    naive:
+      type: grep_then_cat_matches
+      pattern: reindex_changed
+      globs: ["crates/**/*.rs"]
+    ci:
+      tool: edit_context
+      arguments:
+        symbol: reindex_changed
+
+  - id: locate_and_inspect
+    description: "Tìm + hiểu run_indexing_pipeline (locate = search+file_overview+symbol_info)"
+    naive:
+      type: grep_then_cat_matches
+      pattern: run_indexing_pipeline
+      globs: ["crates/**/*.rs"]
+    ci:
+      tool: locate
+      arguments:
+        query: run_indexing_pipeline

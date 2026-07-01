@@ -19,6 +19,11 @@ coverage/
 # Claude Code personal overrides (not shared with team)
 .claude/settings.local.json
 
+# Benchmark harness venv + raw run output
+benchmarks/.venv/
+benchmarks/**/results.json
+__pycache__/
+
 # OS / editor
 .DS_Store
 Thumbs.db
