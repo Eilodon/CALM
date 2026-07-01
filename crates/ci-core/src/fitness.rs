@@ -1,4 +1,4 @@
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -309,6 +309,138 @@ pub fn snapshot_metrics(conn: &Connection, timestamp: &str) -> anyhow::Result<us
 }
 
 // ---------------------------------------------------------------------------
+// Date helpers — no chrono dependency. `snapshot_at` is a plain UTC
+// "YYYY-MM-DD" string, so lexical and chronological ordering coincide and it
+// can be compared directly with `<`/`<=` in SQL.
+// ---------------------------------------------------------------------------
+
+fn epoch_days_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| (d.as_secs() / 86400) as i64)
+        .unwrap_or(0)
+}
+
+/// Howard Hinnant's `civil_from_days`: days-since-epoch (1970-01-01 = 0) to a
+/// proleptic-Gregorian (year, month, day) triple.
+/// See <http://howardhinnant.github.io/date_algorithms.html>.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+fn date_string(epoch_days: i64) -> String {
+    let (y, m, d) = civil_from_days(epoch_days);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// Today's UTC date, rounded to the day. Used as `snapshot_at` so repeated
+/// same-day CI runs collapse onto one row via the (qualified_name,
+/// snapshot_at) UNIQUE constraint instead of growing the table every run.
+pub fn today_utc_date() -> String {
+    date_string(epoch_days_now())
+}
+
+/// UTC date `days_ago` days before today, in the same "YYYY-MM-DD" format as
+/// `today_utc_date` — directly usable as a SQL bound against `snapshot_at`.
+fn date_days_ago(days_ago: i64) -> String {
+    date_string(epoch_days_now() - days_ago)
+}
+
+// ---------------------------------------------------------------------------
+// Trend
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize, PartialEq)]
+pub struct TrendInfo {
+    /// `snapshot_at` of the historical row this trend was computed against.
+    pub compared_to: String,
+    pub caller_count_delta: i64,
+    pub coreness_delta: i64,
+    pub is_hub_changed: bool,
+}
+
+/// Compares a symbol's *live* metrics (current `symbols` row) against its
+/// most recent snapshot that is still at least `lookback_days` old — i.e. the
+/// snapshot closest to (without being more recent than) the
+/// `lookback_days`-ago mark. This gives the tightest valid "at least N days"
+/// comparison, rather than always diffing against the oldest snapshot ever
+/// recorded.
+///
+/// Returns `Ok(None)` when the symbol isn't in `symbols`, or has no snapshot
+/// old enough yet (not tracked for `lookback_days` days).
+pub fn compute_trend(
+    conn: &Connection,
+    qualified_name: &str,
+    lookback_days: i64,
+) -> anyhow::Result<Option<TrendInfo>> {
+    let live: Option<(i64, i64, i64)> = conn
+        .query_row(
+            "SELECT caller_count, COALESCE(coreness, 0), is_hub FROM symbols \
+             WHERE qualified_name = ?1",
+            rusqlite::params![qualified_name],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    let Some((live_callers, live_coreness, live_is_hub)) = live else {
+        return Ok(None);
+    };
+
+    let cutoff = date_days_ago(lookback_days);
+    let baseline: Option<(String, i64, i64, i64)> = conn
+        .query_row(
+            "SELECT snapshot_at, caller_count, coreness, is_hub \
+             FROM symbol_metrics_history \
+             WHERE qualified_name = ?1 AND snapshot_at <= ?2 \
+             ORDER BY snapshot_at DESC LIMIT 1",
+            rusqlite::params![qualified_name, cutoff],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()?;
+    let Some((compared_to, base_callers, base_coreness, base_is_hub)) = baseline else {
+        return Ok(None);
+    };
+
+    Ok(Some(TrendInfo {
+        compared_to,
+        caller_count_delta: live_callers - base_callers,
+        coreness_delta: live_coreness - base_coreness,
+        is_hub_changed: (live_is_hub != 0) != (base_is_hub != 0),
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Prune
+// ---------------------------------------------------------------------------
+
+/// Snapshots older than this are pruned by `prune_old_snapshots` — keeps
+/// `symbol_metrics_history` from growing unbounded on long-lived projects.
+pub const METRICS_RETENTION_DAYS: i64 = 180;
+
+/// Deletes `symbol_metrics_history` rows older than `METRICS_RETENTION_DAYS`.
+/// Called from `ci doctor` — not on the `fitness-check` hot path, since
+/// pruning isn't needed on every CI run.
+pub fn prune_old_snapshots(conn: &Connection) -> anyhow::Result<usize> {
+    let cutoff = date_days_ago(METRICS_RETENTION_DAYS);
+    let deleted = conn.execute(
+        "DELETE FROM symbol_metrics_history WHERE snapshot_at < ?1",
+        rusqlite::params![cutoff],
+    )?;
+    if deleted > 0 {
+        tracing::info!(deleted, cutoff = %cutoff, "metrics_history_pruned");
+    }
+    Ok(deleted)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -590,5 +722,128 @@ mod tests {
     fn test_load_thresholds_none() {
         let thresholds = load_thresholds(None).unwrap();
         assert_eq!(thresholds.max_hub_count, 50);
+    }
+
+    #[test]
+    fn test_civil_from_days_known_dates() {
+        // Reference epoch-day values cross-checked against Python's datetime.
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        assert_eq!(civil_from_days(11017), (2000, 3, 1));
+        // 2024 is a leap year — Feb 29 must exist and Mar 1 must follow it.
+        assert_eq!(civil_from_days(19782), (2024, 2, 29));
+        assert_eq!(civil_from_days(19783), (2024, 3, 1));
+        assert_eq!(date_string(20635), "2026-07-01");
+    }
+
+    #[test]
+    fn test_today_utc_date_format() {
+        let d = today_utc_date();
+        assert_eq!(d.len(), 10, "expected YYYY-MM-DD, got {d}");
+        assert_eq!(d.as_bytes()[4], b'-');
+        assert_eq!(d.as_bytes()[7], b'-');
+    }
+
+    #[test]
+    fn test_date_days_ago_is_before_today() {
+        let today = today_utc_date();
+        let week_ago = date_days_ago(7);
+        assert!(week_ago < today, "{week_ago} should sort before {today}");
+    }
+
+    fn insert_symbol_with_metrics(
+        conn: &Connection,
+        qname: &str,
+        caller_count: i64,
+        coreness: i64,
+        is_hub: i64,
+    ) {
+        conn.execute(
+            "INSERT INTO symbols (qualified_name, name, kind, language, path, \
+             line_start, line_end, caller_count, coreness, is_hub, indexed_at) \
+             VALUES (?1, ?1, 'function', 'python', 'mod.py', 1, 5, ?2, ?3, ?4, 0.0)",
+            rusqlite::params![qname, caller_count, coreness, is_hub],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_compute_trend_no_symbol_returns_none() {
+        let conn = test_conn();
+        let trend = compute_trend(&conn, "mod.missing", 7).unwrap();
+        assert!(trend.is_none());
+    }
+
+    #[test]
+    fn test_compute_trend_no_baseline_snapshot_returns_none() {
+        let conn = test_conn();
+        insert_symbol_with_metrics(&conn, "mod.foo", 5, 3, 0);
+        // No snapshot rows at all yet.
+        let trend = compute_trend(&conn, "mod.foo", 7).unwrap();
+        assert!(trend.is_none());
+    }
+
+    #[test]
+    fn test_compute_trend_computes_deltas_against_oldest_eligible_snapshot() {
+        let conn = test_conn();
+        insert_symbol_with_metrics(&conn, "mod.foo", 10, 5, 1);
+
+        let old_cutoff = date_days_ago(30);
+        let recent = date_days_ago(1);
+        conn.execute(
+            "INSERT INTO symbol_metrics_history \
+             (qualified_name, snapshot_at, caller_count, coreness, is_hub) \
+             VALUES ('mod.foo', ?1, 4, 2, 0)",
+            rusqlite::params![old_cutoff],
+        )
+        .unwrap();
+        // A snapshot too recent to satisfy a 7-day lookback — must be ignored
+        // in favor of the older row above.
+        conn.execute(
+            "INSERT INTO symbol_metrics_history \
+             (qualified_name, snapshot_at, caller_count, coreness, is_hub) \
+             VALUES ('mod.foo', ?1, 9, 5, 1)",
+            rusqlite::params![recent],
+        )
+        .unwrap();
+
+        let trend = compute_trend(&conn, "mod.foo", 7).unwrap().unwrap();
+        assert_eq!(trend.compared_to, old_cutoff);
+        assert_eq!(trend.caller_count_delta, 6); // 10 - 4
+        assert_eq!(trend.coreness_delta, 3); // 5 - 2
+        assert!(trend.is_hub_changed); // false -> true
+    }
+
+    #[test]
+    fn test_prune_old_snapshots_deletes_only_stale_rows() {
+        let conn = test_conn();
+        let stale = date_days_ago(METRICS_RETENTION_DAYS + 10);
+        let fresh = date_days_ago(1);
+        for (qname, ts) in [("mod.a", stale.as_str()), ("mod.b", fresh.as_str())] {
+            conn.execute(
+                "INSERT INTO symbol_metrics_history (qualified_name, snapshot_at, caller_count) \
+                 VALUES (?1, ?2, 0)",
+                rusqlite::params![qname, ts],
+            )
+            .unwrap();
+        }
+
+        let deleted = prune_old_snapshots(&conn).unwrap();
+        assert_eq!(deleted, 1);
+
+        let remaining: i64 = conn
+            .query_row("SELECT COUNT(*) FROM symbol_metrics_history", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(remaining, 1);
+
+        let remaining_name: String = conn
+            .query_row(
+                "SELECT qualified_name FROM symbol_metrics_history",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining_name, "mod.b");
     }
 }

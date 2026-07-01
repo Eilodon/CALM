@@ -212,6 +212,15 @@ pub fn doctor(project_root: &std::path::Path) -> Result<()> {
         let file_count: i64 =
             conn.query_row("SELECT COUNT(*) FROM file_index", [], |r| r.get(0))?;
         println!("  files indexed: {file_count}");
+
+        match ci_core::fitness::prune_old_snapshots(&conn) {
+            Ok(pruned) => println!(
+                "  metrics history: pruned {pruned} snapshot(s) older than {} days",
+                ci_core::fitness::METRICS_RETENTION_DAYS
+            ),
+            Err(e) => println!("  metrics history: prune failed: {e}"),
+        }
+
         println!("  status: OK");
     } else {
         println!("  status: NOT FOUND (run 'ci index' first)");

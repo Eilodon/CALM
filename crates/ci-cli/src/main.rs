@@ -166,6 +166,16 @@ async fn main() -> Result<()> {
             let coverage = ci_core::analysis::coverage::load_coverage(&root);
             let result = ci_core::fitness::run_fitness_check(&conn, &thresholds, &root, &coverage)?;
 
+            // Record today's metrics for later trend comparison (edit_context's
+            // `trend` field). Rounded to the day so repeated same-day CI runs
+            // collapse onto one row via the UNIQUE(qualified_name, snapshot_at)
+            // constraint instead of growing the table on every run. Best-effort:
+            // a snapshot failure shouldn't fail the fitness gate itself.
+            let snapshot_at = ci_core::fitness::today_utc_date();
+            if let Err(e) = ci_core::fitness::snapshot_metrics(&conn, &snapshot_at) {
+                tracing::warn!("Failed to snapshot symbol metrics history: {e}");
+            }
+
             if json {
                 println!("{}", serde_json::to_string_pretty(&result)?);
             } else {
