@@ -352,16 +352,93 @@ fn detect_entry_point(
                 ".delete(",
                 ".patch(",
             ];
-            decorators
-                .iter()
-                .any(|d| HOOKS.iter().any(|h| d.contains(h)))
+            // Dunder methods (`__init__`, `__str__`, `__eq__`, `__iter__`, ...)
+            // are invoked by Python's data model via protocol dispatch
+            // (`str(x)` calls `__str__`, `for v in x` calls `__iter__`, a
+            // constructor call `X()` calls `__init__`) — never by their
+            // literal name at a call site, so a name-based call-graph can
+            // never see a "caller" for them regardless of real usage.
+            (name.len() > 4 && name.starts_with("__") && name.ends_with("__"))
+                || decorators
+                    .iter()
+                    .any(|d| HOOKS.iter().any(|h| d.contains(h)))
         }
         "rust" => {
+            // Any non-trivial attribute macro on a function/method is a
+            // strong, general signal that something other than an ordinary
+            // call site invokes or registers it — route/tool/RPC
+            // registration, FFI export, a plugin/handler framework, etc.
+            // (see `NON_DISPATCH_ATTRS` for the small set of modifier
+            // attributes that don't imply this).
+            const NON_DISPATCH_ATTRS: &[&str] = &[
+                "allow",
+                "deny",
+                "warn",
+                "forbid",
+                "must_use",
+                "deprecated",
+                "inline",
+                "cold",
+                "cfg",
+                "cfg_attr",
+                "doc",
+                "track_caller",
+                "non_exhaustive",
+                "repr",
+                "should_panic",
+                "ignore",
+                "test",
+                "derive",
+                "automatically_derived",
+            ];
+            // Common std/core trait methods dispatched via operator or
+            // protocol syntax (`x.into()`, `x == y`, `for v in x`,
+            // `x.clone()`, ...) rather than by their literal name at a call
+            // site — invisible to a name-based call-graph regardless of how
+            // many places genuinely invoke them through the trait.
+            const TRAIT_DISPATCH_NAMES: &[&str] = &[
+                "from",
+                "try_from",
+                "fmt",
+                "drop",
+                "deref",
+                "deref_mut",
+                "default",
+                "clone",
+                "eq",
+                "ne",
+                "partial_cmp",
+                "cmp",
+                "hash",
+                "next",
+                "into_iter",
+                "index",
+                "index_mut",
+                "add",
+                "sub",
+                "mul",
+                "div",
+                "rem",
+                "neg",
+                "not",
+                "bitand",
+                "bitor",
+                "bitxor",
+                "as_ref",
+                "as_mut",
+                "borrow",
+                "borrow_mut",
+                "deserialize",
+                "serialize",
+            ];
             name == "main"
+                || TRAIT_DISPATCH_NAMES.contains(&name)
                 || decorators.iter().any(|d| {
                     let inner = d.trim_start_matches("#[").trim_end_matches(']');
                     let path = inner.split('(').next().unwrap_or(inner).trim();
-                    path == "main" || path.ends_with("::main")
+                    path == "main"
+                        || path.ends_with("::main")
+                        || !NON_DISPATCH_ATTRS.contains(&path)
                 })
         }
         "go" => node.kind() == "function_declaration" && (name == "main" || name == "init"),
@@ -499,6 +576,12 @@ pub struct RawCall {
     pub enclosing_class: Option<String>,
     pub callee: String,
     pub receiver: Option<String>,
+    /// True when `receiver` came from a `Type::method()` scoped-path call
+    /// (the path segment immediately before the last `::`) rather than a
+    /// `recv.method()` field access. `receiver` is then already the type
+    /// name itself — resolution must scope directly to that class, not go
+    /// through the variable→type lookup a `.`-receiver needs.
+    pub receiver_is_type_path: bool,
     pub line: usize,
 }
 
@@ -512,21 +595,44 @@ fn leading_ident(seg: &str) -> Option<String> {
     if ident.is_empty() { None } else { Some(ident) }
 }
 
-/// Split a callee expression into (immediate receiver, method/callee name).
+/// Split a callee expression into (immediate receiver, method/callee name,
+/// whether that receiver is a type-path segment rather than a variable).
 ///
-/// `self.method` → (Some("self"), "method"); `a.b.method` → (Some("b"), "method");
-/// `mod::func` / `func` → (None, "func").
-fn split_receiver_callee(raw: &str) -> Option<(Option<String>, String)> {
+/// `self.method` → (Some("self"), "method", false);
+/// `a.b.method` → (Some("b"), "method", false);
+/// `HashMap::new` → (Some("HashMap"), "new", true) — the segment before the
+/// last `::` is kept (not discarded) when it looks like a type name, since
+/// that's the class an associated-function call like `Type::method()` must
+/// resolve against; `mod::func` → (None, "func", false) — a lowercase
+/// segment reads as a module, not a type (see `is_type_like`).
+fn split_receiver_callee(raw: &str) -> Option<(Option<String>, String, bool)> {
     if let Some(dot) = raw.rfind('.') {
         let (left, right) = raw.split_at(dot);
         let callee = leading_ident(&right[1..])?;
         // Immediate receiver = last segment of the left side.
         let recv = left.rsplit(['.', ':']).next().and_then(leading_ident);
-        Some((recv, callee))
+        Some((recv, callee, false))
+    } else if let Some(idx) = raw.rfind("::") {
+        let (left, right) = raw.split_at(idx);
+        let callee = leading_ident(&right[2..])?;
+        let recv = left.rsplit("::").next().and_then(leading_ident);
+        let is_type = recv.as_deref().is_some_and(is_type_like);
+        Some((if is_type { recv } else { None }, callee, is_type))
     } else {
-        let last = raw.rsplit("::").next().unwrap_or(raw);
-        Some((None, leading_ident(last)?))
+        Some((None, leading_ident(raw)?, false))
     }
+}
+
+/// Heuristic: a path segment is "type-like" when it starts with an uppercase
+/// letter, matching Rust/C#/Java/Kotlin/Swift convention for types/classes
+/// (vs. snake_case modules or lowerCamelCase namespaces/packages). Not
+/// perfect — code that doesn't follow the convention won't benefit — but a
+/// false negative here just falls back to the pre-existing unscoped
+/// resolution behavior, so the cost of missing one is low; a false positive
+/// (treating a module as a type) just means a class-scoped lookup that
+/// finds nothing, same as today.
+fn is_type_like(segment: &str) -> bool {
+    segment.chars().next().is_some_and(|c| c.is_uppercase())
 }
 
 /// Walk the AST collecting call sites, tracking the nearest enclosing function
@@ -559,7 +665,8 @@ fn walk_calls(
     if consts.call_node_types.contains(&node.kind())
         && let Some((enc_name, enc_line)) = &current
         && let Some(fn_node) = node.child_by_field_name(consts.call_function_field)
-        && let Some((receiver, callee)) = split_receiver_callee(&source[fn_node.byte_range()])
+        && let Some((receiver, callee, receiver_is_type_path)) =
+            split_receiver_callee(&source[fn_node.byte_range()])
     {
         out.push(RawCall {
             enclosing_name: enc_name.clone(),
@@ -567,6 +674,7 @@ fn walk_calls(
             enclosing_class: child_class.clone(),
             callee,
             receiver,
+            receiver_is_type_path,
             line: node.start_position().row + 1,
         });
     }
@@ -1323,6 +1431,22 @@ def run():
         assert!(find(&symbols, "run").is_entry_point);
     }
 
+    /// Regression: dunder methods are invoked by Python's data model via
+    /// protocol dispatch (`X()` calls `__init__`, `str(x)` calls `__str__`),
+    /// never by their literal name — must not be flagged as dead code just
+    /// because a name-based call-graph never sees a "caller" for them.
+    /// Single-underscore-prefixed names (the usual "private" convention)
+    /// are a different thing entirely and must not match.
+    #[test]
+    fn test_python_entry_point_dunder_methods() {
+        let code = "class C:\n    def __init__(self):\n        pass\n    def __str__(self):\n        return \"\"\n    def _private_helper(self):\n        pass\n    def helper(self):\n        pass\n";
+        let symbols = extract_symbols(code, "python", "c.py").unwrap();
+        assert!(find(&symbols, "__init__").is_entry_point);
+        assert!(find(&symbols, "__str__").is_entry_point);
+        assert!(!find(&symbols, "_private_helper").is_entry_point);
+        assert!(!find(&symbols, "helper").is_entry_point);
+    }
+
     #[test]
     fn test_rust_entry_point_main_name() {
         let code = "fn main() {}\nfn helper() {}\n";
@@ -1336,6 +1460,49 @@ def run():
         let code = "#[tokio::main]\nasync fn main() {}\n";
         let symbols = extract_symbols(code, "rust", "main.rs").unwrap();
         assert!(find(&symbols, "main").is_entry_point);
+    }
+
+    /// Regression: an attribute-macro-registered handler (route/RPC/tool
+    /// framework, etc.) is invoked externally via the macro's generated
+    /// dispatch, never by a literal call site — a name-based call-graph can
+    /// never give it a nonzero caller_count, so it must be treated as an
+    /// entry point (like `main`) rather than flagged as dead code.
+    #[test]
+    fn test_rust_entry_point_attribute_macro() {
+        let code = "struct S;\nimpl S {\n    #[tool(name = \"repo_overview\")]\n    fn repo_overview(&self) {}\n}\nfn helper() {}\n";
+        let symbols = extract_symbols(code, "rust", "server.rs").unwrap();
+        assert!(find(&symbols, "repo_overview").is_entry_point);
+        assert!(!find(&symbols, "helper").is_entry_point);
+    }
+
+    /// Regression: a small set of purely-cosmetic/compiler-directive
+    /// attributes must NOT trigger the broad "has an attribute macro"
+    /// entry-point signal — they don't imply anything invokes the function
+    /// other than an ordinary call site.
+    #[test]
+    fn test_rust_non_dispatch_attributes_dont_trigger_entry_point() {
+        let code = "#[allow(dead_code)]\nfn helper() {}\n\n#[inline]\nfn also_helper() {}\n";
+        let symbols = extract_symbols(code, "rust", "lib.rs").unwrap();
+        assert!(!find(&symbols, "helper").is_entry_point);
+        assert!(!find(&symbols, "also_helper").is_entry_point);
+    }
+
+    /// Regression: common std/core trait methods (`from`, `clone`, `fmt`,
+    /// `default`, `next`, ...) are invoked via operator/trait/protocol
+    /// syntax (`.into()`, `==`, `for` loops, ...), never by their literal
+    /// name at a call site — a name-based call-graph can never see a real
+    /// "caller" for them, so they must not be flagged as dead code just
+    /// because they have zero recorded callers.
+    #[test]
+    fn test_rust_entry_point_trait_dispatch_names() {
+        let code = "struct S;\nimpl S {\n    fn from(x: i32) -> Self {\n        S\n    }\n    fn clone(&self) -> Self {\n        S\n    }\n    fn process(&self) {}\n}\n";
+        let symbols = extract_symbols(code, "rust", "types.rs").unwrap();
+        assert!(find(&symbols, "from").is_entry_point);
+        assert!(find(&symbols, "clone").is_entry_point);
+        assert!(
+            !find(&symbols, "process").is_entry_point,
+            "an ordinary method name not in the trait-dispatch list is unaffected"
+        );
     }
 
     #[test]
@@ -1689,5 +1856,56 @@ class Foo {
         let code = "def run\n  if true\n    puts 'x'\n  end\nend\n";
         let syms = extract_symbols_shallow(code, "ruby", "a.rb");
         assert!(syms.iter().all(|s| s.complexity == 1));
+    }
+
+    #[test]
+    fn test_split_receiver_callee_dot_receiver() {
+        assert_eq!(
+            split_receiver_callee("self.method"),
+            Some((Some("self".to_string()), "method".to_string(), false))
+        );
+        assert_eq!(
+            split_receiver_callee("a.b.method"),
+            Some((Some("b".to_string()), "method".to_string(), false))
+        );
+    }
+
+    #[test]
+    fn test_split_receiver_callee_type_path_is_scoped() {
+        // Type::method() — uppercase segment before the last `::` is kept as
+        // a receiver AND flagged as a type path (not a variable to look up).
+        assert_eq!(
+            split_receiver_callee("HashMap::new"),
+            Some((Some("HashMap".to_string()), "new".to_string(), true))
+        );
+        // Module-qualified free function — lowercase segment is not type-like,
+        // so it is dropped exactly like before this fix (no behavior change).
+        assert_eq!(
+            split_receiver_callee("mod::func"),
+            Some((None, "func".to_string(), false))
+        );
+        // Multi-level module path to an associated function: only the segment
+        // immediately before the last `::` is kept (the type, not the module).
+        assert_eq!(
+            split_receiver_callee("std::collections::HashMap::new"),
+            Some((Some("HashMap".to_string()), "new".to_string(), true))
+        );
+    }
+
+    #[test]
+    fn test_split_receiver_callee_bare_function() {
+        assert_eq!(
+            split_receiver_callee("func"),
+            Some((None, "func".to_string(), false))
+        );
+    }
+
+    #[test]
+    fn test_is_type_like() {
+        assert!(is_type_like("HashMap"));
+        assert!(is_type_like("StructA"));
+        assert!(!is_type_like("mod"));
+        assert!(!is_type_like("helper"));
+        assert!(!is_type_like(""));
     }
 }

@@ -105,6 +105,13 @@ pub struct FileDiff {
     pub path: String,
     /// (new_start, new_end) inclusive, 1-indexed line ranges touched in the new file.
     pub hunks: Vec<(i64, i64)>,
+    /// New-file line numbers that are actual `+` additions, as opposed to
+    /// unchanged context lines that merely fall within a hunk's numeric
+    /// range. Real diffs carry surrounding context (typically 3 lines) even
+    /// around a pure insertion, so a hunk-level "nothing removed" check is
+    /// not enough — this is precise per line. A symbol whose signature range
+    /// is fully covered by these didn't exist as that text before this diff.
+    pub added_lines: std::collections::HashSet<i64>,
     pub is_new_file: bool,
     pub is_deleted_file: bool,
 }
@@ -115,6 +122,9 @@ pub struct FileDiff {
 pub fn parse_unified_diff(diff_text: &str) -> Vec<FileDiff> {
     let mut files: Vec<FileDiff> = Vec::new();
     let mut current: Option<FileDiff> = None;
+    // New-file line number the next hunk-body line corresponds to; 0 means
+    // "not currently inside a hunk body" (reset per file, set by each `@@`).
+    let mut new_line_cursor: i64 = 0;
 
     for line in diff_text.lines() {
         if let Some(rest) = line.strip_prefix("diff --git ") {
@@ -124,9 +134,11 @@ pub fn parse_unified_diff(diff_text: &str) -> Vec<FileDiff> {
             current = Some(FileDiff {
                 path: parse_diff_git_header(rest),
                 hunks: Vec::new(),
+                added_lines: std::collections::HashSet::new(),
                 is_new_file: false,
                 is_deleted_file: false,
             });
+            new_line_cursor = 0;
         } else if line.starts_with("new file mode") {
             if let Some(f) = current.as_mut() {
                 f.is_new_file = true;
@@ -142,10 +154,27 @@ pub fn parse_unified_diff(diff_text: &str) -> Vec<FileDiff> {
                     f.path = rest.strip_prefix("b/").unwrap_or(rest).to_string();
                 }
             }
-        } else if let Some(range) = line.strip_prefix("@@ ").and_then(parse_hunk_header)
+        } else if let Some((new_start, new_end)) =
+            line.strip_prefix("@@ ").and_then(parse_hunk_header)
             && let Some(f) = current.as_mut()
         {
-            f.hunks.push(range);
+            f.hunks.push((new_start, new_end));
+            new_line_cursor = new_start;
+        } else if new_line_cursor > 0
+            && let Some(f) = current.as_mut()
+        {
+            // Inside a hunk body. `+` lines are additions at the current
+            // new-file line (then the cursor advances); ` ` (context) lines
+            // also advance the cursor but aren't additions; `-` (old-file
+            // only) lines don't touch the new-file cursor at all.
+            if line.starts_with('+') {
+                f.added_lines.insert(new_line_cursor);
+                new_line_cursor += 1;
+            } else if line.starts_with(' ') {
+                new_line_cursor += 1;
+            }
+            // Anything else (e.g. `-` lines, "\ No newline at end of file")
+            // doesn't correspond to a new-file line — ignored.
         }
     }
     if let Some(f) = current.take() {
@@ -182,11 +211,40 @@ fn parse_hunk_header(rest: &str) -> Option<(i64, i64)> {
     Some((start, end))
 }
 
-pub fn is_signature_changed(signature_range: (i64, i64), hunk_ranges: &[(i64, i64)]) -> bool {
-    let (sig_start, sig_end) = signature_range;
-    hunk_ranges
-        .iter()
-        .any(|&(hunk_start, hunk_end)| !(hunk_end < sig_start || hunk_start > sig_end))
+/// True when at least one line in `signature_range` is an actual `+`
+/// addition (`added_lines` — see `FileDiff`), i.e. text that differs from
+/// the pre-diff version, rather than unchanged context merely spanned by
+/// the same hunk. Line-precise on purpose: real diffs carry several lines
+/// of unchanged context around any edit (git's default -U3), so a coarser
+/// "does any hunk's overall numeric range overlap this symbol" check flags
+/// every symbol sitting near an edit within the same hunk — not just the
+/// one actually touched — as "signature changed".
+pub fn is_signature_changed(signature_range: (i64, i64), added_lines: &HashSet<i64>) -> bool {
+    let (start, end) = signature_range;
+    (start..=end).any(|line| added_lines.contains(&line))
+}
+
+/// True when `signature_range` falls entirely within territory that didn't
+/// exist before this diff: either the whole file is new (`file_is_new`), or
+/// every line in the range is an actual `+` addition (`added_lines` — see
+/// `FileDiff`; deliberately *not* a hunk-level check, since real diffs carry
+/// unchanged context lines around an insertion, so "hunk touches this range"
+/// is not the same as "this range is new text"). Distinguishes "this symbol
+/// was just created" from "this pre-existing symbol's signature line was
+/// edited" — the two `diff_impact` previously conflated under a single
+/// `signature_changed` flag, escalating every brand-new function to "high
+/// risk — all call sites may need update" even though a symbol with zero
+/// prior existence has zero prior call sites.
+pub fn is_new_symbol(
+    signature_range: (i64, i64),
+    file_is_new: bool,
+    added_lines: &std::collections::HashSet<i64>,
+) -> bool {
+    if file_is_new {
+        return true;
+    }
+    let (start, end) = signature_range;
+    start <= end && (start..=end).all(|line| added_lines.contains(&line))
 }
 
 pub fn compute_aggregate_risk(
@@ -266,7 +324,7 @@ pub fn sort_affected_symbols(
     symbols.truncate(max_affected);
 }
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[cfg(test)]
 mod tests {
@@ -274,20 +332,38 @@ mod tests {
 
     #[test]
     fn test_is_signature_changed_overlap() {
-        assert!(is_signature_changed((5, 10), &[(8, 15)]));
-        assert!(is_signature_changed((5, 10), &[(1, 6)]));
-        assert!(is_signature_changed((5, 10), &[(5, 10)]));
+        assert!(is_signature_changed((5, 10), &HashSet::from([8])));
+        assert!(is_signature_changed((5, 10), &HashSet::from([6])));
+        assert!(is_signature_changed((5, 10), &HashSet::from([5, 10])));
     }
 
     #[test]
     fn test_is_signature_changed_no_overlap() {
-        assert!(!is_signature_changed((5, 10), &[(11, 20)]));
-        assert!(!is_signature_changed((5, 10), &[(1, 4)]));
+        assert!(!is_signature_changed((5, 10), &HashSet::from([11, 20])));
+        assert!(!is_signature_changed((5, 10), &HashSet::from([1, 4])));
     }
 
     #[test]
-    fn test_is_signature_changed_empty_hunks() {
-        assert!(!is_signature_changed((5, 10), &[]));
+    fn test_is_signature_changed_empty_added_lines() {
+        assert!(!is_signature_changed((5, 10), &HashSet::new()));
+    }
+
+    /// Regression: a symbol sitting near a real edit — but not itself
+    /// touched — must not be flagged just because a hunk's *numeric range*
+    /// (context lines included) happens to span it. `line 7` is unchanged
+    /// context in the same hunk as an edit at line 3; only line 3 is an
+    /// actual addition.
+    #[test]
+    fn test_is_signature_changed_ignores_unchanged_context_in_same_hunk() {
+        let added = HashSet::from([3]);
+        assert!(
+            !is_signature_changed((7, 9), &added),
+            "lines 7-9 are unchanged context, not touched by this diff"
+        );
+        assert!(
+            is_signature_changed((1, 5), &added),
+            "line 3 is genuinely new"
+        );
     }
 
     #[test]
@@ -363,6 +439,104 @@ mod tests {
         let result = run_with_timeout("/bin/sleep", vec!["0".into()], dir.path(), 5);
         let output = result.unwrap();
         assert!(output.status.success());
+    }
+
+    #[test]
+    fn test_is_new_symbol_whole_new_file() {
+        assert!(is_new_symbol(
+            (5, 7),
+            true,
+            &std::collections::HashSet::new()
+        ));
+    }
+
+    #[test]
+    fn test_is_new_symbol_all_lines_added() {
+        let added: std::collections::HashSet<i64> = (5..=7).collect();
+        assert!(is_new_symbol((5, 7), false, &added));
+    }
+
+    #[test]
+    fn test_is_new_symbol_false_when_some_lines_are_context() {
+        // Line 6 is missing — it's unchanged context, not an addition — so
+        // the signature range is not fully new text, even though its other
+        // two lines are.
+        let added: std::collections::HashSet<i64> = [5, 7].into_iter().collect();
+        assert!(!is_new_symbol((5, 7), false, &added));
+    }
+
+    #[test]
+    fn test_is_new_symbol_false_when_no_lines_added() {
+        assert!(!is_new_symbol(
+            (5, 7),
+            false,
+            &std::collections::HashSet::new()
+        ));
+    }
+
+    /// Regression: a realistic git diff for inserting a new function after an
+    /// existing one carries unchanged context lines in the *same* hunk (git's
+    /// default -U3), so the hunk header alone (`-10,3 +10,7`) never has
+    /// old_len=0 even though 4 of its 7 new-side lines are pure additions.
+    /// `added_lines` must track this at line granularity, not hunk granularity.
+    #[test]
+    fn test_parse_unified_diff_tracks_added_lines_with_realistic_context() {
+        // Built via an array + join (not `\`-continued string lines) so each
+        // context line's meaningful single leading space survives exactly —
+        // `\`-then-newline in a Rust string literal strips *all* leading
+        // whitespace on the continuation line, which would silently eat the
+        // very space that marks a diff context line.
+        let diff = [
+            "diff --git a/src/foo.rs b/src/foo.rs",
+            "--- a/src/foo.rs",
+            "+++ b/src/foo.rs",
+            "@@ -10,3 +10,7 @@ fn existing() {",
+            " line_a",
+            " line_b",
+            " line_c",
+            "+",
+            "+fn brand_new() {",
+            "+    2",
+            "+}",
+        ]
+        .join("\n");
+        let files = parse_unified_diff(&diff);
+        assert_eq!(files[0].hunks, vec![(10, 16)]);
+        for context_line in 10..=12 {
+            assert!(
+                !files[0].added_lines.contains(&context_line),
+                "line {context_line} is unchanged context, not an addition"
+            );
+        }
+        for added_line in 13..=16 {
+            assert!(
+                files[0].added_lines.contains(&added_line),
+                "line {added_line} is part of the new function"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_unified_diff_modified_line_is_not_added() {
+        let diff = [
+            "diff --git a/src/foo.rs b/src/foo.rs",
+            "--- a/src/foo.rs",
+            "+++ b/src/foo.rs",
+            "@@ -10,1 +10,2 @@ fn foo() {",
+            " context",
+            "+new_line",
+        ]
+        .join("\n");
+        let files = parse_unified_diff(&diff);
+        assert_eq!(files[0].hunks, vec![(10, 11)]);
+        assert!(
+            !files[0].added_lines.contains(&10),
+            "context line is not an addition"
+        );
+        assert!(
+            files[0].added_lines.contains(&11),
+            "the +new_line is an addition"
+        );
     }
 
     #[test]

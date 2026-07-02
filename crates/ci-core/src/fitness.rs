@@ -7,7 +7,6 @@ use crate::analysis::coverage::{CoverageData, normalize_path};
 use crate::analysis::dead_code::{
     compute_dead_code_confidence, is_private_symbol, scope_clear_for_language,
 };
-use crate::analysis::hotspot::compute_hotspots;
 use crate::config::HotspotsConfig;
 
 // ---------------------------------------------------------------------------
@@ -17,13 +16,25 @@ use crate::config::HotspotsConfig;
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct FitnessThresholds {
+    /// Legacy absolute cap, kept for backward compat with existing
+    /// thresholds.toml files — `max_hub_pct` below is the metric actually
+    /// meant to catch unhealthy hub concentration. Because `is_hub` is
+    /// assigned by percentile, hub_count scales *linearly* with codebase
+    /// size for a project with a constant, healthy hub_pct, while a fixed
+    /// absolute cap does not — so any cap tight enough to mean something for
+    /// a small project is mathematically guaranteed to eventually fail any
+    /// codebase that keeps growing, independent of whether fan-in
+    /// concentration (the thing actually worth catching) got any worse. The
+    /// default here is set high enough to stay out of `max_hub_pct`'s way
+    /// for reasonably large projects (comfortably covers a multi-thousand-
+    /// symbol codebase at a healthy ~10-15% hub ratio) rather than doubling
+    /// as a second, redundant, scale-sensitive gate.
     pub max_hub_count: i64,
     /// Scale-invariant companion to `max_hub_count`: `is_hub` is assigned by
     /// percentile (top N% by caller count, plus bridge-hubs via coreness),
     /// so raw hub_count grows with codebase size regardless of real fan-in
     /// concentration. `max_hub_pct` (of total symbols) stays meaningful as
-    /// the codebase grows; `max_hub_count` is kept for backward compat with
-    /// existing thresholds.toml files.
+    /// the codebase grows — this is the metric that should actually gate.
     pub max_hub_pct: f64,
     pub max_avg_coreness: f64,
     pub max_dead_code_pct: f64,
@@ -50,7 +61,7 @@ pub const HIGH_COMPLEXITY_THRESHOLD: i64 = 10;
 impl Default for FitnessThresholds {
     fn default() -> Self {
         Self {
-            max_hub_count: 50,
+            max_hub_count: 1000,
             max_hub_pct: 20.0,
             max_avg_coreness: 15.0,
             max_dead_code_pct: 10.0,
@@ -117,8 +128,19 @@ pub struct FitnessMetrics {
 }
 
 /// Row shape needed to re-run `compute_dead_code_confidence` per symbol:
-/// (path, line_start, line_end, caller_count, is_entry_point, is_test, language, name, signature).
-type DeadCodeRow = (String, i64, i64, i64, bool, bool, String, String, String);
+/// (path, line_start, line_end, caller_count, is_entry_point, is_test, language, name, signature, kind).
+type DeadCodeRow = (
+    String,
+    i64,
+    i64,
+    i64,
+    bool,
+    bool,
+    String,
+    String,
+    String,
+    String,
+);
 
 pub fn collect_metrics(
     conn: &Connection,
@@ -143,7 +165,22 @@ pub fn collect_metrics(
         .query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0))
         .unwrap_or(0);
 
-    let edge_coverage_pct = if total_symbols > 0 {
+    // Same category error as dead_code_pct: a struct/class-like symbol can
+    // never be a call *source* either (it has no body to call from), so it
+    // can never appear as `call_edges.from_symbol` no matter how much of
+    // its own code genuinely calls out to other symbols — every one of
+    // them padding the denominator without ever being able to reach the
+    // numerator. Denominator is `function`/`method` symbols only, matching
+    // the set of kinds that can possibly have an outgoing call at all.
+    let callable_symbols: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM symbols WHERE kind IN ('function', 'method')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+
+    let edge_coverage_pct = if callable_symbols > 0 {
         let covered: i64 = conn
             .query_row(
                 "SELECT COUNT(DISTINCT from_symbol) FROM call_edges",
@@ -151,15 +188,24 @@ pub fn collect_metrics(
                 |r| r.get(0),
             )
             .unwrap_or(0);
-        (covered as f64 / total_symbols as f64) * 100.0
+        (covered as f64 / callable_symbols as f64) * 100.0
     } else {
         100.0
     };
 
     let dead_code_pct = if total_symbols > 0 {
+        // Only `function`/`method` are ever evaluated: a struct/class-like
+        // symbol is referenced via construction syntax, not a call, so the
+        // call-graph extractor never gives it a nonzero caller_count no
+        // matter how widely it's actually used — "dead code" isn't a
+        // well-formed question for those kinds (see
+        // `compute_dead_code_confidence`'s own kind guard, which this
+        // filter mirrors so the *denominator* — "how many symbols could
+        // meaningfully be dead" — is correct too, not just the numerator).
         let mut stmt = conn.prepare(
             "SELECT path, line_start, line_end, COALESCE(caller_count, 0), is_entry_point, \
-             is_test, language, name, signature FROM symbols",
+             is_test, language, name, signature, kind FROM symbols \
+             WHERE kind IN ('function', 'method')",
         )?;
         let rows: Vec<DeadCodeRow> = stmt
             .query_map([], |r| {
@@ -173,6 +219,7 @@ pub fn collect_metrics(
                     r.get::<_, String>(6)?,
                     r.get::<_, String>(7)?,
                     r.get::<_, String>(8)?,
+                    r.get::<_, String>(9)?,
                 ))
             })?
             .filter_map(|r| r.ok())
@@ -181,7 +228,18 @@ pub fn collect_metrics(
         let high_confidence_dead = rows
             .iter()
             .filter(
-                |(path, line_start, line_end, caller_count, is_entry, is_test, lang, name, sig)| {
+                |(
+                    path,
+                    line_start,
+                    line_end,
+                    caller_count,
+                    is_entry,
+                    is_test,
+                    lang,
+                    name,
+                    sig,
+                    kind,
+                )| {
                     let abs_path = normalize_path(&project_root.join(path));
                     let is_private = is_private_symbol(lang, name, sig);
                     let scope_clear = scope_clear_for_language(lang);
@@ -195,6 +253,7 @@ pub fn collect_metrics(
                         is_private,
                         scope_clear,
                         coverage,
+                        kind,
                     );
                     confidence == "high"
                 },
@@ -206,22 +265,21 @@ pub fn collect_metrics(
         0.0
     };
 
-    let hotspot_risk = compute_hotspots(
+    let hotspot_risk = crate::analysis::hotspot::compute_absolute_hotspot_risk(
         project_root,
         conn,
-        &HotspotsConfig::default(),
-        1,
         &HotspotsConfig::default().default_since,
-        0,
-        false,
-    )
-    .hotspots
-    .first()
-    .map(|h| h.hotspot_score)
-    .unwrap_or(0.0);
+    );
 
-    let hub_pct = if total_symbols > 0 {
-        hub_count as f64 / total_symbols as f64 * 100.0
+    // Same category error as dead_code_pct/edge_coverage_pct: a struct/class
+    // symbol can be constructed and referenced constantly without that ever
+    // showing up as call fan-in, so it can (in principle) never earn `is_hub`
+    // the way a heavily-called function/method does. Denominator matches
+    // `callable_symbols` above so hub_pct measures "hub concentration among
+    // symbols that could actually become a hub," not diluted by symbols that
+    // structurally never can.
+    let hub_pct = if callable_symbols > 0 {
+        hub_count as f64 / callable_symbols as f64 * 100.0
     } else {
         0.0
     };
@@ -588,7 +646,7 @@ mod tests {
     #[test]
     fn test_default_thresholds() {
         let t = FitnessThresholds::default();
-        assert_eq!(t.max_hub_count, 50);
+        assert_eq!(t.max_hub_count, 1000);
         assert_eq!(t.max_avg_coreness, 15.0);
         assert_eq!(t.max_dead_code_pct, 10.0);
         assert_eq!(t.max_hotspot_risk, 0.75);
@@ -649,7 +707,7 @@ mod tests {
 
     /// DEBT-009 regression: `is_hub` is assigned by percentile, so a small
     /// codebase where every symbol is a hub (100% hub_pct) still passes the
-    /// absolute `max_hub_count` gate (default 50) — but must fail the
+    /// absolute `max_hub_count` gate (default 1000) — but must fail the
     /// scale-invariant `max_hub_pct` gate (default 20%), proving the new
     /// metric catches concentration the absolute count cannot.
     #[test]
@@ -692,6 +750,55 @@ mod tests {
         );
         assert_eq!(hub_pct_check.value, 100.0);
         assert!(!result.passed);
+    }
+
+    /// Same taxonomy fix as `edge_coverage_pct`/`dead_code_pct`: a `struct`
+    /// symbol can never earn `is_hub` (no incoming *call* fan-in is possible
+    /// for a type), so padding the denominator with structs only dilutes
+    /// hub_pct — it can never cause a false failure, but it can mask real
+    /// concentration in a struct-heavy codebase. Denominator must be
+    /// `callable_symbols` (function/method), not every symbol.
+    #[test]
+    fn test_hub_pct_denominator_excludes_structs() {
+        let conn = test_conn();
+        let thresholds = FitnessThresholds::default();
+
+        conn.execute(
+            "INSERT INTO symbols (qualified_name, name, kind, language, path, \
+             line_start, line_end, is_hub, indexed_at) \
+             VALUES ('mod.foo', 'foo', 'function', 'python', 'mod.py', 1, 5, 1, 0.0)",
+            [],
+        )
+        .unwrap();
+        for i in 0..9 {
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, \
+                 line_start, line_end, is_hub, indexed_at) \
+                 VALUES (?1, ?1, 'struct', 'python', 'mod.py', 1, 5, 0, 0.0)",
+                rusqlite::params![format!("mod.Struct{i}")],
+            )
+            .unwrap();
+        }
+
+        let result = run_fitness_check(
+            &conn,
+            &thresholds,
+            &std::env::temp_dir(),
+            &CoverageData::none(),
+            &[],
+        )
+        .unwrap();
+
+        // 1 hub / 1 callable symbol = 100%, not 1 hub / 10 total symbols = 10%
+        // (which would have stayed under the 20% threshold, hiding the fact
+        // that every callable symbol in this codebase is a hub).
+        let hub_pct_check = result
+            .checks
+            .iter()
+            .find(|c| c.metric == "hub_pct")
+            .unwrap();
+        assert_eq!(hub_pct_check.value, 100.0);
+        assert!(!hub_pct_check.passed);
     }
 
     #[test]
@@ -827,6 +934,50 @@ mod tests {
             .find(|c| c.metric == "edge_coverage_pct")
             .unwrap();
         assert!(check.passed);
+    }
+
+    /// Regression: a `struct` can never be a call *source* either (it has
+    /// no body to call from), so it can never appear as
+    /// `call_edges.from_symbol` no matter how much genuinely-calling code
+    /// exists elsewhere — every struct in the codebase used to pad
+    /// `edge_coverage_pct`'s denominator without ever being able to reach
+    /// the numerator, artificially deflating the metric. Two functions (one
+    /// with an outgoing call) plus one struct must score 50%, not 33%.
+    #[test]
+    fn test_edge_coverage_pct_excludes_structs_from_denominator() {
+        let conn = test_conn();
+        conn.execute(
+            "INSERT INTO symbols (qualified_name, name, kind, language, path, \
+             line_start, line_end, indexed_at) \
+             VALUES ('mod.foo', 'foo', 'function', 'python', 'mod.py', 1, 5, 0.0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO symbols (qualified_name, name, kind, language, path, \
+             line_start, line_end, indexed_at) \
+             VALUES ('mod.bar', 'bar', 'function', 'python', 'mod.py', 10, 15, 0.0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO symbols (qualified_name, name, kind, language, path, \
+             line_start, line_end, indexed_at) \
+             VALUES ('mod.S', 'S', 'struct', 'rust', 'mod.rs', 1, 5, 0.0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO call_edges (from_symbol, to_symbol) VALUES ('mod.foo', 'mod.bar')",
+            [],
+        )
+        .unwrap();
+
+        let metrics = collect_metrics(&conn, &std::env::temp_dir(), &CoverageData::none()).unwrap();
+        assert_eq!(
+            metrics.edge_coverage_pct, 50.0,
+            "1 of 2 *callable* symbols (foo) has an outgoing edge; the struct must not count"
+        );
     }
 
     #[test]
@@ -966,7 +1117,7 @@ mod tests {
     #[test]
     fn test_load_thresholds_missing_file() {
         let thresholds = load_thresholds(Some(Path::new("/nonexistent/path.toml"))).unwrap();
-        assert_eq!(thresholds.max_hub_count, 50);
+        assert_eq!(thresholds.max_hub_count, 1000);
     }
 
     #[test]
@@ -1071,7 +1222,7 @@ mod tests {
     #[test]
     fn test_load_thresholds_none() {
         let thresholds = load_thresholds(None).unwrap();
-        assert_eq!(thresholds.max_hub_count, 50);
+        assert_eq!(thresholds.max_hub_count, 1000);
     }
 
     #[test]

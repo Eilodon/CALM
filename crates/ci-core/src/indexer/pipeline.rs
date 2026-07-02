@@ -307,15 +307,38 @@ fn extract_file_data(
     let mut call_sites = Vec::with_capacity(calls.len());
     for c in &calls {
         if let Some(enc_qn) = qn_by_loc.get(&(c.enclosing_name.clone(), c.enclosing_line)) {
-            let mut confidence = resolver.resolve_tier1(&c.callee, &ctx, &aliases).confidence;
+            let mut confidence;
             let mut target_class: Option<String> = None;
-            if confidence == EdgeConfidence::Textual
+
+            if c.receiver_is_type_path
                 && let Some(receiver) = &c.receiver
-                && let Some(cls) =
-                    resolver.resolve_tier2(receiver, &ctx, c.enclosing_class.as_deref())
             {
+                // `Type::method()` names its type directly and unambiguously
+                // in the source text — this takes priority over tier-1
+                // *before* it even runs, not just when tier-1 comes up
+                // textual. Tier-1's `file_symbols`/`import_map` check
+                // matches on the bare callee name alone (`"new"`), with no
+                // idea a receiver type was named at all, so it would happily
+                // "resolve" e.g. `Vec::new()` against this file's own
+                // unrelated `SomeStruct::new` just because both are named
+                // "new" — same file, same bare name, wrong symbol entirely.
+                // Skipping tier-1 here (rather than only overriding it when
+                // textual) is what actually closes that gap. And if nothing
+                // in the codebase has this exact type, "unresolved" is the
+                // correct answer — no fallback to the unscoped global
+                // by_name match, which is the fan-out bug this prevents.
                 confidence = EdgeConfidence::Inferred;
-                target_class = Some(cls);
+                target_class = Some(receiver.clone());
+            } else {
+                confidence = resolver.resolve_tier1(&c.callee, &ctx, &aliases).confidence;
+                if confidence == EdgeConfidence::Textual
+                    && let Some(receiver) = &c.receiver
+                    && let Some(cls) =
+                        resolver.resolve_tier2(receiver, &ctx, c.enclosing_class.as_deref())
+                {
+                    confidence = EdgeConfidence::Inferred;
+                    target_class = Some(cls);
+                }
             }
             let callee = aliases.get(&c.callee).unwrap_or(&c.callee).clone();
             // Tier-3: StackGraph confirmed this callee has a definition in scope.
@@ -1135,6 +1158,190 @@ mod tests {
         assert_eq!(
             confidence, "resolved",
             "imported call should be resolved, not textual"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression: `Type::method()` (a scoped-path call, no `.` receiver) must
+    /// resolve *only* against `Type`, not fan out to every same-named symbol
+    /// project-wide. Two structs (`StructA`, `StructB`) each define `fn new()`;
+    /// `caller` calls `StructA::new()` (must resolve to exactly that one) and
+    /// `HashMap::new()` (an external/undefined type in this fixture — must
+    /// resolve to nothing at all, not to `StructA::new`/`StructB::new` via the
+    /// old unscoped `by_name["new"]` fallback).
+    #[test]
+    fn test_type_path_call_resolves_scoped_not_fanned_out() {
+        let dir = std::env::temp_dir().join(format!("ci_idx_typepath_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("a.rs"),
+            "struct StructA;
+impl StructA {
+    fn new() -> Self {
+        StructA
+    }
+}
+",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("b.rs"),
+            "struct StructB;
+impl StructB {
+    fn new() -> Self {
+        StructB
+    }
+}
+",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("c.rs"),
+            "fn caller() {
+    let _a = StructA::new();
+    let _m = HashMap::new();
+}
+",
+        )
+        .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
+
+        // Correctly scoped: caller -> StructA::new, and only StructA::new.
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM call_edges WHERE from_symbol = (SELECT qualified_name FROM symbols WHERE name = 'caller') AND to_symbol = (SELECT qualified_name FROM symbols WHERE name = 'new' AND path = 'a.rs')",
+            ),
+            1,
+            "StructA::new() must resolve to StructA's own new(), scoped via target_class"
+        );
+        let confidence: String = conn
+            .query_row(
+                "SELECT edge_confidence FROM call_edges WHERE from_symbol = (SELECT qualified_name FROM symbols WHERE name = 'caller') AND to_symbol = (SELECT qualified_name FROM symbols WHERE name = 'new' AND path = 'a.rs')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            confidence, "inferred",
+            "type-path call is tier-2 inferred, not textual"
+        );
+
+        // Not fanned out: must NOT also point at StructB::new.
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM call_edges WHERE from_symbol = (SELECT qualified_name FROM symbols WHERE name = 'caller') AND to_symbol = (SELECT qualified_name FROM symbols WHERE name = 'new' AND path = 'b.rs')",
+            ),
+            0,
+            "StructA::new() must not also resolve to the unrelated StructB::new()"
+        );
+
+        // HashMap::new() names an undefined type in this fixture — must resolve
+        // to nothing (old behavior: fell back to matching every `new` in the
+        // project, i.e. both StructA::new and StructB::new).
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM call_edges WHERE from_symbol = (SELECT qualified_name FROM symbols WHERE name = 'caller') AND to_symbol LIKE '%StructB%'",
+            ),
+            0,
+            "HashMap::new() must not resolve to any project symbol"
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM call_edges WHERE from_symbol = (SELECT qualified_name FROM symbols WHERE name = 'caller')",
+            ),
+            1,
+            "caller must have exactly one outgoing edge total (StructA::new only)"
+        );
+
+        // The call_sites row for HashMap::new() itself was correctly scoped to
+        // "HashMap" (not left NULL/unscoped) — it just has no project-side match.
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM call_sites WHERE callee_name = 'new' AND target_class = 'HashMap'",
+            ),
+            1,
+            "HashMap::new() call site must be scoped to target_class='HashMap'"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression: tier-1's `file_symbols.contains(bare_name)` check matches
+    /// on the callee name alone, with no idea a receiver type was ever named
+    /// — so when the *caller's own file* happens to define something with
+    /// the same bare name as an unrelated `Type::method()` call's method
+    /// (extremely likely for "new"), tier-1 used to "resolve" first and
+    /// short-circuit past the type-path scoping fix entirely (it only ran
+    /// when tier-1 came back textual), reintroducing the exact fan-out bug
+    /// for this specific, common case. `a.rs` defines its own `LocalType`
+    /// with `fn new()` *and* calls `Vec::new()` in the same file — the
+    /// local "new" must not cause `Vec::new()` to also match
+    /// `OtherType::new()` defined in a completely different file.
+    #[test]
+    fn test_type_path_call_not_shadowed_by_same_file_bare_name_match() {
+        let dir = std::env::temp_dir().join(format!("ci_idx_typepath2_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("a.rs"),
+            "struct LocalType;\nimpl LocalType {\n    fn new() -> Self {\n        LocalType\n    }\n}\nfn caller() {\n    let _v: Vec<i32> = Vec::new();\n    let _l = LocalType::new();\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("b.rs"),
+            "struct OtherType;\nimpl OtherType {\n    fn new() -> Self {\n        OtherType\n    }\n}\n",
+        )
+        .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
+
+        // The intentional local call resolves correctly.
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM call_edges \
+                 WHERE from_symbol = (SELECT qualified_name FROM symbols WHERE name = 'caller') \
+                 AND to_symbol = (SELECT qualified_name FROM symbols WHERE name = 'new' AND path = 'a.rs')",
+            ),
+            1,
+            "LocalType::new() must resolve to the local new(), scoped via target_class"
+        );
+
+        // Vec::new() must NOT fan out to OtherType::new() in b.rs just
+        // because a.rs's own file_symbols happens to contain "new" too.
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM call_edges \
+                 WHERE from_symbol = (SELECT qualified_name FROM symbols WHERE name = 'caller') \
+                 AND to_symbol = (SELECT qualified_name FROM symbols WHERE name = 'new' AND path = 'b.rs')",
+            ),
+            0,
+            "Vec::new() must not resolve to the unrelated OtherType::new() in b.rs"
+        );
+
+        // Exactly one outgoing edge total: the local LocalType::new() call.
+        // (Vec::new() correctly resolves to nothing — Vec isn't a project type.)
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM call_edges \
+                 WHERE from_symbol = (SELECT qualified_name FROM symbols WHERE name = 'caller')",
+            ),
+            1,
+            "caller must have exactly one outgoing edge total"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

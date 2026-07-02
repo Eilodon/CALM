@@ -370,10 +370,10 @@ không có gợi ý rõ ràng):
 | `edit_context` | always | `"diff_impact"` | `"MANDATORY after changes — verify blast radius"` | — |
 | `session_context` | `frontier non-empty` | `"file_overview"` | `"Explore top frontier file"` | `{path: frontier[0].path}` |
 | `session_context` | `frontier empty` | `"repo_overview"` | `"Frontier exhausted — refresh map"` | — |
-| `diff_impact` | `aggregate_risk in [critical, high]`, `unindexed_files == []` | `"callers"` | `"Verify high-risk callers manually"` | `{symbol: affected_symbols[0].name}` |
-| `diff_impact` | `aggregate_risk == "medium"`, `unindexed_files == []` | `"callers"` | `"Medium-risk changes — spot-check key callers"` | `{symbol: affected_symbols[0].name}` |
-| `diff_impact` | `aggregate_risk == "unknown"`, `unindexed_files == []` | `"indexing_status"` | `"Risk unknown — check index state"` | — |
-| `diff_impact` | `unindexed_files non-empty` | `"indexing_status"` | `"Wait for index before treating as safe"` | — |
+| `diff_impact` | `aggregate_risk in [critical, high]`, no `pending_scan` entry | `"callers"` | `"Verify high-risk callers manually"` | `{symbol: affected_symbols[0].name}` |
+| `diff_impact` | `aggregate_risk == "medium"`, no `pending_scan` entry | `"callers"` | `"Medium-risk changes — spot-check key callers"` | `{symbol: affected_symbols[0].name}` |
+| `diff_impact` | `aggregate_risk == "unknown"`, no `pending_scan` entry | `"indexing_status"` | `"Risk unknown — check index state"` | — |
+| `diff_impact` | `unindexed_files` has a `reason == "pending_scan"` entry | `"indexing_status"` | `"Wait for index before treating as safe"` | — |
 | `hotspots` | default | `"file_overview"` | `"Inspect highest-risk file"` | `{path: hotspots[0].path}` |
 | `understand` | `ambiguous` present | `"symbol_info"` | `"Ambiguous — retry with specific candidate"` | `{name: ambiguous.candidates[0].name, path: ambiguous.candidates[0].path}` |
 | `understand` | `is_hub == true` | `"edit_context"` | `"Hub — mandatory pre-edit check"` | `{symbol: name, path: path}` |
@@ -386,7 +386,7 @@ không có gợi ý rõ ràng):
 **Priority rules** (within each tool, conditions evaluated top-to-bottom, first match wins):
 
 - **repo_overview**: Condition 1 (phase not ready) beats Condition 2 (embeddings failed). Embeddings retry chỉ có ý nghĩa khi `phase == "ready"` — retry trước khi index xong là vô nghĩa.
-- **diff_impact**: Condition `unindexed_files non-empty` beats `aggregate_risk in [critical, high]`. aggregate_risk không thể trust khi có unindexed files — có thể under-estimated. Giải quyết index trước, sau đó re-evaluate risk.
+- **diff_impact**: Condition "`unindexed_files` có entry `reason == pending_scan`" beats `aggregate_risk in [critical, high]`. aggregate_risk không thể trust khi có file đang chờ scan — có thể under-estimated. Giải quyết index trước, sau đó re-evaluate risk. Entry `reason == "out_of_scope"` KHÔNG kích hoạt điều kiện này — file đó sẽ không bao giờ được scan, không có gì để đợi.
 
 **Note `path` + `max_hops`**: `"timeout"` gợi ý giảm search space bằng `max_hops` nhỏ hơn.
 `"max_hops"` nghĩa là path thật có thể dài hơn limit — gợi ý *tăng* `max_hops`. `args` swap
@@ -680,7 +680,8 @@ không liên tục với trước.
 | Diff hợp lệ nhưng chỉ touch file non-code                        | `affected_symbols: []`, `aggregate_risk: "low"`                                                                    |
 | `staged: true` nhưng `git diff --cached` trả empty              | `affected_symbols: []`, `aggregate_risk: "low"`, note: "No staged changes found."                                  |
 | `commits` với empty range (same commit)                          | `affected_symbols: []`, `aggregate_risk: "low"`, note: "Commit range resolves to no changes."                      |
-| File trong diff chưa index hoặc hash outdated                    | `affected_symbols: []`, `aggregate_risk: "unknown"`, `unindexed_files: [...]`                                      |
+| File trong diff chưa index (recognized extension, chờ scan)      | `affected_symbols: []`, `aggregate_risk: "unknown"`, `unindexed_files: [{path, reason: "pending_scan"}]`           |
+| File trong diff ngoài phạm vi ngôn ngữ (docs/config/...)         | `affected_symbols: []`, `aggregate_risk` không bị ảnh hưởng, `unindexed_files: [{path, reason: "out_of_scope"}]`   |
 
 `edge_confidence` không bao giờ bị discount trong `diff_impact` — `edge_confidence_note` được
 expose, agent tự quyết định mức tin cậy. KHÔNG treat `"textual"` edges là safe, chỉ treat
@@ -695,9 +696,13 @@ chạm vào 2 symbols khác nhau, mỗi symbol nhận `signature_changed` check 
 chính symbol đó. Không aggregate: symbol A có thể `signature_changed: true`, symbol B trong cùng
 hunk có thể `signature_changed: false`.
 
-**`unindexed_files` scope (M-11)**: chỉ chứa files **trực tiếp xuất hiện trong diff** mà chưa được
-index (hoặc hash stale). KHÔNG expand ra transitive dependencies. Agent phải tự suy luận về transitive
-risk từ `edges_ready` state.
+**`unindexed_files` scope (M-11)**: chỉ chứa files **trực tiếp xuất hiện trong diff** mà chưa có
+row trong `file_index` (file đã scan nhưng 0 symbol — vd `mod.rs` chỉ có `pub mod` — KHÔNG tính là
+unindexed, vì đã có row trong `file_index`). Mỗi entry có `reason`: `"pending_scan"` (extension được hỗ
+trợ, indexer chưa kịp scan — tạm thời, tự hết khi index xong) hoặc `"out_of_scope"` (extension không
+được parse — vĩnh viễn, không bao giờ tự hết dù đợi bao lâu). Chỉ `"pending_scan"` mới kéo
+`aggregate_risk` xuống `"unknown"`; `"out_of_scope"` không ảnh hưởng risk. KHÔNG expand ra transitive
+dependencies. Agent phải tự suy luận về transitive risk từ `edges_ready` state.
 
 **`change_type` trong `diff` mode (M-12)**:
 - `"modified"` — default cho mọi symbol bị touch bởi diff.

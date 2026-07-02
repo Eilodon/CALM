@@ -153,12 +153,13 @@ diff_impact(diff="<raw diff text>")   # verify without git
 diff_impact(commits="HEAD~1..HEAD")   # verify already-committed changes
 ```
 
-**Done when**: `aggregate_risk == "low"` and `unindexed_files == []`. Safe to commit.
+**Done when**: `aggregate_risk == "low"` and no `unindexed_files` entry has `reason == "pending_scan"`. Safe to commit.
 
 **Signals**:
 - `aggregate_risk == "critical"` or `"high"` → call `callers` on `affected_symbols[0]` to verify manually
-- `aggregate_risk == "unknown"` → unindexed files present; wait for index to reach `ready`
-- `unindexed_files non-empty` → index incomplete; DO NOT treat diff as safe to push
+- `aggregate_risk == "unknown"` → a `pending_scan` file is present; wait for index to reach `ready`, then retry
+- `unindexed_files[].reason == "pending_scan"` → that file's index is stale/missing; DO NOT treat diff as safe to push yet
+- `unindexed_files[].reason == "out_of_scope"` → not a source file (docs/config/etc.); permanent, harmless, does not affect `aggregate_risk`
 - `suggested_reviewers` present → notify these owners before merging
 
 **Rule: Never commit or push** without calling `diff_impact` first. Under Claude Code with this repo's bundled hook (`.claude/hooks/ci-nudge.sh`), this is enforced: `git commit`/`git push` is denied whenever a file was edited since the last `diff_impact` call.

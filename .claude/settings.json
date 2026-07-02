@@ -8,6 +8,11 @@
             "type": "command",
             "command": "bash .claude/hooks/session-start-agents-md.sh",
             "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/session-start-build-ci.sh",
+            "timeout": 300
           }
         ]
       }

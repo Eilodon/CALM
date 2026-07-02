@@ -35,7 +35,26 @@ pub fn compute_dead_code_confidence(
     is_private: bool,
     scope_clear: bool,
     coverage: &CoverageData,
+    kind: &str,
 ) -> (&'static str, &'static str) {
+    // Type-level definitions (struct/class/...) aren't "called" the way
+    // functions and methods are — they're referenced via construction
+    // syntax (`Foo { .. }` in Rust) that the call-graph extractor doesn't
+    // track as a call at all, so `caller_count` is 0 for essentially every
+    // one of them regardless of real usage (confirmed: 100% of this repo's
+    // own `struct` symbols have caller_count=0). "Dead code" isn't a
+    // well-formed question for a kind that structurally can't accrue
+    // callers — answering "high confidence dead" here was the single
+    // largest source of `dead_code_pct` false positives.
+    if !matches!(kind, "function" | "method") {
+        let source = if coverage.source != "none" {
+            "static+coverage"
+        } else {
+            "static"
+        };
+        return ("none", source);
+    }
+
     if is_entry_point || is_test || caller_count > 0 {
         let source = if coverage.source != "none" {
             "static+coverage"
@@ -100,6 +119,7 @@ mod tests {
             false,
             false,
             &no_coverage(),
+            "function",
         );
         assert_eq!(conf, "none");
         assert_eq!(src, "static");
@@ -117,6 +137,7 @@ mod tests {
             false,
             false,
             &no_coverage(),
+            "function",
         );
         assert_eq!(conf, "none");
         assert_eq!(src, "static");
@@ -137,6 +158,7 @@ mod tests {
             true,
             true,
             &no_coverage(),
+            "function",
         );
         assert_eq!(conf, "none");
         assert_eq!(src, "static");
@@ -145,8 +167,9 @@ mod tests {
     #[test]
     fn test_runtime_covered_returns_low() {
         let cov = with_coverage("/f.py", &[5]);
-        let (conf, src) =
-            compute_dead_code_confidence("/f.py", 1, 10, 0, false, false, false, false, &cov);
+        let (conf, src) = compute_dead_code_confidence(
+            "/f.py", 1, 10, 0, false, false, false, false, &cov, "function",
+        );
         assert_eq!(conf, "low");
         assert_eq!(src, "static+coverage");
     }
@@ -163,6 +186,7 @@ mod tests {
             true,
             false,
             &no_coverage(),
+            "function",
         );
         assert_eq!(conf, "high");
     }
@@ -179,6 +203,7 @@ mod tests {
             false,
             true,
             &no_coverage(),
+            "function",
         );
         assert_eq!(conf, "medium");
     }
@@ -195,6 +220,7 @@ mod tests {
             false,
             false,
             &no_coverage(),
+            "function",
         );
         assert_eq!(conf, "low");
     }
@@ -211,12 +237,57 @@ mod tests {
             false,
             false,
             &no_coverage(),
+            "function",
         );
         assert_eq!(src, "static");
 
         let cov = with_coverage("/other.py", &[1]);
-        let (_, src) =
-            compute_dead_code_confidence("/f.py", 1, 10, 5, false, false, false, false, &cov);
+        let (_, src) = compute_dead_code_confidence(
+            "/f.py", 1, 10, 5, false, false, false, false, &cov, "function",
+        );
         assert_eq!(src, "static+coverage");
+    }
+
+    /// Regression: a `struct` (or any non-callable kind) must never be
+    /// scored "high confidence dead" just because it has zero callers — it
+    /// *always* has zero callers in this codebase's call-graph model (type
+    /// construction isn't tracked as a call), so the old behavior flagged
+    /// essentially every private struct in the project.
+    #[test]
+    fn test_non_callable_kind_is_never_flagged_dead_even_when_private() {
+        let (conf, src) = compute_dead_code_confidence(
+            "/f.rs",
+            1,
+            10,
+            0,
+            false,
+            false,
+            true, // is_private — would return "high" for a function/method
+            true,
+            &no_coverage(),
+            "struct",
+        );
+        assert_eq!(conf, "none");
+        assert_eq!(src, "static");
+    }
+
+    #[test]
+    fn test_method_kind_is_still_evaluated() {
+        let (conf, _) = compute_dead_code_confidence(
+            "/f.rs",
+            1,
+            10,
+            0,
+            false,
+            false,
+            true,
+            true,
+            &no_coverage(),
+            "method",
+        );
+        assert_eq!(
+            conf, "high",
+            "method is a callable kind — still subject to normal dead-code rules"
+        );
     }
 }

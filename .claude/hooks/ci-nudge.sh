@@ -73,6 +73,35 @@ is_code_file() {
   esac
 }
 
+# Resolve the git repo root that `cmd` will actually operate on, so the
+# commit/push gate only fires for *this* project's repo — not an unrelated
+# repo the agent is inspecting/debugging elsewhere (e.g. a scratch clone
+# under /tmp, or a test fixture repo). PreToolUse hooks always run with cwd
+# pinned to the project root regardless of any `cd` inside `cmd` (this
+# harness resets the shell's cwd between Bash calls), so neither `pwd` nor
+# the hook JSON's `cwd` field can distinguish this — the command text itself
+# is the only signal available. Best-effort, not a real shell parser: honors
+# the last explicit `git -C <dir>` / `cd <dir> &&`/`;` before the git call;
+# anything it can't confidently resolve falls back to "this repo" (fail
+# toward enforcing the gate, not silently skipping it).
+resolve_git_target_root() {
+  local cmd="$1" explicit_dir=""
+
+  explicit_dir=$(grep -oE 'git[[:space:]]+-C[[:space:]]+[^[:space:]]+' <<<"$cmd" \
+    | tail -1 | awk '{print $NF}')
+
+  if [ -z "$explicit_dir" ]; then
+    explicit_dir=$(grep -oE 'cd[[:space:]]+[^[:space:]&;]+[[:space:]]*(&&|;)' <<<"$cmd" \
+      | tail -1 | sed -E 's/^cd[[:space:]]+//; s/[[:space:]]*(&&|;)$//')
+  fi
+
+  if [ -n "$explicit_dir" ]; then
+    git -C "$explicit_dir" rev-parse --show-toplevel 2>/dev/null
+  else
+    git rev-parse --show-toplevel 2>/dev/null
+  fi
+}
+
 # Record mcp__ci__edit_context / mcp__ci__diff_impact calls as they happen —
 # recorded on PreToolUse (before the call runs) since attempting the check is
 # what matters here, and PreToolUse is all that's needed to observe it.
@@ -103,9 +132,19 @@ case "$tool_name" in
     nudge 'MANDATORY per AGENTS.md Stage 5 — call mcp__ci__edit_context(symbol) before this write if it modifies existing code, never skip (especially if is_hub).'
     ;;
   Bash)
-    if grep -qE '\bgit[[:space:]]+(commit|push)\b' <<<"$command"; then
+    # Broad on purpose: `git -C <dir> commit` / `git --git-dir=<dir> push` put
+    # flags between the subcommand and "commit"/"push", so a tight
+    # `git commit` adjacency check misses them entirely (a false negative —
+    # worse than the false positive this file otherwise guards against).
+    # resolve_git_target_root() + the scope check below is what keeps this
+    # broad match from over-firing on unrelated repos.
+    if grep -qE '\bgit\b.*\b(commit|push)\b' <<<"$command"; then
       if [ "$needs_diff_impact" = "true" ]; then
-        deny 'MANDATORY per AGENTS.md Stage 7 — call mcp__ci__diff_impact(staged=true) before this commit/push, never skip. Files changed since the last diff_impact check.'
+        target_root=$(resolve_git_target_root "$command")
+        project_root=$(git rev-parse --show-toplevel 2>/dev/null)
+        if [ -z "$target_root" ] || [ "$target_root" = "$project_root" ]; then
+          deny 'MANDATORY per AGENTS.md Stage 7 — call mcp__ci__diff_impact(staged=true) before this commit/push, never skip. Files changed since the last diff_impact check.'
+        fi
       fi
     elif grep -qE '\b(grep|rg|ag)\b' <<<"$command"; then
       nudge 'CI available in this repo — prefer mcp__ci__search / mcp__ci__locate instead of grep via Bash (AGENTS.md Stage 2).'
