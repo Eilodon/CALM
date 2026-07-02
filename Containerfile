@@ -8,7 +8,7 @@ FROM rust:alpine AS builder
 RUN apk add --no-cache build-base
 WORKDIR /build
 COPY . .
-RUN cargo build --release --bin ci \
+RUN cargo build --release --bin ci --no-default-features --features tier0-5 \
     && strip target/release/ci
 
 FROM scratch

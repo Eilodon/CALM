@@ -53,9 +53,11 @@ schemars = "0.8"
 clap = { version = "4", features = ["derive"] }
 rayon = "1"
 
-# Internal
-ci-core = { path = "crates/ci-core" }
-ci-server = { path = "crates/ci-server" }
+# Internal — default-features = false so that `--no-default-features` on the
+# top-level binary actually propagates: without this, workspace deps keep
+# their own defaults (including `embeddings` → `sqlite-vec`, which fails on musl).
+ci-core = { path = "crates/ci-core", default-features = false }
+ci-server = { path = "crates/ci-server", default-features = false }
 
 [profile.release]
 lto = true
