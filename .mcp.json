@@ -17,8 +17,8 @@
     },
     "ci": {
       "type": "stdio",
-      "command": "cargo",
-      "args": ["run", "--quiet", "-p", "ci-cli", "--", "serve", "--project-root", "."],
+      "command": "bash",
+      "args": [".claude/hooks/ci-mcp-entrypoint.sh"],
       "env": {}
     }
   }
