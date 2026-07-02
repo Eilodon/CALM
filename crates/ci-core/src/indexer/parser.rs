@@ -21,6 +21,9 @@ pub struct ParsedSymbol {
     /// Enclosing class/impl type name for methods (`None` for free functions).
     /// Drives tier-2 method resolution.
     pub class_context: Option<String>,
+    /// McCabe cyclomatic complexity (1 = no branches). Always 1 for
+    /// languages without a real parse tree — see `branch_node_kinds`.
+    pub complexity: i64,
 }
 
 use crate::graph::tokenize::tokenize_identifier;
@@ -238,6 +241,7 @@ fn walk_symbols(
 
         let is_entry_point = detect_entry_point(node, source, language, &name, &signature);
         let is_test = detect_is_test(node, source, language, &name, &signature, path);
+        let complexity = compute_cyclomatic_complexity(node, language);
 
         out.push(ParsedSymbol {
             qualified_name: name.clone(),
@@ -252,6 +256,7 @@ fn walk_symbols(
             name_tokens,
             is_entry_point,
             is_test,
+            complexity,
             class_context,
         });
     }
@@ -401,6 +406,35 @@ fn collect_java_annotations<'a>(node: tree_sitter::Node, source: &'a str) -> Vec
         }
     }
     out
+}
+
+/// McCabe cyclomatic complexity: 1 (baseline path) + 1 per decision-point
+/// node in `node`'s subtree (see `branch_node_kinds`). Walks the full
+/// subtree, so a nested function/closure defined inside `node` contributes
+/// to the enclosing symbol's count too, in addition to getting its own
+/// separate `ParsedSymbol` entry — this over-counts relative to some
+/// stricter McCabe implementations that stop at nested function boundaries,
+/// but keeps the walk simple and still gives a useful relative signal
+/// ("this symbol's body, including anything defined inline in it, branches
+/// a lot").
+fn compute_cyclomatic_complexity(node: tree_sitter::Node, language: &str) -> i64 {
+    let branch_kinds = crate::indexer::lang_constants::branch_node_kinds(language);
+    if branch_kinds.is_empty() {
+        return 1;
+    }
+    let mut complexity = 1i64;
+    count_branch_nodes(node, branch_kinds, &mut complexity);
+    complexity
+}
+
+fn count_branch_nodes(node: tree_sitter::Node, branch_kinds: &[&str], complexity: &mut i64) {
+    if branch_kinds.contains(&node.kind()) {
+        *complexity += 1;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        count_branch_nodes(child, branch_kinds, complexity);
+    }
 }
 
 /// Best-effort "is this a test function" signal, per language. Feeds
@@ -1111,6 +1145,7 @@ pub fn extract_symbols_shallow(source: &str, language: &str, path: &str) -> Vec<
             is_entry_point: false,
             is_test: false,
             class_context: None,
+            complexity: 1,
         });
     }
     out
@@ -1518,5 +1553,141 @@ public class FooTest {
         assert_eq!(syms.len(), 2);
         assert!(syms[0].qualified_name.starts_with("a.rb::run"));
         assert_ne!(syms[0].qualified_name, syms[1].qualified_name);
+    }
+
+    // -----------------------------------------------------------------
+    // Cyclomatic complexity
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_complexity_baseline_one_for_straight_line_function() {
+        let code = "def hello(a, b):\n    return a + b\n";
+        let symbols = extract_symbols(code, "python", "test.py").unwrap();
+        assert_eq!(find(&symbols, "hello").complexity, 1);
+    }
+
+    #[test]
+    fn test_complexity_python_counts_branches() {
+        let code = "\
+def classify(x):
+    if x < 0:
+        return 'neg'
+    elif x == 0:
+        return 'zero'
+    else:
+        return 'pos'
+    for i in range(x):
+        if i % 2 == 0 and i > 0:
+            pass
+    while x > 0:
+        x -= 1
+    return x
+";
+        let symbols = extract_symbols(code, "python", "test.py").unwrap();
+        let c = find(&symbols, "classify").complexity;
+        // baseline 1 + if + elif + for + if + and(boolean_operator) + while = 7
+        assert_eq!(c, 7, "expected 7, got {c}");
+    }
+
+    #[test]
+    fn test_complexity_rust_counts_branches() {
+        let code = r#"
+fn classify(x: i32) -> i32 {
+    if x < 0 {
+        return -1;
+    } else if x == 0 {
+        return 0;
+    }
+    match x {
+        1 => 1,
+        2 => 2,
+        _ => 3,
+    }
+}
+"#;
+        let symbols = extract_symbols(code, "rust", "test.rs").unwrap();
+        let c = find(&symbols, "classify").complexity;
+        // baseline 1 + if + if(else-if) + 3 match_arm = 6
+        assert_eq!(c, 6, "expected 6, got {c}");
+    }
+
+    #[test]
+    fn test_complexity_go_counts_branches() {
+        let code = r#"
+package main
+
+func classify(x int) int {
+	if x < 0 {
+		return -1
+	}
+	for i := 0; i < x; i++ {
+		x--
+	}
+	switch x {
+	case 1:
+		return 1
+	case 2:
+		return 2
+	}
+	return x
+}
+"#;
+        let symbols = extract_symbols(code, "go", "test.go").unwrap();
+        let c = find(&symbols, "classify").complexity;
+        // baseline 1 + if + for + 2 expression_case = 5
+        assert_eq!(c, 5, "expected 5, got {c}");
+    }
+
+    #[test]
+    fn test_complexity_javascript_counts_branches() {
+        let code = "\
+function classify(x) {
+    if (x < 0) {
+        return -1;
+    } else if (x === 0) {
+        return 0;
+    }
+    for (let i = 0; i < x; i++) {
+        x--;
+    }
+    return x > 0 ? 1 : -1;
+}
+";
+        let symbols = extract_symbols(code, "javascript", "test.js").unwrap();
+        let c = find(&symbols, "classify").complexity;
+        // baseline 1 + if + if(else-if) + for + ternary = 5
+        assert_eq!(c, 5, "expected 5, got {c}");
+    }
+
+    #[test]
+    fn test_complexity_java_counts_branches() {
+        let code = r#"
+class Foo {
+    int classify(int x) {
+        if (x < 0) {
+            return -1;
+        } else if (x == 0) {
+            return 0;
+        }
+        for (int i = 0; i < x; i++) {
+            x--;
+        }
+        return x;
+    }
+}
+"#;
+        let symbols = extract_symbols(code, "java", "test.java").unwrap();
+        let c = find(&symbols, "classify").complexity;
+        // baseline 1 + if + if(else-if) + for = 4
+        assert_eq!(c, 4, "expected 4, got {c}");
+    }
+
+    #[test]
+    fn test_complexity_shallow_extraction_defaults_to_one() {
+        // Tier-0.5 (no real parse tree) always gets baseline complexity —
+        // there's no AST to count branches in.
+        let code = "def run\n  if true\n    puts 'x'\n  end\nend\n";
+        let syms = extract_symbols_shallow(code, "ruby", "a.rb");
+        assert!(syms.iter().all(|s| s.complexity == 1));
     }
 }

@@ -9,7 +9,7 @@ thật; khi số đo ra ngoài kỳ vọng (vd B6 `find_callers` = 0%), báo cá
 |---|---|---|---|
 | B1 | AST Indexing Accuracy | Tree-sitter vs regex | Planned |
 | B2 | Call Graph Resolution Quality | Tier-1/2/3 vs textual | Planned |
-| B3 | Search Quality | Hybrid RRF vs FTS-only vs raw grep | Planned |
+| B3 | Search Quality | Hybrid RRF vs FTS-only vs raw grep (NDCG@10) | **Implemented** — [`b3_search_quality/`](b3_search_quality/) |
 | B4 | Token Efficiency | MCP tools vs `cat`/`grep` naive workflow | **Implemented** — [`b4_token_efficiency/`](b4_token_efficiency/) |
 | B5 | Incremental Indexing Speed | Reindex chỉ file thay đổi | Planned |
 | B6 | Tool-Call Efficiency | Số round-trip naive vs 1 MCP call (ý tưởng từ CodeGraph) | **Implemented** — [`b6_tool_call_efficiency/`](b6_tool_call_efficiency/) |
@@ -20,9 +20,9 @@ Nguồn cảm hứng B6-B8: xem phần "Nghiên cứu competitor" bên dưới.
 
 ## Hạ tầng dùng chung — `lib/`
 
-`mcp_client.py` (MCP stdio client), `tasks.yaml` (task definitions), `naive_workflow.py` (mô phỏng
-naive cat/grep + đếm call) nằm ở `benchmarks/lib/`, dùng chung cho B4 và B6 — không định nghĩa lại
-task hay logic mô phỏng ở mỗi benchmark.
+`mcp_client.py` (MCP stdio client), `tasks.yaml` (task definitions cho B4/B6), `naive_workflow.py`
+(mô phỏng naive cat/grep + đếm call, cộng `naive_grep_ranked_files` cho baseline ranking của B3)
+nằm ở `benchmarks/lib/`, dùng chung — không định nghĩa lại task hay logic mô phỏng ở mỗi benchmark.
 
 ## Chạy benchmark
 
@@ -31,6 +31,7 @@ python3 -m venv benchmarks/.venv
 benchmarks/.venv/bin/pip install -r benchmarks/requirements.txt
 cargo build --release -p ci-cli   # cần build sẵn trước khi chạy bất kỳ benchmark nào
 
+benchmarks/.venv/bin/python benchmarks/b3_search_quality/run_benchmark.py
 benchmarks/.venv/bin/python benchmarks/b4_token_efficiency/run_benchmark.py
 benchmarks/.venv/bin/python benchmarks/b6_tool_call_efficiency/run_benchmark.py
 ```

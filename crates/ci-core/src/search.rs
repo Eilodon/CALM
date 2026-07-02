@@ -7,6 +7,14 @@ use crate::types::SearchKind;
 
 const BM25_EXACT_WEIGHT: f64 = 1.5;
 const BM25_TOKENS_WEIGHT: f64 = 1.0;
+/// Multiplier applied to a result's final score when its path looks like a
+/// test/generated/example file — a tie-breaker, not a filter: a noisy-path
+/// result can still rank first if nothing cleaner matches at all, it's just
+/// pushed behind an equally-relevant non-noisy one. Applied uniformly across
+/// every search kind at the point scores are finalized (`search_symbol`'s own
+/// sort and `rrf_merge_n`'s fused sort) so ranking behavior doesn't depend on
+/// which source found the match.
+const NOISE_PENALTY: f64 = 0.6;
 /// Default RRF k constant; overridden at runtime by `config.search.rrf_k`.
 /// Used as the fallback when config load fails — see `SearchConfig::default`.
 pub const DEFAULT_RRF_K: f64 = 20.0;
@@ -31,6 +39,13 @@ pub struct SearchResult {
     pub score: f64,
     pub match_type: String,
     pub snippet: Option<String>,
+    /// From `symbols.is_test` (see `indexer::parser::detect_is_test`) — used
+    /// alongside `is_noisy_path` for the noise penalty. Catches the common
+    /// case a path check alone misses: inline `#[test]`/`#[cfg(test)] mod
+    /// tests` functions living in the *same file* as the implementation
+    /// they test, so there's no separate test-directory path to flag.
+    /// `false` for non-symbol results (file/gap-chunk hits).
+    pub is_test: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -58,6 +73,55 @@ pub fn search(
     }
 }
 
+/// `true` when `path` looks like a test, generated, or example/fixture file
+/// — cheap substring checks on a lowercased path, deliberately conservative
+/// (false negatives are fine; a false positive would wrongly demote a real
+/// implementation file with e.g. "test" in a legitimate directory name like
+/// `latest/`, so checks anchor on path-segment boundaries via `/`, `_`, `.`
+/// rather than bare substring wherever that risk is realistic).
+fn is_noisy_path(path: &str) -> bool {
+    let p = path.to_ascii_lowercase();
+    // Paths are stored project-root-relative with no leading slash (e.g.
+    // "src/main.py"), so a top-level noisy directory has no "/" before it —
+    // check both "at the start" and "after a directory separator".
+    let has_dir = |name: &str| {
+        let with_slash = format!("{name}/");
+        p.starts_with(&with_slash) || p.contains(&format!("/{with_slash}"))
+    };
+    let is_test = has_dir("test")
+        || has_dir("tests")
+        || p.starts_with("test_")
+        || p.contains("/test_")
+        || p.contains("_test.")
+        || p.contains(".test.")
+        || p.contains(".spec.")
+        || p.contains("_spec.");
+    let is_generated = has_dir("generated")
+        || p.contains(".generated.")
+        || has_dir("vendor")
+        || has_dir("dist")
+        || has_dir("node_modules")
+        || has_dir("build")
+        || p.contains(".min.");
+    let is_example = has_dir("examples")
+        || has_dir("example")
+        || has_dir("fixtures")
+        || has_dir("fixture")
+        || has_dir("mocks")
+        || has_dir("mock");
+    is_test || is_generated || is_example
+}
+
+/// Score multiplier for a result — see `NOISE_PENALTY`, `is_noisy_path`, and
+/// `SearchResult::is_test`.
+fn noise_multiplier(path: &str, is_test: bool) -> f64 {
+    if is_test || is_noisy_path(path) {
+        NOISE_PENALTY
+    } else {
+        1.0
+    }
+}
+
 fn escape_fts5_query(query: &str) -> String {
     let mut escaped = String::with_capacity(query.len() + 2);
     escaped.push('"');
@@ -82,7 +146,7 @@ fn search_symbol(conn: &Connection, query: &str, limit: usize) -> rusqlite::Resu
 
     let mut stmt_exact = conn.prepare(
         "SELECT s.qualified_name, s.name, s.path, s.line_start, s.line_end, s.kind,
-                -bm25(fts_exact) AS score
+                -bm25(fts_exact) AS score, s.is_test
          FROM fts_exact
          JOIN symbols s ON s.id = fts_exact.rowid
          WHERE fts_exact MATCH ?1
@@ -98,6 +162,7 @@ fn search_symbol(conn: &Connection, query: &str, limit: usize) -> rusqlite::Resu
             line_end: row.get(4)?,
             kind: row.get(5)?,
             score: row.get(6)?,
+            is_test: row.get(7)?,
         })
     })?;
 
@@ -110,7 +175,7 @@ fn search_symbol(conn: &Connection, query: &str, limit: usize) -> rusqlite::Resu
 
     let mut stmt_tokens = conn.prepare(
         "SELECT s.qualified_name, s.name, s.path, s.line_start, s.line_end, s.kind,
-                -bm25(fts_tokens) AS score
+                -bm25(fts_tokens) AS score, s.is_test
          FROM fts_tokens
          JOIN symbols s ON s.id = fts_tokens.rowid
          WHERE fts_tokens MATCH ?1
@@ -126,6 +191,7 @@ fn search_symbol(conn: &Connection, query: &str, limit: usize) -> rusqlite::Resu
             line_end: row.get(4)?,
             kind: row.get(5)?,
             score: row.get(6)?,
+            is_test: row.get(7)?,
         })
     })?;
 
@@ -134,6 +200,12 @@ fn search_symbol(conn: &Connection, query: &str, limit: usize) -> rusqlite::Resu
         *scores.entry(row.qualified_name.clone()).or_default() += row.score * BM25_TOKENS_WEIGHT;
         data.entry(row.qualified_name.clone())
             .or_insert_with(|| row.into_result("tokens"));
+    }
+
+    for (qname, r) in data.iter() {
+        if let Some(s) = scores.get_mut(qname) {
+            *s *= noise_multiplier(&r.path, r.is_test);
+        }
     }
 
     let mut ranked: Vec<_> = data.into_iter().collect();
@@ -168,7 +240,7 @@ fn search_text(conn: &Connection, query: &str, limit: usize) -> rusqlite::Result
 
     let mut stmt = conn.prepare(
         "SELECT s.qualified_name, s.name, s.path, s.line_start, s.line_end, s.kind,
-                -bm25(fts_exact) AS score
+                -bm25(fts_exact) AS score, s.is_test
          FROM fts_exact
          JOIN symbols s ON s.id = fts_exact.rowid
          WHERE fts_exact MATCH ?1
@@ -185,6 +257,7 @@ fn search_text(conn: &Connection, query: &str, limit: usize) -> rusqlite::Result
             line_end: row.get(4)?,
             kind: row.get(5)?,
             score: row.get(6)?,
+            is_test: row.get(7)?,
         })
     })?;
 
@@ -230,6 +303,7 @@ fn search_file(conn: &Connection, query: &str, limit: usize) -> rusqlite::Result
             score: 1.0,
             match_type: "file".to_string(),
             snippet: None,
+            is_test: false,
         });
     }
 
@@ -251,7 +325,7 @@ fn symbol_semantic_results(
 ) -> rusqlite::Result<Vec<SearchResult>> {
     let hits = crate::embedding::knn(conn, qvec, limit)?;
     let mut stmt = conn.prepare(
-        "SELECT qualified_name, name, path, line_start, line_end, kind FROM symbols WHERE id = ?1",
+        "SELECT qualified_name, name, path, line_start, line_end, kind, is_test FROM symbols WHERE id = ?1",
     )?;
     let mut results = Vec::with_capacity(hits.len());
     for (id, dist) in &hits {
@@ -266,6 +340,7 @@ fn symbol_semantic_results(
                 score: 0.0,
                 match_type: "semantic".to_string(),
                 snippet: None,
+                is_test: row.get(6)?,
             })
         }) {
             // cosine distance → similarity in [0, 1] for a friendlier score.
@@ -319,21 +394,30 @@ fn chunk_hit_to_result(conn: &Connection, chunk_id: i64) -> rusqlite::Result<Opt
         return Ok(None);
     };
 
-    let (qualified_name, name, kind) = match &symbol_qn {
+    let (qualified_name, name, kind, is_test) = match &symbol_qn {
         Some(qn) => {
             let mut sym_stmt =
-                conn.prepare("SELECT name, kind FROM symbols WHERE qualified_name = ?1")?;
+                conn.prepare("SELECT name, kind, is_test FROM symbols WHERE qualified_name = ?1")?;
             let sym = sym_stmt.query_row(rusqlite::params![qn], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, bool>(2)?,
+                ))
             });
             match sym {
-                Ok((name, kind)) => (qn.clone(), name, kind),
-                Err(_) => (qn.clone(), qn.clone(), None),
+                Ok((name, kind, is_test)) => (qn.clone(), name, kind, is_test),
+                Err(_) => (qn.clone(), qn.clone(), None, false),
             }
         }
         None => {
             let fname = path.rsplit('/').next().unwrap_or(&path).to_string();
-            (format!("{path}#chunk:{line_start}-{line_end}"), fname, None)
+            (
+                format!("{path}#chunk:{line_start}-{line_end}"),
+                fname,
+                None,
+                false,
+            )
         }
     };
 
@@ -347,6 +431,7 @@ fn chunk_hit_to_result(conn: &Connection, chunk_id: i64) -> rusqlite::Result<Opt
         score: 0.0,
         match_type: "semantic_chunk".to_string(),
         snippet: None,
+        is_test,
     }))
 }
 
@@ -492,6 +577,12 @@ fn rrf_merge_n(
         }
     }
 
+    for (qname, r) in data.iter() {
+        if let Some(s) = scores.get_mut(qname) {
+            *s *= noise_multiplier(&r.path, r.is_test);
+        }
+    }
+
     let mut ranked: Vec<_> = data.into_iter().collect();
     ranked.sort_by(|a, b| {
         let sa = scores.get(&a.0).unwrap_or(&0.0);
@@ -518,6 +609,7 @@ struct RawRow {
     line_end: Option<i64>,
     kind: Option<String>,
     score: f64,
+    is_test: bool,
 }
 
 impl RawRow {
@@ -532,6 +624,7 @@ impl RawRow {
             score: self.score,
             match_type: match_type.to_string(),
             snippet: None,
+            is_test: self.is_test,
         }
     }
 }
@@ -760,6 +853,7 @@ mod tests {
                 score: 10.0,
                 match_type: "exact".into(),
                 snippet: None,
+                is_test: false,
             },
             SearchResult {
                 name: "b".into(),
@@ -771,6 +865,7 @@ mod tests {
                 score: 5.0,
                 match_type: "exact".into(),
                 snippet: None,
+                is_test: false,
             },
         ];
         let semantic = vec![SearchResult {
@@ -783,6 +878,7 @@ mod tests {
             score: 0.9,
             match_type: "semantic".into(),
             snippet: None,
+            is_test: false,
         }];
 
         let merged = rrf_merge_n(
@@ -807,6 +903,7 @@ mod tests {
             score: 0.0,
             match_type: match_type.into(),
             snippet: None,
+            is_test: false,
         }
     }
 
@@ -936,5 +1033,149 @@ mod tests {
         for r in &output.results {
             assert!(r.score > 0.0, "Scores should be positive, got {}", r.score);
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Noise-penalty ranking
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_is_noisy_path_detects_test_generated_example() {
+        assert!(is_noisy_path("tests/test_auth.py"));
+        assert!(is_noisy_path("src/auth_test.go"));
+        assert!(is_noisy_path("src/auth.test.ts"));
+        assert!(is_noisy_path("src/auth.spec.ts"));
+        assert!(is_noisy_path("vendor/lib/foo.py"));
+        assert!(is_noisy_path("dist/bundle.js"));
+        assert!(is_noisy_path("examples/quickstart.py"));
+        assert!(is_noisy_path("fixtures/sample.py"));
+    }
+
+    #[test]
+    fn test_is_noisy_path_does_not_flag_real_implementation() {
+        assert!(!is_noisy_path("src/auth/login.py"));
+        assert!(!is_noisy_path("crates/ci-core/src/search.rs"));
+        // "test" as a substring of an unrelated word must not false-positive.
+        assert!(!is_noisy_path("src/latest/handler.py"));
+        assert!(!is_noisy_path("src/protest/handler.py"));
+    }
+
+    #[test]
+    fn test_noise_multiplier_values() {
+        assert_eq!(noise_multiplier("tests/test_foo.py", false), NOISE_PENALTY);
+        assert_eq!(noise_multiplier("src/foo.py", false), 1.0);
+        assert_eq!(
+            noise_multiplier("src/foo.py", true),
+            NOISE_PENALTY,
+            "is_test=true must penalize even a clean-looking path"
+        );
+    }
+
+    fn stub_result_at(qn: &str, path: &str) -> SearchResult {
+        SearchResult {
+            name: qn.into(),
+            qualified_name: qn.into(),
+            path: path.into(),
+            kind: None,
+            line_start: None,
+            line_end: None,
+            score: 0.0,
+            match_type: "exact".into(),
+            snippet: None,
+            is_test: false,
+        }
+    }
+
+    /// Two results with otherwise-identical rank contributions: the one in a
+    /// test file must rank behind the one in real implementation code.
+    #[test]
+    fn test_rrf_merge_n_demotes_noisy_path_on_tie() {
+        let fts = [
+            stub_result_at("real_impl", "src/auth/login.py"),
+            stub_result_at("test_impl", "tests/test_login.py"),
+        ];
+        // Give both the SAME rank by putting each as the sole entry of its
+        // own source list — without the penalty their RRF scores would tie
+        // and HashMap iteration order would make the outcome nondeterministic.
+        let merged = rrf_merge_n(
+            &[(&fts[..1], 1.0), (&fts[1..], 1.0)],
+            10,
+            DEFAULT_RRF_K,
+            "hybrid",
+        );
+        assert_eq!(merged.len(), 2);
+        assert_eq!(
+            merged[0].qualified_name, "real_impl",
+            "non-test path must outrank an equally-ranked test path, got: {merged:?}"
+        );
+    }
+
+    #[test]
+    fn test_search_symbol_demotes_test_file_on_equal_relevance() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        for (qn, path) in [
+            ("real::widget", "src/widget.py"),
+            ("test::widget", "tests/test_widget.py"),
+        ] {
+            conn.execute(
+                "INSERT INTO symbols (name, qualified_name, kind, path, language, line_start, line_end, docstring, name_tokens)
+                 VALUES ('widget', ?1, 'function', ?2, 'python', 1, 5, '', 'widget')",
+                rusqlite::params![qn, path],
+            )
+            .unwrap();
+        }
+
+        let output = search(&conn, "widget", SearchKind::Symbol, 10, None, DEFAULT_RRF_K).unwrap();
+        assert_eq!(output.results.len(), 2);
+        assert_eq!(
+            output.results[0].qualified_name,
+            "real::widget",
+            "identical-relevance match in src/ must rank above the tests/ one, got: {:?}",
+            output
+                .results
+                .iter()
+                .map(|r| &r.qualified_name)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Real-world case a path check alone misses: Rust's `#[cfg(test)] mod
+    /// tests` convention puts the test function in the *same file* as the
+    /// implementation, so there's no separate tests/ path to flag — only
+    /// `symbols.is_test` distinguishes them.
+    #[test]
+    fn test_search_symbol_demotes_inline_test_function_same_file() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        for (qn, is_test) in [("rrf_merge_n", 0), ("test_rrf_merge_n_works", 1)] {
+            conn.execute(
+                "INSERT INTO symbols (name, qualified_name, kind, path, language, line_start, line_end, docstring, name_tokens, is_test)
+                 VALUES ('rrf_merge_n', ?1, 'function', 'src/search.rs', 'rust', 1, 5, '', 'rrf merge n', ?2)",
+                rusqlite::params![qn, is_test],
+            )
+            .unwrap();
+        }
+
+        let output = search(
+            &conn,
+            "rrf merge n",
+            SearchKind::Symbol,
+            10,
+            None,
+            DEFAULT_RRF_K,
+        )
+        .unwrap();
+        assert_eq!(output.results.len(), 2);
+        assert_eq!(
+            output.results[0].qualified_name,
+            "rrf_merge_n",
+            "the real implementation must outrank its same-file test function, got: {:?}",
+            output
+                .results
+                .iter()
+                .map(|r| &r.qualified_name)
+                .collect::<Vec<_>>()
+        );
     }
 }

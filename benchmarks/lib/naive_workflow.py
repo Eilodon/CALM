@@ -36,6 +36,14 @@ def naive_text(repo_root: Path, spec: dict) -> str:
     return text
 
 
+def naive_grep_ranked_files(repo_root: Path, pattern: str, globs: list[str]) -> list[str]:
+    """Files matching `pattern` (`grep -l`), in the order grep -l returns them
+    — i.e. no relevance ranking at all, just file-scan order. Used by B3 as
+    the "naive" baseline ranking to compare `ci search`'s real ranking against.
+    """
+    return _grep_files(repo_root, pattern, globs)
+
+
 def _grep(repo_root: Path, pattern: str, globs: list[str]) -> str:
     files = _glob_files(repo_root, globs)
     result = subprocess.run(

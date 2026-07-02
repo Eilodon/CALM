@@ -28,7 +28,18 @@ pub struct FitnessThresholds {
     pub max_dead_code_pct: f64,
     pub max_hotspot_risk: f64,
     pub min_edge_coverage_pct: f64,
+    /// % of function/method symbols whose McCabe cyclomatic complexity
+    /// exceeds `HIGH_COMPLEXITY_THRESHOLD`. Tier-0.5 languages (no real
+    /// parse tree) always report complexity 1, so they never count toward
+    /// the numerator — this dilutes the percentage as their share of the
+    /// codebase grows, a known limitation rather than a precision claim.
+    pub max_high_complexity_pct: f64,
 }
+
+/// Per-symbol cyclomatic complexity above this is "high" for
+/// `high_complexity_pct` — the conventional McCabe cutoff between
+/// "moderate" and "high" risk (1-10 simple, 11-20 moderate, 21+ high).
+pub const HIGH_COMPLEXITY_THRESHOLD: i64 = 10;
 
 impl Default for FitnessThresholds {
     fn default() -> Self {
@@ -39,6 +50,7 @@ impl Default for FitnessThresholds {
             max_dead_code_pct: 10.0,
             max_hotspot_risk: 0.75,
             min_edge_coverage_pct: 60.0,
+            max_high_complexity_pct: 15.0,
         }
     }
 }
@@ -72,6 +84,7 @@ pub struct FitnessMetrics {
     pub dead_code_pct: f64,
     pub hotspot_risk: f64,
     pub edge_coverage_pct: f64,
+    pub high_complexity_pct: f64,
 }
 
 /// Row shape needed to re-run `compute_dead_code_confidence` per symbol:
@@ -184,6 +197,27 @@ pub fn collect_metrics(
         0.0
     };
 
+    let total_functions: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM symbols WHERE kind IN ('function', 'method')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let high_complexity_pct = if total_functions > 0 {
+        let high_complexity_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM symbols WHERE kind IN ('function', 'method') \
+                 AND cyclomatic_complexity > ?1",
+                rusqlite::params![HIGH_COMPLEXITY_THRESHOLD],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        100.0 * high_complexity_count as f64 / total_functions as f64
+    } else {
+        0.0
+    };
+
     Ok(FitnessMetrics {
         hub_count,
         hub_pct,
@@ -191,6 +225,7 @@ pub fn collect_metrics(
         dead_code_pct,
         hotspot_risk,
         edge_coverage_pct,
+        high_complexity_pct,
     })
 }
 
@@ -286,6 +321,19 @@ pub fn run_fitness_check(
         message: format!(
             "Edge coverage {:.1}% (min {:.1}%)",
             metrics.edge_coverage_pct, thresholds.min_edge_coverage_pct
+        ),
+    });
+
+    checks.push(FitnessCheckItem {
+        metric: "high_complexity_pct".into(),
+        value: metrics.high_complexity_pct,
+        threshold: thresholds.max_high_complexity_pct,
+        passed: metrics.high_complexity_pct <= thresholds.max_high_complexity_pct,
+        message: format!(
+            "High-complexity functions {:.1}% (max {:.1}%, complexity > {})",
+            metrics.high_complexity_pct,
+            thresholds.max_high_complexity_pct,
+            HIGH_COMPLEXITY_THRESHOLD
         ),
     });
 
@@ -493,6 +541,7 @@ mod tests {
         assert_eq!(t.max_dead_code_pct, 10.0);
         assert_eq!(t.max_hotspot_risk, 0.75);
         assert_eq!(t.min_edge_coverage_pct, 60.0);
+        assert_eq!(t.max_high_complexity_pct, 15.0);
     }
 
     #[test]
@@ -507,7 +556,7 @@ mod tests {
         )
         .unwrap();
         assert!(result.passed, "Empty DB should pass all checks");
-        assert_eq!(result.checks.len(), 6);
+        assert_eq!(result.checks.len(), 7);
     }
 
     #[test]
@@ -720,6 +769,74 @@ mod tests {
             .find(|c| c.metric == "edge_coverage_pct")
             .unwrap();
         assert!(check.passed);
+    }
+
+    #[test]
+    fn test_high_complexity_pct_counts_only_functions_above_threshold() {
+        let conn = test_conn();
+        // Simple function (complexity 1, DB default) — not high.
+        conn.execute(
+            "INSERT INTO symbols (qualified_name, name, kind, language, path, \
+             line_start, line_end, indexed_at) \
+             VALUES ('mod.simple', 'simple', 'function', 'python', 'mod.py', 1, 5, 0.0)",
+            [],
+        )
+        .unwrap();
+        // Complex function above HIGH_COMPLEXITY_THRESHOLD.
+        conn.execute(
+            "INSERT INTO symbols (qualified_name, name, kind, language, path, \
+             line_start, line_end, cyclomatic_complexity, indexed_at) \
+             VALUES ('mod.complex', 'complex', 'function', 'python', 'mod.py', 10, 50, 25, 0.0)",
+            [],
+        )
+        .unwrap();
+        // A class with high aggregate complexity must NOT count — only
+        // function/method kinds feed the metric.
+        conn.execute(
+            "INSERT INTO symbols (qualified_name, name, kind, language, path, \
+             line_start, line_end, cyclomatic_complexity, indexed_at) \
+             VALUES ('mod.Big', 'Big', 'class', 'python', 'mod.py', 1, 100, 40, 0.0)",
+            [],
+        )
+        .unwrap();
+
+        let metrics = collect_metrics(&conn, &std::env::temp_dir(), &CoverageData::none()).unwrap();
+        assert_eq!(
+            metrics.high_complexity_pct, 50.0,
+            "1 of 2 function/method symbols exceeds the threshold"
+        );
+    }
+
+    #[test]
+    fn test_high_complexity_pct_fail_gates_fitness_check() {
+        let conn = test_conn();
+        let thresholds = FitnessThresholds {
+            max_high_complexity_pct: 10.0,
+            ..Default::default()
+        };
+        conn.execute(
+            "INSERT INTO symbols (qualified_name, name, kind, language, path, \
+             line_start, line_end, cyclomatic_complexity, indexed_at) \
+             VALUES ('mod.complex', 'complex', 'function', 'python', 'mod.py', 1, 50, 30, 0.0)",
+            [],
+        )
+        .unwrap();
+
+        let result = run_fitness_check(
+            &conn,
+            &thresholds,
+            &std::env::temp_dir(),
+            &CoverageData::none(),
+        )
+        .unwrap();
+        let check = result
+            .checks
+            .iter()
+            .find(|c| c.metric == "high_complexity_pct")
+            .unwrap();
+        assert!(!check.passed);
+        assert_eq!(check.value, 100.0);
+        assert!(!result.passed);
     }
 
     #[test]

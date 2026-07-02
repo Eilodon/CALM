@@ -1,0 +1,94 @@
+# Ground truth for B3 — Search Quality (self-repo corpus: Code-Intelligence itself).
+#
+# Each query is a short, realistic phrase an agent would actually pass to
+# `search`/`locate` (2-4 words — not a full sentence: `search`'s `kind=symbol`
+# wraps the whole query as one FTS5 phrase match, so multi-word natural-
+# language questions rarely match anything; this is a real, verified
+# property of the current implementation, not an assumption).
+#
+# relevant: graded relevance for NDCG. 2 = the ideal top result. 1 = a
+# related-enough symbol that a reasonable agent would accept, if any exists
+# (often the target's own unit test, living in the same file). Anything not
+# listed is 0. All (name, path) pairs below were verified against a real
+# index of this repo at the time of writing (see naming — do not rename the
+# referenced symbols without updating this file).
+#
+# grep_pattern: single keyword a person "just grepping" would plausibly
+# search for — deliberately NOT the exact target symbol name (that would be
+# cheating the naive baseline) — used to compute the naive-grep comparison
+# ranking (file-scan order, no relevance ranking at all).
+
+queries:
+  - id: cyclomatic_complexity
+    query: "cyclomatic complexity"
+    grep_pattern: complexity
+    relevant:
+      - { name: compute_cyclomatic_complexity, path: crates/ci-core/src/indexer/parser.rs, grade: 2 }
+
+  - id: detect_is_test
+    query: "detect is test"
+    grep_pattern: is_test
+    relevant:
+      - { name: detect_is_test, path: crates/ci-core/src/indexer/parser.rs, grade: 2 }
+
+  - id: noise_multiplier
+    query: "noise multiplier"
+    grep_pattern: noise
+    relevant:
+      - { name: noise_multiplier, path: crates/ci-core/src/search.rs, grade: 2 }
+      - { name: test_noise_multiplier_values, path: crates/ci-core/src/search.rs, grade: 1 }
+
+  - id: rrf_merge
+    query: "rrf merge"
+    grep_pattern: rrf
+    relevant:
+      - { name: rrf_merge_n, path: crates/ci-core/src/search.rs, grade: 2 }
+
+  - id: sanitize_source_output
+    query: "sanitize source output"
+    grep_pattern: sanitize
+    relevant:
+      - { name: sanitize_source_output, path: crates/ci-core/src/sanitize.rs, grade: 2 }
+
+  - id: detect_injection_patterns
+    query: "detect injection patterns"
+    grep_pattern: injection
+    relevant:
+      - { name: detect_injection_patterns, path: crates/ci-core/src/sanitize.rs, grade: 2 }
+
+  - id: compute_hotspots
+    query: "compute hotspots"
+    grep_pattern: hotspot
+    relevant:
+      - { name: compute_hotspots, path: crates/ci-core/src/analysis/hotspot.rs, grade: 2 }
+
+  - id: fitness_thresholds
+    query: "fitness thresholds"
+    grep_pattern: threshold
+    relevant:
+      - { name: FitnessThresholds, path: crates/ci-core/src/fitness.rs, grade: 2 }
+
+  - id: compute_coreness
+    query: "compute coreness"
+    grep_pattern: coreness
+    relevant:
+      - { name: compute_coreness, path: crates/ci-core/src/graph/coreness.rs, grade: 2 }
+
+  - id: update_is_hub_flags
+    query: "update is hub flags"
+    grep_pattern: is_hub
+    relevant:
+      - { name: update_is_hub_flags, path: crates/ci-core/src/graph/hub.rs, grade: 2 }
+
+  - id: dead_code_confidence
+    query: "dead code confidence"
+    grep_pattern: dead_code
+    relevant:
+      - { name: compute_dead_code_confidence, path: crates/ci-core/src/analysis/dead_code.rs, grade: 2 }
+
+  - id: resolve_symbol
+    query: "resolve symbol"
+    grep_pattern: resolve
+    relevant:
+      - { name: resolve_symbol, path: crates/ci-server/src/tools.rs, grade: 2 }
+      - { name: resolve_symbol_candidates, path: crates/ci-server/src/tools.rs, grade: 1 }

@@ -4,7 +4,7 @@
 viết bằng Rust thuần, giúp AI coding agent (Claude Code, Cursor, v.v.) *hiểu* codebase thay vì chỉ
 grep text mù quáng. `ci` parse code bằng `tree-sitter`, dựng call graph + import graph có mức độ tin
 cậy rõ ràng, tính graph metrics (hub/coreness) để phát hiện các symbol "lõi" dễ vỡ khi sửa, và cung
-cấp full-text + semantic search — tất cả phục vụ qua 16 MCP tools, chạy local, không gọi ra ngoài.
+cấp full-text + semantic search — tất cả phục vụ qua 18 MCP tools, chạy local, không gọi ra ngoài.
 
 ## Vì sao cần cái này?
 
@@ -92,6 +92,12 @@ agent: "tôi cần sửa hàm getUserByEmail"
   hook, không phải chỉ quy ước trong docs) chặn cứng: `Edit` đầu tiên lên file code mỗi session bị từ
   chối tới khi gọi `edit_context`; `git commit`/`git push` bị từ chối nếu có file đổi từ lần gọi
   `diff_impact` gần nhất.
+- **Noise-penalty ranking** — `search`/`locate` hạ điểm (×0.6) kết quả nằm trong file test/generated/
+  example khi có kết quả tương đương ở code thật, để implementation thật lên trước thay vì bị chôn
+  dưới test file trùng tên.
+- **Memory tool (`remember`/`recall`)** — ghi chú diễn giải bền vững (quyết định kiến trúc, gotcha đã
+  gặp) theo topic, sống qua nhiều session/restart — khác `session_context` (chỉ track điều hướng
+  trong 1 session, mất khi server restart).
 
 ## Cấu trúc Crates
 
@@ -99,7 +105,7 @@ agent: "tôi cần sửa hàm getUserByEmail"
   → inferred → formal/StackGraph), graph algorithms (coreness, hub), FTS5/semantic search (2-layer:
   symbol identity + code-body chunks), analysis (hotspot/coverage/codeowners/diff_impact/dead_code),
   fitness metrics, gitignore management.
-- `crates/ci-server/` — MCP server (rmcp/stdio) phơi bày 16 tools + incremental file watcher.
+- `crates/ci-server/` — MCP server (rmcp/stdio) phơi bày 18 tools + incremental file watcher.
 - `crates/ci-cli/` — CLI: `ci init`, `ci index`, `ci serve`, `ci fitness-check`, `ci doctor`.
 
 ## CLI Reference
@@ -117,7 +123,7 @@ ci fitness-check --project-root . --json                      # output JSON
 ci fitness-check --project-root . --config thresholds.toml    # thresholds tùy chỉnh
 ```
 
-## 16 MCP Tools cho AI agents
+## 18 MCP Tools cho AI agents
 
 Hỗ trợ CLI presets lọc tool theo phase làm việc: `orient`, `trace`, `edit`, `compound`, `full`
 (mặc định) qua `ci serve --preset` hoặc field `preset` trong `config.json`. Mọi response đều kèm
@@ -131,11 +137,11 @@ Hỗ trợ CLI presets lọc tool theo phase làm việc: `orient`, `trace`, `ed
 | Inspect | `source`, `symbol_info`, `understand` |
 | Trace | `callers`, `callees`, `path`, `dependencies` |
 | Edit | `edit_context` (bắt buộc trước khi sửa), `diff_impact` (bắt buộc trước khi commit) — hook-enforced dưới Claude Code, xem `.claude/hooks/ci-nudge.sh` |
-| Recover | `session_context` |
+| Recover | `session_context`, `remember`, `recall` |
 
 ## Fitness Check — CI Gate
 
-`ci fitness-check` đo 6 metrics và so sánh với ngưỡng trong `thresholds.toml`:
+`ci fitness-check` đo 7 metrics và so sánh với ngưỡng trong `thresholds.toml`:
 
 | Metric | Mô tả | Ngưỡng mặc định |
 |---|---|---|
@@ -145,6 +151,7 @@ Hỗ trợ CLI presets lọc tool theo phase làm việc: `orient`, `trace`, `ed
 | `dead_code_pct` | % symbols có confidence "high" là dead code | ≤ 10% |
 | `hotspot_risk` | Hotspot score cao nhất trong codebase | ≤ 0.75 |
 | `edge_coverage_pct` | % symbols có ít nhất 1 call edge | ≥ 60% |
+| `high_complexity_pct` | % function/method có cyclomatic complexity > 10 (McCabe, đếm branch qua AST — chỉ 6 ngôn ngữ Tier-0 có parse tree thật; Tier-0.5 luôn báo complexity=1) | ≤ 15.0% |
 
 Mỗi lần chạy `ci fitness-check` còn snapshot metrics vào DB để `edit_context` có thể hiển thị
 trend (delta so với ngày trước).

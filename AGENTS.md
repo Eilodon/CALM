@@ -1,6 +1,6 @@
 # Code Intelligence MCP — Navigational Workflow v2.7.2
 
-> 16 tools. 8 stages. Every response carries `suggested_next` — follow it.
+> 18 tools. 8 stages. Every response carries `suggested_next` — follow it.
 
 ---
 
@@ -164,25 +164,30 @@ diff_impact(commits="HEAD~1..HEAD")   # verify already-committed changes
 
 ## Stage 8 — Recover
 
-**Goal**: Reorient when lost, session is long, or index state is uncertain.
+**Goal**: Reorient when lost, session is long, or index state is uncertain — and carry durable knowledge across sessions.
 
-**Tools**: `session_context` (after 10+ calls without convergence), `indexing_status` (when index state unclear)
+**Tools**: `session_context` (after 10+ calls without convergence), `indexing_status` (when index state unclear), `remember` / `recall` (durable interpretive notes — architecture decisions, gotchas — separate from `session_context`'s per-session navigational state, which resets on server restart)
 
 ```
 session_context()                           # see what you've explored, where frontier is
 indexing_status()                           # check phase, file counts, embedding state
 indexing_status(retry_embeddings=true)      # recover failed embeddings
+recall()                                    # check for notes left by a previous session
+remember("auth-flow", "OAuth callback must validate state param — see incident-42")
 ```
 
 **When to use**:
 - After 10+ tool calls without finding what you need → `session_context` shows frontier files
 - `suggested_next.tool == "indexing_status"` appears repeatedly → index not ready yet
 - `session_started_at` changed from your saved T₀ → server restarted; begin again at Stage 1
+- Starting work on an area you (or a prior session) may have left notes about → `recall(topic=...)` or `recall(query=...)` before assuming from scratch
+- You just learned a non-obvious WHY that the graph/AST can't capture (not derivable by re-running `edit_context`/`callers`) → `remember(topic, content)` before it's lost at session end
 
 **Signals**:
 - `frontier non-empty` → explore `frontier[0].path` with `file_overview`
 - `frontier empty` → call `repo_overview` to refresh the map
 - `embeddings_status == "failed"` → call `indexing_status(retry_embeddings=true)`
+- `recall` returns `notes: []` → nothing recorded yet, not an error; proceed normally
 
 ---
 
@@ -197,7 +202,7 @@ indexing_status(retry_embeddings=true)      # recover failed embeddings
 | 5 Pre-Edit | `edit_context` | *(no native equivalent)* |
 | 6 Edit | native editor tools | — |
 | 7 Verify | `diff_impact` | *(no native equivalent)* |
-| 8 Recover | `session_context`, `indexing_status` | *(no native equivalent)* |
+| 8 Recover | `session_context`, `indexing_status`, `remember`, `recall` | *(no native equivalent)* |
 
 ---
 
@@ -221,7 +226,7 @@ indexing_status(retry_embeddings=true)      # recover failed embeddings
 | `orient` | `repo_overview`, `locate`, `dependencies`, `hotspots`, `indexing_status` | Exploration only, no edits |
 | `trace` | `repo_overview`, `search`, `locate`, `symbol_info`, `source`, `callers`, `callees`, `path`, `dependencies`, `indexing_status` | Call graph traversal |
 | `edit` | `repo_overview`, `search`, `locate`, `symbol_info`, `source`, `callers`, `callees`, `edit_context`, `diff_impact`, `indexing_status` | Code modification workflow |
-| `compound` | `repo_overview`, `locate`, `hotspots`, `source`, `understand`, `edit_context`, `diff_impact`, `session_context`, `indexing_status` | Full workflow, no raw graph traversal |
-| `full` | All 16 tools | Default; use when workflow spans multiple stages |
+| `compound` | `repo_overview`, `locate`, `hotspots`, `source`, `understand`, `edit_context`, `diff_impact`, `session_context`, `indexing_status`, `remember`, `recall` | Full workflow, no raw graph traversal |
+| `full` | All 18 tools | Default; use when workflow spans multiple stages |
 
 `--preset` is set once at server startup and cannot change mid-session. Use `full` (default) when the workflow spans multiple stages. Use specific presets only when scope is locked to one stage.

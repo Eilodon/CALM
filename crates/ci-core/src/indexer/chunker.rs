@@ -170,6 +170,7 @@ mod tests {
             is_entry_point: false,
             is_test: false,
             class_context: None,
+            complexity: 1,
         }
     }
 

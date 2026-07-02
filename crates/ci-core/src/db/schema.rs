@@ -20,7 +20,8 @@ CREATE TABLE IF NOT EXISTS symbols (
     file_hash       TEXT NOT NULL DEFAULT '',
     indexed_at      REAL NOT NULL DEFAULT 0,
     class_context   TEXT,
-    is_test         INTEGER NOT NULL DEFAULT 0
+    is_test         INTEGER NOT NULL DEFAULT 0,
+    cyclomatic_complexity INTEGER NOT NULL DEFAULT 1
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_symbols_qualified ON symbols(qualified_name);
@@ -109,6 +110,19 @@ CREATE TABLE IF NOT EXISTS code_chunks (
     file_hash  TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_code_chunks_path ON code_chunks(path);
+
+-- Durable, agent-written interpretive notes (architecture decisions, gotchas,
+-- rationale) — distinct from anything derived from the AST/call-graph, and
+-- distinct from `session_context`'s per-session navigational state (which
+-- resets every server restart). One row per `topic`; `remember` upserts.
+CREATE TABLE IF NOT EXISTS project_memory (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    topic       TEXT NOT NULL UNIQUE,
+    content     TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_project_memory_topic ON project_memory(topic);
 ";
 
 const FTS5_SQL: &str = "
@@ -177,6 +191,12 @@ fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
     migrate_add_column(conn, "symbols", "coreness", "INTEGER")?;
     migrate_add_column(conn, "symbols", "class_context", "TEXT")?;
     migrate_add_column(conn, "symbols", "is_test", "INTEGER NOT NULL DEFAULT 0")?;
+    migrate_add_column(
+        conn,
+        "symbols",
+        "cyclomatic_complexity",
+        "INTEGER NOT NULL DEFAULT 1",
+    )?;
     migrate_add_column(conn, "file_index", "mtime", "REAL")?;
     // call_sites columns added after the table first shipped.
     migrate_add_column(

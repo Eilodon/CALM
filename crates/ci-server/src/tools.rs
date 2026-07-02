@@ -154,6 +154,19 @@ impl CodeIntelligenceServer {
         rusqlite::Connection::open(&self.db_path).unwrap()
     }
 
+    /// Write connection for `remember` — the one tool handler that isn't
+    /// read-only (every other tool must use `make_read_conn()`). Scoped
+    /// narrowly: `project_memory` is never touched by the indexer/watcher,
+    /// so this doesn't contend with indexing writes in practice; the
+    /// `busy_timeout` covers the rare case where SQLite's single-writer-per-
+    /// file lock is briefly held by an indexing transaction anyway, rather
+    /// than failing the note immediately.
+    pub(crate) fn memory_write_conn(&self) -> Result<rusqlite::Connection, rusqlite::Error> {
+        let conn = rusqlite::Connection::open(&self.db_path)?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        Ok(conn)
+    }
+
     /// Wraps `telemetry::timed_tool`, additionally bumping the session's tool-call
     /// counter. Kept as a method (rather than changing `timed_tool`'s signature)
     /// since only this type has access to `session_log`.
@@ -335,6 +348,8 @@ fn preset_tools(preset: &str) -> Option<&'static [&'static str]> {
             "diff_impact",
             "session_context",
             "indexing_status",
+            "remember",
+            "recall",
         ]),
         "full" | "" => None, // None = all tools, no filtering
         _ => None,
@@ -1635,6 +1650,65 @@ struct UnderstandOutput {
     edges_ready: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     suggested_next: Option<SuggestedNext>,
+}
+
+// ---------------------------------------------------------------------------
+// Tool 17: remember
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize, JsonSchema)]
+struct RememberParams {
+    /// Short stable key for this note (e.g. "why-resolver-tiers",
+    /// "auth-module-gotcha"). Calling `remember` again with the same topic
+    /// overwrites its content — one note per topic, not an append log.
+    topic: String,
+    content: String,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct RememberOutput {
+    topic: String,
+    updated_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suggested_next: Option<SuggestedNext>,
+}
+
+// ---------------------------------------------------------------------------
+// Tool 18: recall
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize, JsonSchema)]
+struct RecallParams {
+    /// Exact topic to fetch. Takes priority over `query` if both are set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    topic: Option<String>,
+    /// Keyword search across topic + content (SQL LIKE, case-insensitive
+    /// for ASCII). Ignored if `topic` is set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    query: Option<String>,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct MemoryNote {
+    topic: String,
+    content: String,
+    updated_at: String,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct RecallOutput {
+    notes: Vec<MemoryNote>,
+    truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suggested_next: Option<SuggestedNext>,
+}
+
+fn memory_note_row(row: &rusqlite::Row) -> rusqlite::Result<MemoryNote> {
+    Ok(MemoryNote {
+        topic: row.get(0)?,
+        content: row.get(1)?,
+        updated_at: row.get(2)?,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -3144,6 +3218,115 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
             .unwrap_or_default()
         })
     }
+
+    #[tool(
+        name = "remember",
+        description = "Save a durable, interpretive note (architecture decision, gotcha, rationale) under a short topic key. Persists across sessions and server restarts — unlike session_context, which only tracks the current session's navigation. USE WHEN: you've learned something a future session should know that the graph/AST can't capture on its own (a WHY, not a fact derivable from code). Upserts: calling again with the same topic overwrites its content."
+    )]
+    fn remember(&self, #[tool(aggr)] p: RememberParams) -> String {
+        self.timed_tool("remember", || {
+            let topic = p.topic.trim();
+            let content = p.content.trim();
+            if topic.is_empty() || content.is_empty() {
+                return r#"{"error": "topic and content must both be non-empty"}"#.to_string();
+            }
+
+            let conn = match self.memory_write_conn() {
+                Ok(c) => c,
+                Err(e) => return format!(r#"{{"error": "db connection failed: {e}"}}"#),
+            };
+            let now = utc_now_iso8601();
+            let result = conn.execute(
+                "INSERT INTO project_memory (topic, content, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, ?3) \
+                 ON CONFLICT(topic) DO UPDATE SET content = excluded.content, updated_at = excluded.updated_at",
+                rusqlite::params![topic, content, now],
+            );
+            if let Err(e) = result {
+                return format!(r#"{{"error": "write failed: {e}"}}"#);
+            }
+
+            serde_json::to_string_pretty(&RememberOutput {
+                topic: topic.to_string(),
+                updated_at: now,
+                suggested_next: self.filter_sn(suggested("recall", "Verify the note was saved")),
+            })
+            .unwrap_or_default()
+        })
+    }
+
+    #[tool(
+        name = "recall",
+        description = "Retrieve durable notes saved by remember. USE WHEN: starting work on a topic you might have left notes about, or checking for known gotchas before touching an area. Pass `topic` for one exact note, `query` for a keyword search across all notes, or neither to list everything (most recently updated first)."
+    )]
+    fn recall(&self, #[tool(aggr)] p: RecallParams) -> String {
+        self.timed_tool("recall", || {
+            const RECALL_LIMIT: i64 = 50;
+
+            let conn = match self.make_read_conn() {
+                Ok(c) => c,
+                Err(e) => return format!(r#"{{"error": "db connection failed: {e}"}}"#),
+            };
+
+            let query_result = if let Some(topic) =
+                p.topic.as_deref().map(str::trim).filter(|t| !t.is_empty())
+            {
+                conn.prepare(
+                    "SELECT topic, content, updated_at FROM project_memory WHERE topic = ?1",
+                )
+                .and_then(|mut stmt| {
+                    stmt.query_map(rusqlite::params![topic], memory_note_row)?
+                        .collect::<Result<Vec<_>, _>>()
+                })
+            } else if let Some(q) = p.query.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
+                let pattern = format!("%{q}%");
+                conn.prepare(
+                    "SELECT topic, content, updated_at FROM project_memory \
+                     WHERE topic LIKE ?1 OR content LIKE ?1 ORDER BY updated_at DESC LIMIT ?2",
+                )
+                .and_then(|mut stmt| {
+                    stmt.query_map(
+                        rusqlite::params![pattern, RECALL_LIMIT + 1],
+                        memory_note_row,
+                    )?
+                    .collect::<Result<Vec<_>, _>>()
+                })
+            } else {
+                conn.prepare(
+                    "SELECT topic, content, updated_at FROM project_memory \
+                     ORDER BY updated_at DESC LIMIT ?1",
+                )
+                .and_then(|mut stmt| {
+                    stmt.query_map(rusqlite::params![RECALL_LIMIT + 1], memory_note_row)?
+                        .collect::<Result<Vec<_>, _>>()
+                })
+            };
+
+            let notes = match query_result {
+                Ok(n) => n,
+                Err(e) => return format!(r#"{{"error": "query failed: {e}"}}"#),
+            };
+
+            let truncated = notes.len() as i64 > RECALL_LIMIT;
+            let notes: Vec<MemoryNote> = notes.into_iter().take(RECALL_LIMIT as usize).collect();
+
+            let sn = if notes.is_empty() {
+                suggested(
+                    "remember",
+                    "No notes found — save one if you learn something worth keeping",
+                )
+            } else {
+                None
+            };
+
+            serde_json::to_string_pretty(&RecallOutput {
+                notes,
+                truncated,
+                suggested_next: self.filter_sn(sn),
+            })
+            .unwrap_or_default()
+        })
+    }
 }
 
 #[tool(tool_box)]
@@ -3259,6 +3442,16 @@ mod tests {
             "understand",
             CodeIntelligenceServer::understand_tool_attr(),
             &["query"],
+        );
+        assert_has_fields(
+            "remember",
+            CodeIntelligenceServer::remember_tool_attr(),
+            &["topic", "content"],
+        );
+        assert_has_fields(
+            "recall",
+            CodeIntelligenceServer::recall_tool_attr(),
+            &["topic", "query"],
         );
     }
 
@@ -4575,6 +4768,8 @@ mod tests {
             "diff_impact",
             "session_context",
             "indexing_status",
+            "remember",
+            "recall",
         ];
         let tools = preset_tools("compound");
         let tools = tools.expect("compound must return Some (not all-tools fallback)");
@@ -4586,8 +4781,8 @@ mod tests {
         }
         assert_eq!(
             tools.len(),
-            9,
-            "compound preset must have exactly 9 tools, got: {tools:?}"
+            11,
+            "compound preset must have exactly 11 tools, got: {tools:?}"
         );
     }
 
@@ -4802,6 +4997,183 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0))
             .expect("read conn must be able to query symbols");
         assert_eq!(count, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------
+    // remember / recall
+    // -----------------------------------------------------------------
+
+    fn test_server(name: &str) -> (std::path::PathBuf, CodeIntelligenceServer) {
+        let dir = std::env::temp_dir().join(format!("ci_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
+        (dir, server)
+    }
+
+    #[test]
+    fn remember_rejects_empty_topic_or_content() {
+        let (dir, server) = test_server("remember_empty");
+
+        let v: serde_json::Value = serde_json::from_str(&server.remember(RememberParams {
+            topic: "  ".into(),
+            content: "something".into(),
+        }))
+        .unwrap();
+        assert!(v.get("error").is_some());
+
+        let v: serde_json::Value = serde_json::from_str(&server.remember(RememberParams {
+            topic: "topic".into(),
+            content: "".into(),
+        }))
+        .unwrap();
+        assert!(v.get("error").is_some());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remember_then_recall_by_exact_topic() {
+        let (dir, server) = test_server("remember_recall");
+
+        let out = server.remember(RememberParams {
+            topic: "resolver-tiers".into(),
+            content: "Formal tier only covers Python for now.".into(),
+        });
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["topic"], "resolver-tiers");
+        assert!(v["updated_at"].as_str().unwrap().ends_with('Z'));
+
+        let out = server.recall(RecallParams {
+            topic: Some("resolver-tiers".into()),
+            query: None,
+        });
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["notes"].as_array().unwrap().len(), 1);
+        assert_eq!(v["notes"][0]["topic"], "resolver-tiers");
+        assert_eq!(
+            v["notes"][0]["content"],
+            "Formal tier only covers Python for now."
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remember_upserts_same_topic() {
+        let (dir, server) = test_server("remember_upsert");
+
+        server.remember(RememberParams {
+            topic: "gotcha".into(),
+            content: "first version".into(),
+        });
+        server.remember(RememberParams {
+            topic: "gotcha".into(),
+            content: "second version".into(),
+        });
+
+        let out = server.recall(RecallParams {
+            topic: Some("gotcha".into()),
+            query: None,
+        });
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let notes = v["notes"].as_array().unwrap();
+        assert_eq!(notes.len(), 1, "upsert must not create a duplicate row");
+        assert_eq!(notes[0]["content"], "second version");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recall_by_query_matches_topic_or_content() {
+        let (dir, server) = test_server("recall_query");
+
+        server.remember(RememberParams {
+            topic: "auth-flow".into(),
+            content: "OAuth callback must validate state param.".into(),
+        });
+        server.remember(RememberParams {
+            topic: "unrelated".into(),
+            content: "Nothing to do with authentication.".into(),
+        });
+
+        let out = server.recall(RecallParams {
+            topic: None,
+            query: Some("oauth".into()),
+        });
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let notes = v["notes"].as_array().unwrap();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0]["topic"], "auth-flow");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recall_with_no_args_lists_all_most_recent_first() {
+        let (dir, server) = test_server("recall_list_all");
+
+        server.remember(RememberParams {
+            topic: "a".into(),
+            content: "first".into(),
+        });
+        // Backdate "a" instead of sleeping for a real second-resolution tick.
+        server
+            .db()
+            .execute(
+                "UPDATE project_memory SET updated_at = '2020-01-01T00:00:00Z' WHERE topic = 'a'",
+                [],
+            )
+            .unwrap();
+        server.remember(RememberParams {
+            topic: "b".into(),
+            content: "second".into(),
+        });
+
+        let out = server.recall(RecallParams {
+            topic: None,
+            query: None,
+        });
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let notes = v["notes"].as_array().unwrap();
+        assert_eq!(notes.len(), 2);
+        assert_eq!(
+            notes[0]["topic"], "b",
+            "most recently updated note must come first"
+        );
+        assert!(!v["truncated"].as_bool().unwrap());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recall_empty_db_suggests_remember() {
+        let (dir, server) = test_server("recall_empty");
+
+        let out = server.recall(RecallParams {
+            topic: None,
+            query: None,
+        });
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["notes"].as_array().unwrap().len(), 0);
+        assert_eq!(v["suggested_next"]["tool"], "remember");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recall_unknown_topic_returns_empty_not_error() {
+        let (dir, server) = test_server("recall_unknown");
+
+        let out = server.recall(RecallParams {
+            topic: Some("does-not-exist".into()),
+            query: None,
+        });
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["notes"].as_array().unwrap().len(), 0);
+        assert!(v.get("error").is_none());
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

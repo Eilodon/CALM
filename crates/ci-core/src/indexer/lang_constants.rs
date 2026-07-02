@@ -201,6 +201,71 @@ pub fn get_lang_constants(lang: &str) -> Option<LangConstants> {
     }
 }
 
+/// Tree-sitter node kinds that count as a decision point for McCabe
+/// cyclomatic complexity (baseline 1 + one per branch). Only defined for the
+/// six Tier-0 languages, which get a real parse tree; every other language
+/// (Tier-0.5 line-scan extraction, or an unrecognized language) returns an
+/// empty slice, so `compute_cyclomatic_complexity` falls back to the
+/// baseline 1 rather than guessing from unparsed text.
+///
+/// Short-circuit boolean operators (`&&`/`||`) are only counted where the
+/// grammar exposes a dedicated node kind (Python's `boolean_operator`);
+/// languages whose grammar folds them into a generic `binary_expression`
+/// alongside arithmetic operators are not text-inspected to disambiguate, so
+/// this undercounts those slightly rather than risk misclassifying
+/// arithmetic as a branch.
+pub fn branch_node_kinds(language: &str) -> &'static [&'static str] {
+    match language {
+        "python" => &[
+            "if_statement",
+            "elif_clause",
+            "for_statement",
+            "while_statement",
+            "except_clause",
+            "boolean_operator",
+            "conditional_expression",
+            "case_clause",
+        ],
+        "rust" => &[
+            "if_expression",
+            "if_let_expression",
+            "match_arm",
+            "while_expression",
+            "while_let_expression",
+            "for_expression",
+            "loop_expression",
+        ],
+        "go" => &[
+            "if_statement",
+            "for_statement",
+            "expression_case",
+            "communication_case",
+            "type_case",
+        ],
+        "javascript" | "typescript" => &[
+            "if_statement",
+            "for_statement",
+            "for_in_statement",
+            "while_statement",
+            "do_statement",
+            "switch_case",
+            "catch_clause",
+            "ternary_expression",
+        ],
+        "java" => &[
+            "if_statement",
+            "for_statement",
+            "while_statement",
+            "do_statement",
+            "switch_label",
+            "switch_rule",
+            "catch_clause",
+            "ternary_expression",
+        ],
+        _ => &[],
+    }
+}
+
 /// Map a file extension to a language id.
 /// Returns a tier-0 language (full parse + call-graph) for the six main
 /// languages, and a tier-0.5 language id (shallow symbol-only extraction)
