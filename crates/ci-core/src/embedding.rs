@@ -14,6 +14,12 @@ use rusqlite::Connection;
 /// True when the crate was built with the `embeddings` feature.
 pub const ENABLED: bool = cfg!(feature = "embeddings");
 
+/// The default embedding model id (matches `SemanticSearchConfig::default`).
+/// `Embedder::load` special-cases this id to use weights vendored into the
+/// binary (see `assets/potion-code-16m/`) instead of fetching from the
+/// HuggingFace Hub — kept as one constant so the two can't drift apart.
+pub const DEFAULT_MODEL_ID: &str = "minishlab/potion-code-16M";
+
 /// The text embedded for a symbol: name + signature + docstring. This is
 /// Layer 1 of semantic search — *symbol identity*. Layer 2 (`code_chunks` /
 /// `code_chunk_vecs`, populated by `indexer::chunker`) embeds the raw code
@@ -66,6 +72,16 @@ mod imp {
         )
     }
 
+    /// Bytes for the default model, vendored into the repo (MIT-licensed;
+    /// `minishlab/potion-code-16M`, distilled from `nomic-ai/CodeRankEmbed`,
+    /// also MIT) and baked into the binary at compile time. Loading the
+    /// default model is then zero-I/O and zero-network — no HuggingFace Hub
+    /// round-trip on first run, which is otherwise required before semantic
+    /// search works (see `bootstrap_embeddings`).
+    static DEFAULT_CONFIG: &[u8] = include_bytes!("../assets/potion-code-16m/config.json");
+    static DEFAULT_TOKENIZER: &[u8] = include_bytes!("../assets/potion-code-16m/tokenizer.json");
+    static DEFAULT_WEIGHTS: &[u8] = include_bytes!("../assets/potion-code-16m/model.safetensors");
+
     /// A loaded static embedding model.
     pub struct Embedder {
         model: StaticModel,
@@ -73,11 +89,24 @@ mod imp {
     }
 
     impl Embedder {
-        /// Load `model_id` (a HuggingFace repo id or local path). Output is
-        /// L2-normalised so cosine distance behaves well.
+        /// Load `model_id`. The default model id (`DEFAULT_MODEL_ID`) loads
+        /// from the bytes vendored into the binary; any other id (a custom
+        /// model configured via `semantic_search.model`) still resolves via
+        /// `from_pretrained` — a local path, or a HuggingFace Hub download.
+        /// Output is L2-normalised so cosine distance behaves well.
         pub fn load(model_id: &str, dim: usize) -> anyhow::Result<Self> {
-            let model = StaticModel::from_pretrained(model_id, None, Some(true), None)
-                .map_err(|e| anyhow::anyhow!("load embedding model '{model_id}': {e}"))?;
+            let model = if model_id == DEFAULT_MODEL_ID {
+                StaticModel::from_bytes(
+                    DEFAULT_TOKENIZER,
+                    DEFAULT_WEIGHTS,
+                    DEFAULT_CONFIG,
+                    Some(true),
+                )
+                .map_err(|e| anyhow::anyhow!("load vendored embedding model: {e}"))?
+            } else {
+                StaticModel::from_pretrained(model_id, None, Some(true), None)
+                    .map_err(|e| anyhow::anyhow!("load embedding model '{model_id}': {e}"))?
+            };
             Ok(Self { model, dim })
         }
 
@@ -375,6 +404,24 @@ mod tests {
             "run fn run() does a thing"
         );
         assert_eq!(symbol_doc("run", "", ""), "run");
+    }
+
+    /// Regression for the vendored default model (`include_bytes!` in
+    /// `Embedder::load`): loads with zero network, produces the right
+    /// dimensionality, and is L2-normalised. Catches a bad asset path, a
+    /// corrupted file, or an unexpected tensor layout at test time instead
+    /// of at first-run in production.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn default_model_loads_from_vendored_bytes() {
+        let embedder = Embedder::load(DEFAULT_MODEL_ID, 256).expect("vendored model must load");
+        let v = embedder.embed_one("fn parse_config(path: &str) -> Config");
+        assert_eq!(v.len(), 256);
+        let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!(
+            (norm - 1.0).abs() < 1e-3,
+            "output should be L2-normalised, got {norm}"
+        );
     }
 
     #[cfg(feature = "embeddings")]

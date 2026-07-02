@@ -1,0 +1,5 @@
+{
+    "normalize": true,
+    "embedding_dtype": "float32",
+    "vocabulary_quantization": 61826
+}

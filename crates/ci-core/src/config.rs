@@ -90,8 +90,9 @@ impl Default for SemanticSearchConfig {
         Self {
             enabled: true,
             // Pure-Rust static code embeddings (model2vec-rs); distilled from
-            // nomic CodeRankEmbed, 256-dim.
-            model: "minishlab/potion-code-16M".into(),
+            // nomic CodeRankEmbed, 256-dim. Weights for this default model
+            // are vendored into the binary — see `embedding::DEFAULT_MODEL_ID`.
+            model: crate::embedding::DEFAULT_MODEL_ID.into(),
             dimensions: 256,
             index_on_startup: true,
         }

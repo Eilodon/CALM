@@ -77,7 +77,10 @@ agent: "tôi cần sửa hàm getUserByEmail"
   code-body chunk vector) — tìm được cả khi câu query không trùng tên symbol. KNN là brute-force
   cosine scan thuần Rust (cache theo path DB trong RAM, không phải re-fetch SQL mỗi query) — không
   còn phụ thuộc extension C nào, nên hoạt động giống hệt trên mọi platform release (trước đây
-  `sqlite-vec` không compile được trên musl libc, khiến bản Linux/Docker bị tắt semantic).
+  `sqlite-vec` không compile được trên musl libc, khiến bản Linux/Docker bị tắt semantic). Model mặc
+  định (`minishlab/potion-code-16M`, MIT license) được vendor sẵn vào binary lúc compile
+  (`crates/ci-core/assets/potion-code-16m/`, qua Git LFS) — load model mặc định không cần mạng, chỉ
+  model tuỳ biến qua `semantic_search.model` mới tải từ HuggingFace Hub.
 - **Index freshness minh bạch** — mọi response đều báo trạng thái index (`scanning → parsing →
   building_edges → ready`) để agent không tin nhầm dữ liệu cũ.
 - **Coverage-aware dead code** — tự detect lcov/`.coverage`/Go `coverage.out`/Cobertura XML khi
@@ -201,6 +204,9 @@ reason = "core không được phụ thuộc server layer"
   (tag theo version + `latest`) mỗi khi push git tag.
 - `compose.yaml` mẫu hardened (`read_only`, `cap_drop: ALL`, `no-new-privileges`, `pids_limit: 64`,
   `mem_limit: 256m`).
+- Repo dùng Git LFS cho `crates/ci-core/assets/potion-code-16m/*.safetensors` (~61MB) — cần
+  `git lfs install` trước khi clone để lấy đúng weight file (không có LFS, `git clone` vẫn chạy
+  được nhưng file đó chỉ là pointer text, build sẽ fail ở bước `include_bytes!`).
 
 ## Testing
 

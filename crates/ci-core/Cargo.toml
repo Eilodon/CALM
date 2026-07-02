@@ -39,7 +39,12 @@ tempfile = "3"
 # Nearest-neighbour search is a data-parallel brute-force cosine scan
 # (embedding.rs::knn) over plain SQLite BLOB storage — no vector-search C
 # extension (previously sqlite-vec, which failed to compile on musl libc),
-# so this is on by default for every target, release or native.
+# so this is on by default for every target, release or native. The default
+# model's weights are vendored into the binary via `include_bytes!` (see
+# `embedding::DEFAULT_MODEL_ID` and `assets/potion-code-16m/`, tracked with
+# Git LFS) — loading it needs no network. A custom `semantic_search.model`
+# still resolves through model2vec-rs's `hf-hub` fallback (local path or
+# HuggingFace Hub download).
 default = ["embeddings", "tier0-5"]
 embeddings = ["dep:model2vec-rs"]
 # Tier-0.5 upgrade: optional per-language tree-sitter grammars for accurate
