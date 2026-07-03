@@ -46,7 +46,8 @@ Rust dev), crate `scip` 0.9 (Phase B, feature-gated), rayon.
 - `crates/ci-core/src/indexer/mod.rs` — khai báo `pub mod crate_map;` (A2)
 - `crates/ci-core/src/indexer/pipeline.rs` — dùng crate map trong resolve import (A3)
 - `crates/ci-core/src/indexer/lang_constants.rs` — thêm `function_signature_item` (A4)
-- `crates/ci-core/src/indexer/parser.rs` — constructor type inference (A5)
+- `crates/ci-core/src/indexer/parser.rs` — `walk_symbols` per-node-kind class name field cho
+  `trait_item` (A4) + constructor type inference (A5)
 - `crates/ci-core/tests/fixtures/rust_workspace/` — **mới**: fixture (Task 0)
 
 **Phase B (module mới):**
@@ -59,7 +60,8 @@ Rust dev), crate `scip` 0.9 (Phase B, feature-gated), rayon.
 - `crates/ci-core/src/config.rs` — thêm `RustConfig`/`ScipConfig`
 - `crates/ci-core/Cargo.toml` — thêm `scip` dep + feature `scip-overlay`
 - `crates/ci-server/src/lib.rs` — gọi overlay sau `phase=ready`
-- `benchmarks/rust_precision/` — **mới**: harness đo precision/recall vs SCIP oracle (B6)
+- `benchmarks/b2_call_graph_quality/` — **mới**: harness đo precision/recall vs SCIP oracle,
+  lấp slot "B2 | Call Graph Resolution Quality | Planned" có sẵn trong `benchmarks/README.md` (B6)
 
 ---
 
@@ -290,6 +292,13 @@ fn parse_rust_import(text: &str) -> Option<ParsedImport> {
 }
 ```
 
+> **Phạm vi Task A1**: vẫn thuần string-manipulation (chỉ thêm bước strip visibility) — **không**
+> chuyển sang AST-based traversal của `use_declaration` như `docs/rust-support-research.md` §R0.1
+> mô tả ("parse bằng cấu trúc node tree-sitter... sửa luôn nested groups"). Nested groups như
+> `use a::{b::{c, d}, e}` vẫn chưa được xử lý đúng sau task này — không phải regression (đã sai
+> y hệt trước đó), chỉ là scope Task A1 hẹp hơn cách research doc mô tả. Không chặn merge, chỉ
+> ghi rõ để không ai tưởng nested groups đã được sửa xong.
+
 - [ ] **Step 4: Chạy — xác nhận PASS** `cargo test -p ci-core --lib imports::tests` và `cargo test -p ci-core --test rust_indexing pub_use_reexport_is_indexed` → expected: cả hai PASS
 - [ ] **Step 5: fmt + clippy + commit** `cargo fmt --all && cargo clippy --all-targets -- -D warnings && git commit -am "fix(imports): recognize pub use re-exports (Rust R0.1)"`
 
@@ -487,6 +496,13 @@ fn rel_dir(project_root: &Path, abs_dir: &Path) -> Option<String> {
 ### Task A3: Rust cross-crate + module resolution (R0.3)
 
 Thay đường strip-prefix sai trong `resolve_module_to_path` bằng resolver Rust dùng `CrateMap`.
+
+> **Lưu ý số dòng**: các trích dẫn `pipeline.rs:NNN` dưới đây đã cập nhật theo commit
+> `9d45c63` ("prefer same-file candidate when resolving a call by bare name", đã merge trước
+> khi plan này được viết ra nhưng phần phân tích ban đầu không tính tới), commit này chèn thêm
+> ~21 dòng vào giữa file (khối "same-file preference" trong `rebuild_graph`, dòng ~440-472).
+> Khối đó nằm **trước** và **tách biệt** với `resolve_import_targets`/`resolve_module_to_path`
+> mà Task A3 sửa — không có tương tác chức năng, chỉ cần biết để số dòng khớp bản hiện tại.
 Đây là task đóng gap #2 (cross-crate `to_path = NULL`). Scope Tier-0: `crate::`, tên crate
 ngoài, `self::` resolve chính xác; `super::` chấp nhận xấp xỉ (climb theo thư mục) và ghi chú
 rõ — phần dư để Phase B phủ.
@@ -615,7 +631,7 @@ fn resolve_rust_module(
 }
 ```
 
-- [ ] **Step 4: Rẽ nhánh rust trong `resolve_module_to_path`** — sửa đầu hàm (pipeline.rs:526, ngay sau khối `let m = ...; if m.is_empty()`), thêm tham số `crate_map` và ưu tiên resolver rust cho file `.rs`. Đổi signature:
+- [ ] **Step 4: Rẽ nhánh rust trong `resolve_module_to_path`** — sửa đầu hàm (pipeline.rs:547, ngay sau khối `let m = ...; if m.is_empty()`), thêm tham số `crate_map` và ưu tiên resolver rust cho file `.rs`. Đổi signature:
 ```rust
 fn resolve_module_to_path(
     from_path: &str,
@@ -638,7 +654,7 @@ fn resolve_module_to_path(
     // ... existing generic body unchanged from here ...
 ```
 
-- [ ] **Step 5: Build & truyền `CrateMap` trong `resolve_import_targets`** — sửa hàm (pipeline.rs:489). Nó cần `project_root` để build map; hiện chỉ nhận `tx`. Thêm tham số. Sửa signature + thân:
+- [ ] **Step 5: Build & truyền `CrateMap` trong `resolve_import_targets`** — sửa hàm (pipeline.rs:510). Nó cần `project_root` để build map; hiện chỉ nhận `tx`. Thêm tham số. Sửa signature + thân:
 ```rust
 fn resolve_import_targets(
     tx: &rusqlite::Transaction,
@@ -653,7 +669,7 @@ fn resolve_import_targets(
 }
 ```
 
-Và tại call site trong `rebuild_graph` (pipeline.rs:480), đổi `resolve_import_targets(tx)?;` thành nhận map. `rebuild_graph` cũng chưa có `project_root` — thêm tham số vào nó và truyền từ 2 call site (`run_indexing_pipeline` ~712, incremental ~823). Chuỗi thay đổi:
+Và tại call site trong `rebuild_graph` (pipeline.rs:501), đổi `resolve_import_targets(tx)?;` thành nhận map. `rebuild_graph` cũng chưa có `project_root` — thêm tham số vào nó và truyền từ 2 call site (`run_indexing_pipeline` ~733, incremental ~844). Chuỗi thay đổi:
 ```rust
 // rebuild_graph signature:
 fn rebuild_graph(
@@ -687,6 +703,8 @@ của `node_kind_to_symbol_kind` (đã đọc: parser.rs:54-60) map function-lik
 
 **Files:**
 - Modify: `crates/ci-core/src/indexer/lang_constants.rs:26-34` (rust `function_node_types`)
+- Modify: `crates/ci-core/src/indexer/parser.rs:294-301` (`walk_symbols` — per-node-kind class
+  name field cho Rust `trait_item`; xem Step 4)
 - Test: `crates/ci-core/tests/rust_indexing.rs`
 
 - [ ] **Step 1: Viết test đỏ**:
@@ -726,15 +744,41 @@ fn trait_method_declaration_is_a_symbol() {
             class_name_field: "type",
         }),
 ```
-> **Lưu ý:** thêm `trait_item` vào `class_node_types` để method bên trong trait nhận
-> `class_context` = tên trait (`class_name_field = "type"` — với `trait_item` field tên là
-> `name`, không phải `type`; kiểm tra: nếu `trait_item` dùng field `name`, cần xử lý riêng).
-> **Executor phải verify**: chạy Step 4; nếu `Runner::run` ra qualified_name sai (thiếu tên
-> trait), thì `class_name_field` cho trait khác impl — khi đó tách logic tên-class theo node
-> kind trong `walk_symbols` (impl→field `type`, trait→field `name`). Test ở Step 1 là oracle.
 
-- [ ] **Step 4: Chạy — xác nhận PASS** `cargo test -p ci-core --test rust_indexing` và full `cargo test -p ci-core` → expected: PASS, không regression (đặc biệt các test symbol Rust có sẵn trong `parser.rs`/`pipeline.rs`).
-- [ ] **Step 5: fmt + clippy + commit** `cargo fmt --all && cargo clippy --all-targets -- -D warnings && git commit -am "feat(indexer): index Rust trait method declarations (R0.5)"`
+- [ ] **Step 4: Sửa `walk_symbols` cho field tên của `trait_item`** — **đã xác nhận bằng
+  `node-types.json` thật của `tree-sitter-rust 0.23.3`, không phải giả định**: `impl_item` có
+  field `type` (kiểu Self) và field optional `trait`; `trait_item` có field `name` (kiểu
+  `type_identifier`) — **không có field `type`**. `class_name_field` là một hằng số dùng chung
+  cho cả ngôn ngữ (`"type"` cho rust), nên chỉ thêm `trait_item` vào `class_node_types` như
+  Step 3 là **chưa đủ**: `node.child_by_field_name(lc.class_name_field)` trong `walk_symbols`
+  (`parser.rs:295-297`) sẽ tra field `"type"` trên `trait_item`, field này không tồn tại →
+  `None` → rơi về `enclosing_class` (thường là `None` ở top-level) → method trong trait
+  **không** nhận được `class_context = "Runner"`, và oracle test ở Step 1 (`qualified_name =
+  'core/src/lib.rs::Runner::run'`) sẽ FAIL dù Step 3 đã áp dụng đúng. Sửa `walk_symbols`
+  (`parser.rs:294-301`) để chọn field theo node kind thay vì dùng thẳng `lc.class_name_field`:
+
+```rust
+    // Entering a class/impl sets the context for its descendants. Rust's
+    // `trait_item` names itself via field `name` (a `type_identifier`) — it
+    // does not share `impl_item`'s `class_name_field` ("type", the Self
+    // type) — so the field to read can't come from the single
+    // per-language `class_name_field` constant alone for this node kind.
+    let child_class = if lc.class_node_types.contains(&node.kind()) {
+        let name_field = if node.kind() == "trait_item" {
+            "name"
+        } else {
+            lc.class_name_field
+        };
+        node.child_by_field_name(name_field)
+            .map(|n| source[n.byte_range()].to_string())
+            .or_else(|| enclosing_class.clone())
+    } else {
+        enclosing_class.clone()
+    };
+```
+
+- [ ] **Step 5: Chạy — xác nhận PASS** `cargo test -p ci-core --test rust_indexing` và full `cargo test -p ci-core` → expected: PASS, không regression (đặc biệt các test symbol Rust có sẵn trong `parser.rs`/`pipeline.rs`).
+- [ ] **Step 6: fmt + clippy + commit** `cargo fmt --all && cargo clippy --all-targets -- -D warnings && git commit -am "feat(indexer): index Rust trait method declarations (R0.5)"`
 
 ---
 
@@ -773,7 +817,7 @@ fn constructor_binding_infers_receiver_type() {
 ```
 
 - [ ] **Step 2: Chạy — xác nhận FAIL** `cargo test -p ci-core --test rust_indexing constructor_binding_infers_receiver_type` → expected: FAIL (textual, edge có thể không tồn tại theo target_class)
-- [ ] **Step 3: Thêm inference** — trong `extract_type_map_impl` (parser.rs, hàm chứa vòng `while let Some(node) = stack.pop()` ~810), thêm một nhánh rust: khi gặp `let_declaration` không có field `type` nhưng có `value` là constructor. Chèn ngay sau khối `if binding_kinds.contains(...)`:
+- [ ] **Step 3: Thêm inference** — trong `extract_type_map_from_tree` (parser.rs, hàm chứa vòng `while let Some(node) = stack.pop()` ~810), thêm một nhánh rust: khi gặp `let_declaration` không có field `type` nhưng có `value` là constructor. Chèn ngay sau khối `if binding_kinds.contains(...)`:
 ```rust
         // Rust constructor inference: `let x = Foo::new(...)`, `Foo::default()`,
         // or `Foo { .. }` binds x to type Foo even without a type annotation.
@@ -1416,7 +1460,7 @@ pub fn run_overlay(conn: &Connection, root: &Path, rust: &RustConfig) -> anyhow:
 > `scip-overlay`: `tempfile = { version = "3", optional = true }` và thêm vào
 > `scip-overlay = ["dep:scip", "dep:tempfile"]`; giữ dòng dev-dependency cho test khác).
 
-- [ ] **Step 4: Wire vào server** — trong `crates/ci-server/src/lib.rs`, sau khi indexer đặt `phase=Ready` trong `spawn_blocking` (sau block 70-97), thêm (feature-gated):
+- [ ] **Step 4: Wire vào server** — trong `crates/ci-server/src/lib.rs`, sau khi indexer đặt `phase=Ready` trong `spawn_blocking` (khối hiện tại là dòng 53-113; điểm chèn đúng là ngay sau khối `if index_ok { ... }` ở dòng 99-105, cạnh lệnh `bootstrap_embeddings(&conn, ...)` đã có sẵn ở dòng 107-109, trước khi gọi `watcher::run_watch_loop` ở dòng 112), thêm (feature-gated):
 ```rust
             #[cfg(feature = "scip-overlay")]
             if index_ok {
@@ -1444,22 +1488,32 @@ pub fn run_overlay(conn: &Connection, root: &Path, rust: &RustConfig) -> anyhow:
 
 ---
 
-### Task B6: Benchmark — SCIP as precision/recall oracle
+### Task B6: Benchmark — SCIP as precision/recall oracle (lấp slot B2 có sẵn)
 
 Biến "Rust tốt chưa" thành số: so call edges của Tầng A với SCIP ground truth trên corpus thật.
 
-**Files:**
-- Create: `benchmarks/rust_precision/run.py`
-- Create: `benchmarks/rust_precision/README.md`
+`benchmarks/README.md` đã có sẵn dòng **"B2 | Call Graph Resolution Quality | Tier-1/2/3 vs
+textual | Planned"** — đây chính là lần triển khai đầu tiên của B2 (scope: Rust, dùng
+rust-analyzer làm oracle). Đặt tên/vị trí theo đúng convention `bN_ten/run_benchmark.py` +
+tái dùng `benchmarks/lib/` (`mcp_client.py`) mà `b3_search_quality`/`b4_token_efficiency`/
+`b6_tool_call_efficiency` đã dùng — không tạo thư mục top-level riêng lệch chuẩn như
+`rust_precision/run.py`.
 
-- [ ] **Step 1: Viết harness** `benchmarks/rust_precision/run.py` — pseudo-flow (executor hoàn thiện theo `benchmarks/lib` sẵn có):
+**Files:**
+- Create: `benchmarks/b2_call_graph_quality/run_benchmark.py`
+- Create: `benchmarks/b2_call_graph_quality/README.md`
+- Modify: `benchmarks/README.md` — đổi dòng B2 từ `Planned` → `Implemented` (ghi rõ scope
+  hiện tại: Rust only) kèm link tới `b2_call_graph_quality/`, theo đúng cách B3/B4/B6 đã làm.
+
+- [ ] **Step 1: Viết harness** `benchmarks/b2_call_graph_quality/run_benchmark.py` — pseudo-flow (executor hoàn thiện theo `benchmarks/lib/mcp_client.py` sẵn có, cùng cách b3/b4/b6 đã dùng):
   1. Nhận `--repo <path>` (mặc định: chính `ci`).
   2. Chạy `rust-analyzer scip <repo> --output oracle.scip`; decode bằng `scip print --json` (hoặc crate) → tập cạnh `(caller_file:line → callee_def_file:line)` cho các ref không-local.
   3. Chạy `ci index <repo>`; đọc `.codeindex/index.db` `call_edges` (Rust) → tập cạnh tương ứng qua `symbols.line_start`.
   4. Tính precision = |ci ∩ oracle| / |ci|, recall = |ci ∩ oracle| / |oracle|, phân tách theo `edge_confidence`.
   5. In bảng; ghi JSON để track qua thời gian.
-- [ ] **Step 2: Chạy baseline** `python benchmarks/rust_precision/run.py --repo .` → ghi lại số precision/recall hiện tại (sau Phase A). Đây là mốc để mọi thay đổi Rust về sau đối chiếu.
-- [ ] **Step 3: Commit** `git commit -am "bench(rust): precision/recall harness with SCIP oracle (Phase B6)"`
+- [ ] **Step 2: Chạy baseline** `python benchmarks/b2_call_graph_quality/run_benchmark.py --repo .` → ghi lại số precision/recall hiện tại (sau Phase A). Đây là mốc để mọi thay đổi Rust về sau đối chiếu.
+- [ ] **Step 3: Cập nhật `benchmarks/README.md`** — đổi dòng B2 sang `Implemented` kèm link tới `b2_call_graph_quality/`.
+- [ ] **Step 4: Commit** `git commit -am "bench(rust): B2 call-graph precision/recall harness with SCIP oracle"`
 
 ---
 
