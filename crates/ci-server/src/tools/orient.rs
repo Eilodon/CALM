@@ -105,6 +105,52 @@ impl CodeIntelligenceServer {
                 .query_row("SELECT COUNT(*) FROM project_memory", [], |r| r.get(0))
                 .unwrap_or(0);
 
+            // "Repo-map" style architectural skeleton (inspired by Aider's
+            // PageRank-ranked repo map) — reuses `coreness` (k-core), which
+            // `edit_context`'s hub/risk-gating already computes, instead of
+            // standing up a second centrality metric just for this. Ranked
+            // by coreness (structural embeddedness in the densest connected
+            // subgraph), tie-broken by caller_count then qualified_name for
+            // deterministic output. `coreness > 0` on purpose: a symbol at
+            // baseline 0 is either isolated or edges aren't built yet, and
+            // isn't "core" by any reasonable reading of the word — an empty
+            // list is itself the honest answer in that case, not a bug.
+            // `is_test = 0` excludes test helpers for the same reason
+            // `hotspot::compute_hotspots` does: test code calls production
+            // code structurally, which would skew "architectural
+            // importance" toward test scaffolding rather than real design.
+            // Gated on `edges_ready` (same convention as `symbol_info`'s
+            // `coreness` field) so a not-yet-built graph reports honestly
+            // empty instead of a stale/partial ranking.
+            const CORE_SYMBOLS_LIMIT: usize = 15;
+            let core_symbols: Vec<CoreSymbolItem> = if self.edges_ready() {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT qualified_name, name, kind, path, coreness, caller_count, is_hub \
+                         FROM symbols \
+                         WHERE is_test = 0 AND coreness IS NOT NULL AND coreness > 0 \
+                         ORDER BY coreness DESC, caller_count DESC, qualified_name ASC \
+                         LIMIT ?1",
+                    )
+                    .unwrap();
+                stmt.query_map(rusqlite::params![CORE_SYMBOLS_LIMIT as i64], |r| {
+                    Ok(CoreSymbolItem {
+                        qualified_name: r.get(0)?,
+                        name: r.get(1)?,
+                        kind: r.get(2)?,
+                        path: r.get(3)?,
+                        coreness: r.get(4)?,
+                        caller_count: r.get(5)?,
+                        is_hub: r.get::<_, i64>(6)? != 0,
+                    })
+                })
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect()
+            } else {
+                Vec::new()
+            };
+
             let phase = self.phase_str();
             let embed_status = self.embed_status_str();
             let sn = if phase != "ready" {
@@ -127,6 +173,7 @@ impl CodeIntelligenceServer {
                 module_map,
                 health_summary,
                 memory_notes_count,
+                core_symbols,
                 workflow_guide: r#"WORKFLOW (8 stages) — follow suggested_next in every response:
 1 ORIENT   : repo_overview (ALWAYS first) → hotspots, fitness_report (optional health snapshot)
 2 LOCATE   : locate(query) [= search+file_overview+symbol_info in 1 call] | search(kind="hybrid"|"grep") | file_overview(path)
@@ -393,9 +440,25 @@ pub(crate) struct RepoOverviewOutput {
     pub(crate) health_summary: HealthSummary,
     /// Count only, no content — see `recall()` to actually read them.
     pub(crate) memory_notes_count: i64,
+    /// Top symbols by `coreness` (k-core) — an architectural skeleton of
+    /// this repo, empty until `health_summary.edges_ready`. See the
+    /// `core_symbols` query's comment above for why it's coreness-ranked,
+    /// `is_test`-excluded, and `coreness > 0`-floored.
+    pub(crate) core_symbols: Vec<CoreSymbolItem>,
     pub(crate) workflow_guide: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) suggested_next: Option<SuggestedNext>,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub(crate) struct CoreSymbolItem {
+    pub(crate) qualified_name: String,
+    pub(crate) name: String,
+    pub(crate) kind: String,
+    pub(crate) path: String,
+    pub(crate) coreness: i64,
+    pub(crate) caller_count: i64,
+    pub(crate) is_hub: bool,
 }
 
 // ---------------------------------------------------------------------------

@@ -90,6 +90,9 @@ agent: "tôi cần sửa hàm getUserByEmail"
   `textual` tuỳ vào mức độ chắc chắn khi resolve. `formal` (Tier-3, StackGraph) hiện hỗ trợ Python.
 - **Import graph** — file-level dependency graph cho tool `dependencies`.
 - **Graph metrics** — `coreness` (k-core) và `is_hub` để nhận diện symbol trung tâm trước khi sửa.
+  `repo_overview.core_symbols` dùng lại chính `coreness` này để vẽ "khung xương kiến trúc" ngay từ
+  câu gọi đầu tiên (lấy cảm hứng từ repo-map PageRank của Aider, nhưng tận dụng metric đã có sẵn
+  thay vì tính riêng) — loại bỏ symbol trong test file, rỗng cho tới khi `edges_ready`.
 - **Incremental watcher** — chỉ re-parse file thay đổi (FNV-1a hash-diff), rebuild call graph tăng
   dần; parallel hoá bằng `rayon`. `ci serve` tự động chọn incremental reindex khi đã có index cũ.
 - **Full-text + semantic search** — FTS5 (BM25) kết hợp semantic embeddings (`model2vec-rs`,

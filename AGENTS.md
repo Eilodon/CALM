@@ -35,6 +35,7 @@ fitness_report()         # hub/dead-code/complexity/coverage/boundary health vs 
 - `health_summary.hub_count > 0` → hub symbols exist in this repo; check `is_hub` before editing any symbol
 - `hotspots[0].risk_level == "critical"` → this file breaks often; read before touching
 - `memory_notes_count > 0` → prior notes exist for this repo (count only, no content) — worth a `recall()` if you're about to touch an area a past session may have left a gotcha about
+- `core_symbols` non-empty → architectural skeleton of the repo (top symbols by `coreness`), ranked, `is_test`-excluded; empty until `health_summary.edges_ready` — a quick "what actually matters here" without a separate `hotspots`/`locate` round trip
 - `fitness_report().passed == false` → repo-wide metric regressed past its threshold; `suggested_next` points to `hotspots` to localize it
 
 ---

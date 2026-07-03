@@ -1220,6 +1220,72 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// `core_symbols` — reuses `coreness` (already computed for hub/risk
+    /// gating) as an Aider-repo-map-style architectural skeleton. Verifies:
+    /// empty before `edges_ready`; ranked by coreness once ready; a
+    /// `coreness = 0` (baseline/isolated) symbol is excluded; an
+    /// `is_test = 1` symbol is excluded even with high coreness, so test
+    /// helpers can't crowd out real architecture.
+    #[test]
+    fn repo_overview_core_symbols_ranked_and_filtered() {
+        let (dir, server) = test_server("repo_overview_core_symbols");
+
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point, coreness, is_test)
+                 VALUES ('mod.core_low', 'core_low', 'function', 'python', 'a.py', 1, 1, '', '', 'core_low', 3, 0, 0, 2, 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point, coreness, is_test)
+                 VALUES ('mod.core_high', 'core_high', 'function', 'python', 'b.py', 1, 1, '', '', 'core_high', 9, 1, 0, 5, 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point, coreness, is_test)
+                 VALUES ('mod.isolated', 'isolated', 'function', 'python', 'c.py', 1, 1, '', '', 'isolated', 0, 0, 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point, coreness, is_test)
+                 VALUES ('mod.test_helper', 'test_helper', 'function', 'python', 'test_c.py', 1, 1, '', '', 'test_helper', 20, 0, 0, 8, 1)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let before_ready: serde_json::Value =
+            serde_json::from_str(&server.repo_overview()).unwrap();
+        assert_eq!(
+            before_ready["core_symbols"],
+            serde_json::json!([]),
+            "must be empty before edges_ready: {before_ready}"
+        );
+
+        *server.phase_handle().write().unwrap() = IndexingPhase::Ready;
+
+        let after_ready: serde_json::Value = serde_json::from_str(&server.repo_overview()).unwrap();
+        let core = after_ready["core_symbols"].as_array().unwrap();
+        let names: Vec<&str> = core
+            .iter()
+            .map(|s| s["qualified_name"].as_str().unwrap())
+            .collect();
+
+        assert_eq!(
+            names,
+            vec!["mod.core_high", "mod.core_low"],
+            "must be coreness-ranked, excluding coreness=0 and is_test=1, got: {after_ready}"
+        );
+        assert_eq!(core[0]["coreness"], 5);
+        assert_eq!(core[0]["is_hub"], true);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Regression for Task 9 (schema drift): `callers` used to drop
     /// `call_site_line` even though `call_edges` always had the column, and
     /// never surfaced `edges_ready`/`transitive_count`/`transitive_capped`.
