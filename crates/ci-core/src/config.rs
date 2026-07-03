@@ -18,6 +18,7 @@ pub struct Config {
     pub dependencies: DependenciesConfig,
     pub session: SessionConfig,
     pub cochange: CoChangeConfig,
+    pub rust: RustConfig,
 }
 
 impl Default for Config {
@@ -52,6 +53,7 @@ impl Default for Config {
             dependencies: DependenciesConfig::default(),
             session: SessionConfig::default(),
             cochange: CoChangeConfig::default(),
+            rust: RustConfig::default(),
         }
     }
 }
@@ -74,6 +76,23 @@ impl Default for HubThresholdConfig {
             coreness_pct: 75.0,
         }
     }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct RustConfig {
+    pub scip: ScipConfig,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ScipConfig {
+    /// Off by default. When true and `rust-analyzer` is detectable, the batch
+    /// SCIP overlay upgrades Rust call edges to `formal` confidence after the
+    /// syntactic index reaches `ready`.
+    pub enabled: bool,
+    /// Optional explicit rust-analyzer binary path (else auto-detect).
+    pub binary: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -360,5 +379,23 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+}
+
+#[cfg(test)]
+mod scip_config_tests {
+    use super::*;
+
+    #[test]
+    fn rust_scip_defaults_off() {
+        let c = Config::default();
+        assert!(!c.rust.scip.enabled, "SCIP overlay must be off by default");
+    }
+
+    #[test]
+    fn rust_scip_opt_in_parses() {
+        let json = r#"{"rust":{"scip":{"enabled":true}}}"#;
+        let c: Config = serde_json::from_str(json).unwrap();
+        assert!(c.rust.scip.enabled);
     }
 }
