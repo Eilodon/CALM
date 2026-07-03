@@ -95,6 +95,16 @@ impl CodeIntelligenceServer {
                 edges_ready: self.edges_ready(),
             };
 
+            // Count only, never content — deliberately not auto-surfacing note
+            // *text* here (that would be a passive-injection memory pattern;
+            // current agent-memory practice, e.g. Letta/MemGPT, favors the
+            // agent deciding for itself when to call `recall()` over having
+            // content pushed at it). This is just enough signal to make that
+            // decision cheaply instead of guessing whether any notes exist.
+            let memory_notes_count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM project_memory", [], |r| r.get(0))
+                .unwrap_or(0);
+
             let phase = self.phase_str();
             let embed_status = self.embed_status_str();
             let sn = if phase != "ready" {
@@ -116,6 +126,7 @@ impl CodeIntelligenceServer {
                 entry_points,
                 module_map,
                 health_summary,
+                memory_notes_count,
                 workflow_guide: r#"WORKFLOW (8 stages) — follow suggested_next in every response:
 1 ORIENT   : repo_overview (ALWAYS first) → hotspots, fitness_report (optional health snapshot)
 2 LOCATE   : locate(query) [= search+file_overview+symbol_info in 1 call] | search(kind="hybrid"|"grep") | file_overview(path)
@@ -380,6 +391,8 @@ pub(crate) struct RepoOverviewOutput {
     pub(crate) entry_points: Vec<EntryPointItem>,
     pub(crate) module_map: Vec<ModuleEntry>,
     pub(crate) health_summary: HealthSummary,
+    /// Count only, no content — see `recall()` to actually read them.
+    pub(crate) memory_notes_count: i64,
     pub(crate) workflow_guide: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) suggested_next: Option<SuggestedNext>,

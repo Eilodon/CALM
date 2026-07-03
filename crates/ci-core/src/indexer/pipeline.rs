@@ -1391,6 +1391,90 @@ impl StructB {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Verifies `ci`'s own recovery path for a scenario an agent host's
+    /// checkpoint/rewind feature (Claude Code's `/rewind`, similar in
+    /// Cursor/Windsurf) can produce: a file gets reverted to *older*
+    /// content out from under the running server, entirely outside any
+    /// `edit_lines`/`edit_symbol` call `ci` knows about. Since
+    /// `reindex_changed` decides "did this file change" by comparing a
+    /// fresh content hash against the DB's stored hash — not by mtime or
+    /// direction — a revert to prior content produces a different hash from
+    /// what's currently indexed and is picked up exactly like a forward
+    /// edit would be. This confirms that by construction rather than
+    /// building a separate `ci`-side undo mechanism, which would risk
+    /// drifting out of sync with whatever the host's own checkpoint state
+    /// actually is.
+    #[test]
+    fn test_reindex_recovers_after_file_externally_reverted_to_older_content() {
+        let dir = std::env::temp_dir().join(format!("ci_idx_revert_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let original = "def original():\n    pass\n";
+        std::fs::write(dir.join("a.py"), original).unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM symbols WHERE qualified_name = 'a.py::original'"
+            ),
+            1
+        );
+
+        // Agent (or the agent's host) edits the file forward.
+        std::fs::write(dir.join("a.py"), "def edited():\n    pass\n").unwrap();
+        reindex_changed(&mut conn, &dir).unwrap();
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM symbols WHERE qualified_name = 'a.py::edited'"
+            ),
+            1
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM symbols WHERE qualified_name = 'a.py::original'"
+            ),
+            0,
+            "the edited-away symbol must not linger"
+        );
+
+        // Something *outside* ci's own write path (a host checkpoint
+        // rewind, a manual `git checkout`, an editor undo) puts the
+        // original content back — not a new edit_lines/edit_symbol call.
+        std::fs::write(dir.join("a.py"), original).unwrap();
+        let s = reindex_changed(&mut conn, &dir).unwrap();
+        assert_eq!(
+            s,
+            ReindexSummary {
+                changed: 1,
+                deleted: 0
+            },
+            "a revert to prior content is still a content-hash change and must be picked up"
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM symbols WHERE qualified_name = 'a.py::original'"
+            ),
+            1,
+            "the reverted-to symbol must be restored"
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM symbols WHERE qualified_name = 'a.py::edited'"
+            ),
+            0,
+            "the since-reverted symbol must not linger as a stale leftover"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn test_reindex_incremental_add_modify_delete() {
         let dir = std::env::temp_dir().join(format!("ci_idx_inc_{}", std::process::id()));

@@ -34,6 +34,7 @@ fitness_report()         # hub/dead-code/complexity/coverage/boundary health vs 
 - `indexing_phase != "ready"` → graph tools have degraded results; call `indexing_status` to monitor
 - `health_summary.hub_count > 0` → hub symbols exist in this repo; check `is_hub` before editing any symbol
 - `hotspots[0].risk_level == "critical"` → this file breaks often; read before touching
+- `memory_notes_count > 0` → prior notes exist for this repo (count only, no content) — worth a `recall()` if you're about to touch an area a past session may have left a gotcha about
 - `fitness_report().passed == false` → repo-wide metric regressed past its threshold; `suggested_next` points to `hotspots` to localize it
 
 ---
@@ -210,6 +211,7 @@ remember("auth-flow", "OAuth callback must validate state param — see incident
 - `frontier empty` → call `repo_overview` to refresh the map
 - `embeddings_status == "failed"` → call `indexing_status(retry_embeddings=true)`
 - `recall` returns `notes: []` → nothing recorded yet, not an error; proceed normally
+- `possibly_stuck == true` (`calls_since_progress >= 10`) → purely informational, not enforced; confirms the "10+ calls without convergence" cue above actually applies right now instead of you having to count
 
 ---
 

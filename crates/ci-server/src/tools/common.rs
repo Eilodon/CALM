@@ -77,6 +77,9 @@ impl CodeIntelligenceServer {
     pub(crate) fn track_symbol(&self, qualified_name: &str) {
         if let Ok(mut log) = self.session_log.lock() {
             let now = log.tool_calls;
+            if !log.explored_symbols.contains_key(qualified_name) {
+                log.last_progress_at = now;
+            }
             log.explored_symbols.insert(qualified_name.to_string(), now);
         }
     }
@@ -84,6 +87,9 @@ impl CodeIntelligenceServer {
     pub(crate) fn track_file(&self, path: &str) {
         if let Ok(mut log) = self.session_log.lock() {
             let now = log.tool_calls;
+            if !log.explored_files.contains_key(path) {
+                log.last_progress_at = now;
+            }
             log.explored_files.insert(path.to_string(), now);
         }
     }

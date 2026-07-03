@@ -95,6 +95,15 @@ struct SessionLog {
     /// so any MCP client gets the same "you edited, verify blast radius"
     /// signal without relying on a host-specific hook.
     written_files: std::collections::HashSet<String>,
+    /// `tool_calls` value the last time `explored_files`/`explored_symbols`
+    /// gained a genuinely *new* key (not just a re-touch refreshing an
+    /// existing one's timestamp) — lets `session_context` report how many
+    /// calls have passed with no new ground covered, a cheap, informational
+    /// "you might be circling" signal. Deliberately not enforced/blocking
+    /// anywhere: loop-breaking is the host's job (e.g. Claude Code's
+    /// `/goal`); this only makes the "10+ calls without convergence"
+    /// heuristic AGENTS.md already documents checkable instead of guessed.
+    last_progress_at: u64,
     session_started_at: String,
 }
 
@@ -105,6 +114,7 @@ impl Default for SessionLog {
             explored_symbols: std::collections::HashMap::new(),
             explored_files: std::collections::HashMap::new(),
             written_files: std::collections::HashSet::new(),
+            last_progress_at: 0,
             session_started_at: utc_now_iso8601(),
         }
     }
@@ -1175,6 +1185,37 @@ mod tests {
 
         assert_eq!(v["health_summary"]["hub_count"], 1);
         assert_eq!(v["health_summary"]["edges_ready"], false);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `memory_notes_count` is deliberately count-only — no note *content*
+    /// belongs in `repo_overview` (that would be passive-injection memory,
+    /// the opposite of the agent-driven `recall()`/`remember()` model this
+    /// tool already follows). Just enough signal to decide whether calling
+    /// `recall()` is worth it.
+    #[test]
+    fn repo_overview_reports_memory_notes_count_without_content() {
+        let (dir, server) = test_server("repo_overview_memory_count");
+
+        let empty: serde_json::Value = serde_json::from_str(&server.repo_overview()).unwrap();
+        assert_eq!(empty["memory_notes_count"], 0, "{empty}");
+
+        server.remember(RememberParams {
+            topic: "auth-flow".into(),
+            content: "OAuth callback must validate state param".into(),
+        });
+        server.remember(RememberParams {
+            topic: "db-migrations".into(),
+            content: "always run in a transaction".into(),
+        });
+
+        let with_notes: serde_json::Value = serde_json::from_str(&server.repo_overview()).unwrap();
+        assert_eq!(with_notes["memory_notes_count"], 2, "{with_notes}");
+        assert!(
+            !with_notes.to_string().contains("state param"),
+            "note content must not leak into repo_overview, got: {with_notes}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2384,6 +2425,56 @@ mod tests {
             v["coreness"].is_null(),
             "coreness must be null when edges_ready is false, got: {}",
             v["coreness"]
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Purely informational "you might be circling" signal — never enforced
+    /// (loop-breaking stays the host's job), just makes AGENTS.md's "10+
+    /// calls without convergence" heuristic checkable. `track_file`/
+    /// `track_symbol` calls (via `file_overview` here) reset the counter
+    /// only when they add a genuinely *new* entry, not on a re-touch.
+    #[test]
+    fn session_context_reports_possibly_stuck_after_threshold_calls_without_progress() {
+        let (dir, server) = test_server("session_ctx_stuck");
+
+        for _ in 0..9 {
+            server.session_context();
+        }
+        let at_nine: serde_json::Value = serde_json::from_str(&server.session_context()).unwrap();
+        // 10 calls in (the loop's 9 + this one), none of them explored anything.
+        assert_eq!(at_nine["calls_since_progress"], 10, "{at_nine}");
+        assert_eq!(at_nine["possibly_stuck"], true, "{at_nine}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_context_progress_resets_on_new_file_explored_not_on_retouch() {
+        let (dir, server) = test_server("session_ctx_progress_reset");
+
+        for _ in 0..5 {
+            server.session_context();
+        }
+        server.track_file("a.rs"); // new — resets the counter
+        let after_new: serde_json::Value = serde_json::from_str(&server.session_context()).unwrap();
+        // 1, not 0: session_context's own call increments tool_calls before
+        // reading it, so the very next call after a reset always reads "1
+        // call since progress" — the reset itself, not the read, is what
+        // this checks.
+        assert_eq!(after_new["calls_since_progress"], 1, "{after_new}");
+        assert_eq!(after_new["possibly_stuck"], false, "{after_new}");
+
+        for _ in 0..3 {
+            server.session_context();
+        }
+        server.track_file("a.rs"); // re-touch of the SAME file — must not reset
+        let after_retouch: serde_json::Value =
+            serde_json::from_str(&server.session_context()).unwrap();
+        assert!(
+            after_retouch["calls_since_progress"].as_u64().unwrap() > 0,
+            "a re-touch of an already-explored file must not reset the counter: {after_retouch}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
