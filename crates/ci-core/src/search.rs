@@ -1,6 +1,8 @@
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
-use rusqlite::Connection;
+use rayon::prelude::*;
+use rusqlite::{Connection, OptionalExtension};
 
 use crate::embedding::Embedder;
 use crate::types::SearchKind;
@@ -235,8 +237,13 @@ fn search_symbol(conn: &Connection, query: &str, limit: usize) -> rusqlite::Resu
 
 fn search_text(conn: &Connection, query: &str, limit: usize) -> rusqlite::Result<SearchOutput> {
     let raw_query = escape_fts5_query(query);
-    // FTS5 global column filter: {docstring} restricts ALL tokens to docstring column only
-    let fts_query = format!("{{docstring}} : {raw_query}");
+    // FTS5 global column filter: {docstring signature} restricts ALL tokens to
+    // just those two columns — deliberately excludes `name` (that's what
+    // kind="symbol" is for) but, unlike the old docstring-only filter, now
+    // also matches a symbol's signature (parameter/return types), not just
+    // its docstring. Still doesn't cover function bodies, imports, or
+    // non-code files — that's what kind="grep" is for (search_grep, above).
+    let fts_query = format!("{{docstring signature}} : {raw_query}");
 
     let mut stmt = conn.prepare(
         "SELECT s.qualified_name, s.name, s.path, s.line_start, s.line_end, s.kind,
@@ -275,25 +282,65 @@ fn search_text(conn: &Connection, query: &str, limit: usize) -> rusqlite::Result
     })
 }
 
+/// A query is treated as a glob (matched via `globset` against the whole
+/// relative path) instead of a plain substring when it contains any glob
+/// metacharacter — otherwise `search_file` keeps its original SQL `LIKE`
+/// substring behavior unchanged, so existing non-glob callers see no
+/// difference.
+fn looks_like_glob(query: &str) -> bool {
+    query.contains(['*', '?', '['])
+}
+
 fn search_file(conn: &Connection, query: &str, limit: usize) -> rusqlite::Result<SearchOutput> {
-    let pattern = format!("%{query}%");
+    let results = if looks_like_glob(query) {
+        let Ok(matcher) = globset::Glob::new(query).map(|g| g.compile_matcher()) else {
+            // Invalid glob syntax — degrade to zero results rather than erroring
+            // the whole tool call; the caller sees an empty result set and can
+            // retry with a corrected pattern.
+            return Ok(SearchOutput {
+                results: vec![],
+                truncated: false,
+                degraded: true,
+                note: Some(format!("invalid glob pattern: {query}")),
+            });
+        };
 
-    let mut stmt = conn.prepare(
-        "SELECT fi.path
-         FROM file_index fi
-         WHERE fi.path LIKE ?1
-         ORDER BY fi.path
-         LIMIT ?2",
-    )?;
+        let mut stmt = conn.prepare("SELECT fi.path FROM file_index fi ORDER BY fi.path")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut matched = Vec::new();
+        for row in rows {
+            let path = row?;
+            if matcher.is_match(&path) {
+                matched.push(path);
+            }
+            if matched.len() >= limit {
+                break;
+            }
+        }
+        matched
+    } else {
+        let pattern = format!("%{query}%");
+        let mut stmt = conn.prepare(
+            "SELECT fi.path
+             FROM file_index fi
+             WHERE fi.path LIKE ?1
+             ORDER BY fi.path
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![pattern, limit as i64], |row| {
+            row.get::<_, String>(0)
+        })?;
+        let mut matched = Vec::new();
+        for row in rows {
+            matched.push(row?);
+        }
+        matched
+    };
 
-    let rows = stmt.query_map(rusqlite::params![pattern, limit as i64], |row| {
-        row.get::<_, String>(0)
-    })?;
-
-    let mut results = Vec::new();
-    for row in rows {
-        let path = row?;
-        results.push(SearchResult {
+    let truncated = results.len() >= limit;
+    let results = results
+        .into_iter()
+        .map(|path| SearchResult {
             name: path.rsplit('/').next().unwrap_or(&path).to_string(),
             qualified_name: path.clone(),
             path,
@@ -304,10 +351,219 @@ fn search_file(conn: &Connection, query: &str, limit: usize) -> rusqlite::Result
             match_type: "file".to_string(),
             snippet: None,
             is_test: false,
-        });
+        })
+        .collect();
+
+    Ok(SearchOutput {
+        results,
+        truncated,
+        degraded: false,
+        note: None,
+    })
+}
+
+/// Find the tightest enclosing symbol for `(path, line)`, if any — enriches
+/// `search_grep` matches with a `name`/`qualified_name`/`kind` a raw text
+/// search can't offer on its own. Narrowest span wins when ranges nest
+/// (e.g. a method inside a class).
+fn enclosing_symbol(
+    conn: &Connection,
+    path: &str,
+    line: i64,
+) -> rusqlite::Result<Option<(String, String, Option<String>)>> {
+    conn.query_row(
+        "SELECT name, qualified_name, kind FROM symbols
+         WHERE path = ?1 AND line_start <= ?2 AND line_end >= ?2
+         ORDER BY (line_end - line_start) ASC
+         LIMIT 1",
+        rusqlite::params![path, line],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )
+    .optional()
+}
+
+/// Hard cap on a single rendered snippet line's length. Without this, a
+/// pathological single-line file (minified JSON, a generated lockfile, a
+/// vendored data blob) that happens to contain a match turns one grep
+/// result into a multi-megabyte response — this bit a live run against
+/// `crates/ci-core/assets/potion-code-16m/tokenizer.json` (a ~1-line JSON
+/// vocab file) during Tier A verification.
+const MAX_SNIPPET_LINE_CHARS: usize = 300;
+
+/// Files larger than this are skipped by `search_grep` entirely, before
+/// reading — grepping multi-megabyte generated/vendored blobs is rarely
+/// useful and wastes time; real source files essentially never hit this.
+const MAX_GREP_FILE_BYTES: u64 = 2 * 1024 * 1024;
+
+fn truncate_snippet_line(line: &str) -> std::borrow::Cow<'_, str> {
+    if line.len() <= MAX_SNIPPET_LINE_CHARS {
+        return std::borrow::Cow::Borrowed(line);
+    }
+    // Truncate on a char boundary, not a byte offset, to stay UTF8-safe.
+    let cut = line
+        .char_indices()
+        .map(|(i, _)| i)
+        .take_while(|&i| i <= MAX_SNIPPET_LINE_CHARS)
+        .last()
+        .unwrap_or(0);
+    std::borrow::Cow::Owned(format!(
+        "{}… (truncated, {} more chars)",
+        &line[..cut],
+        line.len() - cut
+    ))
+}
+
+/// Render `context` lines of surrounding text around the matched line
+/// (0-indexed `match_idx` into `lines`), 1-indexed and marked, e.g.:
+/// `"    12: fn foo() {\n>   13:     bar();\n    14: }"`. Each rendered line
+/// is capped at `MAX_SNIPPET_LINE_CHARS` — see its doc comment.
+fn build_snippet(lines: &[&str], match_idx: usize, context: usize) -> String {
+    let start = match_idx.saturating_sub(context);
+    let end = (match_idx + context).min(lines.len().saturating_sub(1));
+    (start..=end)
+        .map(|i| {
+            let marker = if i == match_idx { ">" } else { " " };
+            format!("{marker} {:>5}: {}", i + 1, truncate_snippet_line(lines[i]))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// One regex match found while scanning a file — pure text-layer data, no DB
+/// involvement yet (`enclosing_symbol` enrichment happens afterward, in a
+/// single sequential pass — see `search_grep`).
+struct RawGrepMatch {
+    rel_path: String,
+    line_no: i64,
+    snippet: String,
+}
+
+/// `search(kind="grep")`: regex + optional glob search over raw file
+/// content read straight off disk via the shared `crate::walk` walker — not
+/// the FTS/DB index. This is what lets it cover files the indexer never
+/// parses at all (`Cargo.toml`, `docs/*.md`, `Containerfile`, ...), unlike
+/// `search_text` which only ever matches the `docstring` FTS column of
+/// already-indexed symbols. Each match is opportunistically enriched with
+/// its enclosing symbol (if any) via `enclosing_symbol` — a plain grep tool
+/// can't do that because it has no code graph to consult.
+///
+/// Two-phase to parallelize the expensive part safely: (1) walk + glob/size
+/// filter is sequential and cheap (metadata only), (2) reading and
+/// regex-scanning each candidate file's content is the real cost on a large
+/// repo and runs via `rayon` — the same "parallel CPU work, no DB" pattern
+/// `indexer::pipeline::reindex_changed` already uses for its hash pass.
+/// Symbol enrichment stays a single sequential pass afterward because
+/// `rusqlite::Connection` is `Send` but not `Sync` — it can't be shared by
+/// reference across rayon's worker threads.
+#[allow(clippy::too_many_arguments)]
+pub fn search_grep(
+    conn: &Connection,
+    project_root: &Path,
+    pattern: &str,
+    glob: Option<&str>,
+    case_insensitive: bool,
+    context: usize,
+    ignore_patterns: &[String],
+    limit: usize,
+) -> anyhow::Result<SearchOutput> {
+    let re = regex::RegexBuilder::new(pattern)
+        .case_insensitive(case_insensitive)
+        .build()?;
+    let glob_matcher = glob
+        .map(|g| globset::Glob::new(g).map(|gl| gl.compile_matcher()))
+        .transpose()?;
+
+    // Phase 1 (sequential, cheap): walk + glob/size filter to candidates.
+    let mut candidates: Vec<(PathBuf, String)> = Vec::new();
+    for entry in crate::walk::build_walker(project_root, ignore_patterns) {
+        let Ok(entry) = entry else { continue };
+        if !entry.file_type().is_some_and(|t| t.is_file()) {
+            continue;
+        }
+        let path = entry.into_path();
+        let rel_path = path
+            .strip_prefix(project_root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+
+        if let Some(matcher) = &glob_matcher
+            && !matcher.is_match(&rel_path)
+        {
+            continue;
+        }
+        // Skip oversized files before reading — see MAX_GREP_FILE_BYTES.
+        if std::fs::metadata(&path).is_ok_and(|m| m.len() > MAX_GREP_FILE_BYTES) {
+            continue;
+        }
+        candidates.push((path, rel_path));
     }
 
-    let truncated = results.len() >= limit;
+    // Phase 2 (parallel, expensive): read + regex-scan each candidate.
+    // `.par_iter().map().collect::<Vec<_>>()` on a `Vec` preserves the
+    // original (walk) order in the output, so results stay deterministic.
+    let per_file: Vec<Vec<RawGrepMatch>> = candidates
+        .par_iter()
+        .map(|(path, rel_path)| {
+            // Non-UTF8/binary files fail to decode here and are silently
+            // skipped, same as ripgrep's default binary-detection behavior.
+            let Ok(content) = std::fs::read_to_string(path) else {
+                return Vec::new();
+            };
+            let lines: Vec<&str> = content.lines().collect();
+            let mut matches = Vec::new();
+            for (idx, line) in lines.iter().enumerate() {
+                if re.is_match(line) {
+                    matches.push(RawGrepMatch {
+                        rel_path: rel_path.clone(),
+                        line_no: (idx + 1) as i64,
+                        snippet: build_snippet(&lines, idx, context),
+                    });
+                }
+            }
+            matches
+        })
+        .collect();
+
+    // Phase 3 (sequential, single connection): enrich with the enclosing
+    // symbol (if any) and apply the result limit.
+    let mut results = Vec::new();
+    let mut truncated = false;
+    'enrich: for file_matches in per_file {
+        for m in file_matches {
+            if results.len() >= limit {
+                truncated = true;
+                break 'enrich;
+            }
+            let symbol = enclosing_symbol(conn, &m.rel_path, m.line_no)?;
+            let (name, qualified_name, kind) = match symbol {
+                Some((name, qn, kind)) => (name, qn, kind),
+                None => (
+                    m.rel_path
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or(&m.rel_path)
+                        .to_string(),
+                    format!("{}:{}", m.rel_path, m.line_no),
+                    None,
+                ),
+            };
+
+            results.push(SearchResult {
+                name,
+                qualified_name,
+                path: m.rel_path,
+                kind,
+                line_start: Some(m.line_no),
+                line_end: Some(m.line_no),
+                score: 1.0,
+                match_type: "grep".to_string(),
+                snippet: Some(m.snippet),
+                is_test: false,
+            });
+        }
+    }
+
     Ok(SearchOutput {
         results,
         truncated,
@@ -822,6 +1078,249 @@ mod tests {
         let conn = setup_db_with_symbols();
         let output = search(&conn, "src/", SearchKind::File, 10, None, DEFAULT_RRF_K).unwrap();
         assert_eq!(output.results.len(), 3);
+    }
+
+    #[test]
+    fn test_search_file_glob_matches_extension() {
+        let conn = setup_db_with_symbols();
+        let output = search(&conn, "*.ts", SearchKind::File, 10, None, DEFAULT_RRF_K).unwrap();
+        assert_eq!(output.results.len(), 1);
+        assert_eq!(output.results[0].path, "src/helper.ts");
+    }
+
+    #[test]
+    fn test_search_file_glob_no_match_falls_back_empty_not_substring() {
+        let conn = setup_db_with_symbols();
+        // A glob query must NOT silently degrade to substring matching —
+        // "*.py" as a literal substring would match nothing anyway here,
+        // but this pins the glob-vs-substring branch selection itself via
+        // looks_like_glob rather than accidentally exercising LIKE.
+        let output = search(&conn, "*.rs", SearchKind::File, 10, None, DEFAULT_RRF_K).unwrap();
+        assert_eq!(output.results.len(), 0);
+    }
+
+    #[test]
+    fn test_search_file_plain_substring_still_works() {
+        // Non-glob queries keep the original LIKE substring behavior.
+        let conn = setup_db_with_symbols();
+        let output = search(&conn, "helper", SearchKind::File, 10, None, DEFAULT_RRF_K).unwrap();
+        assert_eq!(output.results.len(), 1);
+        assert_eq!(output.results[0].path, "src/helper.ts");
+    }
+
+    #[test]
+    fn test_search_text_matches_signature_not_just_docstring() {
+        let conn = setup_db_with_symbols();
+        conn.execute(
+            "INSERT INTO symbols (name, qualified_name, kind, path, language, line_start, line_end, signature, docstring, name_tokens)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            rusqlite::params![
+                "reticulate",
+                "src/main.py::reticulate",
+                "function",
+                "src/main.py",
+                "python",
+                50,
+                55,
+                "fn reticulate(spline: Widgetronic) -> bool",
+                "",
+                "reticulate"
+            ],
+        )
+        .unwrap();
+
+        let output = search(
+            &conn,
+            "widgetronic",
+            SearchKind::Text,
+            10,
+            None,
+            DEFAULT_RRF_K,
+        )
+        .unwrap();
+        assert_eq!(
+            output.results.len(),
+            1,
+            "kind=text should now also match a symbol's signature, not just its docstring"
+        );
+        assert_eq!(output.results[0].name, "reticulate");
+    }
+
+    fn make_temp_project(suffix: &str, files: &[(&str, &str)]) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("ci_search_grep_{suffix}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for (rel, content) in files {
+            let path = dir.join(rel);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(path, content).unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn test_search_grep_finds_raw_text_in_non_indexed_file() {
+        let dir = make_temp_project(
+            "nonindexed",
+            &[("Cargo.toml", "[dependencies]\nrayon = \"1\"\n")],
+        );
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        let output = search_grep(&conn, &dir, "rayon", None, false, 0, &[], 10).unwrap();
+        assert_eq!(
+            output.results.len(),
+            1,
+            "grep must reach files the indexer never parses"
+        );
+        assert_eq!(output.results[0].path, "Cargo.toml");
+        assert_eq!(output.results[0].line_start, Some(2));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_search_grep_regex_and_case_insensitive() {
+        let dir = make_temp_project("regex", &[("a.py", "FOO_BAR = 1\nbaz = 2\n")]);
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        let output = search_grep(&conn, &dir, "^foo_bar", None, true, 0, &[], 10).unwrap();
+        assert_eq!(output.results.len(), 1);
+        assert_eq!(output.results[0].line_start, Some(1));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_search_grep_glob_filter_restricts_files() {
+        let dir = make_temp_project("globfilter", &[("a.py", "needle\n"), ("b.md", "needle\n")]);
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        let output = search_grep(&conn, &dir, "needle", Some("*.py"), false, 0, &[], 10).unwrap();
+        assert_eq!(output.results.len(), 1);
+        assert_eq!(output.results[0].path, "a.py");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_search_grep_enriches_match_with_enclosing_symbol() {
+        let dir = make_temp_project(
+            "enrich",
+            &[(
+                "a.py",
+                "def helper():\n    needle_marker = 1\n    return needle_marker\n",
+            )],
+        );
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO symbols (name, qualified_name, kind, path, language, line_start, line_end, name_tokens)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params!["helper", "a.py::helper", "function", "a.py", "python", 1, 3, "helper"],
+        )
+        .unwrap();
+
+        let output =
+            search_grep(&conn, &dir, "needle_marker = 1", None, false, 0, &[], 10).unwrap();
+        assert_eq!(output.results.len(), 1);
+        assert_eq!(output.results[0].qualified_name, "a.py::helper");
+        assert_eq!(output.results[0].kind.as_deref(), Some("function"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_search_grep_respects_limit_and_truncates() {
+        let dir = make_temp_project("limit", &[("a.py", "needle\nneedle\nneedle\n")]);
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        let output = search_grep(&conn, &dir, "needle", None, false, 0, &[], 2).unwrap();
+        assert_eq!(output.results.len(), 2);
+        assert!(output.truncated);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression for a live-verification bug: a pathological single-line
+    /// file (minified JSON, a generated data blob — this exact shape hit
+    /// `crates/ci-core/assets/potion-code-16m/tokenizer.json` in practice)
+    /// must not balloon one match's snippet into megabytes of output.
+    #[test]
+    fn test_search_grep_truncates_pathological_long_line() {
+        let huge_line = format!("{}needle{}", "x".repeat(10_000), "y".repeat(10_000));
+        let dir = make_temp_project("longline", &[("blob.json", &huge_line)]);
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        let output = search_grep(&conn, &dir, "needle", None, false, 0, &[], 10).unwrap();
+        assert_eq!(output.results.len(), 1);
+        let snippet = output.results[0].snippet.as_ref().unwrap();
+        assert!(
+            snippet.len() < 1_000,
+            "snippet must be capped, got {} chars",
+            snippet.len()
+        );
+        assert!(snippet.contains("truncated"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_search_grep_skips_oversized_files() {
+        let huge_content = "x".repeat((MAX_GREP_FILE_BYTES + 1) as usize);
+        let dir = make_temp_project(
+            "oversized",
+            &[("huge.txt", &huge_content), ("small.txt", "needle\n")],
+        );
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        let output = search_grep(&conn, &dir, "x{5}", None, false, 0, &[], 10).unwrap();
+        assert!(
+            output.results.iter().all(|r| r.path != "huge.txt"),
+            "oversized file must be skipped entirely, not just truncated in output"
+        );
+
+        let output = search_grep(&conn, &dir, "needle", None, false, 0, &[], 10).unwrap();
+        assert_eq!(output.results.len(), 1);
+        assert_eq!(output.results[0].path, "small.txt");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_search_grep_respects_ignore_patterns_and_gitignore() {
+        // `ignore::WalkBuilder` only honors `.gitignore` when the walked
+        // root looks like an actual git repo (`require_git` defaults to
+        // true, matching git's own behavior) — a `.git` marker is required
+        // for this fixture to exercise gitignore handling at all, same as
+        // `crate::gitignore::ensure_gitignore`'s own `.git` existence check.
+        let dir = make_temp_project(
+            "ignore",
+            &[
+                (".git/HEAD", "ref: refs/heads/main\n"),
+                ("keep.py", "needle\n"),
+                ("vendor/skip.py", "needle\n"),
+                (".gitignore", "skipped_by_git/\n"),
+                ("skipped_by_git/also.py", "needle\n"),
+            ],
+        );
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        let ignore = vec!["vendor".to_string()];
+        let output = search_grep(&conn, &dir, "needle", None, false, 0, &ignore, 10).unwrap();
+        let paths: Vec<&str> = output.results.iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(paths, vec!["keep.py"]);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

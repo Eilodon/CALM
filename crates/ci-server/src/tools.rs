@@ -11,6 +11,7 @@ use ci_core::sanitize::{injection_warning, sanitize_source_output};
 use ci_core::types::{EmbedStatus, IndexingPhase};
 
 mod common;
+mod edit;
 mod guardrails;
 mod inspect;
 mod locate;
@@ -112,6 +113,11 @@ pub struct CodeIntelligenceServer {
     /// Coverage data loaded once at startup from lcov/cobertura/etc files, if present.
     coverage: Arc<ci_core::analysis::coverage::CoverageData>,
     session_log: Arc<Mutex<SessionLog>>,
+    /// Serializes `edit_lines` write+reindex sequences — `rmcp` dispatches
+    /// tool calls concurrently, so without this two overlapping edits could
+    /// race on both the file (between atomic-write and the next read) and
+    /// the DB write connection. Not held by any read-only tool.
+    edit_lock: Arc<Mutex<()>>,
     preset: String,
 }
 
@@ -127,6 +133,8 @@ impl CodeIntelligenceServer {
         dependencies,
         path,
         edit_context,
+        edit_lines,
+        edit_symbol,
         session_context,
         diff_impact,
         indexing_status,
@@ -296,6 +304,7 @@ impl rmcp::ServerHandler for CodeIntelligenceServer {
 #[cfg(test)]
 mod tests {
     use super::common::*;
+    use super::edit::*;
     use super::guardrails::*;
     use super::inspect::*;
     use super::locate::*;
@@ -371,6 +380,16 @@ mod tests {
             "edit_context",
             CodeIntelligenceServer::edit_context_tool_attr(),
             &["symbol"],
+        );
+        assert_has_fields(
+            "edit_lines",
+            CodeIntelligenceServer::edit_lines_tool_attr(),
+            &["path", "edits", "confirm"],
+        );
+        assert_has_fields(
+            "edit_symbol",
+            CodeIntelligenceServer::edit_symbol_tool_attr(),
+            &["symbol", "new_text"],
         );
         assert_has_fields(
             "diff_impact",
@@ -2733,6 +2752,263 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["notes"].as_array().unwrap().len(), 0);
         assert!(v.get("error").is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------
+    // edit_lines / edit_symbol
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn edit_lines_preview_without_hash_writes_nothing() {
+        let (dir, server) = test_server("edit_preview");
+        std::fs::write(dir.join("a.py"), "def helper():\n    return 1\n").unwrap();
+
+        let out = server.edit_lines(EditLinesParams {
+            path: "a.py".into(),
+            edits: vec![EditHunkParam {
+                start_line: 2,
+                end_line: 2,
+                expected_hash: None,
+                new_text: "    return 2\n".into(),
+            }],
+            confirm: false,
+        });
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["applied"], false);
+        assert_eq!(v["hunks"][0]["status"], "preview");
+        assert!(!v["hunks"][0]["current_hash"].as_str().unwrap().is_empty());
+
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.py")).unwrap(),
+            "def helper():\n    return 1\n",
+            "preview must not touch the file"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_lines_conflict_on_stale_hash_writes_nothing() {
+        let (dir, server) = test_server("edit_conflict");
+        std::fs::write(dir.join("a.py"), "def helper():\n    return 1\n").unwrap();
+
+        let out = server.edit_lines(EditLinesParams {
+            path: "a.py".into(),
+            edits: vec![EditHunkParam {
+                start_line: 2,
+                end_line: 2,
+                expected_hash: Some("deadbeefdeadbeef".into()),
+                new_text: "    return 2\n".into(),
+            }],
+            confirm: false,
+        });
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["applied"], false);
+        assert_eq!(v["hunks"][0]["status"], "conflict");
+
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.py")).unwrap(),
+            "def helper():\n    return 1\n"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_lines_applies_writes_file_and_reindexes() {
+        let (dir, server) = test_server("edit_apply");
+        std::fs::write(dir.join("a.py"), "def helper():\n    return 1\n").unwrap();
+        let hash = ci_core::edit::range_checksum("def helper():\n    return 1\n", 2, 2).unwrap();
+
+        let out = server.edit_lines(EditLinesParams {
+            path: "a.py".into(),
+            edits: vec![EditHunkParam {
+                start_line: 2,
+                end_line: 2,
+                expected_hash: Some(hash),
+                new_text: "    return 2\n".into(),
+            }],
+            confirm: false,
+        });
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["applied"], true, "response: {v}");
+        assert_eq!(v["hunks"][0]["status"], "applied");
+        assert_eq!(v["hunks"][0]["old_text"], "    return 1\n");
+        assert_eq!(v["parse_status"], "clean");
+
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.py")).unwrap(),
+            "def helper():\n    return 2\n"
+        );
+
+        // Reindex ran synchronously — the DB must already reflect the edit,
+        // not require waiting on the file watcher's debounce.
+        let conn = server.db();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM symbols WHERE qualified_name = 'a.py::helper'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_lines_rejects_syntax_error_before_writing() {
+        let (dir, server) = test_server("edit_syntax_err");
+        std::fs::write(dir.join("a.py"), "def helper():\n    return 1\n").unwrap();
+        let hash = ci_core::edit::range_checksum("def helper():\n    return 1\n", 2, 2).unwrap();
+
+        let out = server.edit_lines(EditLinesParams {
+            path: "a.py".into(),
+            edits: vec![EditHunkParam {
+                start_line: 2,
+                end_line: 2,
+                expected_hash: Some(hash),
+                new_text: "    return (\n".into(), // unbalanced paren — syntax error
+            }],
+            confirm: false,
+        });
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["error"]["code"], "PARSE_ERROR");
+
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.py")).unwrap(),
+            "def helper():\n    return 1\n",
+            "a rejected parse-error edit must never touch disk"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_lines_requires_confirm_for_hub_symbol() {
+        let (dir, server) = test_server("edit_confirm_gate");
+        std::fs::write(dir.join("a.py"), "def helper():\n    return 1\n").unwrap();
+        let hash = ci_core::edit::range_checksum("def helper():\n    return 1\n", 2, 2).unwrap();
+
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.py::helper', 'helper', 'function', 'python', 'a.py', 1, 2, '', '', 'helper', 0, 1, 0)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let without_confirm = server.edit_lines(EditLinesParams {
+            path: "a.py".into(),
+            edits: vec![EditHunkParam {
+                start_line: 2,
+                end_line: 2,
+                expected_hash: Some(hash.clone()),
+                new_text: "    return 2\n".into(),
+            }],
+            confirm: false,
+        });
+        let v: serde_json::Value = serde_json::from_str(&without_confirm).unwrap();
+        assert_eq!(v["error"]["code"], "CONFIRM_REQUIRED", "response: {v}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.py")).unwrap(),
+            "def helper():\n    return 1\n"
+        );
+
+        let with_confirm = server.edit_lines(EditLinesParams {
+            path: "a.py".into(),
+            edits: vec![EditHunkParam {
+                start_line: 2,
+                end_line: 2,
+                expected_hash: Some(hash),
+                new_text: "    return 2\n".into(),
+            }],
+            confirm: true,
+        });
+        let v: serde_json::Value = serde_json::from_str(&with_confirm).unwrap();
+        assert_eq!(v["applied"], true, "response: {v}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.py")).unwrap(),
+            "def helper():\n    return 2\n"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_lines_multi_hunk_batch_applies_bottom_up() {
+        let (dir, server) = test_server("edit_multi_hunk");
+        let content = "def a():\n    return 1\n\n\ndef b():\n    return 2\n";
+        std::fs::write(dir.join("m.py"), content).unwrap();
+
+        let hash_a = ci_core::edit::range_checksum(content, 2, 2).unwrap();
+        let hash_b = ci_core::edit::range_checksum(content, 6, 6).unwrap();
+
+        let out = server.edit_lines(EditLinesParams {
+            path: "m.py".into(),
+            edits: vec![
+                EditHunkParam {
+                    start_line: 2,
+                    end_line: 2,
+                    expected_hash: Some(hash_a),
+                    new_text: "    return 10\n".into(),
+                },
+                EditHunkParam {
+                    start_line: 6,
+                    end_line: 6,
+                    expected_hash: Some(hash_b),
+                    new_text: "    return 20\n".into(),
+                },
+            ],
+            confirm: false,
+        });
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["applied"], true, "response: {v}");
+
+        assert_eq!(
+            std::fs::read_to_string(dir.join("m.py")).unwrap(),
+            "def a():\n    return 10\n\n\ndef b():\n    return 20\n"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_symbol_resolves_and_replaces_whole_body() {
+        let (dir, server) = test_server("edit_symbol_basic");
+        std::fs::write(dir.join("a.py"), "def helper():\n    return 1\n").unwrap();
+
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.py::helper', 'helper', 'function', 'python', 'a.py', 1, 2, '', '', 'helper', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        }
+        let hash = ci_core::edit::range_checksum("def helper():\n    return 1\n", 1, 2).unwrap();
+
+        let out = server.edit_symbol(EditSymbolParams {
+            symbol: "helper".into(),
+            path: None,
+            line: None,
+            expected_hash: Some(hash),
+            new_text: "def helper():\n    return 42\n".into(),
+            confirm: false,
+        });
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["applied"], true, "response: {v}");
+        assert_eq!(v["path"], "a.py");
+
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.py")).unwrap(),
+            "def helper():\n    return 42\n"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

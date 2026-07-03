@@ -1,6 +1,7 @@
 pub mod analysis;
 pub mod config;
 pub mod db;
+pub mod edit;
 pub mod embedding;
 pub mod fitness;
 pub mod gitignore;
@@ -10,3 +11,4 @@ pub mod resolver;
 pub mod sanitize;
 pub mod search;
 pub mod types;
+pub mod walk;

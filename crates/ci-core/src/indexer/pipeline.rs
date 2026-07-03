@@ -15,18 +15,6 @@ use crate::indexer::parser::{
 };
 use crate::types::EdgeConfidence;
 
-/// Built-in directories never descended into during a project scan.
-/// These are always ignored regardless of user config.
-const IGNORE_DIRS: &[&str] = &[
-    "target",
-    "node_modules",
-    "dist",
-    "build",
-    "__pycache__",
-    "venv",
-    "legacy",
-];
-
 /// Maximum number of same-named symbols a call may resolve to before it is
 /// dropped as too ambiguous (conservative).
 const MAX_CALLEE_CANDIDATES: usize = 20;
@@ -36,52 +24,26 @@ const MAX_CALLEE_CANDIDATES: usize = 20;
 /// parsed-but-not-yet-persisted files instead of an entire large repo.
 const PARSE_BATCH_SIZE: usize = 1000;
 
-/// Return true if `name` matches any pattern in `patterns`.
-/// Supports `*.ext` glob (file extension matching) and exact name matching.
-fn matches_ignore_pattern(name: &str, patterns: &[String]) -> bool {
-    patterns.iter().any(|p| {
-        if let Some(ext) = p.strip_prefix("*.") {
-            name.ends_with(&format!(".{ext}"))
-        } else {
-            p == name
-        }
-    })
-}
-
 /// A persisted call site loaded for graph rebuild:
 /// (from_path, enclosing_qn, callee_name, call_line, confidence, target_class).
 type CallSiteRow = (String, String, String, Option<i64>, String, Option<String>);
 
-/// Recursively collect tier-0 source files under `root`, skipping built-in
-/// ignored directories, dot-prefixed directories, and any user-configured
-/// `ignore` patterns. Deterministic order is imposed by the caller.
+/// Collect tier-0 source files under `root` via the shared `crate::walk`
+/// walker (built-in `IGNORE_DIRS`, dot-directories, user-configured `ignore`
+/// patterns, and real `.gitignore`), filtered down to extensions
+/// `language_for_extension` recognizes. Deterministic order is imposed by
+/// the caller.
 pub fn collect_source_files(root: &Path, ignore: &[String], out: &mut Vec<PathBuf>) {
-    let entries = match std::fs::read_dir(root) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Ok(ft) = entry.file_type() else { continue };
-        if ft.is_dir() {
-            if let Some(name) = path.file_name().and_then(|n| n.to_str())
-                && (name.starts_with('.')
-                    || IGNORE_DIRS.contains(&name)
-                    || matches_ignore_pattern(name, ignore))
-            {
-                continue;
-            }
-            collect_source_files(&path, ignore, out);
-        } else if ft.is_file() {
-            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if matches_ignore_pattern(name, ignore) {
-                continue;
-            }
-            if let Some(ext) = path.extension().and_then(|e| e.to_str())
-                && language_for_extension(ext).is_some()
-            {
-                out.push(path);
-            }
+    for result in crate::walk::build_walker(root, ignore) {
+        let Ok(entry) = result else { continue };
+        if !entry.file_type().is_some_and(|t| t.is_file()) {
+            continue;
+        }
+        let path = entry.into_path();
+        if let Some(ext) = path.extension().and_then(|e| e.to_str())
+            && language_for_extension(ext).is_some()
+        {
+            out.push(path);
         }
     }
 }
@@ -91,8 +53,9 @@ pub fn collect_source_files(root: &Path, ignore: &[String], out: &mut Vec<PathBu
 /// persisted `file_index.hash` column meant a toolchain upgrade could
 /// invalidate every cached hash and force a full re-parse. FNV-1a has a
 /// fixed, documented algorithm so the same content always hashes the same
-/// way regardless of toolchain.
-fn hash_content(s: &str) -> String {
+/// way regardless of toolchain. `pub` so `crate::edit` can reuse it as the
+/// same stale-write conflict guard for arbitrary line ranges.
+pub fn hash_content(s: &str) -> String {
     const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
     const FNV_PRIME: u64 = 0x100000001b3;
     let mut h = FNV_OFFSET_BASIS;
@@ -960,15 +923,6 @@ mod tests {
         let s = "def hello():\n    pass\n";
         assert_eq!(hash_content(s), hash_content(s));
         assert_ne!(hash_content(s), hash_content("different content"));
-    }
-
-    #[test]
-    fn test_matches_ignore_pattern() {
-        let patterns = vec!["vendor".to_string(), "*.min.js".to_string()];
-        assert!(matches_ignore_pattern("vendor", &patterns));
-        assert!(matches_ignore_pattern("app.min.js", &patterns));
-        assert!(!matches_ignore_pattern("vendors", &patterns));
-        assert!(!matches_ignore_pattern("app.js", &patterns));
     }
 
     #[test]

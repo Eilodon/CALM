@@ -27,6 +27,7 @@ impl CodeIntelligenceServer {
             embed_status: Arc::new(RwLock::new(EmbedStatus::Disabled)),
             coverage: Arc::new(coverage),
             session_log: Arc::new(Mutex::new(SessionLog::default())),
+            edit_lock: Arc::new(Mutex::new(())),
             preset,
         })
     }
@@ -223,6 +224,8 @@ pub(crate) fn preset_tools(preset: &str) -> Option<&'static [&'static str]> {
             "callers",
             "callees",
             "edit_context",
+            "edit_lines",
+            "edit_symbol",
             "diff_impact",
             "indexing_status",
         ]),
@@ -633,6 +636,21 @@ pub(crate) fn transitive_bfs(
     }
 
     (results, capped)
+}
+
+/// Shared caller-count risk tiering used by `edit_context`, `diff_impact`,
+/// and `edit_lines`/`edit_symbol`'s risk gate — previously three independent
+/// copies of the same `>10`/`>3` thresholds had drifted apart as separate
+/// inline `if`/`else` chains. Centralized here so all three read the same
+/// policy and can't silently diverge again.
+pub(crate) fn risk_level_from_caller_count(caller_count: i64) -> &'static str {
+    if caller_count > 10 {
+        "high"
+    } else if caller_count > 3 {
+        "medium"
+    } else {
+        "low"
+    }
 }
 
 const CALL_SITE_PREVIEW_MAX_CHARS: usize = 160;

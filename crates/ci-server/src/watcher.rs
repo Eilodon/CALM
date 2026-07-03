@@ -113,6 +113,13 @@ pub fn run_watch_loop(
 
         match rusqlite::Connection::open(&db_path) {
             Ok(mut conn) => {
+                // A concurrent `edit_lines` write briefly holds the DB's
+                // single-writer lock too (see tools/edit.rs) — without a
+                // busy_timeout here, an unlucky overlap fails outright with
+                // "database is locked" instead of just waiting it out.
+                if let Err(e) = conn.busy_timeout(std::time::Duration::from_secs(5)) {
+                    tracing::error!("File watcher: failed to set busy_timeout: {e}");
+                }
                 match ci_core::indexer::pipeline::reindex_changed(&mut conn, &project_root) {
                     Ok(s) if !s.is_noop() => {
                         tracing::info!(

@@ -28,6 +28,19 @@ impl CodeIntelligenceServer {
             self.track_symbol(&c.qualified_name);
             self.track_file(&c.path);
 
+            // For edit_lines/edit_symbol's expected_hash — computed the same
+            // way apply_hunks hashes a range, so this checksum is directly
+            // usable without a separate round trip to learn it.
+            let range_checksum = std::fs::read_to_string(self.project_root.join(&c.path))
+                .ok()
+                .and_then(|content| {
+                    ci_core::edit::range_checksum(
+                        &content,
+                        c.line_start as usize,
+                        c.line_end as usize,
+                    )
+                });
+
             let callers: Vec<CallerEntry> = {
                 let mut stmt = conn
                     .prepare(
@@ -107,13 +120,7 @@ impl CodeIntelligenceServer {
                 .map(CoChangedFileOutput::from)
                 .collect();
 
-            let risk = if callers.len() > 10 {
-                Some("high".into())
-            } else if callers.len() > 3 {
-                Some("medium".into())
-            } else {
-                Some("low".into())
-            };
+            let risk = Some(risk_level_from_caller_count(callers.len() as i64).to_string());
 
             let trend = ci_core::fitness::compute_trend(
                 &conn,
@@ -131,6 +138,7 @@ impl CodeIntelligenceServer {
                 callers,
                 callees,
                 blast_radius,
+                range_checksum,
                 risk_assessment: risk,
                 trend,
                 co_changed_files,
@@ -299,13 +307,7 @@ impl CodeIntelligenceServer {
                                 )
                             };
 
-                        let base_level = if caller_count > 10 {
-                            "high"
-                        } else if caller_count > 3 {
-                            "medium"
-                        } else {
-                            "low"
-                        };
+                        let base_level = risk_level_from_caller_count(caller_count);
                         let mut reasons: Vec<String> = Vec::new();
                         let level = if is_new_symbol {
                             reasons.push(
@@ -501,6 +503,12 @@ pub(crate) struct EditContextOutput {
     pub(crate) callers: Vec<CallerEntry>,
     pub(crate) callees: Vec<CalleeEntry>,
     pub(crate) blast_radius: BlastRadiusInfo,
+    /// Hash of the symbol's current `[line_start, line_end]` — pass this
+    /// straight to `edit_lines`/`edit_symbol` as `expected_hash` to skip
+    /// the "learn the hash" preview round trip. Absent if the file
+    /// couldn't be read from disk.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) range_checksum: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) risk_assessment: Option<String>,
     /// Absent when there's no snapshot yet at least `EDIT_CONTEXT_TREND_LOOKBACK_DAYS`

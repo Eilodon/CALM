@@ -8,6 +8,9 @@ impl CodeIntelligenceServer {
     )]
     pub(crate) fn search(&self, #[tool(aggr)] p: SearchParams) -> String {
         self.timed_tool("search", || {
+            if p.kind == "grep" {
+                return self.search_grep_impl(&p);
+            }
             let kind = match p.kind.as_str() {
                 "symbol" => ci_core::types::SearchKind::Symbol,
                 "text" => ci_core::types::SearchKind::Text,
@@ -46,6 +49,7 @@ impl CodeIntelligenceServer {
                             line_end: r.line_end,
                             score: Some(r.score),
                             match_type: Some(r.match_type),
+                            snippet: r.snippet,
                         })
                         .collect();
                     let sn = if !results.is_empty() && kind_str == "symbol" {
@@ -78,6 +82,72 @@ impl CodeIntelligenceServer {
                 .unwrap_or_default(),
             }
         })
+    }
+
+    /// `search(kind="grep")` implementation — kept separate from the
+    /// DB-backed `ci_core::search::search` dispatch because it needs
+    /// `project_root` and walks the filesystem directly instead of
+    /// querying the index. See `ci_core::search::search_grep`.
+    fn search_grep_impl(&self, p: &SearchParams) -> String {
+        let conn = match self.make_read_conn() {
+            Ok(c) => c,
+            Err(e) => return format!(r#"{{"error": "db connection failed: {e}"}}"#),
+        };
+        let ignore_patterns = ci_core::config::load_config(&self.project_root)
+            .map(|c| c.ignore)
+            .unwrap_or_default();
+        match ci_core::search::search_grep(
+            &conn,
+            &self.project_root,
+            &p.query,
+            p.glob.as_deref(),
+            p.case_insensitive,
+            p.context,
+            &ignore_patterns,
+            p.limit,
+        ) {
+            Ok(output) => {
+                let results: Vec<SearchResultItem> = output
+                    .results
+                    .into_iter()
+                    .map(|r| SearchResultItem {
+                        name: r.name,
+                        path: r.path,
+                        kind: r.kind,
+                        line_start: r.line_start,
+                        line_end: r.line_end,
+                        score: Some(r.score),
+                        match_type: Some(r.match_type),
+                        snippet: r.snippet,
+                    })
+                    .collect();
+                let sn = if results.is_empty() {
+                    suggested_with_args(
+                        "search",
+                        "No grep matches — try hybrid for symbol/semantic recall instead",
+                        serde_json::json!({"kind": "hybrid"}),
+                    )
+                } else {
+                    None
+                };
+                serde_json::to_string_pretty(&SearchOutput {
+                    results,
+                    truncated: output.truncated,
+                    degraded: output.degraded,
+                    note: output.note,
+                    suggested_next: self.filter_sn(sn),
+                })
+                .unwrap_or_default()
+            }
+            Err(e) => serde_json::to_string_pretty(&SearchOutput {
+                results: vec![],
+                truncated: false,
+                degraded: true,
+                note: Some(format!("grep search error: {e}")),
+                suggested_next: None,
+            })
+            .unwrap_or_default(),
+        }
     }
 
     #[tool(
@@ -136,6 +206,7 @@ impl CodeIntelligenceServer {
                     line_end: r.line_end,
                     score: Some(r.score),
                     match_type: Some(r.match_type.clone()),
+                    snippet: r.snippet.clone(),
                 })
                 .collect();
 
@@ -283,15 +354,30 @@ pub(crate) struct ErrorDetail {
 pub(crate) struct SearchParams {
     pub(crate) query: String,
     /// One of `"symbol"` (default, name/signature match), `"text"` (FTS
-    /// over code body), `"file"` (path match), `"semantic"` (embedding
-    /// KNN — needs the `embeddings` feature and a ready index), or
-    /// `"hybrid"` (RRF fusion of text + symbol-identity + code-chunk
-    /// vectors). Any other value silently falls back to `"symbol"`.
+    /// over code body), `"file"` (path match — glob syntax like `*.md` or
+    /// `src/**` also works, otherwise plain substring), `"grep"` (real
+    /// regex over raw file content read from disk, including files the
+    /// indexer never parses — Cargo.toml, docs/*.md, etc.; see `glob`/
+    /// `case_insensitive`/`context`), `"semantic"` (embedding KNN — needs
+    /// the `embeddings` feature and a ready index), or `"hybrid"` (RRF
+    /// fusion of text + symbol-identity + code-chunk vectors). Any other
+    /// value silently falls back to `"symbol"`.
     #[serde(default = "default_symbol")]
     pub(crate) kind: String,
     /// Max results to return. Default 10.
     #[serde(default = "default_limit")]
     pub(crate) limit: usize,
+    /// `kind="grep"` only: `query` is treated as a regex pattern by default
+    /// — set this to a glob (e.g. `"*.rs"`, `"docs/**"`) to restrict which
+    /// files are scanned.
+    pub(crate) glob: Option<String>,
+    /// `kind="grep"` only: case-insensitive regex match. Default `false`.
+    #[serde(default)]
+    pub(crate) case_insensitive: bool,
+    /// `kind="grep"` only: number of context lines shown before/after each
+    /// match in the returned snippet. Default 0.
+    #[serde(default)]
+    pub(crate) context: usize,
 }
 
 pub(crate) fn default_symbol() -> String {
@@ -316,6 +402,10 @@ pub(crate) struct SearchResultItem {
     pub(crate) score: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) match_type: Option<String>,
+    /// `kind="grep"` only: the matched line with `context` lines of
+    /// surrounding text, 1-indexed and marked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) snippet: Option<String>,
 }
 
 #[derive(Serialize, JsonSchema)]

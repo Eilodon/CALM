@@ -129,6 +129,7 @@ const FTS5_SQL: &str = "
 CREATE VIRTUAL TABLE IF NOT EXISTS fts_exact USING fts5(
     name,
     docstring,
+    signature,
     content='symbols',
     content_rowid='id',
     tokenize='unicode61'
@@ -144,25 +145,25 @@ CREATE VIRTUAL TABLE IF NOT EXISTS fts_tokens USING fts5(
 
 const TRIGGERS_SQL: &str = "
 CREATE TRIGGER IF NOT EXISTS symbols_ai AFTER INSERT ON symbols BEGIN
-    INSERT INTO fts_exact(rowid, name, docstring)
-        VALUES (new.id, new.name, new.docstring);
+    INSERT INTO fts_exact(rowid, name, docstring, signature)
+        VALUES (new.id, new.name, new.docstring, new.signature);
     INSERT INTO fts_tokens(rowid, name_tokens)
         VALUES (new.id, new.name_tokens);
 END;
 
 CREATE TRIGGER IF NOT EXISTS symbols_ad AFTER DELETE ON symbols BEGIN
-    INSERT INTO fts_exact(fts_exact, rowid, name, docstring)
-        VALUES ('delete', old.id, old.name, old.docstring);
+    INSERT INTO fts_exact(fts_exact, rowid, name, docstring, signature)
+        VALUES ('delete', old.id, old.name, old.docstring, old.signature);
     INSERT INTO fts_tokens(fts_tokens, rowid, name_tokens)
         VALUES ('delete', old.id, old.name_tokens);
 END;
 
 CREATE TRIGGER IF NOT EXISTS symbols_au
-    AFTER UPDATE OF name, docstring, name_tokens ON symbols BEGIN
-    INSERT INTO fts_exact(fts_exact, rowid, name, docstring)
-        VALUES ('delete', old.id, old.name, old.docstring);
-    INSERT INTO fts_exact(rowid, name, docstring)
-        VALUES (new.id, new.name, new.docstring);
+    AFTER UPDATE OF name, docstring, signature, name_tokens ON symbols BEGIN
+    INSERT INTO fts_exact(fts_exact, rowid, name, docstring, signature)
+        VALUES ('delete', old.id, old.name, old.docstring, old.signature);
+    INSERT INTO fts_exact(rowid, name, docstring, signature)
+        VALUES (new.id, new.name, new.docstring, new.signature);
     INSERT INTO fts_tokens(fts_tokens, rowid, name_tokens)
         VALUES ('delete', old.id, old.name_tokens);
     INSERT INTO fts_tokens(rowid, name_tokens)
@@ -208,6 +209,39 @@ fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
     migrate_add_column(conn, "call_sites", "receiver", "TEXT")?;
     migrate_add_column(conn, "call_sites", "target_class", "TEXT")?;
     conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_call_edges_to ON call_edges(to_symbol);")?;
+    migrate_fts_add_signature(conn)?;
+    Ok(())
+}
+
+/// FTS5 virtual tables reject `ALTER TABLE ADD COLUMN` (see
+/// `test_fts5_rejects_alter_table_add_column`), so unlike
+/// `migrate_add_column` this drops and recreates `fts_exact` — plus its
+/// three sync triggers, which also use `CREATE ... IF NOT EXISTS` and would
+/// otherwise silently keep their old (signature-unaware) bodies — before
+/// rebuilding `fts_exact`'s content from `symbols` via FTS5's `'rebuild'`
+/// command. On a fresh DB this is a no-op: `init_db` already creates
+/// `fts_exact` with `signature` from `FTS5_SQL` before migrations run.
+fn migrate_fts_add_signature(conn: &Connection) -> rusqlite::Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(fts_exact)")?;
+    let existing: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    if existing.iter().any(|c| c == "signature") {
+        return Ok(());
+    }
+
+    conn.execute_batch(
+        "DROP TRIGGER IF EXISTS symbols_ai;
+         DROP TRIGGER IF EXISTS symbols_ad;
+         DROP TRIGGER IF EXISTS symbols_au;
+         DROP TABLE IF EXISTS fts_exact;",
+    )?;
+    conn.execute_batch(FTS5_SQL)?;
+    conn.execute_batch(TRIGGERS_SQL)?;
+    conn.execute_batch("INSERT INTO fts_exact(fts_exact) VALUES ('rebuild');")?;
+    tracing::info!("Migration: rebuilt fts_exact with signature column");
     Ok(())
 }
 
@@ -369,5 +403,108 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    /// Locks in the reason `migrate_fts_add_signature` (below) uses a
+    /// drop-and-rebuild instead of `migrate_add_column`'s usual
+    /// `ALTER TABLE ADD COLUMN`: SQLite's FTS5 virtual tables reject
+    /// `ALTER TABLE` outright ("virtual tables may not be altered"), unlike
+    /// ordinary tables. If a future SQLite/rusqlite upgrade ever lifts this
+    /// restriction, this test will fail and the migration can be simplified.
+    #[test]
+    fn test_fts5_rejects_alter_table_add_column() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE t USING fts5(name, docstring, tokenize='unicode61');",
+        )
+        .unwrap();
+        let result = conn.execute_batch("ALTER TABLE t ADD COLUMN signature;");
+        assert!(
+            result.is_err(),
+            "FTS5 unexpectedly accepted ALTER TABLE ADD COLUMN — \
+             migrate_fts_add_signature's drop-and-rebuild can be simplified"
+        );
+    }
+
+    /// Simulates a DB created before `signature` was added to `fts_exact`
+    /// (old `FTS5_SQL`/`TRIGGERS_SQL` shape, hand-inlined here since the
+    /// live constants have since moved on) — a symbol with data already
+    /// exists, then `init_db` runs against it as an upgrade would. Confirms
+    /// the migration backfills existing rows (not just future inserts) and
+    /// that post-migration trigger sync still works.
+    #[test]
+    fn test_migrate_fts_add_signature_backfills_existing_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA_SQL).unwrap();
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE fts_exact USING fts5(
+                 name, docstring, content='symbols', content_rowid='id', tokenize='unicode61');
+             CREATE VIRTUAL TABLE fts_tokens USING fts5(
+                 name_tokens, content='symbols', content_rowid='id', tokenize='unicode61');
+             CREATE TRIGGER symbols_ai AFTER INSERT ON symbols BEGIN
+                 INSERT INTO fts_exact(rowid, name, docstring) VALUES (new.id, new.name, new.docstring);
+                 INSERT INTO fts_tokens(rowid, name_tokens) VALUES (new.id, new.name_tokens);
+             END;",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO symbols (qualified_name, name, kind, language, path, \
+             line_start, line_end, signature, name_tokens, indexed_at) \
+             VALUES ('mod.greet', 'greet', 'function', 'python', 'mod.py', 1, 3, \
+             'fn greet(who: Widgetronic) -> str', 'greet', 0.0)",
+            [],
+        )
+        .unwrap();
+
+        // Pre-migration: old fts_exact has no signature column at all.
+        let cols_before: Vec<String> = {
+            let mut stmt = conn.prepare("PRAGMA table_info(fts_exact)").unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(1))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect()
+        };
+        assert!(!cols_before.iter().any(|c| c == "signature"));
+
+        // init_db on an already-populated old-shape DB is the upgrade path.
+        init_db(&conn).unwrap();
+
+        let cols_after: Vec<String> = {
+            let mut stmt = conn.prepare("PRAGMA table_info(fts_exact)").unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(1))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect()
+        };
+        assert!(cols_after.iter().any(|c| c == "signature"));
+
+        // The pre-existing row's signature was backfilled by 'rebuild', not just
+        // rows inserted after the migration.
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM fts_exact WHERE fts_exact MATCH 'widgetronic'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "existing symbol's signature must be backfilled");
+
+        // Triggers still sync signature for a symbol inserted after migration.
+        conn.execute(
+            "INSERT INTO symbols (qualified_name, name, kind, language, path, \
+             line_start, line_end, signature, name_tokens, indexed_at) \
+             VALUES ('mod.farewell', 'farewell', 'function', 'python', 'mod.py', 5, 7, \
+             'fn farewell(who: Zorbex) -> str', 'farewell', 0.0)",
+            [],
+        )
+        .unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM fts_exact WHERE fts_exact MATCH 'zorbex'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "post-migration trigger must sync signature too");
     }
 }
