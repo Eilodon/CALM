@@ -4,7 +4,8 @@
 viết bằng Rust thuần, giúp AI coding agent (Claude Code, Cursor, v.v.) *hiểu* codebase thay vì chỉ
 grep text mù quáng. `ci` parse code bằng `tree-sitter`, dựng call graph + import graph có mức độ tin
 cậy rõ ràng, tính graph metrics (hub/coreness) để phát hiện các symbol "lõi" dễ vỡ khi sửa, và cung
-cấp full-text + semantic search — tất cả phục vụ qua 18 MCP tools, chạy local, không gọi ra ngoài.
+cấp full-text + semantic search + khả năng sửa file trực tiếp (hash-verified, risk-gated) — tất cả
+phục vụ qua 20 MCP tools, chạy local, không gọi ra ngoài.
 
 ## Vì sao cần cái này?
 
@@ -55,7 +56,9 @@ agent: "tôi cần sửa hàm getUserByEmail"
   → source("getUserByEmail")       # đọc đúng thân hàm, không flood context cả file
   → edit_context("getUserByEmail") # BẮT BUỘC trước khi sửa
       → 12 callers, risk_assessment=high → agent review từng caller trước khi đổi signature
-  → (sửa code)
+  → edit_symbol("getUserByEmail", expected_hash=..., new_text=...) # sửa trực tiếp, hoặc dùng tool edit khác
+      → risk_assessment=high, is_hub=true, không có confirm:true → bị từ chối kèm giải thích
+  → edit_symbol(..., confirm=true)  # xác nhận đã review xong, ghi thật + reindex ngay
   → diff_impact(staged=true)       # xác nhận blast radius trước khi commit
 ```
 
@@ -81,6 +84,19 @@ agent: "tôi cần sửa hàm getUserByEmail"
   định (`minishlab/potion-code-16M`, MIT license) được vendor sẵn vào binary lúc compile
   (`crates/ci-core/assets/potion-code-16m/`, qua Git LFS) — load model mặc định không cần mạng, chỉ
   model tuỳ biến qua `semantic_search.model` mới tải từ HuggingFace Hub.
+- **Grep/glob thật, quét trực tiếp trên đĩa** — `search(kind="grep")` dùng regex thật (crate `regex`)
+  + glob filter (`globset`) qua walker tôn trọng `.gitignore`/`.git/info/exclude` thật (crate
+  `ignore`), không qua FTS/DB nên phủ được cả file indexer không parse (`Cargo.toml`, `docs/*.md`).
+  Mỗi match được enrich thêm symbol bao quanh (nếu có) qua join ngược vào graph. `search(kind="file")`
+  cũng nhận glob pattern thật (`*.rs`, `src/**`), không chỉ substring như trước.
+- **Sửa file trực tiếp — `edit_lines`/`edit_symbol`** — line-range write tool duy nhất của `ci`, hoạt
+  động trên mọi file track được (không chỉ symbol đã parse). Conflict guard bằng hash nội dung
+  (FNV-1a) theo đúng range — sai hash bị từ chối và trả lại hash/nội dung hiện tại để đọc lại; nhiều
+  hunk trong 1 lệnh áp dụng bottom-up để không lệch offset giữa các hunk. Validate cú pháp bằng
+  tree-sitter **trước khi ghi đĩa** (từ chối nếu phát sinh lỗi cú pháp, không ghi gì). Sửa 1 symbol
+  `is_hub=true` hoặc >10 caller bị từ chối trừ khi có `confirm:true` — chính sách chỉ tool có call
+  graph mới làm được. Ghi file atomic (temp + fsync + rename) và reindex đồng bộ ngay sau khi ghi
+  (không đợi file watcher), response trả kèm risk/callers hậu-sửa như 1 `diff_impact` thu nhỏ.
 - **Index freshness minh bạch** — mọi response đều báo trạng thái index (`scanning → parsing →
   building_edges → ready`) để agent không tin nhầm dữ liệu cũ.
 - **Coverage-aware dead code** — tự detect lcov/`.coverage`/Go `coverage.out`/Cobertura XML khi
@@ -114,7 +130,7 @@ agent: "tôi cần sửa hàm getUserByEmail"
   → inferred → formal/StackGraph), graph algorithms (coreness, hub), FTS5/semantic search (2-layer:
   symbol identity + code-body chunks), analysis (hotspot/coverage/codeowners/diff_impact/dead_code),
   fitness metrics, gitignore management.
-- `crates/ci-server/` — MCP server (rmcp/stdio) phơi bày 18 tools + incremental file watcher.
+- `crates/ci-server/` — MCP server (rmcp/stdio) phơi bày 20 tools + incremental file watcher.
 - `crates/ci-cli/` — CLI: `ci init`, `ci index`, `ci serve`, `ci fitness-check`, `ci doctor`.
 
 ## CLI Reference
@@ -132,7 +148,7 @@ ci fitness-check --project-root . --json                      # output JSON
 ci fitness-check --project-root . --config thresholds.toml    # thresholds tùy chỉnh
 ```
 
-## 18 MCP Tools cho AI agents
+## 20 MCP Tools cho AI agents
 
 Hỗ trợ CLI presets lọc tool theo phase làm việc: `orient`, `trace`, `edit`, `compound`, `full`
 (mặc định) qua `ci serve --preset` hoặc field `preset` trong `config.json`. Mọi response đều kèm
@@ -145,7 +161,7 @@ Hỗ trợ CLI presets lọc tool theo phase làm việc: `orient`, `trace`, `ed
 | Locate | `locate`, `search`, `file_overview` |
 | Inspect | `source`, `symbol_info`, `understand` |
 | Trace | `callers`, `callees`, `path`, `dependencies` |
-| Edit | `edit_context` (bắt buộc trước khi sửa), `diff_impact` (bắt buộc trước khi commit) — hook-enforced dưới Claude Code, xem `.claude/hooks/ci-nudge.sh` |
+| Edit | `edit_context` (bắt buộc trước khi sửa), `edit_lines`/`edit_symbol` (write tool duy nhất — hash-verified, risk-gated), `diff_impact` (bắt buộc trước khi commit) — 2 mục đầu/cuối hook-enforced dưới Claude Code, xem `.claude/hooks/ci-nudge.sh` |
 | Recover | `session_context`, `remember`, `recall` |
 
 ### MCP Prompts — workflow đóng gói thành slash-command
@@ -205,8 +221,12 @@ reason = "core không được phụ thuộc server layer"
 - `compose.yaml` mẫu hardened (`read_only`, `cap_drop: ALL`, `no-new-privileges`, `pids_limit: 64`,
   `mem_limit: 256m`).
 - Repo dùng Git LFS cho `crates/ci-core/assets/potion-code-16m/*.safetensors` (~61MB) — cần
-  `git lfs install` trước khi clone để lấy đúng weight file (không có LFS, `git clone` vẫn chạy
-  được nhưng file đó chỉ là pointer text, build sẽ fail ở bước `include_bytes!`).
+  `git lfs install && git lfs pull` để lấy đúng weight file. Không có LFS, `git clone`/`cargo build`
+  vẫn chạy và **compile thành công** (`include_bytes!` chỉ nhúng byte thô, không parse) — nhưng file
+  đó chỉ là pointer text (~130 byte) thay vì model thật, nên lúc **runtime** việc load model sẽ fail
+  ("failed to parse safetensors"), `indexing_status` báo `embeddings_status: "failed"`, và
+  `search(kind="semantic"/"hybrid")` tự động degrade về FTS-only — không crash, nhưng semantic search
+  không hoạt động cho tới khi chạy `git lfs pull` rồi rebuild.
 
 ## Testing
 
