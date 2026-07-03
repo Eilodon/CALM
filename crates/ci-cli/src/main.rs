@@ -58,6 +58,15 @@ enum Commands {
         #[arg(long, default_value = ".")]
         project_root: PathBuf,
     },
+    /// Decode a `.scip` index file to JSON lines (hidden; used by the B2
+    /// call-graph-quality benchmark to get oracle occurrences without
+    /// duplicating SCIP protobuf parsing outside ci-core).
+    #[cfg(feature = "scip-overlay")]
+    #[command(hide = true)]
+    ScipDump {
+        /// Path to the .scip file produced by `rust-analyzer scip`
+        scip_path: PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -234,6 +243,25 @@ async fn main() -> Result<()> {
 
             if !result.passed {
                 std::process::exit(1);
+            }
+        }
+        #[cfg(feature = "scip-overlay")]
+        Commands::ScipDump { scip_path } => {
+            let occ = ci_core::scip::parse::parse_scip_file(&scip_path)?;
+            let stdout = std::io::stdout();
+            let mut w = stdout.lock();
+            for o in &occ {
+                serde_json::to_writer(
+                    &mut w,
+                    &serde_json::json!({
+                        "file": o.file,
+                        "line": o.line,
+                        "symbol": o.symbol,
+                        "is_def": o.is_def,
+                        "is_local": o.is_local,
+                    }),
+                )?;
+                std::io::Write::write_all(&mut w, b"\n")?;
             }
         }
         Commands::Init { project_root } => {
