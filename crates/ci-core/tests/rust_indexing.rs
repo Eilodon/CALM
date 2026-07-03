@@ -79,3 +79,23 @@ fn trait_method_declaration_is_a_symbol() {
         1
     );
 }
+
+#[test]
+fn constructor_binding_infers_receiver_type() {
+    let conn = index_fixture();
+    // `let e = Engine::new(); e.start()` -- e's type is inferred from the
+    // constructor, so the call resolves to Engine::start with >= inferred confidence.
+    let conf: String = conn
+        .query_row(
+            "SELECT edge_confidence FROM call_edges \
+             WHERE from_symbol = 'app/src/main.rs::main' \
+               AND to_symbol = 'core/src/engine.rs::Engine::start'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        matches!(conf.as_str(), "inferred" | "resolved" | "formal"),
+        "expected >= inferred, got {conf}"
+    );
+}

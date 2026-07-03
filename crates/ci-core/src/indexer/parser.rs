@@ -823,12 +823,65 @@ pub fn extract_type_map_from_tree(
                 map.insert(name, ty);
             }
         }
+        // Rust constructor inference: `let x = Foo::new(...)`, `Foo::default()`,
+        // or `Foo { .. }` binds x to type Foo even without a type annotation.
+        if language == "rust"
+            && node.kind() == "let_declaration"
+            && node.child_by_field_name("type").is_none()
+            && let Some(pat) = node.child_by_field_name("pattern")
+            && pat.kind() == "identifier"
+            && let Some(value) = node.child_by_field_name("value")
+            && let Some(ty) = rust_constructor_type(value, source)
+        {
+            map.insert(source[pat.byte_range()].to_string(), ty);
+        }
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
             stack.push(child);
         }
     }
     map
+}
+
+/// The type constructed by a Rust expression used as a `let` initializer:
+/// `Foo::new(..)` / `Foo::default()` / `Foo::with_x(..)` -> `Foo`;
+/// `Foo { .. }` (struct literal) -> `Foo`. Returns `None` for anything else.
+fn rust_constructor_type(value: tree_sitter::Node, source: &str) -> Option<String> {
+    match value.kind() {
+        // Foo::new(...) -- a call whose function is a scoped identifier.
+        "call_expression" => {
+            let func = value.child_by_field_name("function")?;
+            if func.kind() != "scoped_identifier" {
+                return None;
+            }
+            let path = func.child_by_field_name("path")?;
+            // The type is the last path segment before the associated fn name.
+            let seg = source[path.byte_range()].rsplit("::").next()?;
+            first_type_ident(seg)
+        }
+        // Foo { .. } -- struct literal names its type directly.
+        "struct_expression" => {
+            let name = value.child_by_field_name("name")?;
+            first_type_ident(&source[name.byte_range()])
+        }
+        _ => None,
+    }
+}
+
+/// Keep a leading UpperCamelCase type identifier from `seg` (drop generics etc.);
+/// returns None if it doesn't look type-like (avoids treating `foo::bar()` module
+/// calls as constructors).
+fn first_type_ident(seg: &str) -> Option<String> {
+    let ident: String = seg
+        .trim()
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect();
+    if ident.chars().next()?.is_uppercase() {
+        Some(ident)
+    } else {
+        None
+    }
 }
 
 /// `(name, type)` pairs from one typed binding node. Most languages bind a single
