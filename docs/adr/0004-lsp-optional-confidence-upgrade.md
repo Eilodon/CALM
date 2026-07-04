@@ -145,7 +145,8 @@ hướng đi khác. Đã implement đầy đủ cho Rust theo
 `docs/superskills/plans/2026-07-03-rust-support.md` (Phase A: nâng cấp resolver cú pháp thuần;
 Phase B: SCIP overlay), đối chiếu trực tiếp với 6 nguyên tắc ở Decision:
 
-1. **Opt-in, không bundle** — `rust.scip.enabled` trong `config.json`, mặc định `false`
+1. **Opt-in, không bundle — cập nhật thành auto-detect, xem "Update 2026-07-04 (2)" bên dưới.**
+   `rust.scip.enabled` trong `config.json` ban đầu là `bool` mặc định `false`
    (`crates/ci-core/src/config.rs::ScipConfig`) — cùng hình dạng với `lsp.go.enabled` ở Decision §1.
 2. **Detect-once, fail-silent** — `ci_core::scip::runner::resolve_binary` thử override/PATH/
    `rustup which`/VS Code extension một lần; không thấy hoặc spawn lỗi → trả `None`/`Err`, graph
@@ -185,6 +186,42 @@ nhắm tới thu hẹp (edge nâng lên `formal` sau khi bật `rust.scip.enable
 **trước** live-LSP pilot — cùng kết quả (nâng confidence có bằng chứng), ít trục vận hành hơn.
 Live-LSP (Pilot Plan Go/gopls ở trên) vẫn là con đường đúng cho ngôn ngữ không có SCIP indexer
 trưởng thành (ví dụ: Go hiện chưa có SCIP indexer chính thức trưởng thành tương đương).
+
+## Update 2026-07-04 (2): batch SCIP chuyển từ strict opt-in sang auto-detect
+
+Sau khi đo thực tế trên self-repo (bật overlay: 1.474 edge nâng lên `formal`, ~75% tổng số edge
+Rust có call-site — xem `benchmarks/b2_call_graph_quality/README.md`), quyết định nới nguyên tắc
+§1 (Opt-in, không bundle) **chỉ cho batch SCIP**, không áp dụng ngược lại cho live-LSP (Pilot Plan
+Go/gopls ở trên vẫn giữ nguyên strict opt-in — lý do khác nhau về bản chất, xem bên dưới).
+
+`rust.scip.enabled` đổi từ `bool` sang ba trạng thái (`Option<bool>`,
+`crates/ci-core/src/config.rs::ScipConfig`):
+
+- **Không set / `null` (mặc định)**: auto-detect — tự chạy overlay khi `rust-analyzer` có sẵn trên
+  `PATH`/rustup/VS Code, im lặng bỏ qua (không log) khi không thấy — đây là trường hợp phổ biến
+  nhất (checkout chưa từng cấu hình gì) nên không đáng 1 dòng log mỗi phiên.
+- **`true`**: ép bật — cùng cơ chế dò tìm, nhưng log 1 lần ở mức `info` nếu không thấy binary, vì
+  user đã chủ động yêu cầu nên đáng được biết vì sao thành no-op.
+- **`false`**: ép tắt — không dò tìm binary luôn.
+
+Tương thích ngược 100% với config cũ: `{"enabled": true}` / `{"enabled": false}` vẫn parse đúng
+thành `Some(true)`/`Some(false)`; chỉ có trường hợp *không nhắc tới key này* là đổi hành vi (trước:
+tắt hẳn; nay: auto-detect).
+
+**Vì sao chỉ nới cho batch SCIP, không nới nguyên tắc opt-in nói chung**: 3 lý do phân biệt batch
+SCIP với live-LSP (Decision §6 đã tự phân nhóm 2 thứ này khác nhau):
+
+1. Không có subprocess sống — dò tìm binary chỉ là 1 lần `which`-style probe (`runner::resolve_binary`),
+   không phải spawn một server rồi giữ sống suốt phiên như live-LSP. Rủi ro vận hành khi "tự bật" is
+   thấp hơn nhiều bậc.
+2. Timeout cứng có sẵn (`SCIP_TIMEOUT` = 120s, cache theo lockfile hash) — tự bật không có nghĩa là
+   tự chấp nhận rủi ro treo vô thời hạn.
+3. Additive-only theo §3 vẫn nguyên vẹn — tự bật chỉ có thể *thêm* bằng chứng (`formal`/
+   `ruled_out_by_scip`), không bao giờ đổi hành vi graph cơ sở nếu overlay thất bại/không chạy.
+
+Live-LSP (Go/gopls) không có cả 3 đặc điểm này (subprocess sống, giám sát version-drift, chưa đo
+go/no-go) nên **vẫn giữ nguyên strict opt-in** như Decision §1 quy định — nới lỏng này không phải
+tiền lệ cho live-LSP.
 
 ## Consequences
 

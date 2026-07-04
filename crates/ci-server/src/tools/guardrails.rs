@@ -45,7 +45,7 @@ impl CodeIntelligenceServer {
                 let mut stmt = conn
                     .prepare(
                         "SELECT from_symbol, from_path, edge_confidence, call_site_line
-                         FROM call_edges WHERE to_symbol = ?1",
+                         FROM call_edges WHERE to_symbol = ?1 AND ruled_out_by_scip = 0",
                     )
                     .unwrap();
                 stmt.query_map(rusqlite::params![c.qualified_name], |row| {
@@ -68,7 +68,7 @@ impl CodeIntelligenceServer {
                 let mut stmt = conn
                     .prepare(
                         "SELECT to_symbol, to_path, edge_confidence, call_site_line
-                         FROM call_edges WHERE from_symbol = ?1",
+                         FROM call_edges WHERE from_symbol = ?1 AND ruled_out_by_scip = 0",
                     )
                     .unwrap();
                 let from_path = c.path.clone();

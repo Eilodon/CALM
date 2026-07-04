@@ -114,7 +114,11 @@ pub async fn serve_stdio_with_preset(
                     .map(|c| c.rust)
                     .unwrap_or_default();
                 match ci_core::scip::run_overlay(&conn, &indexer_root, &rust_cfg) {
-                    Ok(n) if n > 0 => tracing::info!("SCIP overlay: {n} edges upgraded"),
+                    Ok(stats) if stats.upgraded > 0 || stats.ruled_out > 0 => tracing::info!(
+                        "SCIP overlay: {} edges upgraded, {} fan-out siblings ruled out",
+                        stats.upgraded,
+                        stats.ruled_out
+                    ),
                     Ok(_) => {}
                     Err(e) => tracing::warn!("SCIP overlay error (base graph intact): {e}"),
                 }

@@ -26,7 +26,7 @@ impl CodeIntelligenceServer {
                 let mut stmt = conn
                     .prepare(
                         "SELECT from_symbol, from_path, edge_confidence, call_site_line
-                         FROM call_edges WHERE to_symbol = ?1",
+                         FROM call_edges WHERE to_symbol = ?1 AND ruled_out_by_scip = 0",
                     )
                     .unwrap();
                 stmt.query_map(rusqlite::params![c.qualified_name], |row| {
@@ -136,7 +136,7 @@ impl CodeIntelligenceServer {
                 let mut stmt = conn
                     .prepare(
                         "SELECT to_symbol, to_path, edge_confidence, call_site_line
-                         FROM call_edges WHERE from_symbol = ?1",
+                         FROM call_edges WHERE from_symbol = ?1 AND ruled_out_by_scip = 0",
                     )
                     .unwrap();
                 // The call site lives in the symbol being inspected (`c.path`),
@@ -299,6 +299,47 @@ impl CodeIntelligenceServer {
                 .collect()
             };
 
+            // Glob re-export dependents: files that reach this file's symbols
+            // through exactly one `use other::*;` hop — e.g. `common.rs` has
+            // `use super::*;` and never names `Embedder` itself, but `super`
+            // (`tools.rs`) has its own `use ci_core::embedding::Embedder;`, so
+            // `common.rs` genuinely depends on this file even though no
+            // direct `import_edges` row names it. A glob import row is
+            // identified by `symbols_used = '[]'` (a glob names no specific
+            // item, unlike every other `use` form `parse_rust_import`
+            // produces) joined to a resolved, non-glob import from the same
+            // target back into this file. One hop only — a chain of two or
+            // more globs (`use a::*` re-exporting `use b::*`) is not walked;
+            // that's a real gap but a much rarer pattern than the one-hop
+            // case this closes, and unbounded chain-following risks the same
+            // combinatorial blowup depth caps elsewhere in this file exist to
+            // avoid.
+            let glob_reexport_dependents: Vec<String> = {
+                let mut already: std::collections::HashSet<String> =
+                    imported_by.iter().map(|e| e.from_path.clone()).collect();
+                already.extend(call_dependents.iter().cloned());
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT DISTINCT g.from_path FROM import_edges g \
+                         JOIN import_edges d ON d.from_path = g.to_path \
+                         WHERE g.symbols_used = '[]' \
+                           AND g.to_path IS NOT NULL AND g.to_path != '' \
+                           AND g.from_path != ?1 \
+                           AND d.to_path = ?1 \
+                           AND d.symbols_used != '[]' \
+                         ORDER BY g.from_path LIMIT ?2",
+                    )
+                    .unwrap();
+                stmt.query_map(
+                    rusqlite::params![p.path, dep_config.max_imported_by as i64],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .filter(|f| !already.contains(f))
+                .collect()
+            };
+
             let sn = if imported_by.len() > 20 {
                 suggested("callers", "High fan-in — check symbol blast radius")
             } else {
@@ -311,6 +352,7 @@ impl CodeIntelligenceServer {
                 imported_by,
                 imported_by_truncated,
                 call_dependents,
+                glob_reexport_dependents,
                 suggested_next: self.filter_sn(sn),
             })
             .unwrap_or_default()
@@ -538,6 +580,10 @@ pub(crate) struct DependenciesOutput {
     /// complements the import graph, does not replace it.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) call_dependents: Vec<String>,
+    /// Files that reach this file's symbols through exactly one `use other::*;`
+    /// hop — see the doc comment where this is computed in `dependencies`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) glob_reexport_dependents: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) suggested_next: Option<SuggestedNext>,
 }

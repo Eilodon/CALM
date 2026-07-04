@@ -917,6 +917,25 @@ pub fn extract_type_map_from_tree(
         {
             map.insert(source[pat.byte_range()].to_string(), ty);
         }
+        // Rust reassignment inference: `let mut x;` declares `x` with no
+        // initializer (so the `let_declaration` case above never fires), and
+        // its type only becomes apparent at a later `x = Foo::Variant;` /
+        // `x = Foo::new(..);` assignment — typically one arm of an `if`/`match`
+        // that builds up a state-machine-style value across branches (e.g.
+        // this crate's own `EdgeConfidence` confidence variable in
+        // `pipeline.rs::extract_file_data`). Every matching assignment for the
+        // same `x` inserts the same type, which is what makes this safe across
+        // multiple branches: whichever one the walk visits first or last,
+        // `map[x]` ends up the same value.
+        if language == "rust"
+            && node.kind() == "assignment_expression"
+            && let Some(lhs) = node.child_by_field_name("left")
+            && lhs.kind() == "identifier"
+            && let Some(rhs) = node.child_by_field_name("right")
+            && let Some(ty) = rust_constructor_type(rhs, source)
+        {
+            map.insert(source[lhs.byte_range()].to_string(), ty);
+        }
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
             stack.push(child);
@@ -925,9 +944,11 @@ pub fn extract_type_map_from_tree(
     map
 }
 
-/// The type constructed by a Rust expression used as a `let` initializer:
-/// `Foo::new(..)` / `Foo::default()` / `Foo::with_x(..)` -> `Foo`;
-/// `Foo { .. }` (struct literal) -> `Foo`. Returns `None` for anything else.
+/// The type constructed by a Rust expression used as a `let` initializer (or,
+/// via `assignment_expression` in `extract_type_map_from_tree`, a later
+/// reassignment): `Foo::new(..)` / `Foo::default()` / `Foo::with_x(..)` ->
+/// `Foo`; `Foo { .. }` (struct literal) -> `Foo`; a bare enum-variant path
+/// `Foo::Variant` (no call parens) -> `Foo`. Returns `None` for anything else.
 fn rust_constructor_type(value: tree_sitter::Node, source: &str) -> Option<String> {
     match value.kind() {
         // Foo::new(...) -- a call whose function is a scoped identifier.
@@ -945,6 +966,15 @@ fn rust_constructor_type(value: tree_sitter::Node, source: &str) -> Option<Strin
         "struct_expression" => {
             let name = value.child_by_field_name("name")?;
             first_type_ident(&source[name.byte_range()])
+        }
+        // Foo::Variant -- a bare enum-variant path used as a value (no call
+        // parens), e.g. `confidence = EdgeConfidence::Inferred;`. Same
+        // last-segment-before-`::` extraction as the call case above, just
+        // without a `function`/`call_expression` wrapper to unwrap first.
+        "scoped_identifier" => {
+            let path = value.child_by_field_name("path")?;
+            let seg = source[path.byte_range()].rsplit("::").next()?;
+            first_type_ident(seg)
         }
         _ => None,
     }
@@ -1462,6 +1492,29 @@ mod tests {
         assert_eq!(m.get("y"), Some(&"Foo".to_string()));
         // JavaScript has no static types.
         assert!(extract_type_map("function f(x) {}\n", "javascript").is_empty());
+    }
+
+    /// Regression for the `confidence.as_str()`-style gap: a `let mut x;`
+    /// with no initializer (so the `let_declaration` constructor-inference
+    /// branch never fires) only reveals its type at a later `x = Foo::Variant;`
+    /// assignment, often on more than one `if`/`else` branch. `assignment_expression`
+    /// must be walked the same way `let_declaration` already is, and a bare
+    /// enum-variant path (no call parens) must resolve via `rust_constructor_type`.
+    #[test]
+    fn test_type_map_infers_type_from_branch_reassignment_to_enum_variant() {
+        let code = r#"
+fn f(cond: bool) {
+    let mut confidence;
+    if cond {
+        confidence = EdgeConfidence::Inferred;
+    } else {
+        confidence = EdgeConfidence::Textual;
+    }
+    confidence.as_str();
+}
+"#;
+        let m = extract_type_map(code, "rust");
+        assert_eq!(m.get("confidence"), Some(&"EdgeConfidence".to_string()));
     }
 
     #[test]

@@ -2469,6 +2469,57 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Regression: `common.rs` has `use super::*;` and never names `Embedder`
+    /// itself — it only reaches it because `super` (`tools.rs`) has its own
+    /// `use ci_core::embedding::Embedder;`. The direct `imported_by` query
+    /// (exact `to_path` match) cannot see this; `glob_reexport_dependents`
+    /// closes the one-hop case.
+    #[test]
+    fn dependencies_reports_glob_reexport_dependents_absent_from_imports() {
+        let dir = std::env::temp_dir().join(format!("ci_deps_globdep_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
+        {
+            let conn = server.db();
+            // common.rs: `use super::*;` — glob, names nothing specific.
+            conn.execute(
+                "INSERT INTO import_edges (from_path, to_path, module_name, symbols_used)
+                 VALUES ('tools/common.rs', 'tools.rs', 'super', '[]')",
+                [],
+            )
+            .unwrap();
+            // tools.rs: `use ci_core::embedding::Embedder;` — resolved, named.
+            conn.execute(
+                "INSERT INTO import_edges (from_path, to_path, module_name, symbols_used)
+                 VALUES ('tools.rs', 'embedding.rs', 'ci_core::embedding', '[\"Embedder\"]')",
+                [],
+            )
+            .unwrap();
+        }
+        let output = server.dependencies(DependenciesParams {
+            path: "embedding.rs".into(),
+        });
+        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+        let glob_deps: Vec<String> = v["glob_reexport_dependents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            glob_deps.contains(&"tools/common.rs".to_string()),
+            "one-hop glob re-export dependent must be reported"
+        );
+        assert!(
+            !glob_deps.contains(&"tools.rs".to_string()),
+            "tools.rs already has a direct import_edges row into embedding.rs — not duplicated"
+        );
+        assert_eq!(v["imported_by"][0]["from_path"], "tools.rs");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Regression for Task 15: `dependencies` had no config knob bounding
     /// `imports`/`imported_by` size — a hub file's fan-in list was unbounded.
     #[test]

@@ -87,10 +87,23 @@ pub struct RustConfig {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ScipConfig {
-    /// Off by default. When true and `rust-analyzer` is detectable, the batch
-    /// SCIP overlay upgrades Rust call edges to `formal` confidence after the
-    /// syntactic index reaches `ready`.
-    pub enabled: bool,
+    /// Three-state, not a plain bool, so "unset" is distinguishable from an
+    /// explicit choice:
+    /// - unset / `null` (the default — `None`): auto-detect. The overlay
+    ///   runs when `rust-analyzer` is found on `PATH`/rustup/VS Code, and is
+    ///   silently skipped (no log line — this is the expected, common case
+    ///   for a checkout without it) when it isn't. No config needed either
+    ///   way.
+    /// - `true`: force on. Same auto-detect binary search, but logs once at
+    ///   `info` if `rust-analyzer` isn't found, since the user explicitly
+    ///   asked for this and would want to know why it's a no-op.
+    /// - `false`: force off. Never even probes for the binary.
+    ///
+    /// Backward compatible with the old plain-`bool` shape: existing configs
+    /// with `"enabled": true` or `"enabled": false` still deserialize to
+    /// `Some(true)`/`Some(false)` — only a config that never mentioned the
+    /// key at all changes behavior (was off, is now auto-detect).
+    pub enabled: Option<bool>,
     /// Optional explicit rust-analyzer binary path (else auto-detect).
     pub binary: Option<String>,
 }
@@ -403,15 +416,25 @@ mod scip_config_tests {
     use super::*;
 
     #[test]
-    fn rust_scip_defaults_off() {
+    fn rust_scip_defaults_to_auto_detect_not_forced_on() {
         let c = Config::default();
-        assert!(!c.rust.scip.enabled, "SCIP overlay must be off by default");
+        assert_eq!(
+            c.rust.scip.enabled, None,
+            "unset must mean auto-detect, not an explicit true/false"
+        );
     }
 
     #[test]
     fn rust_scip_opt_in_parses() {
         let json = r#"{"rust":{"scip":{"enabled":true}}}"#;
         let c: Config = serde_json::from_str(json).unwrap();
-        assert!(c.rust.scip.enabled);
+        assert_eq!(c.rust.scip.enabled, Some(true));
+    }
+
+    #[test]
+    fn rust_scip_opt_out_parses() {
+        let json = r#"{"rust":{"scip":{"enabled":false}}}"#;
+        let c: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(c.rust.scip.enabled, Some(false));
     }
 }

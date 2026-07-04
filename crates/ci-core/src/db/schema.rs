@@ -231,6 +231,23 @@ fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
         "INTEGER NOT NULL DEFAULT 0",
     )?;
     conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_call_edges_to ON call_edges(to_symbol);")?;
+    // Set by the SCIP overlay (`ci_core::scip::ingest`) when a reference at a
+    // given call site is proven — via real type-checked evidence — to NOT be
+    // this edge's `to_symbol`: either another candidate in the same
+    // ambiguous fan-out group got upgraded to `formal`, or SCIP resolved the
+    // site to something outside the fan-out set entirely (e.g. a stdlib
+    // method). `edge_confidence` itself is left untouched (still 'ambiguous')
+    // — this is an orthogonal, additive annotation, not a downgrade of an
+    // existing rank, so it doesn't conflict with ADR-0004 §3's
+    // never-downgrade invariant. Query-side (`callers`/`callees`/
+    // `edit_context`) filters `ruled_out_by_scip = 0` to keep proven-wrong
+    // fan-out siblings out of the `ambiguous` bucket shown to the agent.
+    migrate_add_column(
+        conn,
+        "call_edges",
+        "ruled_out_by_scip",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
     migrate_fts_add_signature(conn)?;
     Ok(())
 }
