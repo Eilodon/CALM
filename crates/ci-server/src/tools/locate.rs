@@ -270,7 +270,7 @@ impl CodeIntelligenceServer {
                 None
             } else {
                 top.map(|t| {
-                    build_file_overview(&conn, &t.path)
+                    build_file_overview(&conn, &t.path, Some(LOCATE_FILE_OVERVIEW_SYMBOL_CAP))
                 })
             };
 
@@ -326,7 +326,7 @@ impl CodeIntelligenceServer {
                 Ok(c) => c,
                 Err(e) => return format!(r#"{{"error": "db connection failed: {e}"}}"#),
             };
-            let mut out = build_file_overview(&conn, &p.path);
+            let mut out = build_file_overview(&conn, &p.path, None);
 
             let hub_name: Option<String> = conn
                 .prepare("SELECT name FROM symbols WHERE path = ?1 AND is_hub = 1 LIMIT 1")
@@ -463,14 +463,29 @@ pub(crate) struct FileOverviewOutput {
     pub(crate) language: Option<String>,
     pub(crate) symbols: Vec<FileOverviewSymbol>,
     pub(crate) symbol_count: usize,
+    /// `true` when `symbols` was capped below `symbol_count` (only `locate`
+    /// caps; the `file_overview` tool always returns the full list).
+    pub(crate) symbols_truncated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) suggested_next: Option<SuggestedNext>,
 }
 
+/// Cap on how many symbols `locate` embeds from the top hit's `file_overview`.
+/// `locate` is a compound convenience where the overview is a bonus, so a large
+/// file must not flood the response; the standalone `file_overview` tool passes
+/// `None` for the complete list. `symbols_truncated` flags when this trims.
+const LOCATE_FILE_OVERVIEW_SYMBOL_CAP: usize = 40;
+
 /// Shared by the `file_overview` tool and `locate` (when the top result is a
 /// file match), so both surfaces build the same shape from the same query.
-pub(crate) fn build_file_overview(conn: &rusqlite::Connection, path: &str) -> FileOverviewOutput {
-    let symbols: Vec<FileOverviewSymbol> = {
+/// `max_symbols` caps the returned `symbols` list (setting `symbols_truncated`
+/// when it trims); `None` returns every symbol in the file.
+pub(crate) fn build_file_overview(
+    conn: &rusqlite::Connection,
+    path: &str,
+    max_symbols: Option<usize>,
+) -> FileOverviewOutput {
+    let mut symbols: Vec<FileOverviewSymbol> = {
         let mut stmt = conn
             .prepare(
                 "SELECT name, qualified_name, kind, line_start, line_end, \
@@ -504,11 +519,18 @@ pub(crate) fn build_file_overview(conn: &rusqlite::Connection, path: &str) -> Fi
         .ok();
 
     let symbol_count = symbols.len();
+    // `symbol_count` is the true file total; the visible `symbols` list may be
+    // capped below it (for `locate`), in which case `symbols_truncated` is set.
+    let symbols_truncated = matches!(max_symbols, Some(cap) if symbol_count > cap);
+    if let Some(cap) = max_symbols {
+        symbols.truncate(cap);
+    }
     FileOverviewOutput {
         path: path.to_string(),
         language,
         symbols,
         symbol_count,
+        symbols_truncated,
         suggested_next: None,
     }
 }
@@ -567,3 +589,44 @@ pub(crate) struct LocateOutput {
 // ---------------------------------------------------------------------------
 // Tool 15: hotspots
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    /// Regression for `locate`'s token cost: `build_file_overview` must cap the
+    /// symbol list when `max_symbols` is set (the `locate` path), reporting the
+    /// true `symbol_count` and flagging `symbols_truncated`; `None` (the
+    /// `file_overview` tool path) returns every symbol untrimmed.
+    #[test]
+    fn build_file_overview_caps_symbols_only_when_requested() {
+        let conn = Connection::open_in_memory().unwrap();
+        ci_core::db::schema::init_db(&conn).unwrap();
+        for i in 0..45 {
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES (?1, ?2, 'function', 'rust', 'big.rs', ?3, ?3, '', '', ?2, 0, 0, 0)",
+                rusqlite::params![format!("big.rs::f{i}"), format!("f{i}"), (i + 1) as i64],
+            )
+            .unwrap();
+        }
+
+        let capped = build_file_overview(&conn, "big.rs", Some(40));
+        assert_eq!(
+            capped.symbol_count, 45,
+            "symbol_count is the true file total"
+        );
+        assert_eq!(
+            capped.symbols.len(),
+            40,
+            "visible list capped to max_symbols"
+        );
+        assert!(capped.symbols_truncated);
+
+        let full = build_file_overview(&conn, "big.rs", None);
+        assert_eq!(full.symbol_count, 45);
+        assert_eq!(full.symbols.len(), 45, "no cap returns the full list");
+        assert!(!full.symbols_truncated);
+    }
+}

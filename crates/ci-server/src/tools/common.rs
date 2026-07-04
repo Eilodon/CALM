@@ -409,6 +409,13 @@ pub(crate) struct AmbiguousCandidate {
 #[derive(Serialize, JsonSchema)]
 pub(crate) struct AmbiguousResult {
     pub(crate) ambiguous: bool,
+    /// Total candidates matched before the display cap of
+    /// `MAX_AMBIGUOUS_CANDIDATES`. `truncated` is `true` when `total >
+    /// candidates.len()`, telling the caller there are more matches than
+    /// shown and to narrow with `path`/`line` — the list is never silently
+    /// presented as the complete set.
+    pub(crate) total: usize,
+    pub(crate) truncated: bool,
     pub(crate) candidates: Vec<AmbiguousCandidate>,
 }
 
@@ -478,10 +485,10 @@ pub(crate) fn resolve_symbol_candidates(
 ) -> Vec<CandidateRow> {
     let sql = if path.is_some() {
         "SELECT name, qualified_name, kind, path, line_start, line_end, signature, docstring, caller_count, is_hub, language, class_context, is_entry_point, is_test, coreness
-         FROM symbols WHERE name = ?1 AND path = ?2"
+         FROM symbols WHERE name = ?1 AND path = ?2 ORDER BY path, line_start"
     } else {
         "SELECT name, qualified_name, kind, path, line_start, line_end, signature, docstring, caller_count, is_hub, language, class_context, is_entry_point, is_test, coreness
-         FROM symbols WHERE name = ?1"
+         FROM symbols WHERE name = ?1 ORDER BY path, line_start"
     };
 
     let mut stmt = match conn.prepare(sql) {
@@ -565,14 +572,17 @@ pub(crate) fn resolve_symbol(
 }
 
 pub(crate) fn ambiguous_json(candidates: &[CandidateRow]) -> String {
-    let candidates = candidates
+    let total = candidates.len();
+    let shown = candidates
         .iter()
         .take(MAX_AMBIGUOUS_CANDIDATES)
         .map(CandidateRow::to_ambiguous_candidate)
         .collect();
     serde_json::to_string_pretty(&AmbiguousResult {
         ambiguous: true,
-        candidates,
+        total,
+        truncated: total > MAX_AMBIGUOUS_CANDIDATES,
+        candidates: shown,
     })
     .unwrap_or_default()
 }

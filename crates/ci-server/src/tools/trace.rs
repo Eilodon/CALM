@@ -22,7 +22,7 @@ impl CodeIntelligenceServer {
             self.track_symbol(&c.qualified_name);
             self.track_file(&c.path);
 
-            let direct: Vec<CallerEntry> = {
+            let all: Vec<CallerEntry> = {
                 let mut stmt = conn
                     .prepare(
                         "SELECT from_symbol, from_path, edge_confidence, call_site_line
@@ -64,10 +64,19 @@ impl CodeIntelligenceServer {
                 (None, None, None)
             };
 
+            // Split `ambiguous`-confidence edges out of `direct`. These are
+            // index-time fan-out: when a method call's receiver type can't be
+            // resolved (`x.as_str()` with `x` of unknown type), the indexer
+            // emits an edge to EVERY same-named symbol, each marked `ambiguous`.
+            // They are not confirmed callers of this specific symbol, so
+            // surfacing them as `direct` collapses precision — bucket them
+            // separately for the caller to weigh.
+            let (ambiguous, direct): (Vec<CallerEntry>, Vec<CallerEntry>) = all
+                .into_iter()
+                .partition(|e| e.edge_confidence == "ambiguous");
             let count = direct.len();
-            let has_textual = direct
-                .iter()
-                .any(|e| e.edge_confidence == "textual" || e.edge_confidence == "ambiguous");
+            let ambiguous_count = ambiguous.len();
+            let has_textual = direct.iter().any(|e| e.edge_confidence == "textual");
             let sn = if has_textual || count > 10 {
                 suggested(
                     "edit_context",
@@ -79,6 +88,11 @@ impl CodeIntelligenceServer {
                     "Read top caller implementation",
                     serde_json::json!({"target": direct[0].symbol}),
                 )
+            } else if ambiguous_count > 0 {
+                suggested(
+                    "edit_context",
+                    "Only ambiguous (unresolved-receiver) call sites — verify before trusting",
+                )
             } else {
                 None
             };
@@ -87,6 +101,8 @@ impl CodeIntelligenceServer {
                 edges_ready: self.edges_ready(),
                 direct,
                 direct_count: count,
+                ambiguous,
+                ambiguous_count,
                 transitive,
                 transitive_count,
                 transitive_capped,
@@ -116,7 +132,7 @@ impl CodeIntelligenceServer {
             self.track_symbol(&c.qualified_name);
             self.track_file(&c.path);
 
-            let direct: Vec<CalleeEntry> = {
+            let all: Vec<CalleeEntry> = {
                 let mut stmt = conn
                     .prepare(
                         "SELECT to_symbol, to_path, edge_confidence, call_site_line
@@ -160,7 +176,11 @@ impl CodeIntelligenceServer {
                 (None, None, None)
             };
 
+            let (ambiguous, direct): (Vec<CalleeEntry>, Vec<CalleeEntry>) = all
+                .into_iter()
+                .partition(|e| e.edge_confidence == "ambiguous");
             let count = direct.len();
+            let ambiguous_count = ambiguous.len();
             let sn = if count > 0 {
                 suggested("path", "Trace specific call chain")
             } else {
@@ -171,6 +191,8 @@ impl CodeIntelligenceServer {
                 edges_ready: self.edges_ready(),
                 direct,
                 direct_count: count,
+                ambiguous,
+                ambiguous_count,
                 transitive,
                 transitive_count,
                 transitive_capped,
@@ -251,6 +273,32 @@ impl CodeIntelligenceServer {
                 .take(dep_config.max_imported_by)
                 .collect::<Vec<_>>();
 
+            // Call-graph dependents: files with call sites that resolve INTO
+            // this file but never appear in `imported_by` — e.g. a fully-
+            // qualified `crate::foo::Bar::baz()` call with no matching `use`,
+            // which the import graph cannot see. Best-effort and coarser than
+            // imports (may include ambiguous-receiver calls), so it complements
+            // the import graph rather than replacing it.
+            let call_dependents: Vec<String> = {
+                let already: std::collections::HashSet<&str> =
+                    imported_by.iter().map(|e| e.from_path.as_str()).collect();
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT DISTINCT from_path FROM call_edges \
+                         WHERE to_path = ?1 AND from_path IS NOT NULL AND from_path != ?1 \
+                         ORDER BY from_path LIMIT ?2",
+                    )
+                    .unwrap();
+                stmt.query_map(
+                    rusqlite::params![p.path, dep_config.max_imported_by as i64],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .filter(|f| !already.contains(f.as_str()))
+                .collect()
+            };
+
             let sn = if imported_by.len() > 20 {
                 suggested("callers", "High fan-in — check symbol blast radius")
             } else {
@@ -262,6 +310,7 @@ impl CodeIntelligenceServer {
                 imports_truncated,
                 imported_by,
                 imported_by_truncated,
+                call_dependents,
                 suggested_next: self.filter_sn(sn),
             })
             .unwrap_or_default()
@@ -386,6 +435,14 @@ pub(crate) struct CallersOutput {
     pub(crate) symbol: String,
     pub(crate) edges_ready: bool,
     pub(crate) direct: Vec<CallerEntry>,
+    /// `ambiguous`-confidence callers split out of `direct`: index-time
+    /// fan-out edges (a method call whose receiver type couldn't be resolved
+    /// fans out to every same-named symbol), so each may or may not actually
+    /// call this symbol. Excluded from `direct`/`direct_count` — weigh these
+    /// explicitly rather than trusting them as confirmed callers.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) ambiguous: Vec<CallerEntry>,
+    pub(crate) ambiguous_count: usize,
     pub(crate) direct_count: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) transitive: Option<Vec<TransitiveEntry>>,
@@ -432,6 +489,11 @@ pub(crate) struct CalleesOutput {
     pub(crate) symbol: String,
     pub(crate) edges_ready: bool,
     pub(crate) direct: Vec<CalleeEntry>,
+    /// `ambiguous`-confidence callees split out of `direct` — see
+    /// `CallersOutput::ambiguous`. Excluded from `direct`/`direct_count`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) ambiguous: Vec<CalleeEntry>,
+    pub(crate) ambiguous_count: usize,
     pub(crate) direct_count: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) transitive: Option<Vec<TransitiveEntry>>,
@@ -470,6 +532,12 @@ pub(crate) struct DependenciesOutput {
     pub(crate) imports_truncated: bool,
     pub(crate) imported_by: Vec<ImportEntry>,
     pub(crate) imported_by_truncated: bool,
+    /// Files that reference this file via call edges but are absent from
+    /// `imported_by` — e.g. a fully-qualified `crate::foo::Bar::baz()` call
+    /// with no `use`. Best-effort (can include ambiguous-receiver calls);
+    /// complements the import graph, does not replace it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) call_dependents: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) suggested_next: Option<SuggestedNext>,
 }

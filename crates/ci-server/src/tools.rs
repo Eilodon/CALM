@@ -2320,6 +2320,155 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Regression for the silent ambiguous truncation: an ambiguous match set
+    /// larger than the display cap must report the true `total` and set
+    /// `truncated`, never present the capped view as the whole set.
+    #[test]
+    fn symbol_info_ambiguous_reports_total_and_truncated() {
+        let dir = std::env::temp_dir().join(format!("ci_ambig_trunc_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
+        {
+            let conn = server.db();
+            for i in 0..13 {
+                conn.execute(
+                    "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                     VALUES (?1, 'default', 'method', 'rust', ?2, ?3, ?3, 'fn default()', '', 'default', 0, 0, 0)",
+                    rusqlite::params![
+                        format!("m.default{i}"),
+                        if i < 9 { "a.rs" } else { "b.rs" },
+                        (i + 1) as i64
+                    ],
+                )
+                .unwrap();
+            }
+        }
+        let output = server.symbol_info(SymbolInfoParams {
+            symbol: "default".into(),
+            path: None,
+            line: None,
+        });
+        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(v["ambiguous"], true);
+        assert_eq!(v["total"], 13, "must report the full match count");
+        assert_eq!(v["truncated"], true, "13 > cap of 10 must set truncated");
+        assert_eq!(
+            v["candidates"].as_array().unwrap().len(),
+            10,
+            "shown list capped at 10"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression for callers precision: `ambiguous`-confidence fan-out edges
+    /// must be split out of `direct` into the `ambiguous` bucket, so `direct`
+    /// reflects only confidently-attributed callers.
+    #[test]
+    fn callers_separates_ambiguous_fanout_from_direct() {
+        let dir = std::env::temp_dir().join(format!("ci_callers_ambig_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.rs::EdgeConfidence::as_str', 'as_str', 'method', 'rust', 'a.rs', 41, 45, 'fn as_str()', '', 'as_str', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO call_edges (from_symbol, to_symbol, from_path, to_path, edge_confidence, call_site_line)
+                 VALUES ('x.rs::real', 'a.rs::EdgeConfidence::as_str', 'x.rs', 'a.rs', 'resolved', 10)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO call_edges (from_symbol, to_symbol, from_path, to_path, edge_confidence, call_site_line)
+                 VALUES ('y.rs::string_user', 'a.rs::EdgeConfidence::as_str', 'y.rs', 'a.rs', 'ambiguous', 20)",
+                [],
+            )
+            .unwrap();
+        }
+        let output = server.callers(CallersParams {
+            symbol: "as_str".into(),
+            path: Some("a.rs".into()),
+            line: Some(41),
+            transitive: false,
+            max_depth: None,
+        });
+        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(
+            v["direct_count"], 1,
+            "only the resolved caller is a confident direct caller"
+        );
+        assert_eq!(v["direct"].as_array().unwrap().len(), 1);
+        assert_eq!(v["direct"][0]["edge_confidence"], "resolved");
+        assert_eq!(
+            v["ambiguous_count"], 1,
+            "the fan-out edge is bucketed as ambiguous"
+        );
+        assert_eq!(v["ambiguous"][0]["edge_confidence"], "ambiguous");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression for dependency false negatives: a file that calls INTO the
+    /// target file without importing it (e.g. a fully-qualified path call) must
+    /// surface in `call_dependents`, and files already in `imported_by` must
+    /// not be duplicated there.
+    #[test]
+    fn dependencies_reports_call_dependents_absent_from_imports() {
+        let dir = std::env::temp_dir().join(format!("ci_deps_calldep_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CodeIntelligenceServer::new(dir.clone(), dir.join("index.db")).unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO call_edges (from_symbol, to_symbol, from_path, to_path, edge_confidence)
+                 VALUES ('main.rs::main', 'embedding.rs::load', 'main.rs', 'embedding.rs', 'resolved')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO import_edges (from_path, to_path, module_name, symbols_used)
+                 VALUES ('search.rs', 'embedding.rs', 'crate::embedding', '[\"Embedder\"]')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO call_edges (from_symbol, to_symbol, from_path, to_path, edge_confidence)
+                 VALUES ('search.rs::f', 'embedding.rs::load', 'search.rs', 'embedding.rs', 'resolved')",
+                [],
+            )
+            .unwrap();
+        }
+        let output = server.dependencies(DependenciesParams {
+            path: "embedding.rs".into(),
+        });
+        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+        let call_deps: Vec<String> = v["call_dependents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            call_deps.contains(&"main.rs".to_string()),
+            "FQ-path caller must appear in call_dependents"
+        );
+        assert!(
+            !call_deps.contains(&"search.rs".to_string()),
+            "already in imported_by → not duplicated"
+        );
+        assert_eq!(v["imported_by"][0]["from_path"], "search.rs");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Regression for Task 15: `dependencies` had no config knob bounding
     /// `imports`/`imported_by` size — a hub file's fan-in list was unbounded.
     #[test]

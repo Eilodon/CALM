@@ -476,7 +476,7 @@ fn rebuild_graph(
         .collect::<rusqlite::Result<Vec<_>>>()?
     };
 
-    // One edge per (caller, callee) pair; the first call site supplies the line.
+    // One edge per (caller, callee, call-site line) — distinct sites in the same caller stay separate (so `callers`/`callees` show every site); exact same-line dupes are deduped.
     // Confidence is the resolver's verdict recorded at extraction time. A tier-2
     // call (target_class set) resolves the method within that class only.
     //
@@ -546,7 +546,7 @@ fn rebuild_graph(
         .collect();
 
     let mut edges: Vec<CallEdge> = Vec::new();
-    let mut seen_pairs: HashSet<(String, String)> = HashSet::new();
+    let mut seen_pairs: HashSet<(String, String, Option<i64>)> = HashSet::new();
     for ((from_path, enc_qn, _callee, line, confidence, _target_class, _), targets) in
         sites.iter().zip(candidates.iter())
     {
@@ -562,7 +562,7 @@ fn rebuild_graph(
             confidence.as_str()
         };
         for (to_qn, to_path) in targets {
-            if !seen_pairs.insert((enc_qn.clone(), to_qn.clone())) {
+            if !seen_pairs.insert((enc_qn.clone(), to_qn.clone(), *line)) {
                 continue;
             }
             edges.push(CallEdge {
@@ -655,12 +655,12 @@ fn resolve_rust_module(
         .unwrap_or_default();
 
     // (base directory to resolve the remaining segments under, remaining segments)
-    let (base_dir, rest): (String, &[&str]) = match segs[0] {
+    let (base_dir, rest, uniform_guess): (String, &[&str], bool) = match segs[0] {
         "crate" => {
             let (_, root) = crate_map.crate_of_file(from_path)?;
-            (root.to_string(), &segs[1..])
+            (root.to_string(), &segs[1..], false)
         }
-        "self" => (from_dir.clone(), &segs[1..]),
+        "self" => (from_dir.clone(), &segs[1..], false),
         "super" => {
             let mut dir = from_dir.clone();
             let mut i = 0;
@@ -668,7 +668,7 @@ fn resolve_rust_module(
                 dir = parent_of(&dir);
                 i += 1;
             }
-            (dir, &segs[i..])
+            (dir, &segs[i..], false)
         }
         other => {
             // Rust's "uniform paths": an unprefixed leading segment in a `use`
@@ -677,10 +677,10 @@ fn resolve_rust_module(
             // crate root (e.g. `use engine::Engine;` inside that crate's own
             // `lib.rs` means the same as `use crate::engine::Engine;`).
             match crate_map.root_of(&other.replace('-', "_")) {
-                Some(root) => (root.to_string(), &segs[1..]),
+                Some(root) => (root.to_string(), &segs[1..], false),
                 None => {
                     let (_, root) = crate_map.crate_of_file(from_path)?;
-                    (root.to_string(), segs.as_slice())
+                    (root.to_string(), segs.as_slice(), true)
                 }
             }
         }
@@ -696,8 +696,12 @@ fn resolve_rust_module(
         bases.push(join_rel(&base_dir, &joined));
         if let Some((parent, _)) = joined.rsplit_once('/') {
             bases.push(join_rel(&base_dir, parent));
-        } else {
-            // Single trailing item (`crate::Item`) → the crate root file itself.
+        } else if !uniform_guess {
+            // Single trailing item (`crate::Item`) → the crate root file
+            // itself (an item re-exported at the crate root). Skipped for a
+            // uniform-path guess (`use extern_crate::Item`): its leading
+            // segment is an external crate we only optimistically treated as
+            // local, so it must NOT fall back to this crate's own lib.rs.
             bases.push(base_dir.clone());
         }
     }
@@ -1101,12 +1105,15 @@ mod tests {
 
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM symbols"), 2);
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM file_index"), 1);
+        // `main` calls `helper()` twice (two distinct call sites) → two edges;
+        // edges are keyed on (from, to, call-site line), not just (from, to), so
+        // both sites are preserved rather than collapsed to one.
         assert_eq!(
             count(
                 &conn,
                 "SELECT COUNT(*) FROM call_edges WHERE from_symbol = 'a.py::main' AND to_symbol = 'a.py::helper'",
             ),
-            1
+            2
         );
         assert_eq!(
             count(
@@ -2213,5 +2220,100 @@ impl StructB {
         assert!(!signature_returns_option_or_result(
             "pub fn foo(f: impl Fn() -> Option<i32>) -> i32 {"
         ));
+    }
+
+    /// Regression for the duplicate-call-site collapse: two calls to the same
+    /// function from the same caller (different lines) used to dedupe to a
+    /// single (from, to) edge, losing the second site. The key now includes the
+    /// call-site line, so both survive.
+    #[test]
+    fn distinct_call_sites_in_one_caller_are_kept_as_separate_edges() {
+        let dir = std::env::temp_dir().join(format!("ci_idx_dupsite_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // `helper` defined once; `caller` calls it twice, on lines 3 and 4.
+        std::fs::write(
+            dir.join("a.rs"),
+            "fn helper() {}\nfn caller() {\n    helper();\n    helper();\n}\n",
+        )
+        .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
+
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM call_edges \
+                 WHERE from_symbol = (SELECT qualified_name FROM symbols WHERE name = 'caller') \
+                 AND to_symbol = (SELECT qualified_name FROM symbols WHERE name = 'helper')",
+            ),
+            2,
+            "two distinct call sites must be kept as two edges, not deduped to one"
+        );
+
+        let lines: Vec<i64> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT call_site_line FROM call_edges \
+                     WHERE from_symbol = (SELECT qualified_name FROM symbols WHERE name = 'caller') \
+                     AND to_symbol = (SELECT qualified_name FROM symbols WHERE name = 'helper') \
+                     ORDER BY call_site_line",
+                )
+                .unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect()
+        };
+        assert_eq!(
+            lines,
+            vec![3, 4],
+            "the two edges carry the two call-site lines"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression for the import-graph false positive: a bare `use
+    /// extern_crate::Item` (an external crate, not a workspace member) must NOT
+    /// resolve to the importing crate's own `lib.rs`. Before the `uniform_guess`
+    /// gate, the single-trailing-item fallback matched `{crate_root}/lib.rs`.
+    #[test]
+    fn external_crate_use_does_not_resolve_to_own_lib_rs() {
+        let dir = std::env::temp_dir().join(format!("ci_idx_extern_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"myapp\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "pub mod thing;\n").unwrap();
+        std::fs::write(
+            dir.join("src/thing.rs"),
+            "use rusqlite::Connection;\npub fn f(_c: &Connection) {}\n",
+        )
+        .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
+
+        let to_path: Option<String> = conn
+            .query_row(
+                "SELECT to_path FROM import_edges \
+                 WHERE from_path = 'src/thing.rs' AND module_name = 'rusqlite'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            to_path.as_deref().unwrap_or("").is_empty(),
+            "external crate `rusqlite` must not resolve to a local file, got {to_path:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
