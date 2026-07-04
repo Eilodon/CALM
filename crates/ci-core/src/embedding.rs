@@ -528,9 +528,9 @@ mod imp {
 }
 
 pub use imp::{
-    Embedder, create_chunk_embedding_table, create_embedding_table, default_vendored_asset_unusable,
-    embed_pending, embed_pending_chunks, knn, knn_chunks, prune_orphaned_chunk_vecs,
-    store_chunk_embedding, store_embedding,
+    Embedder, create_chunk_embedding_table, create_embedding_table,
+    default_vendored_asset_unusable, embed_pending, embed_pending_chunks, knn, knn_chunks,
+    prune_orphaned_chunk_vecs, store_chunk_embedding, store_embedding,
 };
 
 #[cfg(test)]
