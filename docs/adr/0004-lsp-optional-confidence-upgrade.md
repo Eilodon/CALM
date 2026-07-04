@@ -93,6 +93,12 @@ sẵn):
    - *Server chưa đủ trưởng thành hoặc giới hạn nền tảng/license*: Kotlin, Swift (sourcekit-lsp —
      yếu trên Windows), PHP (intelephense free tier giới hạn số file), Ruby.
 
+   **Cập nhật 2026-07-04**: với ngôn ngữ có SCIP indexer trưởng thành (Rust qua
+   `rust-analyzer scip` — đã implement, xem "Update 2026-07-04" bên dưới), đánh giá **batch SCIP
+   trước live-LSP** trong thứ tự pilot — đơn giản hơn ở mọi trục vận hành cho cùng một kết quả.
+   Live-LSP (pilot Go/gopls bên dưới) vẫn là đường đi cho ngôn ngữ **không** có SCIP indexer
+   trưởng thành.
+
 ## Pilot Plan — Go + gopls
 
 **Vì sao Go trước**: Go hiện không có formal tier nào (chỉ Conservative) — nhiều nhất để được
@@ -129,6 +135,56 @@ jdtls — ít điều kiện ngoại vi nhất trong nhóm còn thiếu formal t
 **Nếu pilot thất bại**: giữ nguyên `ConservativeResolver` cho Go vĩnh viễn (như ADR-0001 đã coi
 đây "không phải fallback hạng hai"), đóng ADR này với Status = Rejected kèm lý do đo được, không
 thử lại cho ngôn ngữ khác.
+
+## Update 2026-07-04: Batch SCIP — cùng 6 nguyên tắc, transport khác, đã implement cho Rust
+
+**Đây không phải một quyết định mới.** `rust-analyzer scip` (chạy batch, sinh file `.scip` rồi
+thôi, không phải một language-server process sống) là một **transport khác** cho đúng cùng một
+mẫu "additive confidence upgrade" mà ADR này thiết kế cho live-LSP ở Decision, không phải một
+hướng đi khác. Đã implement đầy đủ cho Rust theo
+`docs/superskills/plans/2026-07-03-rust-support.md` (Phase A: nâng cấp resolver cú pháp thuần;
+Phase B: SCIP overlay), đối chiếu trực tiếp với 6 nguyên tắc ở Decision:
+
+1. **Opt-in, không bundle** — `rust.scip.enabled` trong `config.json`, mặc định `false`
+   (`crates/ci-core/src/config.rs::ScipConfig`) — cùng hình dạng với `lsp.go.enabled` ở Decision §1.
+2. **Detect-once, fail-silent** — `ci_core::scip::runner::resolve_binary` thử override/PATH/
+   `rustup which`/VS Code extension một lần; không thấy hoặc spawn lỗi → trả `None`/`Err`, graph
+   cơ sở nguyên vẹn, không retry-loop.
+3. **Additive-only, không bao giờ downgrade/xóa edge** — `ci_core::scip::ingest::ingest_occurrences`
+   chỉ `UPDATE call_edges SET edge_confidence = 'formal'` cho edge đã tồn tại được SCIP xác
+   nhận cùng call-site → cùng def-site; không bao giờ INSERT/DELETE/hạ rank — 2 test
+   `upgrades_matching_edge_to_formal`/`never_downgrades_or_inserts` khóa hành vi này.
+4. **Chạy sau `phase=ready`, không nằm trên đường găng** — `ci_core::scip::run_overlay` được gọi
+   trong `ci-server/src/lib.rs` ngay sau khối index nền, trước `watcher::run_watch_loop`.
+5. **Tái dùng rank `Formal`, không thêm biến thể `EdgeConfidence` mới** — `types.rs::EdgeConfidence`
+   vẫn đúng 4 biến thể (`Formal`/`Resolved`/`Inferred`/`Textual`) sau toàn bộ Phase A+B.
+6. **Mỗi ngôn ngữ là một quyết định độc lập** — module ingest được viết **SCIP-generic** (nhận
+   `ScipOccurrence` thuần, không có gì Rust-specific trong logic đối chiếu), nên cùng code
+   đường này nhận được output của `scip-typescript`/`scip-java`/`scip-clang` sau này mà không
+   phải viết lại (xem `docs/rust-support-research.md` §"Bonus kiến trúc").
+
+**Vì sao batch-first cho ngôn ngữ có SCIP indexer trưởng thành** (so với live-LSP ở Pilot Plan
+ở trên):
+- Không có subprocess sống cần giám sát/leak-check suốt phiên làm việc — chỉ một lần chạy
+  batch có timeout cứng (`SCIP_TIMEOUT` = 120s) rồi thoát, không phải một phiên JSON-RPC sống
+  suốt thời gian index.
+- Không cần xây JSON-RPC client (`initialize`/`didOpen`/`callHierarchy` như Pilot Plan đề xuất
+  cho gopls) — chỉ spawn một lần rồi parse một file protobuf.
+- Cache đơn giản hơn: khóa theo (phiên bản binary, hash `Cargo.lock`) đủ để bỏ qua lần chạy
+  lặp, không cần theo dõi version-drift của một server đang sống giữa chừng phiên.
+- SCIP được thiết kế gốc cho batch/CI indexing (Sourcegraph), không phải cho tương tác editor
+  như LSP — đúng use-case hơn cho một lần enrichment pass sau khi index xong.
+
+**Đo thực tế** (`benchmarks/b2_call_graph_quality/`, lần đầu, self-repo, Phase A trước khi bật
+overlay): precision tổng thể 0.795, recall 0.193; precision theo `edge_confidence`:
+`inferred`=0.967, `resolved`=0.935, `textual`=0.514 — xác nhận trực tiếp giả định ở Decision §5
+(agent nên tin `inferred`/`resolved` hơn `textual`); đây cũng chính là khoảng cách mà SCIP overlay
+nhắm tới thu hẹp (edge nâng lên `formal` sau khi bật `rust.scip.enabled`).
+
+**Kết luận cho Decision §6**: với ngôn ngữ có SCIP indexer trưởng thành, đánh giá batch SCIP
+**trước** live-LSP pilot — cùng kết quả (nâng confidence có bằng chứng), ít trục vận hành hơn.
+Live-LSP (Pilot Plan Go/gopls ở trên) vẫn là con đường đúng cho ngôn ngữ không có SCIP indexer
+trưởng thành (ví dụ: Go hiện chưa có SCIP indexer chính thức trưởng thành tương đương).
 
 ## Consequences
 
