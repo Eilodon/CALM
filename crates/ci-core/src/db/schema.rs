@@ -86,7 +86,8 @@ CREATE TABLE IF NOT EXISTS call_sites (
     call_line    INTEGER,
     confidence   TEXT NOT NULL DEFAULT 'textual',
     receiver     TEXT,
-    target_class TEXT
+    target_class TEXT,
+    looks_option_or_result_chained INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_call_sites_from   ON call_sites(from_path);
 CREATE INDEX IF NOT EXISTS idx_call_sites_callee ON call_sites(callee_name);
@@ -223,6 +224,12 @@ fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
     )?;
     migrate_add_column(conn, "call_sites", "receiver", "TEXT")?;
     migrate_add_column(conn, "call_sites", "target_class", "TEXT")?;
+    migrate_add_column(
+        conn,
+        "call_sites",
+        "looks_option_or_result_chained",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
     conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_call_edges_to ON call_edges(to_symbol);")?;
     migrate_fts_add_signature(conn)?;
     Ok(())

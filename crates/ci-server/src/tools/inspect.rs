@@ -271,6 +271,10 @@ pub(crate) struct CallerCountByConfidence {
     pub(crate) resolved: i64,
     pub(crate) inferred: i64,
     pub(crate) textual: i64,
+    /// Bare-name matches fanned out across >1 same-named candidate with no
+    /// tie-breaker — most likely correct for at most one of them. See
+    /// `EdgeConfidence::Ambiguous`.
+    pub(crate) ambiguous: i64,
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -310,6 +314,7 @@ pub(crate) fn build_health(
         let mut resolved = 0i64;
         let mut inferred = 0i64;
         let mut textual = 0i64;
+        let mut ambiguous = 0i64;
         if let Ok(mut stmt) = conn.prepare(
             "SELECT edge_confidence, COUNT(*) FROM call_edges \
              WHERE to_symbol = ?1 GROUP BY edge_confidence",
@@ -329,6 +334,7 @@ pub(crate) fn build_health(
                             ci_core::types::EdgeConfidence::Resolved => resolved += cnt,
                             ci_core::types::EdgeConfidence::Inferred => inferred += cnt,
                             ci_core::types::EdgeConfidence::Textual => textual += cnt,
+                            ci_core::types::EdgeConfidence::Ambiguous => ambiguous += cnt,
                         }
                     }
                     Ok(())
@@ -340,6 +346,7 @@ pub(crate) fn build_health(
             resolved,
             inferred,
             textual,
+            ambiguous,
         })
     } else {
         None

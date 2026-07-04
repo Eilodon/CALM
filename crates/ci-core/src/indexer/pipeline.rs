@@ -19,14 +19,47 @@ use crate::types::EdgeConfidence;
 /// dropped as too ambiguous (conservative).
 const MAX_CALLEE_CANDIDATES: usize = 20;
 
+/// True if a symbol's stored `signature` string's return type is `Option<_>`
+/// or `Result<_, _>` (bare `Option`/`Result` too, for generic/associated-type
+/// signatures that elide the parameter). Looks at the segment after the last
+/// `->` — the actual return position, not a `->` that might appear earlier in
+/// a higher-order parameter type (`f: impl Fn() -> i32`). A missing `->`
+/// (fields, non-function symbols) returns `false`.
+fn signature_returns_option_or_result(sig: &str) -> bool {
+    let Some(ret) = sig.rsplit("->").next() else {
+        return false;
+    };
+    // Guard against `sig` not containing `->` at all, in which case
+    // `rsplit("->").next()` returns the whole string unchanged.
+    if !sig.contains("->") {
+        return false;
+    }
+    let ret = ret.trim_start();
+    ret.starts_with("Option<")
+        || ret.starts_with("Option ")
+        || ret.starts_with("Result<")
+        || ret.starts_with("Result ")
+        || ret == "Option"
+        || ret == "Result"
+}
+
 /// Files are parsed+resolved (and then persisted) in chunks of this size
 /// rather than all at once, so peak memory holds at most one batch of
 /// parsed-but-not-yet-persisted files instead of an entire large repo.
 const PARSE_BATCH_SIZE: usize = 1000;
 
 /// A persisted call site loaded for graph rebuild:
-/// (from_path, enclosing_qn, callee_name, call_line, confidence, target_class).
-type CallSiteRow = (String, String, String, Option<i64>, String, Option<String>);
+/// (from_path, enclosing_qn, callee_name, call_line, confidence, target_class,
+/// looks_option_or_result_chained).
+type CallSiteRow = (
+    String,
+    String,
+    String,
+    Option<i64>,
+    String,
+    Option<String>,
+    bool,
+);
 
 /// Collect tier-0 source files under `root` via the shared `crate::walk`
 /// walker (built-in `IGNORE_DIRS`, dot-directories, user-configured `ignore`
@@ -139,6 +172,7 @@ struct CallSiteData {
     confidence: String,
     receiver: Option<String>,
     target_class: Option<String>,
+    looks_option_or_result_chained: bool,
 }
 
 /// Everything extracted from a single file's source, before any DB I/O.
@@ -317,6 +351,7 @@ fn extract_file_data(
                 confidence: confidence.as_str().to_string(),
                 receiver: c.receiver.clone(),
                 target_class,
+                looks_option_or_result_chained: c.looks_option_or_result_chained,
             });
         }
     }
@@ -356,8 +391,8 @@ fn persist_file(
     insert_symbols_batch(tx, &extracted.symbols)?;
     insert_import_edges_batch(tx, &extracted.import_edges)?;
     let mut stmt = tx.prepare(
-        "INSERT INTO call_sites (from_path, enclosing_qn, callee_name, call_line, confidence, receiver, target_class) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO call_sites (from_path, enclosing_qn, callee_name, call_line, confidence, receiver, target_class, looks_option_or_result_chained) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
     )?;
     for c in &extracted.call_sites {
         stmt.execute(rusqlite::params![
@@ -367,7 +402,8 @@ fn persist_file(
             c.line,
             c.confidence,
             c.receiver,
-            c.target_class
+            c.target_class,
+            c.looks_option_or_result_chained as i64,
         ])?;
     }
     insert_code_chunks_batch(tx, rel, file_hash, &extracted.chunks)?;
@@ -387,9 +423,13 @@ fn rebuild_graph(
     // name → [(qn, path)] for tier-1; (name, class) → [(qn, path)] for tier-2.
     let mut by_name: HashMap<String, Vec<(String, String)>> = HashMap::new();
     let mut by_name_class: HashMap<(String, String), Vec<(String, String)>> = HashMap::new();
+    // qualified_name → signature, so the `MAX_CALLEE_CANDIDATES` fallback below
+    // can tell whether a candidate's return type could possibly be
+    // `Option`/`Result` — see `looks_option_or_result_chained`'s doc comment.
+    let mut sig_by_qn: HashMap<String, String> = HashMap::new();
     {
         let mut stmt =
-            tx.prepare("SELECT name, qualified_name, path, class_context FROM symbols")?;
+            tx.prepare("SELECT name, qualified_name, path, class_context, signature FROM symbols")?;
         let rows = stmt
             .query_map([], |r| {
                 Ok((
@@ -397,23 +437,29 @@ fn rebuild_graph(
                     r.get::<_, String>(1)?,
                     r.get::<_, String>(2)?,
                     r.get::<_, Option<String>>(3)?,
+                    r.get::<_, String>(4)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        for (name, qn, path, cls) in rows {
+        for (name, qn, path, cls, sig) in rows {
             by_name
                 .entry(name.clone())
                 .or_default()
                 .push((qn.clone(), path.clone()));
             if let Some(c) = cls {
-                by_name_class.entry((name, c)).or_default().push((qn, path));
+                by_name_class
+                    .entry((name, c))
+                    .or_default()
+                    .push((qn.clone(), path));
             }
+            sig_by_qn.insert(qn, sig);
         }
     }
 
     let sites: Vec<CallSiteRow> = {
         let mut stmt = tx.prepare(
-            "SELECT from_path, enclosing_qn, callee_name, call_line, confidence, target_class \
+            "SELECT from_path, enclosing_qn, callee_name, call_line, confidence, target_class, \
+                    looks_option_or_result_chained \
              FROM call_sites",
         )?;
         stmt.query_map([], |r| {
@@ -424,6 +470,7 @@ fn rebuild_graph(
                 r.get::<_, Option<i64>>(3)?,
                 r.get::<_, String>(4)?,
                 r.get::<_, Option<String>>(5)?,
+                r.get::<_, i64>(6)? != 0,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?
@@ -453,30 +500,67 @@ fn rebuild_graph(
     // even then only up to MAX_CALLEE_CANDIDATES.
     let candidates: Vec<Vec<(String, String)>> = sites
         .par_iter()
-        .map(|(from_path, _, callee, _, _, target_class)| {
-            let targets = match target_class {
-                Some(cls) => by_name_class.get(&(callee.clone(), cls.clone())),
-                None => by_name.get(callee),
-            };
-            let Some(t) = targets else {
-                return Vec::new();
-            };
-            let same_file: Vec<_> = t.iter().filter(|(_, p)| p == from_path).cloned().collect();
-            if !same_file.is_empty() {
-                same_file
-            } else if t.len() <= MAX_CALLEE_CANDIDATES {
-                t.clone()
-            } else {
-                Vec::new()
-            }
-        })
+        .map(
+            |(from_path, _, callee, _, _, target_class, looks_option_or_result_chained)| {
+                let targets = match target_class {
+                    Some(cls) => by_name_class.get(&(callee.clone(), cls.clone())),
+                    None => by_name.get(callee),
+                };
+                let Some(t) = targets else {
+                    return Vec::new();
+                };
+                // Return-shape exclusion: `foo.bar()?`/`foo.bar().unwrap()` can only
+                // compile if `bar`'s return type is `Option`/`Result` — so a candidate
+                // whose own signature returns neither is *provably* not this call's
+                // real target, not just an unlikely one. Only filters when the site
+                // shows the signal at all; otherwise every existing candidate stays,
+                // unchanged from before this filter existed.
+                let filtered: Vec<(String, String)>;
+                let t: &Vec<(String, String)> = if *looks_option_or_result_chained {
+                    filtered = t
+                        .iter()
+                        .filter(|(qn, _)| {
+                            sig_by_qn
+                                .get(qn)
+                                .is_some_and(|sig| signature_returns_option_or_result(sig))
+                        })
+                        .cloned()
+                        .collect();
+                    &filtered
+                } else {
+                    t
+                };
+                if t.is_empty() {
+                    return Vec::new();
+                }
+                let same_file: Vec<_> = t.iter().filter(|(_, p)| p == from_path).cloned().collect();
+                if !same_file.is_empty() {
+                    same_file
+                } else if t.len() <= MAX_CALLEE_CANDIDATES {
+                    t.clone()
+                } else {
+                    Vec::new()
+                }
+            },
+        )
         .collect();
 
     let mut edges: Vec<CallEdge> = Vec::new();
     let mut seen_pairs: HashSet<(String, String)> = HashSet::new();
-    for ((from_path, enc_qn, _callee, line, confidence, _target_class), targets) in
+    for ((from_path, enc_qn, _callee, line, confidence, _target_class, _), targets) in
         sites.iter().zip(candidates.iter())
     {
+        // >1 surviving candidate means this call site's edge is duplicated
+        // across multiple distinct symbols with nothing left to break the
+        // tie — mark it `Ambiguous` regardless of which branch produced it,
+        // rather than let it masquerade as an ordinary single-target edge at
+        // its originally recorded confidence (which was computed per call
+        // site, not per final-candidate-count).
+        let effective_confidence = if targets.len() > 1 {
+            EdgeConfidence::Ambiguous.as_str()
+        } else {
+            confidence.as_str()
+        };
         for (to_qn, to_path) in targets {
             if !seen_pairs.insert((enc_qn.clone(), to_qn.clone())) {
                 continue;
@@ -485,7 +569,7 @@ fn rebuild_graph(
                 from_symbol: enc_qn.clone(),
                 to_symbol: to_qn.clone(),
                 call_site_line: line.map(|l| l as i32),
-                edge_confidence: confidence.clone(),
+                edge_confidence: effective_confidence.to_string(),
                 from_path: Some(from_path.clone()),
                 to_path: Some(to_path.clone()),
             });
@@ -2001,5 +2085,133 @@ impl StructB {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression for the real-world incident this module's return-shape filter
+    /// exists for: `caller.rs` calls a bare `as_str()` on an unresolvable
+    /// receiver (Tier-2 can't type it), immediately `.unwrap()`-ed. Two
+    /// same-named candidates exist elsewhere in the repo — one returning
+    /// `Option<&str>` (a plausible real target), one returning plain `&str`
+    /// (provably *not* the target, since `Foo::as_str().unwrap()` wouldn't
+    /// compile against a non-`Option`/`Result` return). Before this filter,
+    /// `rebuild_graph`'s `MAX_CALLEE_CANDIDATES` fallback fanned out to both.
+    #[test]
+    fn test_option_chained_call_excludes_non_option_candidates() {
+        let dir = std::env::temp_dir().join(format!("ci_idx_optchain_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("a.rs"),
+            "pub struct Foo;\nimpl Foo {\n    pub fn as_str(&self) -> &'static str {\n        \"a\"\n    }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("b.rs"),
+            "pub struct Bar;\nimpl Bar {\n    pub fn as_str(&self) -> Option<&'static str> {\n        Some(\"b\")\n    }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("caller.rs"),
+            "fn get_something() -> i32 {\n    0\n}\nfn caller() {\n    let _ = get_something().as_str().unwrap();\n}\n",
+        )
+        .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
+
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM call_edges \
+                 WHERE from_symbol = (SELECT qualified_name FROM symbols WHERE name = 'caller') \
+                 AND to_symbol = (SELECT qualified_name FROM symbols WHERE name = 'as_str' AND path = 'a.rs')",
+            ),
+            0,
+            "Foo::as_str returns &'static str, not Option — .unwrap() on the call site rules it out"
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM call_edges \
+                 WHERE from_symbol = (SELECT qualified_name FROM symbols WHERE name = 'caller') \
+                 AND to_symbol = (SELECT qualified_name FROM symbols WHERE name = 'as_str' AND path = 'b.rs')",
+            ),
+            1,
+            "Bar::as_str returns Option<&'static str> — the only candidate .unwrap() could compile against"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// When the return-shape filter can't break the tie (call site isn't
+    /// `?`/`.unwrap()`-chained, or the surviving candidates are still >1),
+    /// the resulting fan-out edges must be marked `ambiguous` — not the plain
+    /// `textual` a genuine single-candidate resolution gets — so callers of
+    /// `callers`/`symbol_info` can tell "spread across N unrelated symbols"
+    /// apart from "one real, low-confidence match".
+    #[test]
+    fn test_unresolved_fan_out_marked_ambiguous_not_textual() {
+        let dir = std::env::temp_dir().join(format!("ci_idx_ambiguous_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("a.rs"),
+            "pub struct Foo;\nimpl Foo {\n    pub fn as_str(&self) -> &'static str {\n        \"a\"\n    }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("b.rs"),
+            "pub struct Baz;\nimpl Baz {\n    pub fn as_str(&self) -> &'static str {\n        \"c\"\n    }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("caller.rs"),
+            "fn get_something() -> i32 {\n    0\n}\nfn caller() {\n    let _ = get_something().as_str();\n}\n",
+        )
+        .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
+
+        for path in ["a.rs", "b.rs"] {
+            let confidence: String = conn
+                .query_row(
+                    "SELECT edge_confidence FROM call_edges \
+                     WHERE from_symbol = (SELECT qualified_name FROM symbols WHERE name = 'caller') \
+                     AND to_symbol = (SELECT qualified_name FROM symbols WHERE name = 'as_str' AND path = ?1)",
+                    [path],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                confidence, "ambiguous",
+                "fanned-out edge to {path}'s as_str must be marked ambiguous, not textual"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_signature_returns_option_or_result() {
+        assert!(signature_returns_option_or_result(
+            "pub fn as_str(&self) -> Option<&'static str> {"
+        ));
+        assert!(signature_returns_option_or_result(
+            "pub fn parse(s: &str) -> Result<Self, Error> {"
+        ));
+        assert!(!signature_returns_option_or_result(
+            "pub fn as_str(&self) -> &'static str {"
+        ));
+        assert!(!signature_returns_option_or_result("pub struct Foo {"));
+        // The return arrow, not one buried in a higher-order parameter type.
+        assert!(signature_returns_option_or_result(
+            "pub fn foo(f: impl Fn() -> i32) -> Option<i32> {"
+        ));
+        assert!(!signature_returns_option_or_result(
+            "pub fn foo(f: impl Fn() -> Option<i32>) -> i32 {"
+        ));
     }
 }

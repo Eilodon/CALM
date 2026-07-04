@@ -621,6 +621,15 @@ pub struct RawCall {
     /// name itself — resolution must scope directly to that class, not go
     /// through the variable→type lookup a `.`-receiver needs.
     pub receiver_is_type_path: bool,
+    /// True when this whole call expression is immediately `?`-tried
+    /// (`foo.bar()?`) or immediately `.unwrap()`/`.expect(..)`-chained
+    /// (`foo.bar().unwrap()`) — a cheap, sound (not heuristic-guessy)
+    /// syntactic signal that the call's return type is `Option<_>`/`Result<_,_>`.
+    /// Rust won't compile otherwise, so this is provable from the parse tree
+    /// alone, no type inference needed. Used by `rebuild_graph` to drop
+    /// bare-name fan-out candidates whose own signature can't possibly be
+    /// `Option`/`Result` — see its `MAX_CALLEE_CANDIDATES` fallback.
+    pub looks_option_or_result_chained: bool,
     pub line: usize,
 }
 
@@ -674,6 +683,78 @@ fn is_type_like(segment: &str) -> bool {
     segment.chars().next().is_some_and(|c| c.is_uppercase())
 }
 
+/// True if `call_node` (a whole `recv.method(..)`/`Type::method(..)` call
+/// expression) is immediately `?`-tried, or immediately followed by
+/// `.unwrap()`/`.expect(..)`/`.unwrap_or*(..)`. Only Rust's grammar defines
+/// `try_expression`; other languages' `call_node` never has one as a parent,
+/// so this is always `false` there — harmless, not a Rust-only code path.
+///
+/// This is deliberately narrow (direct parent only, not an arbitrary walk up
+/// the chain) — it only needs to be *sound* (no false "yes"), not complete.
+/// A missed case just falls back to today's behavior; a wrong "yes" would
+/// incorrectly drop a real candidate in `rebuild_graph`.
+fn looks_option_or_result_chained(call_node: tree_sitter::Node, source: &str) -> bool {
+    const UNWRAP_LIKE: &[&str] = &[
+        "unwrap",
+        "expect",
+        "unwrap_or",
+        "unwrap_or_default",
+        "unwrap_or_else",
+    ];
+    let Some(parent) = call_node.parent() else {
+        return false;
+    };
+    if parent.kind() == "try_expression" {
+        return true;
+    }
+    if parent.kind() == "field_expression" {
+        // Confirm `call_node` is the receiver (`value`) of this field access, not
+        // some unrelated sibling — and that the field name is one of the
+        // unwrap-like methods, and that the field access is itself being called
+        // (`.unwrap()`, not just referenced as `.unwrap`).
+        let is_value = parent
+            .child_by_field_name("value")
+            .is_some_and(|v| v.id() == call_node.id());
+        let field_name = parent
+            .child_by_field_name("field")
+            .map(|f| &source[f.byte_range()]);
+        let is_invoked = parent.parent().is_some_and(|gp| {
+            gp.kind() == "call_expression"
+                && gp
+                    .child_by_field_name("function")
+                    .is_some_and(|f| f.id() == parent.id())
+        });
+        if is_value && matches!(field_name, Some(f) if UNWRAP_LIKE.contains(&f)) && is_invoked {
+            return true;
+        }
+    }
+    // `.and_then(|x| EXPR)` — sound (not heuristic) one-level closure peel:
+    // `Option::and_then`/`Result::and_then` require the closure's return type
+    // to equal the *outer* Option/Result's own inner type, so if the whole
+    // `.and_then(..)` call is itself provably Option/Result-chained (recurse),
+    // then a single-expression closure body passed to it must be too — the
+    // code wouldn't type-check otherwise. Restricted to `and_then` specifically
+    // (not `.map(..)`, whose closure returns a plain value, not an `Option`/
+    // `Result` — recursing there would be unsound) and to a closure whose body
+    // *is* the call (single-expression closures only, not a `{ .. }` block
+    // that merely contains it somewhere).
+    if parent.kind() == "closure_expression"
+        && parent
+            .child_by_field_name("body")
+            .is_some_and(|b| b.id() == call_node.id())
+        && let Some(and_then_call) = parent.parent().and_then(|args| args.parent())
+        && and_then_call.kind() == "call_expression"
+        && let Some(fn_node) = and_then_call.child_by_field_name("function")
+        && fn_node.kind() == "field_expression"
+        && fn_node
+            .child_by_field_name("field")
+            .is_some_and(|f| &source[f.byte_range()] == "and_then")
+    {
+        return looks_option_or_result_chained(and_then_call, source);
+    }
+    false
+}
+
 /// Walk the AST collecting call sites, tracking the nearest enclosing function
 /// and class.
 fn walk_calls(
@@ -714,6 +795,7 @@ fn walk_calls(
             callee,
             receiver,
             receiver_is_type_path,
+            looks_option_or_result_chained: looks_option_or_result_chained(node, source),
             line: node.start_position().row + 1,
         });
     }
@@ -2152,5 +2234,76 @@ class Foo {
         assert!(!is_type_like("mod"));
         assert!(!is_type_like("helper"));
         assert!(!is_type_like(""));
+    }
+
+    #[test]
+    fn test_looks_option_or_result_chained_detects_try_operator() {
+        let code = "fn caller() {\n    let _ = foo.bar()?;\n}\n";
+        let calls = extract_calls(code, "rust", "a.rs").unwrap();
+        let bar = calls.iter().find(|c| c.callee == "bar").unwrap();
+        assert!(
+            bar.looks_option_or_result_chained,
+            "foo.bar()? must be detected as Option/Result-chained"
+        );
+    }
+
+    #[test]
+    fn test_looks_option_or_result_chained_detects_unwrap() {
+        let code = "fn caller() {\n    let _ = foo.bar().unwrap();\n}\n";
+        let calls = extract_calls(code, "rust", "a.rs").unwrap();
+        let bar = calls.iter().find(|c| c.callee == "bar").unwrap();
+        assert!(
+            bar.looks_option_or_result_chained,
+            "foo.bar().unwrap() must be detected as Option/Result-chained"
+        );
+    }
+
+    #[test]
+    fn test_looks_option_or_result_chained_false_for_plain_call() {
+        let code = "fn caller() {\n    let _ = foo.bar();\n}\n";
+        let calls = extract_calls(code, "rust", "a.rs").unwrap();
+        let bar = calls.iter().find(|c| c.callee == "bar").unwrap();
+        assert!(
+            !bar.looks_option_or_result_chained,
+            "a plain foo.bar() call is not provably Option/Result-returning"
+        );
+    }
+
+    #[test]
+    fn test_looks_option_or_result_chained_peels_and_then_closure() {
+        // `.and_then` requires its closure to return Option/Result matching the
+        // outer chain — provably sound to peel, not just heuristic.
+        let code = "fn caller() {\n    let _ = foo.and_then(|p| p.as_str())?;\n}\n";
+        let calls = extract_calls(code, "rust", "a.rs").unwrap();
+        let as_str = calls.iter().find(|c| c.callee == "as_str").unwrap();
+        assert!(
+            as_str.looks_option_or_result_chained,
+            ".and_then(|p| p.as_str())? must peel through and_then to detect chaining"
+        );
+    }
+
+    #[test]
+    fn test_looks_option_or_result_chained_does_not_peel_map_closure() {
+        // Unlike `.and_then`, `.map`'s closure returns a plain value, not
+        // Option/Result — peeling here would be unsound.
+        let code = "fn caller() {\n    let _ = foo.map(|p| p.as_str())?;\n}\n";
+        let calls = extract_calls(code, "rust", "a.rs").unwrap();
+        let as_str = calls.iter().find(|c| c.callee == "as_str").unwrap();
+        assert!(
+            !as_str.looks_option_or_result_chained,
+            ".map(..)'s closure isn't required to return Option/Result — must not peel"
+        );
+    }
+
+    #[test]
+    fn test_looks_option_or_result_chained_false_when_unwrap_is_on_a_different_receiver() {
+        // `.unwrap()` here chains off `baz()`, not off `bar()` — must not be
+        // misattributed to the unrelated inner call.
+        let code = "fn caller() {\n    let _ = foo.bar();\n    let _ = baz().unwrap();\n}\n";
+        let calls = extract_calls(code, "rust", "a.rs").unwrap();
+        let bar = calls.iter().find(|c| c.callee == "bar").unwrap();
+        assert!(!bar.looks_option_or_result_chained);
+        let baz = calls.iter().find(|c| c.callee == "baz").unwrap();
+        assert!(baz.looks_option_or_result_chained);
     }
 }

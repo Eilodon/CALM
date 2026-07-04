@@ -65,7 +65,9 @@ impl CodeIntelligenceServer {
             };
 
             let count = direct.len();
-            let has_textual = direct.iter().any(|e| e.edge_confidence == "textual");
+            let has_textual = direct
+                .iter()
+                .any(|e| e.edge_confidence == "textual" || e.edge_confidence == "ambiguous");
             let sn = if has_textual || count > 10 {
                 suggested(
                     "edit_context",

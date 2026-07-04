@@ -27,6 +27,14 @@ pub enum EdgeConfidence {
     Resolved,
     Inferred,
     Textual,
+    /// A bare-name match with >1 same-named candidate and no in-file
+    /// preference to break the tie (the `rebuild_graph` `MAX_CALLEE_CANDIDATES`
+    /// fallback) — one edge is emitted per candidate, so this call site is
+    /// double/triple/etc.-counted across unrelated symbols. Distinct from
+    /// `Textual` (which still names exactly one real candidate) precisely so
+    /// consumers can tell "low-confidence but singular" apart from "spread
+    /// across N locations, most likely wrong for N-1 of them".
+    Ambiguous,
 }
 
 impl EdgeConfidence {
@@ -36,15 +44,17 @@ impl EdgeConfidence {
             Self::Resolved => "resolved",
             Self::Inferred => "inferred",
             Self::Textual => "textual",
+            Self::Ambiguous => "ambiguous",
         }
     }
 
     pub fn rank(&self) -> u8 {
         match self {
-            Self::Formal => 3,
-            Self::Resolved => 2,
-            Self::Inferred => 1,
-            Self::Textual => 0,
+            Self::Formal => 4,
+            Self::Resolved => 3,
+            Self::Inferred => 2,
+            Self::Textual => 1,
+            Self::Ambiguous => 0,
         }
     }
 
@@ -58,6 +68,7 @@ impl EdgeConfidence {
             "resolved" => Some(Self::Resolved),
             "inferred" => Some(Self::Inferred),
             "textual" => Some(Self::Textual),
+            "ambiguous" => Some(Self::Ambiguous),
             _ => None,
         }
     }
