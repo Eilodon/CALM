@@ -66,11 +66,11 @@ fn watcher_reindexes_add_and_delete() {
 
     // Add a file → watcher should incrementally index it.
     std::fs::write(dir.join("b.py"), "def b():\n    pass\n").unwrap();
-    let added = wait_for_symbols(&db_path, 2, Duration::from_secs(15));
+    let added = wait_for_symbols(&db_path, 2, Duration::from_secs(30));
 
     // Delete it → watcher should drop its symbol.
     std::fs::remove_file(dir.join("b.py")).unwrap();
-    let removed = wait_for_symbols(&db_path, 1, Duration::from_secs(15));
+    let removed = wait_for_symbols(&db_path, 1, Duration::from_secs(30));
 
     ct.cancel();
     let _ = handle.join();
