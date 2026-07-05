@@ -11,7 +11,7 @@
           },
           {
             "type": "command",
-            "command": "bash .claude/hooks/session-start-build-ci.sh",
+            "command": "bash .claude/hooks/session-start-build-calm.sh",
             "timeout": 300
           }
         ]
@@ -19,11 +19,11 @@
     ],
     "PreToolUse": [
       {
-        "matcher": "Read|Edit|Write|Grep|Bash|mcp__ci__edit_context|mcp__ci__diff_impact|mcp__ci__edit_lines|mcp__ci__edit_symbol",
+        "matcher": "Read|Edit|Write|Grep|Bash|mcp__calm__edit_context|mcp__calm__diff_impact|mcp__calm__edit_lines|mcp__calm__edit_symbol",
         "hooks": [
           {
             "type": "command",
-            "command": "bash .claude/hooks/ci-nudge.sh",
+            "command": "bash .claude/hooks/calm-nudge.sh",
             "timeout": 5
           }
         ]

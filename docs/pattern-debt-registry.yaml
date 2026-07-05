@@ -26,7 +26,7 @@ items:
       53 tests pass, clippy clean.
     current_control: "Full Rust implementation with unit tests"
     remaining: []
-    owner_hint: ci-core
+    owner_hint: calm-core
 
   DEBT-003-bug-fixes:
     status: partial
@@ -39,7 +39,7 @@ items:
     remaining:
       - "H-3: understand response thêm edges_ready: bool"
       - "H-4: AmbiguousResult.signature → Option<String>"
-    owner_hint: ci-core
+    owner_hint: calm-core
 
   DEBT-004-c1-regression:
     status: resolved
@@ -75,14 +75,14 @@ items:
     remaining:
       - "GIỚI HẠN ĐÃ BIẾT: call_sites.confidence='formal' cho builtin KHÔNG tạo ra call_edges row — rebuild_graph() (pipeline.rs) lọc theo tên khớp symbols đã index trong project, độc lập với confidence, nên builtin (không phải project symbol) không bao giờ có call_edges dù tier nào. Nghĩa là callers/path/CallerCountByConfidence chưa thấy được thay đổi này — chỉ đúng ở tầng lưu trữ call_sites, sẵn sàng cho consumer tương lai."
       - "Nếu muốn builtin hiển thị qua tool: cần thiết kế riêng (builtin thành pseudo-symbol?) — rủi ro thật: len/print sẽ có caller_count khổng lồ khắp mọi codebase Python, có thể làm lệch hub_count/coreness. Cố ý chưa làm, cần bàn kỹ trước khi động vào."
-    owner_hint: ci-core/resolver
+    owner_hint: calm-core/resolver
 
   DEBT-007-mcp-schema-empty-object:
     status: resolved
     urgency: done
     resolved_at: "2026-07-01"
     description: >
-      Cả 14/16 tool handler trong ci-server/src/tools.rs dùng
+      Cả 14/16 tool handler trong calm-server/src/tools.rs dùng
       `Parameters(p): Parameters<XxxParams>` KHÔNG có attribute marker
       `#[tool(aggr)]` mà rmcp-macros 0.1.5 yêu cầu để phát sinh input_schema
       thật. Hệ quả: MCP `tools/list` quảng cáo input_schema = EmptyObject
@@ -108,14 +108,14 @@ items:
       rmcp-0.1.5/tests/test_complex_schema.rs) và assert mọi field thật xuất
       hiện trong input_schema.properties, cho cả 14 tool.
     remaining: []
-    owner_hint: ci-server
+    owner_hint: calm-server
 
   DEBT-008-dead-code-test-fn-false-positive:
     status: resolved
     urgency: done
     resolved_at: "2026-07-01"
     description: >
-      compute_dead_code_confidence / is_private_symbol (ci-core/src/analysis/
+      compute_dead_code_confidence / is_private_symbol (calm-core/src/analysis/
       dead_code.rs) không loại trừ test function. Xác nhận bằng query trực
       tiếp trên DB index của chính repo này: 191/698 symbol (27%) là hàm
       Rust `test_*`, tất cả non-pub + caller_count=0 + không phải entry point
@@ -143,7 +143,7 @@ items:
     remaining:
       - "js/ts: không có tín hiệu test-function tĩnh đáng tin cậy (Jest/Mocha dùng callback trong it()/test(), không phải symbol top-level) — vẫn có thể còn dead_code_pct false-positive nhỏ cho JS/TS test files, chưa cover"
       - "Có thể re-baseline max_dead_code_pct sau khi có nhiều dữ liệu thật hơn — 11.1% hiện đã rất gần ngưỡng 10%, nhưng đây là tín hiệu thật (không còn nhiễu test), không cần đổi threshold ngay"
-    owner_hint: ci-core/analysis
+    owner_hint: calm-core/analysis
 
   DEBT-009-hub-count-absolute-threshold-vs-percentile:
     status: resolved
@@ -170,7 +170,7 @@ items:
       hub_count=101 vẫn fail max_hub_count=50 như cũ (không đổi hành vi cũ,
       chỉ bổ sung tín hiệu scale-invariant).
     remaining: []
-    owner_hint: ci-core/fitness
+    owner_hint: calm-core/fitness
 
   DEBT-006-ty-subprocess-premise-invalid:
     status: open
@@ -195,4 +195,4 @@ items:
       - "Đánh giá lại: ty (hoặc pyright/jedi) dùng làm health signal riêng (has_type_error trên symbol) thay vì EdgeConfidence tier — tận dụng đúng loại dữ liệu (âm tính) ty thật sự cung cấp"
       - "Nếu muốn dữ liệu dương tính thật (goto-definition) phải qua LSP (ty server/pyright-langserver), không phải subprocess một lần — chi phí kỹ thuật khác hẳn, cần đánh giá riêng"
       - "So sánh giá trị/chi phí với DEBT-005 (fix builtins pop rule) — cùng ngân sách kỹ thuật, builtins fix cải thiện tier formal đã có sẵn, phủ mọi file Python (len/print/range dùng khắp nơi)"
-    owner_hint: ci-core/resolver
+    owner_hint: calm-core/resolver

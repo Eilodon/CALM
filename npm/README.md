@@ -1,12 +1,12 @@
-# Publishing `@eilodon/ci-mcp` to npm
+# Publishing `@eilodon/calm-mcp` to npm
 
-This directory scaffolds an npm distribution for `ci` alongside the existing
+This directory scaffolds an npm distribution for `calm` alongside the existing
 `scripts/install.sh` and git-clone-based `scripts/mcp-launcher.sh` paths —
 see [`../docs/mcp-client-setup.md`](../docs/mcp-client-setup.md) for how all
 three compare. It follows the same split every other Rust-CLI-on-npm project
 uses (esbuild, swc, ripgrep wrappers): a thin JS entrypoint package
-(`ci-mcp/`) plus one binary-only package per platform
-(`ci-mcp-<platform>/`), wired together with `optionalDependencies` so `npm`
+(`calm-mcp/`) plus one binary-only package per platform
+(`calm-mcp-<platform>/`), wired together with `optionalDependencies` so `npm`
 installs only the one matching binary for whoever's running it — no
 postinstall network fetch, no arbitrary script execution.
 
@@ -14,6 +14,17 @@ postinstall network fetch, no arbitrary script execution.
 manual first publish (see the memory note this was scoped from) so the
 package name/scope gets a human sanity check against the real registry
 before any CI automation is wired to it.
+
+## Migration from `@eilodon/ci-mcp`
+
+The old packages (`@eilodon/ci-mcp`, `@eilodon/ci-mcp-linux-x64`, etc.) have
+been deprecated on npm with a pointer to the new names. If you had them
+installed, uninstall and reinstall:
+
+```bash
+npm uninstall @eilodon/ci-mcp
+npm install @eilodon/calm-mcp
+```
 
 ## One-time setup (before the very first publish)
 
@@ -38,10 +49,19 @@ installs the wrapper right after can already resolve its
 `optionalDependencies`:
 
 ```bash
-cd npm/ci-mcp-linux-x64    && npm publish --access public && cd -
-cd npm/ci-mcp-linux-arm64  && npm publish --access public && cd -
-cd npm/ci-mcp-darwin-arm64 && npm publish --access public && cd -
-cd npm/ci-mcp              && npm publish --access public && cd -
+cd npm/calm-mcp-linux-x64    && npm publish --access public && cd -
+cd npm/calm-mcp-linux-arm64  && npm publish --access public && cd -
+cd npm/calm-mcp-darwin-arm64 && npm publish --access public && cd -
+cd npm/calm-mcp              && npm publish --access public && cd -
+```
+
+## Deprecating the old packages (one-time, after first publish above)
+
+```bash
+npm deprecate @eilodon/ci-mcp "Renamed to @eilodon/calm-mcp — please migrate"
+npm deprecate @eilodon/ci-mcp-linux-x64 "Renamed to @eilodon/calm-mcp-linux-x64"
+npm deprecate @eilodon/ci-mcp-linux-arm64 "Renamed to @eilodon/calm-mcp-linux-arm64"
+npm deprecate @eilodon/ci-mcp-darwin-arm64 "Renamed to @eilodon/calm-mcp-darwin-arm64"
 ```
 
 ## Verifying before you publish for real
@@ -52,11 +72,11 @@ locally:
 
 ```bash
 npm/stage-release.sh v0.1.0   # or whatever tag is current
-cd npm/ci-mcp && npm pack --dry-run   # shows exactly what `files` would ship
-node bin/ci-mcp.js --version          # only works once a platform package's
-                                       # `ci` binary is resolvable — e.g. via
-                                       # `npm link` from ci-mcp-<platform>/,
-                                       # or a manual node_modules symlink
+cd npm/calm-mcp && npm pack --dry-run   # shows exactly what `files` would ship
+node bin/calm-mcp.js --version          # only works once a platform package's
+                                        # `calm` binary is resolvable — e.g. via
+                                        # `npm link` from calm-mcp-<platform>/,
+                                        # or a manual node_modules symlink
 ```
 
 ## Once this is stable: adding CI automation

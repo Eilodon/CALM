@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Regenerates lcov.info at the repo root so this project's own
-# dead-code-confidence analysis (crates/ci-core/src/analysis/dead_code.rs's
+# dead-code-confidence analysis (crates/calm-core/src/analysis/dead_code.rs's
 # CoverageData plumbing) has real runtime coverage to work with instead of
 # silently falling back to CoverageData::none() — see
-# crates/ci-core/src/analysis/coverage.rs's COVERAGE_SEARCH_PATHS.
+# crates/calm-core/src/analysis/coverage.rs's COVERAGE_SEARCH_PATHS.
 #
 # Output is gitignored (already covered by the repo's .gitignore) — this is
 # a point-in-time local artifact to regenerate on demand, not something to

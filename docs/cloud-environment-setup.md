@@ -1,14 +1,14 @@
-# Cloud environment setup — why the "ci" MCP server needs a Setup Script
+# Cloud environment setup — why the "calm" MCP server needs a Setup Script
 
-This repo dogfoods its own MCP server: `.mcp.json` wires up a `ci` stdio
-server pointed at this workspace's own `ci-cli` binary. On Claude Code on
+This repo dogfoods its own MCP server: `.mcp.json` wires up a `calm` stdio
+server pointed at this workspace's own `calm-cli` binary. On Claude Code on
 the web, that binary does not exist until something compiles it — and
 where that compile happens determines whether the server ever connects.
 
 ## The failure this document exists to prevent
 
-`ci-cli` is a Rust binary with a nontrivial dependency tree (tree-sitter
-grammars, stack-graphs, bundled SQLite). A cold `cargo build -p ci-cli` on
+`calm-cli` is a Rust binary with a nontrivial dependency tree (tree-sitter
+grammars, stack-graphs, bundled SQLite). A cold `cargo build -p calm-cli` on
 a fresh checkout measures **~59s** in this environment. Claude Code's MCP
 client dials configured servers **concurrently with, not after,**
 `SessionStart` hooks — confirmed against the official docs:
@@ -24,7 +24,7 @@ client dials configured servers **concurrently with, not after,**
   startup than a Setup Script, which runs "before Claude Code launches."
 
 A `SessionStart` hook that runs `cargo build` (this repo has one —
-`.claude/hooks/session-start-build-ci.sh`) can therefore **win** the race
+`.claude/hooks/session-start-build-calm.sh`) can therefore **win** the race
 against a cold connection attempt, but cannot **guarantee** winning it — a
 59s build has no trouble outlasting a ~7s retry budget. A previous version
 of this repo's setup relied on that hook alone and believed it had fixed
@@ -35,12 +35,12 @@ where it didn't.
 
 Everything below this point (Setup Script, `MCP_TIMEOUT`) works by trying
 to *win* a race against the MCP client's dial attempt. There's a way to
-avoid the race entirely: `.ci-bin/x86_64-unknown-linux-musl/ci`, a
+avoid the race entirely: `.calm-bin/x86_64-unknown-linux-musl/calm`, a
 prebuilt binary committed to the repo via Git LFS and kept current by
 [`.github/workflows/prebuild-mcp-binary.yml`](../.github/workflows/prebuild-mcp-binary.yml)
 on every push to `main`. `scripts/mcp-launcher.sh` execs it directly
 (subject to the same `is_binary_fresh` staleness check as a local
-`target/debug/ci`) — if it's there, there is no compile step for the MCP
+`target/debug/calm`) — if it's there, there is no compile step for the MCP
 dial to race against, because the checkout itself (which necessarily
 completes before Claude Code can even read `.mcp.json`) already contains a
 working binary.
@@ -70,7 +70,7 @@ problems:
 | | Setup Script | `SessionStart` hook |
 |---|---|---|
 | Runs | Once, **before** Claude Code (and MCP dialing) launches at all | Every session, **after** Claude Code launches, concurrently with MCP dialing |
-| Configured in | Cloud environment settings UI (not in this repo) | `.claude/settings.json` (this repo, `.claude/hooks/session-start-build-ci.sh`) |
+| Configured in | Cloud environment settings UI (not in this repo) | `.claude/settings.json` (this repo, `.claude/hooks/session-start-build-calm.sh`) |
 | Output persistence | Filesystem snapshotted and reused for ~7 days, or until the script/network config changes | None — runs fresh every session |
 
 Only the Setup Script runs early enough to structurally rule out the race.
@@ -92,8 +92,8 @@ and put this in the **Setup script** field:
 
 # Resolve Git LFS assets BEFORE building — a checkout without git-lfs
 # installed leaves ~130-byte pointer stubs in place of the vendored
-# embedding model (crates/ci-core/assets/potion-code-16m/) and the prebuilt
-# .ci-bin/ binary. The build still "succeeds" either way (`include_bytes!`
+# embedding model (crates/calm-core/assets/potion-code-16m/) and the prebuilt
+# .calm-bin/ binary. The build still "succeeds" either way (`include_bytes!`
 # just bakes whatever is on disk into the binary) — this is a real incident,
 # not a hypothetical: it silently degrades semantic search to
 # `embeddings_status: "failed"` at runtime instead of failing the build
@@ -110,11 +110,11 @@ if command -v git >/dev/null 2>&1 && grep -q 'filter=lfs' .gitattributes 2>/dev/
   fi
 fi
 
-# Build the ci-cli binary. The `|| true` is CRITICAL: setup scripts that
+# Build the calm-cli binary. The `|| true` is CRITICAL: setup scripts that
 # exit non-zero prevent the session from starting entirely (confirmed in
 # the official docs). A failed build here is non-fatal — the MCP server
 # simply won't connect, which is recoverable; a dead session is not.
-cargo build --quiet -p ci-cli 2>&1 || true
+cargo build --quiet -p calm-cli 2>&1 || true
 ```
 
 **Why `|| true`:** Claude Code's cloud docs state: *"If the script exits
@@ -133,10 +133,10 @@ is only sourced by login shells. Without the explicit source, `cargo:
 command not found` → exit 127 → session dead (without `|| true`).
 
 This must build to the **same path** `.mcp.json` expects:
-`target/debug/ci` (debug, not `--release` — release compiles slower for no
+`target/debug/calm` (debug, not `--release` — release compiles slower for no
 benefit here, since this binary is a local dev/dogfood tool, not a
 distributed artifact; keep this in sync with
-`.claude/hooks/session-start-build-ci.sh` and
+`.claude/hooks/session-start-build-calm.sh` and
 `scripts/mcp-launcher.sh` if that ever changes).
 
 Keep it under Claude Code's ~5-minute Setup Script budget — 59s measured
@@ -164,7 +164,7 @@ session before any cache exists, or right after the ~7-day cache expiry)
 
 ## What's already handled in this repo (defense in depth, not a substitute)
 
-- `.ci-bin/x86_64-unknown-linux-musl/ci` — see the section above. The one
+- `.calm-bin/x86_64-unknown-linux-musl/calm` — see the section above. The one
   layer that can eliminate the race outright rather than just narrowing it,
   when it applies.
 - `scripts/mcp-launcher.sh` — `.mcp.json`'s actual entrypoint now (shared
@@ -173,17 +173,17 @@ session before any cache exists, or right after the ~7-day cache expiry)
   present (no `cargo` involved, no risk of an unexpected rebuild reopening
   this exact race);
   only builds inline if the binary is missing outright.
-- `.claude/hooks/session-start-build-ci.sh` — still runs every session.
+- `.claude/hooks/session-start-build-calm.sh` — still runs every session.
   Redundant with the Setup Script in the common case (no-op if `target/`
   is already warm), but it's what keeps the binary from going *stale*
-  (e.g. after editing `ci`'s own source), and it's the only mechanism at
+  (e.g. after editing `calm`'s own source), and it's the only mechanism at
   all for local/non-cloud Claude Code, which has no Setup Script concept.
   Also runs the same `git lfs pull` best-effort step as the Setup Script
   snippet above, before building — see the runtime safety net below for
   what happens when this doesn't fully resolve it.
 - `Embedder::load`'s network fallback + `embeddings_status:
-  "offline_unavailable"` (`crates/ci-core/src/embedding.rs`,
-  `crates/ci-server/src/lib.rs::bootstrap_embeddings`) — the last line of
+  "offline_unavailable"` (`crates/calm-core/src/embedding.rs`,
+  `crates/calm-server/src/lib.rs::bootstrap_embeddings`) — the last line of
   defense if the LFS pull above still leaves the vendored embedding model
   asset as a pointer stub (offline environment, apt blocked, etc.):
   `Embedder::load` detects the stub and falls back to a one-time
@@ -193,7 +193,7 @@ session before any cache exists, or right after the ~7-day cache expiry)
   `"offline_unavailable"` (a known policy outcome) instead of the more
   generic `"failed"`. `indexing_status(retry_embeddings: true)` re-checks
   this, so fixing the asset or flipping the config recovers without a
-  restart. This only covers the *embedding model*, not the `ci` binary
+  restart. This only covers the *embedding model*, not the `calm` binary
   itself — that's what the two layers above are for.
 
 None of this replaces the Setup Script for cloud sessions — it narrows the
@@ -206,11 +206,11 @@ race entirely.
 At the start of a session, once indexing has had a moment to run:
 
 ```
-mcp__ci__repo_overview()
+mcp__calm__repo_overview()
 ```
 
 If this resolves (rather than the tool being entirely absent from your
-tool list), the connection succeeded. If it's missing, check for a `ci-cli
+tool list), the connection succeeded. If it's missing, check for a `calm-cli
 pre-build failed` message in the session's `SessionStart` hook output —
 that means the fallback hook itself failed (e.g. a real compile error),
 which is a different problem than the timing race this document covers.

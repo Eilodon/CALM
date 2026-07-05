@@ -2,7 +2,7 @@
 
 Đo `ci`'s Tier-0/Tier-2 syntactic call-graph resolver (Phase A của
 `docs/superskills/plans/2026-07-03-rust-support.md`) so với `rust-analyzer scip` làm oracle ground
-truth, trên chính repo Code-Intelligence.
+truth, trên chính repo CALM.
 
 **Scope hiện tại: Rust only.** SCIP có oracle trưởng thành cho Rust (`rust-analyzer scip`); các
 ngôn ngữ khác chưa có oracle tương đương sẵn có nên để lại cho lần triển khai sau.
@@ -10,12 +10,12 @@ ngôn ngữ khác chưa có oracle tương đương sẵn có nên để lại c
 ## Chạy
 
 ```bash
-cargo build --release -p ci-cli --features scip-overlay   # cần cho `ci scip-dump`
+cargo build --release -p calm-cli --features scip-overlay   # cần cho `ci scip-dump`
 benchmarks/.venv/bin/python benchmarks/b2_call_graph_quality/run_benchmark.py --repo .
 ```
 
 Mặc định `--repo` là chính repo này. Script: chạy `rust-analyzer scip` lấy oracle, decode qua `ci
-scip-dump` (dùng lại `ci_core::scip::parse`, không viết lại protobuf decoder ở Python), chạy `ci
+scip-dump` (dùng lại `calm_core::scip::parse`, không viết lại protobuf decoder ở Python), chạy `ci
 index` (mặc định feature, tức **chỉ Phase A**, SCIP overlay không bật) rồi so `call_edges` (Rust)
 với oracle.
 

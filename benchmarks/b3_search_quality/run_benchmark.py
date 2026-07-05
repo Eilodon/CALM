@@ -105,7 +105,7 @@ def main() -> int:
     any_hybrid_active = any(not r["hybrid_degraded"] for r in rows)
 
     summary = {
-        "corpus": "self (Code-Intelligence)",
+        "corpus": "self (CALM)",
         "metric": f"NDCG@{NDCG_K}",
         "queries": rows,
         "aggregate": {

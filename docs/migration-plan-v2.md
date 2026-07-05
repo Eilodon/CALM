@@ -15,9 +15,9 @@ status: DRAFT
 
 ### A.1 — Mượn trực tiếp (giảm thiết kế lại)
 
-| # | Pattern từ SUPER-MCP | Áp dụng cho Code-Intelligence | Lý do |
+| # | Pattern từ SUPER-MCP | Áp dụng cho CALM | Lý do |
 |---|---------------------|-------------------------------|-------|
-| 1 | **CI pipeline** (`.github/workflows/ci.yml`) — typecheck → test → audit → outdated signal | Viết CI cho Rust: `cargo fmt --check` → `cargo clippy` → `cargo test` → `cargo audit` → `cargo outdated` | Code-Intelligence **chưa có CI nào**. SUPER-MCP pattern đơn giản, hiệu quả, copy gần nguyên. |
+| 1 | **CI pipeline** (`.github/workflows/ci.yml`) — typecheck → test → audit → outdated signal | Viết CI cho Rust: `cargo fmt --check` → `cargo clippy` → `cargo test` → `cargo audit` → `cargo outdated` | CALM **chưa có CI nào**. SUPER-MCP pattern đơn giản, hiệu quả, copy gần nguyên. |
 | 2 | **Containerfile multi-stage** — builder (compile+prune) → runtime (minimal alpine) | Phase 6 distribution: builder (`cargo build --release`) → runtime (scratch/alpine + static binary) | Giảm image size, non-root user, read-only fs — áp dụng trực tiếp cho Rust binary. |
 | 3 | **Graceful shutdown + signal handling** — SIGINT/SIGTERM → ordered cleanup → drain tasks → close | `ci-server` MCP server: signal handler → flush DB WAL → close watcher → close embedder → exit | MCP server chạy persistent; cần shutdown sạch để không corrupt SQLite WAL. |
 | 4 | **Execution pipeline middleware chain** — policy → validation → rate-limit → handler → output-filter → telemetry | `ci-server` tool dispatch: preset-filter → input-validate → handler → suggested-next-inject → output-sanitize | 16 tools cần pipeline chung. Không cần rate-limit/quota (local tool), nhưng cần validate + sanitize + inject suggested_next. |
@@ -25,7 +25,7 @@ status: DRAFT
 | 6 | **Output firewall concept** — scan output cho credentials/PII trước khi trả client | Tool responses chứa source code → có thể chứa hardcoded secrets, API keys. Scan `source` tool output bằng regex patterns tương tự SUPER-MCP. | Code analysis tool đọc source code thật → risk lộ secrets trong response cao hơn SaaS tool bình thường. |
 | 7 | **Tool definition metadata** — `ToolDefinition` với annotations (`readOnlyHint`, `destructiveHint`, `idempotentHint`), `capabilities`, `requiredScopes` | rmcp `#[tool]` macro + custom annotations. Tất cả 16 tools đều `readOnlyHint: true` (đọc index, không sửa code). | MCP 2026-07-28 spec yêu cầu tool annotations. SUPER-MCP đã implement đúng spec. |
 | 8 | **Config validation fail-fast** — Zod schema validate toàn bộ config tại startup, crash ngay nếu invalid | `config.rs` đã có Pydantic-equivalent validate. Thêm: fail-fast nếu `project_root` không tồn tại, nếu `config.json` malformed, nếu DB path không writable. | Hiện `load_config` chỉ fallback default — không báo lỗi rõ ràng khi config file tồn tại nhưng malformed. |
-| 9 | **Pattern debt registry** — YAML file tracking technical debt với status, urgency, current_control, remaining | Tạo `docs/pattern-debt-registry.yaml` cho Code-Intelligence. Debt hiện tại: parity harness thiếu, analysis modules chưa port, CI chưa có. | SUPER-MCP pattern mature — track debt formally thay vì để trong đầu. |
+| 9 | **Pattern debt registry** — YAML file tracking technical debt với status, urgency, current_control, remaining | Tạo `docs/pattern-debt-registry.yaml` cho CALM. Debt hiện tại: parity harness thiếu, analysis modules chưa port, CI chưa có. | SUPER-MCP pattern mature — track debt formally thay vì để trong đầu. |
 | 10 | **ADR pattern** — `docs/adr/` cho architectural decisions | Ghi lại decisions: rmcp version lock, Stack Graphs scope, embedding model choice, ConservativeResolver keep/replace. | Decisions hiện nằm rải rác trong design docs, không có single place to look. |
 | 11 | **Telemetry pluggable interface** — ITelemetryLogger với factory pattern | Rust: `tracing` subscriber đã là pluggable. Thêm: structured event logging cho tool calls (tool_name, duration_ms, result_size) — giống SUPER-MCP telemetry points. | Cần cho Phase 5 `session_context` và debugging. |
 | 12 | **Test helper patterns** — `ctx()` helper, deterministic fixtures, async lifecycle cleanup | Rust test: `setup_db()` helper đã có. Mở rộng: `setup_indexed_project()` fixture cho integration tests, `assert_parity!(python_output, rust_output)` macro cho parity harness. | Giảm boilerplate test, tăng consistency. |
@@ -34,13 +34,13 @@ status: DRAFT
 
 | Pattern | Lý do không áp dụng |
 |---------|---------------------|
-| Multi-tenant state management | Code-Intelligence là local single-user tool, không có tenant concept. |
+| Multi-tenant state management | CALM là local single-user tool, không có tenant concept. |
 | Encryption/KMS (v2/v3/v4 envelopes) | Không có persistent encrypted state — SQLite DB là local, unencrypted. |
 | Redis storage backend | Local SQLite là storage duy nhất, không cần remote store. |
 | Rate limiting / quota | Local tool, không phải SaaS — không có abuse scenario. |
 | OIDC/JWT/API-key auth | MCP chạy stdio (local). HTTP transport nếu cần sau này, nhưng không phải priority. |
 | Idempotency manager | 16 tools đều read-only (đọc index). Không có side-effect cần deduplicate. |
-| Plugin system | Code-Intelligence là 1 MCP server duy nhất, không host plugins. |
+| Plugin system | CALM là 1 MCP server duy nhất, không host plugins. |
 | Vault / secrets management | Không có multi-tenant secrets. |
 | Execution lock (tenant mutex) | Single-user, single-writer (WAL handles concurrent reads). |
 
@@ -265,7 +265,7 @@ status: DRAFT
 
 #### 4.2 — Execution Pipeline (mượn từ SUPER-MCP, đơn giản hóa)
 
-SUPER-MCP pipeline có 14 bước. Code-Intelligence chỉ cần 6:
+SUPER-MCP pipeline có 14 bước. CALM chỉ cần 6:
 
 ```
 ┌─────────────────────────────────────────────┐

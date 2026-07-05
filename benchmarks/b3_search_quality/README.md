@@ -2,7 +2,7 @@
 
 Đo chất lượng ranking của `ci search` bằng NDCG@10 trên ground truth đã curate thủ công (12 query
 ngắn, thực tế — kiểu agent thật sẽ gõ, không phải câu hỏi đầy đủ), so với baseline `grep -l` (không
-ranking, chỉ theo thứ tự file-scan) trên chính repo Code-Intelligence.
+ranking, chỉ theo thứ tự file-scan) trên chính repo CALM.
 
 ## Chạy
 
@@ -47,13 +47,13 @@ Trước khi tinh chỉnh `queries.yaml`, chạy thử với query `"rrf merge"`
 `test_rrf_merge_n_respects_limit` — cả hai đều nằm CÙNG FILE `search.rs` (convention Rust
 `#[cfg(test)] mod tests`). Noise-penalty theo path (đã làm trước đó) không bắt được case này vì
 không có thư mục `tests/` riêng để flag. Fix: dùng thẳng cột `symbols.is_test` (đã có sẵn từ
-DEBT-008) thay vì đoán qua tên/đường dẫn — xem `crates/ci-core/src/search.rs::noise_multiplier`.
+DEBT-008) thay vì đoán qua tên/đường dẫn — xem `crates/calm-core/src/search.rs::noise_multiplier`.
 Sau fix, `rrf_merge_n` lên #1. Số liệu trong bảng trên là SAU fix; đây chính là giá trị của việc có
 benchmark thật: bắt được vấn đề thay vì đoán.
 
 ## Phát hiện quan trọng #2: naive grep thất bại hoàn toàn khi từ khoá phổ biến
 
-`resolve_symbol` (`crates/ci-server/src/tools.rs`) NDCG naive-grep = 0.000 — không phải bug, đã
+`resolve_symbol` (`crates/calm-server/src/tools.rs`) NDCG naive-grep = 0.000 — không phải bug, đã
 verify tay: `grep -l resolve` khớp 16 file (từ "resolve" xuất hiện khắp `resolver/*.rs`,
 `indexer/*.rs`...), và `tools.rs` xếp thứ 16/16 theo thứ tự file-scan, ngoài cửa sổ NDCG@10. `ci
 search` xếp đúng file này ở #1 nhờ BM25 trên tên symbol thay vì so khớp text thô toàn file.

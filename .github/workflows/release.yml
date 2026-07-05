@@ -39,7 +39,7 @@ jobs:
 
       # Workspace version defaults to whatever was last committed to
       # Cargo.toml, which drifts from the release tag if nobody remembers to
-      # bump it by hand — stamp it from the tag so `ci --version` always
+      # bump it by hand — stamp it from the tag so `calm --version` always
       # matches the artifact it shipped in.
       - name: Set crate version from tag
         # `-i.bak` (suffix glued to the flag, no space) is the one `sed -i`
@@ -57,21 +57,21 @@ jobs:
 
       - name: Build (cross)
         if: matrix.cross
-        run: cross build --release --bin ci --target ${{ matrix.target }}
+        run: cross build --release --bin calm --target ${{ matrix.target }}
 
       - name: Build (native)
         if: ${{ !matrix.cross }}
-        run: cargo build --release --bin ci --target ${{ matrix.target }}
+        run: cargo build --release --bin calm --target ${{ matrix.target }}
 
       - name: Package
         run: |
-          bin="target/${{ matrix.target }}/release/ci"
-          tar -czf "ci-${{ matrix.target }}.tar.gz" -C "$(dirname "$bin")" ci
+          bin="target/${{ matrix.target }}/release/calm"
+          tar -czf "calm-${{ matrix.target }}.tar.gz" -C "$(dirname "$bin")" calm
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: ci-${{ matrix.target }}
-          path: ci-${{ matrix.target }}.tar.gz
+          name: calm-${{ matrix.target }}
+          path: calm-${{ matrix.target }}.tar.gz
 
   release:
     needs: build
@@ -86,7 +86,7 @@ jobs:
 
       - name: Generate checksums
         working-directory: dist
-        run: sha256sum ci-*.tar.gz > SHA256SUMS
+        run: sha256sum calm-*.tar.gz > SHA256SUMS
 
       - name: Publish release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
@@ -124,5 +124,5 @@ jobs:
           file: Containerfile
           push: true
           tags: |
-            ghcr.io/eilodon/code-intelligence:${{ steps.version.outputs.version }}
-            ghcr.io/eilodon/code-intelligence:latest
+            ghcr.io/eilodon/calm-mcp:${{ steps.version.outputs.version }}
+            ghcr.io/eilodon/calm-mcp:latest

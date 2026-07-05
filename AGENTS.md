@@ -1,4 +1,4 @@
-# Code Intelligence MCP — Navigational Workflow v2.8
+# CALM MCP — Navigational Workflow v2.8
 
 > 21 tools. 8 stages. Every response carries `suggested_next` — follow it.
 
@@ -25,7 +25,7 @@
 ```
 repo_overview()          # ALWAYS call first at session start — never skip
 hotspots(top_n=10)       # find files that break most often
-fitness_report()         # hub/dead-code/complexity/coverage/boundary health vs thresholds — same checks as `ci fitness-check` in CI, queryable mid-session
+fitness_report()         # hub/dead-code/complexity/coverage/boundary health vs thresholds — same checks as `calm fitness-check` in CI, queryable mid-session
 ```
 
 **Done when**: You know the languages, entry points, module structure, and highest-churn files. `suggested_next` points to `locate`.
@@ -132,7 +132,7 @@ edit_context("getUserByEmail")
 - `callers[].edge_confidence == "textual"` → may be false positives AND missed real callers
 - `co_changed_files` non-empty → these files have no import/call relationship to the one you're editing, but historically changed together with it in the same commit — a coupling signal the call graph cannot see (e.g. a model + its migration). Consider whether they need updating too.
 
-**Rule: Never skip this stage** before modifying, refactoring, or deleting any symbol. Under Claude Code with this repo's bundled hook (`.claude/hooks/ci-nudge.sh`), this is enforced for native `Edit`, not just convention: the first `Edit` of a source-code file each session is denied until `edit_context` has been called at least once that session. `edit_symbol`/`edit_lines` (Stage 6) aren't gated this way since they already refuse a hub/high-risk touch per-call without `confirm:true` — reading `edit_context` first is still how you find out *why* before deciding to pass it.
+**Rule: Never skip this stage** before modifying, refactoring, or deleting any symbol. Under Claude Code with this repo's bundled hook (`.claude/hooks/calm-nudge.sh`), this is enforced for native `Edit`, not just convention: the first `Edit` of a source-code file each session is denied until `edit_context` has been called at least once that session. `edit_symbol`/`edit_lines` (Stage 6) aren't gated this way since they already refuse a hub/high-risk touch per-call without `confirm:true` — reading `edit_context` first is still how you find out *why* before deciding to pass it.
 
 ---
 
@@ -140,7 +140,7 @@ edit_context("getUserByEmail")
 
 **Goal**: Make the code change.
 
-**Tools**: `edit_symbol` / `edit_lines` (ci's own write path — preferred for any tracked file), native `Edit`/`Write` (fallback)
+**Tools**: `edit_symbol` / `edit_lines` (calm's own write path — preferred for any tracked file), native `Edit`/`Write` (fallback)
 
 ```
 edit_symbol("getUserByEmail", expected_hash=<range_checksum from edit_context>, new_text="...")
@@ -150,8 +150,8 @@ edit_lines(path="Cargo.toml", edits=[{start_line, end_line, new_text}])
 ```
 
 After `edit_context` confirms you understand the blast radius, make the change:
-- **Prefer `edit_symbol`/`edit_lines`** for any file `ci` tracks. They validate syntax before writing (refuse rather than write a parse error), refuse a hub/high-risk touch without `confirm:true` (the same signal `edit_context` just showed you, enforced per-edit instead of once-per-session), write atomically, and reindex immediately — `diff_impact` right after sees a fresh index instead of waiting on the file watcher.
-- **Fall back to native `Edit`/`Write`** only for a brand-new file (no symbol exists yet to resolve a hash against) or a path `ci` doesn't index at all (dotdirs, `target/`, `node_modules/`, `dist/`, `build/`, `__pycache__/`, `venv/`, `legacy/` — see `crates/ci-core/src/walk.rs::IGNORE_DIRS`).
+- **Prefer `edit_symbol`/`edit_lines`** for any file `calm` tracks. They validate syntax before writing (refuse rather than write a parse error), refuse a hub/high-risk touch without `confirm:true` (the same signal `edit_context` just showed you, enforced per-edit instead of once-per-session), write atomically, and reindex immediately — `diff_impact` right after sees a fresh index instead of waiting on the file watcher.
+- **Fall back to native `Edit`/`Write`** only for a brand-new file (no symbol exists yet to resolve a hash against) or a path `calm` doesn't index at all (dotdirs, `target/`, `node_modules/`, `dist/`, `build/`, `__pycache__/`, `venv/`, `legacy/` — see `crates/calm-core/src/walk.rs::IGNORE_DIRS`).
 
 **Rules**:
 - Update ALL call sites flagged in `edit_context.callers[]` in the same change
@@ -182,7 +182,7 @@ diff_impact(commits="HEAD~1..HEAD")   # verify already-committed changes
 - `unindexed_files[].reason == "recognized_unparsed"` → a recognized-but-unsupported source extension (e.g. `.sol`/`.circom`/`.move`/`.cairo`/`.vy`) tracked by path only, never by symbols; like `out_of_scope`, permanent and harmless — there is no scan to wait for
 - `suggested_reviewers` present → notify these owners before merging
 
-**Rule: Never commit or push** without calling `diff_impact` first. Under Claude Code with this repo's bundled hook (`.claude/hooks/ci-nudge.sh`), this is enforced: `git commit`/`git push` is denied whenever a file was edited since the last `diff_impact` call. Host-agnostic backup for any MCP client (not just Claude Code): `session_context`'s `pending_diff_impact`/`files_pending_diff_impact` report the same thing — files written via `edit_lines`/`edit_symbol` since the last `diff_impact` call — and its `suggested_next` points straight at `diff_impact` while any are pending.
+**Rule: Never commit or push** without calling `diff_impact` first. Under Claude Code with this repo's bundled hook (`.claude/hooks/calm-nudge.sh`), this is enforced: `git commit`/`git push` is denied whenever a file was edited since the last `diff_impact` call. Host-agnostic backup for any MCP client (not just Claude Code): `session_context`'s `pending_diff_impact`/`files_pending_diff_impact` report the same thing — files written via `edit_lines`/`edit_symbol` since the last `diff_impact` call — and its `suggested_next` points straight at `diff_impact` while any are pending.
 
 ---
 
@@ -235,7 +235,7 @@ remember("auth-flow", "OAuth callback must validate state param — see incident
 ## Mandatory Rules (non-negotiable)
 
 1. **`repo_overview` first** — always at session start, never skip
-2. **`edit_context` before edit** — mandatory, no exceptions, never skip. Hook-enforced under Claude Code (see `.claude/hooks/ci-nudge.sh`) for native `Edit`: the first `Edit` of a source file each session is denied until this is called. `edit_symbol`/`edit_lines` are not gated the same way — they carry their own per-call risk gate instead (Stage 6), which is stricter (every touch, not just the first).
+2. **`edit_context` before edit** — mandatory, no exceptions, never skip. Hook-enforced under Claude Code (see `.claude/hooks/calm-nudge.sh`) for native `Edit`: the first `Edit` of a source file each session is denied until this is called. `edit_symbol`/`edit_lines` are not gated the same way — they carry their own per-call risk gate instead (Stage 6), which is stricter (every touch, not just the first).
 3. **`diff_impact` after edit** — mandatory before any commit or push, whether the edit was made via `edit_symbol`/`edit_lines` or native `Edit`/`Write`. Hook-enforced under Claude Code: `git commit`/`git push` is denied if a file changed via any of those four tools since the last `diff_impact` call.
 4. **Never use native Read/grep on project files** when index tools are available — `search(kind="grep")` extends this to files the parser doesn't touch (docs, config, lockfiles), so this holds even outside indexed source
 5. **Follow `suggested_next`** — it is computed per-response with full context; override only with explicit reason

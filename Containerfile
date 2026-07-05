@@ -8,12 +8,12 @@ FROM rust:alpine AS builder
 RUN apk add --no-cache build-base
 WORKDIR /build
 COPY . .
-RUN cargo build --release --bin ci \
-    && strip target/release/ci
+RUN cargo build --release --bin calm \
+    && strip target/release/calm
 
 FROM scratch
-COPY --from=builder /build/target/release/ci /ci
+COPY --from=builder /build/target/release/calm /calm
 # Mount the project read-only at /project; the index DB lives on a writable
 # volume at /data. MCP uses stdio transport, so attach the client to stdin/stdout.
-ENTRYPOINT ["/ci"]
+ENTRYPOINT ["/calm"]
 CMD ["serve", "--project-root", "/project", "--db-path", "/data/index.db"]

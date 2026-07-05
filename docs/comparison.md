@@ -1,4 +1,4 @@
-# So sánh `ci` với các code-intelligence MCP server khác
+# So sánh `calm` với các code-intelligence MCP server khác
 
 Bối cảnh (tính đến giữa 2026): "code intelligence cho AI agent" đã trở thành một nhóm sản phẩm
 riêng, không còn là niche — vài công cụ đã vượt hàng chục nghìn sao GitHub. Bảng dưới đối chiếu

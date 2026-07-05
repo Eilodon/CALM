@@ -36,8 +36,8 @@ mô phỏng ở mỗi benchmark.
 ```bash
 python3 -m venv benchmarks/.venv
 benchmarks/.venv/bin/pip install -r benchmarks/requirements.txt
-cargo build --release -p ci-cli   # cần build sẵn trước khi chạy bất kỳ benchmark nào
-cargo build --release -p ci-cli --features scip-overlay  # cần cho B2 (scip-dump subcommand)
+cargo build --release -p calm-cli   # cần build sẵn trước khi chạy bất kỳ benchmark nào
+cargo build --release -p calm-cli --features scip-overlay  # cần cho B2 (scip-dump subcommand)
 
 benchmarks/.venv/bin/python benchmarks/b2_call_graph_quality/run_benchmark.py
 benchmarks/.venv/bin/python benchmarks/b3_search_quality/run_benchmark.py
@@ -71,6 +71,6 @@ hiểu ý tưởng đo tool-call efficiency.
 
 ## Phạm vi hiện tại
 
-Corpus dùng chung: **self-repo** (chính Code-Intelligence, ~40 file Rust) — zero-setup, không cần
+Corpus dùng chung: **self-repo** (chính CALM, ~40 file Rust) — zero-setup, không cần
 clone gì thêm. Corpus đa ngôn ngữ/quy mô lớn hơn (httpx, FastAPI, Django như trong thiết kế gốc)
 để ở Phase 2, sau khi phương pháp đo được xác nhận đúng trên self-repo.

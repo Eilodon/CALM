@@ -1,6 +1,6 @@
 {
   "servers": {
-    "ci": {
+    "calm": {
       "command": "bash",
       "args": ["scripts/mcp-launcher.sh"]
     }

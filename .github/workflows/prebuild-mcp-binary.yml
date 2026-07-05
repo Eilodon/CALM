@@ -1,19 +1,19 @@
 name: Prebuild MCP binary
 
-# Keeps a ready-to-run `ci` binary committed at .ci-bin/x86_64-unknown-linux-musl/ci
+# Keeps a ready-to-run `calm` binary committed at .calm-bin/x86_64-unknown-linux-musl/calm
 # (via Git LFS) so scripts/mcp-launcher.sh has it the instant a fresh clone
 # happens — no compile, no download, no tagged-release requirement. This is
 # what closes the Claude-Code-on-the-web cold-start race that a Setup
 # Script/SessionStart hook can only race, never structurally win — see
 # docs/cloud-environment-setup.md.
 #
-# `paths-ignore: ['.ci-bin/**']` is load-bearing: without it, this workflow's
+# `paths-ignore: ['.calm-bin/**']` is load-bearing: without it, this workflow's
 # own commit back to main would retrigger itself.
 on:
   push:
     branches: [main]
     paths-ignore:
-      - '.ci-bin/**'
+      - '.calm-bin/**'
 
 permissions:
   contents: write
@@ -38,18 +38,18 @@ jobs:
         run: cargo install cross --locked
 
       - name: Build
-        run: cross build --release --bin ci --target x86_64-unknown-linux-musl
+        run: cross build --release --bin calm --target x86_64-unknown-linux-musl
 
       - name: Commit prebuilt binary
         run: |
-          mkdir -p .ci-bin/x86_64-unknown-linux-musl
-          cp target/x86_64-unknown-linux-musl/release/ci .ci-bin/x86_64-unknown-linux-musl/ci
+          mkdir -p .calm-bin/x86_64-unknown-linux-musl
+          cp target/x86_64-unknown-linux-musl/release/calm .calm-bin/x86_64-unknown-linux-musl/calm
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add .ci-bin/x86_64-unknown-linux-musl/ci
+          git add .calm-bin/x86_64-unknown-linux-musl/calm
           if git diff --cached --quiet; then
             echo "Binary unchanged, nothing to commit"
             exit 0
           fi
-          git commit -m "chore(ci-bin): update prebuilt ci binary for $(git rev-parse --short HEAD)"
+          git commit -m "chore(calm-bin): update prebuilt calm binary for $(git rev-parse --short HEAD)"
           git push

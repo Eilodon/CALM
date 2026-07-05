@@ -43,10 +43,10 @@ def main() -> int:
         rows = []
         for task in tasks:
             naive = naive_text(repo_root, task["naive"])
-            ci_text = client.call_tool(task["ci"]["tool"], task["ci"]["arguments"])
+            calm_text = client.call_tool(task["ci"]["tool"], task["ci"]["arguments"])
 
             naive_tokens = len(enc.encode(naive))
-            ci_tokens = len(enc.encode(ci_text))
+            ci_tokens = len(enc.encode(calm_text))
             ratio = naive_tokens / ci_tokens if ci_tokens else float("inf")
 
             rows.append({
@@ -63,7 +63,7 @@ def main() -> int:
     ratios = [r["ratio"] for r in rows]
     summary = {
         "encoding_model": ENCODING_MODEL,
-        "corpus": "self (Code-Intelligence)",
+        "corpus": "self (CALM)",
         "tasks": rows,
         "aggregate": {
             "median_ratio": statistics.median(ratios),

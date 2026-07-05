@@ -11,7 +11,7 @@ cùng self-repo corpus, cùng 4 task với B4/B6 (`../lib/tasks.yaml` + `../lib/
 ```bash
 npm i -g @colbymchenry/codegraph   # 1 lần
 codegraph init                     # build .codegraph/ tại repo root — 1 lần, ~1s cho self-repo
-cargo build --release -p ci-cli    # nếu chưa build
+cargo build --release -p calm-cli    # nếu chưa build
 benchmarks/.venv/bin/python benchmarks/b10_real_competitor_ab/run_benchmark.py
 ```
 
@@ -33,9 +33,9 @@ mean ratio: `ci` 10.7x · CodeGraph 147.1x · Semble 50.7x
 ### Accuracy — `find_callers` (collect_source_files) vs grep oracle
 
 Oracle (đếm call site thật bằng `grep -rn 'collect_source_files(' crates --include=*.rs`, loại
-dòng định nghĩa/comment): 2 file gọi — `crates/ci-core/src/indexer/pipeline.rs` và
-`crates/ci-server/src/tools/recover.rs` (khác crate, gọi qua fully-qualified path
-`ci_core::indexer::pipeline::collect_source_files`).
+dòng định nghĩa/comment): 2 file gọi — `crates/calm-core/src/indexer/pipeline.rs` và
+`crates/calm-server/src/tools/recover.rs` (khác crate, gọi qua fully-qualified path
+`calm_core::indexer::pipeline::collect_source_files`).
 
 | Tool | Recall | Ghi chú |
 |---|---|---|

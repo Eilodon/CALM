@@ -23,7 +23,7 @@
         "CODEGRAPH_MCP_TOOLS": "explore,node,search,callers,callees,impact,files,status"
       }
     },
-    "ci": {
+    "calm": {
       "type": "stdio",
       "command": "bash",
       "args": ["scripts/mcp-launcher.sh"],

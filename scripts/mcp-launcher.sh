@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Universal MCP stdio launcher for the "ci" server — works from any MCP
+# Universal MCP stdio launcher for the "calm" server — works from any MCP
 # client's config (Claude Code, Cursor, VS Code, Windsurf, JetBrains, or
 # anything else that spawns a command over stdio). See
 # docs/mcp-client-setup.md for the full rationale and per-client wiring.
@@ -7,13 +7,13 @@
 # Resolution order (first usable binary wins, no exceptions):
 #   1. Fast path   — an already-usable binary: $CI_MCP_BIN override, a
 #                     cached verified download, a local dev build
-#                     (target/release/ci, target/debug/ci), or a prebuilt
-#                     binary committed to .ci-bin/ via Git LFS — the dev
-#                     build and .ci-bin candidates are only trusted if
+#                     (target/release/calm, target/debug/calm), or a prebuilt
+#                     binary committed to .calm-bin/ via Git LFS — the dev
+#                     build and .calm-bin candidates are only trusted if
 #                     `is_binary_fresh` says they're at least as new as
 #                     every source file (see that function's comment for
 #                     the incident this guards against: a stale
-#                     target/debug/ci silently served an entire MCP session
+#                     target/debug/calm silently served an entire MCP session
 #                     because nothing checked it against the checked-out
 #                     source before exec'ing it).
 #                     $CI_MCP_BIN and the cached download are NOT freshness-
@@ -22,7 +22,7 @@
 #                     immutable, checksum-verified artifact for an exact
 #                     tagged commit (its own consistency check is the tag
 #                     match + `--version` check in download_and_verify).
-#                     .ci-bin/ closes the exact cold-start race
+#                     .calm-bin/ closes the exact cold-start race
 #                     docs/cloud-environment-setup.md documents for Claude
 #                     Code on the web: a Setup Script or SessionStart hook
 #                     can only race a cold `cargo build` against the MCP
@@ -48,7 +48,7 @@
 #                     never gets executed, but it also never becomes a dead
 #                     end (see docs/mcp-client-setup.md for why fallback was
 #                     chosen over a hard failure here).
-#   3. Build from source — `cargo build -p ci-cli`, always available as
+#   3. Build from source — `cargo build -p calm-cli`, always available as
 #                     long as a Rust toolchain is present. This is the only
 #                     path for non-Linux platforms, untagged dev checkouts,
 #                     or offline environments.
@@ -62,13 +62,13 @@ set -uo pipefail
 # must resolve relative to that, not to wherever mcp-launcher.sh happens to
 # live on disk. Without this, an external consumer pointing their own
 # project's MCP config at this script would silently index
-# Code-Intelligence itself instead of their own project.
+# CALM itself instead of their own project.
 caller_pwd="$PWD"
 cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
 
-REPO="Eilodon/Code-Intelligence"
+REPO="Eilodon/CALM"
 BASE_URL="${CI_MCP_LAUNCHER_BASE_URL:-https://github.com/${REPO}}"
-CACHE_ROOT="${XDG_CACHE_HOME:-$HOME/.cache}/ci-mcp"
+CACHE_ROOT="${XDG_CACHE_HOME:-$HOME/.cache}/calm-mcp"
 
 log() { printf '[mcp-launcher] %s\n' "$*" >&2; }
 
@@ -79,7 +79,7 @@ log() { printf '[mcp-launcher] %s\n' "$*" >&2; }
 # (not appendable) and rejects it being passed twice. An external consumer
 # wiring this script into another project's client config gets that
 # project's cwd for free this way; without the override-detection below it
-# would collide with the default and `ci serve` always fails with "cannot
+# would collide with the default and `calm serve` always fails with "cannot
 # be used multiple times".
 serve_args=(serve --project-root "$caller_pwd" "$@")
 for arg in "$@"; do
@@ -109,7 +109,7 @@ is_binary_fresh() {
   local bin="$1"
   [ -d crates ] || return 0
   local newer
-  # Also checks vendored assets (crates/ci-core/assets/**, currently just the
+  # Also checks vendored assets (crates/calm-core/assets/**, currently just the
   # embedding model's tokenizer/config/weights) — not just source files.
   # `include_bytes!` bakes these into the binary at compile time same as any
   # `.rs` change, so a binary built before `git lfs pull` resolved a
@@ -118,7 +118,7 @@ is_binary_fresh() {
   # baked in even after the asset on disk is fixed — exactly the gap that let
   # a resolved LFS pull go unnoticed until a manual rebuild.
   newer=$(find crates Cargo.toml Cargo.lock -type f \
-    \( -name '*.rs' -o -name 'Cargo.toml' -o -name 'Cargo.lock' -o -path '*/ci-core/assets/*' \) \
+    \( -name '*.rs' -o -name 'Cargo.toml' -o -name 'Cargo.lock' -o -path '*/calm-core/assets/*' \) \
     -newer "$bin" 2>/dev/null | head -1)
   [ -z "$newer" ]
 }
@@ -133,7 +133,7 @@ is_binary_fresh() {
 # script, which runs (and errors on "version: command not found") INSTEAD
 # OF returning control to this script — verified directly against a
 # synthetic pointer stub, not assumed. Without this check, an unresolved
-# .ci-bin/ pointer would crash the whole launcher instead of falling
+# .calm-bin/ pointer would crash the whole launcher instead of falling
 # through to the next tier.
 is_lfs_pointer() {
   [ "$(head -c 7 -- "$1" 2>/dev/null)" = "version" ]
@@ -156,14 +156,14 @@ cache_key="${resolved_tag:-$workspace_version}"
 
 # ---- Tier 1: fast path — already-usable binary ----
 [ -n "${CI_MCP_BIN:-}" ] && try_exec "$CI_MCP_BIN"
-[ -n "$cache_key" ] && try_exec "${CACHE_ROOT}/${cache_key}/ci"
-try_exec_if_fresh "target/release/ci"
-try_exec_if_fresh "target/debug/ci"
+[ -n "$cache_key" ] && try_exec "${CACHE_ROOT}/${cache_key}/calm"
+try_exec_if_fresh "target/release/calm"
+try_exec_if_fresh "target/debug/calm"
 
 # ---- Tier 1.5: prebuilt binary committed via Git LFS (see header) ----
 # Only the one platform .github/workflows/prebuild-mcp-binary.yml builds.
 if [ "$(uname -s)" = "Linux" ] && [ "$(uname -m)" = "x86_64" ]; then
-  try_exec_if_fresh ".ci-bin/x86_64-unknown-linux-musl/ci"
+  try_exec_if_fresh ".calm-bin/x86_64-unknown-linux-musl/calm"
 fi
 
 # ---- Tier 2: verified download (Linux only, tagged commit only unless opted in) ----
@@ -205,7 +205,7 @@ download_and_verify() {
     return 1
   fi
 
-  asset_name="ci-${target_triple}.tar.gz"
+  asset_name="calm-${target_triple}.tar.gz"
   asset_url="${BASE_URL}/releases/download/${tag}/${asset_name}"
   sums_url="${BASE_URL}/releases/download/${tag}/SHA256SUMS"
 
@@ -234,9 +234,9 @@ download_and_verify() {
     log "extraction failed for ${asset_name} — building from source"
     return 1
   fi
-  chmod +x "${tmp_dir}/ci"
+  chmod +x "${tmp_dir}/calm"
 
-  downloaded_version=$("${tmp_dir}/ci" --version 2>/dev/null | awk '{print $NF}')
+  downloaded_version=$("${tmp_dir}/calm" --version 2>/dev/null | awk '{print $NF}')
   if [ -n "$workspace_version" ] && [ "$downloaded_version" != "$workspace_version" ]; then
     log "downloaded binary reports version '${downloaded_version}', expected '${workspace_version}' — building from source instead"
     return 1
@@ -244,21 +244,21 @@ download_and_verify() {
 
   cache_dir="${CACHE_ROOT}/${tag}"
   mkdir -p "$cache_dir"
-  mv "${tmp_dir}/ci" "${cache_dir}/ci"
+  mv "${tmp_dir}/calm" "${cache_dir}/calm"
   rm -rf "$tmp_dir"
 
-  try_exec "${cache_dir}/ci"
+  try_exec "${cache_dir}/calm"
   return 1 # unreachable if try_exec succeeded (exec replaces this process)
 }
 
 download_and_verify
 
 # ---- Tier 3: build from source (always must work standalone) ----
-log "building ci-cli from source (this may take about a minute on a cold cache)"
-if ! cargo build --quiet -p ci-cli 1>&2; then
-  log "build failed — cannot start the ci MCP server"
+log "building calm-cli from source (this may take about a minute on a cold cache)"
+if ! cargo build --quiet -p calm-cli 1>&2; then
+  log "build failed — cannot start the calm MCP server"
   exit 1
 fi
-try_exec "target/debug/ci"
-log "build succeeded but target/debug/ci is missing or not executable — aborting"
+try_exec "target/debug/calm"
+log "build succeeded but target/debug/calm is missing or not executable — aborting"
 exit 1

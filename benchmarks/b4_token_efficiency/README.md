@@ -2,7 +2,7 @@
 
 Đo số token (GPT-4 tokenizer, `tiktoken`) một agent tốn khi dùng workflow naive (`cat` file,
 `grep` text thô) so với gọi thẳng MCP tool tương ứng (`source`, `callers`, `edit_context`,
-`locate`), trên chính repo Code-Intelligence.
+`locate`), trên chính repo CALM.
 
 ## Chạy
 
@@ -18,7 +18,7 @@ Script tự spawn `ci serve --project-root .`, đợi index `ready`, gọi lần
 Dùng chung task set với [B6](../b6_tool_call_efficiency/) — định nghĩa 1 lần tại
 `../lib/tasks.yaml`, không lặp lại. 4 task ánh xạ 4 kịch bản coding thật (đọc hàm / tìm callers /
 kiểm tra blast radius trước khi sửa / locate 3-in-1), dùng symbol thật trong
-`crates/ci-core/src/indexer/pipeline.rs` (`run_indexing_pipeline`, `collect_source_files`,
+`crates/calm-core/src/indexer/pipeline.rs` (`run_indexing_pipeline`, `collect_source_files`,
 `reindex_changed`). `mcp_client.py` (client MCP stdio) cũng nằm ở `../lib/`, tái dùng cho các
 benchmark sau.
 

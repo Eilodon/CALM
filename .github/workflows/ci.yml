@@ -58,12 +58,12 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       # The `embeddings` feature (model2vec-rs). The default model's weights
-      # are vendored via Git LFS (crates/ci-core/assets/potion-code-16m/) and
+      # are vendored via Git LFS (crates/calm-core/assets/potion-code-16m/) and
       # loaded with zero network — `lfs: true` above is required so checkout
       # fetches the real blob instead of a pointer file (include_bytes! would
       # otherwise embed the pointer text and fail to parse at runtime).
       - name: Clippy (embeddings)
-        run: cargo clippy -p ci-core --all-targets --features embeddings -- -D warnings
+        run: cargo clippy -p calm-core --all-targets --features embeddings -- -D warnings
 
       - name: Test (embeddings)
-        run: cargo test -p ci-core --features embeddings
+        run: cargo test -p calm-core --features embeddings

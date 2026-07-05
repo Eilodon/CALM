@@ -1,10 +1,10 @@
-# Hardened deployment example for the Code Intelligence MCP server.
+# Hardened deployment example for the CALM MCP server.
 #
 # MCP uses stdio transport, so this is a reference for sandboxing rather than a
 # detached daemon — attach a client to the container's stdin/stdout:
-#   docker compose run --rm code-intelligence
+#   docker compose run --rm calm
 services:
-  code-intelligence:
+  calm:
     build:
       context: .
       dockerfile: Containerfile
@@ -18,8 +18,8 @@ services:
     tty: false
     volumes:
       - ./:/project:ro              # project mounted read-only
-      - ci-data:/data               # index DB on a writable volume
+      - calm-data:/data               # index DB on a writable volume
     command: ["serve", "--project-root", "/project", "--db-path", "/data/index.db"]
 
 volumes:
-  ci-data:
+  calm-data:

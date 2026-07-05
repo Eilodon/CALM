@@ -4,19 +4,19 @@
 # thresholds (hub_count, dead_code_pct, etc.) keep FitnessThresholds::default().
 
 # Layering rules Rust's own crate/module visibility does NOT already enforce
-# (unlike e.g. "ci-core must not depend on ci-server", which is structurally
-# impossible since ci-core/Cargo.toml doesn't list ci-server as a dependency —
+# (unlike e.g. "calm-core must not depend on calm-server", which is structurally
+# impossible since calm-core/Cargo.toml doesn't list calm-server as a dependency —
 # declaring that here would be a no-op). Both verified at 0 violations against
 # the current import_edges graph before being added.
 
 [[boundaries]]
-from = "crates/ci-core/src/indexer/"
-to = "crates/ci-core/src/analysis/"
+from = "crates/calm-core/src/indexer/"
+to = "crates/calm-core/src/analysis/"
 reason = "indexer (extraction) must stay upstream of analysis (derived intelligence: dead-code, hotspots, fitness) — not the other way around"
 
 [[boundaries]]
-from = "crates/ci-server/src/watcher.rs"
-to = "crates/ci-server/src/tools/"
+from = "crates/calm-server/src/watcher.rs"
+to = "crates/calm-server/src/tools/"
 reason = "the background reindex/watch loop must not depend on the MCP tool-handler layer it runs independently of"
 
 [config_drift]

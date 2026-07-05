@@ -1,9 +1,9 @@
 # Rust build output
 /target/
-crates/ci-core/tests/fixtures/rust_workspace/target/
+crates/calm-core/tests/fixtures/rust_workspace/target/
 
 # Index database (per-project, generated)
-.codeindex/
+.calm/
 *.db
 *.db-wal
 *.db-shm
@@ -37,6 +37,6 @@ Thumbs.db
 # npm platform-package binaries — populated by npm/stage-release.sh from a
 # tagged GitHub Release, not committed (same ~95MB prebuilt binaries
 # .github/workflows/release.yml already publishes, just re-packaged)
-npm/*/ci
+npm/*/calm
 npm/node_modules/
 npm/*/node_modules/

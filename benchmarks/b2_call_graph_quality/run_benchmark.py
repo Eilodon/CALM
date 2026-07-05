@@ -11,12 +11,12 @@ with it, broken down by `edge_confidence`.
 
 Requires:
   - `rust-analyzer` on PATH (or resolvable via rustup/VS Code — same
-    detection `ci_core::scip::runner::resolve_binary` uses).
+    detection `calm_core::scip::runner::resolve_binary` uses).
   - `ci` built with the `scip-overlay` feature, for the hidden `scip-dump`
     subcommand that decodes the oracle `.scip` file to JSON (reuses
-    `ci_core::scip::parse` instead of re-implementing SCIP protobuf decoding
+    `calm_core::scip::parse` instead of re-implementing SCIP protobuf decoding
     in Python):
-        cargo build --release -p ci-cli --features scip-overlay
+        cargo build --release -p calm-cli --features scip-overlay
 
 Methodology:
   1. Run `rust-analyzer scip <repo> --output oracle.scip`.
@@ -24,11 +24,11 @@ Methodology:
   3. Build the oracle edge set: for every non-local reference occurrence,
      resolve its symbol to its (non-local) definition occurrence, giving
      (ref_file, ref_line) -> (def_file, def_line). This mirrors
-     `ci_core::scip::ingest::ingest_occurrences`'s own matching exactly, so
+     `calm_core::scip::ingest::ingest_occurrences`'s own matching exactly, so
      the oracle here is built the same way Phase B's real ingest would use
      it — this benchmark and Phase B are measuring the same underlying
      correspondence.
-  4. Run `ci index --project-root <repo>` (default features -- i.e. Phase A
+  4. Run `calm index --project-root <repo>` (default features -- i.e. Phase A
      only, no SCIP overlay applied) and read `call_edges` for Rust files.
   5. precision = |ci ∩ oracle| / |ci|, recall = |ci ∩ oracle| / |oracle|,
      precision also broken down per `edge_confidence` bucket.
@@ -77,7 +77,7 @@ def find_rust_analyzer() -> str:
 
 def build_oracle(occurrences: list[dict]) -> set[tuple[str, int, str, int]]:
     """(ref_file, ref_line) -> (def_file, def_line) edges, mirroring
-    ci_core::scip::ingest::ingest_occurrences's own matching."""
+    calm_core::scip::ingest::ingest_occurrences's own matching."""
     def_of: dict[str, tuple[str, int]] = {}
     for o in occurrences:
         if o["is_def"] and not o["is_local"]:
@@ -94,7 +94,7 @@ def build_oracle(occurrences: list[dict]) -> set[tuple[str, int, str, int]]:
     return oracle
 
 
-def load_ci_edges(db_path: Path) -> list[tuple[str, int, str, int, str]]:
+def load_calm_edges(db_path: Path) -> list[tuple[str, int, str, int, str]]:
     conn = sqlite3.connect(db_path)
     rows = conn.execute(
         "SELECT ce.from_path, ce.call_site_line, ce.to_path, s.line_start, ce.edge_confidence "
@@ -116,19 +116,19 @@ def main() -> None:
         help="Rust project to measure (default: this repo)",
     )
     parser.add_argument(
-        "--ci-bin",
+        "--calm-bin",
         type=Path,
-        default=repo_root_from_here() / "target" / "release" / "ci",
-        help="Path to a `ci` binary built with --features scip-overlay",
+        default=repo_root_from_here() / "target" / "release" / "calm",
+        help="Path to a `calm` binary built with --features scip-overlay",
     )
     args = parser.parse_args()
     repo = args.repo.resolve()
-    ci_bin = args.ci_bin.resolve()
+    calm_bin = args.calm_bin.resolve()
 
-    if not ci_bin.exists():
+    if not calm_bin.exists():
         sys.exit(
-            f"{ci_bin} not found. Build it first:\n"
-            "  cargo build --release -p ci-cli --features scip-overlay"
+            f"{calm_bin} not found. Build it first:\n"
+            "  cargo build --release -p calm-cli --features scip-overlay"
         )
     ra_bin = find_rust_analyzer()
 
@@ -137,26 +137,26 @@ def main() -> None:
         print(f"Running rust-analyzer scip on {repo} ...")
         run([ra_bin, "scip", str(repo), "--output", str(scip_path)])
 
-        dump = run([str(ci_bin), "scip-dump", str(scip_path)])
+        dump = run([str(calm_bin), "scip-dump", str(scip_path)])
         occurrences = [json.loads(line) for line in dump.stdout.splitlines() if line.strip()]
         print(f"Decoded {len(occurrences)} SCIP occurrences.")
 
     oracle = build_oracle(occurrences)
     print(f"Oracle edges (non-local ref -> def): {len(oracle)}")
 
-    print(f"Indexing {repo} with `ci index` (Phase A syntactic resolver only) ...")
-    run([str(ci_bin), "index", "--project-root", str(repo)])
-    db_path = repo / ".codeindex" / "index.db"
-    ci_edges = load_ci_edges(db_path)
-    print(f"ci call_edges (Rust, with a call site line): {len(ci_edges)}")
+    print(f"Indexing {repo} with `calm index` (Phase A syntactic resolver only) ...")
+    run([str(calm_bin), "index", "--project-root", str(repo)])
+    db_path = repo / ".calm" / "index.db"
+    calm_edges = load_calm_edges(db_path)
+    print(f"ci call_edges (Rust, with a call site line): {len(calm_edges)}")
 
-    matched = [e for e in ci_edges if (e[0], e[1], e[2], e[3]) in oracle]
-    precision = len(matched) / len(ci_edges) if ci_edges else 0.0
+    matched = [e for e in calm_edges if (e[0], e[1], e[2], e[3]) in oracle]
+    precision = len(matched) / len(calm_edges) if calm_edges else 0.0
     oracle_hit = {(e[0], e[1], e[2], e[3]) for e in matched}
     recall = len(oracle_hit) / len(oracle) if oracle else 0.0
 
     by_conf: dict[str, list[tuple]] = defaultdict(list)
-    for e in ci_edges:
+    for e in calm_edges:
         by_conf[e[4]].append(e)
     conf_precision = {}
     for conf, edges in sorted(by_conf.items()):
@@ -167,7 +167,7 @@ def main() -> None:
         }
 
     print()
-    print(f"Overall precision: {precision:.3f}  ({len(matched)}/{len(ci_edges)})")
+    print(f"Overall precision: {precision:.3f}  ({len(matched)}/{len(calm_edges)})")
     print(f"Overall recall:    {recall:.3f}  ({len(oracle_hit)}/{len(oracle)})")
     print()
     print(f"{'confidence':<12} {'count':>8} {'precision':>10}")
@@ -177,7 +177,7 @@ def main() -> None:
     result = {
         "repo": str(repo),
         "oracle_edges": len(oracle),
-        "ci_edges": len(ci_edges),
+        "calm_edges": len(calm_edges),
         "precision": precision,
         "recall": recall,
         "by_confidence": conf_precision,

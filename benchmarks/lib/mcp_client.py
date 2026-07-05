@@ -26,7 +26,7 @@ class MCPClient:
         self._ids = itertools.count(1)
         self.proc = subprocess.Popen(
             [
-                "cargo", "run", "--quiet", "--release", "-p", "ci-cli",
+                "cargo", "run", "--quiet", "--release", "-p", "calm-cli",
                 "--", "serve", "--project-root", project_root,
             ],
             stdin=subprocess.PIPE,

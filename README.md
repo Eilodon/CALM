@@ -2,7 +2,6 @@
 
 **A live, graph-verified map of your codebase — so an AI coding agent can edit with its eyes open instead of grepping in the dark.**
 
-> The CLI binary, MCP server name, crates, and packages are still named `ci` while this rename is staged incrementally — every command below works as written. See [`docs/rename-checklist.md`](docs/rename-checklist.md) for the full plan.
 
 ---
 
@@ -62,23 +61,23 @@ That SCIP-overlay number is the one worth pausing on: CALM doesn't just guess at
 
 ```bash
 # 1. Build the binary
-cargo build --release -p ci-cli
+cargo build --release -p calm-cli
 
 # 2. Initialize config for your project
-ci init --project-root .
+calm init --project-root .
 
 # 3. Build the index (embeds symbols too, if semantic search is enabled in config.json)
-ci index --project-root .
+calm index --project-root .
 
 # 4. Run the MCP server over stdio — incremental reindex kicks in automatically if an index already exists
-ci serve --project-root .
+calm serve --project-root .
 ```
 
 This repo ships ready-made config for Claude Code (`.mcp.json`), Cursor (`.cursor/mcp.json`), and VS Code (`.vscode/mcp.json`) — all three point at `scripts/mcp-launcher.sh`, a shared launcher that finds an already-built binary, downloads a checksum-verified prebuilt release if you're on a matching git tag, or builds from source if nothing is available yet. Clone the repo and it just works — no manual build step required first. See [`docs/mcp-client-setup.md`](docs/mcp-client-setup.md) (Vietnamese) for Windsurf/JetBrains (global config, can't be checked into a repo) and how the launcher decides what to do.
 
-Don't want to clone this repo? See [`docs/mcp-client-setup.md`](docs/mcp-client-setup.md) — install via `curl | sh` (`scripts/install.sh`) or `npx @eilodon/ci-mcp`, then run `ci setup` from inside your own project to write MCP config pointing at the binary you just installed.
+Don't want to clone this repo? See [`docs/mcp-client-setup.md`](docs/mcp-client-setup.md) — install via `curl | sh` (`scripts/install.sh`) or `npx @eilodon/calm-mcp`, then run `calm setup` from inside your own project to write MCP config pointing at the binary you just installed.
 
-> **Note:** `ci serve` automatically adds `.codeindex/` to `.gitignore` on startup so the index database never gets committed.
+> **Note:** `calm serve` automatically adds `.calm/` to `.gitignore` on startup so the index database never gets committed.
 
 ## Example: an agent's actual workflow
 
@@ -102,7 +101,7 @@ agent: "I need to change getUserByEmail"
 ### Multi-tier indexing
 - **6 Tier-0 languages** — Python, TypeScript, JavaScript, Java, Rust, Go — get full `tree-sitter` AST parsing, a real call graph, an import graph, and multi-tier resolution.
 - **8 Tier-0.5 languages** — C, C++, C#, Ruby, PHP, Kotlin, Swift, Shell — get regex/line-scan symbol extraction (no call graph or import resolution). Built in, no feature flag required.
-- **Incremental watcher** — only changed files get re-parsed (FNV-1a content hash diff); the call graph rebuilds incrementally, parallelized with `rayon`. `ci serve` picks incremental reindex automatically whenever an index already exists.
+- **Incremental watcher** — only changed files get re-parsed (FNV-1a content hash diff); the call graph rebuilds incrementally, parallelized with `rayon`. `calm serve` picks incremental reindex automatically whenever an index already exists.
 
 ### A call graph you can actually trust
 - **Every edge carries a confidence label** — `resolved` / `inferred` / `formal` / `textual` (plus `ambiguous`/`unresolved` fallback tiers when a call site's target genuinely can't be pinned down) — so an agent knows when it's looking at a sure thing versus a best guess.
@@ -119,10 +118,10 @@ agent: "I need to change getUserByEmail"
 - **Syntax-validated before it ever touches disk** — `tree-sitter` checks the result parses cleanly; a write that would introduce a syntax error is refused outright, nothing gets written.
 - **Hub and high-fan-in symbols require an explicit `confirm:true`** — a policy only a tool with a real call graph can enforce.
 - **Atomic writes, immediate reindex** — temp file + fsync + rename, then reindexed synchronously (not waiting on the file watcher); the response comes back with post-edit risk/callers, like a miniature `diff_impact`.
-- **Hook-enforced, not just documented** — under Claude Code, `.claude/hooks/ci-nudge.sh` actually blocks the first `Edit` of a session until `edit_context` has been called, and blocks `git commit`/`git push` if files changed since the last `diff_impact`. `session_context`'s `pending_diff_impact` gives the same signal on any other MCP client.
+- **Hook-enforced, not just documented** — under Claude Code, `.claude/hooks/calm-nudge.sh` actually blocks the first `Edit` of a session until `edit_context` has been called, and blocks `git commit`/`git push` if files changed since the last `diff_impact`. `session_context`'s `pending_diff_impact` gives the same signal on any other MCP client.
 
 ### The codebase grading itself
-- **`ci fitness-check` / `fitness_report`** — 9 metrics (hub concentration, dead code, hotspot risk, edge coverage, cyclomatic complexity, architecture-boundary violations, doc-drift) checked against thresholds in `thresholds.toml`, queryable mid-session or as a CI gate.
+- **`calm fitness-check` / `fitness_report`** — 9 metrics (hub concentration, dead code, hotspot risk, edge coverage, cyclomatic complexity, architecture-boundary violations, doc-drift) checked against thresholds in `thresholds.toml`, queryable mid-session or as a CI gate.
 - **Coverage-aware dead-code detection** — auto-detects lcov / `.coverage` / Go `coverage.out` / Cobertura XML at startup and folds real runtime coverage into `dead_code_confidence`, so code a test actually exercises at runtime doesn't get flagged just because the static call graph missed the call site. `scripts/gen-coverage.sh` generates one on demand for this repo itself.
 - **Architecture boundaries — `[[boundaries]]`** — declare "module A must not import module B" directly in `thresholds.toml`, matched by path prefix against the real import graph; every violation is reported with the actual offending file pair, not just a count.
 - **Doc-drift detection — `[config_drift]`** — flags file-path references inside declared docs that no longer point at anything real, so a design doc doesn't quietly keep describing a file that was deleted three refactors ago.
@@ -135,8 +134,8 @@ agent: "I need to change getUserByEmail"
 
 ### Honest about its own freshness
 - **Index state machine surfaced everywhere** — `scanning → parsing → building_edges → ready`, so an agent never mistakes stale data for current.
-- **Build-freshness check** — `ci doctor` compares the commit the running binary was built from against the repo's current `HEAD`; `scripts/mcp-launcher.sh` checks source mtimes before trusting an existing `target/{debug,release}/ci`, rebuilding rather than silently serving a stale binary.
-- **Single-instance indexing lock** — only one `ci serve` process per project root ever runs the background indexer/watcher (an OS-level advisory lock); a second concurrent process (e.g. two editor sessions on the same repo) serves tool calls read-only against the same fresh DB instead of racing a redundant reindex against it.
+- **Build-freshness check** — `calm doctor` compares the commit the running binary was built from against the repo's current `HEAD`; `scripts/mcp-launcher.sh` checks source mtimes before trusting an existing `target/{debug,release}/calm`, rebuilding rather than silently serving a stale binary.
+- **Single-instance indexing lock** — only one `calm serve` process per project root ever runs the background indexer/watcher (an OS-level advisory lock); a second concurrent process (e.g. two editor sessions on the same repo) serves tool calls read-only against the same fresh DB instead of racing a redundant reindex against it.
 
 ### Safe by default
 - **Output sanitization** — `source`/`understand` redact credential-shaped text (PEM keys, GitHub/AWS/Slack tokens, JWTs, password assignments) before it's ever returned, and flag a `content_warning` when code contains prompt-injection-shaped text (`"ignore previous instructions"`, fake `system:` markers) — flagged, never silently altered, since a false positive there would corrupt real code.
@@ -144,37 +143,37 @@ agent: "I need to change getUserByEmail"
 
 ## Crate layout
 
-- `crates/ci-core/` — the index engine: `tree-sitter` parsing, SQLite schema, the multi-tier resolver (conservative → inferred → formal/Stack-Graphs or SCIP), graph algorithms (coreness, hub detection), FTS5/semantic search, analysis (hotspots, coverage, codeowners, diff-impact, dead-code), fitness metrics, gitignore management.
-- `crates/ci-server/` — the MCP server (`rmcp` over stdio), exposing 21 tools plus the incremental file watcher.
-- `crates/ci-cli/` — the CLI: `ci init`, `ci index`, `ci serve`, `ci setup`, `ci fitness-check`, `ci doctor`.
+- `crates/calm-core/` — the index engine: `tree-sitter` parsing, SQLite schema, the multi-tier resolver (conservative → inferred → formal/Stack-Graphs or SCIP), graph algorithms (coreness, hub detection), FTS5/semantic search, analysis (hotspots, coverage, codeowners, diff-impact, dead-code), fitness metrics, gitignore management.
+- `crates/calm-server/` — the MCP server (`rmcp` over stdio), exposing 21 tools plus the incremental file watcher.
+- `crates/calm-cli/` — the CLI: `calm init`, `calm index`, `calm serve`, `calm setup`, `calm fitness-check`, `calm doctor`.
 
 ## CLI reference
 
 ```bash
-ci init     --project-root .    # writes .codeindex/config.json with defaults
-ci index    --project-root .    # one-shot full index (Scanning → Parsing → BuildingEdges → Ready)
+calm init     --project-root .    # writes .calm/config.json with defaults
+calm index    --project-root .    # one-shot full index (Scanning → Parsing → BuildingEdges → Ready)
                                  # also embeds symbols+chunks if semantic_search.enabled=true
-ci serve    --project-root .    # MCP server over stdio + incremental reindex + file watcher
-ci serve    --project-root /project --db-path /data/index.db   # separate DB path (container deployment)
-ci serve    --project-root . --preset orient   # register only the "orient" phase's tools
-ci doctor   --project-root .    # validates config, DB (symbols/files/metrics history), git
-ci setup    --project-root .    # writes/merges MCP config (.mcp.json/.cursor/.vscode) pointing at this binary
-ci fitness-check --project-root .                             # CI gate, exits 1 on failure
-ci fitness-check --project-root . --json                      # JSON output
-ci fitness-check --project-root . --config thresholds.toml    # custom thresholds
+calm serve    --project-root .    # MCP server over stdio + incremental reindex + file watcher
+calm serve    --project-root /project --db-path /data/index.db   # separate DB path (container deployment)
+calm serve    --project-root . --preset orient   # register only the "orient" phase's tools
+calm doctor   --project-root .    # validates config, DB (symbols/files/metrics history), git
+calm setup    --project-root .    # writes/merges MCP config (.mcp.json/.cursor/.vscode) pointing at this binary
+calm fitness-check --project-root .                             # CI gate, exits 1 on failure
+calm fitness-check --project-root . --json                      # JSON output
+calm fitness-check --project-root . --config thresholds.toml    # custom thresholds
 ```
 
 ## 21 MCP tools for AI agents
 
-CLI presets filter tools by workflow phase: `orient`, `trace`, `edit`, `compound`, `full` (default) via `ci serve --preset` or the `preset` field in `config.json`. Every response carries `suggested_next` to point at the next step — full detail on each tool and the complete workflow lives in [AGENTS.md](AGENTS.md).
+CLI presets filter tools by workflow phase: `orient`, `trace`, `edit`, `compound`, `full` (default) via `calm serve --preset` or the `preset` field in `config.json`. Every response carries `suggested_next` to point at the next step — full detail on each tool and the complete workflow lives in [AGENTS.md](AGENTS.md).
 
 | Group | Tools |
 |---|---|
-| Orient | `repo_overview`, `hotspots`, `fitness_report` (health snapshot — same metrics as `ci fitness-check`, queryable mid-session), `indexing_status` |
+| Orient | `repo_overview`, `hotspots`, `fitness_report` (health snapshot — same metrics as `calm fitness-check`, queryable mid-session), `indexing_status` |
 | Locate | `locate`, `search`, `file_overview` |
 | Inspect | `source`, `symbol_info`, `understand` |
 | Trace | `callers`, `callees`, `path`, `dependencies` |
-| Edit | `edit_context` (mandatory before any edit), `edit_lines`/`edit_symbol` (the one write tool — hash-verified, risk-gated), `diff_impact` (mandatory before commit) — the first and last are hook-enforced under Claude Code (see `.claude/hooks/ci-nudge.sh`); `session_context`'s `pending_diff_impact` is the equivalent signal on any other MCP client |
+| Edit | `edit_context` (mandatory before any edit), `edit_lines`/`edit_symbol` (the one write tool — hash-verified, risk-gated), `diff_impact` (mandatory before commit) — the first and last are hook-enforced under Claude Code (see `.claude/hooks/calm-nudge.sh`); `session_context`'s `pending_diff_impact` is the equivalent signal on any other MCP client |
 | Recover | `session_context`, `remember`, `recall` |
 
 ### MCP Prompts — workflows packaged as slash-commands
@@ -189,7 +188,7 @@ Distinct from the `tools` above — MCP Prompts (`prompts/list`, `prompts/get`) 
 
 ## Fitness check — the CI gate
 
-`ci fitness-check` measures 9 metrics against thresholds declared in `thresholds.toml`:
+`calm fitness-check` measures 9 metrics against thresholds declared in `thresholds.toml`:
 
 | Metric | What it measures | Default threshold |
 |---|---|---|
@@ -203,33 +202,33 @@ Distinct from the `tools` above — MCP Prompts (`prompts/list`, `prompts/get`) 
 | `boundary_violations` | Count of `import_edges` violating a declared `[[boundaries]]` rule | ≤ 0 |
 | `config_drift_count` | Count of doc file-path references (declared via `[config_drift].doc_paths`) pointing at nothing real | ≤ 0 |
 
-Every `ci fitness-check` run also snapshots metrics to the DB so `edit_context` can show a trend (delta versus the previous day).
+Every `calm fitness-check` run also snapshots metrics to the DB so `edit_context` can show a trend (delta versus the previous day).
 
 ### Architecture boundaries — `[[boundaries]]`
 
-Declare "module A must not import module B" directly in `thresholds.toml` (same file as `[thresholds]`), matched by path prefix (not glob/regex). Note this is for layering Rust's own crate/module boundaries *don't* already enforce — declaring "ci-core must not import ci-server" would be a no-op, since Cargo's dependency graph makes that structurally impossible already:
+Declare "module A must not import module B" directly in `thresholds.toml` (same file as `[thresholds]`), matched by path prefix (not glob/regex). Note this is for layering Rust's own crate/module boundaries *don't* already enforce — declaring "calm-core must not import calm-server" would be a no-op, since Cargo's dependency graph makes that structurally impossible already:
 
 ```toml
 [[boundaries]]
-from = "crates/ci-core/src/indexer/"
-to = "crates/ci-core/src/analysis/"
+from = "crates/calm-core/src/indexer/"
+to = "crates/calm-core/src/analysis/"
 reason = "indexer (extraction) must stay upstream of analysis (dead-code, hotspots, fitness) — not the other way around"
 ```
 
-`ci fitness-check` reports each violation concretely (the real from/to path, the rule, and the reason) outside `--json` mode; the default `max_boundary_violations = 0` means a rule you bothered to declare is one you actually keep.
+`calm fitness-check` reports each violation concretely (the real from/to path, the rule, and the reason) outside `--json` mode; the default `max_boundary_violations = 0` means a rule you bothered to declare is one you actually keep.
 
 ## Deployment
 
 - `cargo build --release` → static musl binaries via `.github/workflows/release.yml`, matrix: `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl` (with `SHA256SUMS`), `aarch64-apple-darwin`. `scripts/mcp-launcher.sh` downloads and checksum-verifies the right platform's build automatically when checkout is on a matching git tag — see [`docs/mcp-client-setup.md`](docs/mcp-client-setup.md) (Vietnamese).
-- `Containerfile`, multi-stage (`rust:alpine` → `scratch`) — a single static binary, no runtime image needed, published to `ghcr.io/eilodon/code-intelligence` (tagged by version + `latest`) on every git tag push.
+- `Containerfile`, multi-stage (`rust:alpine` → `scratch`) — a single static binary, no runtime image needed, published to `ghcr.io/eilodon/calm-mcp` (tagged by version + `latest`) on every git tag push.
 - `compose.yaml` ships a hardened example (`read_only`, `cap_drop: ALL`, `no-new-privileges`, `pids_limit: 64`, `mem_limit: 256m`).
-- The repo uses Git LFS for `crates/ci-core/assets/potion-code-16m/*.safetensors` (~61MB) — run `git lfs install && git lfs pull` to get the real weight file. Without LFS, `git clone`/`cargo build` still **compiles successfully** (`include_bytes!` just embeds raw bytes without parsing them) — but that file is a ~130-byte LFS pointer instead of the real model, so loading it **at runtime** fails ("failed to parse safetensors"), `indexing_status` reports `embeddings_status: "failed"`, and `search(kind="semantic"/"hybrid")` automatically degrades to FTS-only — no crash, just no semantic search until you run `git lfs pull` and rebuild.
+- The repo uses Git LFS for `crates/calm-core/assets/potion-code-16m/*.safetensors` (~61MB) — run `git lfs install && git lfs pull` to get the real weight file. Without LFS, `git clone`/`cargo build` still **compiles successfully** (`include_bytes!` just embeds raw bytes without parsing them) — but that file is a ~130-byte LFS pointer instead of the real model, so loading it **at runtime** fails ("failed to parse safetensors"), `indexing_status` reports `embeddings_status: "failed"`, and `search(kind="semantic"/"hybrid")` automatically degrades to FTS-only — no crash, just no semantic search until you run `git lfs pull` and rebuild.
 
 ## Testing
 
 ```bash
 cargo test --workspace                        # unit + integration (default features)
-cargo test -p ci-core --features embeddings   # includes the semantic/vector path (brute-force cosine KNN)
+cargo test -p calm-core --features embeddings   # includes the semantic/vector path (brute-force cosine KNN)
 cargo test --test parity_test test_formal_edges   # Stack Graphs regression corpus
 ```
 

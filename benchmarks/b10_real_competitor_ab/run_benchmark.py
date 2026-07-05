@@ -21,7 +21,7 @@ Requires (all installed locally, nothing this script installs itself):
     already built (`codegraph init` in repo root).
   - `uvx` on PATH (semble runs via `uvx --from semble[mcp] semble`, no
     separate install step — uvx caches the environment after first run).
-  - `cargo build --release -p ci-cli` already run (same prerequisite as
+  - `cargo build --release -p calm-cli` already run (same prerequisite as
     B4/B6).
 
 Honest-reporting policy (see benchmarks/README.md): tasks Semble cannot
@@ -102,11 +102,11 @@ def main() -> int:
     enc = tiktoken.encoding_for_model(ENCODING_MODEL)
 
     print(f"[b10] starting ci serve, codegraph serve --mcp, semble for {repo_root} ...", file=sys.stderr)
-    ci_client = MCPClient(project_root=".", repo_root=str(repo_root))
+    calm_client = MCPClient(project_root=".", repo_root=str(repo_root))
     codegraph_client = start_codegraph(repo_root)
     semble_client = start_semble(repo_root)
     try:
-        ci_client.wait_until_indexed()
+        calm_client.wait_until_indexed()
         print("[b10] all servers ready, running tasks", file=sys.stderr)
 
         rows = []
@@ -114,7 +114,7 @@ def main() -> int:
             ctask = competitor_tasks[task_id]
             naive_text_val, naive_calls = naive_text_and_calls(repo_root, task["naive"])
 
-            ci_text = ci_client.call_tool(task["ci"]["tool"], task["ci"]["arguments"])
+            calm_text = calm_client.call_tool(task["ci"]["tool"], task["ci"]["arguments"])
             cg_text = codegraph_client.call_tool(ctask["codegraph"]["tool"], ctask["codegraph"]["arguments"])
             sb_text = semble_client.call_tool(ctask["semble"]["tool"], ctask["semble"]["arguments"])
 
@@ -127,7 +127,7 @@ def main() -> int:
                 "naive_tokens": toks(naive_text_val),
                 "naive_calls": naive_calls,
                 "ci_tool": task["ci"]["tool"],
-                "ci_tokens": toks(ci_text),
+                "ci_tokens": toks(calm_text),
                 "codegraph_tool": ctask["codegraph"]["tool"],
                 "codegraph_tokens": toks(cg_text),
                 "semble_tool": ctask["semble"]["tool"],
@@ -142,7 +142,7 @@ def main() -> int:
 
             if task_id == "find_callers":
                 oracle = grep_oracle_callers(repo_root, task["ci"]["arguments"]["symbol"])
-                ci_found = extract_files(ci_text)
+                ci_found = extract_files(calm_text)
                 cg_found = extract_files(cg_text)
                 row["accuracy"] = {
                     "oracle_files": sorted(oracle),
@@ -154,7 +154,7 @@ def main() -> int:
 
             rows.append(row)
     finally:
-        ci_client.close()
+        calm_client.close()
         codegraph_client.close()
         semble_client.close()
 
@@ -163,9 +163,9 @@ def main() -> int:
 
     summary = {
         "encoding_model": ENCODING_MODEL,
-        "corpus": "self (Code-Intelligence)",
+        "corpus": "self (CALM)",
         "tools_compared": {
-            "ci": "ci-cli (this repo, release build)",
+            "ci": "calm-cli (this repo, release build)",
             "codegraph": "colbymchenry/codegraph v1.2.0 (npm, .codegraph/ built via `codegraph init`)",
             "semble": "semble MCP (uvx --from semble[mcp] semble) — embedding search, no call graph",
         },

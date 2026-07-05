@@ -44,8 +44,8 @@ def main() -> int:
         rows = []
         for task in tasks:
             _, naive_calls = naive_text_and_calls(repo_root, task["naive"])
-            ci_text = client.call_tool(task["ci"]["tool"], task["ci"]["arguments"])
-            if not ci_text.strip():
+            calm_text = client.call_tool(task["ci"]["tool"], task["ci"]["arguments"])
+            if not calm_text.strip():
                 raise RuntimeError(f"{task['id']}: ci tool returned empty content — not a valid 1-call answer")
             ci_calls = 1
 
@@ -64,7 +64,7 @@ def main() -> int:
 
     reductions = [r["reduction_pct"] for r in rows]
     summary = {
-        "corpus": "self (Code-Intelligence)",
+        "corpus": "self (CALM)",
         "tasks": rows,
         "aggregate": {
             "median_reduction_pct": statistics.median(reductions),

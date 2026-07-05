@@ -1,0 +1,35 @@
+[package]
+name = "calm-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "calm"
+path = "src/main.rs"
+
+[dependencies]
+calm-core = { workspace = true }
+calm-server = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+rusqlite = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[features]
+default = ["embeddings", "tier0-5", "scip-overlay"]
+embeddings = ["calm-core/embeddings", "calm-server/embeddings"]
+lang-c      = ["calm-core/lang-c",      "calm-server/lang-c"]
+lang-cpp    = ["calm-core/lang-cpp",    "calm-server/lang-cpp"]
+lang-ruby   = ["calm-core/lang-ruby",   "calm-server/lang-ruby"]
+lang-kotlin = ["calm-core/lang-kotlin", "calm-server/lang-kotlin"]
+lang-swift  = ["calm-core/lang-swift",  "calm-server/lang-swift"]
+lang-php    = ["calm-core/lang-php",    "calm-server/lang-php"]
+lang-shell  = ["calm-core/lang-shell",  "calm-server/lang-shell"]
+tier0-5     = ["calm-core/tier0-5",     "calm-server/tier0-5"]
+scip-overlay = ["calm-core/scip-overlay", "calm-server/scip-overlay"]

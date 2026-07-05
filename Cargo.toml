@@ -1,9 +1,9 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/ci-core",
-    "crates/ci-server",
-    "crates/ci-cli",
+    "crates/calm-core",
+    "crates/calm-server",
+    "crates/calm-cli",
 ]
 
 [workspace.package]
@@ -70,8 +70,8 @@ clap = { version = "4", features = ["derive"] }
 rayon = "1"
 
 # Internal
-ci-core = { path = "crates/ci-core" }
-ci-server = { path = "crates/ci-server" }
+calm-core = { path = "crates/calm-core" }
+calm-server = { path = "crates/calm-server" }
 
 [profile.release]
 lto = true
