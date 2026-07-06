@@ -6,12 +6,12 @@ Usage:
 
 Distinct from B4 (token count): measures how many discrete tool invocations
 (grep, then one file read per match) a naive workflow needs versus a single
-`ci` MCP tool call — this is round-trip / latency overhead, independent of
+`calm` MCP tool call — this is round-trip / latency overhead, independent of
 payload size. Same task set as B4 (../lib/tasks.yaml), reused rather than
 duplicated.
 
 Each ci task is, by construction, exactly 1 MCP call. We still invoke the
-real `ci serve` per task (instead of just asserting "1") to confirm the tool
+real `calm serve` per task (instead of just asserting "1") to confirm the tool
 actually returns non-empty content for each task's real symbol/query.
 """
 
@@ -35,7 +35,7 @@ def main() -> int:
     repo_root = repo_root_from_here()
     tasks = yaml.safe_load(TASKS_PATH.read_text())["tasks"]
 
-    print(f"[b6] starting ci serve for {repo_root} ...", file=sys.stderr)
+    print(f"[b6] starting calm serve for {repo_root} ...", file=sys.stderr)
     client = MCPClient(project_root=".", repo_root=str(repo_root))
     try:
         client.wait_until_indexed()

@@ -5,8 +5,8 @@ Usage:
     benchmarks/.venv/bin/python benchmarks/b4_token_efficiency/run_benchmark.py
 
 Measures, per task, how many LLM tokens (GPT-4 tokenizer) a naive workflow
-(cat/grep) costs versus the equivalent `ci` MCP tool call, using real tool
-responses from a live `ci serve` process against this repo.
+(cat/grep) costs versus the equivalent `calm` MCP tool call, using real tool
+responses from a live `calm serve` process against this repo.
 
 Task definitions and naive-workflow simulation live in ../lib (shared with B6).
 """
@@ -34,7 +34,7 @@ def main() -> int:
     tasks = yaml.safe_load(TASKS_PATH.read_text())["tasks"]
     enc = tiktoken.encoding_for_model(ENCODING_MODEL)
 
-    print(f"[b4] starting ci serve for {repo_root} ...", file=sys.stderr)
+    print(f"[b4] starting calm serve for {repo_root} ...", file=sys.stderr)
     client = MCPClient(project_root=".", repo_root=str(repo_root))
     try:
         client.wait_until_indexed()

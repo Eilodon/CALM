@@ -1,6 +1,6 @@
 # B2 — Call Graph Resolution Quality (Rust, SCIP oracle)
 
-Đo `ci`'s Tier-0/Tier-2 syntactic call-graph resolver (Phase A của
+Đo `calm`'s Tier-0/Tier-2 syntactic call-graph resolver (Phase A của
 `docs/superskills/plans/2026-07-03-rust-support.md`) so với `rust-analyzer scip` làm oracle ground
 truth, trên chính repo CALM.
 
@@ -24,7 +24,7 @@ với oracle.
 | | |
 |---|---|
 | Oracle edges (SCIP, non-local ref → def) | 8117 |
-| `ci` call edges (Rust, có call-site line) | 1972 |
+| `calm` call edges (Rust, có call-site line) | 1972 |
 | **Precision** (`ci ∩ oracle / ci`) | **0.795** (1568/1972) |
 | **Recall** (`ci ∩ oracle / oracle`) | **0.193** (1568/8117) |
 
@@ -43,7 +43,7 @@ Theo `edge_confidence`:
   một nửa. Điều này validate trực tiếp lý do tồn tại của hệ thống confidence tier: agent tiêu thụ
   `edge_confidence` nên tin `inferred`/`resolved` nhiều hơn `textual`.
 - **Recall thấp (19.3%) là kỳ vọng, không phải bug** — SCIP/rust-analyzer làm full type inference
-  + trait resolution + generic monomorphization; `ci`'s Tier-0/Tier-2 resolver cố tình chỉ làm
+  + trait resolution + generic monomorphization; `calm`'s Tier-0/Tier-2 resolver cố tình chỉ làm
   same-file/same-class name matching + constructor inference nông (Task A5), không type-check.
   Khoảng cách 8117 vs 1972 edges phần lớn là các cạnh đòi hỏi suy luận kiểu đầy đủ (trait dispatch,
   generic call, method trên kiểu suy từ chuỗi biểu thức phức tạp) mà Tầng A không nhắm tới — đúng

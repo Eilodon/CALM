@@ -10,7 +10,7 @@
 benchmarks/.venv/bin/python benchmarks/b4_token_efficiency/run_benchmark.py
 ```
 
-Script tự spawn `ci serve --project-root .`, đợi index `ready`, gọi lần lượt từng task trong
+Script tự spawn `calm serve --project-root .`, đợi index `ready`, gọi lần lượt từng task trong
 `../lib/tasks.yaml`, tokenize cả hai phía, in bảng kết quả và ghi `results.json`.
 
 ## Task set

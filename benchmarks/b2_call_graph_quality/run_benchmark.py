@@ -5,14 +5,14 @@ Usage:
     benchmarks/.venv/bin/python benchmarks/b2_call_graph_quality/run_benchmark.py [--repo PATH]
 
 Scope (this implementation): **Rust only**. Uses `rust-analyzer scip` as the
-ground-truth oracle for the Rust call graph and measures how well `ci`'s
+ground-truth oracle for the Rust call graph and measures how well `calm`'s
 Tier-0/Tier-2 syntactic resolver (Phase A of the Rust support plan) agrees
 with it, broken down by `edge_confidence`.
 
 Requires:
   - `rust-analyzer` on PATH (or resolvable via rustup/VS Code — same
     detection `calm_core::scip::runner::resolve_binary` uses).
-  - `ci` built with the `scip-overlay` feature, for the hidden `scip-dump`
+  - `calm` built with the `scip-overlay` feature, for the hidden `scip-dump`
     subcommand that decodes the oracle `.scip` file to JSON (reuses
     `calm_core::scip::parse` instead of re-implementing SCIP protobuf decoding
     in Python):

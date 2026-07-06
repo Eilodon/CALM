@@ -1,6 +1,6 @@
-"""Minimal MCP stdio client for the `ci` server.
+"""Minimal MCP stdio client for the `calm` server.
 
-Spawns `ci serve` once, keeps the process alive for the whole benchmark run,
+Spawns `calm serve` once, keeps the process alive for the whole benchmark run,
 and exposes `call_tool()` returning the raw text content an agent would
 actually receive (this is exactly what gets tokenized for the ratio).
 

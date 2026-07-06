@@ -1,6 +1,6 @@
-# Competitor tool mapping for B9 — reuses the same 4 tasks as tasks.yaml
-# (same anchors, same self-repo corpus) so B9's numbers are directly
-# comparable to B4/B6's `ci` numbers, not a separate task set.
+# Competitor tool mapping — reuses the same 4 tasks as tasks.yaml (same
+# anchors, same self-repo corpus) so numbers are directly comparable to
+# B4/B6's `calm` numbers, not a separate task set.
 #
 # codegraph: real MCP tool calls against a `codegraph init`-built .codegraph/
 #            index (colbymchenry/codegraph v1.2.0).
@@ -8,6 +8,22 @@
 #            (embedding search, no call graph — tasks it structurally cannot
 #            answer are marked `unsupported: true` and still measured, not
 #            skipped, per this project's "report the bad number" policy).
+# grepai:    real MCP tool calls against `grepai mcp-serve` (yoanbernabeu/
+#            grepai, embedding search via Ollama nomic-embed-text PLUS a real
+#            structural call graph — grepai_trace_callers/callees/graph are
+#            not embedding-search substitutes, so find_callers/
+#            pre_edit_blast_radius are NOT marked unsupported here, unlike
+#            Semble).
+# serena:    real MCP tool calls against `serena start-mcp-server`
+#            (oraios/serena, LSP-backed via rust-analyzer for this Rust
+#            corpus). find_referencing_symbols is real cross-reference data
+#            (not embedding search), but has no risk/hub scoring — see
+#            risk_gate_refusal in extended_tasks.yaml for the sharpest probe
+#            of that gap.
+#
+# Tool schemas below were captured live from each server's real `tools/list`
+# response (not from docs) on 2026-07-06 — see the B11 README for the probe
+# transcripts if a future run finds these have drifted.
 
 tasks:
   - id: read_one_function
@@ -23,6 +39,17 @@ tasks:
         repo: "."
         top_k: 1
         max_snippet_lines: null
+    grepai:
+      tool: grepai_search
+      arguments:
+        query: "run_indexing_pipeline function implementation"
+        limit: 1
+    serena:
+      tool: find_symbol
+      arguments:
+        name_path_pattern: run_indexing_pipeline
+        relative_path: crates/calm-core/src/indexer/pipeline.rs
+        include_body: true
 
   - id: find_callers
     codegraph:
@@ -37,6 +64,15 @@ tasks:
         top_k: 5
         max_snippet_lines: 10
       unsupported: true
+    grepai:
+      tool: grepai_trace_callers
+      arguments:
+        symbol: collect_source_files
+    serena:
+      tool: find_referencing_symbols
+      arguments:
+        name_path: collect_source_files
+        relative_path: crates/calm-core/src/indexer/pipeline.rs
 
   - id: pre_edit_blast_radius
     codegraph:
@@ -51,6 +87,17 @@ tasks:
         top_k: 5
         max_snippet_lines: 10
       unsupported: true
+    grepai:
+      tool: grepai_trace_graph
+      arguments:
+        symbol: reindex_changed
+        depth: 2
+    serena:
+      tool: find_referencing_symbols
+      arguments:
+        name_path: reindex_changed
+        relative_path: crates/calm-core/src/indexer/pipeline.rs
+      caveat: "no risk/hub scoring — same tool as find_callers, just a different symbol"
 
   - id: locate_and_inspect
     codegraph:
@@ -64,3 +111,12 @@ tasks:
         repo: "."
         top_k: 3
         max_snippet_lines: 10
+    grepai:
+      tool: grepai_search
+      arguments:
+        query: "run_indexing_pipeline"
+        limit: 3
+    serena:
+      tool: get_symbols_overview
+      arguments:
+        relative_path: crates/calm-core/src/indexer/pipeline.rs

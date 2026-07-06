@@ -1,8 +1,8 @@
 """Generic MCP stdio client — same JSON-RPC protocol `mcp_client.MCPClient` speaks,
-but parameterized over an arbitrary spawn command instead of hardcoding `ci serve`.
+but parameterized over an arbitrary spawn command instead of hardcoding `calm serve`.
 
 Used by B9 to talk to competitor MCP servers (CodeGraph, Semble) with the exact
-same request/response accounting as the `ci`-specific client, so tool-call and
+same request/response accounting as the `calm`-specific client, so tool-call and
 token counts are comparable across tools.
 """
 

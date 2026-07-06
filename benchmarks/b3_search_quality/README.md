@@ -10,7 +10,7 @@ ranking, chỉ theo thứ tự file-scan) trên chính repo CALM.
 benchmarks/.venv/bin/python benchmarks/b3_search_quality/run_benchmark.py
 ```
 
-Script spawn `ci serve --project-root .` (qua `cargo run --release`), đợi index `ready`, chạy từng
+Script spawn `calm serve --project-root .` (qua `cargo run --release`), đợi index `ready`, chạy từng
 query trong `queries.yaml` với `kind=symbol` và `kind=hybrid`, tính NDCG@10 hai phía cộng thêm
 baseline `grep -l` (file-scan order), in bảng kết quả và ghi `results.json`.
 

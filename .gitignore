@@ -15,7 +15,7 @@ coverage.xml
 lcov.info
 coverage/
 .nyc_output/
-!crates/ci-core/tests/fixtures/synthetic_project/lcov.info
+!crates/calm-core/tests/fixtures/synthetic_project/lcov.info
 
 # Claude Code personal overrides (not shared with team)
 .claude/settings.local.json
@@ -23,6 +23,7 @@ coverage/
 # Benchmark harness venv + raw run output
 benchmarks/.venv/
 benchmarks/**/results.json
+benchmarks/scratch/*.json
 __pycache__/
 
 # OS / editor

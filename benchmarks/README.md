@@ -1,6 +1,6 @@
 # Benchmarks
 
-Đo lợi thế thật của `ci` MCP server so với workflow naive (`cat`/`grep`) hoặc so với các
+Đo lợi thế thật của `calm` MCP server so với workflow naive (`cat`/`grep`) hoặc so với các
 competitor cùng nhóm (CodeGraph, Serena, Semble, Semgrep, GitNexus). Mỗi benchmark có anchor code
 thực tế, phương pháp đo cụ thể, và baseline so sánh — không dùng số liệu ước lượng khi có thể đo
 thật; khi số đo ra ngoài kỳ vọng (vd B6 `find_callers` = 0%), báo cáo trung thực thay vì ẩn đi.
@@ -14,22 +14,24 @@ thật; khi số đo ra ngoài kỳ vọng (vd B6 `find_callers` = 0%), báo cá
 | B5 | Incremental Indexing Speed | Reindex chỉ file thay đổi | Planned |
 | B6 | Tool-Call Efficiency | Số round-trip naive vs 1 MCP call (ý tưởng từ CodeGraph) | **Implemented** — [`b6_tool_call_efficiency/`](b6_tool_call_efficiency/) |
 | B7 | Task Correctness / Regression | Agent thật làm refactor, có/không `edit_context`+`diff_impact`, đếm callsite bị bỏ sót (ý tưởng từ Serena) | Planned |
-| B8 | Model-Tier Leveling | Model rẻ + ci tools vs model đắt không có tools, cùng task (ý tưởng từ GitNexus) | Planned |
-| B9 | Scaling Curve | Lợi thế `ci` co giãn theo quy mô repo (nhỏ → lớn) | Planned |
-| B10 | Real Competitor A/B | `ci` vs CodeGraph vs Semble — tool call thật trên cả 3 MCP server thật (không phải số tự báo cáo) | **Implemented** — [`b10_real_competitor_ab/`](b10_real_competitor_ab/) |
+| B8 | Model-Tier Leveling | Model rẻ + calm tools vs model đắt không có tools, cùng task (ý tưởng từ GitNexus) | Planned |
+| B9 | Scaling Curve | Lợi thế `calm` co giãn theo quy mô repo (nhỏ → lớn) | Planned |
+| B10 | Real Competitor A/B | `calm` vs CodeGraph vs Semble — tool call thật trên cả 3 MCP server thật (không phải số tự báo cáo) | **Superseded by B11** — [`b10_real_competitor_ab/`](b10_real_competitor_ab/) (giữ lại, xem B11 cho methodology đã fix) |
+| B11 | Extended Real Competitor A/B | `calm` vs CodeGraph vs Semble vs grepai vs Serena — sửa các lỗ hổng methodology của B10 (oracle đúng-sai cho mọi task, N=5 thay vì N=1, thêm task risk_gate_refusal + memory_recall test thật tính năng khác biệt của `calm`) | **Implemented** — [`b11_extended_competitor_ab/`](b11_extended_competitor_ab/) |
 
 Nguồn cảm hứng B6-B9: xem phần "Nghiên cứu competitor" bên dưới. Khác với B6 (dùng ý tưởng đo của
-CodeGraph nhưng chỉ chạy `ci`), B10 cài thật CodeGraph + Semble và gọi tool thật của cả 3 — xem
-B10's README cho lý do vì sao ratio thô không nên đọc như bảng xếp hạng.
+CodeGraph nhưng chỉ chạy `calm`), B10/B11 cài thật các competitor và gọi tool thật của từng cái — xem
+B11's README (methodology hiện hành) cho lý do vì sao ratio thô không nên đọc như bảng xếp hạng, và
+cho audit trail giải thích vì sao B10 bị thay thế thay vì chỉ sửa tại chỗ.
 
 ## Hạ tầng dùng chung — `lib/`
 
-`mcp_client.py` (MCP stdio client cho `ci`), `generic_mcp_client.py` (client tổng quát cho MCP
-server bất kỳ — CodeGraph, Semble, dùng ở B10), `tasks.yaml` (task definitions cho B4/B6/B10),
-`competitor_tasks.yaml` (mapping cùng task id đó sang tool call của CodeGraph/Semble, dùng ở B10),
-`naive_workflow.py` (mô phỏng naive cat/grep + đếm call, cộng `naive_grep_ranked_files` cho
-baseline ranking của B3) nằm ở `benchmarks/lib/`, dùng chung — không định nghĩa lại task hay logic
-mô phỏng ở mỗi benchmark.
+`mcp_client.py` (MCP stdio client cho `calm`), `generic_mcp_client.py` (client tổng quát cho MCP
+server bất kỳ — CodeGraph, Semble, grepai, Serena, dùng ở B10/B11), `tasks.yaml` (task definitions
+cho B4/B6/B10/B11), `competitor_tasks.yaml` (mapping cùng task id đó sang tool call của
+CodeGraph/Semble/grepai/Serena, dùng ở B10/B11), `naive_workflow.py` (mô phỏng naive cat/grep + đếm
+call, cộng `naive_grep_ranked_files` cho baseline ranking của B3) nằm ở `benchmarks/lib/`, dùng
+chung — không định nghĩa lại task hay logic mô phỏng ở mỗi benchmark.
 
 ## Chạy benchmark
 
@@ -44,9 +46,9 @@ benchmarks/.venv/bin/python benchmarks/b3_search_quality/run_benchmark.py
 benchmarks/.venv/bin/python benchmarks/b4_token_efficiency/run_benchmark.py
 benchmarks/.venv/bin/python benchmarks/b6_tool_call_efficiency/run_benchmark.py
 
-# B10 cần thêm CodeGraph cài thật + index build sẵn (Semble tự tải qua uvx, không cần bước riêng):
-npm i -g @colbymchenry/codegraph && codegraph init
-benchmarks/.venv/bin/python benchmarks/b10_real_competitor_ab/run_benchmark.py
+# B11 (methodology hiện hành — xem b11_extended_competitor_ab/README.md cho setup đầy đủ
+# grepai/Serena/CodeGraph và LÝ DO chạy trên isolated worktree, không phải live repo):
+benchmarks/.venv/bin/python benchmarks/b11_extended_competitor_ab/run_benchmark.py --corpus <isolated-worktree-path>
 ```
 
 `benchmarks/.venv/` và `results.json` không commit (xem `.gitignore`) — kết quả phụ thuộc vào
@@ -60,14 +62,18 @@ trạng thái index tại thời điểm chạy, chạy lại để lấy số m
 - **Serena** (oraios) — không đo token mà đo giảm lỗi khi thao tác đa file (rename/refactor 8-12
   bước thủ công dễ sai → 1 call) → nguồn gốc B7.
 - **GitNexus** — nhấn mạnh model yếu vẫn dùng được nhờ tool đã tiền xử lý cấu trúc → nguồn gốc B8.
+  Chưa cài/đo thật trong B10/B11 (loại khỏi vòng đo hiện tại theo yêu cầu).
+- **grepai** (yoanbernabeu) — semantic search + call graph thật (Ollama, 100% local); dùng thật
+  trong B11, không chỉ tham khảo tài liệu.
 - **Semgrep** — bài học về minh bạch: số official (250% true-positive) bị audit độc lập chỉ ra chỉ
   50-71%. Áp dụng: không che số xấu (B6 `find_callers` = 0% được giữ nguyên, không loại khỏi báo cáo;
-  B10 Semble 2/4 task đánh dấu `unsupported` nhưng vẫn đo, không loại khỏi bảng).
+  B10/B11 Semble các task `unsupported` vẫn đo, không loại khỏi bảng).
 
 B6-B9 dùng số liệu công khai của competitor làm nguồn cảm hứng phương pháp, không phải A/B trực
-tiếp. **B10 là A/B trực tiếp thật** — cài CodeGraph + Semble thật, gọi tool thật, trên cùng self-repo
-corpus với B4/B6 — nên đọc B10 khi cần số so sánh thật giữa `ci` và 2 tool kia, đọc B6 khi chỉ cần
-hiểu ý tưởng đo tool-call efficiency.
+tiếp. **B10/B11 là A/B trực tiếp thật** — cài CodeGraph + Semble (+ grepai + Serena ở B11) thật, gọi
+tool thật, trên cùng self-repo corpus với B4/B6 — đọc B11 khi cần số so sánh thật mới nhất (B10 giữ
+lại làm lịch sử, methodology của nó có lỗ hổng đã audit — xem B11's README), đọc B6 khi chỉ cần hiểu
+ý tưởng đo tool-call efficiency.
 
 ## Phạm vi hiện tại
 

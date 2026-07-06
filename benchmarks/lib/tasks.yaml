@@ -1,7 +1,7 @@
 # Task set for B4 — Token Efficiency (self-repo corpus: CALM itself).
 #
 # Each task pairs a "naive" workflow (what an agent without call-graph tools would do)
-# against the equivalent `ci` MCP tool call. Anchors below are real symbols verified to
+# against the equivalent `calm` MCP tool call. Anchors below are real symbols verified to
 # exist in this repo at the time of writing (crates/calm-core/src/indexer/pipeline.rs).
 #
 # naive.type:

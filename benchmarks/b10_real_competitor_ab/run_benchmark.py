@@ -6,7 +6,7 @@ Usage:
 
 Unlike the competitor numbers quoted in docs/comparison.md (drawn from each
 project's own public docs/benchmarks), this script runs REAL tool calls
-against REAL installs of `ci`, CodeGraph (colbymchenry/codegraph), and Semble
+against REAL installs of `calm`, CodeGraph (colbymchenry/codegraph), and Semble
 — same self-repo corpus, same 4 tasks as B4/B6 (benchmarks/lib/tasks.yaml +
 competitor_tasks.yaml) — and measures:
 
@@ -90,7 +90,7 @@ def grep_oracle_callers(repo_root: Path, symbol: str) -> set[str]:
 
 
 def extract_files(text: str) -> set[str]:
-    """Best-effort file-path extraction from free-text tool output (both `ci`
+    """Best-effort file-path extraction from free-text tool output (both `calm`
     and CodeGraph responses embed `crates/.../file.rs` paths inline)."""
     return set(re.findall(r"crates/[\w./-]+\.rs", text))
 
@@ -101,7 +101,7 @@ def main() -> int:
     competitor_tasks = {t["id"]: t for t in yaml.safe_load(COMPETITOR_TASKS_PATH.read_text())["tasks"]}
     enc = tiktoken.encoding_for_model(ENCODING_MODEL)
 
-    print(f"[b10] starting ci serve, codegraph serve --mcp, semble for {repo_root} ...", file=sys.stderr)
+    print(f"[b10] starting calm serve, codegraph serve --mcp, semble for {repo_root} ...", file=sys.stderr)
     calm_client = MCPClient(project_root=".", repo_root=str(repo_root))
     codegraph_client = start_codegraph(repo_root)
     semble_client = start_semble(repo_root)
@@ -134,7 +134,7 @@ def main() -> int:
                 "semble_tokens": toks(sb_text),
                 "semble_unsupported": ctask["semble"].get("unsupported", False),
                 # every competitor call here is exactly 1 MCP round-trip,
-                # same accounting B6 uses for `ci`
+                # same accounting B6 uses for `calm`
                 "ci_calls": 1,
                 "codegraph_calls": 1,
                 "semble_calls": 1,

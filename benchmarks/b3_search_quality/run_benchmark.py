@@ -71,7 +71,7 @@ def main() -> int:
     repo_root = repo_root_from_here()
     queries = yaml.safe_load(QUERIES_PATH.read_text())["queries"]
 
-    print(f"[b3] starting ci serve for {repo_root} ...", file=sys.stderr)
+    print(f"[b3] starting calm serve for {repo_root} ...", file=sys.stderr)
     client = MCPClient(project_root=".", repo_root=str(repo_root))
     try:
         client.wait_until_indexed()

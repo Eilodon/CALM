@@ -13,7 +13,7 @@ Dùng chung task set với B4 (`../lib/tasks.yaml`), không định nghĩa lại
 benchmarks/.venv/bin/python benchmarks/b6_tool_call_efficiency/run_benchmark.py
 ```
 
-Script vẫn gọi `ci serve` thật cho mỗi task (không chỉ giả định "1 call") để xác nhận tool thực sự
+Script vẫn gọi `calm serve` thật cho mỗi task (không chỉ giả định "1 call") để xác nhận tool thực sự
 trả về nội dung — nếu response rỗng, script raise lỗi thay vì báo cáo "1 call" sai sự thật.
 
 ## Cách đếm naive calls
