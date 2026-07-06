@@ -65,6 +65,13 @@ pub struct FitnessThresholds {
 /// "moderate" and "high" risk (1-10 simple, 11-20 moderate, 21+ high).
 pub const HIGH_COMPLEXITY_THRESHOLD: i64 = 10;
 
+/// Above this share of Tier-0.5 (line-scan-only) functions/methods,
+/// `high_complexity_pct`'s dilution toward zero (see
+/// `FitnessThresholds::max_high_complexity_pct`'s doc comment) is worth
+/// surfacing directly via `FitnessMetrics::high_complexity_pct_note` rather
+/// than only documented on the threshold field.
+const TIER_0_5_NOTE_THRESHOLD_PCT: f64 = 10.0;
+
 impl Default for FitnessThresholds {
     fn default() -> Self {
         Self {
@@ -161,8 +168,14 @@ pub struct FitnessMetrics {
     pub hotspot_risk: f64,
     pub edge_coverage_pct: f64,
     pub high_complexity_pct: f64,
+    /// Set when Tier-0.5 languages (line-scan only, no real parse tree —
+    /// always report complexity 1) make up more than
+    /// `TIER_0_5_NOTE_THRESHOLD_PCT` of function/method symbols, since at
+    /// that share `high_complexity_pct`'s dilution (see
+    /// `FitnessThresholds::max_high_complexity_pct`'s doc comment) is worth
+    /// surfacing directly rather than only documented on the threshold field.
+    pub high_complexity_pct_note: Option<String>,
 }
-
 /// Row shape needed to re-run `compute_dead_code_confidence` per symbol:
 /// (path, line_start, line_end, caller_count, is_entry_point, is_test, language, name, signature, kind).
 type DeadCodeRow = (
@@ -341,6 +354,33 @@ pub fn collect_metrics(
         0.0
     };
 
+    // Tier-0.5 languages (see `language_for_extension`) have no real parse
+    // tree and always report cyclomatic_complexity 1, so they can only ever
+    // dilute `high_complexity_pct` toward zero, never inflate it — a large
+    // enough share makes a passing score misleading rather than reassuring.
+    let high_complexity_pct_note = if total_functions > 0 {
+        let tier_0_5_functions: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM symbols WHERE kind IN ('function', 'method') \
+                 AND language IN ('c','cpp','csharp','ruby','shell','kotlin','swift','php')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        let tier_0_5_pct = 100.0 * tier_0_5_functions as f64 / total_functions as f64;
+        if tier_0_5_pct > TIER_0_5_NOTE_THRESHOLD_PCT {
+            Some(format!(
+                "{tier_0_5_pct:.1}% of function/method symbols are in Tier-0.5 languages \
+                 (line-scan only, no real parse tree) and always report complexity 1 — \
+                 high_complexity_pct is likely understated for this codebase."
+            ))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     Ok(FitnessMetrics {
         hub_count,
         hub_pct,
@@ -349,6 +389,7 @@ pub fn collect_metrics(
         hotspot_risk,
         edge_coverage_pct,
         high_complexity_pct,
+        high_complexity_pct_note,
     })
 }
 
@@ -1083,6 +1124,48 @@ mod tests {
             metrics.high_complexity_pct, 50.0,
             "1 of 2 function/method symbols exceeds the threshold"
         );
+    }
+
+    #[test]
+    fn test_high_complexity_pct_note_absent_for_tier_0_language_codebase() {
+        let conn = test_conn();
+        conn.execute(
+            "INSERT INTO symbols (qualified_name, name, kind, language, path, \
+             line_start, line_end, indexed_at) \
+             VALUES ('mod.simple', 'simple', 'function', 'python', 'mod.py', 1, 5, 0.0)",
+            [],
+        )
+        .unwrap();
+
+        let metrics = collect_metrics(&conn, &std::env::temp_dir(), &CoverageData::none()).unwrap();
+        assert!(metrics.high_complexity_pct_note.is_none());
+    }
+
+    #[test]
+    fn test_high_complexity_pct_note_present_when_tier_0_5_dominant() {
+        let conn = test_conn();
+        // 1 Tier-0 (python) function, 1 Tier-0.5 (shell) function — 50%
+        // Tier-0.5, well above the note threshold.
+        conn.execute(
+            "INSERT INTO symbols (qualified_name, name, kind, language, path, \
+             line_start, line_end, indexed_at) \
+             VALUES ('mod.simple', 'simple', 'function', 'python', 'mod.py', 1, 5, 0.0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO symbols (qualified_name, name, kind, language, path, \
+             line_start, line_end, indexed_at) \
+             VALUES ('script.run', 'run', 'function', 'shell', 'script.sh', 1, 5, 0.0)",
+            [],
+        )
+        .unwrap();
+
+        let metrics = collect_metrics(&conn, &std::env::temp_dir(), &CoverageData::none()).unwrap();
+        let note = metrics
+            .high_complexity_pct_note
+            .expect("note should be set when Tier-0.5 share exceeds threshold");
+        assert!(note.contains("50.0%"), "note was: {note}");
     }
 
     #[test]

@@ -137,8 +137,11 @@ pub struct CodeIntelligenceServer {
     embedder: Arc<RwLock<Option<Arc<Embedder>>>>,
     /// Embedding pipeline status, surfaced as `embeddings_status`.
     embed_status: Arc<RwLock<EmbedStatus>>,
-    /// Coverage data loaded once at startup from lcov/cobertura/etc files, if present.
-    coverage: Arc<calm_core::analysis::coverage::CoverageData>,
+    /// Coverage data loaded at startup from lcov/cobertura/etc files, if
+    /// present — behind a lock (not just an `Arc`) so the file watcher can
+    /// reload it in place when the coverage file itself changes, instead of
+    /// staying frozen at whatever existed at server startup.
+    coverage: Arc<RwLock<calm_core::analysis::coverage::CoverageData>>,
     session_log: Arc<Mutex<SessionLog>>,
     /// Serializes `edit_lines` write+reindex sequences — `rmcp` dispatches
     /// tool calls concurrently, so without this two overlapping edits could
@@ -172,6 +175,18 @@ impl CodeIntelligenceServer {
         recall,
         fitness_report
     });
+
+    /// The actual tool list `list_tools` returns, scoped to `preset` (see
+    /// `common::is_tool_available`/`common::preset_tools`) — factored out of
+    /// `list_tools` itself so it's unit-testable without needing to
+    /// construct a real MCP `RequestContext`/`Peer`.
+    pub(crate) fn filtered_tool_list(preset: &str) -> Vec<rmcp::model::Tool> {
+        Self::tool_box()
+            .list()
+            .into_iter()
+            .filter(|t| common::is_tool_available(preset, &t.name))
+            .collect()
+    }
 }
 
 /// MCP Prompts — canned, parameterized instruction messages a client can
@@ -269,7 +284,6 @@ fn render_prompt(name: &str, arguments: &Option<rmcp::model::JsonObject>) -> Opt
     }
 }
 
-#[tool(tool_box)]
 impl rmcp::ServerHandler for CodeIntelligenceServer {
     fn get_info(&self) -> rmcp::model::ServerInfo {
         rmcp::model::ServerInfo {
@@ -287,6 +301,42 @@ impl rmcp::ServerHandler for CodeIntelligenceServer {
                 .build(),
             ..Default::default()
         }
+    }
+
+    // Hand-written instead of `#[tool(tool_box)]`'s generated version (which
+    // is just `Self::tool_box().list()`/`.call()`, with no per-instance
+    // filtering at all) so `list_tools`/`call_tool` actually honor
+    // `self.preset` — `tool_box()` itself (built by the plain `rmcp::tool_box!`
+    // macro call above, listing every `#[tool]` method) still registers every
+    // tool unconditionally; preset scoping only happens here, at the
+    // MCP-protocol boundary.
+    async fn list_tools(
+        &self,
+        _request: rmcp::model::PaginatedRequestParam,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::ListToolsResult, rmcp::model::ErrorData> {
+        Ok(rmcp::model::ListToolsResult {
+            next_cursor: None,
+            tools: Self::filtered_tool_list(&self.preset),
+        })
+    }
+
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParam,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::CallToolResult, rmcp::model::ErrorData> {
+        if !common::is_tool_available(&self.preset, &request.name) {
+            return Err(rmcp::model::ErrorData::invalid_params(
+                format!(
+                    "tool '{}' is not available under preset '{}'",
+                    request.name, self.preset
+                ),
+                None,
+            ));
+        }
+        let context = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        Self::tool_box().call(context).await
     }
 
     fn list_prompts(
@@ -2992,6 +3042,40 @@ mod tests {
     }
 
     #[test]
+    fn filtered_tool_list_matches_preset_tools_for_named_presets() {
+        for preset in ["orient", "trace", "edit", "compound"] {
+            let expected: std::collections::BTreeSet<&str> =
+                preset_tools(preset).unwrap().iter().copied().collect();
+            let actual_names: Vec<String> = CodeIntelligenceServer::filtered_tool_list(preset)
+                .into_iter()
+                .map(|t| t.name.as_ref().to_string())
+                .collect();
+            let actual: std::collections::BTreeSet<&str> =
+                actual_names.iter().map(|s| s.as_str()).collect();
+            assert_eq!(
+                actual, expected,
+                "list_tools output for preset '{preset}' must match preset_tools exactly"
+            );
+        }
+    }
+
+    #[test]
+    fn filtered_tool_list_returns_every_tool_for_full_and_empty_preset() {
+        let unfiltered_count = CodeIntelligenceServer::tool_box().list().len();
+        for preset in ["full", ""] {
+            let all = CodeIntelligenceServer::filtered_tool_list(preset);
+            assert_eq!(
+                all.len(),
+                unfiltered_count,
+                "preset '{preset}' must not filter out any tool"
+            );
+            // Sanity: a tool excluded from every named preset above (e.g.
+            // 'callers', excluded from 'compound') must still be present here.
+            assert!(all.iter().any(|t| t.name.as_ref() == "callers"));
+        }
+    }
+
+    #[test]
     fn locate_suggests_callers_for_zero_caller_count_symbol() {
         let dir = std::env::temp_dir().join(format!("ci_locate_dead_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -3588,6 +3672,92 @@ mod tests {
         });
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["notes"][0]["staleness"], "fresh");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recall_query_ranks_by_relevance_not_just_recency() {
+        let (dir, server) = test_server("recall_relevance");
+
+        // Oldest note: postgres mentioned once, in passing.
+        server.remember(RememberParams {
+            topic: "old-note".into(),
+            content: "We briefly considered postgres before choosing something else.".into(),
+        });
+        // Newest note, but has nothing to do with the query — recency alone
+        // (the old LIKE query's only ordering) would rank this first.
+        server.remember(RememberParams {
+            topic: "unrelated-newer-note".into(),
+            content: "The deploy pipeline now retries failed steps automatically.".into(),
+        });
+        // postgres is the whole focus here — must rank above old-note despite
+        // being remembered before unrelated-newer-note.
+        server.remember(RememberParams {
+            topic: "focused-note".into(),
+            content: "postgres postgres postgres: we use postgres for all persistence.".into(),
+        });
+
+        let out = server.recall(RecallParams {
+            topic: None,
+            query: Some("postgres".into()),
+        });
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let notes = v["notes"].as_array().unwrap();
+        assert_eq!(
+            notes.len(),
+            2,
+            "only notes mentioning postgres should match at all"
+        );
+        assert_eq!(
+            notes[0]["topic"], "focused-note",
+            "the more relevant match must rank first, not just the more recent one"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recall_query_ties_break_by_recency() {
+        let (dir, server) = test_server("recall_recency_tiebreak");
+        {
+            // Same content on both rows → identical BM25 relevance —
+            // inserted directly (bypassing `remember`'s auto `now` timestamp,
+            // which is only second-granular and could collide in a fast
+            // test) so the recency tie-break is deterministic.
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO project_memory (topic, content, created_at, updated_at) \
+                 VALUES ('topic-a', 'widgetronic config lives in settings.toml', \
+                 '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO project_memory (topic, content, created_at, updated_at) \
+                 VALUES ('topic-b', 'widgetronic config lives in settings.toml', \
+                 '2026-01-02T00:00:00Z', '2026-01-02T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO project_memory_fts(project_memory_fts) VALUES ('rebuild')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let out = server.recall(RecallParams {
+            topic: None,
+            query: Some("widgetronic".into()),
+        });
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let notes = v["notes"].as_array().unwrap();
+        assert_eq!(notes.len(), 2);
+        assert_eq!(
+            notes[0]["topic"], "topic-b",
+            "equal relevance must tie-break to the most recently updated note"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

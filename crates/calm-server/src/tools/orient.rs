@@ -277,7 +277,7 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
                 &conn,
                 &thresholds,
                 &self.project_root,
-                &self.coverage,
+                &self.coverage.read().unwrap(),
                 &boundary_rules,
                 &config_drift_doc_paths,
             ) {
@@ -341,6 +341,8 @@ pub(crate) struct FitnessMetricsOutput {
     pub(crate) hotspot_risk: f64,
     pub(crate) edge_coverage_pct: f64,
     pub(crate) high_complexity_pct: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) high_complexity_pct_note: Option<String>,
 }
 
 impl From<calm_core::fitness::FitnessMetrics> for FitnessMetricsOutput {
@@ -353,6 +355,7 @@ impl From<calm_core::fitness::FitnessMetrics> for FitnessMetricsOutput {
             hotspot_risk: m.hotspot_risk,
             edge_coverage_pct: m.edge_coverage_pct,
             high_complexity_pct: m.high_complexity_pct,
+            high_complexity_pct_note: m.high_complexity_pct_note,
         }
     }
 }
@@ -478,6 +481,9 @@ pub(crate) struct HotspotsParams {
     pub(crate) since: Option<String>,
     /// Minimum commit count for a file to qualify. Defaults to
     /// `hotspots.default_min_churn` in config.json (2 out of the box).
+    /// Set to `0` to also surface high-complexity files with little or no
+    /// recent churn ("stable legacy debt") that the default threshold
+    /// excludes entirely.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) min_churn: Option<i64>,
     /// `true` to also list the highest-risk symbols within each hotspot
@@ -489,6 +495,12 @@ pub(crate) struct HotspotsParams {
 #[derive(Serialize, JsonSchema)]
 pub(crate) struct HotspotChurnOutput {
     pub(crate) commit_count: i64,
+    /// Commits whose author looks like a bot account (dependabot[bot],
+    /// renovate[bot], etc.) — see `churn_source`.
+    pub(crate) bot_commit_count: i64,
+    /// "unknown" (no churn data — e.g. git unavailable), "human" (no bot
+    /// commits), "bot_dominated" (every commit was a bot), or "mixed".
+    pub(crate) churn_source: String,
     pub(crate) authors: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) last_changed: Option<String>,
@@ -524,6 +536,12 @@ pub(crate) struct HotspotEntryOutput {
     pub(crate) language: String,
     pub(crate) churn: HotspotChurnOutput,
     pub(crate) complexity: HotspotComplexityOutput,
+    /// Churn share (0-1) of the score, normalized against the busiest
+    /// candidate file this run — 0.0 when git is unavailable.
+    pub(crate) norm_churn: f64,
+    /// Complexity share (0-1) of the score, normalized against the most
+    /// complex candidate file this run.
+    pub(crate) norm_compl: f64,
     pub(crate) hotspot_score: f64,
     pub(crate) risk_level: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -545,11 +563,14 @@ pub(crate) struct HotspotsOutput {
 
 impl From<calm_core::analysis::hotspot::HotspotEntry> for HotspotEntryOutput {
     fn from(h: calm_core::analysis::hotspot::HotspotEntry) -> Self {
+        let churn_source = h.churn.churn_source().to_string();
         HotspotEntryOutput {
             path: h.path,
             language: h.language,
             churn: HotspotChurnOutput {
                 commit_count: h.churn.commit_count,
+                bot_commit_count: h.churn.bot_commit_count,
+                churn_source,
                 authors: h.churn.authors.into_iter().collect(),
                 last_changed: h.churn.last_changed,
             },
@@ -560,6 +581,8 @@ impl From<calm_core::analysis::hotspot::HotspotEntry> for HotspotEntryOutput {
                 connected_coreness_count: h.complexity.connected_coreness_count,
                 language: h.complexity.language,
             },
+            norm_churn: h.norm_churn,
+            norm_compl: h.norm_compl,
             hotspot_score: h.hotspot_score,
             risk_level: h.risk_level,
             top_symbols: h.top_symbols.map(|syms| {

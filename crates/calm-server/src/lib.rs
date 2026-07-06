@@ -17,6 +17,10 @@ use tools::CodeIntelligenceServer;
 /// Shared handle to the loaded embedder, written by the indexer, read by tools.
 pub type EmbedderHandle = Arc<RwLock<Option<Arc<Embedder>>>>;
 
+/// Shared handle to loaded coverage data, reloaded in place by the file
+/// watcher whenever the coverage file itself changes on disk.
+pub type CoverageHandle = Arc<RwLock<calm_core::analysis::coverage::CoverageData>>;
+
 pub async fn serve_stdio(project_root: PathBuf, db_path: PathBuf) -> Result<()> {
     serve_stdio_with_preset(project_root, db_path, "full".into()).await
 }
@@ -50,7 +54,9 @@ pub async fn serve_stdio_with_preset(
     let last_index_error = server.last_index_error_handle();
     let embedder = server.embedder_handle();
     let embed_status = server.embed_status_handle();
+    let coverage = server.coverage_handle();
     let watch_embedder = embedder.clone();
+    let watch_coverage = coverage.clone();
     // Kept outside the `spawn_blocking` closure below so a panic there (caught
     // via the awaited `JoinHandle`) still has a handle to report through —
     // `phase`/`last_index_error` themselves are moved into that closure.
@@ -193,7 +199,13 @@ pub async fn serve_stdio_with_preset(
                 let _ = index_ok;
             }
             // Watch for edits and incrementally reindex (and re-embed) until shutdown.
-            watcher::run_watch_loop(indexer_root, indexer_db_path, watch_ct, watch_embedder);
+            watcher::run_watch_loop(
+                indexer_root,
+                indexer_db_path,
+                watch_ct,
+                watch_embedder,
+                watch_coverage,
+            );
         });
         // Await (rather than discard) the indexer thread's handle so a panic
         // inside it — which would otherwise silently strand `phase` at

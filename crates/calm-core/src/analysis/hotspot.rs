@@ -8,8 +8,29 @@ use crate::config::HotspotsConfig;
 #[derive(Debug, Clone)]
 pub struct ChurnInfo {
     pub commit_count: i64,
+    /// Commits whose author looks like a bot account (see `is_bot_author`) —
+    /// counted separately from `commit_count` so `churn_source` can tell
+    /// human-driven churn from CI/dependency-bump noise.
+    pub bot_commit_count: i64,
     pub authors: HashSet<String>,
     pub last_changed: Option<String>,
+}
+
+impl ChurnInfo {
+    /// "unknown" with no churn data at all (e.g. git unavailable),
+    /// "human" when no commit came from a bot account, "bot_dominated" when
+    /// every commit did, "mixed" otherwise.
+    pub fn churn_source(&self) -> &'static str {
+        if self.commit_count == 0 {
+            "unknown"
+        } else if self.bot_commit_count == 0 {
+            "human"
+        } else if self.bot_commit_count >= self.commit_count {
+            "bot_dominated"
+        } else {
+            "mixed"
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -41,6 +62,13 @@ pub struct HotspotEntry {
     pub language: String,
     pub churn: ChurnInfo,
     pub complexity: ComplexityInfo,
+    /// Churn share (0-1) of `hotspot_score`'s numerator, normalized against
+    /// the busiest candidate file this run — 0.0 when git is unavailable
+    /// (no churn signal at all, not "no churn").
+    pub norm_churn: f64,
+    /// Complexity share (0-1) of `hotspot_score`'s numerator, normalized
+    /// against the most complex candidate file this run.
+    pub norm_compl: f64,
     pub hotspot_score: f64,
     pub risk_level: String,
     pub top_symbols: Option<Vec<HotspotSymbol>>,
@@ -87,6 +115,7 @@ pub fn compute_hotspots(
                     path.clone(),
                     ChurnInfo {
                         commit_count: 0,
+                        bot_commit_count: 0,
                         authors: HashSet::new(),
                         last_changed: None,
                     },
@@ -141,10 +170,13 @@ pub fn compute_hotspots(
         .iter()
         .filter_map(|(path, churn)| {
             let cm = complexity_map.get(path)?;
+            // Computed unconditionally (not just when `git_available`) so
+            // callers can see the churn share even when it didn't factor
+            // into `hotspot_score` — 0.0 uniformly when git is unavailable,
+            // since every candidate's `commit_count` is 0 in that branch.
+            let norm_churn = churn_scores.get(path.as_str()).copied().unwrap_or(0.0) / max_churn;
             let norm_compl = compl_scores.get(path.as_str()).copied().unwrap_or(0.0) / max_compl;
             let score = if git_available {
-                let norm_churn =
-                    churn_scores.get(path.as_str()).copied().unwrap_or(0.0) / max_churn;
                 norm_churn * norm_compl
             } else {
                 norm_compl
@@ -165,6 +197,8 @@ pub fn compute_hotspots(
                 language: cm.language.clone(),
                 churn: churn.clone(),
                 complexity: cm.clone(),
+                norm_churn: (norm_churn * 10000.0).round() / 10000.0,
+                norm_compl: (norm_compl * 10000.0).round() / 10000.0,
                 hotspot_score: (score * 10000.0).round() / 10000.0,
                 risk_level: risk_level.to_string(),
                 top_symbols: None,
@@ -283,6 +317,7 @@ fn collect_git_churn(project_root: &Path, since: &str) -> (HashMap<String, Churn
         for path in &commit.files {
             let entry = churn_map.entry(path.clone()).or_insert_with(|| ChurnInfo {
                 commit_count: 0,
+                bot_commit_count: 0,
                 authors: HashSet::new(),
                 // H-1 fix: last_changed is Option<String>, None instead of ""
                 last_changed: commit.date.clone(),
@@ -290,10 +325,21 @@ fn collect_git_churn(project_root: &Path, since: &str) -> (HashMap<String, Churn
             entry.commit_count += 1;
             if let Some(ref author) = commit.author {
                 entry.authors.insert(author.clone());
+                if is_bot_author(author) {
+                    entry.bot_commit_count += 1;
+                }
             }
         }
     }
     (churn_map, true)
+}
+
+/// GitHub's bot accounts (dependabot[bot], renovate[bot], github-actions[bot],
+/// etc.) all carry `[bot]` in their noreply author email (`%ae`), which is
+/// what `commits_with_files` captures — this substring check covers them
+/// without hardcoding a specific bot allowlist.
+fn is_bot_author(author: &str) -> bool {
+    author.contains("[bot]")
 }
 
 fn collect_complexity(conn: &Connection) -> HashMap<String, ComplexityInfo> {
@@ -510,6 +556,100 @@ mod tests {
         assert_eq!(output.hotspots.len(), 1);
         assert_eq!(output.hotspots[0].path, "hot.py");
         assert_eq!(output.hotspots[0].churn.commit_count, 2);
+    }
+
+    #[test]
+    fn test_churn_source_classifies_human_bot_mixed_and_unknown() {
+        let unknown = ChurnInfo {
+            commit_count: 0,
+            bot_commit_count: 0,
+            authors: HashSet::new(),
+            last_changed: None,
+        };
+        assert_eq!(unknown.churn_source(), "unknown");
+
+        let human = ChurnInfo {
+            commit_count: 3,
+            bot_commit_count: 0,
+            authors: HashSet::new(),
+            last_changed: None,
+        };
+        assert_eq!(human.churn_source(), "human");
+
+        let bot_dominated = ChurnInfo {
+            commit_count: 3,
+            bot_commit_count: 3,
+            authors: HashSet::new(),
+            last_changed: None,
+        };
+        assert_eq!(bot_dominated.churn_source(), "bot_dominated");
+
+        let mixed = ChurnInfo {
+            commit_count: 4,
+            bot_commit_count: 1,
+            authors: HashSet::new(),
+            last_changed: None,
+        };
+        assert_eq!(mixed.churn_source(), "mixed");
+    }
+
+    #[test]
+    fn test_is_bot_author_matches_bot_suffix() {
+        assert!(is_bot_author(
+            "49699333+dependabot[bot]@users.noreply.github.com"
+        ));
+        assert!(is_bot_author(
+            "29139614+renovate[bot]@users.noreply.github.com"
+        ));
+        assert!(!is_bot_author("jane@example.com"));
+    }
+
+    #[test]
+    fn test_collect_git_churn_tallies_bot_commits_separately() {
+        let dir = tempfile::tempdir().unwrap();
+        run_git(dir.path(), &["init", "-q"]);
+        run_git(dir.path(), &["config", "user.email", "human@example.com"]);
+        run_git(dir.path(), &["config", "user.name", "Human"]);
+        std::fs::write(dir.path().join("f.py"), "x = 1\n").unwrap();
+        run_git(dir.path(), &["add", "f.py"]);
+        run_git(dir.path(), &["commit", "-q", "-m", "init"]);
+
+        run_git(
+            dir.path(),
+            &[
+                "config",
+                "user.email",
+                "49699333+dependabot[bot]@users.noreply.github.com",
+            ],
+        );
+        run_git(dir.path(), &["config", "user.name", "dependabot[bot]"]);
+        std::fs::write(dir.path().join("f.py"), "x = 2\n").unwrap();
+        run_git(dir.path(), &["commit", "-q", "-am", "bump"]);
+
+        let (churn_map, git_available) = collect_git_churn(dir.path(), "1 year");
+        assert!(git_available);
+        let entry = churn_map.get("f.py").unwrap();
+        assert_eq!(entry.commit_count, 2);
+        assert_eq!(entry.bot_commit_count, 1);
+        assert_eq!(entry.churn_source(), "mixed");
+    }
+
+    #[test]
+    fn test_norm_compl_and_norm_churn_are_exposed_without_git() {
+        let conn = setup_db();
+        let dir = tempfile::tempdir().unwrap();
+        insert_symbol(&conn, "a.func1", "/a.py", 0, false, 0);
+        insert_symbol(&conn, "b.func1", "/b.py", 10, true, 5);
+        insert_symbol(&conn, "b.func2", "/b.py", 2, false, 1);
+
+        let config = HotspotsConfig::default();
+        let output = compute_hotspots(dir.path(), &conn, &config, 10, "6 months ago", 2, false);
+        assert!(!output.git_available);
+        // No churn signal at all when git is unavailable.
+        assert!(output.hotspots.iter().all(|h| h.norm_churn == 0.0));
+        // b.py is the most complex candidate, so its complexity share is 1.0.
+        let b = output.hotspots.iter().find(|h| h.path == "/b.py").unwrap();
+        assert_eq!(b.norm_compl, 1.0);
     }
 
     /// Regression: `compute_absolute_hotspot_risk` must NOT saturate to

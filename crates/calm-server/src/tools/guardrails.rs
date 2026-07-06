@@ -168,7 +168,7 @@ impl CodeIntelligenceServer {
                     c.is_test,
                     is_private,
                     scope_clear,
-                    &self.coverage,
+                    &self.coverage.read().unwrap(),
                     &c.kind,
                 );
             if confirmed_caller_count == 0

@@ -2,12 +2,13 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
 /// One declared architecture rule: files under `from` must not import files
-/// under `to`. Matching is a simple path-prefix check on project-relative,
-/// forward-slash paths (the same format `import_edges.from_path`/`to_path`
-/// already use) — deliberately not glob/regex, so a rule reads exactly like
-/// the directory boundary it describes and there's no pattern syntax to get
-/// wrong. `from`/`to` are directory prefixes (e.g. `"crates/calm-core/src/indexer/"`),
-/// not exact file paths.
+/// under `to`. `from`/`to` are project-relative, forward-slash paths (the
+/// same format `import_edges.from_path`/`to_path` already use). A pattern
+/// containing a glob metacharacter (`*`, `?`, `[`) is matched with `globset`
+/// against the whole path (e.g. `"crates/*/src/indexer/**"`); otherwise it's
+/// treated as a plain directory prefix via `starts_with` (e.g.
+/// `"crates/calm-core/src/indexer/"`) — existing prefix-style rules keep
+/// working unchanged.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct BoundaryRule {
     pub from: String,
@@ -30,6 +31,34 @@ pub struct BoundaryViolation {
 /// is reported per (edge, rule) pair — the same edge can violate more than
 /// one rule if rules overlap, which is surfaced rather than deduplicated so
 /// each rule's own `reason` is visible.
+enum PathMatcher {
+    Prefix(String),
+    Glob(globset::GlobMatcher),
+}
+
+impl PathMatcher {
+    /// A pattern containing a glob metacharacter is compiled with `globset`;
+    /// otherwise (including invalid glob syntax) it falls back to a plain
+    /// `starts_with` prefix check, so existing prefix-style rules are
+    /// unaffected and a typo'd glob degrades to its literal prefix rather
+    /// than silently matching nothing.
+    fn new(pattern: &str) -> Self {
+        if pattern.contains(['*', '?', '[']) {
+            if let Ok(glob) = globset::Glob::new(pattern) {
+                return PathMatcher::Glob(glob.compile_matcher());
+            }
+        }
+        PathMatcher::Prefix(pattern.to_string())
+    }
+
+    fn matches(&self, path: &str) -> bool {
+        match self {
+            PathMatcher::Prefix(prefix) => path.starts_with(prefix.as_str()),
+            PathMatcher::Glob(matcher) => matcher.is_match(path),
+        }
+    }
+}
+
 pub fn check_boundaries(
     conn: &Connection,
     rules: &[BoundaryRule],
@@ -46,10 +75,15 @@ pub fn check_boundaries(
         .filter_map(|r| r.ok())
         .collect();
 
+    let matchers: Vec<(PathMatcher, PathMatcher)> = rules
+        .iter()
+        .map(|rule| (PathMatcher::new(&rule.from), PathMatcher::new(&rule.to)))
+        .collect();
+
     let mut violations = Vec::new();
     for (from_path, to_path) in &edges {
-        for rule in rules {
-            if from_path.starts_with(&rule.from) && to_path.starts_with(&rule.to) {
+        for (rule, (from_matcher, to_matcher)) in rules.iter().zip(&matchers) {
+            if from_matcher.matches(from_path) && to_matcher.matches(to_path) {
                 violations.push(BoundaryViolation {
                     from_path: from_path.clone(),
                     to_path: to_path.clone(),
@@ -182,5 +216,44 @@ mod tests {
         ];
         let violations = check_boundaries(&conn, &rules).unwrap();
         assert_eq!(violations.len(), 2);
+    }
+
+    #[test]
+    fn test_glob_rule_matches_nested_paths() {
+        let conn = test_conn();
+        insert_import(&conn, "crates/calm-core/src/indexer/foo.rs", "crates/calm-server/src/tools/orient.rs");
+        let rules = vec![BoundaryRule {
+            from: "crates/*/src/indexer/**".into(),
+            to: "crates/*/src/tools/**".into(),
+            reason: "indexer must not import server tools".into(),
+        }];
+        let violations = check_boundaries(&conn, &rules).unwrap();
+        assert_eq!(violations.len(), 1);
+    }
+
+    #[test]
+    fn test_glob_rule_does_not_match_unrelated_path() {
+        let conn = test_conn();
+        insert_import(&conn, "crates/calm-core/src/other/foo.rs", "crates/calm-server/src/tools/orient.rs");
+        let rules = vec![BoundaryRule {
+            from: "crates/*/src/indexer/**".into(),
+            to: "crates/*/src/tools/**".into(),
+            reason: "indexer must not import server tools".into(),
+        }];
+        let violations = check_boundaries(&conn, &rules).unwrap();
+        assert!(violations.is_empty());
+    }
+
+    #[test]
+    fn test_invalid_glob_falls_back_to_literal_prefix() {
+        let conn = test_conn();
+        insert_import(&conn, "a/[unclosed/x.py", "b/y.py");
+        let rules = vec![BoundaryRule {
+            from: "a/[unclosed".into(),
+            to: "b/".into(),
+            reason: "invalid glob syntax degrades to prefix match".into(),
+        }];
+        let violations = check_boundaries(&conn, &rules).unwrap();
+        assert_eq!(violations.len(), 1);
     }
 }

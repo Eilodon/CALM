@@ -75,14 +75,18 @@ impl CodeIntelligenceServer {
                         .collect::<Result<Vec<_>, _>>()
                 })
             } else if let Some(q) = p.query.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
-                let pattern = format!("%{q}%");
+                let fts_query = Self::escape_fts5_query(q);
                 conn.prepare(
-                    "SELECT topic, content, updated_at FROM project_memory \
-                     WHERE topic LIKE ?1 OR content LIKE ?1 ORDER BY updated_at DESC LIMIT ?2",
+                    "SELECT p.topic, p.content, p.updated_at \
+                     FROM project_memory_fts \
+                     JOIN project_memory p ON p.id = project_memory_fts.rowid \
+                     WHERE project_memory_fts MATCH ?1 \
+                     ORDER BY bm25(project_memory_fts), p.updated_at DESC \
+                     LIMIT ?2",
                 )
                 .and_then(|mut stmt| {
                     stmt.query_map(
-                        rusqlite::params![pattern, RECALL_LIMIT + 1],
+                        rusqlite::params![fts_query, RECALL_LIMIT + 1],
                         memory_note_row,
                     )?
                     .collect::<Result<Vec<_>, _>>()
@@ -145,6 +149,27 @@ impl CodeIntelligenceServer {
             })
             .unwrap_or_default()
         })
+    }
+
+    /// Wraps `query` as a single FTS5 phrase (embedded `"` doubled per FTS5
+    /// syntax) so arbitrary user input — including FTS5 operators like `-`,
+    /// `*`, `:` — is always treated as literal text to match, never parsed
+    /// as query syntax. Mirrors `calm_core::search`'s identical helper for
+    /// code search; duplicated rather than shared across crates for one
+    /// small, dependency-free function.
+    fn escape_fts5_query(query: &str) -> String {
+        let mut escaped = String::with_capacity(query.len() + 2);
+        escaped.push('"');
+        for ch in query.chars() {
+            if ch == '"' {
+                escaped.push('"');
+                escaped.push('"');
+            } else {
+                escaped.push(ch);
+            }
+        }
+        escaped.push('"');
+        escaped
     }
 }
 

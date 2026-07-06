@@ -254,6 +254,7 @@ fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
         "INTEGER NOT NULL DEFAULT 0",
     )?;
     migrate_fts_add_signature(conn)?;
+    migrate_add_project_memory_fts(conn)?;
     Ok(())
 }
 
@@ -286,6 +287,62 @@ fn migrate_fts_add_signature(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(TRIGGERS_SQL)?;
     conn.execute_batch("INSERT INTO fts_exact(fts_exact) VALUES ('rebuild');")?;
     tracing::info!("Migration: rebuilt fts_exact with signature column");
+    Ok(())
+}
+
+const PROJECT_MEMORY_FTS_SQL: &str = "
+CREATE VIRTUAL TABLE IF NOT EXISTS project_memory_fts USING fts5(
+    topic,
+    content,
+    content='project_memory',
+    content_rowid='id',
+    tokenize='unicode61'
+);
+";
+
+const PROJECT_MEMORY_TRIGGERS_SQL: &str = "
+CREATE TRIGGER IF NOT EXISTS project_memory_ai AFTER INSERT ON project_memory BEGIN
+    INSERT INTO project_memory_fts(rowid, topic, content)
+        VALUES (new.id, new.topic, new.content);
+END;
+
+CREATE TRIGGER IF NOT EXISTS project_memory_ad AFTER DELETE ON project_memory BEGIN
+    INSERT INTO project_memory_fts(project_memory_fts, rowid, topic, content)
+        VALUES ('delete', old.id, old.topic, old.content);
+END;
+
+CREATE TRIGGER IF NOT EXISTS project_memory_au
+    AFTER UPDATE OF content ON project_memory BEGIN
+    INSERT INTO project_memory_fts(project_memory_fts, rowid, topic, content)
+        VALUES ('delete', old.id, old.topic, old.content);
+    INSERT INTO project_memory_fts(rowid, topic, content)
+        VALUES (new.id, new.topic, new.content);
+END;
+";
+
+/// Unlike `fts_exact` (always unconditionally (re)created by `FTS5_SQL`
+/// before migrations run, so `migrate_fts_add_signature` above has to key
+/// off a column, not the table's existence), `project_memory_fts` is a
+/// brand-new table that no pre-existing DB has — so its absence from
+/// `sqlite_master` is itself a reliable "not yet migrated" marker. `remember`
+/// upserts via `ON CONFLICT DO UPDATE`, which SQLite fires as an UPDATE
+/// trigger (not INSERT) against the pre-existing row, hence the `AFTER
+/// UPDATE OF content` trigger — `topic` never changes on an upsert (it's the
+/// conflict key) so it isn't watched.
+fn migrate_add_project_memory_fts(conn: &Connection) -> rusqlite::Result<()> {
+    let already_migrated: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'project_memory_fts'",
+        [],
+        |r| r.get(0),
+    )?;
+    if already_migrated > 0 {
+        return Ok(());
+    }
+
+    conn.execute_batch(PROJECT_MEMORY_FTS_SQL)?;
+    conn.execute_batch(PROJECT_MEMORY_TRIGGERS_SQL)?;
+    conn.execute_batch("INSERT INTO project_memory_fts(project_memory_fts) VALUES ('rebuild');")?;
+    tracing::info!("Migration: created project_memory_fts and backfilled existing notes");
     Ok(())
 }
 
@@ -550,5 +607,124 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1, "post-migration trigger must sync signature too");
+    }
+
+    #[test]
+    fn test_project_memory_fts_trigger_sync() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        conn.execute(
+            "INSERT INTO project_memory (topic, content, created_at, updated_at) \
+             VALUES ('db-choice', 'we use postgres for prod', '2026-01-01', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM project_memory_fts WHERE project_memory_fts MATCH 'postgres'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+
+        // remember's upsert (`ON CONFLICT(topic) DO UPDATE`) must fire as an
+        // UPDATE trigger, not leave the FTS index stuck on the old content.
+        conn.execute(
+            "INSERT INTO project_memory (topic, content, created_at, updated_at) \
+             VALUES ('db-choice', 'we migrated to mysql', '2026-01-01', '2026-01-02') \
+             ON CONFLICT(topic) DO UPDATE SET content = excluded.content, updated_at = excluded.updated_at",
+            [],
+        )
+        .unwrap();
+
+        let old_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM project_memory_fts WHERE project_memory_fts MATCH 'postgres'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_count, 0, "stale content must not still match");
+        let new_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM project_memory_fts WHERE project_memory_fts MATCH 'mysql'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(new_count, 1, "updated content must match");
+
+        conn.execute("DELETE FROM project_memory WHERE topic = 'db-choice'", [])
+            .unwrap();
+        let deleted_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM project_memory_fts WHERE project_memory_fts MATCH 'mysql'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(deleted_count, 0, "deleted note must be removed from the FTS index");
+    }
+
+    #[test]
+    fn test_migrate_add_project_memory_fts_backfills_existing_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Old-shape DB: SCHEMA_SQL only, predating project_memory_fts entirely.
+        conn.execute_batch(SCHEMA_SQL).unwrap();
+        conn.execute(
+            "INSERT INTO project_memory (topic, content, created_at, updated_at) \
+             VALUES ('legacy-note', 'uses widgetronic auth', '2026-01-01', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+
+        let exists_before: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'project_memory_fts'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists_before, 0);
+
+        // init_db on an already-populated old-shape DB is the upgrade path.
+        init_db(&conn).unwrap();
+
+        let exists_after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'project_memory_fts'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists_after, 1);
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM project_memory_fts WHERE project_memory_fts MATCH 'widgetronic'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "pre-existing note must be backfilled by 'rebuild'");
+
+        // Triggers sync notes inserted after the migration too.
+        conn.execute(
+            "INSERT INTO project_memory (topic, content, created_at, updated_at) \
+             VALUES ('new-note', 'uses zorbex cache', '2026-01-02', '2026-01-02')",
+            [],
+        )
+        .unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM project_memory_fts WHERE project_memory_fts MATCH 'zorbex'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "post-migration trigger must sync new notes too");
     }
 }

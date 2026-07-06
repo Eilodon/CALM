@@ -23,7 +23,7 @@ impl CoverageData {
     }
 }
 
-const COVERAGE_SEARCH_PATHS: &[(&str, &str)] = &[
+pub const COVERAGE_SEARCH_PATHS: &[(&str, &str)] = &[
     ("lcov.info", "lcov"),
     ("coverage/lcov.info", "lcov"),
     (".nyc_output/lcov.info", "lcov"),

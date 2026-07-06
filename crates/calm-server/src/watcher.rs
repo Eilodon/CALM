@@ -46,6 +46,22 @@ fn event_is_relevant(res: &notify::Result<notify::Event>) -> bool {
     matches!(res, Ok(event) if event.paths.iter().any(|p| is_relevant_path(p)))
 }
 
+/// True when `path` is one of the fixed coverage-report locations
+/// `calm_core::analysis::coverage::load_coverage` looks for (`lcov.info`,
+/// `coverage.xml`, `.coverage`, etc.) — checked by exact path match rather
+/// than folded into `is_relevant_path`, since some of these (`.coverage`,
+/// `.nyc_output/lcov.info`) are legitimately dot-prefixed and would
+/// otherwise be rejected by that function's VCS/build-dir filtering.
+fn is_coverage_path(path: &Path, project_root: &Path) -> bool {
+    calm_core::analysis::coverage::COVERAGE_SEARCH_PATHS
+        .iter()
+        .any(|&(relative, _)| path == project_root.join(relative))
+}
+
+fn event_touches_coverage(res: &notify::Result<notify::Event>, project_root: &Path) -> bool {
+    matches!(res, Ok(event) if event.paths.iter().any(|p| is_coverage_path(p, project_root)))
+}
+
 /// Block on the watch loop until `ct` is cancelled. Intended to run inside a
 /// `spawn_blocking` task after the initial full index completes. When an embedder
 /// is loaded, newly (re)indexed symbols are embedded after each reindex.
@@ -54,6 +70,7 @@ pub fn run_watch_loop(
     db_path: PathBuf,
     ct: CancellationToken,
     embedder: crate::EmbedderHandle,
+    coverage: crate::CoverageHandle,
 ) {
     let (tx, rx) = mpsc::channel();
     let mut watcher = match recommended_watcher(move |res| {
@@ -78,17 +95,25 @@ pub fn run_watch_loop(
         if ct.is_cancelled() {
             break;
         }
-        // Wait for the next *relevant* event. Irrelevant noise (DB/WAL writes
-        // under .calm, editor temp files) is dropped here so it can neither
-        // trigger nor — critically — delay a reindex.
+        // Wait for the next *relevant* event: either a tier-0 source file (see
+        // `is_relevant_path`) or one of the fixed coverage-report locations
+        // (see `is_coverage_path`). Irrelevant noise (DB/WAL writes under
+        // .calm, editor temp files) is dropped here so it can neither trigger
+        // nor — critically — delay a reindex/coverage-reload.
+        let mut coverage_touched;
         match rx.recv_timeout(Duration::from_secs(1)) {
-            Ok(res) if event_is_relevant(&res) => {}
-            Ok(_) => continue,
+            Ok(res) => {
+                let source_relevant = event_is_relevant(&res);
+                coverage_touched = event_touches_coverage(&res, &project_root);
+                if !source_relevant && !coverage_touched {
+                    continue;
+                }
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
 
-        // Debounce: reindex once the tree has been quiet (no relevant events) for
+        // Debounce: reindex/reload once the tree has been quiet (no relevant events) for
         // DEBOUNCE. Only relevant events extend the window — a steady stream of
         // irrelevant events must not starve it.
         let mut deadline = std::time::Instant::now() + DEBOUNCE;
@@ -102,13 +127,23 @@ pub fn run_watch_loop(
                     if ct.is_cancelled() {
                         return;
                     }
-                    if event_is_relevant(&res) {
+                    let source_relevant = event_is_relevant(&res);
+                    if event_touches_coverage(&res, &project_root) {
+                        coverage_touched = true;
+                    }
+                    if source_relevant || coverage_touched {
                         deadline = std::time::Instant::now() + DEBOUNCE;
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => break,
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
+        }
+
+        if coverage_touched {
+            let reloaded = calm_core::analysis::coverage::load_coverage(&project_root);
+            tracing::info!("Coverage file changed — reloaded ({})", reloaded.source);
+            *coverage.write().unwrap() = reloaded;
         }
 
         match calm_core::db::conn::open_writer(&db_path) {
@@ -206,5 +241,28 @@ mod tests {
         assert!(!is_relevant_path(Path::new("target/debug/foo.rs")));
         // Non-source files are ignored.
         assert!(!is_relevant_path(Path::new("README.md")));
+    }
+
+    #[test]
+    fn coverage_paths_matched_by_exact_relative_location() {
+        let root = Path::new("/proj");
+        assert!(is_coverage_path(Path::new("/proj/lcov.info"), root));
+        assert!(is_coverage_path(Path::new("/proj/coverage/lcov.info"), root));
+        // `.coverage`/`.nyc_output` are legitimately dot-prefixed — must still
+        // count, unlike `is_relevant_path`'s dot-dir rejection.
+        assert!(is_coverage_path(Path::new("/proj/.coverage"), root));
+        assert!(is_coverage_path(
+            Path::new("/proj/.nyc_output/lcov.info"),
+            root
+        ));
+        assert!(is_coverage_path(Path::new("/proj/coverage.xml"), root));
+        assert!(is_coverage_path(Path::new("/proj/coverage.out"), root));
+        // Unrelated files, and files under a different root, must not match.
+        assert!(!is_coverage_path(Path::new("/proj/src/main.rs"), root));
+        assert!(!is_coverage_path(
+            Path::new("/proj/nested/lcov.info"),
+            root
+        ));
+        assert!(!is_coverage_path(Path::new("/other/lcov.info"), root));
     }
 }

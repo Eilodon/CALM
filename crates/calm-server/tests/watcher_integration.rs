@@ -59,7 +59,12 @@ fn watcher_reindexes_add_and_delete() {
         let (root, db, ct) = (dir.clone(), db_path.clone(), ct.clone());
         let embedder: calm_server::EmbedderHandle =
             std::sync::Arc::new(std::sync::RwLock::new(None));
-        std::thread::spawn(move || calm_server::watcher::run_watch_loop(root, db, ct, embedder))
+        let coverage: calm_server::CoverageHandle = std::sync::Arc::new(std::sync::RwLock::new(
+            calm_core::analysis::coverage::CoverageData::none(),
+        ));
+        std::thread::spawn(move || {
+            calm_server::watcher::run_watch_loop(root, db, ct, embedder, coverage)
+        })
     };
 
     // Let the watcher register before mutating the tree.
@@ -123,7 +128,12 @@ fn concurrent_edit_write_and_watcher_reindex_does_not_lock_or_go_stale() {
         let (root, db, ct) = (dir.clone(), db_path.clone(), ct.clone());
         let embedder: calm_server::EmbedderHandle =
             std::sync::Arc::new(std::sync::RwLock::new(None));
-        std::thread::spawn(move || calm_server::watcher::run_watch_loop(root, db, ct, embedder))
+        let coverage: calm_server::CoverageHandle = std::sync::Arc::new(std::sync::RwLock::new(
+            calm_core::analysis::coverage::CoverageData::none(),
+        ));
+        std::thread::spawn(move || {
+            calm_server::watcher::run_watch_loop(root, db, ct, embedder, coverage)
+        })
     };
     std::thread::sleep(Duration::from_millis(400));
 
@@ -159,5 +169,98 @@ fn concurrent_edit_write_and_watcher_reindex_does_not_lock_or_go_stale() {
     assert!(
         converged,
         "DB must reflect the latest file content once both writers settle"
+    );
+}
+
+/// Poll `coverage`'s loaded `source` field until it matches `want` or the
+/// deadline passes.
+fn wait_for_coverage_source(
+    coverage: &calm_server::CoverageHandle,
+    want: &str,
+    timeout: Duration,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if coverage.read().unwrap().source == want {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    coverage.read().unwrap().source == want
+}
+
+/// Regression for the coverage hot-reload gap: `load_coverage` used to run
+/// once at server startup only, so a coverage report regenerated mid-session
+/// (e.g. after `pytest --cov`) never got picked up until the next restart —
+/// `is_relevant_path` doesn't recognize lcov/cobertura/etc. report files at
+/// all, so the watcher silently ignored their change events entirely. This
+/// writes an `lcov.info` after the watcher is already running and asserts
+/// the shared `CoverageHandle` reflects it without a restart.
+#[test]
+fn watcher_hot_reloads_coverage_file_change() {
+    let dir = std::env::temp_dir().join(format!(
+        "ci_watch_cov_{}_{}",
+        std::process::id(),
+        Instant::now().elapsed().as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a.py"), "def a():\n    pass\n").unwrap();
+
+    let db_path = dir.join(".calm").join("index.db");
+    std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    {
+        let mut conn = rusqlite::Connection::open(&db_path).unwrap();
+        calm_core::db::schema::init_db(&conn).unwrap();
+        calm_core::indexer::pipeline::run_indexing_pipeline(
+            &mut conn,
+            &dir,
+            std::sync::Arc::new(std::sync::RwLock::new(
+                calm_core::types::IndexingPhase::Scanning,
+            )),
+        )
+        .unwrap();
+    }
+
+    let coverage: calm_server::CoverageHandle = std::sync::Arc::new(std::sync::RwLock::new(
+        calm_core::analysis::coverage::CoverageData::none(),
+    ));
+    assert_eq!(
+        coverage.read().unwrap().source,
+        "none",
+        "no coverage file yet"
+    );
+
+    let ct = CancellationToken::new();
+    let handle = {
+        let (root, db, ct, coverage) =
+            (dir.clone(), db_path.clone(), ct.clone(), coverage.clone());
+        let embedder: calm_server::EmbedderHandle =
+            std::sync::Arc::new(std::sync::RwLock::new(None));
+        std::thread::spawn(move || {
+            calm_server::watcher::run_watch_loop(root, db, ct, embedder, coverage)
+        })
+    };
+
+    // Let the watcher register before mutating the tree.
+    std::thread::sleep(Duration::from_millis(400));
+
+    // Write a coverage report *after* the watcher is running — this is the
+    // "regenerated mid-session" case the fix targets.
+    std::fs::write(
+        dir.join("lcov.info"),
+        "SF:a.py\nDA:1,1\nDA:2,1\nend_of_record\n",
+    )
+    .unwrap();
+
+    let reloaded = wait_for_coverage_source(&coverage, "lcov", Duration::from_secs(30));
+
+    ct.cancel();
+    let _ = handle.join();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        reloaded,
+        "watcher should have hot-reloaded the new lcov.info without a restart"
     );
 }

@@ -26,7 +26,7 @@ impl CodeIntelligenceServer {
             last_index_error: Arc::new(RwLock::new(None)),
             embedder: Arc::new(RwLock::new(None)),
             embed_status: Arc::new(RwLock::new(EmbedStatus::Disabled)),
-            coverage: Arc::new(coverage),
+            coverage: Arc::new(RwLock::new(coverage)),
             session_log: Arc::new(Mutex::new(SessionLog::default())),
             edit_lock: Arc::new(Mutex::new(())),
             preset,
@@ -197,7 +197,11 @@ impl CodeIntelligenceServer {
         Arc::clone(&self.embedder)
     }
     pub fn embed_status_handle(&self) -> Arc<RwLock<EmbedStatus>> {
-        Arc::clone(&self.embed_status)
+        self.embed_status.clone()
+    }
+
+    pub fn coverage_handle(&self) -> Arc<RwLock<calm_core::analysis::coverage::CoverageData>> {
+        self.coverage.clone()
     }
 
     /// The loaded embedder, if semantic search is ready.
