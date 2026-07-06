@@ -253,6 +253,19 @@ fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
         "ruled_out_by_scip",
         "INTEGER NOT NULL DEFAULT 0",
     )?;
+    // Provenance of a `formal`-confidence edge, set by whichever pass upgraded
+    // it: `'scip'` (exact (file,line) match — see `scip::ingest`) or
+    // `'stack_graphs'` (per-file name-set match — see
+    // `indexer::pipeline::extract_file_data`). NULL for every other
+    // confidence tier, and for pre-migration `formal` rows this column can't
+    // retroactively attribute (harmless: `ingest_occurrences` treats NULL the
+    // same as `'stack_graphs'` — weaker evidence SCIP is allowed to confirm
+    // or override — never the same as `'scip'`, which it never re-touches).
+    // SCIP is deliberately allowed to override a `'stack_graphs'`-sourced
+    // `formal` edge (re-target an ambiguous group when the two disagree) —
+    // exact type-checked evidence beats a per-file name-set heuristic — but
+    // never re-litigates its own prior `'scip'` verdict.
+    migrate_add_column(conn, "call_edges", "formal_source", "TEXT")?;
     migrate_fts_add_signature(conn)?;
     migrate_add_project_memory_fts(conn)?;
     Ok(())

@@ -191,12 +191,17 @@ pub fn run_watch_loop(
                                 &rust_cfg,
                                 &dirty,
                             ) {
-                                Ok(stats) if stats.upgraded > 0 || stats.ruled_out > 0 => {
+                                Ok(stats)
+                                    if stats.upgraded > 0
+                                        || stats.ruled_out > 0
+                                        || stats.inserted > 0 =>
+                                {
                                     // caller_count was computed by this reindex's
                                     // rebuild_graph before the overlay flipped
-                                    // edge_confidence/ruled_out_by_scip on some
-                                    // edges — refresh or it goes stale immediately
-                                    // relative to the columns it's filtered on.
+                                    // edge_confidence/ruled_out_by_scip on (or
+                                    // inserted) some edges — refresh or it goes
+                                    // stale immediately relative to the columns
+                                    // it's filtered on.
                                     if let Err(e) =
                                         calm_core::indexer::pipeline::refresh_caller_counts(&conn)
                                     {
@@ -205,9 +210,10 @@ pub fn run_watch_loop(
                                         );
                                     }
                                     tracing::info!(
-                                        "Incremental SCIP overlay: {} edges upgraded, {} fan-out siblings ruled out",
+                                        "Incremental SCIP overlay: {} edges upgraded, {} fan-out siblings ruled out, {} inserted",
                                         stats.upgraded,
-                                        stats.ruled_out
+                                        stats.ruled_out,
+                                        stats.inserted
                                     );
                                 }
                                 Ok(_) => {}

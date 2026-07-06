@@ -1,4 +1,4 @@
-export type EdgeConfidence = "resolved" | "inferred" | "textual";
+export type EdgeConfidence = "formal" | "resolved" | "inferred" | "textual" | "ambiguous" | "unresolved";
 
 export interface Health {
   has_docstring: boolean;
@@ -436,7 +436,7 @@ export interface UnderstandOutput {
   callers_summary?: {
     name: string;
     path: string;
-    edge_confidence: "resolved" | "inferred" | "textual";
+    edge_confidence: EdgeConfidence;
     line: number;
   }[];
   total_callers?: number;

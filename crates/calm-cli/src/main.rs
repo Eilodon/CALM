@@ -181,17 +181,19 @@ async fn main() -> Result<()> {
                     .unwrap_or_default();
                 let dirty = calm_core::scip::rust_source_dirty_keys(&conn);
                 match calm_core::scip::run_overlay(&conn, &root, &rust_cfg, &dirty) {
-                    Ok(stats) if stats.upgraded > 0 || stats.ruled_out > 0 => {
+                    Ok(stats)
+                        if stats.upgraded > 0 || stats.ruled_out > 0 || stats.inserted > 0 =>
+                    {
                         // caller_count was computed by rebuild_graph before this
-                        // overlay flipped edge_confidence/ruled_out_by_scip on
-                        // some edges — refresh it or it goes stale immediately
-                        // relative to the columns it's filtered on.
+                        // overlay flipped edge_confidence/ruled_out_by_scip on (or
+                        // inserted) some edges — refresh it or it goes stale
+                        // immediately relative to the columns it's filtered on.
                         if let Err(e) = calm_core::indexer::pipeline::refresh_caller_counts(&conn) {
                             tracing::warn!("caller_count refresh after SCIP overlay failed: {e}");
                         }
                         println!(
-                            "SCIP overlay: {} edges upgraded, {} fan-out siblings ruled out.",
-                            stats.upgraded, stats.ruled_out
+                            "SCIP overlay: {} edges upgraded, {} fan-out siblings ruled out, {} inserted.",
+                            stats.upgraded, stats.ruled_out, stats.inserted
                         );
                     }
                     Ok(_) => {}

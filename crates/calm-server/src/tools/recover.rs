@@ -350,6 +350,20 @@ pub(crate) struct ScipOverlayStatusOutput {
     /// none has ever run) — the next non-noop incremental reindex will
     /// actually invoke rust-analyzer again rather than cache-skip.
     pub(crate) up_to_date: bool,
+    /// Fraction (0.0-1.0) of SCIP-resolved call sites represented by a
+    /// `formal` edge as of the last real overlay run — absent if it's never
+    /// actually run. A low value alongside a healthy `.scip` file usually
+    /// means indexer-subroot paths aren't rebased correctly for wherever the
+    /// indexer ran (see `parse::parse_index`'s `rebase_prefix`). Stale the
+    /// instant `up_to_date` is `false`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) last_match_rate: Option<f64>,
+    /// New `call_edges` rows the last real overlay run inserted for a call
+    /// site tree-sitter's own candidate selection dropped entirely (e.g. name
+    /// fan-out past `MAX_CALLEE_CANDIDATES`) — absent if it's never actually
+    /// run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) last_inserted: Option<usize>,
 }
 
 #[cfg(feature = "scip-overlay")]
@@ -358,6 +372,8 @@ impl From<calm_core::scip::OverlayStatus> for ScipOverlayStatusOutput {
         Self {
             available: s.available,
             up_to_date: s.up_to_date,
+            last_match_rate: s.last_match_rate,
+            last_inserted: s.last_inserted,
         }
     }
 }
@@ -371,6 +387,10 @@ impl From<calm_core::scip::OverlayStatus> for ScipOverlayStatusOutput {
 pub(crate) struct ScipOverlayStatusOutput {
     pub(crate) available: bool,
     pub(crate) up_to_date: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) last_match_rate: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) last_inserted: Option<usize>,
 }
 
 // ---------------------------------------------------------------------------

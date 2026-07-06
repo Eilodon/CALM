@@ -684,6 +684,18 @@ fn rebuild_graph(
 
     tx.execute("DELETE FROM call_edges", [])?;
     insert_call_edges_batch(tx, &edges)?;
+    // Every `formal` row at this point came from the stack-graphs upgrade at
+    // this function's own confidence-assignment loop above (`formally_resolved`)
+    // — the SCIP overlay (`scip::ingest::ingest_occurrences`) is a separate,
+    // later UPDATE pass that runs after this one and sets `formal_source =
+    // 'scip'` itself. Cheaper than threading a new field through
+    // `CallSiteData`/`CallEdge`/`insert_call_edges_batch` for what's
+    // otherwise a one-shot fact true immediately after every fresh rebuild.
+    tx.execute(
+        "UPDATE call_edges SET formal_source = 'stack_graphs' \
+         WHERE edge_confidence = 'formal' AND formal_source IS NULL",
+        [],
+    )?;
     refresh_caller_counts(tx)?;
     resolve_import_targets(tx, crate_map)?;
     crate::graph::coreness::compute_coreness(tx)?;

@@ -75,15 +75,37 @@ pub fn run_overlay(
             return Ok(ingest::IngestStats::default());
         }
     };
-    let stats = ingest::ingest_occurrences(conn, &occ)?;
+    let insert_missing = rust.scip.insert_missing != Some(false);
+    let stats = ingest::ingest_occurrences(conn, &occ, insert_missing)?;
     tracing::info!(
-        "SCIP overlay: {} edges upgraded to formal, {} fan-out siblings ruled out",
+        "SCIP overlay: {} edges upgraded to formal, {} fan-out siblings ruled out, \
+         {} edges inserted, match_rate={:.2}",
         stats.upgraded,
-        stats.ruled_out
+        stats.ruled_out,
+        stats.inserted,
+        stats.match_rate
     );
     // Best-effort: a failed cache write just means the next run pays the cost
     // of rust-analyzer again, never a correctness issue.
     let _ = std::fs::write(&cache_path, &key);
+    // Best-effort sidecar so `indexing_status`/`overlay_status` can surface
+    // this run's `inserted`/`match_rate` without re-running the overlay —
+    // those two fields aren't derivable from `call_edges` alone the way
+    // `available`/`up_to_date` are (there's no column recording "how many
+    // SCIP-resolved sites exist" once the pass is done). Stands until the
+    // next real (non-cache-skip) run overwrites it; reading code should
+    // treat it as "as of the last real run", not "live".
+    let stats_path = root.join(".calm").join("scip-stats.json");
+    let _ = std::fs::write(
+        &stats_path,
+        serde_json::json!({
+            "upgraded": stats.upgraded,
+            "ruled_out": stats.ruled_out,
+            "inserted": stats.inserted,
+            "match_rate": stats.match_rate,
+        })
+        .to_string(),
+    );
     Ok(stats)
 }
 
@@ -160,13 +182,38 @@ pub fn overlay_status(conn: &Connection, root: &Path, rust: &RustConfig) -> Opti
         }
         None => false,
     };
+    let (last_match_rate, last_inserted) = read_last_stats(root);
     Some(OverlayStatus {
         available,
         up_to_date,
+        last_match_rate,
+        last_inserted,
     })
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Best-effort read of the sidecar `run_overlay` writes after a real
+/// (non-cache-skip) run — `inserted`/`match_rate` aren't derivable from
+/// `call_edges` alone at read time the way `available`/`up_to_date` are, so
+/// they have to come from whatever the last real run actually observed.
+/// Absent (never run) or corrupt — both `(None, None)`, not an error; this is
+/// a diagnostic nicety, not load-bearing.
+fn read_last_stats(root: &Path) -> (Option<f64>, Option<usize>) {
+    let path = root.join(".calm").join("scip-stats.json");
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return (None, None);
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return (None, None);
+    };
+    (
+        v.get("match_rate").and_then(|x| x.as_f64()),
+        v.get("inserted")
+            .and_then(|x| x.as_u64())
+            .map(|n| n as usize),
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct OverlayStatus {
     /// `rust-analyzer` binary was found (PATH/rustup/VS Code) at last check.
     pub available: bool,
@@ -176,6 +223,14 @@ pub struct OverlayStatus {
     /// wired to call it) would actually invoke rust-analyzer again rather
     /// than cache-skip. Always `false` when `available` is `false`.
     pub up_to_date: bool,
+    /// `IngestStats::match_rate` from the last real (non-cache-skip)
+    /// `run_overlay` invocation, or `None` if it has never actually run
+    /// (a fresh checkout, or `available == false`). Stale the moment
+    /// `up_to_date` is `false` — read that first.
+    pub last_match_rate: Option<f64>,
+    /// `IngestStats::inserted` from that same last real run, or `None` for
+    /// the same reasons as `last_match_rate`.
+    pub last_inserted: Option<usize>,
 }
 
 #[cfg(test)]
@@ -196,6 +251,7 @@ mod tests {
             scip: crate::config::ScipConfig {
                 enabled: Some(false),
                 binary: None,
+                insert_missing: None,
             },
         };
         assert_eq!(
@@ -259,6 +315,7 @@ mod tests {
             scip: crate::config::ScipConfig {
                 enabled: Some(false),
                 binary: None,
+                insert_missing: None,
             },
         };
         assert_eq!(overlay_status(&conn, Path::new("."), &rust), None);
@@ -284,6 +341,7 @@ mod tests {
             scip: crate::config::ScipConfig {
                 enabled: Some(true),
                 binary: None,
+                insert_missing: None,
             },
         };
         let dirty = rust_source_dirty_keys(&conn);

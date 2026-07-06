@@ -106,6 +106,19 @@ pub struct ScipConfig {
     pub enabled: Option<bool>,
     /// Optional explicit rust-analyzer binary path (else auto-detect).
     pub binary: Option<String>,
+    /// Gated insert: when SCIP resolves a call site to a definition but no
+    /// existing `call_edges` row represents that exact target at all (e.g.
+    /// tree-sitter's own candidate selection dropped it for exceeding
+    /// `MAX_CALLEE_CANDIDATES`, or the name never matched across crates) —
+    /// insert a new `formal`/`formal_source: 'scip'` edge instead of leaving
+    /// that call site permanently edge-less. Three-state like `enabled`:
+    /// `None` (default) is auto-on — the gates already applied before an
+    /// insert (fresh cache key, a uniquely-resolved definition symbol, a
+    /// real syntactic `call_sites` row for the call, dedup against existing
+    /// edges) are strict enough to be safe by default. `Some(false)` opts
+    /// out entirely (e.g. while dogfooding a repo where you don't yet trust
+    /// this).
+    pub insert_missing: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
