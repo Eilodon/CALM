@@ -12,7 +12,7 @@ use calm_core::types::EmbedStatus;
 use rmcp::transport::io::stdio;
 use tokio_util::sync::CancellationToken;
 
-use tools::CodeIntelligenceServer;
+use tools::CalmServer;
 
 /// Shared handle to the loaded embedder, written by the indexer, read by tools.
 pub type EmbedderHandle = Arc<RwLock<Option<Arc<Embedder>>>>;
@@ -32,8 +32,7 @@ pub async fn serve_stdio_with_preset(
 ) -> Result<()> {
     calm_core::gitignore::ensure_gitignore(&project_root)?;
 
-    let server =
-        CodeIntelligenceServer::new_with_preset(project_root.clone(), db_path.clone(), preset)?;
+    let server = CalmServer::new_with_preset(project_root.clone(), db_path.clone(), preset)?;
     let ct = CancellationToken::new();
     let ct_clone = ct.clone();
 
@@ -54,6 +53,8 @@ pub async fn serve_stdio_with_preset(
     let last_index_error = server.last_index_error_handle();
     let embedder = server.embedder_handle();
     let embed_status = server.embed_status_handle();
+    let last_embed_error = server.last_embed_error_handle();
+    let owns_indexer_lock = server.owns_indexer_lock_handle();
     let coverage = server.coverage_handle();
     let watch_embedder = embedder.clone();
     let watch_coverage = coverage.clone();
@@ -99,8 +100,21 @@ pub async fn serve_stdio_with_preset(
                         *phase.write().unwrap() = calm_core::types::IndexingPhase::Ready;
                     }
                 }
+                // The lock only gates *writes* (new index rows, new embedding
+                // rows) — every process still needs its own live `Embedder`
+                // to embed *queries* at search time, and loading it is a
+                // pure, local, side-effect-free operation (vendored weights,
+                // zero network by default). Without this, every `calm serve`
+                // process that loses the race — i.e. every session opened
+                // against this project after the first one — would report
+                // `embeddings_status: "disabled"` forever, even though the DB
+                // the winner maintains already has real embeddings in it.
+                if semantic.enabled {
+                    load_embedder_readonly(&semantic, &embedder, &embed_status, &last_embed_error);
+                }
                 return;
             };
+            *owns_indexer_lock.write().unwrap() = true;
 
             if let Ok(mut conn) = calm_core::db::conn::open_writer(&indexer_db_path) {
                 let _ = calm_core::db::schema::init_db(&conn);
@@ -163,7 +177,13 @@ pub async fn serve_stdio_with_preset(
                 };
                 // Opt-in semantic embeddings, after the graph is built.
                 if semantic.enabled {
-                    bootstrap_embeddings(&conn, &semantic, &embedder, &embed_status);
+                    bootstrap_embeddings(
+                        &conn,
+                        &semantic,
+                        &embedder,
+                        &embed_status,
+                        &last_embed_error,
+                    );
                 }
 
                 #[cfg(feature = "scip-overlay")]
@@ -253,26 +273,43 @@ fn embeddings_blocked_by_offline_policy(
 /// publish the model + status. Runs on the indexer thread after the graph is
 /// built (and again from `indexing_status`'s `retry_embeddings` after a prior
 /// failure). A no-op surface when the `embeddings` feature is off (load fails).
-pub fn bootstrap_embeddings(
-    conn: &rusqlite::Connection,
+/// Load the configured embedding model into `embedder` + `status`, honoring
+/// the offline-fallback policy. This is the safe, side-effect-free half of
+/// embeddings bootstrap — no DB writes, no network unless the vendored asset
+/// is broken AND `allow_network_fallback` already consented to a download.
+/// Every `calm serve` process for a given project can and should run this
+/// independently, regardless of which one won the indexer lock in
+/// `serve_stdio_with_preset`: each process needs its own live `Embedder` to
+/// embed *queries* at search time (the winner's DB rows are shared, an
+/// in-memory model instance is not) — only writing new embedding rows to
+/// that shared DB needs to stay exclusive to the lock owner. Returns the
+/// loaded model on success, having left `status` at `Downloading` (still
+/// mid-flight — the caller decides what "done" means: the lock owner still
+/// has table/row work left, `load_embedder_readonly` below is done
+/// immediately). Returns `None` on failure, having already set `status` and
+/// `last_embed_error`.
+fn load_embedder_model(
     semantic: &SemanticSearchConfig,
     embedder: &EmbedderHandle,
     status: &Arc<RwLock<EmbedStatus>>,
-) {
+    last_embed_error: &Arc<RwLock<Option<String>>>,
+) -> Option<Arc<Embedder>> {
     *status.write().unwrap() = EmbedStatus::Downloading;
+    *last_embed_error.write().unwrap() = None;
     if embeddings_blocked_by_offline_policy(
         semantic.model == calm_core::embedding::DEFAULT_MODEL_ID,
         calm_core::embedding::default_vendored_asset_unusable(),
         semantic.allow_network_fallback,
     ) {
-        tracing::warn!(
-            "Vendored embedding model is an unresolved Git LFS pointer and \
+        let msg = "Vendored embedding model is an unresolved Git LFS pointer and \
              semantic_search.allow_network_fallback is false — embeddings unavailable this \
              run. Run `git lfs pull` to fix the vendored asset, or set \
              allow_network_fallback=true to download it instead, then retry_embeddings."
-        );
+            .to_string();
+        tracing::warn!("{msg}");
         *status.write().unwrap() = EmbedStatus::OfflineUnavailable;
-        return;
+        *last_embed_error.write().unwrap() = Some(msg);
+        return None;
     }
     if semantic.model == calm_core::embedding::DEFAULT_MODEL_ID {
         tracing::info!(
@@ -288,30 +325,60 @@ pub fn bootstrap_embeddings(
     let model = match Embedder::load(&semantic.model, semantic.dimensions) {
         Ok(m) => Arc::new(m),
         Err(e) => {
-            tracing::error!("Embedding model load failed: {e}");
+            let msg = format!("Embedding model load failed: {e}");
+            tracing::error!("{msg}");
             *status.write().unwrap() = EmbedStatus::Failed;
-            return;
+            *last_embed_error.write().unwrap() = Some(msg);
+            return None;
         }
+    };
+    *embedder.write().unwrap() = Some(model.clone());
+    Some(model)
+}
+
+/// Load the embedding model, create the vector tables, embed all pending
+/// symbols/chunks, and publish `Ready`. Only the process holding the indexer
+/// lock (see `serve_stdio_with_preset`) should call this — it writes to the
+/// shared DB. Runs on the indexer thread after the graph is built (and again
+/// from `indexing_status`'s `retry_embeddings` after a prior failure, when
+/// this process is the lock owner — see `retry_embeddings_if_failed`). A
+/// no-op surface when the `embeddings` feature is off (`Embedder::load`
+/// always fails in that build).
+pub fn bootstrap_embeddings(
+    conn: &rusqlite::Connection,
+    semantic: &SemanticSearchConfig,
+    embedder: &EmbedderHandle,
+    status: &Arc<RwLock<EmbedStatus>>,
+    last_embed_error: &Arc<RwLock<Option<String>>>,
+) {
+    let Some(model) = load_embedder_model(semantic, embedder, status, last_embed_error) else {
+        return;
     };
     // `model.dim()` (real, probed at load time) rather than
     // `semantic.dimensions` (config, possibly stale) — see
     // `Embedder::load` and `create_embedding_table`'s self-heal.
     if let Err(e) = calm_core::embedding::create_embedding_table(conn, model.dim()) {
-        tracing::error!("Embedding table creation failed: {e}");
+        let msg = format!("Embedding table creation failed: {e}");
+        tracing::error!("{msg}");
         *status.write().unwrap() = EmbedStatus::Failed;
+        *last_embed_error.write().unwrap() = Some(msg);
         return;
     }
     if let Err(e) = calm_core::embedding::create_chunk_embedding_table(conn, model.dim()) {
-        tracing::error!("Chunk embedding table creation failed: {e}");
+        let msg = format!("Chunk embedding table creation failed: {e}");
+        tracing::error!("{msg}");
         *status.write().unwrap() = EmbedStatus::Failed;
+        *last_embed_error.write().unwrap() = Some(msg);
         return;
     }
     *status.write().unwrap() = EmbedStatus::Embedding;
     match calm_core::embedding::embed_pending(conn, model.as_ref()) {
         Ok(n) => tracing::info!("Embedded {n} symbols"),
         Err(e) => {
-            tracing::error!("Embedding failed: {e}");
+            let msg = format!("Embedding failed: {e}");
+            tracing::error!("{msg}");
             *status.write().unwrap() = EmbedStatus::Failed;
+            *last_embed_error.write().unwrap() = Some(msg);
             return;
         }
     }
@@ -321,14 +388,40 @@ pub fn bootstrap_embeddings(
     match calm_core::embedding::embed_pending_chunks(conn, model.as_ref()) {
         Ok(n) => tracing::info!("Embedded {n} code chunks"),
         Err(e) => {
-            tracing::error!("Chunk embedding failed: {e}");
+            let msg = format!("Chunk embedding failed: {e}");
+            tracing::error!("{msg}");
             *status.write().unwrap() = EmbedStatus::Failed;
+            *last_embed_error.write().unwrap() = Some(msg);
             return;
         }
     }
-    *embedder.write().unwrap() = Some(model);
     *status.write().unwrap() = EmbedStatus::Ready;
     tracing::info!("Embeddings ready");
+}
+
+/// Lightweight embeddings bootstrap for a `calm serve` process that lost the
+/// indexer-lock race (see the `else` branch in `serve_stdio_with_preset`, and
+/// `retry_embeddings_if_failed` for the same case on a manual retry): loads
+/// this process's own `Embedder` so query-time semantic search works here
+/// too, without ever touching the DB — creating tables and writing new
+/// embedding rows stays the lock owner's job alone (`bootstrap_embeddings`
+/// above). Before this existed, every `calm serve` process past the first one
+/// opened against a given project reported `embeddings_status: "disabled"`
+/// forever, even once the winning process had already embedded everything.
+/// Caller is expected to have already checked `semantic.enabled`.
+pub(crate) fn load_embedder_readonly(
+    semantic: &SemanticSearchConfig,
+    embedder: &EmbedderHandle,
+    status: &Arc<RwLock<EmbedStatus>>,
+    last_embed_error: &Arc<RwLock<Option<String>>>,
+) {
+    if load_embedder_model(semantic, embedder, status, last_embed_error).is_some() {
+        *status.write().unwrap() = EmbedStatus::Ready;
+        tracing::info!(
+            "Embedder loaded for query-time semantic search (another process owns \
+             indexing/embedding writes for this project)"
+        );
+    }
 }
 
 pub fn default_db_path(project_root: &std::path::Path) -> PathBuf {

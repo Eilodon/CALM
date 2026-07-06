@@ -1,7 +1,7 @@
 use super::common::*;
 use super::*;
 
-impl CodeIntelligenceServer {
+impl CalmServer {
     #[tool(
         name = "indexing_status",
         description = "USE WHEN: you need file-level index stats, embedding error details, or to trigger embedding recovery. NOT a replacement for repo_overview at session start. retry_embeddings=true triggers re-download of embedding model."
@@ -44,6 +44,7 @@ impl CodeIntelligenceServer {
 
             let phase = self.phase_str();
             let indexing_error = self.last_index_error.read().unwrap().clone();
+            let embeddings_error = self.last_embed_error.read().unwrap().clone();
             let sn = if phase == "failed" {
                 suggested(
                     "indexing_status",
@@ -77,6 +78,7 @@ impl CodeIntelligenceServer {
                 symbols_indexed: symbols,
                 edges_indexed: edges,
                 embeddings_status: self.embed_status_str(),
+                embeddings_error,
                 edges_ready: self.edges_ready(),
                 last_updated: last_updated.map(epoch_to_iso8601),
                 scip_overlay,
@@ -314,6 +316,13 @@ pub(crate) struct IndexingStatusOutput {
     pub(crate) symbols_indexed: i64,
     pub(crate) edges_indexed: i64,
     pub(crate) embeddings_status: String,
+    /// Error message from the most recent embeddings failure, present only
+    /// when `embeddings_status` is `"failed"` or `"offline_unavailable"` —
+    /// see `EmbedStatus::Failed`/`OfflineUnavailable`. `"disabled"` means
+    /// `semantic_search.enabled` is `false` in config, not a failure — no
+    /// error accompanies it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) embeddings_error: Option<String>,
     pub(crate) edges_ready: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) last_updated: Option<String>,

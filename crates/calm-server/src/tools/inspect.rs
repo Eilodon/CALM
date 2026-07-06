@@ -1,7 +1,7 @@
 use super::common::*;
 use super::*;
 
-impl CodeIntelligenceServer {
+impl CalmServer {
     #[tool(
         name = "symbol_info",
         description = "USE WHEN: you have a symbol name and want metadata + health signals BEFORE reading source. Check is_hub + coreness before deciding whether to modify — hub symbols need edit_context. NOT FOR: reading source (use source), finding symbols (use search/locate). vs source: symbol_info is metadata-only (no code body)."

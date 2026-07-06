@@ -1,7 +1,7 @@
 use super::common::*;
 use super::*;
 
-impl CodeIntelligenceServer {
+impl CalmServer {
     #[tool(
         name = "repo_overview",
         description = "ALWAYS call this FIRST at the start of every session — never skip. USE WHEN: starting a new session, switching projects, or after server restart. NOT FOR: per-file details (use file_overview), searching for symbols (use search/locate)."

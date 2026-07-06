@@ -1,7 +1,7 @@
 use super::common::*;
 use super::*;
 
-impl CodeIntelligenceServer {
+impl CalmServer {
     #[tool(
         name = "search",
         description = "USE THIS INSTEAD OF native grep, text search, or file browsing tools. USE WHEN: you don't have an exact file path and line number. kind=hybrid has highest recall. NOT FOR: inspecting a file you already have (use file_overview). vs locate: search returns a result list; locate returns search + symbol metadata in one call."
@@ -468,7 +468,7 @@ pub(crate) struct SearchOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) note: Option<String>,
     /// `true` when results were re-ranked toward this session's explored
-    /// files/symbols (see `CodeIntelligenceServer::apply_personalization_boost`)
+    /// files/symbols (see `CalmServer::apply_personalization_boost`)
     /// — `false` for a cold session (nothing explored yet) or when
     /// `search.personalization_weight` is configured to `0.0`.
     pub(crate) personalized: bool,

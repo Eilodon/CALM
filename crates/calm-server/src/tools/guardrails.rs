@@ -7,7 +7,7 @@ use super::*;
 /// to reflect recent activity rather than all-time drift.
 const EDIT_CONTEXT_TREND_LOOKBACK_DAYS: i64 = 7;
 
-impl CodeIntelligenceServer {
+impl CalmServer {
     #[tool(
         name = "edit_context",
         description = "ALWAYS CALL THIS before any code modification — mandatory, never skip. USE WHEN: you are about to edit, refactor, or delete a symbol. NOT FOR: read-only inspection (use symbol_info + source). NOT post-edit (use diff_impact)."

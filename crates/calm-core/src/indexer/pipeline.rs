@@ -2228,7 +2228,7 @@ impl StructB {
     }
 
     /// Regression for the real-world incident this fix addresses (found via
-    /// this repo's own `common.rs::CodeIntelligenceServer::timed_tool`
+    /// this repo's own `common.rs::CalmServer::timed_tool`
     /// delegating to `telemetry.rs::timed_tool` the same way): a same-named
     /// wrapper method calling a fully-qualified `crate::module::func()` with
     /// no `use` for it used to resolve to the WRONG same-named symbol — the

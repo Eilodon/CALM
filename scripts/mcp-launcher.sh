@@ -230,7 +230,7 @@ download_and_verify() {
     return 1
   fi
 
-  if ! tar -xzf "${tmp_dir}/${asset_name}" -C "$tmp_dir" ci; then
+  if ! tar -xzf "${tmp_dir}/${asset_name}" -C "$tmp_dir" calm; then
     log "extraction failed for ${asset_name} — building from source"
     return 1
   fi
@@ -254,8 +254,17 @@ download_and_verify() {
 download_and_verify
 
 # ---- Tier 3: build from source (always must work standalone) ----
+# `--features embeddings` is explicit here on purpose, not left to whatever
+# calm-cli's Cargo.toml `default` happens to be today: a defense-in-depth
+# measure so a future default-features change can't silently regress every
+# freshly-built dev binary back to the "embeddings always Disabled" state
+# (see `bootstrap_embeddings`/`load_embedder_readonly` in
+# crates/calm-server/src/lib.rs for the multi-process lock-loser bug that
+# state used to mask). `tier0-5`/`scip-overlay` are also named explicitly for
+# the same reason, even though all three are currently also the crate's
+# defaults.
 log "building calm-cli from source (this may take about a minute on a cold cache)"
-if ! cargo build --quiet -p calm-cli 1>&2; then
+if ! cargo build --quiet -p calm-cli --features embeddings,tier0-5,scip-overlay 1>&2; then
   log "build failed — cannot start the calm MCP server"
   exit 1
 fi

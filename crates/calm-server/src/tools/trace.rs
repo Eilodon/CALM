@@ -1,7 +1,7 @@
 use super::common::*;
 use super::*;
 
-impl CodeIntelligenceServer {
+impl CalmServer {
     #[tool(
         name = "callers",
         description = "USE WHEN: you need to know who calls a specific symbol — blast radius scan, refactoring impact. USE THIS for SYMBOL-LEVEL call sites. NOT for file-level imports (use dependencies). vs edit_context: callers is for exploration; edit_context is the mandatory pre-edit tool."

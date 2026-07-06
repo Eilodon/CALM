@@ -1,7 +1,7 @@
 use super::common::*;
 use super::*;
 
-impl CodeIntelligenceServer {
+impl CalmServer {
     #[tool(
         name = "remember",
         description = "Save a durable, interpretive note (architecture decision, gotcha, rationale) under a short topic key. Persists across sessions and server restarts — unlike session_context, which only tracks the current session's navigation. USE WHEN: you've learned something a future session should know that the graph/AST can't capture on its own (a WHY, not a fact derivable from code). Upserts: calling again with the same topic overwrites its content."

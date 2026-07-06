@@ -2,7 +2,7 @@ use super::common::*;
 use super::guardrails::*;
 use super::*;
 
-impl CodeIntelligenceServer {
+impl CalmServer {
     #[tool(
         name = "edit_lines",
         description = "The only write-capable tool in ci — line-range granularity, works on ANY tracked file (source code, Cargo.toml, docs — not just parsed symbols). NOT FOR: symbol-scoped edits with auto-resolved range (use edit_symbol). Requires expected_hash from a prior call's current_hash (or edit_context's range_checksum for a whole symbol); omit it to preview a range's hash/content without writing anything. All hunks in one call apply to the same file and must be disjoint (non-overlapping)."

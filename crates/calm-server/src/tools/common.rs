@@ -2,7 +2,7 @@ use super::guardrails::*;
 use super::inspect::*;
 use super::*;
 
-impl CodeIntelligenceServer {
+impl CalmServer {
     pub fn new(project_root: PathBuf, db_path: PathBuf) -> anyhow::Result<Self> {
         Self::new_with_preset(project_root, db_path, "full".into())
     }
@@ -26,6 +26,8 @@ impl CodeIntelligenceServer {
             last_index_error: Arc::new(RwLock::new(None)),
             embedder: Arc::new(RwLock::new(None)),
             embed_status: Arc::new(RwLock::new(EmbedStatus::Disabled)),
+            last_embed_error: Arc::new(RwLock::new(None)),
+            owns_indexer_lock: Arc::new(RwLock::new(false)),
             coverage: Arc::new(RwLock::new(coverage)),
             session_log: Arc::new(Mutex::new(SessionLog::default())),
             edit_lock: Arc::new(Mutex::new(())),
@@ -243,18 +245,38 @@ impl CodeIntelligenceServer {
         let db_path = self.db_path.clone();
         let embedder = Arc::clone(&self.embedder);
         let status = Arc::clone(&self.embed_status);
+        let last_embed_error = Arc::clone(&self.last_embed_error);
+        // Only the process that actually won the indexer-lock race is
+        // allowed to write new embedding rows to the shared DB — a
+        // non-owning process just reloads its own local `Embedder` for
+        // query-time embedding instead (see `load_embedder_readonly`);
+        // calling the write-capable path here would race the real owner's
+        // writes.
+        let owns_lock = *self.owns_indexer_lock.read().unwrap();
         std::thread::spawn(move || {
             // Catches a panic inside the bootstrap so a bug there (or in a
             // future change to it) can't leave `status` stuck on
             // `Downloading` forever with no thread left to ever flip it —
             // the discarded `JoinHandle` means nothing else would notice.
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                match calm_core::db::conn::open_writer(&db_path) {
-                    Ok(conn) => crate::bootstrap_embeddings(&conn, &semantic, &embedder, &status),
-                    Err(e) => {
-                        tracing::error!("Embeddings retry: failed to open DB: {e}");
-                        *status.write().unwrap() = EmbedStatus::Failed;
+                if owns_lock {
+                    match calm_core::db::conn::open_writer(&db_path) {
+                        Ok(conn) => crate::bootstrap_embeddings(
+                            &conn,
+                            &semantic,
+                            &embedder,
+                            &status,
+                            &last_embed_error,
+                        ),
+                        Err(e) => {
+                            tracing::error!("Embeddings retry: failed to open DB: {e}");
+                            *status.write().unwrap() = EmbedStatus::Failed;
+                            *last_embed_error.write().unwrap() =
+                                Some(format!("Embeddings retry: failed to open DB: {e}"));
+                        }
                     }
+                } else {
+                    crate::load_embedder_readonly(&semantic, &embedder, &status, &last_embed_error);
                 }
             }));
             if outcome.is_err() {
@@ -262,6 +284,14 @@ impl CodeIntelligenceServer {
                 *status.write().unwrap() = EmbedStatus::Failed;
             }
         });
+    }
+
+    pub fn last_embed_error_handle(&self) -> Arc<RwLock<Option<String>>> {
+        self.last_embed_error.clone()
+    }
+
+    pub fn owns_indexer_lock_handle(&self) -> Arc<RwLock<bool>> {
+        self.owns_indexer_lock.clone()
     }
     pub(crate) fn current_phase(&self) -> IndexingPhase {
         *self.phase.read().unwrap()

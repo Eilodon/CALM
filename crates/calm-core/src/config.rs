@@ -154,7 +154,7 @@ pub struct SearchConfig {
     pub text_max_chunk_lines: usize,
     pub rrf_k: usize,
     /// Additive weight applied to the session-journey proximity boost (see
-    /// `CodeIntelligenceServer::apply_personalization_boost`) before
+    /// `CalmServer::apply_personalization_boost`) before
     /// re-ranking `search`/`locate` results — a result whose file is
     /// import/call-adjacent to something this session recently explored
     /// gets `score += personalization_weight * boost` (`boost` in `(0, 1]`).

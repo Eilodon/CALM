@@ -697,6 +697,29 @@ fn chunk_hit_to_result(conn: &Connection, chunk_id: i64) -> rusqlite::Result<Opt
     }))
 }
 
+/// The `note` explaining why semantic results are unavailable for `search_hybrid`/
+/// `search_semantic`, tailored to the actual reason instead of one generic
+/// hardcoded guess — a build without the `embeddings` feature, config with
+/// `semantic_search.enabled: false`, or a process whose embedder hasn't
+/// loaded yet/failed/was blocked need different next steps, and guessing
+/// wrong sends the caller chasing the wrong fix (e.g. "recompile" when the
+/// binary already has the feature and the real issue is a `Failed`/
+/// `OfflineUnavailable` status visible in `indexing_status`).
+fn embedder_unavailable_note() -> String {
+    if !crate::embedding::ENABLED {
+        "Semantic search inactive — this binary wasn't compiled with the `embeddings` Cargo \
+         feature (rebuild with `--features embeddings`, or use the default feature set, which \
+         already includes it)"
+            .to_string()
+    } else {
+        "Semantic search inactive for this process — either `semantic_search.enabled` is \
+         `false` in config.json, the embedder is still loading, or a prior load attempt \
+         failed/was blocked. Call indexing_status for `embeddings_status`/`embeddings_error`, \
+         and `retry_embeddings: true` to retry a failed load."
+            .to_string()
+    }
+}
+
 fn search_semantic(
     conn: &Connection,
     query: &str,
@@ -709,7 +732,7 @@ fn search_semantic(
             results: Vec::new(),
             truncated: false,
             degraded: true,
-            note: Some("Semantic search inactive — compile with `--features embeddings` and set `semantic_search.enabled: true` in config.json".to_string()),
+            note: Some(embedder_unavailable_note()),
         });
     };
 
@@ -766,7 +789,10 @@ fn search_hybrid(
     let Some(embedder) = embedder else {
         return Ok(SearchOutput {
             degraded: true,
-            note: Some("Hybrid search degraded to FTS-only — semantic search inactive (compile with `--features embeddings` and set `semantic_search.enabled: true` in config.json)".to_string()),
+            note: Some(format!(
+                "Hybrid search degraded to FTS-only — {}",
+                embedder_unavailable_note()
+            )),
             ..fts_output
         });
     };
