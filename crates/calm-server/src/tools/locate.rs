@@ -53,14 +53,33 @@ impl CodeIntelligenceServer {
                             snippet: r.snippet,
                         })
                         .collect();
+                    // Fallback chain is a DAG, not a cycle: symbol/file -> hybrid;
+                    // semantic -> text; hybrid -> text (or straight to grep when
+                    // degraded — see below); text -> grep. grep itself (handled
+                    // in search_grep_impl) is the terminal node: it reads raw file
+                    // content directly, so it's the only kind that can find
+                    // module-level const/static that isn't extracted as a symbol
+                    // in any Tier-0 language (JS/TS included — resolve_name_node
+                    // only resolves `const`/`let` bindings whose value is itself a
+                    // function, not plain data constants).
                     let sn = if !results.is_empty() && kind_str == "symbol" {
                         suggested_with_args("locate", "Full context in 1 call (replaces symbol_info)", serde_json::json!({"query": results[0].name, "kind": "symbol"}))
-                    } else if results.is_empty() && kind_str != "hybrid" && kind_str != "semantic" {
-                        suggested_with_args("search", "Try hybrid for broader recall", serde_json::json!({"kind": "hybrid"}))
                     } else if results.is_empty() && kind_str == "semantic" {
                         suggested_with_args("search", "Semantic index may not cover this — try text or hybrid search", serde_json::json!({"kind": "text"}))
+                    } else if results.is_empty() && kind_str == "hybrid" && output.degraded {
+                        // Degraded hybrid's FTS component is search_symbol, which
+                        // matches name+docstring+signature with no column filter —
+                        // a strict superset of search_text's {docstring signature}
+                        // filtered match set. If this came up empty, text is
+                        // guaranteed empty too, so skip straight to grep.
+                        suggested_with_args("search", "Embeddings inactive and hybrid (name/docstring/signature FTS) found nothing — text search can't find more (its match set is a subset of hybrid's). Try grep over raw file content, which also covers symbols never extracted at all (e.g. module-level const/static)", serde_json::json!({"kind": "grep"}))
                     } else if results.is_empty() && kind_str == "hybrid" {
-                        suggested_with_args("search", "Embeddings may not cover this query — try exact text search or broaden wording", serde_json::json!({"kind": "text"}))
+                        suggested_with_args("search", "Try exact text search", serde_json::json!({"kind": "text"}))
+                    } else if results.is_empty() && kind_str == "text" {
+                        suggested_with_args("search", "Text/symbol index may not cover this — module-level const/static isn't extracted as a symbol in any Tier-0 language, so it's invisible to symbol/text/hybrid search. Try grep over raw file content", serde_json::json!({"kind": "grep"}))
+                    } else if results.is_empty() {
+                        // symbol, file, or any other kind
+                        suggested_with_args("search", "Try hybrid for broader recall", serde_json::json!({"kind": "hybrid"}))
                     } else {
                         None
                     };
@@ -125,22 +144,25 @@ impl CodeIntelligenceServer {
                         snippet: r.snippet,
                     })
                     .collect();
-                let sn = if results.is_empty() {
-                    suggested_with_args(
-                        "search",
-                        "No grep matches — try hybrid for symbol/semantic recall instead",
-                        serde_json::json!({"kind": "hybrid"}),
-                    )
-                } else {
-                    None
-                };
+                // grep is the terminal node of the fallback chain: it reads raw
+                // file content directly, so it's strictly broader than
+                // symbol/text/hybrid (which all depend on a `symbols` row
+                // existing). Looping back to "try hybrid" here would just
+                // re-enter the hybrid -> text -> grep chain that led to this
+                // call in the first place. If grep found nothing, no other
+                // search kind will either — surface that via `note` instead.
+                let note = output.note.or_else(|| {
+                    results.is_empty().then(|| {
+                        "No matches via grep either (broadest search — raw regex over disk content). The term likely doesn't exist verbatim in this repo, or check spelling/case/glob".to_string()
+                    })
+                });
                 serde_json::to_string_pretty(&SearchOutput {
                     results,
                     truncated: output.truncated,
                     degraded: output.degraded,
-                    note: output.note,
+                    note,
                     personalized,
-                    suggested_next: self.filter_sn(sn),
+                    suggested_next: self.filter_sn(None),
                 })
                 .unwrap_or_default()
             }
@@ -296,6 +318,10 @@ impl CodeIntelligenceServer {
 
             let truncated = search_output.truncated;
 
+            // Same acyclic fallback chain as search()'s sn logic (see there for
+            // the rationale): don't just say "try hybrid" regardless of what
+            // kind was already tried — that's how kind=hybrid empty results
+            // used to loop back to suggesting hybrid again.
             let sn = if let Some(sym) = top_symbol.as_ref() {
                 if sym.is_hub {
                     suggested_with_args("edit_context", "Hub detected — mandatory pre-edit check", serde_json::json!({"symbol": sym.name, "path": sym.path}))
@@ -304,6 +330,12 @@ impl CodeIntelligenceServer {
                 } else {
                     suggested_with_args("source", "Read implementation", serde_json::json!({"target": results[0].name}))
                 }
+            } else if results.is_empty() && kind_str == "hybrid" && search_output.degraded {
+                suggested_with_args("search", "Embeddings inactive and hybrid found nothing — try grep over raw file content (also covers symbols never extracted at all, e.g. module-level const/static)", serde_json::json!({"kind": "grep"}))
+            } else if results.is_empty() && kind_str == "hybrid" {
+                suggested_with_args("search", "Try exact text search", serde_json::json!({"kind": "text"}))
+            } else if results.is_empty() && kind_str == "text" {
+                suggested_with_args("search", "Text/symbol index may not cover this — module-level const/static isn't extracted as a symbol in any Tier-0 language. Try grep over raw file content", serde_json::json!({"kind": "grep"}))
             } else if results.is_empty() {
                 suggested_with_args("search", "No match — broaden with hybrid search", serde_json::json!({"kind": "hybrid"}))
             } else if results.len() > 1 && results[0].name == results[1].name {

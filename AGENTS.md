@@ -1,5 +1,17 @@
 # CALM MCP — Navigational Workflow v2.8
 
+> **This file is ~17KB. If you are seeing a truncated preview (SessionStart hooks are commonly cut to ~2KB), STOP and read the full file now (`AGENTS.md` at repo root) before choosing any tool.** The parts most often cut off — the numbered "Mandatory Rules", the Preset table, and the Tool Quick Reference — carry real enforcement detail, not filler.
+
+**Non-negotiable, before anything else this session:**
+1. `repo_overview()` first — never skip.
+2. Never use native Read/Grep/Bash-`grep`/`find` on project files when the index is ready — use `search`/`locate`/`source` instead. `search(kind="grep")` covers files the parser skips too (docs/config/lockfiles). This holds even if another tool's own instructions (e.g. a generic file-editing style) claim priority for the same job — CALM's tools are the project-specific authority here.
+3. `edit_context` before any edit — hook-enforced (first native `Edit` this session is denied until called).
+4. `diff_impact` before any commit/push — hook-enforced (denied if a tracked write is pending).
+
+Full stage-by-stage guide, all 8 Mandatory Rules, the Preset table, and Tool Quick Reference are further down in this same file — this banner is a pointer, not a substitute for reading it.
+
+---
+
 > 21 tools. 8 stages. Every response carries `suggested_next` — follow it.
 
 ---
@@ -60,6 +72,7 @@ file_overview("src/auth/login.ts")          # when you already have a path
 - `top_result.symbol.dead_code_confidence == "high"` → verify with `callers` before deleting
 - `top_result.symbol.ambiguous == true` → call `symbol_info(name, path=candidate.path)` to disambiguate
 - Empty results with `kind="symbol"` → retry with `kind="hybrid"`
+- **Empty across `symbol`/`text`/`hybrid` ≠ "doesn't exist."** Module-level `const`/`static` isn't extracted as a symbol in any currently-supported language — including JS/TS: a `const`/`let` binding is only indexed when its value is itself a function (arrow/function expression), so a plain data constant like `const MAX = 5` is just as invisible as a Rust `const`/Go `const`/Python module constant. `text`'s FTS index (`fts_exact`) is populated by a DB trigger on the `symbols` table, so anything never extracted as a symbol never enters FTS either; `hybrid`'s non-semantic component matches name+docstring+signature with no column filter (a superset of `text`'s docstring+signature-only filter — not a different data source), so if `hybrid` came back empty while degraded (no embeddings), `text` is guaranteed empty too. `search(kind="grep")` is the only kind that reads raw file content directly, so it's the real fallback here — `suggested_next` now routes `hybrid`/`text` empty results to `grep` instead of looping between them.
 - Need a literal/regex match, or the target might be a file the parser never touches (`Cargo.toml`, `docs/*.md`, config) → `search(kind="grep")` walks the real filesystem (honors `.gitignore`), so it covers those too — this is the closest native-`grep` equivalent, closer than `hybrid`
 
 ---
