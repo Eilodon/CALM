@@ -233,8 +233,7 @@ fn watcher_hot_reloads_coverage_file_change() {
 
     let ct = CancellationToken::new();
     let handle = {
-        let (root, db, ct, coverage) =
-            (dir.clone(), db_path.clone(), ct.clone(), coverage.clone());
+        let (root, db, ct, coverage) = (dir.clone(), db_path.clone(), ct.clone(), coverage.clone());
         let embedder: calm_server::EmbedderHandle =
             std::sync::Arc::new(std::sync::RwLock::new(None));
         std::thread::spawn(move || {

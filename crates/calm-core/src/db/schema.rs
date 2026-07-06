@@ -666,7 +666,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(deleted_count, 0, "deleted note must be removed from the FTS index");
+        assert_eq!(
+            deleted_count, 0,
+            "deleted note must be removed from the FTS index"
+        );
     }
 
     #[test]
@@ -709,7 +712,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(count, 1, "pre-existing note must be backfilled by 'rebuild'");
+        assert_eq!(
+            count, 1,
+            "pre-existing note must be backfilled by 'rebuild'"
+        );
 
         // Triggers sync notes inserted after the migration too.
         conn.execute(

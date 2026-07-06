@@ -43,14 +43,13 @@ impl PathMatcher {
     /// unaffected and a typo'd glob degrades to its literal prefix rather
     /// than silently matching nothing.
     fn new(pattern: &str) -> Self {
-        if pattern.contains(['*', '?', '[']) {
-            if let Ok(glob) = globset::Glob::new(pattern) {
-                return PathMatcher::Glob(glob.compile_matcher());
-            }
+        if pattern.contains(['*', '?', '['])
+            && let Ok(glob) = globset::Glob::new(pattern)
+        {
+            return PathMatcher::Glob(glob.compile_matcher());
         }
         PathMatcher::Prefix(pattern.to_string())
     }
-
     fn matches(&self, path: &str) -> bool {
         match self {
             PathMatcher::Prefix(prefix) => path.starts_with(prefix.as_str()),
@@ -221,7 +220,11 @@ mod tests {
     #[test]
     fn test_glob_rule_matches_nested_paths() {
         let conn = test_conn();
-        insert_import(&conn, "crates/calm-core/src/indexer/foo.rs", "crates/calm-server/src/tools/orient.rs");
+        insert_import(
+            &conn,
+            "crates/calm-core/src/indexer/foo.rs",
+            "crates/calm-server/src/tools/orient.rs",
+        );
         let rules = vec![BoundaryRule {
             from: "crates/*/src/indexer/**".into(),
             to: "crates/*/src/tools/**".into(),
@@ -234,7 +237,11 @@ mod tests {
     #[test]
     fn test_glob_rule_does_not_match_unrelated_path() {
         let conn = test_conn();
-        insert_import(&conn, "crates/calm-core/src/other/foo.rs", "crates/calm-server/src/tools/orient.rs");
+        insert_import(
+            &conn,
+            "crates/calm-core/src/other/foo.rs",
+            "crates/calm-server/src/tools/orient.rs",
+        );
         let rules = vec![BoundaryRule {
             from: "crates/*/src/indexer/**".into(),
             to: "crates/*/src/tools/**".into(),

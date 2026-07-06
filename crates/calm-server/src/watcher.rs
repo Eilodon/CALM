@@ -247,7 +247,10 @@ mod tests {
     fn coverage_paths_matched_by_exact_relative_location() {
         let root = Path::new("/proj");
         assert!(is_coverage_path(Path::new("/proj/lcov.info"), root));
-        assert!(is_coverage_path(Path::new("/proj/coverage/lcov.info"), root));
+        assert!(is_coverage_path(
+            Path::new("/proj/coverage/lcov.info"),
+            root
+        ));
         // `.coverage`/`.nyc_output` are legitimately dot-prefixed — must still
         // count, unlike `is_relevant_path`'s dot-dir rejection.
         assert!(is_coverage_path(Path::new("/proj/.coverage"), root));
@@ -259,10 +262,7 @@ mod tests {
         assert!(is_coverage_path(Path::new("/proj/coverage.out"), root));
         // Unrelated files, and files under a different root, must not match.
         assert!(!is_coverage_path(Path::new("/proj/src/main.rs"), root));
-        assert!(!is_coverage_path(
-            Path::new("/proj/nested/lcov.info"),
-            root
-        ));
+        assert!(!is_coverage_path(Path::new("/proj/nested/lcov.info"), root));
         assert!(!is_coverage_path(Path::new("/other/lcov.info"), root));
     }
 }
