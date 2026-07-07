@@ -640,8 +640,38 @@ fn rebuild_graph(
                     }
                 }
                 let same_file: Vec<_> = t.iter().filter(|(_, p)| p == from_path).cloned().collect();
+                // Tier-1.5 same-directory preference (8-language plan P1.3,
+                // V1 — no schema change): checked only when same_file found
+                // nothing, and only for go/java/c/cpp. A directory is a much
+                // stronger scoping signal than "anywhere in the repo" for
+                // these: Go's compilation unit literally IS the directory
+                // (package = dir); a Java package commonly maps 1:1 onto a
+                // directory even without a build-tool classpath on the
+                // classpath to consult; C/C++ headers and their .c/.cpp
+                // implementation conventionally live alongside each other.
+                // Rust/Python/JS/TS are deliberately excluded — they already
+                // resolve unqualified calls correctly via import_map/type_map
+                // at extraction time, so widening this to them would just be
+                // a second, redundant (and potentially wrong) narrowing pass.
+                let same_dir = || -> Option<Vec<(String, String)>> {
+                    if !matches!(
+                        caller_lang.map(String::as_str),
+                        Some("go" | "java" | "c" | "cpp")
+                    ) {
+                        return None;
+                    }
+                    let caller_dir = Path::new(from_path).parent();
+                    let dir_matches: Vec<_> = t
+                        .iter()
+                        .filter(|(_, p)| Path::new(p.as_str()).parent() == caller_dir)
+                        .cloned()
+                        .collect();
+                    (!dir_matches.is_empty()).then_some(dir_matches)
+                };
                 if !same_file.is_empty() {
                     same_file
+                } else if let Some(dir_matches) = same_dir() {
+                    dir_matches
                 } else if t.len() <= MAX_CALLEE_CANDIDATES {
                     t.clone()
                 } else {
@@ -2055,6 +2085,182 @@ impl StructB {
             ),
             0,
             "caller_b's helper() must NOT also fan out to a.rs's unrelated helper()"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    // P1.3 V1: Go's compilation unit is the directory (package = dir), and a
+    // bare call like `Helper()` never carries a qualifier for module_hint to
+    // key off — without the same-dir tier this falls straight through to
+    // global fan-out (or an empty edge set once there are >MAX_CALLEE_CANDIDATES
+    // same-named functions repo-wide).
+    fn test_go_same_directory_call_resolves_not_fanned_out() {
+        let dir = std::env::temp_dir().join(format!("ci_idx_go_samedir_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("pkga")).unwrap();
+        std::fs::create_dir_all(dir.join("pkgb")).unwrap();
+        std::fs::write(
+            dir.join("pkga/helper.go"),
+            "package pkga\n\nfunc Helper() int {\n\treturn 1\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("pkga/caller.go"),
+            "package pkga\n\nfunc CallerA() int {\n\treturn Helper()\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("pkgb/helper.go"),
+            "package pkgb\n\nfunc Helper() int {\n\treturn 2\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("pkgb/caller.go"),
+            "package pkgb\n\nfunc CallerB() int {\n\treturn Helper()\n}\n",
+        )
+        .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
+
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM call_edges \
+                 WHERE from_symbol = (SELECT qualified_name FROM symbols WHERE name = 'CallerA') \
+                 AND to_symbol = (SELECT qualified_name FROM symbols WHERE name = 'Helper' AND path = 'pkga/helper.go')",
+            ),
+            1,
+            "CallerA's Helper() must resolve to its own directory's Helper"
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM call_edges \
+                 WHERE from_symbol = (SELECT qualified_name FROM symbols WHERE name = 'CallerA') \
+                 AND to_symbol = (SELECT qualified_name FROM symbols WHERE name = 'Helper' AND path = 'pkgb/helper.go')",
+            ),
+            0,
+            "CallerA's Helper() must NOT fan out to pkgb's unrelated Helper()"
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM call_edges \
+                 WHERE from_symbol = (SELECT qualified_name FROM symbols WHERE name = 'CallerB') \
+                 AND to_symbol = (SELECT qualified_name FROM symbols WHERE name = 'Helper' AND path = 'pkgb/helper.go')",
+            ),
+            1,
+            "CallerB's Helper() must resolve to its own directory's Helper"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    // P1.3 V1: a same-package (no-import-needed) qualified static call —
+    // `Helper.greet()` — with a same-named class in an unrelated package's
+    // directory must not fan out to that unrelated Helper.
+    fn test_java_same_package_call_resolves_not_fanned_out() {
+        let dir = std::env::temp_dir().join(format!("ci_idx_java_samedir_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("pkga")).unwrap();
+        std::fs::create_dir_all(dir.join("pkgb")).unwrap();
+        std::fs::write(
+            dir.join("pkga/Helper.java"),
+            "package pkga;\n\nclass Helper {\n    static int greet() {\n        return 1;\n    }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("pkga/Main.java"),
+            "package pkga;\n\nclass Main {\n    static int callHelper() {\n        return Helper.greet();\n    }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("pkgb/Helper.java"),
+            "package pkgb;\n\nclass Helper {\n    static int greet() {\n        return 2;\n    }\n}\n",
+        )
+        .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
+
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM call_edges \
+                 WHERE from_symbol = (SELECT qualified_name FROM symbols WHERE name = 'callHelper') \
+                 AND to_symbol = (SELECT qualified_name FROM symbols WHERE name = 'greet' AND path = 'pkga/Helper.java')",
+            ),
+            1,
+            "Main.callHelper()'s Helper.greet() must resolve to pkga's own Helper"
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM call_edges \
+                 WHERE from_symbol = (SELECT qualified_name FROM symbols WHERE name = 'callHelper') \
+                 AND to_symbol = (SELECT qualified_name FROM symbols WHERE name = 'greet' AND path = 'pkgb/Helper.java')",
+            ),
+            0,
+            "Main.callHelper()'s Helper.greet() must NOT fan out to pkgb's unrelated Helper"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    // P1.3 V1: C headers/impls conventionally live in the same directory —
+    // a bare call to a same-named function defined in an unrelated
+    // directory (a different logical module) must not fan out either.
+    fn test_c_same_directory_call_resolves_not_fanned_out() {
+        let dir = std::env::temp_dir().join(format!("ci_idx_c_samedir_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("moda")).unwrap();
+        std::fs::create_dir_all(dir.join("modb")).unwrap();
+        std::fs::write(
+            dir.join("moda/helper.c"),
+            "int helper(void) {\n    return 1;\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("moda/main.c"),
+            "int helper(void);\nint caller_a(void) {\n    return helper();\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("modb/helper.c"),
+            "int helper(void) {\n    return 2;\n}\n",
+        )
+        .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
+
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM call_edges \
+                 WHERE from_symbol = (SELECT qualified_name FROM symbols WHERE name = 'caller_a') \
+                 AND to_symbol = (SELECT qualified_name FROM symbols WHERE name = 'helper' AND path = 'moda/helper.c')",
+            ),
+            1,
+            "caller_a's helper() must resolve to moda's own helper()"
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM call_edges \
+                 WHERE from_symbol = (SELECT qualified_name FROM symbols WHERE name = 'caller_a') \
+                 AND to_symbol = (SELECT qualified_name FROM symbols WHERE name = 'helper' AND path = 'modb/helper.c')",
+            ),
+            0,
+            "caller_a's helper() must NOT fan out to modb's unrelated helper()"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
