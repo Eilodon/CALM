@@ -1224,6 +1224,14 @@ pub fn extract_type_map_from_tree(
         // `binding_names_and_type`'s "c" | "cpp" arm for how the name is
         // pulled out of the (possibly pointer-wrapped) declarator.
         "c" | "cpp" => &["declaration", "field_declaration"],
+        // C#: confirmed via the real grammar that `field_declaration` and
+        // `local_declaration_statement` both just wrap one
+        // `variable_declaration` node (which itself carries the `type`
+        // field directly) — matching that one inner node kind covers both
+        // fields and locals, no separate `field_declaration`/
+        // `local_declaration_statement` arm needed. `parameter` names/types
+        // itself directly and falls through to the generic arm below.
+        "csharp" => &["parameter", "variable_declaration"],
         _ => return map, // javascript: no static annotations
     };
 
@@ -1265,6 +1273,35 @@ pub fn extract_type_map_from_tree(
         {
             map.insert(source[lhs.byte_range()].to_string(), ty);
         }
+        // C# constructor inference: `var x = new Foo(...);` — `var`'s
+        // "type" field is the literal identifier text "var" (not a real
+        // type), so `binding_names_and_type`'s generic path above
+        // deliberately treats it as absent (empty `ty`, see there) and
+        // contributes nothing for this node; every declarator's real type
+        // comes from its own initializer instead. Multiple declarators per
+        // statement (`var a = new Foo(); `-style is one declarator, but the
+        // grammar still allows `Foo a = ..., b = ...;` sharing one
+        // `variable_declaration`) are each handled independently.
+        if language == "csharp"
+            && node.kind() == "variable_declaration"
+            && node
+                .child_by_field_name("type")
+                .is_some_and(|t| source[t.byte_range()].trim() == "var")
+        {
+            let mut cur = node.walk();
+            let declarators: Vec<_> = node
+                .children(&mut cur)
+                .filter(|c| c.kind() == "variable_declarator")
+                .collect();
+            for declarator in declarators {
+                if let Some(name_node) = declarator.child_by_field_name("name")
+                    && let Some(init) = csharp_declarator_initializer(declarator)
+                    && let Some(ty) = csharp_constructor_type(init, source)
+                {
+                    map.insert(source[name_node.byte_range()].to_string(), ty);
+                }
+            }
+        }
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
             stack.push(child);
@@ -1272,6 +1309,7 @@ pub fn extract_type_map_from_tree(
     }
     map
 }
+
 /// The type constructed by a Rust expression used as a `let` initializer (or,
 /// via `assignment_expression` in `extract_type_map_from_tree`, a later
 /// reassignment): `Foo::new(..)` / `Foo::default()` / `Foo::with_x(..)` ->
@@ -1352,10 +1390,21 @@ fn binding_names_and_type(
             .map(|n| source[n.byte_range()].trim().to_string())
             .unwrap_or_else(|| source[type_node.byte_range()].trim().to_string())
     } else {
-        source[type_node.byte_range()]
+        let raw = source[type_node.byte_range()]
             .trim_start_matches(':')
             .trim()
-            .to_string()
+            .to_string();
+        // C#'s `var` is implicit typing, not a real type name — its "type"
+        // field is just the literal identifier text "var". Treat as absent
+        // so this node contributes nothing here; `extract_type_map_from_tree`
+        // has a separate constructor-inference block (mirroring Rust's own)
+        // that infers the real type from `var x = new Foo(...)`'s
+        // initializer instead.
+        if language == "csharp" && raw == "var" {
+            String::new()
+        } else {
+            raw
+        }
     };
     if ty.is_empty() {
         return Vec::new();
@@ -1388,6 +1437,19 @@ fn binding_names_and_type(
         // `formal_parameter`, which names itself directly and falls through
         // to the generic arm below unchanged).
         "java" if node.kind() == "field_declaration" => {
+            let mut cur = node.walk();
+            node.children(&mut cur)
+                .filter(|c| c.kind() == "variable_declarator")
+                .filter_map(|d| d.child_by_field_name("name"))
+                .map(|n| source[n.byte_range()].to_string())
+                .collect()
+        }
+        // C#'s `variable_declaration` (shared by both `field_declaration`
+        // and `local_declaration_statement` — see `extract_type_map_from_tree`'s
+        // "csharp" comment) shares one type across one-or-more
+        // `variable_declarator` children, same multi-declarator shape as
+        // Java's field_declaration above.
+        "csharp" if node.kind() == "variable_declaration" => {
             let mut cur = node.walk();
             node.children(&mut cur)
                 .filter(|c| c.kind() == "variable_declarator")
@@ -1442,6 +1504,32 @@ fn innermost_c_declarator_identifier(node: tree_sitter::Node, source: &str) -> O
             .and_then(|d| innermost_c_declarator_identifier(d, source)),
     }
 }
+
+/// The initializer expression of a C# `variable_declarator` (`= <expr>`),
+/// e.g. the `new Foo(...)` in `var x = new Foo(...);`. The grammar doesn't
+/// name this field (confirmed via the real grammar — `=` and the value are
+/// both plain positional children), so it's found by position: the node
+/// right after the literal `=` token.
+fn csharp_declarator_initializer<'a>(
+    declarator: tree_sitter::Node<'a>,
+) -> Option<tree_sitter::Node<'a>> {
+    let mut cur = declarator.walk();
+    let children: Vec<_> = declarator.children(&mut cur).collect();
+    let eq_idx = children.iter().position(|c| c.kind() == "=")?;
+    children.get(eq_idx + 1).copied()
+}
+
+/// C# constructor inference for `var x = new Foo(...);` — `object_creation_expression`
+/// names its type directly via a `type` field, so unlike Rust's
+/// `rust_constructor_type` this needs no path-segment unwrapping.
+fn csharp_constructor_type(value: tree_sitter::Node, source: &str) -> Option<String> {
+    if value.kind() != "object_creation_expression" {
+        return None;
+    }
+    let ty = value.child_by_field_name("type")?;
+    Some(source[ty.byte_range()].trim().to_string())
+}
+
 // ---------------------------------------------------------------------------
 // Tier-0.5: lightweight regex/heuristic symbol extraction for languages that
 // have no tree-sitter grammar registered in this build. Returns function and
@@ -1911,6 +1999,7 @@ mod tests {
             ("package p\nfunc f(x Foo) {}\n", "go"),
             ("class C { void m(Foo x) {} }\n", "java"),
             ("function f(x: Foo) {}\n", "typescript"),
+            ("class C { void M(Foo x) {} }\n", "csharp"),
         ];
         for (src, lang) in cases {
             let m = extract_type_map(src, lang);
@@ -1926,6 +2015,27 @@ mod tests {
         assert_eq!(m.get("y"), Some(&"Foo".to_string()));
         // JavaScript has no static types.
         assert!(extract_type_map("function f(x) {}\n", "javascript").is_empty());
+    }
+
+    #[test]
+    fn csharp_field_and_local_share_one_type_across_declarators() {
+        // field_declaration
+        let m = extract_type_map("class C { Foo a, b; }\n", "csharp");
+        assert_eq!(m.get("a"), Some(&"Foo".to_string()));
+        assert_eq!(m.get("b"), Some(&"Foo".to_string()));
+        // local_declaration_statement (both wrap the same variable_declaration shape)
+        let m = extract_type_map("class C { void M() { Foo local; } }\n", "csharp");
+        assert_eq!(m.get("local"), Some(&"Foo".to_string()));
+    }
+
+    #[test]
+    fn csharp_var_infers_type_from_constructor() {
+        let m = extract_type_map("class C { void M() { var x = new Foo(); } }\n", "csharp");
+        assert_eq!(
+            m.get("x"),
+            Some(&"Foo".to_string()),
+            "var x = new Foo() must infer x: Foo from the constructor, not bind x: \"var\""
+        );
     }
 
     /// Regression: struct/class FIELD types (as opposed to params/locals,

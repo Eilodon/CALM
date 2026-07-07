@@ -2451,6 +2451,78 @@ impl StructB {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    // P1.5: exercises both C# type_map paths — an explicitly-typed field
+    // (`Circle shape;`) and `var`-with-constructor-inference (`var s = new
+    // Circle();`) — each resolving `.Area()` to the right class by declared
+    // type, not fanning out to the unrelated same-named-method Square.
+    fn test_csharp_field_type_and_var_ctor_resolve_via_declared_type() {
+        let dir =
+            std::env::temp_dir().join(format!("ci_idx_csharp_typemap_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("circle.cs"),
+            "class Circle {\n    double Area() { return 1.0; }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("square.cs"),
+            "class Square {\n    double Area() { return 2.0; }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("main.cs"),
+            "class Container {\n\
+             \x20   Circle shape;\n\
+             \x20   void RunField() {\n\
+             \x20       shape.Area();\n\
+             \x20   }\n\
+             \x20   void RunVar() {\n\
+             \x20       var s = new Circle();\n\
+             \x20       s.Area();\n\
+             \x20   }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
+
+        for (caller, wrong_count_desc) in [
+            ("RunField", "shape.Area()"),
+            ("RunVar", "s.Area() (var-inferred)"),
+        ] {
+            assert_eq!(
+                count(
+                    &conn,
+                    &format!(
+                        "SELECT COUNT(*) FROM call_edges \
+                         WHERE from_symbol = (SELECT qualified_name FROM symbols WHERE name = '{caller}') \
+                         AND to_symbol = (SELECT qualified_name FROM symbols WHERE name = 'Area' AND class_context = 'Circle')",
+                    ),
+                ),
+                1,
+                "{wrong_count_desc} must resolve to Circle::Area via the declared type"
+            );
+            assert_eq!(
+                count(
+                    &conn,
+                    &format!(
+                        "SELECT COUNT(*) FROM call_edges \
+                         WHERE from_symbol = (SELECT qualified_name FROM symbols WHERE name = '{caller}') \
+                         AND to_symbol = (SELECT qualified_name FROM symbols WHERE name = 'Area' AND class_context = 'Square')",
+                    ),
+                ),
+                0,
+                "{wrong_count_desc} must NOT also fan out to the unrelated Square::Area"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Same fan-out bug, `by_name_class` variant: two unrelated types in
     /// different files that happen to share both a type name AND a method
     /// name (e.g. two local `struct Handler` in different modules, each with
