@@ -1,6 +1,6 @@
 # CALM — Kế hoạch Formal-tier cho 8 ngôn ngữ còn lại (bản đã audit)
 
-> **Ngày:** 2026-07-07 · **Trạng thái:** PLAN_READY (đã qua deep-review, chưa thực thi)
+> **Ngày:** 2026-07-07 · **Trạng thái:** P0.1–P0.3 ĐÃ XONG (commit `20f4265`, `40e6b40`, `e0471f9` trên `main`) — P0.4 trở đi CHƯA thực thi. Xem §3 để biết chi tiết những gì đã làm; đừng làm lại.
 > **Phạm vi:** Go · Java · C# · C · C++ · JavaScript · PHP · SQL (+ Python nâng chuẩn, + Kotlin bonus)
 > **Nguồn gốc:** Kế hoạch SCIP-overlay gốc của user + audit codebase & SOTA research phiên 2026-07-07.
 > Mọi khẳng định codebase trong file này ĐÃ ĐƯỢC XÁC MINH trên working tree ngày 2026-07-07 — phiên sau không cần re-verify trừ khi file liên quan đã đổi.
@@ -59,35 +59,29 @@ Phiên sau đọc mục này thay vì tự khảo sát lại:
 
 ## 3. PHASE 0 — Nền tảng (làm TRƯỚC, đúng thứ tự)
 
-### P0.1 — Nối overlay vào `calm index` one-shot
-- **File:** `crates/calm-cli/src/main.rs` (lệnh index), tham chiếu mẫu gọi ở `crates/calm-server/src/lib.rs:195`.
-- **Bước:** sau khi pipeline index xong, gọi `calm_core::scip::run_overlay(&conn, root, &cfg.rust, &scip::rust_source_dirty_keys(&conn))` — copy đúng shape lib.rs:195 (match + tracing::warn khi Err).
-- **Test:** integration test theo mẫu `overlay_upgrades_a_real_edge_on_the_fixture` (scip/mod.rs:273), gate `#[ignore]` nếu rust-analyzer vắng.
-- **DoD:** `calm index` trên fixture rust_workspace có rust-analyzer → tồn tại edge `formal`; không có binary → hành vi y hệt cũ. Effort: **XS**.
+### P0.1 — ✅ ĐÃ XONG — Nối overlay vào `calm index` one-shot
+- **Commit:** `20f4265` (`feat(cli): wire SCIP overlay into one-shot calm index`).
+- **Kết quả thật:** `crates/calm-cli/src/main.rs`'s `Commands::Index` giờ gọi `calm_core::scip::run_overlay` sau khi pipeline + embeddings xong, đúng shape `lib.rs`'s `serve_stdio_with_preset` (match + refresh_caller_counts + tracing::warn khi Err).
+- **Test:** `crates/calm-cli/tests/scip_overlay_cli.rs::calm_index_cli_upgrades_a_real_edge_on_the_fixture` (`#[ignore]`, cần rust-analyzer) — xanh. DoD cả 2 nhánh (có/không binary) đã verify thủ công thêm bằng subprocess thật trên bản copy fixture.
+- Đừng làm lại — nếu cần sửa, xem file/commit trên.
 
-### P0.2 — Path rebase cho indexer chạy ở subroot
-- **File:** `crates/calm-core/src/scip/parse.rs`, `runner.rs`.
-- **Bước:**
-  1. `parse_index(index, rebase_prefix: &Path)` — occ.file = normalize(join(prefix, relative_path)).
-  2. Xử lý cả path tuyệt đối: nếu `relative_path` absolute (một số indexer emit vậy) → strip `index.metadata.project_root` (URI `file://...`) rồi mới join prefix.
-  3. Rust runner hiện chạy ở repo root → prefix = `""` (không đổi hành vi).
-- **Test:** unit — Index synthetic có doc `helper.go`, prefix `services/api` → occurrence `services/api/helper.go`; case absolute path + project_root.
-- **DoD:** test xanh + Rust overlay tests cũ xanh nguyên vẹn. Effort: **S**.
+### P0.2 — ✅ ĐÃ XONG — Path rebase cho indexer chạy ở subroot
+- **Commit:** `40e6b40` (`feat(scip): rebase SCIP occurrence paths for indexers run at a subroot`).
+- **Kết quả thật:** `parse_index`/`parse_scip_file` (`crates/calm-core/src/scip/parse.rs`) nhận thêm `rebase_prefix: &Path`, join+normalize (`.`/`..` collapse, `/`-separated). Absolute `relative_path` → strip `index.metadata.project_root` (`file://` URI, percent-decode thủ công) rồi mới rebase; project_root không rõ → giữ nguyên absolute (KHÔNG rơi về relative-looking string để tránh trùng path giả). Cả 2 call site production (`run_overlay`, `main.rs`'s `scip-dump`) truyền prefix rỗng — hành vi Rust không đổi, verify lại bằng test `overlay_upgrades_a_real_edge_on_the_fixture` (real rust-analyzer) chạy xanh sau khi sửa.
+- **Tests mới:** `rebase_prefix_joins_onto_a_subroot`, `rebase_prefix_normalizes_dot_segments`, `absolute_relative_path_is_stripped_of_project_root_then_rebased`, `absolute_relative_path_with_unknown_project_root_falls_back_unchanged`, `empty_prefix_is_identity_rust_runner_behavior_unchanged`, `file_uri_to_path_decodes_percent_escapes` — tất cả trong `scip/parse.rs`.
+- Đừng làm lại. Lưu ý cho Phase 2: khi thêm provider mới (P0.4/P2.x), gọi `parse_scip_file(path, sub_root)` với `sub_root` thật thay vì `Path::new("")`.
 
-### P0.3 — Provenance + gated-insert mode + match-rate (đòn bẩy chính xác lớn nhất)
-- **File:** schema/migration (tìm nơi tạo bảng `call_edges` — search `CREATE TABLE call_edges`), `scip/ingest.rs`, `indexer/pipeline.rs`, `types.rs`, `types/mcp_types.ts`.
-- **Bước:**
-  1. Migration: `ALTER TABLE call_edges ADD COLUMN formal_source TEXT` (`'scip'` | `'stack_graphs'` | NULL). Ingest upgrade → set `'scip'`; stack-graphs upgrade trong `extract_file_data` (pipeline.rs:376-379) → `'stack_graphs'`. SCIP được phép **override** edge formal có `formal_source='stack_graphs'` (re-target khi mâu thuẫn).
-  2. **Gated insert** trong `ingest_occurrences`: với mỗi ref `(file,line)→def(file,line)` mà KHÔNG có edge nào khớp:
-     - Map def → symbol: `SELECT ... FROM symbols WHERE path=def_file AND line_start<=def_line<=line_end` (chọn range hẹp nhất); phải ra đúng 1 symbol, không thì bỏ.
-     - Map call site → enclosing symbol tương tự trên `(ref_file, ref_line)`; không tìm thấy → bỏ.
-     - INSERT edge `edge_confidence='formal', formal_source='scip'`, from/to/call_site_line đầy đủ. Dedupe theo (from_qn, to_qn, line).
-     - Gate tổng: chỉ chạy trong ngữ cảnh ingest hiện tại (cache key fresh — điều kiện có sẵn); config `scip.insert_missing: Option<bool>` mặc định auto=on.
-  3. `IngestStats` thêm `inserted`, `match_rate` (refs khớp/tổng refs non-local). Log + expose qua `indexing_status` và `fitness_report`.
-  4. Tests (ingest.rs): giữ `never_downgrades`; thêm `inserts_edge_for_uncandidated_call_site`, `no_insert_when_def_unknown_symbol`, `no_insert_when_enclosing_missing`, `scip_overrides_stack_graphs_target`.
-  5. Tiện tay: sửa `types/mcp_types.ts` EdgeConfidence thêm `"formal" | "ambiguous"`.
-- **Lý do (đừng bỏ qua):** không có bước này, mọi call site vượt cap 20 ứng viên (tên phổ biến trong repo Java/C#/Go lớn) vĩnh viễn không có formal edge dù .scip hoàn hảo — đúng nhóm virtual/interface dispatch mà ta mua indexer về để giải.
-- **DoD:** fixture có call site bị cap-drop → sau overlay xuất hiện edge formal inserted; match_rate hiển thị trong indexing_status. Effort: **M**.
+### P0.3 — ✅ ĐÃ XONG — Provenance + gated-insert mode + match-rate (đòn bẩy chính xác lớn nhất)
+- **Commit:** `e0471f9` (`feat(scip): provenance-aware gated-insert for cap-dropped call sites`).
+- **Kết quả thật (khớp cả 5 bước gốc):**
+  1. Migration `call_edges.formal_source TEXT` (`db/schema.rs::run_migrations`). Set `'stack_graphs'` bằng 1 UPDATE ngay sau `insert_call_edges_batch` trong `rebuild_graph` (đơn giản hơn thiết kế gốc — không cần thread field mới qua `CallSiteData`/`CallEdge`, vì mọi row `formal` ngay sau fresh-insert chắc chắn đến từ stack-graphs). `ingest_occurrences` set `'scip'` và được phép override `'stack_graphs'` (không override `'scip'` cũ) — implement trong `mark_ruled_out_siblings`'s `is_formal` computation.
+  2. Gated insert = `scip/ingest.rs::insert_missing_edges`. **Khác thiết kế gốc một điểm có chủ đích:** thay vì tự map call site → enclosing symbol bằng range-lookup thô (như def-side), nó JOIN thẳng vào bảng `call_sites` (đã có sẵn `enclosing_qn`) — vừa đơn giản hơn, vừa là gate an toàn quan trọng: một SCIP reference thuần túy (type ref, field access) KHÔNG BAO GIỜ có mặt trong `call_sites` (chỉ tree-sitter call expression thật mới có), nên không thể tự tạo edge giả từ non-call reference. Def-side vẫn dùng narrow-range lookup trên `symbols` đúng như thiết kế gốc (`resolve_unique_symbol_at`).
+  3. `IngestStats.inserted`/`match_rate` — expose qua `indexing_status`'s `scip_overlay` field (`last_match_rate`/`last_inserted`) qua sidecar `.calm/scip-stats.json` (mirror pattern `scip.cache`). **Cắt phạm vi có chủ đích:** KHÔNG wire vào `fitness_report` (đó là threshold pass/fail gate, thêm 1 ratio diagnostic vào đó là scope creep ngoài effort budget) — `indexing_status` đã là nơi DoD yêu cầu và đủ dùng.
+  4. Tests đúng cả 4 tên gốc + `insert_missing_false_skips_the_insert_gate_entirely`.
+  5. `types/mcp_types.ts` `EdgeConfidence` sửa đủ 6 variant (`formal|resolved|inferred|textual|ambiguous|unresolved`), không chỉ 2 cái đề xuất.
+- **Sửa thêm phát hiện khi làm:** cả 3 call site production của `run_overlay` (`lib.rs`, `watcher.rs`, `main.rs`) trước đó chỉ refresh `caller_count` khi `upgraded>0 || ruled_out>0` — thiếu `inserted>0`, nghĩa là edge mới insert sẽ có `caller_count` stale ngay lập tức. Đã sửa cả 3.
+- **Verify trên dữ liệu thật (không chỉ fixture synthetic):** chạy `calm index` với rust-analyzer thật trên fixture → 5 upgraded, 1 ruled_out, **3 inserted** (đúng nhóm cap-dropped mà P0.3 sinh ra để giải), match_rate=0.28 (số hợp lý, không phải 1.0 giả tạo).
+- Đừng làm lại.
 
 ### P0.4 — Tổng quát hoá runner thành `ScipProvider`
 - **File mới:** `crates/calm-core/src/scip/provider.rs`; refactor `scip/mod.rs::run_overlay`, `runner.rs`, `config.rs`.
@@ -212,12 +206,19 @@ Mỗi provider = 1 entry bảng + probe prereq + integration test nightly trên 
 ## 9. Thứ tự thực thi khuyến nghị (dependency graph)
 
 ```
-P0.1 → P0.2 → P0.3 → P0.4 → P0.5        (tuần tự, nền tảng)
+P0.1 ✅ → P0.2 ✅ → P0.3 ✅ → P0.4 ⬜ → P0.5 ⬜   (tuần tự, nền tảng — dừng ở P0.3, xem banner đầu file)
 sau P0: P1.1 ∥ P1.2 ∥ P1.3 ∥ P1.4 ∥ P1.5  (song song)
 sau P0.4: P2.1 ∥ P2.2 ∥ P2.3 ∥ P2.4 ∥ P2.5 → P2.6
 sau P2: P3.1 ∥ P3.2
-P3.3 (SQL): bất kỳ lúc nào sau P0.3 (cần cột edge_kind)
+P3.3 (SQL): bất kỳ lúc nào sau P0.3 (cần cột edge_kind) — CÓ THỂ BẮT ĐẦU NGAY, không phụ thuộc P0.4/P0.5
 Benchmark harness: dựng ngay sau P0.5, đo baseline trước Phase 2 để chứng minh giá trị overlay
 ```
 
-Effort tổng ước lượng: P0 ≈ 1.5–2 tuần-người; P1 ≈ 1–1.5 tuần; P2 ≈ 2–3 tuần (song song hoá tốt); P3 ≈ 2–3 tuần. SQL độc lập ≈ 1 tuần.
+Effort tổng ước lượng: P0 ≈ 1.5–2 tuần-người (P0.1-P0.3 đã xong trong 1 phiên); P1 ≈ 1–1.5 tuần; P2 ≈ 2–3 tuần (song song hoá tốt); P3 ≈ 2–3 tuần. SQL độc lập ≈ 1 tuần.
+
+## 10. Điểm dừng phiên này (2026-07-07)
+
+P0.4 chưa bắt đầu — cân nhắc lại trước khi làm: nó là refactor thuần (KHÔNG đổi hành vi, per DoD gốc), giá trị chỉ hiện ra khi Phase 2 có provider thứ 2 thật để cắm vào bảng `ScipProvider`. Xây abstraction với đúng 1 case (Rust) có rủi ro đoán sai shape. 3 lựa chọn cho phiên sau, xem `docs/superskills/session-state-2026-07-07-04.md` để biết chi tiết bối cảnh:
+1. Làm P0.4 + P0.5 trước (đúng thứ tự gốc của kế hoạch).
+2. Bỏ qua P0.4, làm thẳng 1 provider Phase 2 cụ thể (vd Go) trên shape hiện tại của Rust, tổng quát hoá sau khi có 2 case thật.
+3. P3.3 (SQL) độc lập hoàn toàn, có thể làm bất kỳ lúc nào không cần chờ P0.4/P0.5.
