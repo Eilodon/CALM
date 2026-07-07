@@ -1,0 +1,35 @@
+name: SCIP overlay (nightly)
+
+# Runs the real-external-indexer integration tests that `ci.yml` deliberately
+# skips on every push/PR (`#[ignore]`d — they need a heavy binary installed
+# and are too slow/flaky to gate merges on). See the 8-language plan doc's
+# P0.5: docs/superskills/plans/2026-07-07-eight-lang-formal-tier.md
+on:
+  schedule:
+    - cron: "0 3 * * *" # 03:00 UTC daily
+  workflow_dispatch: {}
+
+jobs:
+  scip-overlay-nightly:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          lfs: true
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          components: rust-analyzer
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      # Only rust-analyzer is installed today, covering the P0.1-P0.4
+      # `#[ignore]`d tests (real rust-analyzer end-to-end). Add each Phase 2
+      # provider's own toolchain/binary install step here as it lands — Go
+      # toolchain + scip-go, JDK + Gradle/Maven + scip-java, .NET SDK +
+      # scip-dotnet, etc. `cargo test --workspace -- --ignored` below picks
+      # up their new `#[ignore]`d tests (likely pointed at
+      # `crates/calm-core/tests/fixtures/multi_lang_workspace/`) the moment
+      # they exist — no other change needed in this file.
+      - name: Run real-indexer integration tests
+        run: cargo test --workspace -- --ignored

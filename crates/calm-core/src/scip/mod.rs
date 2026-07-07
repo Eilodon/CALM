@@ -1,13 +1,14 @@
 pub mod cache;
 pub mod ingest;
 pub mod parse;
+pub mod provider;
 pub mod runner;
 
 use std::path::Path;
 
 use rusqlite::Connection;
 
-use crate::config::RustConfig;
+use crate::config::{RustConfig, ScipConfig};
 
 /// Run the full SCIP overlay: detect rust-analyzer, run batch scip into a temp
 /// file, parse, and upgrade edges. Fail-silent — every failure mode (disabled,
@@ -34,59 +35,65 @@ use crate::config::RustConfig;
 /// forever; an empty slice degrades to the old (lockfile/toolchain-only) key,
 /// which remains safe on its own because it can only widen a "skip" into a
 /// "run", never the reverse.
-pub fn run_overlay(
+pub fn run_overlay_for(
+    provider: &provider::ScipProvider,
     conn: &Connection,
     root: &Path,
-    rust: &RustConfig,
+    sub_root: &Path,
+    cfg: &ScipConfig,
     dirty: &[String],
 ) -> anyhow::Result<ingest::IngestStats> {
-    if rust.scip.enabled == Some(false) {
+    if cfg.enabled == Some(false) {
         return Ok(ingest::IngestStats::default());
     }
-    let Some(bin) = runner::resolve_binary(rust.scip.binary.as_deref(), root) else {
-        if rust.scip.enabled == Some(true) {
-            tracing::info!("SCIP overlay enabled but no rust-analyzer found — skipping");
+    let Some(bin) = (provider.resolve_binary)(cfg.binary.as_deref(), root) else {
+        if cfg.enabled == Some(true) {
+            tracing::info!(
+                "SCIP overlay enabled but no {} indexer found — skipping",
+                provider.lang
+            );
         }
         return Ok(ingest::IngestStats::default());
     };
 
-    let cache_path = root.join(".calm").join("scip.cache");
-    let key = cache::overlay_cache_key(
-        &runner::binary_version(&bin),
-        &runner::active_toolchain_fingerprint(root),
-        &lockfile_hash(root),
-        &cargo_toml_hash(root),
-        dirty,
-    );
+    let cache_path = root.join(".calm").join(provider.cache_file_name);
+    let key = (provider.cache_key)(&bin, root, dirty);
     if std::fs::read_to_string(&cache_path).is_ok_and(|prev| prev.trim() == key) {
-        tracing::info!("SCIP overlay: cache key unchanged, skipping rust-analyzer run");
+        tracing::info!(
+            "SCIP overlay ({}): cache key unchanged, skipping indexer run",
+            provider.lang
+        );
         return Ok(ingest::IngestStats::default());
     }
 
     let tmp = tempfile::Builder::new().suffix(".scip").tempfile()?;
-    if let Err(e) = runner::run_scip(&bin, root, tmp.path()) {
-        tracing::warn!("SCIP overlay run failed, keeping syntactic graph: {e}");
+    if let Err(e) = runner::run_indexer(provider, &bin, root, tmp.path()) {
+        tracing::warn!(
+            "SCIP overlay ({}) run failed, keeping syntactic graph: {e}",
+            provider.lang
+        );
         return Ok(ingest::IngestStats::default());
     }
-    let occ = match parse::parse_scip_file(tmp.path(), Path::new("")) {
+    let occ = match parse::parse_scip_file(tmp.path(), sub_root) {
         Ok(o) => o,
         Err(e) => {
-            tracing::warn!("SCIP parse failed: {e}");
+            tracing::warn!("SCIP parse failed ({}): {e}", provider.lang);
             return Ok(ingest::IngestStats::default());
         }
     };
-    let insert_missing = rust.scip.insert_missing != Some(false);
+    let insert_missing = cfg.insert_missing != Some(false);
     let stats = ingest::ingest_occurrences(conn, &occ, insert_missing)?;
     tracing::info!(
-        "SCIP overlay: {} edges upgraded to formal, {} fan-out siblings ruled out, \
+        "SCIP overlay ({}): {} edges upgraded to formal, {} fan-out siblings ruled out, \
          {} edges inserted, match_rate={:.2}",
+        provider.lang,
         stats.upgraded,
         stats.ruled_out,
         stats.inserted,
         stats.match_rate
     );
     // Best-effort: a failed cache write just means the next run pays the cost
-    // of rust-analyzer again, never a correctness issue.
+    // of re-running this provider's indexer again, never a correctness issue.
     let _ = std::fs::write(&cache_path, &key);
     // Best-effort sidecar so `indexing_status`/`overlay_status` can surface
     // this run's `inserted`/`match_rate` without re-running the overlay —
@@ -94,7 +101,9 @@ pub fn run_overlay(
     // `available`/`up_to_date` are (there's no column recording "how many
     // SCIP-resolved sites exist" once the pass is done). Stands until the
     // next real (non-cache-skip) run overwrites it; reading code should
-    // treat it as "as of the last real run", not "live".
+    // treat it as "as of the last real run", not "live". Shared across
+    // providers for now (single filename) — fine while `RUST` is the only
+    // entry in the table; Phase 2 may need to key this per-language too.
     let stats_path = root.join(".calm").join("scip-stats.json");
     let _ = std::fs::write(
         &stats_path,
@@ -109,41 +118,50 @@ pub fn run_overlay(
     Ok(stats)
 }
 
-/// Hash of `Cargo.lock`'s contents, or `""` when absent (e.g. a virtual
-/// workspace without a checked-in lockfile) — a stable "no lockfile" key that
-/// still changes the moment one appears.
-fn lockfile_hash(root: &Path) -> String {
-    std::fs::read_to_string(root.join("Cargo.lock"))
-        .map(|s| crate::indexer::pipeline::hash_content(&s))
-        .unwrap_or_default()
+/// Run the full SCIP overlay for Rust — thin wrapper around
+/// `run_overlay_for(&provider::RUST, ...)`. Kept as its own function (rather
+/// than inlining the `RustConfig` unwrap at every call site) because all 3
+/// production callers (`lib.rs`, `watcher.rs`, `main.rs`) already call this
+/// exact signature; changing it would touch 3 files for zero behavior gain.
+/// See `run_overlay_for`'s doc comment for the actual contract (fail-silent,
+/// caching, three-state `enabled`).
+pub fn run_overlay(
+    conn: &Connection,
+    root: &Path,
+    rust: &RustConfig,
+    dirty: &[String],
+) -> anyhow::Result<ingest::IngestStats> {
+    run_overlay_for(
+        &provider::RUST,
+        conn,
+        root,
+        Path::new(""),
+        &rust.scip,
+        dirty,
+    )
 }
-
-/// Hash of `Cargo.toml`'s contents, or `""` when absent. Catches `edition`
-/// and workspace-member changes that `lockfile_hash` won't: bumping
-/// `edition = "2021"` -> `"2024"` changes name resolution/macro semantics
-/// rust-analyzer relies on, without necessarily touching `Cargo.lock` or any
-/// `.rs` file.
-fn cargo_toml_hash(root: &Path) -> String {
-    std::fs::read_to_string(root.join("Cargo.toml"))
-        .map(|s| crate::indexer::pipeline::hash_content(&s))
-        .unwrap_or_default()
-}
-
-/// Fingerprint of every currently-indexed Rust file's content, for
-/// `run_overlay`'s `dirty` parameter — one `"path@hash"` entry per file
-/// (`hash` already computed by the indexer, so this is a cheap read, no
-/// re-hashing). Changes whenever any Rust file's content differs from what
-/// was indexed at the last successful overlay run, regardless of whether
-/// `Cargo.lock` or the rust-analyzer version also changed — see
-/// `run_overlay`'s doc comment for why that matters.
-pub fn rust_source_dirty_keys(conn: &Connection) -> Vec<String> {
-    let mut stmt = match conn
-        .prepare("SELECT path, hash FROM file_index WHERE language = 'rust' ORDER BY path")
-    {
+/// Fingerprint of every currently-indexed file's content for one or more
+/// `file_index.language` values, for `run_overlay_for`'s `dirty` parameter —
+/// one `"path@hash"` entry per file (`hash` already computed by the indexer,
+/// so this is a cheap read, no re-hashing). Changes whenever any matching
+/// file's content differs from what was indexed at the last successful
+/// overlay run, regardless of whether the lockfile/toolchain also changed —
+/// see `run_overlay_for`'s doc comment for why that matters. `langs` lets a
+/// future multi-language provider (e.g. a combined C/C++ one) scope this to
+/// more than one `file_index.language` value at once.
+pub fn source_dirty_keys(conn: &Connection, langs: &[&str]) -> Vec<String> {
+    if langs.is_empty() {
+        return Vec::new();
+    }
+    let placeholders = langs.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "SELECT path, hash FROM file_index WHERE language IN ({placeholders}) ORDER BY path"
+    );
+    let mut stmt = match conn.prepare(&sql) {
         Ok(s) => s,
         Err(_) => return Vec::new(),
     };
-    stmt.query_map([], |r| {
+    stmt.query_map(rusqlite::params_from_iter(langs.iter()), |r| {
         Ok(format!(
             "{}@{}",
             r.get::<_, String>(0)?,
@@ -154,30 +172,36 @@ pub fn rust_source_dirty_keys(conn: &Connection) -> Vec<String> {
     .unwrap_or_default()
 }
 
-/// Cheap, non-invoking snapshot of the overlay's readiness — never spawns
-/// rust-analyzer, just checks binary presence and compares the cache key that
-/// `run_overlay` would compute against what's already on disk. Backs
-/// `indexing_status`'s `scip_overlay` field so an agent can tell whether the
-/// call graph for currently-edited Rust files has actually been upgraded by
-/// SCIP yet, without waiting on or triggering a real run. `None` when
-/// `rust.scip.enabled == Some(false)` — overlay is off, nothing to report.
-pub fn overlay_status(conn: &Connection, root: &Path, rust: &RustConfig) -> Option<OverlayStatus> {
-    if rust.scip.enabled == Some(false) {
+/// Rust-only convenience wrapper around `source_dirty_keys` — all existing
+/// callers (`lib.rs`, `watcher.rs`, `main.rs`, this module's own tests) call
+/// this exact name; kept so P0.4 touches zero call sites.
+pub fn rust_source_dirty_keys(conn: &Connection) -> Vec<String> {
+    source_dirty_keys(conn, &["rust"])
+}
+
+/// Cheap, non-invoking snapshot of the overlay's readiness — never spawns an
+/// external indexer, just checks binary presence and compares the cache key
+/// that `run_overlay_for` would compute against what's already on disk.
+/// Backs `indexing_status`'s `scip_overlay` field so an agent can tell
+/// whether the call graph for currently-edited files has actually been
+/// upgraded by SCIP yet, without waiting on or triggering a real run. `None`
+/// when `cfg.enabled == Some(false)` — overlay is off, nothing to report.
+pub fn overlay_status_for(
+    provider: &provider::ScipProvider,
+    conn: &Connection,
+    root: &Path,
+    cfg: &ScipConfig,
+) -> Option<OverlayStatus> {
+    if cfg.enabled == Some(false) {
         return None;
     }
-    let bin = runner::resolve_binary(rust.scip.binary.as_deref(), root);
+    let bin = (provider.resolve_binary)(cfg.binary.as_deref(), root);
     let available = bin.is_some();
     let up_to_date = match &bin {
         Some(bin) => {
-            let dirty = rust_source_dirty_keys(conn);
-            let key = cache::overlay_cache_key(
-                &runner::binary_version(bin),
-                &runner::active_toolchain_fingerprint(root),
-                &lockfile_hash(root),
-                &cargo_toml_hash(root),
-                &dirty,
-            );
-            let cache_path = root.join(".calm").join("scip.cache");
+            let dirty = source_dirty_keys(conn, &[provider.lang]);
+            let key = (provider.cache_key)(bin, root, &dirty);
+            let cache_path = root.join(".calm").join(provider.cache_file_name);
             std::fs::read_to_string(&cache_path).is_ok_and(|prev| prev.trim() == key)
         }
         None => false,
@@ -189,6 +213,13 @@ pub fn overlay_status(conn: &Connection, root: &Path, rust: &RustConfig) -> Opti
         last_match_rate,
         last_inserted,
     })
+}
+
+/// Rust-only convenience wrapper around `overlay_status_for` — kept so the
+/// one production caller (`recover.rs`'s `indexing_status`) doesn't need to
+/// know about `ScipProvider` yet.
+pub fn overlay_status(conn: &Connection, root: &Path, rust: &RustConfig) -> Option<OverlayStatus> {
+    overlay_status_for(&provider::RUST, conn, root, &rust.scip)
 }
 
 /// Best-effort read of the sidecar `run_overlay` writes after a real

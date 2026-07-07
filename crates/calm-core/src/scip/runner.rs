@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
+use super::provider::ScipProvider;
+
 /// Total wall-clock budget for one `rust-analyzer scip` pass. Measured cost on
 /// the `ci` workspace itself (~44k occurrences) was 21.5s; ripgrep 20s. 120s
 /// leaves generous headroom; overrun → kill and keep whatever the syntactic
@@ -37,30 +39,45 @@ pub fn resolve_binary(override_bin: Option<&str>, root: &Path) -> Option<PathBuf
 /// Run `<bin> scip <root> --output <out>` under the time budget. Returns the
 /// output path on success. Never propagates a panic; a non-zero exit or timeout
 /// is an `Err` the caller swallows.
-pub fn run_scip(bin: &Path, root: &Path, out: &Path) -> anyhow::Result<()> {
-    let mut child = Command::new(bin)
-        .arg("scip")
+pub fn rust_build_command(bin: &Path, root: &Path, out: &Path) -> Command {
+    let mut cmd = Command::new(bin);
+    cmd.arg("scip")
         .arg(root)
         .arg("--output")
         .arg(out)
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()?;
+        .stderr(std::process::Stdio::null());
+    cmd
+}
+
+/// Spawn `provider.build_command(bin, root, out)` and poll it to completion,
+/// killing on overrun. Generic over every provider — this is the one place
+/// that owns "run an external indexer binary, bounded", so a Java/clang
+/// provider with a much larger `timeout` doesn't need its own copy of this
+/// poll loop.
+pub fn run_indexer(
+    provider: &ScipProvider,
+    bin: &Path,
+    root: &Path,
+    out: &Path,
+) -> anyhow::Result<()> {
+    let mut child = (provider.build_command)(bin, root, out).spawn()?;
     // Poll with a deadline; kill on overrun (Command has no built-in timeout —
     // same pattern as analysis/diff_impact.rs's bounded wait).
-    let deadline = std::time::Instant::now() + SCIP_TIMEOUT;
+    let deadline = std::time::Instant::now() + provider.timeout;
     loop {
         if let Some(status) = child.try_wait()? {
             if status.success() {
                 return Ok(());
             }
-            anyhow::bail!("rust-analyzer scip exited with {status}");
+            anyhow::bail!("{} indexer exited with {status}", provider.lang);
         }
         if std::time::Instant::now() >= deadline {
             let _ = child.kill();
             anyhow::bail!(
-                "rust-analyzer scip exceeded {}s budget",
-                SCIP_TIMEOUT.as_secs()
+                "{} indexer exceeded {}s budget",
+                provider.lang,
+                provider.timeout.as_secs()
             );
         }
         std::thread::sleep(Duration::from_millis(200));

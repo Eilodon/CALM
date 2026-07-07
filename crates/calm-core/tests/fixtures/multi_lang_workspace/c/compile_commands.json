@@ -1,0 +1,12 @@
+[
+  {
+    "directory": ".",
+    "command": "cc -c main.c -o main.o",
+    "file": "main.c"
+  },
+  {
+    "directory": ".",
+    "command": "cc -c helper.c -o helper.o",
+    "file": "helper.c"
+  }
+]

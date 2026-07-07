@@ -1,6 +1,6 @@
 # CALM — Kế hoạch Formal-tier cho 8 ngôn ngữ còn lại (bản đã audit)
 
-> **Ngày:** 2026-07-07 · **Trạng thái:** P0.1–P0.3 ĐÃ XONG (commit `20f4265`, `40e6b40`, `e0471f9` trên `main`) — P0.4 trở đi CHƯA thực thi. Xem §3 để biết chi tiết những gì đã làm; đừng làm lại.
+> **Ngày:** 2026-07-07 · **Trạng thái:** P0 (P0.1–P0.5) ĐÃ XONG toàn bộ — nền tảng hoàn tất. P0.1-P0.3: commit `20f4265`, `40e6b40`, `e0471f9`. P0.4-P0.5: cùng phiên với P0 hoàn tất (xem lịch sử git — commit gộp, chưa tách theo từng mục). Phase 1/2/3 CHƯA thực thi. Xem §3 để biết chi tiết những gì đã làm; đừng làm lại.
 > **Phạm vi:** Go · Java · C# · C · C++ · JavaScript · PHP · SQL (+ Python nâng chuẩn, + Kotlin bonus)
 > **Nguồn gốc:** Kế hoạch SCIP-overlay gốc của user + audit codebase & SOTA research phiên 2026-07-07.
 > Mọi khẳng định codebase trong file này ĐÃ ĐƯỢC XÁC MINH trên working tree ngày 2026-07-07 — phiên sau không cần re-verify trừ khi file liên quan đã đổi.
@@ -83,32 +83,34 @@ Phiên sau đọc mục này thay vì tự khảo sát lại:
 - **Verify trên dữ liệu thật (không chỉ fixture synthetic):** chạy `calm index` với rust-analyzer thật trên fixture → 5 upgraded, 1 ruled_out, **3 inserted** (đúng nhóm cap-dropped mà P0.3 sinh ra để giải), match_rate=0.28 (số hợp lý, không phải 1.0 giả tạo).
 - Đừng làm lại.
 
-### P0.4 — Tổng quát hoá runner thành `ScipProvider`
-- **File mới:** `crates/calm-core/src/scip/provider.rs`; refactor `scip/mod.rs::run_overlay`, `runner.rs`, `config.rs`.
-- **Thiết kế:**
+### P0.4 — ✅ ĐÃ XONG — Tổng quát hoá runner thành `ScipProvider`
+- **File mới:** `crates/calm-core/src/scip/provider.rs`. Refactor `scip/mod.rs` (`run_overlay`→`run_overlay_for`, `overlay_status`→`overlay_status_for`, `rust_source_dirty_keys`→`source_dirty_keys`) và `runner.rs` (`run_scip`→`rust_build_command`+`run_indexer`).
+- **Kết quả thật (khác thiết kế gốc ở vài điểm có chủ đích — xem lý do dưới mỗi điểm):**
   ```rust
   pub struct ScipProvider {
-      pub lang: &'static str,              // "rust", "go", ...
-      pub marker_files: &'static [&'static str],   // ["go.mod"], ["pom.xml","build.gradle","build.gradle.kts"], ...
-      pub binary_names: &'static [&'static str],   // ["scip-go"]; rust giữ probe đặc thù (rustup/VS Code)
-      pub invoke: InvokeSpec,              // args template: {root} {out}; rust = ["scip","{root}","--output","{out}"]
-      pub cache_inputs: CacheSpec,         // lockfile globs + toolchain probe cmd ("go version", "java -version", ...)
-      pub prereqs: &'static [Prereq],      // CompileCommands | VendorAutoload | NodeModules | DotnetSdk...
-      pub timeout: Duration,               // rust 300s; java/clang cao hơn
-      pub default_policy: RefreshPolicy,   // OnSave | MinInterval(Duration) | OnDemand
+      pub lang: &'static str,
+      pub resolve_binary: fn(Option<&str>, &Path) -> Option<PathBuf>,
+      pub build_command: fn(bin: &Path, root: &Path, out: &Path) -> Command,
+      pub timeout: Duration,
+      pub cache_key: fn(bin: &Path, root: &Path, dirty: &[String]) -> String,
+      pub cache_file_name: &'static str,
   }
   ```
-  - `run_overlay_for(provider, conn, repo_root, sub_root, cfg, dirty)` — pipeline chung: resolve binary → cache key (per sub_root!) → run → parse(rebase=sub_root) → ingest. Cache file: `.calm/scip-{lang}-{hash(sub_root)}.cache`.
-  - **Multi-root discovery:** scan marker files (bounded depth, tôn trọng ignore-dirs của indexer) → chạy per sub-root. Go: nếu có `go.work` thì lấy danh sách module từ đó.
-  - `config.rs`: generalize `[languages.<lang>] scip = {...}` — thêm `GoConfig/JavaConfig/CsharpConfig/...` cùng shape `RustConfig { scip: ScipConfig }` (+ field riêng: `clang.compile_commands`, `sql.dialect`). `ScipConfig` giữ nguyên (đã tổng quát).
-  - Dirty-keys: generalize `rust_source_dirty_keys` → `source_dirty_keys(conn, lang_exts)`.
-- **DoD:** Rust đi qua provider table, toàn bộ test scip cũ xanh, không đổi hành vi. Effort: **M**. **Làm xong mới bắt đầu Phase 2.**
+  - **Cắt phạm vi có chủ đích:** `marker_files`, `prereqs: &[Prereq]`, `default_policy: RefreshPolicy` KHÔNG có trong struct thật. Lý do: với đúng 1 provider (Rust) tồn tại, các field này sẽ là dead field (không ai đọc) → tự vi phạm `-D warnings` (dead_code) mà không mang lại giá trị thật — hoãn đến khi Phase 2 có provider thứ 2 để xác nhận đúng shape (multi-root discovery, prereq gating, refresh policy) thay vì đoán trước. Thêm field + mở rộng bảng khi đó, không phải viết lại.
+  - **`cache_key` gộp thành 1 fn thay vì `CacheSpec` tách lockfile-glob/toolchain-probe:** mỗi provider tự sở hữu toàn bộ cách tính cache key (bao gồm việc dò bao nhiêu file manifest) — generic pipeline không cần biết Go có 2 file (go.mod+go.sum) hay C++ có 1 (compile_commands.json). Rust's `rust_cache_key` (trong `provider.rs`) gọi lại nguyên xi `cache::overlay_cache_key` 4-tham-số đã có sẵn — `cache.rs` và cả 5 test của nó KHÔNG đổi.
+  - `run_overlay_for(provider, conn, root, sub_root, cfg, dirty)` — pipeline chung: `enabled` gate → resolve binary → cache key → `runner::run_indexer` (spawn+poll+timeout generic, thay `run_scip`) → `parse::parse_scip_file(tmp, sub_root)` → `ingest::ingest_occurrences`. Cache file: `provider.cache_file_name` (Rust giữ nguyên `"scip.cache"` — không đổi tên để không phá cache của checkout cũ).
+  - **KHÔNG làm (hoãn sang Phase 2 khi cần):** multi-root marker-file discovery, `config.rs`'s `GoConfig/JavaConfig/...` (không có consumer nào hôm nay), `RefreshPolicy` enum.
+  - Dirty-keys: `source_dirty_keys(conn, langs: &[&str])` (SQL `WHERE language IN (...)`, dùng `rusqlite::params_from_iter` — pattern đã có sẵn ở `tools/common.rs`). `rust_source_dirty_keys` giờ là wrapper 1 dòng.
+  - `run_overlay`/`overlay_status`/`rust_source_dirty_keys` giữ **nguyên xi chữ ký công khai** (0 call site nào trong `lib.rs`/`watcher.rs`/`main.rs`/`recover.rs` phải sửa) — wrapper mỏng gọi `*_for(&provider::RUST, ...)`.
+- **Verify trên dữ liệu thật:** `calm index` qua binary CLI thật trên bản copy fixture `rust_workspace` → **giống hệt số P0.3**: 5 upgraded, 1 ruled_out, 3 inserted, match_rate=0.2777... — xác nhận 0 thay đổi hành vi qua đường ống mới.
+- **Tests:** toàn bộ 32 test trong `scip::*` + `config::scip_config_tests::*` xanh (bao gồm 2 test `#[ignore]` chạy thật với rust-analyzer: `scip::tests::overlay_upgrades_a_real_edge_on_the_fixture` và calm-cli's `scip_overlay_cli.rs::calm_index_cli_upgrades_a_real_edge_on_the_fixture`). Toàn bộ workspace: 496+6+6+108+3 passed, 0 failed. `cargo clippy --workspace --all-targets --features scip-overlay -- -D warnings` sạch (1 lint thật gặp phải: `doc_lazy_continuation` do dòng doc-comment bắt đầu bằng `+` bị hiểu nhầm là markdown list — sửa bằng cách viết lại câu, không `#[allow]`). `cargo fmt --all -- --check` sạch.
+- Đừng làm lại.
 
-### P0.5 — Fixture `multi_lang_workspace` + CI nightly
-- **Vị trí:** `crates/calm-core/tests/fixtures/multi_lang_workspace/` — mỗi ngôn ngữ một dự án mini:
-  - `go/`: go.mod + `helper.go`/`main.go` cùng package (gap chuẩn); `java/`: Maven tối giản, static call cùng package không import; `csharp/`: .csproj + call qua namespace; `c/`: helper.c/main.c + compile_commands.json tối giản; `cpp/`: 1 virtual method call; `js/`: package.json + require + call; `php/`: composer.json + require_once + `$obj->method()`; `sql/`: schema.sql (CREATE TABLE users + CREATE VIEW tham chiếu + 1 procedure CALL).
-- **CI:** job **nightly** (không per-PR) cài rust-analyzer/scip-go/scip-java/scip-dotnet, chạy integration tests đánh dấu `#[ignore]` bằng `--ignored`. Per-PR chỉ chạy phần không cần binary ngoài.
-- **DoD:** fixture commit + nightly workflow xanh. Effort: **S-M**.
+### P0.5 — ✅ ĐÃ XONG — Fixture `multi_lang_workspace` + CI nightly
+- **Vị trí:** `crates/calm-core/tests/fixtures/multi_lang_workspace/` — đúng 8 thư mục như thiết kế gốc (`go/`, `java/`, `csharp/`, `c/`, `cpp/`, `js/`, `php/`, `sql/`), mỗi thư mục là "standard gap" cho ngôn ngữ đó (chi tiết + lý do từng file: xem `multi_lang_workspace/README.md`). Đây là fixture TĨNH (hand-written, không build được) — chưa test nào tham chiếu tới nó (Phase 1/2/3 chưa code); README ghi rõ Phase 1/2/3 nên trỏ `#[ignore]` test riêng vào đây khi cần, không cần sửa gì thêm ở CI.
+- **CI:** `.github/workflows/scip-nightly.yml` (file mới, KHÔNG chung với `ci.yml`) — trigger `schedule` (03:00 UTC) + `workflow_dispatch`. **Cắt phạm vi có chủ đích so với thiết kế gốc:** chỉ cài `rust-analyzer` (qua `dtolnay/rust-toolchain`'s `components:`) — KHÔNG cài scip-go/scip-java/scip-dotnet ngay bây giờ, vì chưa provider Phase 2 nào tồn tại để tiêu thụ chúng (cài toolchain Go/JDK+Gradle/.NET SDK cho các binary không ai gọi là phí phút CI + tăng bề mặt lỗi vô ích). Comment trong file ghi rõ: thêm bước cài đặt cho từng Phase 2 provider ngay khi nó hạ cánh; job luôn chạy `cargo test --workspace -- --ignored` nên tự động nhặt test `#[ignore]` mới, không cần sửa workflow lần nữa.
+- **Verify:** YAML parse hợp lệ (kiểm bằng `pyyaml`); action versions/pin SHA copy nguyên từ `ci.yml` (không tự chế). Lệnh thật trong job (`cargo test --workspace -- --ignored`) đã chạy LOCAL và xanh (2+1 test thật với rust-analyzer). **Chưa xác nhận trên GitHub Actions thật** (phiên này không push/trigger workflow) — DoD gốc yêu cầu "nightly workflow xanh"; phần local-equivalent đã xanh, phần "chạy thật trên GitHub Actions" cần push lên remote + đợi lịch chạy (hoặc `workflow_dispatch` thủ công) để xác nhận, phiên sau nên làm việc đó nếu cần độ tin cậy cao hơn.
+- Đừng làm lại.
 
 ---
 
@@ -206,19 +208,23 @@ Mỗi provider = 1 entry bảng + probe prereq + integration test nightly trên 
 ## 9. Thứ tự thực thi khuyến nghị (dependency graph)
 
 ```
-P0.1 ✅ → P0.2 ✅ → P0.3 ✅ → P0.4 ⬜ → P0.5 ⬜   (tuần tự, nền tảng — dừng ở P0.3, xem banner đầu file)
-sau P0: P1.1 ∥ P1.2 ∥ P1.3 ∥ P1.4 ∥ P1.5  (song song)
-sau P0.4: P2.1 ∥ P2.2 ∥ P2.3 ∥ P2.4 ∥ P2.5 → P2.6
+P0.1 ✅ → P0.2 ✅ → P0.3 ✅ → P0.4 ✅ → P0.5 ✅   (P0 XONG TOÀN BỘ — xem banner đầu file)
+sau P0: P1.1 ∥ P1.2 ∥ P1.3 ∥ P1.4 ∥ P1.5  (song song — CÓ THỂ BẮT ĐẦU NGAY)
+sau P0.4: P2.1 ∥ P2.2 ∥ P2.3 ∥ P2.4 ∥ P2.5 → P2.6   (CÓ THỂ BẮT ĐẦU NGAY — P0.4 đã xong)
 sau P2: P3.1 ∥ P3.2
-P3.3 (SQL): bất kỳ lúc nào sau P0.3 (cần cột edge_kind) — CÓ THỂ BẮT ĐẦU NGAY, không phụ thuộc P0.4/P0.5
-Benchmark harness: dựng ngay sau P0.5, đo baseline trước Phase 2 để chứng minh giá trị overlay
+P3.3 (SQL): bất kỳ lúc nào — CÓ THỂ BẮT ĐẦU NGAY, không phụ thuộc gì thêm
+Benchmark harness: CÓ THỂ DỰNG NGAY (P0.5 xong) — đo baseline trước khi bắt đầu Phase 1/2 để có số so sánh
 ```
 
 Effort tổng ước lượng: P0 ≈ 1.5–2 tuần-người (P0.1-P0.3 đã xong trong 1 phiên); P1 ≈ 1–1.5 tuần; P2 ≈ 2–3 tuần (song song hoá tốt); P3 ≈ 2–3 tuần. SQL độc lập ≈ 1 tuần.
 
-## 10. Điểm dừng phiên này (2026-07-07)
+## 10. Điểm dừng phiên này (2026-07-07, phiên tiếp — sau khi P0.4/P0.5 hoàn tất)
 
-P0.4 chưa bắt đầu — cân nhắc lại trước khi làm: nó là refactor thuần (KHÔNG đổi hành vi, per DoD gốc), giá trị chỉ hiện ra khi Phase 2 có provider thứ 2 thật để cắm vào bảng `ScipProvider`. Xây abstraction với đúng 1 case (Rust) có rủi ro đoán sai shape. 3 lựa chọn cho phiên sau, xem `docs/superskills/session-state-2026-07-07-04.md` để biết chi tiết bối cảnh:
-1. Làm P0.4 + P0.5 trước (đúng thứ tự gốc của kế hoạch).
-2. Bỏ qua P0.4, làm thẳng 1 provider Phase 2 cụ thể (vd Go) trên shape hiện tại của Rust, tổng quát hoá sau khi có 2 case thật.
-3. P3.3 (SQL) độc lập hoàn toàn, có thể làm bất kỳ lúc nào không cần chờ P0.4/P0.5.
+Toàn bộ Phase 0 (P0.1-P0.5) đã xong và verify (build/test/clippy/fmt xanh + smoke test thật trên fixture cho re-run; xem §3 P0.4/P0.5). Thay đổi CHƯA commit tại thời điểm ghi chú này — người dùng chọn gộp P0.4+P0.5 vào 1 commit thay vì tách như P0.1-P0.3, xem lịch sử git để biết commit thật đã tạo chưa.
+
+Không còn phụ thuộc kỹ thuật nào chặn bất kỳ nhánh nào bên dưới — lựa chọn tiếp theo thuần là ưu tiên, không phải trình tự bắt buộc:
+1. **Phase 1** (P1.1 JS stack-graphs · P1.2 PHP · P1.3 Tier-1.5 same-dir · P1.4 C/C++ · P1.5 C#) — song song hoá tốt, mỗi mục effort S/M, không cần binary ngoài, giá trị thấy ngay trên fixture nội bộ.
+2. **Phase 2 provider đầu tiên** (khuyến nghị Go — `scip-go` đơn giản nhất, không cần build-tool network resolve như Java/C#) — giờ có thể cắm thẳng vào bảng `ScipProvider` (P0.4 đã tổng quát hoá) mà không cần sửa lại `mod.rs`/`runner.rs`, chỉ thêm 1 entry + config `GoConfig` khi cần.
+3. **P3.3 (SQL)** — độc lập hoàn toàn, effort M-L riêng, có thể làm song song với 1/2.
+4. **Benchmark harness** (`benchmarks/resolution/`) — đo baseline trước khi Phase 1/2 đổ vào, để có số so sánh "trước/sau" thật.
+5. Xác nhận `.github/workflows/scip-nightly.yml` chạy xanh thật trên GitHub Actions (push + đợi lịch hoặc `workflow_dispatch` thủ công) — phiên này chỉ verify tương đương ở local.
