@@ -1,6 +1,6 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
-  "name": "io.github.eilodon/calm-mcp",
+  "name": "io.github.Eilodon/calm-mcp",
   "description": "MCP server giving coding agents a call-graph-aware, hash-verified view of a codebase, not grep.",
   "repository": {
     "url": "https://github.com/Eilodon/CALM",
