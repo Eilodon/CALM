@@ -1,6 +1,6 @@
 # CALM — Kế hoạch Formal-tier cho 8 ngôn ngữ còn lại (bản đã audit)
 
-> **Ngày:** 2026-07-07 · **Trạng thái:** P0 (P0.1–P0.5) VÀ Phase 1 (P1.1–P1.5) ĐÃ XONG TOÀN BỘ. P0.1-P0.3: commit `20f4265`, `40e6b40`, `e0471f9`. P0.4-P0.5: commit `bae5161`. P1.3: `fdf0aaf`. P1.4: `7ba5fb5`. P1.5: `d7178b9` (partial — xem ghi chú trong mục). P1.2: `7b7dec7`. P1.1: cùng phiên, xem lịch sử git cho commit cụ thể. **`benchmarks/resolution/` (§7) ĐÃ XONG** — baseline thật 8/8 ngôn ngữ đo xong, kèm 1 bug crash thật tìm+sửa (C, xem §7). Phase 2/3 CHƯA thực thi. Xem §3/§4/§7 để biết chi tiết những gì đã làm; đừng làm lại.
+> **Ngày:** 2026-07-08 (cập nhật) · **Trạng thái:** P0 (P0.1–P0.5) VÀ Phase 1 (P1.1–P1.5) ĐÃ XONG TOÀN BỘ. P0.1-P0.3: commit `20f4265`, `40e6b40`, `e0471f9`. P0.4-P0.5: commit `bae5161`. P1.3: `fdf0aaf`. P1.4: `7ba5fb5`. P1.5: `d7178b9` (partial — xem ghi chú trong mục). P1.2: `7b7dec7`. P1.1: cùng phiên, xem lịch sử git cho commit cụ thể. **`benchmarks/resolution/` (§7) ĐÃ XONG** — baseline thật 8/8 ngôn ngữ đo xong, kèm 1 bug crash thật tìm+sửa (C, xem §7). **Phase 2: P2.1 (Go) ĐÃ XONG** — commit `6603e49`, verify thật với scip-go thật (xem §5's bảng, dòng P2.1). Còn lại P2.2-P2.6 và Phase 3 CHƯA thực thi. Xem §3/§4/§5/§7 để biết chi tiết những gì đã làm; đừng làm lại.
 > **Phạm vi:** Go · Java · C# · C · C++ · JavaScript · PHP · SQL (+ Python nâng chuẩn, + Kotlin bonus)
 > **Nguồn gốc:** Kế hoạch SCIP-overlay gốc của user + audit codebase & SOTA research phiên 2026-07-07.
 > Mọi khẳng định codebase trong file này ĐÃ ĐƯỢC XÁC MINH trên working tree ngày 2026-07-07 — phiên sau không cần re-verify trừ khi file liên quan đã đổi.
@@ -173,7 +173,7 @@ Mỗi provider = 1 entry bảng + probe prereq + integration test nightly trên 
 
 | # | Provider | Markers | Invoke | Cache key inputs | Prereq/policy | Ghi chú |
 |---|---|---|---|---|---|---|
-| P2.1 | go | `go.mod` (enumerate qua `go.work` nếu có) | `scip-go --output {out}` tại module dir | hash(go.mod+go.sum) + `go version` + dirty .go trong module | Go toolchain; policy OnSave/MinInterval ok (nhẹ) | Multi-module TỰ xử lý (upstream incomplete); mỗi module một run + rebase P0.2 |
+| P2.1 | go | ✅ **XONG (V1 single-module)** — commit `6603e49`. `provider::GO` (`crates/calm-core/src/scip/provider.rs`) + `go_resolve_binary`/`go_build_command`/`go_toolchain_fingerprint` (`runner.rs`) + `GoConfig` (`config.rs`) + `run_go_overlay_and_log` (`mod.rs`), wired vào đúng 3 call site production (lib.rs/watcher.rs/main.rs) cạnh Rust. **Verify thật bằng scip-go thật** (`go install github.com/scip-code/scip-go/cmd/scip-go@latest` — LƯU Ý module path đã đổi từ `sourcegraph/scip-go`, xem §2) trên fixture 2-package cross-call: `calm index` → 2 edge upgrade `formal`/`formal_source=scip`, match_rate=0.67; lần chạy 2 cache-skip đúng, không re-invoke. **Chưa làm (V2, hoãn có chủ đích):** multi-module `go.work` enumerate (P0.4's `ScipProvider` vẫn chưa có field marker/multi-root — Go V1 chỉ single go.mod ở root, đúng như phần lớn checkout thật). Toàn bộ workspace 658 test xanh (527+2 mới), clippy `-D warnings` sạch, fmt sạch. Đừng làm lại V1. | ~~`scip-go --output {out}` tại module dir~~ → thật: `scip-go index --module-root {root} --output {out} --quiet` | hash(go.mod+go.sum) + `go version` + dirty .go trong module | Go toolchain; policy OnSave/MinInterval ok (nhẹ) | Multi-module (`go.work`) CHƯA xử lý — V2 |
 | P2.2 | java | `pom.xml`/`build.gradle(.kts)`/`settings.gradle` | `scip-java index --output {out}` | build files + lockfiles + JDK version | JDK + build resolve (mạng lần đầu). **Policy: OnDemand/MinInterval(15m+)** — full build, KHÔNG on-save. Docs: khuyến nghị Docker `sourcegraph/scip-java` cho CI | Giữ stack-graphs Java làm fallback. **Bonus: Kotlin/Scala free** — thêm ext mapping khi bật |
 | P2.3 | csharp | `*.sln`/`*.csproj` | `scip-dotnet index` | csproj/sln + packages.lock.json + `dotnet --version` | .NET 8 SDK; policy MinInterval | |
 | P2.4 | python | `pyproject.toml`/`setup.py`/`requirements.txt` | `scip-python index . --output {out}` | lockfile + `python --version` | npm package (cần node) — probe cả binary lẫn `npx` | Nâng Python lên formal THẬT (hiện chỉ stack-graphs archived) |
@@ -259,7 +259,7 @@ Mỗi provider = 1 entry bảng + probe prereq + integration test nightly trên 
 ```
 P0.1 ✅ → P0.2 ✅ → P0.3 ✅ → P0.4 ✅ → P0.5 ✅   (P0 XONG TOÀN BỘ)
 P1.1 ✅ ∥ P1.2 ✅ ∥ P1.3 ✅ ∥ P1.4 ✅ ∥ P1.5 ✅ (partial, xem ghi chú)   (PHASE 1 XONG TOÀN BỘ)
-sau P0.4: P2.1 ∥ P2.2 ∥ P2.3 ∥ P2.4 ∥ P2.5 → P2.6   (CÓ THỂ BẮT ĐẦU NGAY — P0.4 đã xong)
+P2.1 ✅ (Go, V1 single-module, commit `6603e49`) ∥ P2.2 ∥ P2.3 ∥ P2.4 ∥ P2.5 → P2.6   (P2.2-P2.6 mở)
 sau P2: P3.1 ∥ P3.2
 P3.3 (SQL): bất kỳ lúc nào — CÓ THỂ BẮT ĐẦU NGAY, không phụ thuộc gì thêm
 Benchmark harness: ✅ XONG (2026-07-07) — xem §7, kết quả baseline đầu tiên đã đo thật, 8/8 ngôn ngữ
@@ -268,7 +268,33 @@ P1.5's "using→namespace" nửa còn lại: mở, cần 1 pre-pass kiến trúc
 
 Effort tổng ước lượng: P0 ≈ 1.5–2 tuần-người (P0.1-P0.3 đã xong trong 1 phiên); P1 ≈ 1–1.5 tuần; P2 ≈ 2–3 tuần (song song hoá tốt); P3 ≈ 2–3 tuần. SQL độc lập ≈ 1 tuần.
 
-## 10. Điểm dừng phiên này (2026-07-07, phiên tiếp — sau khi Phase 0 VÀ Phase 1 hoàn tất toàn bộ)
+## 10. Điểm dừng phiên 2026-07-08 — sau khi P2.1 (Go) xong (MỚI NHẤT — đọc mục này trước §10.1)
+
+**Môi trường sandbox này (không phải mọi môi trường):** Go 1.24.7 + network tới `proxy.golang.org` sẵn có → `go install github.com/scip-code/scip-go/cmd/scip-go@latest` cài và chạy được ngay (lưu ý: org đã đổi từ `sourcegraph/scip-go` sang `scip-code/scip-go`, khớp §2's ghi chú "SCIP → community governance 03/2026"). Node 22 + npm cũng có → `@sourcegraph/scip-typescript@0.4.0` và `@sourcegraph/scip-python@0.6.6` resolve được trên registry (chưa thử cài/chạy thật) → P2.4/P3.2 khả thi kỹ thuật, chưa verify. JDK 21+Gradle+Maven có sẵn nhưng tải release scip-java từ GitHub bị 403 qua proxy trong sandbox này (không thử coursier/Docker) → P2.2 ma sát cao hơn ở đây. Không có .NET SDK → P2.3 không khả thi trong sandbox này. `davidrjenni/scip-php`'s module path Go không đúng như kỳ vọng khi thử `go install` trực tiếp → P2.5 cần điều tra thêm.
+
+**Đã làm (P2.1 — Go, V1 single-module):**
+- `crates/calm-core/src/scip/provider.rs::GO` — entry thứ 2 trong bảng `ScipProvider`, xác nhận thiết kế P0.4 tổng quát hoá đúng thật (không cần sửa `mod.rs`/`runner.rs`'s core logic).
+- `runner.rs::go_resolve_binary`/`go_build_command`/`go_toolchain_fingerprint`/`GO_SCIP_TIMEOUT` (180s, cao hơn Rust's 120s — Go compiler-driven typecheck chậm hơn LSP incremental).
+- `config.rs::GoConfig` (mirror `RustConfig`, cùng `ScipConfig` 3-trạng thái).
+- `mod.rs::run_go_overlay_and_log` — helper gộp refresh+log, tránh copy ~15 dòng lần thứ 3 ở mỗi trong 3 call site production (`lib.rs`, `watcher.rs`, `main.rs`) — chỉ 1 hàm mới cần sửa nếu provider thứ 3 xuất hiện.
+- **Verify thật bằng scip-go thật** (không chỉ fixture giả): fixture Go 2-package (`main.go` gọi `pkg.Helper()`) → `calm index` → 2 edge upgrade thành `formal`/`formal_source='scip'`, match_rate=0.67; chạy `calm index` lần 2 (không đổi gì) → cache-skip đúng, KHÔNG re-invoke `scip-go`. Test `PRAGMA table_info`/`SELECT * FROM call_edges` xác nhận trực tiếp qua sqlite3 (python3, vì `sqlite3` CLI không có trong sandbox).
+- 2 test mới: `go_explicit_off_is_a_noop_even_when_scip_go_is_on_path` (mod.rs), `go_binary_runs_rejects_a_nonexistent_path` (runner.rs) — mirror đúng 2 test tương ứng của Rust.
+- Toàn bộ workspace: 658 test xanh (527+2 mới +... — bản build trước P2.1 đã ở 656 do 2 test go thêm vào 526 gốc, khớp; xem log thật trong commit), `cargo clippy --workspace --all-targets --features scip-overlay -- -D warnings` sạch, `cargo fmt --all -- --check` sạch.
+- Commit: `6603e49` (`feat(scip): Go SCIP provider via scip-go (P2.1)`).
+- Đừng làm lại V1.
+
+**Cắt phạm vi có chủ đích (V2, chưa làm):**
+- `go.work` multi-module enumerate — P0.4's `ScipProvider` chưa có field marker-file/multi-root discovery; Go V1 chỉ chạy 1 lần ở project root (đúng cho phần lớn checkout single-module thật, đúng tinh thần "hoãn field tới khi có 2nd/3rd case xác nhận shape" của P0.4's chính nó).
+- P2.6 (ops surface: `calm scip run`, `--scip-file` CI ingest, refresh policy config, per-language `indexing_status`/`fitness_report`) — chưa làm, vẫn dùng chung sidecar `scip-stats.json` với Rust (ghi đè lẫn nhau nếu cả 2 provider cùng chạy 1 lúc — bug nhỏ có sẵn từ P0.4, không phải P2.1 gây ra, nên fix khi làm P2.6).
+
+**Tiếp theo (ưu tiên theo môi trường thật, không chỉ theo bảng gốc):**
+1. **P3.3 (SQL)** — độc lập hoàn toàn, không cần toolchain ngoài nào, effort thấp nhất trong các lựa chọn còn lại.
+2. **P2.4 (Python, scip-python)** hoặc **P3.2 (JS/TS, scip-typescript)** — cả 2 chỉ cần Node/npm (đã xác nhận có), chưa thử chạy thật — nên thử cài+chạy thật trước khi code, như đã làm với Go.
+3. P2.2 (Java) — toolchain có nhưng tải release bị chặn trong sandbox này; cần tìm đường khác (coursier, Docker image `sourcegraph/scip-java`) trước khi bắt đầu code.
+4. P2.3 (C#) — bỏ qua trong sandbox này (không có .NET SDK); không chặn các nhánh khác.
+5. P2.6 (ops surface) — làm sau khi có ≥2 provider Phase 2 thật để tránh đoán trước shape config (đúng tinh thần P0.4).
+
+## 10.1 Điểm dừng phiên 2026-07-07 (Phase 0+1 xong) — LỊCH SỬ, xem §10 ở trên cho trạng thái hiện tại
 
 Phase 0 (P0.1-P0.5) và Phase 1 (P1.1-P1.5, P1.5 partial) đã xong và verify đầy đủ (build/test/clippy/fmt xanh sau MỖI mục, không chỉ ở cuối). Mỗi mục Phase 1 đã có commit riêng (P1.3 `fdf0aaf`, P1.4 `7ba5fb5`, P1.5 `d7178b9`, P1.2 `7b7dec7`; P1.1 xem git log). Toàn bộ workspace ở lần verify cuối: 526 test, 0 fail.
 
