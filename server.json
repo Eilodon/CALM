@@ -1,7 +1,7 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.eilodon/calm-mcp",
-  "description": "CALM (Coding Agent Liveness Map) — a Rust MCP server that gives coding agents a call-graph-aware, hash-verified view of a codebase: locate/source/edit_symbol/diff_impact and 22 tools total, backed by a multi-tier resolver (syntactic -> Stack Graphs -> SCIP) instead of grep.",
+  "description": "MCP server giving coding agents a call-graph-aware, hash-verified view of a codebase, not grep.",
   "repository": {
     "url": "https://github.com/Eilodon/CALM",
     "source": "github"
