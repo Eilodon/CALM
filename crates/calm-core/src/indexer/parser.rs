@@ -984,7 +984,7 @@ fn module_hint_of(raw: &str) -> Option<String> {
 /// resolution behavior, so the cost of missing one is low; a false positive
 /// (treating a module as a type) just means a class-scoped lookup that
 /// finds nothing, same as today.
-fn is_type_like(segment: &str) -> bool {
+pub(crate) fn is_type_like(segment: &str) -> bool {
     segment.chars().next().is_some_and(|c| c.is_uppercase())
 }
 

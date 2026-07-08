@@ -423,6 +423,36 @@ fn extract_file_data(
                 {
                     confidence = EdgeConfidence::Inferred;
                     target_class = Some(cls);
+                } else if confidence == EdgeConfidence::Textual
+                    && lang == "csharp"
+                    && let Some(receiver) = &c.receiver
+                    && crate::indexer::parser::is_type_like(receiver)
+                {
+                    // C# has no separate static-access operator (`.` covers
+                    // both `helper.Greet()` and `Helper.Greet()`), so
+                    // `receiver_is_type_path` — set only on the `::` branch
+                    // of `split_receiver_callee`, shared by every language —
+                    // never fires here, and tier-2 just tried `receiver` as
+                    // a *variable* name (it isn't one) and missed. Without
+                    // this, `Helper.Greet()` fell through to `rebuild_graph`'s
+                    // unscoped `by_name` fan-out on the bare method name
+                    // alone — silently wrong (or `Ambiguous`) the moment two
+                    // same-named methods exist anywhere in the C# codebase.
+                    // Scoped to csharp only (a `lang` string check, not a
+                    // change to the shared `is_type_like`/
+                    // `split_receiver_callee` used by every other language)
+                    // to keep this a zero-blast-radius fix elsewhere — see
+                    // the 8-language plan's P1.5 for the equivalent Java gap
+                    // this does NOT fix (out of scope here).
+                    // `rebuild_graph`'s same-namespace narrowing (8-language
+                    // plan P1.5's "using -> namespace" remainder) may still
+                    // upgrade this to `Resolved` once it can confirm
+                    // `receiver` is declared in one of this file's active
+                    // `using` namespaces — that needs the whole-project
+                    // `NamespaceMap`, unavailable here (extract_file_data
+                    // runs per-file, in parallel, before it's built).
+                    confidence = EdgeConfidence::Inferred;
+                    target_class = Some(receiver.clone());
                 }
             }
             let callee = aliases.get(&c.callee).unwrap_or(&c.callee).clone();
@@ -512,6 +542,7 @@ fn rebuild_graph(
     hub_config: &crate::config::HubThresholdConfig,
     crate_map: &crate::indexer::crate_map::CrateMap,
     psr4: &crate::indexer::psr4::Psr4Map,
+    namespace_map: &crate::indexer::csharp_namespace::NamespaceMap,
 ) -> rusqlite::Result<()> {
     // name → [(qn, path, language)] for tier-1; (name, class) → [(qn, path,
     // language)] for tier-2. `language` rides along so a call site can never
@@ -587,6 +618,29 @@ fn rebuild_graph(
         .collect::<rusqlite::Result<Vec<_>>>()?
     };
 
+    // C# `using X;` directives, per caller file — feeds the same-namespace
+    // candidate narrowing below (8-language plan P1.5's "using -> namespace"
+    // remainder). `import_edges` is already populated by this point (this
+    // function runs after every file in the current batch is parsed and
+    // persisted), so no extra parse pass is needed; filtering to `.cs` keeps
+    // this cheap and skips rows other languages' imports could never match
+    // anyway (`NamespaceMap` only ever knows about C# namespaces).
+    let mut caller_usings: HashMap<String, HashSet<String>> = HashMap::new();
+    if !namespace_map.is_empty() {
+        let mut stmt = tx.prepare(
+            "SELECT from_path, module_name FROM import_edges WHERE from_path LIKE '%.cs'",
+        )?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (from_path, module_name) in rows {
+            caller_usings
+                .entry(from_path)
+                .or_default()
+                .insert(module_name);
+        }
+    }
+
     // One edge per (caller, callee, call-site line) — distinct sites in the same caller stay separate (so `callers`/`callees` show every site); exact same-line dupes are deduped.
     // Confidence is the resolver's verdict recorded at extraction time. A tier-2
     // call (target_class set) resolves the method within that class only.
@@ -609,7 +663,11 @@ fn rebuild_graph(
     // fix never covered this general by-name/by-name-class path, so the bug
     // survived here. Only fan out globally when nothing in-file matches, and
     // even then only up to MAX_CALLEE_CANDIDATES.
-    let candidates: Vec<Vec<(String, String)>> = sites
+    // `bool` = this site's target list was narrowed down to a single
+    // candidate by the C# same-namespace check below, confirmed against a
+    // real `namespace` declaration (not just a heuristic) — the second loop
+    // upgrades such a site's confidence to `resolved` on that signal.
+    let candidates: Vec<(Vec<(String, String)>, bool)> = sites
         .par_iter()
         .map(
             |(
@@ -628,7 +686,7 @@ fn rebuild_graph(
                     None => by_name.get(callee),
                 };
                 let Some(t) = targets else {
-                    return Vec::new();
+                    return (Vec::new(), false);
                 };
                 // Same-language filter: a call site can only ever resolve to a
                 // symbol written in the same language as its caller — a
@@ -647,7 +705,7 @@ fn rebuild_graph(
                     .map(|(qn, path, _)| (qn.clone(), path.clone()))
                     .collect();
                 if same_lang.is_empty() {
-                    return Vec::new();
+                    return (Vec::new(), false);
                 }
                 let t = &same_lang;
                 // Return-shape exclusion: `foo.bar()?`/`foo.bar().unwrap()` can only
@@ -672,7 +730,7 @@ fn rebuild_graph(
                     t
                 };
                 if t.is_empty() {
-                    return Vec::new();
+                    return (Vec::new(), false);
                 }
                 // Module-qualifier preference: `crate::telemetry::timed_tool()`
                 // carries an explicit, unambiguous module segment in the source
@@ -696,7 +754,7 @@ fn rebuild_graph(
                         .cloned()
                         .collect();
                     if !hinted.is_empty() {
-                        return hinted;
+                        return (hinted, false);
                     }
                 }
                 let same_file: Vec<_> = t.iter().filter(|(_, p)| p == from_path).cloned().collect();
@@ -728,14 +786,39 @@ fn rebuild_graph(
                         .collect();
                     (!dir_matches.is_empty()).then_some(dir_matches)
                 };
+                // Same-namespace preference (8-language plan P1.5's "using ->
+                // namespace" remainder), C#-only: a `Type.Method()` call
+                // (part A above sets `target_class = receiver` for these)
+                // whose bare class name collides across namespaces can be
+                // disambiguated by which namespace(s) this caller's `using`
+                // directives actually bring into scope — real evidence from
+                // `NamespaceMap` (built from `namespace` declarations, not a
+                // directory convention), so a narrowing to exactly one
+                // candidate here also upgrades confidence to `resolved`
+                // below (see the `bool` in this closure's return type).
+                let same_namespace = || -> Option<Vec<(String, String)>> {
+                    if caller_lang.map(String::as_str) != Some("csharp") {
+                        return None;
+                    }
+                    let usings = caller_usings.get(from_path)?;
+                    let ns_matches: Vec<_> = t
+                        .iter()
+                        .filter(|(_, p)| usings.iter().any(|ns| namespace_map.contains(ns, p)))
+                        .cloned()
+                        .collect();
+                    (!ns_matches.is_empty()).then_some(ns_matches)
+                };
                 if !same_file.is_empty() {
-                    same_file
+                    (same_file, false)
                 } else if let Some(dir_matches) = same_dir() {
-                    dir_matches
+                    (dir_matches, false)
+                } else if let Some(ns_matches) = same_namespace() {
+                    let confirmed = ns_matches.len() == 1;
+                    (ns_matches, confirmed)
                 } else if t.len() <= MAX_CALLEE_CANDIDATES {
-                    t.clone()
+                    (t.clone(), false)
                 } else {
-                    Vec::new()
+                    (Vec::new(), false)
                 }
             },
         )
@@ -743,8 +826,10 @@ fn rebuild_graph(
 
     let mut edges: Vec<CallEdge> = Vec::new();
     let mut seen_pairs: HashSet<(String, String, Option<i64>)> = HashSet::new();
-    for ((from_path, enc_qn, _callee, line, confidence, _target_class, _, _, edge_kind), targets) in
-        sites.iter().zip(candidates.iter())
+    for (
+        (from_path, enc_qn, _callee, line, confidence, _target_class, _, _, edge_kind),
+        (targets, namespace_confirmed),
+    ) in sites.iter().zip(candidates.iter())
     {
         // >1 surviving candidate means this call site's edge is duplicated
         // across multiple distinct symbols with nothing left to break the
@@ -754,6 +839,8 @@ fn rebuild_graph(
         // site, not per final-candidate-count).
         let effective_confidence = if targets.len() > 1 {
             EdgeConfidence::Ambiguous.as_str()
+        } else if *namespace_confirmed {
+            EdgeConfidence::Resolved.as_str()
         } else {
             confidence.as_str()
         };
@@ -788,7 +875,7 @@ fn rebuild_graph(
         [],
     )?;
     refresh_caller_counts(tx)?;
-    resolve_import_targets(tx, crate_map, psr4)?;
+    resolve_import_targets(tx, crate_map, psr4, namespace_map)?;
     crate::graph::coreness::compute_coreness(tx)?;
     crate::graph::hub::update_is_hub_flags(tx, hub_config)?;
     Ok(())
@@ -829,6 +916,7 @@ fn resolve_import_targets(
     tx: &rusqlite::Transaction,
     crate_map: &crate::indexer::crate_map::CrateMap,
     psr4: &crate::indexer::psr4::Psr4Map,
+    namespace_map: &crate::indexer::csharp_namespace::NamespaceMap,
 ) -> rusqlite::Result<()> {
     let known: HashSet<String> = {
         let mut stmt = tx.prepare("SELECT path FROM file_index")?;
@@ -853,7 +941,7 @@ fn resolve_import_targets(
     let targets: Vec<Option<String>> = rows
         .par_iter()
         .map(|(_, from_path, module)| {
-            resolve_module_to_path(from_path, module, &known, crate_map, psr4)
+            resolve_module_to_path(from_path, module, &known, crate_map, psr4, namespace_map)
         })
         .collect();
 
@@ -1003,6 +1091,7 @@ fn resolve_module_to_path(
     known: &HashSet<String>,
     crate_map: &crate::indexer::crate_map::CrateMap,
     psr4: &crate::indexer::psr4::Psr4Map,
+    namespace_map: &crate::indexer::csharp_namespace::NamespaceMap,
 ) -> Option<String> {
     let m = module.trim().trim_matches(|c| c == '"' || c == '\'');
     if m.is_empty() {
@@ -1031,6 +1120,20 @@ fn resolve_module_to_path(
         && known.contains(&hit)
     {
         return Some(hit);
+    }
+
+    // C#: `using MultiLang;` names a namespace directly (no PSR-4-style
+    // prefix→dir table needed — `csharp_namespace::NamespaceMap` already
+    // read every real `namespace` declaration). Only resolves when exactly
+    // one file declares that namespace — a namespace legitimately spanning
+    // several files has no single correct `to_path` (single-valued column,
+    // see `NamespaceMap::resolve`'s doc comment), so it's left `None` rather
+    // than guessing one of them.
+    if from_path.ends_with(".cs")
+        && let Some(hit) = namespace_map.resolve(m)
+        && known.contains(hit)
+    {
+        return Some(hit.to_string());
     }
 
     // Build candidate base paths (without extension), forward-slash normalised.
@@ -1254,7 +1357,14 @@ pub fn run_indexing_pipeline(
 
     let crate_map = crate::indexer::crate_map::CrateMap::build(project_root);
     let psr4 = crate::indexer::psr4::Psr4Map::build(project_root);
-    rebuild_graph(&tx, &config.hub_threshold, &crate_map, &psr4)?;
+    let namespace_map = crate::indexer::csharp_namespace::NamespaceMap::build(project_root);
+    rebuild_graph(
+        &tx,
+        &config.hub_threshold,
+        &crate_map,
+        &psr4,
+        &namespace_map,
+    )?;
     tx.commit()?;
 
     *phase.write().unwrap() = IndexingPhase::Ready;
@@ -1379,7 +1489,14 @@ pub fn reindex_changed(
     if !summary.is_noop() {
         let crate_map = crate::indexer::crate_map::CrateMap::build(project_root);
         let psr4 = crate::indexer::psr4::Psr4Map::build(project_root);
-        rebuild_graph(&tx, &config.hub_threshold, &crate_map, &psr4)?;
+        let namespace_map = crate::indexer::csharp_namespace::NamespaceMap::build(project_root);
+        rebuild_graph(
+            &tx,
+            &config.hub_threshold,
+            &crate_map,
+            &psr4,
+            &namespace_map,
+        )?;
     }
     tx.commit()?;
     Ok(summary)
@@ -2648,6 +2765,210 @@ impl StructB {
                 "{wrong_count_desc} must NOT also fan out to the unrelated Square::Area"
             );
         }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    // P1.5 remainder (8-language plan, "using -> namespace"), both parts:
+    // `Helper.Greet()` is a type-qualified static call — C# has no separate
+    // static-access operator, so `receiver_is_type_path` never fires on the
+    // `.` branch shared by every language, and tier-2 tried "Helper" as a
+    // *variable* name (it isn't one) and missed. Before part A's fix the
+    // call fell through to `rebuild_graph`'s unscoped `by_name` fan-out on
+    // the bare method name alone: two same-named methods anywhere in the C#
+    // codebase (Helper.Greet and Other.Greet here) meant `Ambiguous`, not a
+    // correct single edge. Part B's `NamespaceMap` then confirms Helper is
+    // really declared in the `using`d `MultiLang` namespace, upgrading the
+    // edge from `inferred` (part A alone) to `resolved`.
+    fn test_csharp_type_qualified_static_call_resolves_via_target_class() {
+        let dir =
+            std::env::temp_dir().join(format!("ci_idx_csharp_typepath_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("helper.cs"),
+            "namespace MultiLang\n{\n    public static class Helper\n    {\n        public static string Greet(string name) { return name; }\n    }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("other.cs"),
+            "namespace Elsewhere\n{\n    public static class Other\n    {\n        public static string Greet(string name) { return name; }\n    }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("program.cs"),
+            "using MultiLang;\n\nclass Program\n{\n    static void Main()\n    {\n        System.Console.WriteLine(Helper.Greet(\"world\"));\n    }\n}\n",
+        )
+        .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
+
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM call_edges \
+                 WHERE from_symbol = (SELECT qualified_name FROM symbols WHERE name = 'Main') \
+                 AND to_symbol = (SELECT qualified_name FROM symbols WHERE name = 'Greet' AND class_context = 'Helper') \
+                 AND edge_confidence = 'resolved'",
+            ),
+            1,
+            "Helper.Greet() must resolve to Helper::Greet via target_class scoping; confidence \
+             is 'resolved' (not just 'inferred') because `using MultiLang;` plus a real \
+             `namespace MultiLang` declaration on Helper's file confirms the match — the \
+             same-namespace narrowing this test's `program.cs` `using` line is meant to exercise"
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM call_edges \
+                 WHERE from_symbol = (SELECT qualified_name FROM symbols WHERE name = 'Main') \
+                 AND to_symbol = (SELECT qualified_name FROM symbols WHERE name = 'Greet' AND class_context = 'Other')",
+            ),
+            0,
+            "must NOT also fan out to the unrelated Other::Greet just because both are named Greet"
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM call_edges \
+                 WHERE from_symbol = (SELECT qualified_name FROM symbols WHERE name = 'Main') \
+                 AND edge_confidence = 'ambiguous'",
+            ),
+            0,
+            "must not be Ambiguous — target_class scoping should have picked exactly one candidate"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    // P1.5 remainder, the actual disambiguation case the "using -> namespace"
+    // gap was closed for: TWO classes named `Helper` exist, in different
+    // namespaces — `by_name_class` alone can't tell them apart (its key is
+    // the bare class name, "Helper", not a namespace-qualified one). Without
+    // `NamespaceMap`, both would survive candidate narrowing and the edge
+    // would be marked `Ambiguous`. With it, the caller's `using MultiLang;`
+    // picks out exactly the Helper declared in that namespace.
+    fn test_csharp_same_class_name_in_different_namespaces_disambiguated_by_using() {
+        let dir =
+            std::env::temp_dir().join(format!("ci_idx_csharp_ns_collision_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("multilang_helper.cs"),
+            "namespace MultiLang\n{\n    public static class Helper\n    {\n        public static string Greet(string name) { return name; }\n    }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("elsewhere_helper.cs"),
+            "namespace Elsewhere\n{\n    public static class Helper\n    {\n        public static string Greet(string name) { return \"nope\"; }\n    }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("program.cs"),
+            "using MultiLang;\n\nclass Program\n{\n    static void Main()\n    {\n        System.Console.WriteLine(Helper.Greet(\"world\"));\n    }\n}\n",
+        )
+        .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
+
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM call_edges \
+                 WHERE from_symbol = (SELECT qualified_name FROM symbols WHERE name = 'Main') \
+                 AND to_symbol = 'multilang_helper.cs::Helper::Greet' \
+                 AND edge_confidence = 'resolved'",
+            ),
+            1,
+            "must resolve to the MultiLang.Helper.Greet the `using MultiLang;` actually named, \
+             confidence resolved (namespace-confirmed)"
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM call_edges \
+                 WHERE from_symbol = (SELECT qualified_name FROM symbols WHERE name = 'Main') \
+                 AND to_symbol = 'elsewhere_helper.cs::Helper::Greet'",
+            ),
+            0,
+            "must NOT also resolve to Elsewhere.Helper.Greet — it was never `using`d"
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM call_edges \
+                 WHERE from_symbol = (SELECT qualified_name FROM symbols WHERE name = 'Main') \
+                 AND edge_confidence = 'ambiguous'",
+            ),
+            0,
+            "must not be Ambiguous — the using-confirmed namespace should have broken the tie"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    // P1.5 remainder: `import_edges.to_path` (the `dependencies` tool's data
+    // source) resolves a `using X;` to the single file declaring namespace
+    // X, and stays NULL when the namespace spans 2+ files — `to_path` is a
+    // single-valued column, so an ambiguous namespace intentionally gets no
+    // guess rather than an arbitrary one (see `NamespaceMap::resolve`).
+    fn test_csharp_using_resolves_import_edge_to_path_when_unambiguous() {
+        let dir =
+            std::env::temp_dir().join(format!("ci_idx_csharp_to_path_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("helper.cs"),
+            "namespace MultiLang\n{\n    public static class Helper {}\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("shared_a.cs"),
+            "namespace Shared\n{\n    public class A {}\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("shared_b.cs"),
+            "namespace Shared\n{\n    public class B {}\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("program.cs"),
+            "using MultiLang;\nusing Shared;\n\nclass Program {}\n",
+        )
+        .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
+
+        let unambiguous_to_path: String = conn
+            .query_row(
+                "SELECT to_path FROM import_edges WHERE from_path = 'program.cs' AND module_name = 'MultiLang'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(unambiguous_to_path, "helper.cs");
+
+        let ambiguous_to_path: Option<String> = conn
+            .query_row(
+                "SELECT to_path FROM import_edges WHERE from_path = 'program.cs' AND module_name = 'Shared'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            ambiguous_to_path, None,
+            "Shared spans 2 files — to_path must stay NULL, not guess one"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

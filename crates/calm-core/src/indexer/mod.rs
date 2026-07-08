@@ -1,5 +1,6 @@
 pub mod chunker;
 pub mod crate_map;
+pub mod csharp_namespace;
 pub mod edges;
 pub mod imports;
 pub mod lang_constants;

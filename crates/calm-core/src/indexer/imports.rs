@@ -57,6 +57,13 @@ fn import_node_types(language: &str) -> &'static [&'static str] {
             "include_once_expression",
             "namespace_use_declaration",
         ],
+        // `using MultiLang;` — brings a namespace's types into scope. Unlike
+        // every other language's import here, it binds no single name (see
+        // `parse_csharp_using`), so its only job is feeding `import_edges`
+        // and — via `csharp_namespace::NamespaceMap` (8-language plan P1.5's
+        // "using -> namespace" remainder) — the caller's active-namespace
+        // set consulted at `rebuild_graph` time.
+        "csharp" => &["using_directive"],
         _ => &[],
     }
 }
@@ -111,6 +118,7 @@ fn parse_import(text: &str, language: &str) -> Option<ParsedImport> {
         "r" => parse_r_library(text),
         "c" | "cpp" => parse_c_include(text),
         "php" => parse_php_import(text),
+        "csharp" => parse_csharp_using(text),
         _ => None,
     }
 }
@@ -499,6 +507,33 @@ fn parse_php_use(text: &str) -> Option<ParsedImport> {
         imported_names: name.into_iter().collect(),
     })
 }
+
+/// `using MultiLang;` / `using System.Collections.Generic;` — brings every
+/// type in the named namespace into unqualified/qualified-shorthand scope
+/// for the rest of the file. Unlike PHP's `use App\Service\Foo;` this binds
+/// no single name (there's no "Foo" to extract — the whole namespace is in
+/// play), so `imported_names` stays empty, same treatment as `#include`/
+/// `require`. `module_name` keeps the dotted namespace text as written;
+/// `csharp_namespace::NamespaceMap` (built from real `namespace`
+/// declarations, not this text) is what actually resolves it to file(s).
+///
+/// `using static Type;` (imports a type's *static members*, not a
+/// namespace) and `using Alias = Namespace.Type;` (a type alias) are
+/// deliberately left unhandled (`None`) — neither is "this file can now see
+/// namespace X", the only shape `NamespaceMap` resolves; confirmed via the
+/// real grammar that both share `using_directive`'s node kind with the
+/// plain form, so the distinction has to be made here, from the text.
+fn parse_csharp_using(text: &str) -> Option<ParsedImport> {
+    let rest = text.strip_prefix("using")?.trim();
+    if rest.is_empty() || rest.starts_with("static ") || rest.contains('=') {
+        return None;
+    }
+    Some(ParsedImport {
+        module_name: rest.to_string(),
+        imported_names: Vec::new(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -692,6 +727,37 @@ mod tests {
             i.imported_names,
             vec!["Bar".to_string()],
             "an alias binds the alias name, not the original"
+        );
+    }
+
+    #[test]
+    fn csharp_using_plain_namespace() {
+        let i = one("using MultiLang;\n", "csharp");
+        assert_eq!(i.module_name, "MultiLang");
+        assert!(
+            i.imported_names.is_empty(),
+            "using binds no single name, unlike PHP's use"
+        );
+    }
+    #[test]
+    fn csharp_using_dotted_namespace() {
+        let i = one("using System.Collections.Generic;\n", "csharp");
+        assert_eq!(i.module_name, "System.Collections.Generic");
+    }
+    #[test]
+    fn csharp_using_static_yields_no_import() {
+        let v = extract_imports("using static System.Console;\n", "csharp");
+        assert!(
+            v.is_empty(),
+            "using static imports a type's members, not a namespace — expected no import, got {v:?}"
+        );
+    }
+    #[test]
+    fn csharp_using_alias_yields_no_import() {
+        let v = extract_imports("using X = MultiLang.Helper;\n", "csharp");
+        assert!(
+            v.is_empty(),
+            "a using alias is a type alias, not a namespace import — expected no import, got {v:?}"
         );
     }
 }
