@@ -155,6 +155,112 @@ pub struct ScipConfig {
     /// out entirely (e.g. while dogfooding a repo where you don't yet trust
     /// this).
     pub insert_missing: Option<bool>,
+    /// When an *automatic* caller (the background watcher's incremental
+    /// reindex, or `calm index`'s one-shot pass) may actually invoke this
+    /// provider's indexer — never gates an explicit manual refresh (`calm
+    /// scip run`, the `scip_refresh` MCP tool), which always runs regardless
+    /// of policy. Default `OnSave` reproduces this feature's original
+    /// behavior exactly (run whenever the cache key differs) — existing
+    /// configs that never mention `policy` see zero behavior change. Real
+    /// value for a heavy future provider (Java/clang): `MinInterval`/
+    /// `OnDemand` keep a full build-tool invocation off the hot edit-save
+    /// path (see the plan's own risk note: "indexer nặng không được chạy
+    /// on-save").
+    #[serde(default)]
+    pub policy: RefreshPolicy,
+}
+
+/// See `ScipConfig::policy`. Serializes/deserializes as a plain string so
+/// `config.json` stays human-writable: `"on_save"`, `"on_demand"`, or
+/// `"min_interval:900"` (seconds).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshPolicy {
+    /// Run whenever the cache key differs from the last successful run —
+    /// today's only behavior, still the default.
+    #[default]
+    OnSave,
+    /// Never run automatically; only an explicit manual refresh does.
+    OnDemand,
+    /// Run automatically only if at least this many seconds have passed
+    /// since the provider's last real (non-cache-skip) run.
+    MinInterval(u64),
+}
+
+impl std::fmt::Display for RefreshPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RefreshPolicy::OnSave => write!(f, "on_save"),
+            RefreshPolicy::OnDemand => write!(f, "on_demand"),
+            RefreshPolicy::MinInterval(secs) => write!(f, "min_interval:{secs}"),
+        }
+    }
+}
+
+impl Serialize for RefreshPolicy {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for RefreshPolicy {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        match s.as_str() {
+            "on_save" => Ok(RefreshPolicy::OnSave),
+            "on_demand" => Ok(RefreshPolicy::OnDemand),
+            _ => s
+                .strip_prefix("min_interval:")
+                .and_then(|secs| secs.parse::<u64>().ok())
+                .map(RefreshPolicy::MinInterval)
+                .ok_or_else(|| {
+                    serde::de::Error::custom(format!(
+                        "invalid scip refresh policy {s:?} — expected \
+                         \"on_save\", \"on_demand\", or \"min_interval:<seconds>\""
+                    ))
+                }),
+        }
+    }
+}
+
+#[cfg(test)]
+mod refresh_policy_tests {
+    use super::*;
+
+    #[test]
+    fn default_is_on_save() {
+        assert_eq!(RefreshPolicy::default(), RefreshPolicy::OnSave);
+    }
+
+    #[test]
+    fn round_trips_through_json_string_form() {
+        for policy in [
+            RefreshPolicy::OnSave,
+            RefreshPolicy::OnDemand,
+            RefreshPolicy::MinInterval(900),
+        ] {
+            let json = serde_json::to_string(&policy).unwrap();
+            let back: RefreshPolicy = serde_json::from_str(&json).unwrap();
+            assert_eq!(policy, back);
+        }
+    }
+
+    #[test]
+    fn min_interval_parses_seconds() {
+        let policy: RefreshPolicy = serde_json::from_str("\"min_interval:900\"").unwrap();
+        assert_eq!(policy, RefreshPolicy::MinInterval(900));
+    }
+
+    #[test]
+    fn unset_policy_field_defaults_to_on_save() {
+        let cfg: ScipConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(cfg.policy, RefreshPolicy::OnSave);
+    }
+
+    #[test]
+    fn invalid_policy_string_is_a_clear_error_not_a_panic() {
+        let result: Result<RefreshPolicy, _> = serde_json::from_str("\"bogus\"");
+        assert!(result.is_err());
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

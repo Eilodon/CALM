@@ -18,6 +18,7 @@ mod locate;
 mod memory;
 mod orient;
 mod recover;
+mod scip;
 mod trace;
 
 // ---------------------------------------------------------------------------
@@ -189,7 +190,8 @@ impl CalmServer {
         understand,
         remember,
         recall,
-        fitness_report
+        fitness_report,
+        scip_refresh
     });
 
     /// The actual tool list `list_tools` returns, scoped to `preset` (see

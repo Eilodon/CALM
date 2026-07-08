@@ -33,6 +33,25 @@ enum Commands {
         /// Project root directory
         #[arg(long, default_value = ".")]
         project_root: PathBuf,
+        /// Ingest a pre-built `.scip` index file instead of probing for and
+        /// running any external indexer binary (P2.6) — the standard way to
+        /// get formal-tier edges in a CI/sandboxed environment with no
+        /// network access to install one: build the `.scip` file in an
+        /// earlier CI step (or another machine) that does have network
+        /// access, then pass it here. Parses and ingests only, for every
+        /// language's occurrences the file contains; skips every provider's
+        /// own auto-detection entirely when set.
+        #[cfg(feature = "scip-overlay")]
+        #[arg(long)]
+        scip_file: Option<PathBuf>,
+        /// Path prefix to rebase `--scip-file`'s occurrence paths onto, when
+        /// the indexer that produced it ran at a subdirectory of
+        /// `project_root` (e.g. a nested Go module) rather than the root
+        /// itself — see `scip::parse::parse_scip_file`'s `sub_root`
+        /// parameter. Ignored without `--scip-file`.
+        #[cfg(feature = "scip-overlay")]
+        #[arg(long, requires = "scip_file")]
+        sub_root: Option<PathBuf>,
     },
     /// Validate config, DB, tree-sitter, git
     Doctor {
@@ -70,6 +89,21 @@ enum Commands {
         /// instead of leaving it alone
         #[arg(long)]
         force: bool,
+    },
+    /// Manually run one or every SCIP provider's indexer right now (P2.6),
+    /// bypassing the configured refresh policy — e.g. to force a run for a
+    /// `min_interval`/`on_demand` provider without waiting, or as a
+    /// standalone step outside `calm index`. Requires an existing index
+    /// (run `calm index` first).
+    #[cfg(feature = "scip-overlay")]
+    ScipRun {
+        /// Project root directory
+        #[arg(long, default_value = ".")]
+        project_root: PathBuf,
+        /// Which provider to refresh: rust, go, python, javascript, or
+        /// "all" (default) for every provider in the table.
+        #[arg(long)]
+        lang: Option<String>,
     },
     /// Decode a `.scip` index file to JSON lines (hidden; used by the B2
     /// call-graph-quality benchmark to get oracle occurrences without
@@ -115,7 +149,13 @@ async fn main() -> Result<()> {
             );
             calm_server::serve_stdio_with_preset(root, db, effective_preset).await?;
         }
-        Commands::Index { project_root } => {
+        Commands::Index {
+            project_root,
+            #[cfg(feature = "scip-overlay")]
+            scip_file,
+            #[cfg(feature = "scip-overlay")]
+            sub_root,
+        } => {
             let root = std::fs::canonicalize(&project_root)?;
             tracing::info!("Indexing {}", root.display());
             let db_path = calm_server::default_db_path(&root);
@@ -174,8 +214,30 @@ async fn main() -> Result<()> {
             // fail-silent by design (see `run_overlay`'s doc comment) — a
             // missing rust-analyzer or any overlay error leaves the syntactic
             // graph untouched.
+            //
+            // `--scip-file` (P2.6) takes a completely different, much
+            // simpler path: parse + ingest that one file directly, skipping
+            // every provider's own binary auto-detection entirely — the
+            // point is to work in a sandbox with no network access to run
+            // any of them.
             #[cfg(feature = "scip-overlay")]
-            {
+            if let Some(scip_file) = scip_file {
+                let sub_root = sub_root.unwrap_or_default();
+                let occ = calm_core::scip::parse::parse_scip_file(&scip_file, &sub_root)?;
+                let stats = calm_core::scip::ingest::ingest_occurrences(&conn, &occ, true)?;
+                if stats.upgraded > 0 || stats.ruled_out > 0 || stats.inserted > 0 {
+                    calm_core::indexer::pipeline::refresh_caller_counts(&conn)?;
+                }
+                println!(
+                    "SCIP overlay (from {}): {} edges upgraded, {} fan-out siblings ruled out, \
+                     {} inserted, match_rate={:.2}.",
+                    scip_file.display(),
+                    stats.upgraded,
+                    stats.ruled_out,
+                    stats.inserted,
+                    stats.match_rate
+                );
+            } else {
                 let rust_cfg = calm_core::config::load_config(&root)
                     .map(|c| c.rust)
                     .unwrap_or_default();
@@ -344,6 +406,22 @@ async fn main() -> Result<()> {
 
             if !result.passed {
                 std::process::exit(1);
+            }
+        }
+        #[cfg(feature = "scip-overlay")]
+        Commands::ScipRun { project_root, lang } => {
+            let root = std::fs::canonicalize(&project_root)?;
+            let db_path = calm_server::default_db_path(&root);
+            let conn = calm_core::db::conn::open_writer(&db_path)?;
+            let config = calm_core::config::load_config(&root).unwrap_or_default();
+            let results =
+                calm_core::scip::refresh_language(&conn, &root, &config, lang.as_deref())?;
+            for (lang, stats) in &results {
+                println!(
+                    "SCIP overlay ({lang}): {} edges upgraded, {} fan-out siblings ruled out, \
+                     {} inserted, match_rate={:.2}.",
+                    stats.upgraded, stats.ruled_out, stats.inserted, stats.match_rate
+                );
             }
         }
         #[cfg(feature = "scip-overlay")]

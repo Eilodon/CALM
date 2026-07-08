@@ -42,8 +42,35 @@ pub fn run_overlay_for(
     sub_root: &Path,
     cfg: &ScipConfig,
     dirty: &[String],
+    force: bool,
 ) -> anyhow::Result<ingest::IngestStats> {
     if cfg.enabled == Some(false) {
+        return Ok(ingest::IngestStats::default());
+    }
+    // Cheap DB check before any subprocess: a project with zero files of
+    // this provider's language(s) has nothing this provider could ever
+    // upgrade, so there's no reason to probe for its binary at all — for
+    // Python/JS that probe can be a real `npx --yes <package> --version`
+    // network round-trip (see `runner.rs`'s `npx_can_run_scip_python`/
+    // `npx_can_run_scip_typescript`), paid on *every* incremental reindex
+    // regardless of what changed. Found the hard way: adding the JS
+    // provider doubled this unconditional per-reindex network cost on the
+    // watcher's hot path, which was enough to push
+    // `watcher_integration.rs`'s `watcher_reindexes_add_and_delete` (a
+    // Python-only fixture, so both the Python *and* the wastefully-probed
+    // Go/JS providers paid this tax on every reindex) past its 30s timeout
+    // budget in CI.
+    if !provider_has_any_files(conn, provider) {
+        return Ok(ingest::IngestStats::default());
+    }
+    if !force && !policy_allows_automatic_run(cfg.policy, root, provider) {
+        tracing::info!(
+            "SCIP overlay ({}): refresh policy ({}) skips this automatic run — \
+             use `calm scip run --lang {}` or the `scip_refresh` MCP tool to force it",
+            provider.lang,
+            cfg.policy,
+            provider.lang
+        );
         return Ok(ingest::IngestStats::default());
     }
     let Some(bin) = (provider.resolve_binary)(cfg.binary.as_deref(), root) else {
@@ -96,15 +123,22 @@ pub fn run_overlay_for(
     // of re-running this provider's indexer again, never a correctness issue.
     let _ = std::fs::write(&cache_path, &key);
     // Best-effort sidecar so `indexing_status`/`overlay_status` can surface
-    // this run's `inserted`/`match_rate` without re-running the overlay —
-    // those two fields aren't derivable from `call_edges` alone the way
+    // this run's `inserted`/`match_rate`/`last_run` without re-running the
+    // overlay — none of those are derivable from `call_edges` alone the way
     // `available`/`up_to_date` are (there's no column recording "how many
-    // SCIP-resolved sites exist" once the pass is done). Stands until the
-    // next real (non-cache-skip) run overwrites it; reading code should
-    // treat it as "as of the last real run", not "live". Shared across
-    // providers for now (single filename) — fine while `RUST` is the only
-    // entry in the table; Phase 2 may need to key this per-language too.
-    let stats_path = root.join(".calm").join("scip-stats.json");
+    // SCIP-resolved sites exist" once the pass is done, or when it ran).
+    // Stands until the next real (non-cache-skip) run overwrites it; reading
+    // code should treat it as "as of the last real run", not "live". One
+    // file per provider (P2.6) — was a single shared `scip-stats.json` for
+    // every provider through P2.1/P2.4, a known bug (each provider's run
+    // clobbered the others' stats) fixed here alongside adding `last_run`,
+    // which `policy_allows_automatic_run`'s `MinInterval` case also needs
+    // per-provider, not shared.
+    let stats_path = root.join(".calm").join(stats_file_name(provider));
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     let _ = std::fs::write(
         &stats_path,
         serde_json::json!({
@@ -112,10 +146,62 @@ pub fn run_overlay_for(
             "ruled_out": stats.ruled_out,
             "inserted": stats.inserted,
             "match_rate": stats.match_rate,
+            "last_run_unix": now_unix,
         })
         .to_string(),
     );
     Ok(stats)
+}
+
+/// `<provider.cache_file_name minus ".cache">-stats.json` — e.g. Rust's
+/// `scip.cache` -> `scip-stats.json` (same name the old shared sidecar
+/// used, so an existing checkout's Rust stats aren't orphaned by this
+/// rename), Go's `scip-go.cache` -> `scip-go-stats.json`. Derived from the
+/// cache filename (already unique per provider) rather than adding yet
+/// another `ScipProvider` field for the same purpose.
+fn stats_file_name(provider: &provider::ScipProvider) -> String {
+    format!(
+        "{}-stats.json",
+        provider
+            .cache_file_name
+            .strip_suffix(".cache")
+            .unwrap_or(provider.cache_file_name)
+    )
+}
+
+/// Whether an *automatic* caller (not an explicit `force`d manual refresh)
+/// may run this provider's indexer right now, per `cfg.policy`. `OnSave`
+/// (the default) always allows it — the pre-P2.6 behavior, gated only by
+/// the cache-key check just above this function's call site.
+/// `MinInterval` reads the provider's own last-run timestamp from its stats
+/// sidecar (`None` — never run for real — always allows a first run).
+fn policy_allows_automatic_run(
+    policy: crate::config::RefreshPolicy,
+    root: &Path,
+    provider: &provider::ScipProvider,
+) -> bool {
+    use crate::config::RefreshPolicy;
+    match policy {
+        RefreshPolicy::OnSave => true,
+        RefreshPolicy::OnDemand => false,
+        RefreshPolicy::MinInterval(secs) => match read_last_run_unix(root, provider) {
+            None => true,
+            Some(last) => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                now.saturating_sub(last) >= secs
+            }
+        },
+    }
+}
+
+fn read_last_run_unix(root: &Path, provider: &provider::ScipProvider) -> Option<u64> {
+    let path = root.join(".calm").join(stats_file_name(provider));
+    let text = std::fs::read_to_string(path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    v.get("last_run_unix").and_then(|x| x.as_u64())
 }
 
 /// Run the full SCIP overlay for Rust — thin wrapper around
@@ -138,6 +224,7 @@ pub fn run_overlay(
         Path::new(""),
         &rust.scip,
         dirty,
+        false,
     )
 }
 /// Fingerprint of every currently-indexed file's content for one or more
@@ -172,6 +259,26 @@ pub fn source_dirty_keys(conn: &Connection, langs: &[&str]) -> Vec<String> {
     .unwrap_or_default()
 }
 
+/// Whether the project has at least one indexed file in any of `provider`'s
+/// `dirty_langs` — see `run_overlay_for`'s call site for why this gate
+/// exists. Fails open (`true`, i.e. don't skip) on a query error, same
+/// posture as `source_dirty_keys`'s own error handling, so a transient DB
+/// hiccup degrades to "probe anyway" rather than silently going blind to a
+/// language that's actually present.
+fn provider_has_any_files(conn: &Connection, provider: &provider::ScipProvider) -> bool {
+    let langs = provider.dirty_langs;
+    if langs.is_empty() {
+        return true;
+    }
+    let placeholders = langs.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!("SELECT EXISTS(SELECT 1 FROM file_index WHERE language IN ({placeholders}))");
+    conn.query_row(&sql, rusqlite::params_from_iter(langs.iter()), |r| {
+        r.get::<_, i64>(0)
+    })
+    .map(|n| n != 0)
+    .unwrap_or(true)
+}
+
 /// Rust-only convenience wrapper around `source_dirty_keys` — all existing
 /// callers (`lib.rs`, `watcher.rs`, `main.rs`, this module's own tests) call
 /// this exact name; kept so P0.4 touches zero call sites.
@@ -179,24 +286,39 @@ pub fn rust_source_dirty_keys(conn: &Connection) -> Vec<String> {
     source_dirty_keys(conn, &["rust"])
 }
 
-/// Run the Go overlay (`provider::GO`), refresh `caller_count` if it changed
-/// anything, and log the outcome — the Go-specific counterpart to the
+/// Run one provider's overlay, refresh `caller_count` if it changed
+/// anything, and return the stats — the shared core behind
+/// `run_go_overlay_and_log`/`run_python_overlay_and_log`/
+/// `run_js_overlay_and_log` (each a 1-line `force: false` wrapper for their
+/// existing public signatures, unchanged since P2.1/P2.4/P3.2) and
+/// `refresh_language`'s `force: true` manual-refresh path (P2.6). Bundled
+/// into one function (rather than inlining ~15 lines at every call site) so
+/// a future 4th provider's callers only need one new line, not a new copy
+/// of the refresh dance.
+fn run_and_refresh(
+    provider: &provider::ScipProvider,
+    conn: &Connection,
+    root: &Path,
+    cfg: &ScipConfig,
+    force: bool,
+) -> anyhow::Result<ingest::IngestStats> {
+    let dirty = source_dirty_keys(conn, provider.dirty_langs);
+    let stats = run_overlay_for(provider, conn, root, Path::new(""), cfg, &dirty, force)?;
+    if stats.upgraded > 0 || stats.ruled_out > 0 || stats.inserted > 0 {
+        crate::indexer::pipeline::refresh_caller_counts(conn)?;
+    }
+    Ok(stats)
+}
+
+/// Run the Go overlay (`provider::GO`) — the Go-specific counterpart to the
 /// Rust-only block each of the 3 production call sites (`lib.rs`,
-/// `watcher.rs`, `main.rs`) already had before this existed. Bundled into one
-/// function (rather than inlining ~15 lines a 3rd time at each call site) so
-/// a future 3rd provider's callers only need one new line here, not a new
-/// copy of the refresh/log dance at every call site.
+/// `watcher.rs`, `main.rs`) already had before this existed.
 pub fn run_go_overlay_and_log(
     conn: &Connection,
     root: &Path,
     cfg: &crate::config::GoConfig,
 ) -> anyhow::Result<ingest::IngestStats> {
-    let dirty = source_dirty_keys(conn, provider::GO.dirty_langs);
-    let stats = run_overlay_for(&provider::GO, conn, root, Path::new(""), &cfg.scip, &dirty)?;
-    if stats.upgraded > 0 || stats.ruled_out > 0 || stats.inserted > 0 {
-        crate::indexer::pipeline::refresh_caller_counts(conn)?;
-    }
-    Ok(stats)
+    run_and_refresh(&provider::GO, conn, root, &cfg.scip, false)
 }
 
 /// Run the Python overlay (`provider::PYTHON`) — the Python-specific
@@ -209,19 +331,7 @@ pub fn run_python_overlay_and_log(
     root: &Path,
     cfg: &crate::config::PythonConfig,
 ) -> anyhow::Result<ingest::IngestStats> {
-    let dirty = source_dirty_keys(conn, provider::PYTHON.dirty_langs);
-    let stats = run_overlay_for(
-        &provider::PYTHON,
-        conn,
-        root,
-        Path::new(""),
-        &cfg.scip,
-        &dirty,
-    )?;
-    if stats.upgraded > 0 || stats.ruled_out > 0 || stats.inserted > 0 {
-        crate::indexer::pipeline::refresh_caller_counts(conn)?;
-    }
-    Ok(stats)
+    run_and_refresh(&provider::PYTHON, conn, root, &cfg.scip, false)
 }
 
 /// Run the JS/TS overlay (`provider::TYPESCRIPT`) — same shape as
@@ -234,19 +344,52 @@ pub fn run_js_overlay_and_log(
     root: &Path,
     cfg: &crate::config::JsConfig,
 ) -> anyhow::Result<ingest::IngestStats> {
-    let dirty = source_dirty_keys(conn, provider::TYPESCRIPT.dirty_langs);
-    let stats = run_overlay_for(
-        &provider::TYPESCRIPT,
-        conn,
-        root,
-        Path::new(""),
-        &cfg.scip,
-        &dirty,
-    )?;
-    if stats.upgraded > 0 || stats.ruled_out > 0 || stats.inserted > 0 {
-        crate::indexer::pipeline::refresh_caller_counts(conn)?;
+    run_and_refresh(&provider::TYPESCRIPT, conn, root, &cfg.scip, false)
+}
+
+/// Manually refresh one or every SCIP provider right now, bypassing
+/// `cfg.policy`'s automatic-run gate (`force: true` — see
+/// `run_overlay_for`) — the shared entry point behind `calm scip run` and
+/// the `scip_refresh` MCP tool (P2.6). `lang`: `None` or `Some("all")` runs
+/// every provider in the table, in this fixed order; `Some("go"|"python"|
+/// "javascript"|"rust")` runs just that one. An unrecognized `lang` is an
+/// `Err`, not a silent no-op — this is an explicit user request, not an
+/// auto-detect probe. Stops at the first hard error (a real DB failure from
+/// `ingest_occurrences`, not an unavailable/failing external indexer, which
+/// `run_overlay_for` already swallows into `Ok(default)`) rather than
+/// silently skipping the remaining providers.
+pub fn refresh_language(
+    conn: &Connection,
+    root: &Path,
+    config: &crate::config::Config,
+    lang: Option<&str>,
+) -> anyhow::Result<Vec<(String, ingest::IngestStats)>> {
+    let all = ["rust", "go", "python", "javascript"];
+    let want: &[&str] = match lang {
+        None | Some("all") => &all,
+        Some(l) if all.contains(&l) => std::slice::from_ref(
+            all.iter()
+                .find(|x| **x == l)
+                .expect("just checked contains"),
+        ),
+        Some(other) => anyhow::bail!(
+            "unknown SCIP provider {other:?} — expected one of: rust, go, python, javascript, all"
+        ),
+    };
+    let mut out = Vec::with_capacity(want.len());
+    for lang in want {
+        let stats = match *lang {
+            "rust" => run_and_refresh(&provider::RUST, conn, root, &config.rust.scip, true)?,
+            "go" => run_and_refresh(&provider::GO, conn, root, &config.go.scip, true)?,
+            "python" => run_and_refresh(&provider::PYTHON, conn, root, &config.python.scip, true)?,
+            "javascript" => {
+                run_and_refresh(&provider::TYPESCRIPT, conn, root, &config.js.scip, true)?
+            }
+            _ => unreachable!("want is filtered to `all` above"),
+        };
+        out.push((lang.to_string(), stats));
     }
-    Ok(stats)
+    Ok(out)
 }
 
 /// Cheap, non-invoking snapshot of the overlay's readiness — never spawns an
@@ -276,12 +419,14 @@ pub fn overlay_status_for(
         }
         None => false,
     };
-    let (last_match_rate, last_inserted) = read_last_stats(root);
+    let (last_match_rate, last_inserted) = read_last_stats(root, provider);
+    let last_run_unix = read_last_run_unix(root, provider);
     Some(OverlayStatus {
         available,
         up_to_date,
         last_match_rate,
         last_inserted,
+        last_run_unix,
     })
 }
 
@@ -292,14 +437,14 @@ pub fn overlay_status(conn: &Connection, root: &Path, rust: &RustConfig) -> Opti
     overlay_status_for(&provider::RUST, conn, root, &rust.scip)
 }
 
-/// Best-effort read of the sidecar `run_overlay` writes after a real
+/// Best-effort read of the sidecar `run_overlay_for` writes after a real
 /// (non-cache-skip) run — `inserted`/`match_rate` aren't derivable from
 /// `call_edges` alone at read time the way `available`/`up_to_date` are, so
 /// they have to come from whatever the last real run actually observed.
 /// Absent (never run) or corrupt — both `(None, None)`, not an error; this is
 /// a diagnostic nicety, not load-bearing.
-fn read_last_stats(root: &Path) -> (Option<f64>, Option<usize>) {
-    let path = root.join(".calm").join("scip-stats.json");
+fn read_last_stats(root: &Path, provider: &provider::ScipProvider) -> (Option<f64>, Option<usize>) {
+    let path = root.join(".calm").join(stats_file_name(provider));
     let Ok(text) = std::fs::read_to_string(path) else {
         return (None, None);
     };
@@ -314,7 +459,7 @@ fn read_last_stats(root: &Path) -> (Option<f64>, Option<usize>) {
     )
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct OverlayStatus {
     /// `rust-analyzer` binary was found (PATH/rustup/VS Code) at last check.
     pub available: bool,
@@ -332,6 +477,12 @@ pub struct OverlayStatus {
     /// `IngestStats::inserted` from that same last real run, or `None` for
     /// the same reasons as `last_match_rate`.
     pub last_inserted: Option<usize>,
+    /// Unix seconds of that same last real run, or `None` if it has never
+    /// actually run. Raw epoch (not formatted) — this type lives in
+    /// `calm-core`, which doesn't depend on the ISO8601 formatter
+    /// `calm-server`'s MCP output types already use for `last_updated`; the
+    /// MCP boundary formats it the same way.
+    pub last_run_unix: Option<u64>,
 }
 
 #[cfg(test)]
@@ -353,6 +504,7 @@ mod tests {
                 enabled: Some(false),
                 binary: None,
                 insert_missing: None,
+                policy: crate::config::RefreshPolicy::OnSave,
             },
         };
         assert_eq!(
@@ -375,6 +527,7 @@ mod tests {
                 enabled: Some(false),
                 binary: None,
                 insert_missing: None,
+                policy: crate::config::RefreshPolicy::OnSave,
             },
         };
         assert_eq!(
@@ -396,6 +549,7 @@ mod tests {
                 enabled: Some(false),
                 binary: None,
                 insert_missing: None,
+                policy: crate::config::RefreshPolicy::OnSave,
             },
         };
         assert_eq!(
@@ -417,12 +571,102 @@ mod tests {
                 enabled: Some(false),
                 binary: None,
                 insert_missing: None,
+                policy: crate::config::RefreshPolicy::OnSave,
             },
         };
         assert_eq!(
             run_js_overlay_and_log(&conn, Path::new("."), &js).unwrap(),
             ingest::IngestStats::default()
         );
+    }
+
+    /// A project with zero indexed files of a provider's language(s) must
+    /// short-circuit to a no-op *before* ever probing for a binary — even
+    /// with `enabled: Some(true)`, which would otherwise log a "not found"
+    /// line if the probe actually ran and came up empty. Deterministic
+    /// regardless of whether this machine has rust-analyzer installed (it
+    /// does): the in-memory DB below has a "python" file but no "rust"
+    /// ones, so `run_overlay` must never reach `resolve_binary` at all.
+    #[test]
+    fn provider_with_zero_matching_files_is_a_noop_even_when_forced_on() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO file_index (path, hash, language, last_indexed) VALUES ('main.py', 'h', 'python', 0.0)",
+            [],
+        )
+        .unwrap();
+        let rust = RustConfig {
+            scip: crate::config::ScipConfig {
+                enabled: Some(true),
+                binary: None,
+                insert_missing: None,
+                policy: crate::config::RefreshPolicy::OnSave,
+            },
+        };
+        assert_eq!(
+            run_overlay(&conn, Path::new("."), &rust, &[]).unwrap(),
+            ingest::IngestStats::default()
+        );
+    }
+
+    /// `refresh_language` rejects an unrecognized provider name outright
+    /// (an explicit user request, not an auto-detect probe) — deterministic
+    /// regardless of any binary/network availability since the check runs
+    /// before any provider is touched.
+    #[test]
+    fn refresh_language_rejects_unknown_lang() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        let config = crate::config::Config::default();
+        let err = refresh_language(&conn, Path::new("."), &config, Some("cobol")).unwrap_err();
+        assert!(err.to_string().contains("cobol"));
+    }
+
+    /// `None`/`Some("all")` runs every provider in the table, in the same
+    /// fixed order, one result per provider — all 4 configs are disabled so
+    /// this is deterministic regardless of what's installed on this machine.
+    #[test]
+    fn refresh_language_all_covers_every_provider_in_order() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        let mut config = crate::config::Config::default();
+        let off = crate::config::ScipConfig {
+            enabled: Some(false),
+            binary: None,
+            insert_missing: None,
+            policy: crate::config::RefreshPolicy::OnSave,
+        };
+        config.rust.scip = off.clone();
+        config.go.scip = off.clone();
+        config.python.scip = off.clone();
+        config.js.scip = off;
+
+        let results = refresh_language(&conn, Path::new("."), &config, None).unwrap();
+        let langs: Vec<&str> = results.iter().map(|(l, _)| l.as_str()).collect();
+        assert_eq!(langs, vec!["rust", "go", "python", "javascript"]);
+        assert!(
+            results
+                .iter()
+                .all(|(_, s)| *s == ingest::IngestStats::default())
+        );
+
+        let results_explicit_all =
+            refresh_language(&conn, Path::new("."), &config, Some("all")).unwrap();
+        assert_eq!(results_explicit_all.len(), 4);
+    }
+
+    /// A specific `lang` runs only that one provider.
+    #[test]
+    fn refresh_language_single_lang_runs_only_that_one() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        let mut config = crate::config::Config::default();
+        config.go.scip.enabled = Some(false);
+
+        let results = refresh_language(&conn, Path::new("."), &config, Some("go")).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, "go");
     }
 
     #[test]
@@ -481,6 +725,7 @@ mod tests {
                 enabled: Some(false),
                 binary: None,
                 insert_missing: None,
+                policy: crate::config::RefreshPolicy::OnSave,
             },
         };
         assert_eq!(overlay_status(&conn, Path::new("."), &rust), None);
@@ -507,6 +752,7 @@ mod tests {
                 enabled: Some(true),
                 binary: None,
                 insert_missing: None,
+                policy: crate::config::RefreshPolicy::OnSave,
             },
         };
         let dirty = rust_source_dirty_keys(&conn);
@@ -549,6 +795,7 @@ mod tests {
                 enabled: Some(true),
                 binary: None,
                 insert_missing: None,
+                policy: crate::config::RefreshPolicy::OnSave,
             },
         };
         let stats = run_go_overlay_and_log(&conn, &fixture, &go).unwrap();
@@ -589,6 +836,7 @@ mod tests {
                 enabled: Some(true),
                 binary: None,
                 insert_missing: None,
+                policy: crate::config::RefreshPolicy::OnSave,
             },
         };
         let stats = run_python_overlay_and_log(&conn, &fixture, &python).unwrap();
@@ -629,6 +877,7 @@ mod tests {
                 enabled: Some(true),
                 binary: None,
                 insert_missing: None,
+                policy: crate::config::RefreshPolicy::OnSave,
             },
         };
         let stats = run_js_overlay_and_log(&conn, &fixture, &js).unwrap();

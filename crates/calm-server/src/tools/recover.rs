@@ -70,6 +70,11 @@ impl CalmServer {
             #[cfg(not(feature = "scip-overlay"))]
             let scip_overlay: Option<ScipOverlayStatusOutput> = None;
 
+            #[cfg(feature = "scip-overlay")]
+            let scip_overlays = self.per_language_overlay_statuses(&conn);
+            #[cfg(not(feature = "scip-overlay"))]
+            let scip_overlays: Vec<PerLanguageOverlayStatus> = Vec::new();
+
             serde_json::to_string_pretty(&IndexingStatusOutput {
                 indexing_phase: phase,
                 indexing_error,
@@ -82,10 +87,59 @@ impl CalmServer {
                 edges_ready: self.edges_ready(),
                 last_updated: last_updated.map(epoch_to_iso8601),
                 scip_overlay,
+                scip_overlays,
                 suggested_next: self.filter_sn(sn),
             })
             .unwrap_or_default()
         })
+    }
+
+    /// One `OverlayStatus` per SCIP provider (P2.6) — `scip_overlay` above
+    /// stays Rust-only for backward compat with existing callers; this is
+    /// the superset covering Go/Python/JS-TS too. Skips a provider entirely
+    /// when `cfg.enabled == Some(false)` (same semantics as
+    /// `overlay_status_for` returning `None`) rather than reporting a
+    /// misleading `available: false`.
+    #[cfg(feature = "scip-overlay")]
+    fn per_language_overlay_statuses(
+        &self,
+        conn: &rusqlite::Connection,
+    ) -> Vec<PerLanguageOverlayStatus> {
+        let config = calm_core::config::load_config(&self.project_root).unwrap_or_default();
+        let mut out = Vec::new();
+        if let Some(s) = calm_core::scip::overlay_status_for(
+            &calm_core::scip::provider::RUST,
+            conn,
+            &self.project_root,
+            &config.rust.scip,
+        ) {
+            out.push(PerLanguageOverlayStatus::new("rust", s));
+        }
+        if let Some(s) = calm_core::scip::overlay_status_for(
+            &calm_core::scip::provider::GO,
+            conn,
+            &self.project_root,
+            &config.go.scip,
+        ) {
+            out.push(PerLanguageOverlayStatus::new("go", s));
+        }
+        if let Some(s) = calm_core::scip::overlay_status_for(
+            &calm_core::scip::provider::PYTHON,
+            conn,
+            &self.project_root,
+            &config.python.scip,
+        ) {
+            out.push(PerLanguageOverlayStatus::new("python", s));
+        }
+        if let Some(s) = calm_core::scip::overlay_status_for(
+            &calm_core::scip::provider::TYPESCRIPT,
+            conn,
+            &self.project_root,
+            &config.js.scip,
+        ) {
+            out.push(PerLanguageOverlayStatus::new("javascript", s));
+        }
+        out
     }
     #[tool(
         name = "session_context",
@@ -333,6 +387,14 @@ pub(crate) struct IndexingStatusOutput {
     /// `calm_core::scip::overlay_status`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) scip_overlay: Option<ScipOverlayStatusOutput>,
+    /// Superset of `scip_overlay` covering every SCIP provider (P2.6) —
+    /// `rust`/`go`/`python`/`javascript` — instead of Rust alone. Empty when
+    /// this build lacks the `scip-overlay` feature. A language is omitted
+    /// (not present with `available: false`) when its `enabled` config is
+    /// explicitly `false` — nothing to report, same as `scip_overlay` being
+    /// absent for that reason.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) scip_overlays: Vec<PerLanguageOverlayStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) suggested_next: Option<SuggestedNext>,
 }
@@ -364,6 +426,10 @@ pub(crate) struct ScipOverlayStatusOutput {
     /// run.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) last_inserted: Option<usize>,
+    /// ISO8601 timestamp of that same last real (non-cache-skip) run,
+    /// absent if it's never actually run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) last_run: Option<String>,
 }
 
 #[cfg(feature = "scip-overlay")]
@@ -374,6 +440,7 @@ impl From<calm_core::scip::OverlayStatus> for ScipOverlayStatusOutput {
             up_to_date: s.up_to_date,
             last_match_rate: s.last_match_rate,
             last_inserted: s.last_inserted,
+            last_run: s.last_run_unix.map(|secs| epoch_to_iso8601(secs as f64)),
         }
     }
 }
@@ -391,6 +458,36 @@ pub(crate) struct ScipOverlayStatusOutput {
     pub(crate) last_match_rate: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) last_inserted: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) last_run: Option<String>,
+}
+
+/// One `ScipOverlayStatusOutput` tagged with its `file_index.language`
+/// value — see `IndexingStatusOutput::scip_overlays`.
+#[cfg(feature = "scip-overlay")]
+#[derive(Serialize, JsonSchema)]
+pub(crate) struct PerLanguageOverlayStatus {
+    pub(crate) lang: String,
+    #[serde(flatten)]
+    pub(crate) status: ScipOverlayStatusOutput,
+}
+
+#[cfg(feature = "scip-overlay")]
+impl PerLanguageOverlayStatus {
+    fn new(lang: &str, status: calm_core::scip::OverlayStatus) -> Self {
+        Self {
+            lang: lang.to_string(),
+            status: ScipOverlayStatusOutput::from(status),
+        }
+    }
+}
+
+/// Stub so `IndexingStatusOutput`'s `scip_overlays` field type-checks
+/// identically regardless of the `scip-overlay` feature.
+#[cfg(not(feature = "scip-overlay"))]
+#[derive(Serialize, JsonSchema)]
+pub(crate) struct PerLanguageOverlayStatus {
+    pub(crate) lang: String,
 }
 
 // ---------------------------------------------------------------------------
