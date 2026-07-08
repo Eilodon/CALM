@@ -853,6 +853,11 @@ pub(crate) struct CallerEntry {
     pub(crate) symbol: String,
     pub(crate) path: String,
     pub(crate) edge_confidence: String,
+    /// `"call"` or `"reference"` (SQL view/proc reading a table via
+    /// FROM/JOIN) — see `call_edges.edge_kind`. Lets a consumer tell a real
+    /// invocation apart from a mere read without misreading a JOIN as a
+    /// function call.
+    pub(crate) edge_kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) line: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -864,6 +869,8 @@ pub(crate) struct CalleeEntry {
     pub(crate) symbol: String,
     pub(crate) path: String,
     pub(crate) edge_confidence: String,
+    /// See `CallerEntry::edge_kind`.
+    pub(crate) edge_kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) line: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]

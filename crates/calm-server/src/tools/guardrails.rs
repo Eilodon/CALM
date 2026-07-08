@@ -44,7 +44,7 @@ impl CalmServer {
             let callers: Vec<CallerEntry> = {
                 let mut stmt = conn
                     .prepare(
-                        "SELECT from_symbol, from_path, edge_confidence, call_site_line
+                        "SELECT from_symbol, from_path, edge_confidence, call_site_line, edge_kind
                          FROM call_edges WHERE to_symbol = ?1 AND ruled_out_by_scip = 0",
                     )
                     .unwrap();
@@ -56,6 +56,7 @@ impl CalmServer {
                         preview: line_preview(&self.project_root, &path, line),
                         path,
                         edge_confidence: row.get(2)?,
+                        edge_kind: row.get(4)?,
                         line,
                     })
                 })
@@ -67,7 +68,7 @@ impl CalmServer {
             let callees: Vec<CalleeEntry> = {
                 let mut stmt = conn
                     .prepare(
-                        "SELECT to_symbol, to_path, edge_confidence, call_site_line
+                        "SELECT to_symbol, to_path, edge_confidence, call_site_line, edge_kind
                          FROM call_edges WHERE from_symbol = ?1 AND ruled_out_by_scip = 0",
                     )
                     .unwrap();
@@ -78,6 +79,7 @@ impl CalmServer {
                         symbol: row.get(0)?,
                         path: row.get::<_, String>(1).unwrap_or_default(),
                         edge_confidence: row.get(2)?,
+                        edge_kind: row.get(4)?,
                         preview: line_preview(&self.project_root, &from_path, line),
                         line,
                     })

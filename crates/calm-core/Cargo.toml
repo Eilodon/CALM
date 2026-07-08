@@ -9,6 +9,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
 regex = { workspace = true }
+sqlparser = { workspace = true }
 ignore = { workspace = true }
 globset = { workspace = true }
 thiserror = { workspace = true }

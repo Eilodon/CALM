@@ -64,6 +64,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
 regex = "1"
+# SQL indexer (8-language plan P3.3) — the crates.io name for the
+# `apache/datafusion-sqlparser-rs` project the plan names by its GitHub repo.
+sqlparser = "0.62"
 ignore = "0.4"
 globset = "0.4"
 thiserror = "2"

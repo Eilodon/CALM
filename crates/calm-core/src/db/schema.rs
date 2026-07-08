@@ -36,7 +36,8 @@ CREATE TABLE IF NOT EXISTS call_edges (
     call_site_line  INTEGER,
     edge_confidence TEXT NOT NULL DEFAULT 'textual',
     from_path       TEXT,
-    to_path         TEXT
+    to_path         TEXT,
+    edge_kind       TEXT NOT NULL DEFAULT 'call'
 );
 
 CREATE INDEX IF NOT EXISTS idx_call_edges_from  ON call_edges(from_symbol);
@@ -88,7 +89,8 @@ CREATE TABLE IF NOT EXISTS call_sites (
     receiver     TEXT,
     target_class TEXT,
     looks_option_or_result_chained INTEGER NOT NULL DEFAULT 0,
-    module_hint  TEXT
+    module_hint  TEXT,
+    edge_kind    TEXT NOT NULL DEFAULT 'call'
 );
 CREATE INDEX IF NOT EXISTS idx_call_sites_from   ON call_sites(from_path);
 CREATE INDEX IF NOT EXISTS idx_call_sites_callee ON call_sites(callee_name);
@@ -266,6 +268,26 @@ fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
     // exact type-checked evidence beats a per-file name-set heuristic — but
     // never re-litigates its own prior `'scip'` verdict.
     migrate_add_column(conn, "call_edges", "formal_source", "TEXT")?;
+    // SQL indexer (8-language plan P3.3): distinguishes a genuine call
+    // (proc/trigger → proc via CALL/EXEC) from a mere read reference
+    // (view/proc → table via FROM/JOIN), threaded from `call_sites` straight
+    // through to `call_edges` in `rebuild_graph` — so `callers`/`callees`
+    // never present a table read as if it were a function call. Every other
+    // language's extractor only ever produces genuine calls, so this
+    // defaults to `'call'` everywhere except what `indexer::sql` explicitly
+    // marks `'reference'`.
+    migrate_add_column(
+        conn,
+        "call_sites",
+        "edge_kind",
+        "TEXT NOT NULL DEFAULT 'call'",
+    )?;
+    migrate_add_column(
+        conn,
+        "call_edges",
+        "edge_kind",
+        "TEXT NOT NULL DEFAULT 'call'",
+    )?;
     migrate_fts_add_signature(conn)?;
     migrate_add_project_memory_fts(conn)?;
     Ok(())

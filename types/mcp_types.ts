@@ -172,7 +172,7 @@ export interface CallersInput {
 }
 
 export type CallersOutput = {
-  direct: { caller_symbol: string; caller_path: string; line: number; preview: string; edge_confidence: EdgeConfidence }[];
+  direct: { caller_symbol: string; caller_path: string; line: number; preview: string; edge_confidence: EdgeConfidence; edge_kind: string }[];
   total_direct: number;
   truncated: boolean;
   transitive_count?: number | null;
@@ -190,7 +190,7 @@ export interface CalleesInput {
 }
 
 export type CalleesOutput = {
-  direct: { callee_symbol: string; callee_path: string; line: number; preview: string; edge_confidence: EdgeConfidence }[];
+  direct: { callee_symbol: string; callee_path: string; line: number; preview: string; edge_confidence: EdgeConfidence; edge_kind: string }[];
   total_direct: number;
   truncated: boolean;
   transitive_count?: number | null;

@@ -407,6 +407,10 @@ pub fn language_for_extension(ext: &str) -> Option<&'static str> {
         // Community convention is capital ".R"; lowercase ".r" also occurs.
         "r" | "R" => Some("r"),
 
+        // Standalone module (8-language plan P3.3) — not tree-sitter, see
+        // `indexer::sql`'s module doc comment for why.
+        "sql" => Some("sql"),
+
         _ => None,
     }
 }

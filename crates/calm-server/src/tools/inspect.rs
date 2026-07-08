@@ -219,7 +219,7 @@ impl CalmServer {
                 .map(|(info, _)| {
                     let mut stmt = conn
                         .prepare(
-                            "SELECT from_symbol, from_path, edge_confidence, call_site_line
+                            "SELECT from_symbol, from_path, edge_confidence, call_site_line, edge_kind
                              FROM call_edges WHERE to_symbol = ?1",
                         )
                         .unwrap();
@@ -231,6 +231,7 @@ impl CalmServer {
                             preview: line_preview(&self.project_root, &path, line),
                             path,
                             edge_confidence: row.get(2)?,
+                            edge_kind: row.get(4)?,
                             line,
                         })
                     })

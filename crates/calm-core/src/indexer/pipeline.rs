@@ -62,7 +62,7 @@ const PARSE_BATCH_SIZE: usize = 1000;
 
 /// A persisted call site loaded for graph rebuild:
 /// (from_path, enclosing_qn, callee_name, call_line, confidence, target_class,
-/// looks_option_or_result_chained).
+/// looks_option_or_result_chained, module_hint, edge_kind).
 type CallSiteRow = (
     String,
     String,
@@ -72,6 +72,7 @@ type CallSiteRow = (
     Option<String>,
     bool,
     Option<String>,
+    String,
 );
 
 /// Collect tier-0 source files under `root` via the shared `crate::walk`
@@ -193,6 +194,11 @@ struct CallSiteData {
     /// same-named candidates by file when there's no `use` for `resolve_tier1`
     /// to match against.
     module_hint: Option<String>,
+    /// `"call"` for every tree-sitter-derived call site (every language
+    /// below); `"reference"` only for `indexer::sql`'s FROM/JOIN table reads
+    /// (a view/proc reading a table is not invoking it) — see
+    /// `call_edges.edge_kind`'s migration comment in `db::schema`.
+    edge_kind: String,
 }
 
 /// Everything extracted from a single file's source, before any DB I/O.
@@ -237,6 +243,39 @@ fn extract_file_data(
     entry_point_patterns: &[String],
     formal: &crate::resolver::formal::FormalResolver,
 ) -> ExtractedFile {
+    // SQL (8-language plan P3.3) is its own standalone module, not a
+    // tree-sitter grammar — its DDL vocabulary and dialect-specific
+    // procedural bodies don't fit the per-node-kind-table shape every other
+    // language here uses (see `indexer::sql`'s module doc comment). Handled
+    // entirely before `parse_tree` even runs.
+    if lang == "sql" {
+        let sql_file = crate::indexer::sql::extract_sql_file(rel, source);
+        let symbol_count = sql_file.symbols.len();
+        let chunks = chunk_pending(source, &sql_file.symbols);
+        let call_sites = sql_file
+            .references
+            .into_iter()
+            .map(|r| CallSiteData {
+                enclosing_qn: r.enclosing_qn,
+                callee: r.target_name,
+                line: r.line,
+                confidence: r.confidence.as_str().to_string(),
+                receiver: None,
+                target_class: None,
+                looks_option_or_result_chained: false,
+                module_hint: None,
+                edge_kind: r.edge_kind.to_string(),
+            })
+            .collect();
+        return ExtractedFile {
+            symbols: sql_file.symbols,
+            import_edges: Vec::new(),
+            call_sites,
+            symbol_count,
+            chunks,
+        };
+    }
+
     let Some(tree) = parse_tree(source, lang) else {
         // Tier-0.5: no tree-sitter grammar for this language — extract symbols
         // via lightweight line-scan (no calls, no imports, no resolver tiers).
@@ -402,6 +441,7 @@ fn extract_file_data(
                 target_class,
                 looks_option_or_result_chained: c.looks_option_or_result_chained,
                 module_hint: c.module_hint.clone(),
+                edge_kind: "call".to_string(),
             });
         }
     }
@@ -441,8 +481,8 @@ fn persist_file(
     insert_symbols_batch(tx, &extracted.symbols)?;
     insert_import_edges_batch(tx, &extracted.import_edges)?;
     let mut stmt = tx.prepare(
-        "INSERT INTO call_sites (from_path, enclosing_qn, callee_name, call_line, confidence, receiver, target_class, looks_option_or_result_chained, module_hint) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        "INSERT INTO call_sites (from_path, enclosing_qn, callee_name, call_line, confidence, receiver, target_class, looks_option_or_result_chained, module_hint, edge_kind) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
     )?;
     for c in &extracted.call_sites {
         stmt.execute(rusqlite::params![
@@ -455,6 +495,7 @@ fn persist_file(
             c.target_class,
             c.looks_option_or_result_chained as i64,
             c.module_hint,
+            c.edge_kind,
         ])?;
     }
     insert_code_chunks_batch(tx, rel, file_hash, &extracted.chunks)?;
@@ -527,7 +568,7 @@ fn rebuild_graph(
     let sites: Vec<CallSiteRow> = {
         let mut stmt = tx.prepare(
             "SELECT from_path, enclosing_qn, callee_name, call_line, confidence, target_class, \
-                    looks_option_or_result_chained, module_hint \
+                    looks_option_or_result_chained, module_hint, edge_kind \
              FROM call_sites",
         )?;
         stmt.query_map([], |r| {
@@ -540,6 +581,7 @@ fn rebuild_graph(
                 r.get::<_, Option<String>>(5)?,
                 r.get::<_, i64>(6)? != 0,
                 r.get::<_, Option<String>>(7)?,
+                r.get::<_, String>(8)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?
@@ -579,6 +621,7 @@ fn rebuild_graph(
                 target_class,
                 looks_option_or_result_chained,
                 module_hint,
+                _,
             )| {
                 let targets = match target_class {
                     Some(cls) => by_name_class.get(&(callee.clone(), cls.clone())),
@@ -700,7 +743,7 @@ fn rebuild_graph(
 
     let mut edges: Vec<CallEdge> = Vec::new();
     let mut seen_pairs: HashSet<(String, String, Option<i64>)> = HashSet::new();
-    for ((from_path, enc_qn, _callee, line, confidence, _target_class, _, _), targets) in
+    for ((from_path, enc_qn, _callee, line, confidence, _target_class, _, _, edge_kind), targets) in
         sites.iter().zip(candidates.iter())
     {
         // >1 surviving candidate means this call site's edge is duplicated
@@ -725,6 +768,7 @@ fn rebuild_graph(
                 edge_confidence: effective_confidence.to_string(),
                 from_path: Some(from_path.clone()),
                 to_path: Some(to_path.clone()),
+                edge_kind: edge_kind.clone(),
             });
         }
     }
@@ -3731,6 +3775,68 @@ impl StructB {
         assert!(
             to_path.as_deref().unwrap_or("").is_empty(),
             "external crate `rusqlite` must not resolve to a local file, got {to_path:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P3.3 (8-language plan) end-to-end, matching the plan's own DoD
+    /// verbatim: `schema.sql` gets a `file_index` row, a `users` table
+    /// symbol and a `get_user` proc symbol, and a `resolved`-confidence
+    /// `reference`-kind view→table edge — driven through the real
+    /// `run_indexing_pipeline` (not just `sql::extract_sql_file` directly),
+    /// so this also proves `extract_file_data`'s `lang == "sql"` branch and
+    /// `rebuild_graph`'s `edge_kind` threading are wired correctly end to end.
+    #[test]
+    fn test_sql_p3_3_end_to_end() {
+        let dir = std::env::temp_dir().join(format!("ci_idx_sql_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("schema.sql"),
+            "CREATE TABLE users (id INT PRIMARY KEY, name TEXT);\n\
+             CREATE VIEW active_users AS SELECT id, name FROM users;\n\
+             CREATE FUNCTION get_user(uid INT) RETURNS INT AS $$ \
+             BEGIN RETURN (SELECT id FROM users WHERE id = uid); END; \
+             $$ LANGUAGE plpgsql;\n",
+        )
+        .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
+
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM file_index WHERE path = 'schema.sql'"
+            ),
+            1
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM symbols WHERE name = 'users' AND kind = 'struct' AND language = 'sql'"
+            ),
+            1
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM symbols WHERE name = 'get_user' AND kind = 'function' AND language = 'sql'"
+            ),
+            1
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM call_edges \
+                 WHERE from_symbol = (SELECT qualified_name FROM symbols WHERE name = 'active_users') \
+                 AND to_symbol = (SELECT qualified_name FROM symbols WHERE name = 'users') \
+                 AND edge_confidence = 'resolved' AND edge_kind = 'reference'",
+            ),
+            1,
+            "view->table edge must be resolved+reference, not call"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

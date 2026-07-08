@@ -9,6 +9,10 @@ pub struct CallEdge {
     pub edge_confidence: String,
     pub from_path: Option<String>,
     pub to_path: Option<String>,
+    /// `"call"` (every non-SQL producer) or `"reference"` (SQL's
+    /// `indexer::sql` module, for a view/proc's FROM/JOIN read of a table —
+    /// see `call_edges.edge_kind`'s migration comment in `db::schema`).
+    pub edge_kind: String,
 }
 
 pub struct ImportEdge {
@@ -47,8 +51,8 @@ pub fn insert_symbols_batch(tx: &Transaction, symbols: &[ParsedSymbol]) -> rusql
 
 pub fn insert_call_edges_batch(tx: &Transaction, edges: &[CallEdge]) -> rusqlite::Result<()> {
     let mut stmt = tx.prepare(
-        "INSERT INTO call_edges (from_symbol, to_symbol, call_site_line, edge_confidence, from_path, to_path)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+        "INSERT INTO call_edges (from_symbol, to_symbol, call_site_line, edge_confidence, from_path, to_path, edge_kind)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
     )?;
     for e in edges {
         stmt.execute(rusqlite::params![
@@ -57,7 +61,8 @@ pub fn insert_call_edges_batch(tx: &Transaction, edges: &[CallEdge]) -> rusqlite
             e.call_site_line,
             e.edge_confidence,
             e.from_path,
-            e.to_path
+            e.to_path,
+            e.edge_kind
         ])?;
     }
     Ok(())
@@ -156,6 +161,7 @@ mod tests {
             edge_confidence: "resolved".to_string(),
             from_path: Some("a.rs".to_string()),
             to_path: Some("b.rs".to_string()),
+            edge_kind: "call".to_string(),
         }];
         insert_call_edges_batch(&tx, &edges).unwrap();
         tx.commit().unwrap();
