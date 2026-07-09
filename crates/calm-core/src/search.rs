@@ -1657,7 +1657,11 @@ mod tests {
         )
         .unwrap();
         let anchor_id: i64 = conn
-            .query_row("SELECT id FROM code_chunks WHERE line_start = 10", [], |r| r.get(0))
+            .query_row(
+                "SELECT id FROM code_chunks WHERE line_start = 10",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         conn.execute(
             "INSERT INTO code_chunks (path, line_start, line_end, chunk_text, symbol_qn, file_hash)
@@ -1666,7 +1670,11 @@ mod tests {
         )
         .unwrap();
         let same_symbol_id: i64 = conn
-            .query_row("SELECT id FROM code_chunks WHERE line_start = 15", [], |r| r.get(0))
+            .query_row(
+                "SELECT id FROM code_chunks WHERE line_start = 15",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         conn.execute(
             "INSERT INTO code_chunks (path, line_start, line_end, chunk_text, symbol_qn, file_hash)
@@ -1675,7 +1683,11 @@ mod tests {
         )
         .unwrap();
         let other_symbol_id: i64 = conn
-            .query_row("SELECT id FROM code_chunks WHERE line_start = 25", [], |r| r.get(0))
+            .query_row(
+                "SELECT id FROM code_chunks WHERE line_start = 25",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
 
         crate::embedding::store_chunk_embedding(&conn, anchor_id, &[1.0, 0.0, 0.0]).unwrap();
@@ -1684,7 +1696,11 @@ mod tests {
 
         let output = search_similar(&conn, "src/main.py", 12, 10).unwrap();
         assert!(!output.degraded);
-        assert_eq!(output.results.len(), 1, "only the other symbol's chunk should survive");
+        assert_eq!(
+            output.results.len(),
+            1,
+            "only the other symbol's chunk should survive"
+        );
         assert_eq!(output.results[0].qualified_name, "src/main.py::update_user");
     }
 
@@ -1701,7 +1717,11 @@ mod tests {
         )
         .unwrap();
         let anchor_id: i64 = conn
-            .query_row("SELECT id FROM code_chunks WHERE line_start = 10", [], |r| r.get(0))
+            .query_row(
+                "SELECT id FROM code_chunks WHERE line_start = 10",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         // Two chunks for the SAME other symbol, at different similarity.
         conn.execute(
@@ -1711,7 +1731,9 @@ mod tests {
         )
         .unwrap();
         let closer_id: i64 = conn
-            .query_row("SELECT id FROM code_chunks WHERE line_start = 1", [], |r| r.get(0))
+            .query_row("SELECT id FROM code_chunks WHERE line_start = 1", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         conn.execute(
             "INSERT INTO code_chunks (path, line_start, line_end, chunk_text, symbol_qn, file_hash)
@@ -1720,7 +1742,9 @@ mod tests {
         )
         .unwrap();
         let farther_id: i64 = conn
-            .query_row("SELECT id FROM code_chunks WHERE line_start = 8", [], |r| r.get(0))
+            .query_row("SELECT id FROM code_chunks WHERE line_start = 8", [], |r| {
+                r.get(0)
+            })
             .unwrap();
 
         crate::embedding::store_chunk_embedding(&conn, anchor_id, &[1.0, 0.0, 0.0]).unwrap();
@@ -1728,8 +1752,16 @@ mod tests {
         crate::embedding::store_chunk_embedding(&conn, farther_id, &[0.8, 0.2, 0.0]).unwrap();
 
         let output = search_similar(&conn, "src/main.py", 12, 10).unwrap();
-        assert_eq!(output.results.len(), 1, "only the best-scoring chunk per symbol should survive");
-        assert_eq!(output.results[0].line_start, Some(1), "the closer window, not the farther one");
+        assert_eq!(
+            output.results.len(),
+            1,
+            "only the best-scoring chunk per symbol should survive"
+        );
+        assert_eq!(
+            output.results[0].line_start,
+            Some(1),
+            "the closer window, not the farther one"
+        );
     }
     #[test]
     fn test_search_symbol_scores_positive() {
@@ -1827,7 +1859,12 @@ mod tests {
         // same way: alphabetically by qualified_name.
         let a = stub_result("aaa_symbol", "semantic");
         let z = stub_result("zzz_symbol", "semantic");
-        let merged = rrf_merge_n(&[(&[a][..], 1.0), (&[z][..], 1.0)], 10, DEFAULT_RRF_K, "semantic");
+        let merged = rrf_merge_n(
+            &[(&[a][..], 1.0), (&[z][..], 1.0)],
+            10,
+            DEFAULT_RRF_K,
+            "semantic",
+        );
         assert_eq!(merged.len(), 2);
         assert_eq!(merged[0].score, merged[1].score, "must be a genuine tie");
         assert_eq!(

@@ -39,6 +39,12 @@ pub fn symbol_doc(name: &str, signature: &str, docstring: &str) -> String {
     s
 }
 
+/// (chunk id, embedding vector, optional owning symbol qualified name) — the
+/// row shape returned by `chunk_at`. Factored out to satisfy
+/// `clippy::type_complexity`; still a plain positional tuple everywhere
+/// it's used.
+pub type ChunkMatch = (i64, Vec<f32>, Option<String>);
+
 // ---------------------------------------------------------------------------
 // Feature ON: real model2vec-rs + brute-force cosine-scan implementation.
 // ---------------------------------------------------------------------------
@@ -442,11 +448,11 @@ mod imp {
     /// `None` when the file isn't chunked at that line yet, or the chunk
     /// has no embedding yet (feature off, or the embedding pass hasn't
     /// reached it).
-pub fn chunk_at(
+    pub fn chunk_at(
         conn: &Connection,
         path: &str,
         line: i64,
-    ) -> rusqlite::Result<Option<(i64, Vec<f32>, Option<String>)>> {
+    ) -> rusqlite::Result<Option<ChunkMatch>> {
         // `code_chunk_vecs` only exists once `create_chunk_embedding_table` has
         // run at least once (e.g. after the first embedding pass) — a brand
         // new/unembedded project legitimately doesn't have it yet, which is
@@ -475,7 +481,6 @@ pub fn chunk_at(
         })
         .optional()
     }
-
     /// Data-parallel brute-force top-`k` by cosine distance (ascending —
     /// smallest distance first) over already-decoded vectors. Defense in
     /// depth: skips any vector whose length disagrees with `query` — should
@@ -570,7 +575,7 @@ mod imp {
         _conn: &Connection,
         _path: &str,
         _line: i64,
-    ) -> rusqlite::Result<Option<(i64, Vec<f32>, Option<String>)>> {
+    ) -> rusqlite::Result<Option<ChunkMatch>> {
         Ok(None)
     }
 }
@@ -779,7 +784,9 @@ mod tests {
         )
         .unwrap();
         let wide_id: i64 = conn
-            .query_row("SELECT id FROM code_chunks WHERE line_end = 20", [], |r| r.get(0))
+            .query_row("SELECT id FROM code_chunks WHERE line_end = 20", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         conn.execute(
             "INSERT INTO code_chunks (path, line_start, line_end, chunk_text, symbol_qn, file_hash)
@@ -788,14 +795,19 @@ mod tests {
         )
         .unwrap();
         let tight_id: i64 = conn
-            .query_row("SELECT id FROM code_chunks WHERE line_end = 12", [], |r| r.get(0))
+            .query_row("SELECT id FROM code_chunks WHERE line_end = 12", [], |r| {
+                r.get(0)
+            })
             .unwrap();
 
         store_chunk_embedding(&conn, wide_id, &[1.0, 0.0, 0.0]).unwrap();
         store_chunk_embedding(&conn, tight_id, &[0.0, 1.0, 0.0]).unwrap();
 
         let (id, vec, symbol_qn) = chunk_at(&conn, "src/a.py", 10).unwrap().unwrap();
-        assert_eq!(id, tight_id, "should pick the tighter of two overlapping spans");
+        assert_eq!(
+            id, tight_id,
+            "should pick the tighter of two overlapping spans"
+        );
         assert_eq!(vec, vec![0.0, 1.0, 0.0]);
         assert_eq!(symbol_qn, Some("src/a.py::f".to_string()));
     }

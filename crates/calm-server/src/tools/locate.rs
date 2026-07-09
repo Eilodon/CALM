@@ -822,9 +822,16 @@ mod tests {
 
     #[test]
     fn apply_include_tests_filter_keeps_all_when_include_tests_true() {
-        let mut results = vec![stub_search_result("a", false), stub_search_result("b", true)];
+        let mut results = vec![
+            stub_search_result("a", false),
+            stub_search_result("b", true),
+        ];
         let truncated = apply_include_tests_filter(&mut results, 10, true);
-        assert_eq!(results.len(), 2, "include_tests=true is the current, unchanged behavior");
+        assert_eq!(
+            results.len(),
+            2,
+            "include_tests=true is the current, unchanged behavior"
+        );
         assert!(!truncated);
     }
 
@@ -841,7 +848,10 @@ mod tests {
             results.iter().all(|r| r.qualified_name != "b"),
             "is_test result must be hard-excluded, not just score-penalized"
         );
-        assert!(!truncated, "under the limit even after filtering, not truncated");
+        assert!(
+            !truncated,
+            "under the limit even after filtering, not truncated"
+        );
     }
 
     #[test]
