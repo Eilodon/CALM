@@ -11,6 +11,9 @@ impl CalmServer {
             if p.kind == "grep" {
                 return self.search_grep_impl(&p);
             }
+            if p.kind == "similar" {
+                return self.search_similar_impl(&p);
+            }
             let kind = match p.kind.as_str() {
                 "symbol" => calm_core::types::SearchKind::Symbol,
                 "text" => calm_core::types::SearchKind::Text,
@@ -33,11 +36,13 @@ impl CalmServer {
                 &conn,
                 &p.query,
                 kind,
-                p.limit,
+                search_fetch_limit(&p),
                 self.embedder().as_deref(),
                 rrf_k,
             ) {
                 Ok(mut output) => {
+                    let filter_truncated =
+                        apply_include_tests_filter(&mut output.results, p.limit, p.include_tests);
                     let personalized = self.apply_personalization_boost(&conn, &mut output.results);
                     let results: Vec<SearchResultItem> = output
                         .results
@@ -85,7 +90,7 @@ impl CalmServer {
                     };
                     serde_json::to_string_pretty(&SearchOutput {
                         results,
-                        truncated: output.truncated,
+                        truncated: output.truncated || filter_truncated,
                         degraded: output.degraded,
                         note: output.note,
                         personalized,
@@ -126,9 +131,11 @@ impl CalmServer {
             p.case_insensitive,
             p.context,
             &ignore_patterns,
-            p.limit,
+            search_fetch_limit(p),
         ) {
             Ok(mut output) => {
+                let filter_truncated =
+                    apply_include_tests_filter(&mut output.results, p.limit, p.include_tests);
                 let personalized = self.apply_personalization_boost(&conn, &mut output.results);
                 let results: Vec<SearchResultItem> = output
                     .results
@@ -158,7 +165,7 @@ impl CalmServer {
                 });
                 serde_json::to_string_pretty(&SearchOutput {
                     results,
-                    truncated: output.truncated,
+                    truncated: output.truncated || filter_truncated,
                     degraded: output.degraded,
                     note,
                     personalized,
@@ -178,6 +185,69 @@ impl CalmServer {
         }
     }
 
+    /// `kind="similar"` path: vector-similarity KNN anchored at `p.path`+
+    /// `p.line` instead of embedding `p.query` (which is ignored here).
+    fn search_similar_impl(&self, p: &SearchParams) -> String {
+        let (Some(path), Some(line)) = (p.path.as_deref(), p.line) else {
+            return serde_json::to_string_pretty(&SearchOutput {
+                results: vec![],
+                truncated: false,
+                degraded: true,
+                note: Some("kind=\"similar\" requires both `path` and `line`".to_string()),
+                personalized: false,
+                suggested_next: None,
+            })
+            .unwrap_or_default();
+        };
+        let conn = match self.make_read_conn() {
+            Ok(c) => c,
+            Err(e) => return format!(r#"{{"error": "db connection failed: {e}"}}"#),
+        };
+        match calm_core::search::search_similar(&conn, path, line, search_fetch_limit(p)) {
+            Ok(mut output) => {
+                let filter_truncated =
+                    apply_include_tests_filter(&mut output.results, p.limit, p.include_tests);
+                let personalized = self.apply_personalization_boost(&conn, &mut output.results);
+                let results: Vec<SearchResultItem> = output
+                    .results
+                    .into_iter()
+                    .map(|r| SearchResultItem {
+                        name: r.name,
+                        path: r.path,
+                        kind: r.kind,
+                        line_start: r.line_start,
+                        line_end: r.line_end,
+                        score: Some(r.score),
+                        match_type: Some(r.match_type),
+                        snippet: r.snippet,
+                    })
+                    .collect();
+                let note = output.note.or_else(|| {
+                    results.is_empty().then(|| {
+                        "No similar code found elsewhere in the index — this may be genuinely unique code, or the embeddings index is still building".to_string()
+                    })
+                });
+                serde_json::to_string_pretty(&SearchOutput {
+                    results,
+                    truncated: output.truncated || filter_truncated,
+                    degraded: output.degraded,
+                    note,
+                    personalized,
+                    suggested_next: self.filter_sn(None),
+                })
+                .unwrap_or_default()
+            }
+            Err(e) => serde_json::to_string_pretty(&SearchOutput {
+                results: vec![],
+                truncated: false,
+                degraded: true,
+                note: Some(format!("similar search error: {e}")),
+                personalized: false,
+                suggested_next: None,
+            })
+            .unwrap_or_default(),
+        }
+    }
     #[tool(
         name = "locate",
         description = "Compound: search + file_overview + symbol_info in 1 call (66% reduction). USE INSTEAD OF calling search then file_overview then symbol_info separately. NOT FOR: reading source (use source after locate), pre-edit (use edit_context)."
@@ -404,6 +474,9 @@ pub(crate) struct ErrorDetail {
 #[derive(Deserialize, JsonSchema)]
 #[allow(dead_code)]
 pub(crate) struct SearchParams {
+    /// Free-text query. Required for every `kind` except `"similar"`, where
+    /// it's ignored — pass `path`+`line` instead (an anchor location has no
+    /// text query to embed; its own stored chunk vector is reused as-is).
     pub(crate) query: String,
     /// One of `"symbol"` (default, name/signature match), `"text"` (FTS
     /// over code body), `"file"` (path match — glob syntax like `*.md` or
@@ -411,9 +484,12 @@ pub(crate) struct SearchParams {
     /// regex over raw file content read from disk, including files the
     /// indexer never parses — Cargo.toml, docs/*.md, etc.; see `glob`/
     /// `case_insensitive`/`context`), `"semantic"` (embedding KNN — needs
-    /// the `embeddings` feature and a ready index), or `"hybrid"` (RRF
-    /// fusion of text + symbol-identity + code-chunk vectors). Any other
-    /// value silently falls back to `"symbol"`.
+    /// the `embeddings` feature and a ready index), `"hybrid"` (RRF
+    /// fusion of text + symbol-identity + code-chunk vectors), or
+    /// `"similar"` (embedding KNN anchored at `path`+`line` instead of a
+    /// text query — "find code that looks like *this location*", not "find
+    /// code matching these words"; needs `embeddings` and `path`+`line`).
+    /// Any other value silently falls back to `"symbol"`.
     #[serde(default = "default_symbol")]
     pub(crate) kind: String,
     /// Max results to return. Default 10.
@@ -430,6 +506,23 @@ pub(crate) struct SearchParams {
     /// match in the returned snippet. Default 0.
     #[serde(default)]
     pub(crate) context: usize,
+    /// `kind="similar"` only, required: repo-relative path of the anchor
+    /// location whose code you want to find elsewhere in the repo.
+    pub(crate) path: Option<String>,
+    /// `kind="similar"` only, required: 1-indexed line within `path` that
+    /// selects the anchor chunk (the smallest indexed chunk spanning this
+    /// line).
+    pub(crate) line: Option<i64>,
+    /// `false` to hard-exclude test code (`is_test`) from results. Default
+    /// `true` (current behavior, unchanged): tests are only soft-penalized
+    /// via `NOISE_PENALTY`, which a descriptively-named test that closely
+    /// paraphrases the query can still outrank the real implementation
+    /// against — pass `false` when the query has nothing to do with tests
+    /// to exclude them outright instead of just down-ranking them. May
+    /// return fewer than `limit` results if enough hits were tests (a
+    /// modest overfetch covers most cases but isn't retried further).
+    #[serde(default = "default_include_tests")]
+    pub(crate) include_tests: bool,
 }
 
 pub(crate) fn default_symbol() -> String {
@@ -438,6 +531,43 @@ pub(crate) fn default_symbol() -> String {
 
 pub(crate) fn default_limit() -> usize {
     10
+}
+
+pub(crate) fn default_include_tests() -> bool {
+    true
+}
+
+/// Internal fetch size passed to the underlying `calm_core` search —
+/// deliberately larger than `p.limit` when `include_tests` is `false`, so
+/// `apply_include_tests_filter` below has enough of a pool to drop test
+/// hits from without immediately starving the response. Not a guarantee:
+/// a file with unusually many tests can still under-fill `limit`.
+pub(crate) fn search_fetch_limit(p: &SearchParams) -> usize {
+    if p.include_tests {
+        p.limit
+    } else {
+        p.limit.saturating_mul(2).max(p.limit + 5)
+    }
+}
+
+/// Hard-excludes `is_test` rows when `include_tests` is `false` (vs
+/// `NOISE_PENALTY`'s soft score demotion inside `rrf_merge_n`, which a
+/// descriptively-named test that closely paraphrases the query can still
+/// outrank the real implementation against), then truncates back down to
+/// `limit`. Returns `true` if the filter itself dropped enough rows that
+/// truncation now reflects the filter rather than (or in addition to) the
+/// underlying search's own limit.
+pub(crate) fn apply_include_tests_filter(
+    results: &mut Vec<calm_core::search::SearchResult>,
+    limit: usize,
+    include_tests: bool,
+) -> bool {
+    if !include_tests {
+        results.retain(|r| !r.is_test);
+    }
+    let filter_truncated = results.len() > limit;
+    results.truncate(limit);
+    filter_truncated
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -673,5 +803,56 @@ mod tests {
         assert_eq!(full.symbol_count, 45);
         assert_eq!(full.symbols.len(), 45, "no cap returns the full list");
         assert!(!full.symbols_truncated);
+    }
+
+    fn stub_search_result(qn: &str, is_test: bool) -> calm_core::search::SearchResult {
+        calm_core::search::SearchResult {
+            name: qn.into(),
+            qualified_name: qn.into(),
+            path: "x.rs".into(),
+            kind: None,
+            line_start: None,
+            line_end: None,
+            score: 0.0,
+            match_type: "symbol".into(),
+            snippet: None,
+            is_test,
+        }
+    }
+
+    #[test]
+    fn apply_include_tests_filter_keeps_all_when_include_tests_true() {
+        let mut results = vec![stub_search_result("a", false), stub_search_result("b", true)];
+        let truncated = apply_include_tests_filter(&mut results, 10, true);
+        assert_eq!(results.len(), 2, "include_tests=true is the current, unchanged behavior");
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn apply_include_tests_filter_excludes_tests_when_false() {
+        let mut results = vec![
+            stub_search_result("a", false),
+            stub_search_result("b", true),
+            stub_search_result("c", false),
+        ];
+        let truncated = apply_include_tests_filter(&mut results, 10, false);
+        assert_eq!(results.len(), 2);
+        assert!(
+            results.iter().all(|r| r.qualified_name != "b"),
+            "is_test result must be hard-excluded, not just score-penalized"
+        );
+        assert!(!truncated, "under the limit even after filtering, not truncated");
+    }
+
+    #[test]
+    fn apply_include_tests_filter_reports_truncated_when_still_over_limit() {
+        let mut results = vec![
+            stub_search_result("a", false),
+            stub_search_result("b", false),
+            stub_search_result("c", false),
+        ];
+        let truncated = apply_include_tests_filter(&mut results, 2, true);
+        assert_eq!(results.len(), 2);
+        assert!(truncated);
     }
 }

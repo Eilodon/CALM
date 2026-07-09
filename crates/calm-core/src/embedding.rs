@@ -435,6 +435,47 @@ mod imp {
         .collect()
     }
 
+    /// Resolve the code chunk containing `line` in `path`, returning its
+    /// stored embedding vector alongside `symbol_qn` (used by callers to
+    /// exclude other windows of the same symbol from "elsewhere" results).
+    /// Picks the smallest containing span when sliding windows overlap.
+    /// `None` when the file isn't chunked at that line yet, or the chunk
+    /// has no embedding yet (feature off, or the embedding pass hasn't
+    /// reached it).
+pub fn chunk_at(
+        conn: &Connection,
+        path: &str,
+        line: i64,
+    ) -> rusqlite::Result<Option<(i64, Vec<f32>, Option<String>)>> {
+        // `code_chunk_vecs` only exists once `create_chunk_embedding_table` has
+        // run at least once (e.g. after the first embedding pass) — a brand
+        // new/unembedded project legitimately doesn't have it yet, which is
+        // just another way of saying "no embedding here", not an error.
+        let vecs_table_exists: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'code_chunk_vecs'",
+            [],
+            |r| r.get(0),
+        )?;
+        if vecs_table_exists == 0 {
+            return Ok(None);
+        }
+        let mut stmt = conn.prepare(
+            "SELECT cc.id, cc.symbol_qn, cv.embedding
+             FROM code_chunks cc
+             JOIN code_chunk_vecs cv ON cv.chunk_id = cc.id
+             WHERE cc.path = ?1 AND cc.line_start <= ?2 AND cc.line_end >= ?2
+             ORDER BY (cc.line_end - cc.line_start) ASC
+             LIMIT 1",
+        )?;
+        stmt.query_row(rusqlite::params![path, line], |r| {
+            let id: i64 = r.get(0)?;
+            let symbol_qn: Option<String> = r.get(1)?;
+            let blob = r.get_ref(2)?.as_blob().unwrap_or(&[]);
+            Ok((id, blob_to_vec(blob), symbol_qn))
+        })
+        .optional()
+    }
+
     /// Data-parallel brute-force top-`k` by cosine distance (ascending —
     /// smallest distance first) over already-decoded vectors. Defense in
     /// depth: skips any vector whose length disagrees with `query` — should
@@ -525,10 +566,17 @@ mod imp {
     pub fn knn_chunks(_c: &Connection, _q: &[f32], _k: usize) -> rusqlite::Result<Vec<(i64, f64)>> {
         Ok(Vec::new())
     }
+    pub fn chunk_at(
+        _conn: &Connection,
+        _path: &str,
+        _line: i64,
+    ) -> rusqlite::Result<Option<(i64, Vec<f32>, Option<String>)>> {
+        Ok(None)
+    }
 }
 
 pub use imp::{
-    Embedder, create_chunk_embedding_table, create_embedding_table,
+    Embedder, chunk_at, create_chunk_embedding_table, create_embedding_table,
     default_vendored_asset_unusable, embed_pending, embed_pending_chunks, knn, knn_chunks,
     prune_orphaned_chunk_vecs, store_chunk_embedding, store_embedding,
 };
@@ -714,6 +762,62 @@ mod tests {
         assert_eq!(hits[0].0, 30, "nearest should be chunk id 30");
     }
 
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn chunk_at_picks_smallest_containing_span_and_returns_vector() {
+        use rusqlite::Connection;
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        create_chunk_embedding_table(&conn, 3).unwrap();
+
+        // Two overlapping windows over the same file — chunk_at should prefer
+        // the tighter one that still contains the target line.
+        conn.execute(
+            "INSERT INTO code_chunks (path, line_start, line_end, chunk_text, symbol_qn, file_hash)
+             VALUES ('src/a.py', 1, 20, 'wide', 'src/a.py::f', 'h')",
+            [],
+        )
+        .unwrap();
+        let wide_id: i64 = conn
+            .query_row("SELECT id FROM code_chunks WHERE line_end = 20", [], |r| r.get(0))
+            .unwrap();
+        conn.execute(
+            "INSERT INTO code_chunks (path, line_start, line_end, chunk_text, symbol_qn, file_hash)
+             VALUES ('src/a.py', 8, 12, 'tight', 'src/a.py::f', 'h')",
+            [],
+        )
+        .unwrap();
+        let tight_id: i64 = conn
+            .query_row("SELECT id FROM code_chunks WHERE line_end = 12", [], |r| r.get(0))
+            .unwrap();
+
+        store_chunk_embedding(&conn, wide_id, &[1.0, 0.0, 0.0]).unwrap();
+        store_chunk_embedding(&conn, tight_id, &[0.0, 1.0, 0.0]).unwrap();
+
+        let (id, vec, symbol_qn) = chunk_at(&conn, "src/a.py", 10).unwrap().unwrap();
+        assert_eq!(id, tight_id, "should pick the tighter of two overlapping spans");
+        assert_eq!(vec, vec![0.0, 1.0, 0.0]);
+        assert_eq!(symbol_qn, Some("src/a.py::f".to_string()));
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn chunk_at_returns_none_without_a_stored_embedding() {
+        use rusqlite::Connection;
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        create_chunk_embedding_table(&conn, 3).unwrap();
+
+        conn.execute(
+            "INSERT INTO code_chunks (path, line_start, line_end, chunk_text, symbol_qn, file_hash)
+             VALUES ('src/a.py', 1, 5, 'unembedded', NULL, 'h')",
+            [],
+        )
+        .unwrap();
+
+        // No matching code_chunk_vecs row yet (embedding pass hasn't reached it).
+        assert!(chunk_at(&conn, "src/a.py", 3).unwrap().is_none());
+    }
     #[cfg(feature = "embeddings")]
     #[test]
     fn prune_orphaned_chunk_vecs_removes_only_dangling_rows() {
