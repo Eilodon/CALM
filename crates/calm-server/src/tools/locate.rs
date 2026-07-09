@@ -11,6 +11,9 @@ impl CalmServer {
             if p.kind == "grep" {
                 return self.search_grep_impl(&p);
             }
+            if p.kind == "similar" {
+                return self.search_similar_impl(&p);
+            }
             let kind = match p.kind.as_str() {
                 "symbol" => calm_core::types::SearchKind::Symbol,
                 "text" => calm_core::types::SearchKind::Text,
@@ -178,6 +181,67 @@ impl CalmServer {
         }
     }
 
+    /// `kind="similar"` path: vector-similarity KNN anchored at `p.path`+
+    /// `p.line` instead of embedding `p.query` (which is ignored here).
+    fn search_similar_impl(&self, p: &SearchParams) -> String {
+        let (Some(path), Some(line)) = (p.path.as_deref(), p.line) else {
+            return serde_json::to_string_pretty(&SearchOutput {
+                results: vec![],
+                truncated: false,
+                degraded: true,
+                note: Some("kind=\"similar\" requires both `path` and `line`".to_string()),
+                personalized: false,
+                suggested_next: None,
+            })
+            .unwrap_or_default();
+        };
+        let conn = match self.make_read_conn() {
+            Ok(c) => c,
+            Err(e) => return format!(r#"{{"error": "db connection failed: {e}"}}"#),
+        };
+        match calm_core::search::search_similar(&conn, path, line, p.limit) {
+            Ok(mut output) => {
+                let personalized = self.apply_personalization_boost(&conn, &mut output.results);
+                let results: Vec<SearchResultItem> = output
+                    .results
+                    .into_iter()
+                    .map(|r| SearchResultItem {
+                        name: r.name,
+                        path: r.path,
+                        kind: r.kind,
+                        line_start: r.line_start,
+                        line_end: r.line_end,
+                        score: Some(r.score),
+                        match_type: Some(r.match_type),
+                        snippet: r.snippet,
+                    })
+                    .collect();
+                let note = output.note.or_else(|| {
+                    results.is_empty().then(|| {
+                        "No similar code found elsewhere in the index — this may be genuinely unique code, or the embeddings index is still building".to_string()
+                    })
+                });
+                serde_json::to_string_pretty(&SearchOutput {
+                    results,
+                    truncated: output.truncated,
+                    degraded: output.degraded,
+                    note,
+                    personalized,
+                    suggested_next: self.filter_sn(None),
+                })
+                .unwrap_or_default()
+            }
+            Err(e) => serde_json::to_string_pretty(&SearchOutput {
+                results: vec![],
+                truncated: false,
+                degraded: true,
+                note: Some(format!("similar search error: {e}")),
+                personalized: false,
+                suggested_next: None,
+            })
+            .unwrap_or_default(),
+        }
+    }
     #[tool(
         name = "locate",
         description = "Compound: search + file_overview + symbol_info in 1 call (66% reduction). USE INSTEAD OF calling search then file_overview then symbol_info separately. NOT FOR: reading source (use source after locate), pre-edit (use edit_context)."
@@ -404,6 +468,9 @@ pub(crate) struct ErrorDetail {
 #[derive(Deserialize, JsonSchema)]
 #[allow(dead_code)]
 pub(crate) struct SearchParams {
+    /// Free-text query. Required for every `kind` except `"similar"`, where
+    /// it's ignored — pass `path`+`line` instead (an anchor location has no
+    /// text query to embed; its own stored chunk vector is reused as-is).
     pub(crate) query: String,
     /// One of `"symbol"` (default, name/signature match), `"text"` (FTS
     /// over code body), `"file"` (path match — glob syntax like `*.md` or
@@ -411,9 +478,12 @@ pub(crate) struct SearchParams {
     /// regex over raw file content read from disk, including files the
     /// indexer never parses — Cargo.toml, docs/*.md, etc.; see `glob`/
     /// `case_insensitive`/`context`), `"semantic"` (embedding KNN — needs
-    /// the `embeddings` feature and a ready index), or `"hybrid"` (RRF
-    /// fusion of text + symbol-identity + code-chunk vectors). Any other
-    /// value silently falls back to `"symbol"`.
+    /// the `embeddings` feature and a ready index), `"hybrid"` (RRF
+    /// fusion of text + symbol-identity + code-chunk vectors), or
+    /// `"similar"` (embedding KNN anchored at `path`+`line` instead of a
+    /// text query — "find code that looks like *this location*", not "find
+    /// code matching these words"; needs `embeddings` and `path`+`line`).
+    /// Any other value silently falls back to `"symbol"`.
     #[serde(default = "default_symbol")]
     pub(crate) kind: String,
     /// Max results to return. Default 10.
@@ -430,6 +500,13 @@ pub(crate) struct SearchParams {
     /// match in the returned snippet. Default 0.
     #[serde(default)]
     pub(crate) context: usize,
+    /// `kind="similar"` only, required: repo-relative path of the anchor
+    /// location whose code you want to find elsewhere in the repo.
+    pub(crate) path: Option<String>,
+    /// `kind="similar"` only, required: 1-indexed line within `path` that
+    /// selects the anchor chunk (the smallest indexed chunk spanning this
+    /// line).
+    pub(crate) line: Option<i64>,
 }
 
 pub(crate) fn default_symbol() -> String {

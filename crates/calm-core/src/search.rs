@@ -777,6 +777,73 @@ fn search_semantic(
     })
 }
 
+/// Vector-similarity search anchored at a specific code location instead of
+/// a text query — "find code that looks like *this*", not "find code
+/// matching these words". Reuses the same chunk embeddings
+/// `chunk_semantic_results` scans, and is cheaper than a text query since
+/// the anchor's own stored vector is the query vector (no embedder
+/// inference needed).
+///
+/// Excludes the anchor chunk itself and any other chunk belonging to the
+/// same symbol as the anchor (sliding-window neighbours of the anchor's own
+/// function aren't "elsewhere"), then keeps only the highest-scoring chunk
+/// per symbol/gap-region so the result set can't collapse into N windows of
+/// one other function.
+pub fn search_similar(
+    conn: &Connection,
+    path: &str,
+    line: i64,
+    limit: usize,
+) -> rusqlite::Result<SearchOutput> {
+    let Some((anchor_id, anchor_vec, anchor_symbol_qn)) =
+        crate::embedding::chunk_at(conn, path, line)?
+    else {
+        return Ok(SearchOutput {
+            results: Vec::new(),
+            truncated: false,
+            degraded: true,
+            note: Some(
+                "No embedded chunk at this location — the embeddings feature may be off, the index hasn't embedded this file/line yet, or the line is out of range"
+                    .to_string(),
+            ),
+        });
+    };
+
+    // Overfetch: the anchor itself, same-symbol windows, and repeat symbols
+    // all get filtered below, so asking knn_chunks for exactly `limit` would
+    // under-return once any filtering kicks in.
+    let hits = crate::embedding::knn_chunks(conn, &anchor_vec, (limit * 4).max(20))?;
+
+    let mut seen = std::collections::HashSet::new();
+    let mut results = Vec::with_capacity(limit);
+    for (chunk_id, dist) in hits {
+        if chunk_id == anchor_id {
+            continue;
+        }
+        let Some(mut r) = chunk_hit_to_result(conn, chunk_id)? else {
+            continue;
+        };
+        if anchor_symbol_qn.as_deref() == Some(r.qualified_name.as_str()) {
+            continue; // another window of the anchor's own symbol, not "elsewhere"
+        }
+        if !seen.insert(r.qualified_name.clone()) {
+            continue; // keep only the best-scoring chunk per symbol/gap-region
+        }
+        r.score = 1.0 - dist;
+        r.match_type = "similar_chunk".to_string();
+        results.push(r);
+        if results.len() >= limit {
+            break;
+        }
+    }
+
+    Ok(SearchOutput {
+        truncated: results.len() >= limit,
+        degraded: false,
+        note: None,
+        results,
+    })
+}
 fn search_hybrid(
     conn: &Connection,
     query: &str,
@@ -1557,6 +1624,106 @@ mod tests {
         assert!(r.kind.is_none());
     }
 
+    #[test]
+    fn test_search_similar_no_chunk_returns_degraded() {
+        let conn = setup_db_with_symbols();
+        // No code_chunks at all for this path/line — same result whether the
+        // embeddings feature is on (no chunk indexed there) or off (stub).
+        let output = search_similar(&conn, "src/main.py", 12, 10).unwrap();
+        assert!(output.degraded);
+        assert!(output.results.is_empty());
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn search_similar_excludes_anchor_and_same_symbol_windows() {
+        let conn = setup_db_with_symbols();
+        crate::embedding::create_chunk_embedding_table(&conn, 3).unwrap();
+
+        // get_user has two overlapping windows (its own sliding-window
+        // chunks) — both near-identical to the anchor vector, but neither
+        // should come back since they're the anchor's own symbol.
+        conn.execute(
+            "INSERT INTO code_chunks (path, line_start, line_end, chunk_text, symbol_qn, file_hash)
+             VALUES ('src/main.py', 10, 14, 'a', 'src/main.py::get_user', 'h')",
+            [],
+        )
+        .unwrap();
+        let anchor_id: i64 = conn
+            .query_row("SELECT id FROM code_chunks WHERE line_start = 10", [], |r| r.get(0))
+            .unwrap();
+        conn.execute(
+            "INSERT INTO code_chunks (path, line_start, line_end, chunk_text, symbol_qn, file_hash)
+             VALUES ('src/main.py', 15, 20, 'b', 'src/main.py::get_user', 'h')",
+            [],
+        )
+        .unwrap();
+        let same_symbol_id: i64 = conn
+            .query_row("SELECT id FROM code_chunks WHERE line_start = 15", [], |r| r.get(0))
+            .unwrap();
+        conn.execute(
+            "INSERT INTO code_chunks (path, line_start, line_end, chunk_text, symbol_qn, file_hash)
+             VALUES ('src/main.py', 25, 40, 'c', 'src/main.py::update_user', 'h')",
+            [],
+        )
+        .unwrap();
+        let other_symbol_id: i64 = conn
+            .query_row("SELECT id FROM code_chunks WHERE line_start = 25", [], |r| r.get(0))
+            .unwrap();
+
+        crate::embedding::store_chunk_embedding(&conn, anchor_id, &[1.0, 0.0, 0.0]).unwrap();
+        crate::embedding::store_chunk_embedding(&conn, same_symbol_id, &[0.99, 0.01, 0.0]).unwrap();
+        crate::embedding::store_chunk_embedding(&conn, other_symbol_id, &[0.9, 0.1, 0.0]).unwrap();
+
+        let output = search_similar(&conn, "src/main.py", 12, 10).unwrap();
+        assert!(!output.degraded);
+        assert_eq!(output.results.len(), 1, "only the other symbol's chunk should survive");
+        assert_eq!(output.results[0].qualified_name, "src/main.py::update_user");
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn search_similar_dedupes_by_symbol_keeping_best_scoring_chunk() {
+        let conn = setup_db_with_symbols();
+        crate::embedding::create_chunk_embedding_table(&conn, 3).unwrap();
+
+        conn.execute(
+            "INSERT INTO code_chunks (path, line_start, line_end, chunk_text, symbol_qn, file_hash)
+             VALUES ('src/main.py', 10, 14, 'a', 'src/main.py::get_user', 'h')",
+            [],
+        )
+        .unwrap();
+        let anchor_id: i64 = conn
+            .query_row("SELECT id FROM code_chunks WHERE line_start = 10", [], |r| r.get(0))
+            .unwrap();
+        // Two chunks for the SAME other symbol, at different similarity.
+        conn.execute(
+            "INSERT INTO code_chunks (path, line_start, line_end, chunk_text, symbol_qn, file_hash)
+             VALUES ('src/utils.py', 1, 7, 'a', 'src/utils.py::parse_config', 'h')",
+            [],
+        )
+        .unwrap();
+        let closer_id: i64 = conn
+            .query_row("SELECT id FROM code_chunks WHERE line_start = 1", [], |r| r.get(0))
+            .unwrap();
+        conn.execute(
+            "INSERT INTO code_chunks (path, line_start, line_end, chunk_text, symbol_qn, file_hash)
+             VALUES ('src/utils.py', 8, 15, 'b', 'src/utils.py::parse_config', 'h')",
+            [],
+        )
+        .unwrap();
+        let farther_id: i64 = conn
+            .query_row("SELECT id FROM code_chunks WHERE line_start = 8", [], |r| r.get(0))
+            .unwrap();
+
+        crate::embedding::store_chunk_embedding(&conn, anchor_id, &[1.0, 0.0, 0.0]).unwrap();
+        crate::embedding::store_chunk_embedding(&conn, closer_id, &[0.95, 0.05, 0.0]).unwrap();
+        crate::embedding::store_chunk_embedding(&conn, farther_id, &[0.8, 0.2, 0.0]).unwrap();
+
+        let output = search_similar(&conn, "src/main.py", 12, 10).unwrap();
+        assert_eq!(output.results.len(), 1, "only the best-scoring chunk per symbol should survive");
+        assert_eq!(output.results[0].line_start, Some(1), "the closer window, not the farther one");
+    }
     #[test]
     fn test_search_symbol_scores_positive() {
         let conn = setup_db_with_symbols();

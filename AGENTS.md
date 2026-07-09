@@ -56,12 +56,13 @@ fitness_report()         # hub/dead-code/complexity/coverage/boundary health vs 
 
 **Goal**: Find the symbol or file you need.
 
-**Tools**: `locate` (preferred — 3-in-1), `search` (result list only, 6 kinds), `file_overview` (when you already have a path)
+**Tools**: `locate` (preferred — 3-in-1), `search` (result list only, 7 kinds), `file_overview` (when you already have a path)
 
 ```
 locate("getUserByEmail")                    # search + file_overview + symbol_info in 1 call
 search("auth handler", kind="hybrid")       # broadest recall when embeddings ready
 search("TODO(sec)", kind="grep")            # real regex+glob scan on disk (case_insensitive, context)
+search(path="src/auth/login.ts", line=42, kind="similar")  # find code that looks like *this location*, not a text match
 file_overview("src/auth/login.ts")          # when you already have a path
 ```
 
@@ -74,6 +75,7 @@ file_overview("src/auth/login.ts")          # when you already have a path
 - Empty results with `kind="symbol"` → retry with `kind="hybrid"`
 - **Empty across `symbol`/`text`/`hybrid` ≠ "doesn't exist."** Module-level `const`/`static` isn't extracted as a symbol in any currently-supported language — including JS/TS: a `const`/`let` binding is only indexed when its value is itself a function (arrow/function expression), so a plain data constant like `const MAX = 5` is just as invisible as a Rust `const`/Go `const`/Python module constant. `text`'s FTS index (`fts_exact`) is populated by a DB trigger on the `symbols` table, so anything never extracted as a symbol never enters FTS either; `hybrid`'s non-semantic component matches name+docstring+signature with no column filter (a superset of `text`'s docstring+signature-only filter — not a different data source), so if `hybrid` came back empty while degraded (no embeddings), `text` is guaranteed empty too. `search(kind="grep")` is the only kind that reads raw file content directly, so it's the real fallback here — `suggested_next` now routes `hybrid`/`text` empty results to `grep` instead of looping between them.
 - Need a literal/regex match, or the target might be a file the parser never touches (`Cargo.toml`, `docs/*.md`, config) → `search(kind="grep")` walks the real filesystem (honors `.gitignore`), so it covers those too — this is the closest native-`grep` equivalent, closer than `hybrid`
+- Found a bug/anti-pattern at a specific location and want to know if it's duplicated elsewhere (not "what calls this", but "what looks like this") → `search(path=..., line=..., kind="similar")`. It anchors on the code's own stored embedding (no text to write), excludes the anchor and any other window of the *same* symbol, and keeps only the best-scoring chunk per symbol so results don't collapse into N windows of one other function. Needs `embeddings` and a chunk already embedded at that line — degrades to `degraded: true` otherwise, same as `kind="semantic"`.
 
 ---
 
@@ -121,6 +123,7 @@ dependencies("src/auth/login.ts")      # file import graph
 - `transitive_capped: true` → BFS timed out; true blast radius may be larger than reported
 - `path.terminated_by == "max_hops"` → retry with larger `max_hops` or reverse `from`/`to`
 - `dependencies.imported_by_total > 20` → high fan-in file; check symbol blast radius too
+- Want "what else looks like this" rather than "what calls/imports this" → that's not this stage: use `search(kind="similar", path=..., line=...)` (Stage 2) instead. `callers`/`callees`/`dependencies` are exact graph edges; `similar` is vector similarity — the right tool for spotting a duplicated bug pattern with no call relationship at all.
 
 ---
 
