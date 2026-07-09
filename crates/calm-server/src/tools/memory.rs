@@ -1,22 +1,27 @@
 use super::common::*;
 use super::*;
 
+#[rmcp::tool_router(router = "memory_tool_router", vis = "pub(crate)")]
 impl CalmServer {
     #[tool(
         name = "remember",
         description = "Save a durable, interpretive note (architecture decision, gotcha, rationale) under a short topic key. Persists across sessions and server restarts — unlike session_context, which only tracks the current session's navigation. USE WHEN: you've learned something a future session should know that the graph/AST can't capture on its own (a WHY, not a fact derivable from code). Upserts: calling again with the same topic overwrites its content."
     )]
-    pub(crate) fn remember(&self, #[tool(aggr)] p: RememberParams) -> String {
-        self.timed_tool("remember", || {
+    pub(crate) fn remember(&self, Parameters(p): Parameters<RememberParams>) -> Json<ToolOutcome<RememberOutput>> {
+        Json(self.timed_tool("remember", || {
             let topic = p.topic.trim();
             let content = p.content.trim();
             if topic.is_empty() || content.is_empty() {
-                return r#"{"error": "topic and content must both be non-empty"}"#.to_string();
+                return ToolOutcome::error(error_detail(
+                    "INVALID_INPUT",
+                    "topic and content must both be non-empty",
+                    false,
+                ));
             }
 
             let conn = match self.memory_write_conn() {
                 Ok(c) => c,
-                Err(e) => return format!(r#"{{"error": "db connection failed: {e}"}}"#),
+                Err(e) => return db_error(e),
             };
             let now = utc_now_iso8601();
             let result = conn.execute(
@@ -26,7 +31,11 @@ impl CalmServer {
                 rusqlite::params![topic, content, now],
             );
             if let Err(e) = result {
-                return format!(r#"{{"error": "write failed: {e}"}}"#);
+                return ToolOutcome::error(error_detail(
+                    "WRITE_FAILED",
+                    &format!("write failed: {e}"),
+                    false,
+                ));
             }
 
             // Best-effort: capture which real files this note references, so
@@ -41,27 +50,26 @@ impl CalmServer {
                 tracing::error!("remember: failed to store refs for topic {topic}: {e}");
             }
 
-            serde_json::to_string_pretty(&RememberOutput {
+            ToolOutcome::success(RememberOutput {
                 topic: topic.to_string(),
                 updated_at: now,
                 refs_captured,
                 suggested_next: self.filter_sn(suggested("recall", "Verify the note was saved")),
             })
-            .unwrap_or_default()
-        })
+        }))
     }
 
     #[tool(
         name = "recall",
         description = "Retrieve durable notes saved by remember. USE WHEN: starting work on a topic you might have left notes about, or checking for known gotchas before touching an area. Pass `topic` for one exact note, `query` for a keyword search across all notes, or neither to list everything (most recently updated first)."
     )]
-    pub(crate) fn recall(&self, #[tool(aggr)] p: RecallParams) -> String {
-        self.timed_tool("recall", || {
+    pub(crate) fn recall(&self, Parameters(p): Parameters<RecallParams>) -> Json<ToolOutcome<RecallOutput>> {
+        Json(self.timed_tool("recall", || {
             const RECALL_LIMIT: i64 = 50;
 
             let conn = match self.make_read_conn() {
                 Ok(c) => c,
-                Err(e) => return format!(r#"{{"error": "db connection failed: {e}"}}"#),
+                Err(e) => return db_error(e),
             };
 
             let query_result = if let Some(topic) =
@@ -104,7 +112,13 @@ impl CalmServer {
 
             let notes = match query_result {
                 Ok(n) => n,
-                Err(e) => return format!(r#"{{"error": "query failed: {e}"}}"#),
+                Err(e) => {
+                    return ToolOutcome::error(error_detail(
+                        "QUERY_FAILED",
+                        &format!("query failed: {e}"),
+                        true,
+                    ));
+                }
             };
 
             let truncated = notes.len() as i64 > RECALL_LIMIT;
@@ -142,13 +156,12 @@ impl CalmServer {
                 None
             };
 
-            serde_json::to_string_pretty(&RecallOutput {
+            ToolOutcome::success(RecallOutput {
                 notes,
                 truncated,
                 suggested_next: self.filter_sn(sn),
             })
-            .unwrap_or_default()
-        })
+        }))
     }
 
     /// Wraps `query` as a single FTS5 phrase (embedded `"` doubled per FTS5
@@ -260,7 +273,3 @@ pub(crate) fn memory_note_row(row: &rusqlite::Row) -> rusqlite::Result<MemoryNot
         stale_refs: Vec::new(),
     })
 }
-
-// ---------------------------------------------------------------------------
-// Tool router
-// ---------------------------------------------------------------------------

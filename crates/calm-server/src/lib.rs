@@ -1,3 +1,4 @@
+mod scip_overlay;
 pub mod telemetry;
 pub mod tools;
 pub mod watcher;
@@ -9,7 +10,7 @@ use anyhow::Result;
 use calm_core::config::SemanticSearchConfig;
 use calm_core::embedding::Embedder;
 use calm_core::types::EmbedStatus;
-use rmcp::transport::io::stdio;
+use rmcp::transport::stdio;
 use tokio_util::sync::CancellationToken;
 
 use tools::CalmServer;
@@ -41,6 +42,32 @@ pub async fn serve_stdio_with_preset(
         tracing::info!("Received SIGINT, shutting down");
         ct_clone.cancel();
     });
+
+    // SIGTERM — not just SIGINT — because it's the default (and often only)
+    // signal MCP clients/process managers send to stop a stdio child: Node's
+    // `ChildProcess.kill()` defaults to SIGTERM, as does plain `kill <pid>`.
+    // Without this, only a literal Ctrl+C in an attached terminal reached the
+    // graceful-shutdown path (ct.cancel() below) — every other real-world
+    // teardown (editor closing the MCP connection, a wrapper script relaying
+    // its own SIGTERM) fell straight to the OS default action (immediate
+    // terminate), skipping the WAL checkpoint below entirely. Unix-only:
+    // SIGTERM has no Windows equivalent and `tokio::signal::unix` doesn't
+    // compile there — Windows teardown still goes through SIGINT-equivalent
+    // (Ctrl+C/Ctrl+Break) or an abrupt terminate, same as before this change.
+    #[cfg(unix)]
+    {
+        let ct_term = ct.clone();
+        tokio::spawn(async move {
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(mut term) => {
+                    term.recv().await;
+                    tracing::info!("Received SIGTERM, shutting down");
+                    ct_term.cancel();
+                }
+                Err(e) => tracing::warn!("Failed to install SIGTERM handler: {e}"),
+            }
+        });
+    }
 
     let semantic = calm_core::config::load_config(&project_root)
         .map(|c| c.semantic_search)
@@ -188,189 +215,12 @@ pub async fn serve_stdio_with_preset(
 
                 #[cfg(feature = "scip-overlay")]
                 if index_ok {
-                    let rust_cfg = calm_core::config::load_config(&indexer_root)
-                        .map(|c| c.rust)
-                        .unwrap_or_default();
-                    let dirty = calm_core::scip::rust_source_dirty_keys(&conn);
-                    match calm_core::scip::run_overlay(&conn, &indexer_root, &rust_cfg, &dirty) {
-                        Ok(stats)
-                            if stats.upgraded > 0 || stats.ruled_out > 0 || stats.inserted > 0 =>
-                        {
-                            // caller_count was computed by rebuild_graph before this
-                            // overlay flipped edge_confidence/ruled_out_by_scip on
-                            // (or inserted) some edges — refresh it or it goes stale
-                            // again immediately relative to the columns it's
-                            // filtered on.
-                            if let Err(e) =
-                                calm_core::indexer::pipeline::refresh_caller_counts(&conn)
-                            {
-                                tracing::warn!(
-                                    "caller_count refresh after SCIP overlay failed: {e}"
-                                );
-                            }
-                            tracing::info!(
-                                "SCIP overlay: {} edges upgraded, {} fan-out siblings ruled out, {} inserted",
-                                stats.upgraded,
-                                stats.ruled_out,
-                                stats.inserted
-                            );
-                        }
-                        Ok(_) => {}
-                        Err(e) => tracing::warn!("SCIP overlay error (base graph intact): {e}"),
-                    }
-
-                    let go_cfg = calm_core::config::load_config(&indexer_root)
-                        .map(|c| c.go)
-                        .unwrap_or_default();
-                    match calm_core::scip::run_go_overlay_and_log(&conn, &indexer_root, &go_cfg) {
-                        Ok(stats)
-                            if stats.upgraded > 0 || stats.ruled_out > 0 || stats.inserted > 0 =>
-                        {
-                            tracing::info!(
-                                "SCIP overlay (go): {} edges upgraded, {} fan-out siblings ruled out, {} inserted",
-                                stats.upgraded,
-                                stats.ruled_out,
-                                stats.inserted
-                            );
-                        }
-                        Ok(_) => {}
-                        Err(e) => {
-                            tracing::warn!("SCIP overlay (go) error (base graph intact): {e}")
-                        }
-                    }
-
-                    let python_cfg = calm_core::config::load_config(&indexer_root)
-                        .map(|c| c.python)
-                        .unwrap_or_default();
-                    match calm_core::scip::run_python_overlay_and_log(
-                        &conn,
-                        &indexer_root,
-                        &python_cfg,
-                    ) {
-                        Ok(stats)
-                            if stats.upgraded > 0 || stats.ruled_out > 0 || stats.inserted > 0 =>
-                        {
-                            tracing::info!(
-                                "SCIP overlay (python): {} edges upgraded, {} fan-out siblings ruled out, {} inserted",
-                                stats.upgraded,
-                                stats.ruled_out,
-                                stats.inserted
-                            );
-                        }
-                        Ok(_) => {}
-                        Err(e) => {
-                            tracing::warn!("SCIP overlay (python) error (base graph intact): {e}")
-                        }
-                    }
-
-                    let js_cfg = calm_core::config::load_config(&indexer_root)
-                        .map(|c| c.js)
-                        .unwrap_or_default();
-                    match calm_core::scip::run_js_overlay_and_log(&conn, &indexer_root, &js_cfg) {
-                        Ok(stats)
-                            if stats.upgraded > 0 || stats.ruled_out > 0 || stats.inserted > 0 =>
-                        {
-                            tracing::info!(
-                                "SCIP overlay (js): {} edges upgraded, {} fan-out siblings ruled out, {} inserted",
-                                stats.upgraded,
-                                stats.ruled_out,
-                                stats.inserted
-                            );
-                        }
-                        Ok(_) => {}
-                        Err(e) => {
-                            tracing::warn!("SCIP overlay (js) error (base graph intact): {e}")
-                        }
-                    }
-
-                    let java_cfg = calm_core::config::load_config(&indexer_root)
-                        .map(|c| c.java)
-                        .unwrap_or_default();
-                    match calm_core::scip::run_java_overlay_and_log(&conn, &indexer_root, &java_cfg)
-                    {
-                        Ok(stats)
-                            if stats.upgraded > 0 || stats.ruled_out > 0 || stats.inserted > 0 =>
-                        {
-                            tracing::info!(
-                                "SCIP overlay (java): {} edges upgraded, {} fan-out siblings ruled out, {} inserted",
-                                stats.upgraded,
-                                stats.ruled_out,
-                                stats.inserted
-                            );
-                        }
-                        Ok(_) => {}
-                        Err(e) => {
-                            tracing::warn!("SCIP overlay (java) error (base graph intact): {e}")
-                        }
-                    }
-
-                    let csharp_cfg = calm_core::config::load_config(&indexer_root)
-                        .map(|c| c.csharp)
-                        .unwrap_or_default();
-                    match calm_core::scip::run_csharp_overlay_and_log(
-                        &conn,
-                        &indexer_root,
-                        &csharp_cfg,
-                    ) {
-                        Ok(stats)
-                            if stats.upgraded > 0 || stats.ruled_out > 0 || stats.inserted > 0 =>
-                        {
-                            tracing::info!(
-                                "SCIP overlay (csharp): {} edges upgraded, {} fan-out siblings ruled out, {} inserted",
-                                stats.upgraded,
-                                stats.ruled_out,
-                                stats.inserted
-                            );
-                        }
-                        Ok(_) => {}
-                        Err(e) => {
-                            tracing::warn!("SCIP overlay (csharp) error (base graph intact): {e}")
-                        }
-                    }
-
-                    let php_cfg = calm_core::config::load_config(&indexer_root)
-                        .map(|c| c.php)
-                        .unwrap_or_default();
-                    match calm_core::scip::run_php_overlay_and_log(&conn, &indexer_root, &php_cfg) {
-                        Ok(stats)
-                            if stats.upgraded > 0 || stats.ruled_out > 0 || stats.inserted > 0 =>
-                        {
-                            tracing::info!(
-                                "SCIP overlay (php): {} edges upgraded, {} fan-out siblings ruled out, {} inserted",
-                                stats.upgraded,
-                                stats.ruled_out,
-                                stats.inserted
-                            );
-                        }
-                        Ok(_) => {}
-                        Err(e) => {
-                            tracing::warn!("SCIP overlay (php) error (base graph intact): {e}")
-                        }
-                    }
-
-                    let clang_cfg = calm_core::config::load_config(&indexer_root)
-                        .map(|c| c.clang)
-                        .unwrap_or_default();
-                    match calm_core::scip::run_clang_overlay_and_log(
-                        &conn,
-                        &indexer_root,
-                        &clang_cfg,
-                    ) {
-                        Ok(stats)
-                            if stats.upgraded > 0 || stats.ruled_out > 0 || stats.inserted > 0 =>
-                        {
-                            tracing::info!(
-                                "SCIP overlay (c): {} edges upgraded, {} fan-out siblings ruled out, {} inserted",
-                                stats.upgraded,
-                                stats.ruled_out,
-                                stats.inserted
-                            );
-                        }
-                        Ok(_) => {}
-                        Err(e) => {
-                            tracing::warn!("SCIP overlay (c) error (base graph intact): {e}")
-                        }
-                    }
+                    // Drop the write lock this thread has been holding on `conn`
+                    // before fanning out — the 8 language overlays below each
+                    // open their own connection instead (see `scip_overlay`'s
+                    // doc comment for why that's safe and not just tolerated).
+                    drop(conn);
+                    scip_overlay::run_all(&indexer_root, &indexer_db_path);
                 }
                 #[cfg(not(feature = "scip-overlay"))]
                 let _ = index_ok;
@@ -402,12 +252,40 @@ pub async fn serve_stdio_with_preset(
     let service: rmcp::service::RunningService<rmcp::RoleServer, _> =
         rmcp::service::serve_server_with_ct(server, transport, ct)
             .await
-            .map_err(|e: std::io::Error| anyhow::anyhow!("Server init error: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("Server init error: {e}"))?;
 
     service
         .waiting()
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // Best-effort: reclaim WAL space on a clean shutdown rather than leaving
+    // it to sit around until SQLite's own passive auto-checkpoint happens to
+    // fire — which never runs at all while any connection (including a
+    // lock-loser process that never got a shutdown signal — see the SIGTERM
+    // handler above) still holds an old read snapshot open. Any process may
+    // request a checkpoint regardless of indexer-lock ownership; it's a
+    // WAL-level operation, harmless and idempotent when there's nothing to
+    // reclaim. TRUNCATE can only partially complete ("busy") if another
+    // connection is concurrently active, which is not an error — a missed or
+    // partial checkpoint here just means the next one (from this process or
+    // another) reclaims the rest. This cannot help against SIGKILL, which no
+    // userspace code can intercept on any OS; that gap is inherent, not a bug.
+    if let Ok(conn) = calm_core::db::conn::open_writer(&db_path) {
+        match conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        }) {
+            Ok((busy, log_frames, checkpointed)) => tracing::info!(
+                "WAL checkpoint on shutdown: busy={busy} log_frames={log_frames} checkpointed={checkpointed}"
+            ),
+            Err(e) => tracing::warn!("WAL checkpoint on shutdown failed (non-fatal): {e}"),
+        }
+    }
+
     tracing::info!("Server shut down cleanly");
     Ok(())
 }

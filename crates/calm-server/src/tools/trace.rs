@@ -1,22 +1,23 @@
 use super::common::*;
 use super::*;
 
+#[rmcp::tool_router(router = "trace_tool_router", vis = "pub(crate)")]
 impl CalmServer {
     #[tool(
         name = "callers",
         description = "USE WHEN: you need to know who calls a specific symbol — blast radius scan, refactoring impact. USE THIS for SYMBOL-LEVEL call sites. NOT for file-level imports (use dependencies). vs edit_context: callers is for exploration; edit_context is the mandatory pre-edit tool."
     )]
-    pub(crate) fn callers(&self, #[tool(aggr)] p: CallersParams) -> String {
-        self.timed_tool("callers", || {
+    pub(crate) fn callers(&self, Parameters(p): Parameters<CallersParams>) -> Json<ResolvedOutcome<CallersOutput>> {
+        Json(self.timed_tool("callers", || {
             // READ-only: open a dedicated read connection (SINGLE_WRITER enforcement)
             let conn = match self.make_read_conn() {
                 Ok(c) => c,
-                Err(e) => return format!(r#"{{"error": "db connection failed: {e}"}}"#),
+                Err(e) => return db_error_resolved(e),
             };
             let resolution = resolve_symbol(&conn, &p.symbol, p.path.as_deref(), p.line);
             let c = match resolution {
-                SymbolResolution::NotFound => return not_found_json(&p.symbol),
-                SymbolResolution::Ambiguous(candidates) => return ambiguous_json(&candidates),
+                SymbolResolution::NotFound => return ResolvedOutcome::not_found(&p.symbol),
+                SymbolResolution::Ambiguous(candidates) => return ResolvedOutcome::ambiguous(&candidates),
                 SymbolResolution::Found(c) => *c,
             };
             self.track_symbol(&c.qualified_name);
@@ -97,7 +98,7 @@ impl CalmServer {
             } else {
                 None
             };
-            serde_json::to_string_pretty(&CallersOutput {
+            ResolvedOutcome::success(CallersOutput {
                 symbol: p.symbol,
                 edges_ready: self.edges_ready(),
                 direct,
@@ -109,25 +110,23 @@ impl CalmServer {
                 transitive_capped,
                 suggested_next: self.filter_sn(sn),
             })
-            .unwrap_or_default()
-        })
+        }))
     }
-
     #[tool(
         name = "callees",
         description = "USE WHEN: you need to trace what a symbol calls — understanding logic flow, internal deps. NOT for finding who calls this symbol (use callers). vs callers: callers=upward (who calls X); callees=downward (what X calls)."
     )]
-    pub(crate) fn callees(&self, #[tool(aggr)] p: CalleesParams) -> String {
-        self.timed_tool("callees", || {
+    pub(crate) fn callees(&self, Parameters(p): Parameters<CalleesParams>) -> Json<ResolvedOutcome<CalleesOutput>> {
+        Json(self.timed_tool("callees", || {
             // READ-only: open a dedicated read connection (SINGLE_WRITER enforcement)
             let conn = match self.make_read_conn() {
                 Ok(c) => c,
-                Err(e) => return format!(r#"{{"error": "db connection failed: {e}"}}"#),
+                Err(e) => return db_error_resolved(e),
             };
             let resolution = resolve_symbol(&conn, &p.symbol, p.path.as_deref(), p.line);
             let c = match resolution {
-                SymbolResolution::NotFound => return not_found_json(&p.symbol),
-                SymbolResolution::Ambiguous(candidates) => return ambiguous_json(&candidates),
+                SymbolResolution::NotFound => return ResolvedOutcome::not_found(&p.symbol),
+                SymbolResolution::Ambiguous(candidates) => return ResolvedOutcome::ambiguous(&candidates),
                 SymbolResolution::Found(c) => *c,
             };
             self.track_symbol(&c.qualified_name);
@@ -188,7 +187,7 @@ impl CalmServer {
             } else {
                 None
             };
-            serde_json::to_string_pretty(&CalleesOutput {
+            ResolvedOutcome::success(CalleesOutput {
                 symbol: p.symbol,
                 edges_ready: self.edges_ready(),
                 direct,
@@ -200,21 +199,19 @@ impl CalmServer {
                 transitive_capped,
                 suggested_next: self.filter_sn(sn),
             })
-            .unwrap_or_default()
-        })
+        }))
     }
-
     #[tool(
         name = "dependencies",
         description = "USE WHEN: you need to understand file-level architectural connections. USE THIS for FILE-LEVEL import graph. NOT for symbol-level call sites (use callers/callees). vs callers/callees: dependencies is file-level; callers/callees is symbol-level."
     )]
-    pub(crate) fn dependencies(&self, #[tool(aggr)] p: DependenciesParams) -> String {
-        self.timed_tool("dependencies", || {
+    pub(crate) fn dependencies(&self, Parameters(p): Parameters<DependenciesParams>) -> Json<ToolOutcome<DependenciesOutput>> {
+        Json(self.timed_tool("dependencies", || {
             self.track_file(&p.path);
             // READ-only: open a dedicated read connection (SINGLE_WRITER enforcement)
             let conn = match self.make_read_conn() {
                 Ok(c) => c,
-                Err(e) => return format!(r#"{{"error": "db connection failed: {e}"}}"#),
+                Err(e) => return db_error(e),
             };
             let dep_config = calm_core::config::load_config(&self.project_root)
                 .map(|c| c.dependencies)
@@ -347,7 +344,7 @@ impl CalmServer {
             } else {
                 None
             };
-            serde_json::to_string_pretty(&DependenciesOutput {
+            ToolOutcome::success(DependenciesOutput {
                 path: p.path,
                 imports,
                 imports_truncated,
@@ -357,25 +354,23 @@ impl CalmServer {
                 glob_reexport_dependents,
                 suggested_next: self.filter_sn(sn),
             })
-            .unwrap_or_default()
-        })
+        }))
     }
-
     #[tool(
         name = "path",
         description = "USE WHEN: you need to trace if and how symbol A can reach symbol B through call chain. Bidirectional BFS — cycles terminate cleanly. path is DIRECTED: A→B ≠ B→A. terminated_by=null + exists=true/false → certain result."
     )]
-    pub(crate) fn path(&self, #[tool(aggr)] p: PathParams) -> String {
-        self.timed_tool("path", || {
+    pub(crate) fn path(&self, Parameters(p): Parameters<PathParams>) -> Json<ResolvedOutcome<PathOutput>> {
+        Json(self.timed_tool("path", || {
             // READ-only: open a dedicated read connection (SINGLE_WRITER enforcement)
             let conn = match self.make_read_conn() {
                 Ok(c) => c,
-                Err(e) => return format!(r#"{{"error": "db connection failed: {e}"}}"#),
+                Err(e) => return db_error_resolved(e),
             };
             let from = { resolve_symbol(&conn, &p.from_symbol, p.from_path.as_deref(), p.from_line) };
             let from = match from {
-                SymbolResolution::NotFound => return not_found_json(&p.from_symbol),
-                SymbolResolution::Ambiguous(candidates) => return ambiguous_json(&candidates),
+                SymbolResolution::NotFound => return ResolvedOutcome::not_found(&p.from_symbol),
+                SymbolResolution::Ambiguous(candidates) => return ResolvedOutcome::ambiguous(&candidates),
                 SymbolResolution::Found(c) => *c,
             };
             self.track_symbol(&from.qualified_name);
@@ -383,8 +378,8 @@ impl CalmServer {
 
             let to = { resolve_symbol(&conn, &p.to_symbol, p.to_path.as_deref(), p.to_line) };
             let to = match to {
-                SymbolResolution::NotFound => return not_found_json(&p.to_symbol),
-                SymbolResolution::Ambiguous(candidates) => return ambiguous_json(&candidates),
+                SymbolResolution::NotFound => return ResolvedOutcome::not_found(&p.to_symbol),
+                SymbolResolution::Ambiguous(candidates) => return ResolvedOutcome::ambiguous(&candidates),
                 SymbolResolution::Found(c) => *c,
             };
             self.track_symbol(&to.qualified_name);
@@ -433,7 +428,7 @@ impl CalmServer {
             } else {
                 None
             };
-            serde_json::to_string_pretty(&PathOutput {
+            ResolvedOutcome::success(PathOutput {
                 from_symbol: p.from_symbol,
                 to_symbol: p.to_symbol,
                 routes,
@@ -443,10 +438,8 @@ impl CalmServer {
                 hops_clamped,
                 suggested_next: self.filter_sn(sn),
             })
-            .unwrap_or_default()
-        })
-    }
-}
+        }))
+    }}
 
 #[derive(Deserialize, JsonSchema)]
 #[allow(dead_code)]

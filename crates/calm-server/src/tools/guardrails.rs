@@ -1,5 +1,4 @@
 use super::common::*;
-use super::locate::*;
 use super::*;
 
 /// Lookback window for the `trend` field — chosen to match typical daily CI
@@ -7,22 +6,23 @@ use super::*;
 /// to reflect recent activity rather than all-time drift.
 const EDIT_CONTEXT_TREND_LOOKBACK_DAYS: i64 = 7;
 
+#[rmcp::tool_router(router = "guardrails_tool_router", vis = "pub(crate)")]
 impl CalmServer {
     #[tool(
         name = "edit_context",
         description = "ALWAYS CALL THIS before any code modification — mandatory, never skip. USE WHEN: you are about to edit, refactor, or delete a symbol. NOT FOR: read-only inspection (use symbol_info + source). NOT post-edit (use diff_impact)."
     )]
-    pub(crate) fn edit_context(&self, #[tool(aggr)] p: EditContextParams) -> String {
-        self.timed_tool("edit_context", || {
+    pub(crate) fn edit_context(&self, Parameters(p): Parameters<EditContextParams>) -> Json<ResolvedOutcome<EditContextOutput>> {
+        Json(self.timed_tool("edit_context", || {
             // READ-only: open a dedicated read connection (SINGLE_WRITER enforcement)
             let conn = match self.make_read_conn() {
                 Ok(c) => c,
-                Err(e) => return format!(r#"{{"error": "db connection failed: {e}"}}"#),
+                Err(e) => return db_error_resolved(e),
             };
             let resolution = resolve_symbol(&conn, &p.symbol, p.path.as_deref(), p.line);
             let c = match resolution {
-                SymbolResolution::NotFound => return not_found_json(&p.symbol),
-                SymbolResolution::Ambiguous(candidates) => return ambiguous_json(&candidates),
+                SymbolResolution::NotFound => return ResolvedOutcome::not_found(&p.symbol),
+                SymbolResolution::Ambiguous(candidates) => return ResolvedOutcome::ambiguous(&candidates),
                 SymbolResolution::Found(c) => *c,
             };
             self.track_symbol(&c.qualified_name);
@@ -190,7 +190,7 @@ impl CalmServer {
             .flatten()
             .map(TrendOutput::from);
 
-            serde_json::to_string_pretty(&EditContextOutput {
+            ResolvedOutcome::success(EditContextOutput {
                 symbol: p.symbol,
                 edges_ready: self.edges_ready(),
                 index_freshness: self.phase_str(),
@@ -208,26 +208,25 @@ impl CalmServer {
                     "MANDATORY after changes — verify blast radius",
                 )),
             })
-            .unwrap_or_default()
-        })
+        }))
     }
 
     #[tool(
         name = "diff_impact",
         description = "CALL THIS after every code change, BEFORE commit or push — never skip. USE WHEN: you have uncommitted changes and want to verify blast radius. NOT FOR: pre-edit analysis (use edit_context). vs edit_context: edit_context=pre-edit; diff_impact=post-edit. Omit all three for the unstaged working-tree diff, or provide at most one of: diff, staged=true, commits=<range>."
     )]
-    pub(crate) fn diff_impact(&self, #[tool(aggr)] p: DiffImpactParams) -> String {
-        self.timed_tool("diff_impact", || {
+    pub(crate) fn diff_impact(&self, Parameters(p): Parameters<DiffImpactParams>) -> Json<ToolOutcome<DiffImpactOutput>> {
+        Json(self.timed_tool("diff_impact", || {
             self.clear_written_files();
 
             let input_count =
                 p.diff.is_some() as u8 + p.staged.is_some() as u8 + p.commits.is_some() as u8;
             if input_count > 1 {
-                return error_json(
+                return ToolOutcome::error(error_detail(
                     "INVALID_INPUT",
                     "At most one of diff, staged, or commits may be provided (omit all three for the unstaged working-tree diff)",
                     false,
-                );
+                ));
             }
 
             const DIFF_GIT_TIMEOUT_SECS: u64 = 10;
@@ -244,11 +243,11 @@ impl CalmServer {
                 match diff {
                     Some(d) => d,
                     None => {
-                        return error_json(
+                        return ToolOutcome::error(error_detail(
                             "FEATURE_UNAVAILABLE",
                             &err.unwrap_or_else(|| "git diff failed".into()),
                             true,
-                        );
+                        ));
                     }
                 }
             };
@@ -264,7 +263,7 @@ impl CalmServer {
             {
                 let conn = match self.make_read_conn() {
                     Ok(c) => c,
-                    Err(e) => return format!(r#"{{"error": "db connection failed: {e}"}}"#),
+                    Err(e) => return db_error(e),
                 };
                 for fd in &file_diffs {
                     // file_index has one row per file the indexer has ever
@@ -485,7 +484,7 @@ impl CalmServer {
                 None
             };
 
-            serde_json::to_string_pretty(&DiffImpactOutput {
+            ToolOutcome::success(DiffImpactOutput {
                 files_changed,
                 affected_symbols,
                 unindexed_files,
@@ -494,21 +493,10 @@ impl CalmServer {
                 note: None,
                 suggested_next: self.filter_sn(sn),
             })
-            .unwrap_or_default()
-        })
+        }))
     }
 }
 
-pub(crate) fn error_json(code: &str, message: &str, recoverable: bool) -> String {
-    serde_json::to_string_pretty(&ErrorOutput {
-        error: ErrorDetail {
-            code: code.into(),
-            message: message.into(),
-            recoverable,
-        },
-    })
-    .unwrap_or_default()
-}
 
 #[derive(Deserialize, JsonSchema)]
 #[allow(dead_code)]

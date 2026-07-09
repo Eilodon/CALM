@@ -1,17 +1,18 @@
 use super::common::*;
 use super::*;
 
+#[rmcp::tool_router(router = "recover_tool_router", vis = "pub(crate)")]
 impl CalmServer {
     #[tool(
         name = "indexing_status",
         description = "USE WHEN: you need file-level index stats, embedding error details, or to trigger embedding recovery. NOT a replacement for repo_overview at session start. retry_embeddings=true triggers re-download of embedding model."
     )]
-    pub(crate) fn indexing_status(&self, #[tool(aggr)] p: IndexingStatusParams) -> String {
-        self.timed_tool("indexing_status", || {
+    pub(crate) fn indexing_status(&self, Parameters(p): Parameters<IndexingStatusParams>) -> Json<ToolOutcome<IndexingStatusOutput>> {
+        Json(self.timed_tool("indexing_status", || {
             // READ-only: open a dedicated read connection (SINGLE_WRITER enforcement)
             let conn = match self.make_read_conn() {
                 Ok(c) => c,
-                Err(e) => return format!(r#"{{"error": "db connection failed: {e}"}}"#),
+                Err(e) => return db_error(e),
             };
             let files: i64 = conn
                 .query_row("SELECT COUNT(*) FROM file_index", [], |r| r.get(0))
@@ -75,7 +76,7 @@ impl CalmServer {
             #[cfg(not(feature = "scip-overlay"))]
             let scip_overlays: Vec<PerLanguageOverlayStatus> = Vec::new();
 
-            serde_json::to_string_pretty(&IndexingStatusOutput {
+            ToolOutcome::success(IndexingStatusOutput {
                 indexing_phase: phase,
                 indexing_error,
                 files_indexed: files,
@@ -90,10 +91,8 @@ impl CalmServer {
                 scip_overlays,
                 suggested_next: self.filter_sn(sn),
             })
-            .unwrap_or_default()
-        })
+        }))
     }
-
     /// One `OverlayStatus` per SCIP provider (P2.6) — `scip_overlay` above
     /// stays Rust-only for backward compat with existing callers; this is
     /// the superset covering Go/Python/JS-TS/Java/C#/PHP/C-C++ too. Skips a provider entirely
@@ -177,8 +176,8 @@ impl CalmServer {
         name = "session_context",
         description = "USE WHEN: after 10+ tool calls without convergence, or when starting a new sub-task. Tracks explored symbols, files, and tool call count."
     )]
-    pub(crate) fn session_context(&self) -> String {
-        self.timed_tool("session_context", || {
+    pub(crate) fn session_context(&self) -> Json<ToolOutcome<SessionContextOutput>> {
+        Json(self.timed_tool("session_context", || {
             // Release the lock before DB queries — avoid deadlock if db() is also contended.
             let (tool_calls, explored_symbols, explored_files, last_progress_at, session_started_at) = {
                 let log = self.session_log.lock().unwrap();
@@ -211,7 +210,7 @@ impl CalmServer {
             } else {
                 let conn = match self.make_read_conn() {
                     Ok(c) => c,
-                    Err(e) => return format!(r#"{{"error": "db connection failed: {e}"}}"#),
+                    Err(e) => return db_error(e),
                 };
                 let frontier = compute_frontier_entries(&conn, &explored_files, &explored_symbols);
                 (frontier, false)
@@ -247,7 +246,7 @@ impl CalmServer {
             let explored_symbols = explored_symbols.into_iter().take(max_fetched).collect();
             let explored_files = explored_files.into_iter().take(max_fetched).collect();
 
-            serde_json::to_string_pretty(&SessionContextOutput {
+            ToolOutcome::success(SessionContextOutput {
                 session_started_at,
                 tool_calls,
                 explored_symbols,
@@ -262,10 +261,8 @@ impl CalmServer {
                 possibly_stuck,
                 suggested_next: sn,
             })
-            .unwrap_or_default()
-        })
-    }
-}
+        }))
+    }}
 
 pub(crate) fn compute_frontier_entries(
     conn: &rusqlite::Connection,

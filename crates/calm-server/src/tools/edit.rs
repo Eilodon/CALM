@@ -1,14 +1,14 @@
 use super::common::*;
-use super::guardrails::*;
 use super::*;
 
+#[rmcp::tool_router(router = "edit_tool_router", vis = "pub(crate)")]
 impl CalmServer {
     #[tool(
         name = "edit_lines",
         description = "The only write-capable tool in ci — line-range granularity, works on ANY tracked file (source code, Cargo.toml, docs — not just parsed symbols). NOT FOR: symbol-scoped edits with auto-resolved range (use edit_symbol). Requires expected_hash from a prior call's current_hash (or edit_context's range_checksum for a whole symbol); omit it to preview a range's hash/content without writing anything. All hunks in one call apply to the same file and must be disjoint (non-overlapping)."
     )]
-    pub(crate) fn edit_lines(&self, #[tool(aggr)] p: EditLinesParams) -> String {
-        self.timed_tool("edit_lines", || {
+    pub(crate) fn edit_lines(&self, Parameters(p): Parameters<EditLinesParams>) -> Json<ToolOutcome<EditLinesOutput>> {
+        Json(self.timed_tool("edit_lines", || {
             let hunks: Vec<calm_core::edit::HunkRequest> = p
                 .edits
                 .into_iter()
@@ -20,23 +20,25 @@ impl CalmServer {
                 })
                 .collect();
             self.edit_lines_impl(&p.path, hunks, p.confirm)
-        })
+        }))
     }
 
     #[tool(
         name = "edit_symbol",
         description = "Sugar over edit_lines: resolves symbol (+ optional path/line, same disambiguation contract as edit_context) to its [line_start, line_end] and replaces the whole thing in one hunk. USE WHEN: replacing an entire function/class/method body by name. NOT FOR: editing a single line inside a symbol, or anything outside a parsed symbol (an import line, Cargo.toml) — use edit_lines directly for those."
     )]
-    pub(crate) fn edit_symbol(&self, #[tool(aggr)] p: EditSymbolParams) -> String {
-        self.timed_tool("edit_symbol", || {
+    pub(crate) fn edit_symbol(&self, Parameters(p): Parameters<EditSymbolParams>) -> Json<ResolvedOutcome<EditLinesOutput>> {
+        Json(self.timed_tool("edit_symbol", || {
             let c = {
                 let conn = match self.make_read_conn() {
                     Ok(c) => c,
-                    Err(e) => return format!(r#"{{"error": "db connection failed: {e}"}}"#),
+                    Err(e) => return db_error_resolved(e),
                 };
                 match resolve_symbol(&conn, &p.symbol, p.path.as_deref(), p.line) {
-                    SymbolResolution::NotFound => return not_found_json(&p.symbol),
-                    SymbolResolution::Ambiguous(candidates) => return ambiguous_json(&candidates),
+                    SymbolResolution::NotFound => return ResolvedOutcome::not_found(&p.symbol),
+                    SymbolResolution::Ambiguous(candidates) => {
+                        return ResolvedOutcome::ambiguous(&candidates);
+                    }
                     SymbolResolution::Found(c) => *c,
                 }
             };
@@ -46,8 +48,8 @@ impl CalmServer {
                 expected_hash: p.expected_hash,
                 new_text: p.new_text,
             };
-            self.edit_lines_impl(&c.path, vec![hunk], p.confirm)
-        })
+            self.edit_lines_impl(&c.path, vec![hunk], p.confirm).into_resolved()
+        }))
     }
 
     /// Shared implementation for `edit_lines`/`edit_symbol`. Flow: apply
@@ -62,7 +64,7 @@ impl CalmServer {
         path: &str,
         hunks: Vec<calm_core::edit::HunkRequest>,
         confirm: bool,
-    ) -> String {
+    ) -> ToolOutcome<EditLinesOutput> {
         // Serialize the whole read -> hash-check -> write -> reindex sequence:
         // rmcp dispatches tool calls concurrently, and locking only the write
         // phase left the read+hash-check racy (TOCTOU) -- two concurrent calls
@@ -75,13 +77,23 @@ impl CalmServer {
         let original = match std::fs::read_to_string(&full_path) {
             Ok(s) => s,
             Err(e) => {
-                return error_json("READ_FAILED", &format!("could not read {path}: {e}"), false);
+                return ToolOutcome::error(error_detail(
+                    "READ_FAILED",
+                    &format!("could not read {path}: {e}"),
+                    false,
+                ));
             }
         };
 
         let outcome = match calm_core::edit::apply_hunks(&original, &hunks) {
             Ok(o) => o,
-            Err(e) => return error_json("INVALID_HUNKS", &e.to_string(), false),
+            Err(e) => {
+                return ToolOutcome::error(error_detail(
+                    "INVALID_HUNKS",
+                    &e.to_string(),
+                    false,
+                ));
+            }
         };
 
         let hunks_output: Vec<EditHunkResultOutput> = outcome
@@ -91,7 +103,7 @@ impl CalmServer {
             .collect();
 
         if !outcome.all_applied {
-            return serde_json::to_string_pretty(&EditLinesOutput {
+            return ToolOutcome::success(EditLinesOutput {
                 path: path.to_string(),
                 applied: false,
                 hunks: hunks_output,
@@ -104,8 +116,7 @@ impl CalmServer {
                         .into(),
                 ),
                 suggested_next: None,
-            })
-            .unwrap_or_default();
+            });
         }
         let new_content = outcome.new_content.expect("all_applied implies Some");
 
@@ -116,13 +127,13 @@ impl CalmServer {
         let parse_status = match calm_core::edit::validate_syntax(&new_content, ext) {
             Some(true) => "clean",
             Some(false) => {
-                return error_json(
+                return ToolOutcome::error(error_detail(
                     "PARSE_ERROR",
                     &format!(
                         "this edit would introduce a syntax error in {path} — nothing written"
                     ),
                     true,
-                );
+                ));
             }
             None => "skipped_unrecognized_language",
         };
@@ -130,7 +141,7 @@ impl CalmServer {
         let (risk, hub_hit, _pre_edit_touched) = {
             let conn = match self.make_read_conn() {
                 Ok(c) => c,
-                Err(e) => return format!(r#"{{"error": "db connection failed: {e}"}}"#),
+                Err(e) => return db_error(e),
             };
             let ranges: Vec<(i64, i64)> = hunks
                 .iter()
@@ -144,33 +155,33 @@ impl CalmServer {
             } else {
                 "a high-risk symbol (>10 callers)".to_string()
             };
-            return error_json(
+            return ToolOutcome::error(error_detail(
                 "CONFIRM_REQUIRED",
                 &format!("this edit touches {why} — pass confirm:true to proceed"),
                 true,
-            );
+            ));
         }
 
         if let Err(e) = calm_core::edit::atomic_write(&full_path, &new_content) {
             drop(_guard);
-            return error_json(
+            return ToolOutcome::error(error_detail(
                 "WRITE_FAILED",
                 &format!("failed to write {path}: {e}"),
                 false,
-            );
+            ));
         }
 
         let mut write_conn = match calm_core::db::conn::open_writer(&self.db_path) {
             Ok(c) => c,
             Err(e) => {
                 drop(_guard);
-                return error_json(
+                return ToolOutcome::error(error_detail(
                     "DB_ERROR",
                     &format!(
                         "wrote {path} but could not open DB to reindex: {e} — call indexing_status"
                     ),
                     true,
-                );
+                ));
             }
         };
         match calm_core::indexer::pipeline::reindex_changed(&mut write_conn, &self.project_root) {
@@ -191,13 +202,13 @@ impl CalmServer {
             Err(e) => {
                 drop(write_conn);
                 drop(_guard);
-                return error_json(
+                return ToolOutcome::error(error_detail(
                     "REINDEX_FAILED",
                     &format!(
                         "wrote {path} but reindex failed: {e} — index may be stale, call indexing_status"
                     ),
                     true,
-                );
+                ));
             }
         }
         drop(write_conn);
@@ -210,7 +221,7 @@ impl CalmServer {
             let conn = match self.make_read_conn() {
                 Ok(c) => c,
                 Err(_) => {
-                    return serde_json::to_string_pretty(&EditLinesOutput {
+                    return ToolOutcome::success(EditLinesOutput {
                         path: path.to_string(),
                         applied: true,
                         hunks: hunks_output,
@@ -219,8 +230,7 @@ impl CalmServer {
                         risk_assessment: risk,
                         note: Some("edit applied but could not re-query touched symbols".into()),
                         suggested_next: None,
-                    })
-                    .unwrap_or_default();
+                    });
                 }
             };
             let new_ranges: Vec<(i64, i64)> = outcome
@@ -232,7 +242,7 @@ impl CalmServer {
             touched
         };
 
-        serde_json::to_string_pretty(&EditLinesOutput {
+        ToolOutcome::success(EditLinesOutput {
             path: path.to_string(),
             applied: true,
             hunks: hunks_output,
@@ -245,7 +255,6 @@ impl CalmServer {
                 "Verify wider blast radius, especially if this touched a hub/high-risk symbol",
             )),
         })
-        .unwrap_or_default()
     }
 }
 

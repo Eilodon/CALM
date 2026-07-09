@@ -2,8 +2,10 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
 use rmcp::tool;
+use rmcp::handler::server::wrapper::{Json, Parameters};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use tracing::Instrument;
 
 use calm_core::analysis::dead_code::{is_private_symbol, scope_clear_for_language};
 use calm_core::embedding::Embedder;
@@ -25,6 +27,25 @@ mod trace;
 // Server state
 // ---------------------------------------------------------------------------
 
+/// Process-stable fallback W3C `traceparent` (SEP-414) used by `call_tool`
+/// when the client doesn't send one. Not a real distributed-trace id (no
+/// upstream sender to correlate with) — just a value that's the same for
+/// every tool call within one CALM server process, so local log
+/// correlation (e.g. multi-client WAL contention debugging) works even
+/// without client-side SEP-414 support.
+fn process_traceparent() -> String {
+    static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ID.get_or_init(|| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let pid = std::process::id() as u128;
+        format!("00-{:032x}-{:016x}-01", nanos ^ (pid << 64), pid as u64)
+    })
+    .clone()
+}
+
 fn utc_now_iso8601() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let secs = SystemTime::now()
@@ -34,7 +55,6 @@ fn utc_now_iso8601() -> String {
     let (y, mo, d, h, mi, s) = secs_to_ymd_hms(secs);
     format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
 }
-
 fn epoch_to_iso8601(secs: f64) -> String {
     let (y, mo, d, h, mi, s) = secs_to_ymd_hms(secs.max(0.0) as u64);
     format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
@@ -166,44 +186,64 @@ pub struct CalmServer {
     /// the DB write connection. Not held by any read-only tool.
     edit_lock: Arc<Mutex<()>>,
     preset: String,
+    /// Preset-filtered tool router — built once at construction by merging
+    /// every module's `#[tool_router]` output and disabling whatever
+    /// `preset` excludes (see `tool_router_for_preset`). `ToolRouter::call`/
+    /// `list_all` already skip disabled routes, so this field alone is the
+    /// source of truth for both `list_tools` and `call_tool`'s preset
+    /// scoping — no separate availability check needed at dispatch time.
+    tool_router: rmcp::handler::server::router::tool::ToolRouter<CalmServer>,
 }
 
 impl CalmServer {
-    rmcp::tool_box!(CalmServer {
-        repo_overview,
-        search,
-        file_overview,
-        symbol_info,
-        source,
-        callers,
-        callees,
-        dependencies,
-        path,
-        edit_context,
-        edit_lines,
-        edit_symbol,
-        session_context,
-        diff_impact,
-        indexing_status,
-        locate,
-        hotspots,
-        understand,
-        remember,
-        recall,
-        fitness_report,
-        scip_refresh
-    });
+    /// Merges every module's `#[tool_router]`-generated router into one —
+    /// the unfiltered source of truth for "every tool this server
+    /// implements", before preset scoping (see `tool_router_for_preset`).
+    fn full_tool_router() -> rmcp::handler::server::router::tool::ToolRouter<Self> {
+        let mut router = Self::trace_tool_router();
+        router.merge(Self::locate_tool_router());
+        router.merge(Self::orient_tool_router());
+        router.merge(Self::memory_tool_router());
+        router.merge(Self::guardrails_tool_router());
+        router.merge(Self::recover_tool_router());
+        router.merge(Self::scip_tool_router());
+        router.merge(Self::inspect_tool_router());
+        router.merge(Self::edit_tool_router());
+        router
+    }
 
-    /// The actual tool list `list_tools` returns, scoped to `preset` (see
-    /// `common::is_tool_available`/`common::preset_tools`) — factored out of
-    /// `list_tools` itself so it's unit-testable without needing to
-    /// construct a real MCP `RequestContext`/`Peer`.
+    /// `full_tool_router()` with every tool outside `preset`'s allow-list
+    /// disabled. `ToolRouter::disable_route` hides a disabled tool from
+    /// `list_all()` *and* makes `call()` reject it with "tool not found" —
+    /// so this one router is the single source of truth for both
+    /// `list_tools` and `call_tool`'s preset scoping, computed once here
+    /// instead of checked separately in each.
+    fn tool_router_for_preset(
+        preset: &str,
+    ) -> rmcp::handler::server::router::tool::ToolRouter<Self> {
+        let mut router = Self::full_tool_router();
+        if let Some(allowed) = common::preset_tools(preset) {
+            let names: Vec<_> = router.list_all().into_iter().map(|t| t.name).collect();
+            for name in names {
+                if !allowed.contains(&name.as_ref()) {
+                    router.disable_route(name);
+                }
+            }
+        }
+        router
+    }
+
+    /// The actual tool list `list_tools` returns, scoped to `preset` —
+    /// factored out of `list_tools` itself so it's unit-testable without
+    /// needing to construct a real MCP `RequestContext`/`Peer`.
+    /// The actual tool list `list_tools` returns, scoped to `preset` —
+    /// unit-test-only now (`list_tools` itself calls `self.tool_router`
+    /// directly, which already has preset-disabling baked in at
+    /// construction) — kept as a thin wrapper so tests can check preset
+    /// scoping without constructing a real MCP `RequestContext`/`Peer`.
+    #[cfg(test)]
     pub(crate) fn filtered_tool_list(preset: &str) -> Vec<rmcp::model::Tool> {
-        Self::tool_box()
-            .list()
-            .into_iter()
-            .filter(|t| common::is_tool_available(preset, &t.name))
-            .collect()
+        Self::tool_router_for_preset(preset).list_all()
     }
 }
 
@@ -223,33 +263,33 @@ fn ci_prompts() -> Vec<rmcp::model::Prompt> {
             Some(
                 "Pre-edit review: locate, read source, check blast radius/risk, and list callers for one symbol before touching it.",
             ),
-            Some(vec![rmcp::model::PromptArgument {
-                name: "symbol".into(),
-                description: Some("Symbol name to review".into()),
-                required: Some(true),
-            }]),
+            Some(vec![
+                rmcp::model::PromptArgument::new("symbol")
+                    .with_description("Symbol name to review")
+                    .with_required(true),
+            ]),
         ),
         rmcp::model::Prompt::new(
             "debug_symbol",
             Some(
                 "Debug a symbol: read its implementation, trace callers, and check dead-code/test-coverage signals.",
             ),
-            Some(vec![rmcp::model::PromptArgument {
-                name: "symbol".into(),
-                description: Some("Symbol name to debug".into()),
-                required: Some(true),
-            }]),
+            Some(vec![
+                rmcp::model::PromptArgument::new("symbol")
+                    .with_description("Symbol name to debug")
+                    .with_required(true),
+            ]),
         ),
         rmcp::model::Prompt::new(
             "onboard_area",
             Some(
                 "Get oriented in an unfamiliar area: map overall structure, then zoom into one path and its hotspots.",
             ),
-            Some(vec![rmcp::model::PromptArgument {
-                name: "path".into(),
-                description: Some("File or directory path to onboard into".into()),
-                required: Some(true),
-            }]),
+            Some(vec![
+                rmcp::model::PromptArgument::new("path")
+                    .with_description("File or directory path to onboard into")
+                    .with_required(true),
+            ]),
         ),
     ]
 }
@@ -304,62 +344,78 @@ fn render_prompt(name: &str, arguments: &Option<rmcp::model::JsonObject>) -> Opt
 
 impl rmcp::ServerHandler for CalmServer {
     fn get_info(&self) -> rmcp::model::ServerInfo {
-        rmcp::model::ServerInfo {
-            instructions: Some(
-                "CALM (Coding Agent Liveness Map) MCP server — codebase analysis tools".into(),
-            ),
-            // Without this, `capabilities.tools` is omitted from `initialize`
-            // (ServerCapabilities::default() -> tools: None), and a spec-compliant
-            // MCP client never calls tools/list at all — the server responds fine
-            // if asked directly, but no tools ever get registered. Same logic
-            // applies to `enable_prompts()` for `prompts/list`.
-            capabilities: rmcp::model::ServerCapabilities::builder()
+        // `ServerInfo` (= `InitializeResult`) is `#[non_exhaustive]`, so a
+        // downstream crate can't use struct-literal syntax at all — not even
+        // with `..Default::default()` — hence the `::new(..).with_*(..)`
+        // builder form here instead of the old struct literal.
+        //
+        // Without `.enable_tools()`/`.enable_prompts()`, `capabilities.tools`/
+        // `.prompts` are omitted from `initialize`, and a spec-compliant MCP
+        // client never calls `tools/list`/`prompts/list` at all — the server
+        // answers fine if asked directly, but nothing ever gets discovered.
+        rmcp::model::ServerInfo::new(
+            rmcp::model::ServerCapabilities::builder()
                 .enable_tools()
                 .enable_prompts()
                 .build(),
-            ..Default::default()
-        }
+        )
+        .with_instructions(
+            "CALM (Coding Agent Liveness Map) MCP server — codebase analysis tools",
+        )
     }
 
-    // Hand-written instead of `#[tool(tool_box)]`'s generated version (which
-    // is just `Self::tool_box().list()`/`.call()`, with no per-instance
-    // filtering at all) so `list_tools`/`call_tool` actually honor
-    // `self.preset` — `tool_box()` itself (built by the plain `rmcp::tool_box!`
-    // macro call above, listing every `#[tool]` method) still registers every
-    // tool unconditionally; preset scoping only happens here, at the
-    // MCP-protocol boundary.
+    // Hand-written instead of relying on `#[tool_router]`'s bare merged
+    // router so `list_tools`/`call_tool` go through `self.tool_router`,
+    // which already has every tool outside `self.preset` disabled (see
+    // `tool_router_for_preset`) — preset scoping happens once at
+    // construction, not rechecked per call.
     async fn list_tools(
         &self,
-        _request: rmcp::model::PaginatedRequestParam,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
         _context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<rmcp::model::ListToolsResult, rmcp::model::ErrorData> {
         Ok(rmcp::model::ListToolsResult {
             next_cursor: None,
-            tools: Self::filtered_tool_list(&self.preset),
+            tools: self.tool_router.list_all(),
+            meta: None,
         })
     }
 
     async fn call_tool(
         &self,
-        request: rmcp::model::CallToolRequestParam,
+        request: rmcp::model::CallToolRequestParams,
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<rmcp::model::CallToolResult, rmcp::model::ErrorData> {
-        if !common::is_tool_available(&self.preset, &request.name) {
-            return Err(rmcp::model::ErrorData::invalid_params(
-                format!(
-                    "tool '{}' is not available under preset '{}'",
-                    request.name, self.preset
-                ),
-                None,
-            ));
-        }
-        let context = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
-        Self::tool_box().call(context).await
+        // Preset scoping already lives in `self.tool_router` (built by
+        // `tool_router_for_preset` at construction) — a disabled tool is
+        // rejected by `ToolRouter::call` itself, so no separate
+        // `is_tool_available` check is needed here anymore.
+        //
+        // SEP-414: thread the client's W3C trace-context (if sent) onto this
+        // call's tracing span so `timed_tool`'s structured
+        // `tool_execution_completed` logs are correlatable across a session.
+        // Most clients don't send `_meta.traceparent` yet (this is a very
+        // new MCP extension) — when absent, fall back to an id generated
+        // once per server process, so every tool call within one CALM
+        // instance's lifetime is still groupable in logs without needing to
+        // reach for the client-provided one. Not a cryptographically random
+        // or globally unique id — just a stable local correlation handle.
+        let traceparent = context
+            .meta
+            .get_traceparent()
+            .map(|s| s.to_string())
+            .unwrap_or_else(process_traceparent);
+        let span = tracing::info_span!(
+            "mcp_tool_call",
+            tool = %request.name,
+            traceparent = %traceparent
+        );
+        let tool_context = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        self.tool_router.call(tool_context).instrument(span).await
     }
-
     fn list_prompts(
         &self,
-        _request: rmcp::model::PaginatedRequestParam,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
         _context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> impl std::future::Future<
         Output = Result<rmcp::model::ListPromptsResult, rmcp::model::ErrorData>,
@@ -368,28 +424,29 @@ impl rmcp::ServerHandler for CalmServer {
         std::future::ready(Ok(rmcp::model::ListPromptsResult {
             next_cursor: None,
             prompts: ci_prompts(),
+            meta: None,
         }))
     }
 
     fn get_prompt(
         &self,
-        request: rmcp::model::GetPromptRequestParam,
+        request: rmcp::model::GetPromptRequestParams,
         _context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> impl std::future::Future<
         Output = Result<rmcp::model::GetPromptResult, rmcp::model::ErrorData>,
     > + Send
     + '_ {
         let result = match render_prompt(&request.name, &request.arguments) {
-            Some(text) => Ok(rmcp::model::GetPromptResult {
-                description: ci_prompts()
+            Some(text) => {
+                let mut result = rmcp::model::GetPromptResult::new(vec![
+                    rmcp::model::PromptMessage::new_text(rmcp::model::Role::User, text),
+                ]);
+                result.description = ci_prompts()
                     .into_iter()
                     .find(|p| p.name == request.name)
-                    .and_then(|p| p.description),
-                messages: vec![rmcp::model::PromptMessage::new_text(
-                    rmcp::model::PromptMessageRole::User,
-                    text,
-                )],
-            }),
+                    .and_then(|p| p.description);
+                Ok(result)
+            }
             None => Err(rmcp::model::ErrorData::invalid_params(
                 format!("unknown prompt: {}", request.name),
                 None,
@@ -700,12 +757,11 @@ mod tests {
         }
         *server.phase_handle().write().unwrap() = IndexingPhase::Ready;
 
-        let output = server.symbol_info(SymbolInfoParams {
+        let v = jv(server.symbol_info(rmcp::handler::server::wrapper::Parameters(SymbolInfoParams {
             symbol: "target".into(),
             path: None,
             line: None,
-        });
-        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+        })));
         let by_conf = &v["health"]["caller_count_by_confidence"];
 
         assert_eq!(
@@ -755,12 +811,12 @@ mod tests {
                       context\n\
                      +new line\n";
 
-        let output = server.diff_impact(DiffImpactParams {
+        let output = server.diff_impact(rmcp::handler::server::wrapper::Parameters(DiffImpactParams {
             diff: Some(diff.to_string()),
             staged: None,
             commits: None,
-        });
-        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+        }));
+        let v = jv(output);
 
         assert_eq!(v["files_changed"], serde_json::json!(["src/foo.rs"]));
         assert_eq!(v["affected_symbols"].as_array().unwrap().len(), 1);
@@ -820,12 +876,12 @@ mod tests {
                      +fn another() {}\n\
                      +\n";
 
-        let output = server.diff_impact(DiffImpactParams {
+        let output = server.diff_impact(rmcp::handler::server::wrapper::Parameters(DiffImpactParams {
             diff: Some(diff.to_string()),
             staged: None,
             commits: None,
-        });
-        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+        }));
+        let v = jv(output);
 
         assert!(v["unindexed_files"].as_array().unwrap().is_empty());
         assert_eq!(v["affected_symbols"].as_array().unwrap().len(), 1);
@@ -901,12 +957,12 @@ mod tests {
                       body\n\
                       }\n";
 
-        let output = server.diff_impact(DiffImpactParams {
+        let output = server.diff_impact(rmcp::handler::server::wrapper::Parameters(DiffImpactParams {
             diff: Some(diff.to_string()),
             staged: None,
             commits: None,
-        });
-        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+        }));
+        let v = jv(output);
 
         assert_eq!(v["affected_symbols"].as_array().unwrap().len(), 1);
         let sym = &v["affected_symbols"][0];
@@ -976,12 +1032,12 @@ mod tests {
                      +    top_n: u32,\n\
                       ) -> CoChangeResult {\n";
 
-        let output = server.diff_impact(DiffImpactParams {
+        let output = server.diff_impact(rmcp::handler::server::wrapper::Parameters(DiffImpactParams {
             diff: Some(diff.to_string()),
             staged: None,
             commits: None,
-        });
-        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+        }));
+        let v = jv(output);
 
         assert_eq!(v["affected_symbols"].as_array().unwrap().len(), 1);
         let sym = &v["affected_symbols"][0];
@@ -1018,12 +1074,12 @@ mod tests {
                      @@ -0,0 +1,3 @@\n\
                      +fn new_fn() {}\n";
 
-        let output = server.diff_impact(DiffImpactParams {
+        let output = server.diff_impact(rmcp::handler::server::wrapper::Parameters(DiffImpactParams {
             diff: Some(diff.to_string()),
             staged: None,
             commits: None,
-        });
-        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+        }));
+        let v = jv(output);
 
         assert_eq!(
             v["unindexed_files"],
@@ -1055,12 +1111,12 @@ mod tests {
                       Title\n\
                      +New paragraph\n";
 
-        let output = server.diff_impact(DiffImpactParams {
+        let output = server.diff_impact(rmcp::handler::server::wrapper::Parameters(DiffImpactParams {
             diff: Some(diff.to_string()),
             staged: None,
             commits: None,
-        });
-        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+        }));
+        let v = jv(output);
 
         assert_eq!(
             v["unindexed_files"],
@@ -1095,12 +1151,12 @@ mod tests {
                      @@ -0,0 +1,1 @@\n\
                      +fn fake() {}\n";
 
-        let output = server.diff_impact(DiffImpactParams {
+        let output = server.diff_impact(rmcp::handler::server::wrapper::Parameters(DiffImpactParams {
             diff: Some(diff.to_string()),
             staged: None,
             commits: None,
-        });
-        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+        }));
+        let v = jv(output);
 
         assert_eq!(
             v["unindexed_files"],
@@ -1146,12 +1202,12 @@ mod tests {
                       pub mod a;\n\
                      +pub mod b;\n";
 
-        let output = server.diff_impact(DiffImpactParams {
+        let output = server.diff_impact(rmcp::handler::server::wrapper::Parameters(DiffImpactParams {
             diff: Some(diff.to_string()),
             staged: None,
             commits: None,
-        });
-        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+        }));
+        let v = jv(output);
 
         assert!(v["unindexed_files"].as_array().unwrap().is_empty());
         assert!(v["affected_symbols"].as_array().unwrap().is_empty());
@@ -1197,12 +1253,12 @@ mod tests {
                       pragma solidity ^0.8.0;\n\
                      +contract Token {}\n";
 
-        let output = server.diff_impact(DiffImpactParams {
+        let output = server.diff_impact(rmcp::handler::server::wrapper::Parameters(DiffImpactParams {
             diff: Some(diff.to_string()),
             staged: None,
             commits: None,
-        });
-        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+        }));
+        let v = jv(output);
 
         assert_eq!(
             v["unindexed_files"],
@@ -1259,8 +1315,7 @@ mod tests {
             .unwrap();
         }
 
-        let output = server.repo_overview();
-        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+        let v = jv(server.repo_overview());
 
         assert_eq!(v["entry_points"].as_array().unwrap().len(), 1);
         assert_eq!(v["entry_points"][0]["qualified_name"], "src.main");
@@ -1288,19 +1343,19 @@ mod tests {
     fn repo_overview_reports_memory_notes_count_without_content() {
         let (dir, server) = test_server("repo_overview_memory_count");
 
-        let empty: serde_json::Value = serde_json::from_str(&server.repo_overview()).unwrap();
+        let empty = jv(server.repo_overview());
         assert_eq!(empty["memory_notes_count"], 0, "{empty}");
 
-        server.remember(RememberParams {
+        server.remember(rmcp::handler::server::wrapper::Parameters(RememberParams {
             topic: "auth-flow".into(),
             content: "OAuth callback must validate state param".into(),
-        });
-        server.remember(RememberParams {
+        }));
+        server.remember(rmcp::handler::server::wrapper::Parameters(RememberParams {
             topic: "db-migrations".into(),
             content: "always run in a transaction".into(),
-        });
+        }));
 
-        let with_notes: serde_json::Value = serde_json::from_str(&server.repo_overview()).unwrap();
+        let with_notes = jv(server.repo_overview());
         assert_eq!(with_notes["memory_notes_count"], 2, "{with_notes}");
         assert!(
             !with_notes.to_string().contains("state param"),
@@ -1348,8 +1403,7 @@ mod tests {
             .unwrap();
         }
 
-        let before_ready: serde_json::Value =
-            serde_json::from_str(&server.repo_overview()).unwrap();
+        let before_ready = jv(server.repo_overview());
         assert_eq!(
             before_ready["core_symbols"],
             serde_json::json!([]),
@@ -1358,7 +1412,7 @@ mod tests {
 
         *server.phase_handle().write().unwrap() = IndexingPhase::Ready;
 
-        let after_ready: serde_json::Value = serde_json::from_str(&server.repo_overview()).unwrap();
+        let after_ready = jv(server.repo_overview());
         let core = after_ready["core_symbols"].as_array().unwrap();
         let names: Vec<&str> = core
             .iter()
@@ -1403,14 +1457,13 @@ mod tests {
             .unwrap();
         }
 
-        let output = server.callers(CallersParams {
+        let v = jv(server.callers(rmcp::handler::server::wrapper::Parameters(CallersParams {
             symbol: "foo".into(),
             path: None,
             line: None,
             transitive: false,
             max_depth: None,
-        });
-        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+        })));
 
         assert_eq!(v["edges_ready"], false, "edges not built yet in this test");
         assert_eq!(v["direct"][0]["line"], 2);
@@ -1451,14 +1504,13 @@ mod tests {
             .unwrap();
         }
 
-        let output = server.callers(CallersParams {
+        let v = jv(server.callers(rmcp::handler::server::wrapper::Parameters(CallersParams {
             symbol: "a".into(),
             path: None,
             line: None,
             transitive: true,
             max_depth: Some(5),
-        });
-        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+        })));
 
         assert_eq!(v["transitive_count"], 2, "b at depth 1, c at depth 2");
         assert_eq!(v["transitive_capped"], false);
@@ -1493,12 +1545,12 @@ mod tests {
             .unwrap();
         }
 
-        let output = server.edit_context(EditContextParams {
+        let output = server.edit_context(rmcp::handler::server::wrapper::Parameters(EditContextParams {
             symbol: "a".into(),
             path: None,
             line: None,
-        });
-        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+        }));
+        let v = jv(output);
 
         assert_eq!(v["blast_radius"]["transitive"], 1);
         assert_eq!(
@@ -1548,12 +1600,12 @@ mod tests {
             }
         }
 
-        let output = server.edit_context(EditContextParams {
+        let output = server.edit_context(rmcp::handler::server::wrapper::Parameters(EditContextParams {
             symbol: "has".into(),
             path: None,
             line: None,
-        });
-        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+        }));
+        let v = jv(output);
 
         assert_eq!(
             v["callers"].as_array().unwrap().len(),
@@ -1613,12 +1665,12 @@ mod tests {
             .unwrap();
         }
 
-        let output = server.edit_context(EditContextParams {
+        let output = server.edit_context(rmcp::handler::server::wrapper::Parameters(EditContextParams {
             symbol: "model_fn".into(),
             path: None,
             line: None,
-        });
-        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+        }));
+        let v = jv(output);
 
         let co_changed = v["co_changed_files"].as_array().unwrap();
         assert_eq!(co_changed.len(), 1, "got: {v}");
@@ -1648,12 +1700,12 @@ mod tests {
             .unwrap();
         }
 
-        let output = server.edit_context(EditContextParams {
+        let output = server.edit_context(rmcp::handler::server::wrapper::Parameters(EditContextParams {
             symbol: "a".into(),
             path: None,
             line: None,
-        });
-        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+        }));
+        let v = jv(output);
         assert!(
             v.get("trend").is_none(),
             "trend must be absent (not null) with no snapshot history, got: {v}"
@@ -1690,12 +1742,12 @@ mod tests {
             .unwrap();
         }
 
-        let output = server.edit_context(EditContextParams {
+        let output = server.edit_context(rmcp::handler::server::wrapper::Parameters(EditContextParams {
             symbol: "a".into(),
             path: None,
             line: None,
-        });
-        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+        }));
+        let v = jv(output);
 
         assert_eq!(v["trend"]["compared_to"], "2000-01-01");
         assert_eq!(v["trend"]["caller_count_delta"], 5); // 8 - 3
@@ -1712,12 +1764,12 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
 
-        let output = server.diff_impact(DiffImpactParams {
+        let output = server.diff_impact(rmcp::handler::server::wrapper::Parameters(DiffImpactParams {
             diff: Some("diff --git a/x b/x\n".into()),
             staged: Some(true),
             commits: None,
-        });
-        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+        }));
+        let v = jv(output);
         assert_eq!(v["error"]["code"], "INVALID_INPUT");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1757,12 +1809,12 @@ mod tests {
         std::fs::write(dir.join("foo.rs"), "fn foo() {\n    1\n}\n").unwrap();
 
         let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
-        let output = server.diff_impact(DiffImpactParams {
+        let output = server.diff_impact(rmcp::handler::server::wrapper::Parameters(DiffImpactParams {
             diff: None,
             staged: None,
             commits: None,
-        });
-        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+        }));
+        let v = jv(output);
 
         assert!(v.get("error").is_none(), "expected success, got error: {v}");
         assert_eq!(v["files_changed"], serde_json::json!(["foo.rs"]));
@@ -1790,17 +1842,16 @@ mod tests {
             .unwrap();
         }
 
-        let _ = server.symbol_info(SymbolInfoParams {
+        let _ = server.symbol_info(rmcp::handler::server::wrapper::Parameters(SymbolInfoParams {
             symbol: "foo".into(),
             path: None,
             line: None,
-        });
-        let _ = server.file_overview(FileOverviewParams {
+        }));
+        let _ = server.file_overview(rmcp::handler::server::wrapper::Parameters(FileOverviewParams {
             path: "src/foo.rs".into(),
-        });
+        }));
 
-        let output = server.session_context();
-        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+        let v = jv(server.session_context());
 
         assert!(v["tool_calls"].as_u64().unwrap() >= 3); // symbol_info + file_overview + session_context itself
         assert_eq!(v["explored_symbols"], serde_json::json!(["mod.foo"]));
@@ -1817,8 +1868,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
 
-        let output = server.session_context();
-        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+        let v = jv(server.session_context());
 
         assert!(
             v.get("frontier").is_some(),
@@ -1841,8 +1891,7 @@ mod tests {
         let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
         // Phase starts at Scanning — edges_ready() returns false
 
-        let output = server.session_context();
-        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+        let v = jv(server.session_context());
 
         assert_eq!(
             v["frontier_degraded"], true,
@@ -1864,8 +1913,7 @@ mod tests {
         let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
         // Fresh server: no explored context, empty frontier
 
-        let output = server.session_context();
-        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+        let v = jv(server.session_context());
 
         assert_eq!(
             v["suggested_next"]["tool"].as_str(),
@@ -1917,8 +1965,7 @@ mod tests {
         // files containing callers of that symbol via call_edges (Set B).
         server.track_symbol("pkg::a::fn_a");
 
-        let output = server.session_context();
-        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+        let v = jv(server.session_context());
 
         // frontier_degraded must be false — edges are ready
         assert_eq!(
@@ -2027,12 +2074,11 @@ mod tests {
         // Same `name` + `path`, but two distinct `qualified_name`s — path alone
         // does not disambiguate, so this must stay ambiguous rather than
         // silently picking the first row.
-        let output = server.symbol_info(SymbolInfoParams {
+        let v = jv(server.symbol_info(rmcp::handler::server::wrapper::Parameters(SymbolInfoParams {
             symbol: "method".into(),
             path: Some("src/multi.py".into()),
             line: None,
-        });
-        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+        })));
 
         assert_eq!(v["ambiguous"], true);
         assert_eq!(v["candidates"].as_array().unwrap().len(), 2);
@@ -2072,34 +2118,34 @@ mod tests {
         }
 
         // No line hint: stays ambiguous, same as before this feature existed.
-        let ambiguous = server.symbol_info(SymbolInfoParams {
+        let ambiguous = server.symbol_info(rmcp::handler::server::wrapper::Parameters(SymbolInfoParams {
             symbol: "load".into(),
             path: Some("src/embedding.rs".into()),
             line: None,
-        });
-        let v: serde_json::Value = serde_json::from_str(&ambiguous).unwrap();
+        }));
+        let v = jv(ambiguous);
         assert_eq!(
             v["ambiguous"], true,
             "no line hint must stay ambiguous: {v}"
         );
 
         // A line inside the real impl's range resolves to exactly that one.
-        let resolved = server.symbol_info(SymbolInfoParams {
+        let resolved = server.symbol_info(rmcp::handler::server::wrapper::Parameters(SymbolInfoParams {
             symbol: "load".into(),
             path: Some("src/embedding.rs".into()),
             line: Some(15),
-        });
-        let v: serde_json::Value = serde_json::from_str(&resolved).unwrap();
+        }));
+        let v = jv(resolved);
         assert_eq!(v["qualified_name"], "real_impl::load", "got: {v}");
 
         // A line hint matching neither candidate degrades to the unnarrowed
         // (ambiguous) set rather than reporting NotFound.
-        let stale_hint = server.symbol_info(SymbolInfoParams {
+        let stale_hint = server.symbol_info(rmcp::handler::server::wrapper::Parameters(SymbolInfoParams {
             symbol: "load".into(),
             path: Some("src/embedding.rs".into()),
             line: Some(9999),
-        });
-        let v: serde_json::Value = serde_json::from_str(&stale_hint).unwrap();
+        }));
+        let v = jv(stale_hint);
         assert_eq!(
             v["ambiguous"], true,
             "stale line hint must fall back to ambiguous: {v}"
@@ -2134,7 +2180,7 @@ mod tests {
 
         // Requested 10 hops exceeds the configured max_allowed_hops=5 — with the
         // old hardcoded literal (20) this would NOT have been clamped.
-        let output = server.path(PathParams {
+        let v = jv(server.path(rmcp::handler::server::wrapper::Parameters(PathParams {
             from_symbol: "a".into(),
             to_symbol: "b".into(),
             from_path: None,
@@ -2142,8 +2188,7 @@ mod tests {
             from_line: None,
             to_line: None,
             max_hops: Some(10),
-        });
-        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+        })));
 
         assert_eq!(v["hops_clamped"], true);
 
@@ -2167,20 +2212,19 @@ mod tests {
             .unwrap();
         }
 
-        let output = server.locate(LocateParams {
+        let output = server.locate(rmcp::handler::server::wrapper::Parameters(LocateParams {
             query: "foo".into(),
             kind: None,
             depth: Some("search_only".into()),
             limit: None,
-        });
-        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+        }));
+        let v = jv(output);
 
         assert!(v["top_symbol"].is_null());
         assert!(v["file_overview"].is_null());
         assert!(v["depth_adjusted"].is_null());
 
-        let session = server.session_context();
-        let sv: serde_json::Value = serde_json::from_str(&session).unwrap();
+        let sv = jv(server.session_context());
         assert_eq!(sv["explored_symbols"], serde_json::json!([]));
         assert_eq!(sv["explored_files"], serde_json::json!([]));
 
@@ -2206,13 +2250,13 @@ mod tests {
 
         // kind="text" + default depth ("with_symbol") must auto-downgrade per
         // the LocateDepth invariant, since a text match has no symbol to enrich.
-        let output = server.locate(LocateParams {
+        let output = server.locate(rmcp::handler::server::wrapper::Parameters(LocateParams {
             query: "bar".into(),
             kind: Some("text".into()),
             depth: None,
             limit: None,
-        });
-        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+        }));
+        let v = jv(output);
 
         assert_eq!(v["depth_adjusted"], "with_file");
         assert!(v["top_symbol"].is_null());
@@ -2244,11 +2288,10 @@ mod tests {
             .unwrap();
         }
 
-        let output = server.understand(UnderstandParams {
+        let v = jv(server.understand(rmcp::handler::server::wrapper::Parameters(UnderstandParams {
             query: "foo".into(),
             kind: None,
-        });
-        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+        })));
 
         assert_eq!(v["symbol"]["qualified_name"], "foo.py::foo");
         assert_eq!(v["source"]["language"], "python");
@@ -2275,10 +2318,10 @@ mod tests {
             .unwrap();
         }
 
-        let output = server.file_overview(FileOverviewParams {
+        let output = server.file_overview(rmcp::handler::server::wrapper::Parameters(FileOverviewParams {
             path: "a.py".into(),
-        });
-        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+        }));
+        let v = jv(output);
 
         assert_eq!(v["symbols"][0]["caller_count"], 7);
         assert_eq!(v["symbols"][0]["is_hub"], true);
@@ -2307,13 +2350,12 @@ mod tests {
             .unwrap();
         }
 
-        let output = server.source(SourceParams {
+        let v = jv(server.source(rmcp::handler::server::wrapper::Parameters(SourceParams {
             symbol: "foo".into(),
             path: None,
             line: None,
             include_metadata: false,
-        });
-        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+        })));
 
         assert_eq!(v["data_source"], "disk");
         assert!(
@@ -2342,13 +2384,12 @@ mod tests {
             .unwrap();
         }
 
-        let output = server.source(SourceParams {
+        let v = jv(server.source(rmcp::handler::server::wrapper::Parameters(SourceParams {
             symbol: "foo".into(),
             path: None,
             line: None,
             include_metadata: false,
-        });
-        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+        })));
         assert!(
             v.get("content_warning").is_none(),
             "clean code must omit content_warning entirely, got: {v}"
@@ -2380,13 +2421,12 @@ mod tests {
             .unwrap();
         }
 
-        let output = server.source(SourceParams {
+        let v = jv(server.source(rmcp::handler::server::wrapper::Parameters(SourceParams {
             symbol: "foo".into(),
             path: None,
             line: None,
             include_metadata: false,
-        });
-        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+        })));
 
         let warning = v["content_warning"]
             .as_str()
@@ -2423,11 +2463,10 @@ mod tests {
             .unwrap();
         }
 
-        let output = server.understand(UnderstandParams {
+        let v = jv(server.understand(rmcp::handler::server::wrapper::Parameters(UnderstandParams {
             query: "foo".into(),
             kind: None,
-        });
-        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+        })));
         let warning = v["source"]["content_warning"].as_str().expect(
             "understand.source.content_warning must be present for injection-shaped source",
         );
@@ -2455,10 +2494,9 @@ mod tests {
             .unwrap();
         }
 
-        let output = server.dependencies(DependenciesParams {
+        let v = jv(server.dependencies(rmcp::handler::server::wrapper::Parameters(DependenciesParams {
             path: "a.py".into(),
-        });
-        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+        })));
 
         assert_eq!(
             v["imports"][0]["symbols_used"],
@@ -2492,12 +2530,11 @@ mod tests {
                 .unwrap();
             }
         }
-        let output = server.symbol_info(SymbolInfoParams {
+        let v = jv(server.symbol_info(rmcp::handler::server::wrapper::Parameters(SymbolInfoParams {
             symbol: "default".into(),
             path: None,
             line: None,
-        });
-        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+        })));
         assert_eq!(v["ambiguous"], true);
         assert_eq!(v["total"], 13, "must report the full match count");
         assert_eq!(v["truncated"], true, "13 > cap of 10 must set truncated");
@@ -2540,14 +2577,13 @@ mod tests {
             )
             .unwrap();
         }
-        let output = server.callers(CallersParams {
+        let v = jv(server.callers(rmcp::handler::server::wrapper::Parameters(CallersParams {
             symbol: "as_str".into(),
             path: Some("a.rs".into()),
             line: Some(41),
             transitive: false,
             max_depth: None,
-        });
-        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+        })));
         assert_eq!(
             v["direct_count"], 1,
             "only the resolved caller is a confident direct caller"
@@ -2594,10 +2630,9 @@ mod tests {
             )
             .unwrap();
         }
-        let output = server.dependencies(DependenciesParams {
+        let v = jv(server.dependencies(rmcp::handler::server::wrapper::Parameters(DependenciesParams {
             path: "embedding.rs".into(),
-        });
-        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+        })));
         let call_deps: Vec<String> = v["call_dependents"]
             .as_array()
             .unwrap()
@@ -2645,10 +2680,9 @@ mod tests {
             )
             .unwrap();
         }
-        let output = server.dependencies(DependenciesParams {
+        let v = jv(server.dependencies(rmcp::handler::server::wrapper::Parameters(DependenciesParams {
             path: "embedding.rs".into(),
-        });
-        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+        })));
         let glob_deps: Vec<String> = v["glob_reexport_dependents"]
             .as_array()
             .unwrap()
@@ -2696,10 +2730,9 @@ mod tests {
             .unwrap();
         }
 
-        let output = server.dependencies(DependenciesParams {
+        let v = jv(server.dependencies(rmcp::handler::server::wrapper::Parameters(DependenciesParams {
             path: "a.py".into(),
-        });
-        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+        })));
 
         assert_eq!(v["imports"].as_array().unwrap().len(), 1);
         assert_eq!(v["imports_truncated"], true);
@@ -2730,10 +2763,9 @@ mod tests {
             .unwrap();
         }
 
-        let output = server.indexing_status(IndexingStatusParams {
+        let v = jv(server.indexing_status(rmcp::handler::server::wrapper::Parameters(IndexingStatusParams {
             retry_embeddings: false,
-        });
-        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+        })));
 
         assert_eq!(v["files_indexed"], 1);
         assert_eq!(v["files_total"], 2, "both a.py and b.py exist on disk");
@@ -2818,12 +2850,11 @@ mod tests {
             .unwrap();
         }
 
-        let output = server.symbol_info(SymbolInfoParams {
+        let v = jv(server.symbol_info(rmcp::handler::server::wrapper::Parameters(SymbolInfoParams {
             symbol: "my_fn".into(),
             path: None,
             line: None,
-        });
-        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+        })));
 
         // coreness must be present and equal to 3
         assert_eq!(
@@ -2870,12 +2901,11 @@ mod tests {
             .unwrap();
         }
 
-        let output = server.symbol_info(SymbolInfoParams {
+        let v = jv(server.symbol_info(rmcp::handler::server::wrapper::Parameters(SymbolInfoParams {
             symbol: "my_fn2".into(),
             path: None,
             line: None,
-        });
-        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+        })));
 
         // When edges not ready, coreness must be null (not missing)
         assert!(
@@ -2903,7 +2933,7 @@ mod tests {
         for _ in 0..9 {
             server.session_context();
         }
-        let at_nine: serde_json::Value = serde_json::from_str(&server.session_context()).unwrap();
+        let at_nine = jv(server.session_context());
         // 10 calls in (the loop's 9 + this one), none of them explored anything.
         assert_eq!(at_nine["calls_since_progress"], 10, "{at_nine}");
         assert_eq!(at_nine["possibly_stuck"], true, "{at_nine}");
@@ -2919,7 +2949,7 @@ mod tests {
             server.session_context();
         }
         server.track_file("a.rs"); // new — resets the counter
-        let after_new: serde_json::Value = serde_json::from_str(&server.session_context()).unwrap();
+        let after_new = jv(server.session_context());
         // 1, not 0: session_context's own call increments tool_calls before
         // reading it, so the very next call after a reset always reads "1
         // call since progress" — the reset itself, not the read, is what
@@ -2931,8 +2961,7 @@ mod tests {
             server.session_context();
         }
         server.track_file("a.rs"); // re-touch of the SAME file — must not reset
-        let after_retouch: serde_json::Value =
-            serde_json::from_str(&server.session_context()).unwrap();
+        let after_retouch = jv(server.session_context());
         assert!(
             after_retouch["calls_since_progress"].as_u64().unwrap() > 0,
             "a re-touch of an already-explored file must not reset the counter: {after_retouch}"
@@ -2980,8 +3009,7 @@ mod tests {
     #[test]
     fn fitness_report_returns_metrics_and_checks_on_empty_db() {
         let (dir, server) = test_server("fitness_report_empty");
-        let output = server.fitness_report();
-        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+        let v = jv(server.fitness_report());
 
         assert_eq!(v["passed"], true, "{v}");
         assert!(v["checks"].as_array().unwrap().len() >= 7, "{v}");
@@ -3039,7 +3067,7 @@ mod tests {
 
     #[test]
     fn filtered_tool_list_returns_every_tool_for_full_and_empty_preset() {
-        let unfiltered_count = CalmServer::tool_box().list().len();
+        let unfiltered_count = CalmServer::full_tool_router().list_all().len();
         for preset in ["full", ""] {
             let all = CalmServer::filtered_tool_list(preset);
             assert_eq!(
@@ -3074,13 +3102,13 @@ mod tests {
             ).unwrap();
         }
 
-        let output = server.locate(LocateParams {
+        let output = server.locate(rmcp::handler::server::wrapper::Parameters(LocateParams {
             query: "orphan_fn".into(),
             kind: None,  // symbol kind
             depth: None, // defaults to with_symbol
             limit: None,
-        });
-        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+        }));
+        let v = jv(output);
         let sn = &v["suggested_next"];
         assert_eq!(
             sn["tool"], "callers",
@@ -3123,13 +3151,13 @@ mod tests {
         }
 
         // Use depth="search_only" so top_symbol is None and both results are visible
-        let output = server.locate(LocateParams {
+        let output = server.locate(rmcp::handler::server::wrapper::Parameters(LocateParams {
             query: "process".into(),
             kind: None,
             depth: Some("search_only".into()),
             limit: None,
-        });
-        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+        }));
+        let v = jv(output);
         let sn = &v["suggested_next"];
         assert_eq!(
             sn["tool"], "symbol_info",
@@ -3173,8 +3201,8 @@ mod tests {
             limit: None,
         };
 
-        let baseline = server.locate(params());
-        let bv: serde_json::Value = serde_json::from_str(&baseline).unwrap();
+        let baseline = server.locate(rmcp::handler::server::wrapper::Parameters(params()));
+        let bv = jv(baseline);
         assert_eq!(
             bv["personalized"], false,
             "a session that hasn't explored anything must not personalize"
@@ -3183,8 +3211,8 @@ mod tests {
 
         server.track_file("a.rs");
 
-        let boosted = server.locate(params());
-        let boostv: serde_json::Value = serde_json::from_str(&boosted).unwrap();
+        let boosted = server.locate(rmcp::handler::server::wrapper::Parameters(params()));
+        let boostv = jv(boosted);
         assert_eq!(boostv["personalized"], true);
         let boosted_score = boostv["results"][0]["score"].as_f64().unwrap();
 
@@ -3232,13 +3260,13 @@ mod tests {
         }
 
         server.track_file("a.rs");
-        let output = server.locate(LocateParams {
+        let output = server.locate(rmcp::handler::server::wrapper::Parameters(LocateParams {
             query: "helper_fn".into(),
             kind: None,
             depth: Some("search_only".into()),
             limit: None,
-        });
-        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+        }));
+        let v = jv(output);
         assert_eq!(
             v["personalized"], false,
             "personalization_weight=0.0 must fully disable boosting"
@@ -3265,8 +3293,7 @@ mod tests {
         server.track_file("a.py");
         server.track_file("b.py");
 
-        let output = server.session_context();
-        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+        let v = jv(server.session_context());
 
         assert_eq!(v["explored_files"].as_array().unwrap().len(), 1);
         assert_eq!(
@@ -3285,8 +3312,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
 
-        let output = server.session_context();
-        let v: serde_json::Value = serde_json::from_str(&output).unwrap();
+        let v = jv(server.session_context());
 
         let ts = v["session_started_at"]
             .as_str()
@@ -3311,8 +3337,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
 
-        let out1: serde_json::Value = serde_json::from_str(&server.session_context()).unwrap();
-        let out2: serde_json::Value = serde_json::from_str(&server.session_context()).unwrap();
+        let out1 = jv(server.session_context());
+        let out2 = jv(server.session_context());
 
         assert_eq!(
             out1["session_started_at"], out2["session_started_at"],
@@ -3367,22 +3393,27 @@ mod tests {
         (dir, server)
     }
 
+    /// Test-only: unwrap a migrated tool's `Json<T>` return into a plain
+    /// `serde_json::Value` for the existing untyped `v["field"]`-style
+    /// assertions — same shape tests got from `serde_json::from_str(&s)`
+    /// on the old `String`-returning tools, without the string round-trip.
+    fn jv<T: Serialize>(result: Json<T>) -> serde_json::Value {
+        serde_json::to_value(result.0).unwrap()
+    }
     #[test]
     fn remember_rejects_empty_topic_or_content() {
         let (dir, server) = test_server("remember_empty");
 
-        let v: serde_json::Value = serde_json::from_str(&server.remember(RememberParams {
+        let v = jv(server.remember(rmcp::handler::server::wrapper::Parameters(RememberParams {
             topic: "  ".into(),
             content: "something".into(),
-        }))
-        .unwrap();
+        })));
         assert!(v.get("error").is_some());
 
-        let v: serde_json::Value = serde_json::from_str(&server.remember(RememberParams {
+        let v = jv(server.remember(rmcp::handler::server::wrapper::Parameters(RememberParams {
             topic: "topic".into(),
             content: "".into(),
-        }))
-        .unwrap();
+        })));
         assert!(v.get("error").is_some());
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -3392,19 +3423,19 @@ mod tests {
     fn remember_then_recall_by_exact_topic() {
         let (dir, server) = test_server("remember_recall");
 
-        let out = server.remember(RememberParams {
+        let out = server.remember(rmcp::handler::server::wrapper::Parameters(RememberParams {
             topic: "resolver-tiers".into(),
             content: "Formal tier only covers Python for now.".into(),
-        });
-        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        }));
+        let v = jv(out);
         assert_eq!(v["topic"], "resolver-tiers");
         assert!(v["updated_at"].as_str().unwrap().ends_with('Z'));
 
-        let out = server.recall(RecallParams {
+        let out = server.recall(rmcp::handler::server::wrapper::Parameters(RecallParams {
             topic: Some("resolver-tiers".into()),
             query: None,
-        });
-        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        }));
+        let v = jv(out);
         assert_eq!(v["notes"].as_array().unwrap().len(), 1);
         assert_eq!(v["notes"][0]["topic"], "resolver-tiers");
         assert_eq!(
@@ -3419,20 +3450,20 @@ mod tests {
     fn remember_upserts_same_topic() {
         let (dir, server) = test_server("remember_upsert");
 
-        server.remember(RememberParams {
+        server.remember(rmcp::handler::server::wrapper::Parameters(RememberParams {
             topic: "gotcha".into(),
             content: "first version".into(),
-        });
-        server.remember(RememberParams {
+        }));
+        server.remember(rmcp::handler::server::wrapper::Parameters(RememberParams {
             topic: "gotcha".into(),
             content: "second version".into(),
-        });
+        }));
 
-        let out = server.recall(RecallParams {
+        let out = server.recall(rmcp::handler::server::wrapper::Parameters(RecallParams {
             topic: Some("gotcha".into()),
             query: None,
-        });
-        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        }));
+        let v = jv(out);
         let notes = v["notes"].as_array().unwrap();
         assert_eq!(notes.len(), 1, "upsert must not create a duplicate row");
         assert_eq!(notes[0]["content"], "second version");
@@ -3444,20 +3475,20 @@ mod tests {
     fn recall_by_query_matches_topic_or_content() {
         let (dir, server) = test_server("recall_query");
 
-        server.remember(RememberParams {
+        server.remember(rmcp::handler::server::wrapper::Parameters(RememberParams {
             topic: "auth-flow".into(),
             content: "OAuth callback must validate state param.".into(),
-        });
-        server.remember(RememberParams {
+        }));
+        server.remember(rmcp::handler::server::wrapper::Parameters(RememberParams {
             topic: "unrelated".into(),
             content: "Nothing to do with authentication.".into(),
-        });
+        }));
 
-        let out = server.recall(RecallParams {
+        let out = server.recall(rmcp::handler::server::wrapper::Parameters(RecallParams {
             topic: None,
             query: Some("oauth".into()),
-        });
-        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        }));
+        let v = jv(out);
         let notes = v["notes"].as_array().unwrap();
         assert_eq!(notes.len(), 1);
         assert_eq!(notes[0]["topic"], "auth-flow");
@@ -3469,10 +3500,10 @@ mod tests {
     fn recall_with_no_args_lists_all_most_recent_first() {
         let (dir, server) = test_server("recall_list_all");
 
-        server.remember(RememberParams {
+        server.remember(rmcp::handler::server::wrapper::Parameters(RememberParams {
             topic: "a".into(),
             content: "first".into(),
-        });
+        }));
         // Backdate "a" instead of sleeping for a real second-resolution tick.
         server
             .db()
@@ -3481,16 +3512,16 @@ mod tests {
                 [],
             )
             .unwrap();
-        server.remember(RememberParams {
+        server.remember(rmcp::handler::server::wrapper::Parameters(RememberParams {
             topic: "b".into(),
             content: "second".into(),
-        });
+        }));
 
-        let out = server.recall(RecallParams {
+        let out = server.recall(rmcp::handler::server::wrapper::Parameters(RecallParams {
             topic: None,
             query: None,
-        });
-        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        }));
+        let v = jv(out);
         let notes = v["notes"].as_array().unwrap();
         assert_eq!(notes.len(), 2);
         assert_eq!(
@@ -3506,11 +3537,11 @@ mod tests {
     fn recall_empty_db_suggests_remember() {
         let (dir, server) = test_server("recall_empty");
 
-        let out = server.recall(RecallParams {
+        let out = server.recall(rmcp::handler::server::wrapper::Parameters(RecallParams {
             topic: None,
             query: None,
-        });
-        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        }));
+        let v = jv(out);
         assert_eq!(v["notes"].as_array().unwrap().len(), 0);
         assert_eq!(v["suggested_next"]["tool"], "remember");
 
@@ -3521,11 +3552,11 @@ mod tests {
     fn recall_unknown_topic_returns_empty_not_error() {
         let (dir, server) = test_server("recall_unknown");
 
-        let out = server.recall(RecallParams {
+        let out = server.recall(rmcp::handler::server::wrapper::Parameters(RecallParams {
             topic: Some("does-not-exist".into()),
             query: None,
-        });
-        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        }));
+        let v = jv(out);
         assert_eq!(v["notes"].as_array().unwrap().len(), 0);
         assert!(v.get("error").is_none());
 
@@ -3536,18 +3567,18 @@ mod tests {
     fn remember_note_with_no_file_refs_recalls_unchecked() {
         let (dir, server) = test_server("remember_no_refs");
 
-        let out = server.remember(RememberParams {
+        let out = server.remember(rmcp::handler::server::wrapper::Parameters(RememberParams {
             topic: "philosophy".into(),
             content: "prefer additive fixes over rewrites".into(),
-        });
-        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        }));
+        let v = jv(out);
         assert_eq!(v["refs_captured"], 0);
 
-        let out = server.recall(RecallParams {
+        let out = server.recall(rmcp::handler::server::wrapper::Parameters(RecallParams {
             topic: Some("philosophy".into()),
             query: None,
-        });
-        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        }));
+        let v = jv(out);
         assert_eq!(v["notes"][0]["staleness"], "unchecked");
         assert!(v["notes"][0]["stale_refs"].as_array().is_none());
 
@@ -3559,18 +3590,18 @@ mod tests {
         let (dir, server) = test_server("remember_fresh");
         std::fs::write(dir.join("resolver.py"), "def resolve(): pass\n").unwrap();
 
-        let out = server.remember(RememberParams {
+        let out = server.remember(rmcp::handler::server::wrapper::Parameters(RememberParams {
             topic: "resolver-note".into(),
             content: "see `resolver.py` for the tiering logic".into(),
-        });
-        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        }));
+        let v = jv(out);
         assert_eq!(v["refs_captured"], 1);
 
-        let out = server.recall(RecallParams {
+        let out = server.recall(rmcp::handler::server::wrapper::Parameters(RecallParams {
             topic: Some("resolver-note".into()),
             query: None,
-        });
-        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        }));
+        let v = jv(out);
         assert_eq!(v["notes"][0]["staleness"], "fresh");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -3580,10 +3611,10 @@ mod tests {
     fn recall_reports_stale_when_referenced_file_changes() {
         let (dir, server) = test_server("recall_stale");
         std::fs::write(dir.join("resolver.py"), "def resolve(): pass\n").unwrap();
-        server.remember(RememberParams {
+        server.remember(rmcp::handler::server::wrapper::Parameters(RememberParams {
             topic: "resolver-note".into(),
             content: "see `resolver.py` for the tiering logic".into(),
-        });
+        }));
 
         std::fs::write(
             dir.join("resolver.py"),
@@ -3591,11 +3622,11 @@ mod tests {
         )
         .unwrap();
 
-        let out = server.recall(RecallParams {
+        let out = server.recall(rmcp::handler::server::wrapper::Parameters(RecallParams {
             topic: Some("resolver-note".into()),
             query: None,
-        });
-        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        }));
+        let v = jv(out);
         assert_eq!(v["notes"][0]["staleness"], "stale");
         assert_eq!(v["notes"][0]["stale_refs"][0]["reference"], "resolver.py");
         assert_eq!(v["notes"][0]["stale_refs"][0]["status"], "changed");
@@ -3607,18 +3638,18 @@ mod tests {
     fn recall_reports_gone_when_referenced_file_deleted() {
         let (dir, server) = test_server("recall_gone");
         std::fs::write(dir.join("resolver.py"), "def resolve(): pass\n").unwrap();
-        server.remember(RememberParams {
+        server.remember(rmcp::handler::server::wrapper::Parameters(RememberParams {
             topic: "resolver-note".into(),
             content: "see `resolver.py` for the tiering logic".into(),
-        });
+        }));
 
         std::fs::remove_file(dir.join("resolver.py")).unwrap();
 
-        let out = server.recall(RecallParams {
+        let out = server.recall(rmcp::handler::server::wrapper::Parameters(RecallParams {
             topic: Some("resolver-note".into()),
             query: None,
-        });
-        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        }));
+        let v = jv(out);
         assert_eq!(v["notes"][0]["staleness"], "gone");
         assert_eq!(v["notes"][0]["stale_refs"][0]["status"], "deleted");
 
@@ -3631,24 +3662,24 @@ mod tests {
         std::fs::write(dir.join("a.py"), "# a\n").unwrap();
         std::fs::write(dir.join("b.py"), "# b\n").unwrap();
 
-        server.remember(RememberParams {
+        server.remember(rmcp::handler::server::wrapper::Parameters(RememberParams {
             topic: "gotcha".into(),
             content: "see `a.py`".into(),
-        });
+        }));
         // Re-`remember`ing the same topic with different content must
         // replace the old ref set, not accumulate it — deleting a.py
         // afterward must not make this note "gone" via a stale a.py ref.
-        server.remember(RememberParams {
+        server.remember(rmcp::handler::server::wrapper::Parameters(RememberParams {
             topic: "gotcha".into(),
             content: "see `b.py`".into(),
-        });
+        }));
         std::fs::remove_file(dir.join("a.py")).unwrap();
 
-        let out = server.recall(RecallParams {
+        let out = server.recall(rmcp::handler::server::wrapper::Parameters(RecallParams {
             topic: Some("gotcha".into()),
             query: None,
-        });
-        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        }));
+        let v = jv(out);
         assert_eq!(v["notes"][0]["staleness"], "fresh");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -3659,28 +3690,28 @@ mod tests {
         let (dir, server) = test_server("recall_relevance");
 
         // Oldest note: postgres mentioned once, in passing.
-        server.remember(RememberParams {
+        server.remember(rmcp::handler::server::wrapper::Parameters(RememberParams {
             topic: "old-note".into(),
             content: "We briefly considered postgres before choosing something else.".into(),
-        });
+        }));
         // Newest note, but has nothing to do with the query — recency alone
         // (the old LIKE query's only ordering) would rank this first.
-        server.remember(RememberParams {
+        server.remember(rmcp::handler::server::wrapper::Parameters(RememberParams {
             topic: "unrelated-newer-note".into(),
             content: "The deploy pipeline now retries failed steps automatically.".into(),
-        });
+        }));
         // postgres is the whole focus here — must rank above old-note despite
         // being remembered before unrelated-newer-note.
-        server.remember(RememberParams {
+        server.remember(rmcp::handler::server::wrapper::Parameters(RememberParams {
             topic: "focused-note".into(),
             content: "postgres postgres postgres: we use postgres for all persistence.".into(),
-        });
+        }));
 
-        let out = server.recall(RecallParams {
+        let out = server.recall(rmcp::handler::server::wrapper::Parameters(RecallParams {
             topic: None,
             query: Some("postgres".into()),
-        });
-        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        }));
+        let v = jv(out);
         let notes = v["notes"].as_array().unwrap();
         assert_eq!(
             notes.len(),
@@ -3725,11 +3756,11 @@ mod tests {
             .unwrap();
         }
 
-        let out = server.recall(RecallParams {
+        let out = server.recall(rmcp::handler::server::wrapper::Parameters(RecallParams {
             topic: None,
             query: Some("widgetronic".into()),
-        });
-        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        }));
+        let v = jv(out);
         let notes = v["notes"].as_array().unwrap();
         assert_eq!(notes.len(), 2);
         assert_eq!(
@@ -3749,7 +3780,7 @@ mod tests {
         let (dir, server) = test_server("edit_preview");
         std::fs::write(dir.join("a.py"), "def helper():\n    return 1\n").unwrap();
 
-        let out = server.edit_lines(EditLinesParams {
+        let out = server.edit_lines(rmcp::handler::server::wrapper::Parameters(EditLinesParams {
             path: "a.py".into(),
             edits: vec![EditHunkParam {
                 start_line: 2,
@@ -3758,8 +3789,8 @@ mod tests {
                 new_text: "    return 2\n".into(),
             }],
             confirm: false,
-        });
-        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        }));
+        let v = jv(out);
         assert_eq!(v["applied"], false);
         assert_eq!(v["hunks"][0]["status"], "preview");
         assert!(!v["hunks"][0]["current_hash"].as_str().unwrap().is_empty());
@@ -3778,7 +3809,7 @@ mod tests {
         let (dir, server) = test_server("edit_conflict");
         std::fs::write(dir.join("a.py"), "def helper():\n    return 1\n").unwrap();
 
-        let out = server.edit_lines(EditLinesParams {
+        let out = server.edit_lines(rmcp::handler::server::wrapper::Parameters(EditLinesParams {
             path: "a.py".into(),
             edits: vec![EditHunkParam {
                 start_line: 2,
@@ -3787,8 +3818,8 @@ mod tests {
                 new_text: "    return 2\n".into(),
             }],
             confirm: false,
-        });
-        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        }));
+        let v = jv(out);
         assert_eq!(v["applied"], false);
         assert_eq!(v["hunks"][0]["status"], "conflict");
 
@@ -3806,7 +3837,7 @@ mod tests {
         std::fs::write(dir.join("a.py"), "def helper():\n    return 1\n").unwrap();
         let hash = calm_core::edit::range_checksum("def helper():\n    return 1\n", 2, 2).unwrap();
 
-        let out = server.edit_lines(EditLinesParams {
+        let out = server.edit_lines(rmcp::handler::server::wrapper::Parameters(EditLinesParams {
             path: "a.py".into(),
             edits: vec![EditHunkParam {
                 start_line: 2,
@@ -3815,8 +3846,8 @@ mod tests {
                 new_text: "    return 2\n".into(),
             }],
             confirm: false,
-        });
-        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        }));
+        let v = jv(out);
         assert_eq!(v["applied"], true, "response: {v}");
         assert_eq!(v["hunks"][0]["status"], "applied");
         assert_eq!(v["hunks"][0]["old_text"], "    return 1\n");
@@ -3855,11 +3886,11 @@ mod tests {
         std::fs::write(dir.join("a.py"), "def helper():\n    return 1\n").unwrap();
         let hash = calm_core::edit::range_checksum("def helper():\n    return 1\n", 2, 2).unwrap();
 
-        let before: serde_json::Value = serde_json::from_str(&server.session_context()).unwrap();
+        let before = jv(server.session_context());
         assert_eq!(before["pending_diff_impact"], false);
         assert!(before.get("files_pending_diff_impact").is_none());
 
-        server.edit_lines(EditLinesParams {
+        server.edit_lines(rmcp::handler::server::wrapper::Parameters(EditLinesParams {
             path: "a.py".into(),
             edits: vec![EditHunkParam {
                 start_line: 2,
@@ -3868,10 +3899,9 @@ mod tests {
                 new_text: "    return 2\n".into(),
             }],
             confirm: false,
-        });
+        }));
 
-        let after_edit: serde_json::Value =
-            serde_json::from_str(&server.session_context()).unwrap();
+        let after_edit = jv(server.session_context());
         assert_eq!(after_edit["pending_diff_impact"], true, "{after_edit}");
         assert_eq!(
             after_edit["files_pending_diff_impact"],
@@ -3881,14 +3911,13 @@ mod tests {
 
         // Any diff_impact call — even against unrelated raw diff text —
         // clears the pending set.
-        server.diff_impact(DiffImpactParams {
+        server.diff_impact(rmcp::handler::server::wrapper::Parameters(DiffImpactParams {
             diff: Some("diff --git a/unrelated.rs b/unrelated.rs\n".into()),
             staged: None,
             commits: None,
-        });
+        }));
 
-        let after_verify: serde_json::Value =
-            serde_json::from_str(&server.session_context()).unwrap();
+        let after_verify = jv(server.session_context());
         assert_eq!(after_verify["pending_diff_impact"], false, "{after_verify}");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -3900,7 +3929,7 @@ mod tests {
         std::fs::write(dir.join("a.py"), "def helper():\n    return 1\n").unwrap();
         let hash = calm_core::edit::range_checksum("def helper():\n    return 1\n", 2, 2).unwrap();
 
-        let out = server.edit_lines(EditLinesParams {
+        let out = server.edit_lines(rmcp::handler::server::wrapper::Parameters(EditLinesParams {
             path: "a.py".into(),
             edits: vec![EditHunkParam {
                 start_line: 2,
@@ -3909,8 +3938,8 @@ mod tests {
                 new_text: "    return (\n".into(), // unbalanced paren — syntax error
             }],
             confirm: false,
-        });
-        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        }));
+        let v = jv(out);
         assert_eq!(v["error"]["code"], "PARSE_ERROR");
 
         assert_eq!(
@@ -3938,7 +3967,7 @@ mod tests {
             .unwrap();
         }
 
-        let without_confirm = server.edit_lines(EditLinesParams {
+        let without_confirm = server.edit_lines(rmcp::handler::server::wrapper::Parameters(EditLinesParams {
             path: "a.py".into(),
             edits: vec![EditHunkParam {
                 start_line: 2,
@@ -3947,15 +3976,15 @@ mod tests {
                 new_text: "    return 2\n".into(),
             }],
             confirm: false,
-        });
-        let v: serde_json::Value = serde_json::from_str(&without_confirm).unwrap();
+        }));
+        let v = jv(without_confirm);
         assert_eq!(v["error"]["code"], "CONFIRM_REQUIRED", "response: {v}");
         assert_eq!(
             std::fs::read_to_string(dir.join("a.py")).unwrap(),
             "def helper():\n    return 1\n"
         );
 
-        let with_confirm = server.edit_lines(EditLinesParams {
+        let with_confirm = server.edit_lines(rmcp::handler::server::wrapper::Parameters(EditLinesParams {
             path: "a.py".into(),
             edits: vec![EditHunkParam {
                 start_line: 2,
@@ -3964,8 +3993,8 @@ mod tests {
                 new_text: "    return 2\n".into(),
             }],
             confirm: true,
-        });
-        let v: serde_json::Value = serde_json::from_str(&with_confirm).unwrap();
+        }));
+        let v = jv(with_confirm);
         assert_eq!(v["applied"], true, "response: {v}");
         assert_eq!(
             std::fs::read_to_string(dir.join("a.py")).unwrap(),
@@ -3984,7 +4013,7 @@ mod tests {
         let hash_a = calm_core::edit::range_checksum(content, 2, 2).unwrap();
         let hash_b = calm_core::edit::range_checksum(content, 6, 6).unwrap();
 
-        let out = server.edit_lines(EditLinesParams {
+        let out = server.edit_lines(rmcp::handler::server::wrapper::Parameters(EditLinesParams {
             path: "m.py".into(),
             edits: vec![
                 EditHunkParam {
@@ -4001,8 +4030,8 @@ mod tests {
                 },
             ],
             confirm: false,
-        });
-        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        }));
+        let v = jv(out);
         assert_eq!(v["applied"], true, "response: {v}");
 
         assert_eq!(
@@ -4029,15 +4058,15 @@ mod tests {
         }
         let hash = calm_core::edit::range_checksum("def helper():\n    return 1\n", 1, 2).unwrap();
 
-        let out = server.edit_symbol(EditSymbolParams {
+        let out = server.edit_symbol(rmcp::handler::server::wrapper::Parameters(EditSymbolParams {
             symbol: "helper".into(),
             path: None,
             line: None,
             expected_hash: Some(hash),
             new_text: "def helper():\n    return 42\n".into(),
             confirm: false,
-        });
-        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        }));
+        let v = jv(out);
         assert_eq!(v["applied"], true, "response: {v}");
         assert_eq!(v["path"], "a.py");
 

@@ -20,8 +20,8 @@
     },
     "calm": {
       "type": "stdio",
-      "command": "bash",
-      "args": ["scripts/mcp-launcher.sh"],
+      "command": "/home/ybao/B.1/CALM/scripts/calm-mcp-wrapper.sh",
+      "args": [],
       "env": {}
     }
   }

@@ -1,7 +1,13 @@
 # CALM — Coding Agent Liveness Map
 
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![CI](https://github.com/Eilodon/CALM/actions/workflows/ci.yml/badge.svg)](https://github.com/Eilodon/CALM/actions/workflows/ci.yml)
+[![npm](https://img.shields.io/npm/v/%40eilodon%2Fcalm-mcp?label=npm)](https://www.npmjs.com/package/@eilodon/calm-mcp)
+![Languages](https://img.shields.io/badge/languages-11%20parsed%20%C2%B7%208%20formal--verified-informational)
+
 **A live, graph-verified map of your codebase — so an AI coding agent can edit with its eyes open instead of grepping in the dark.**
 
+Real call graphs, not vector-similarity guesses · hard safety gates before risky edits · memory that survives a restart.
 
 ---
 
@@ -21,7 +27,16 @@ Most coding agents operate the way anyone would in an unfamiliar codebase with o
 
 CALM stands for **Coding Agent Liveness Map**. *Liveness*, because the map is never a stale snapshot — it watches the filesystem, reindexes incrementally as files change, and is honest in every response about how fresh it currently is (`scanning → parsing → building_edges → ready`). *Map*, because it's an actual graph — call edges, import edges, hub/coreness metrics — not a flat text index pretending to be one. Hand an agent a live, trustworthy map of the terrain, and it stops flailing. It gets calm.
 
-## An independent look at this problem — and where CALM sits
+## What you get
+
+- **A real call graph, not a vector-similarity guess.** `callers`/`callees`/`edit_context` tell an agent exactly who depends on the code it's about to touch — full `tree-sitter` call graphs for 6 languages (Python, TypeScript, JavaScript, Java, Rust, Go), lighter symbol-level coverage for 9 more.
+- **Edits that can't silently break things.** Every write is hash-verified against the exact line range, syntax-checked before it ever touches disk, and hub/high-fan-in symbols hard-refuse without an explicit `confirm:true` — a policy only a tool with a real dependency graph can enforce.
+- **Compiler-grade ground truth, on demand.** Optional SCIP overlays (`rust-analyzer`, `scip-go`, `scip-python`, and 5 more) upgrade "best guess" edges to formally verified ones across 8 languages, with zero behavior change on a machine that doesn't have the toolchain installed.
+- **Memory that survives a restart.** `remember`/`recall` keep architecture decisions and gotchas around across sessions instead of making the agent re-derive them from scratch every time.
+- **A codebase that grades itself.** `fitness_report` turns hub concentration, dead code, and architecture-boundary violations into a queryable, CI-enforceable signal instead of a one-off audit.
+- **Local-first.** No code leaves your machine for indexing, search, or editing; the one narrow exception (a default embedding model download) is opt-out-able. MIT-licensed.
+
+## Where CALM sits in this space
 
 "Code intelligence for AI agents" is now a real product category, not a niche — several tools in it have tens of thousands of GitHub stars. A 2026 independent survey of that category landed on two blunt conclusions:
 
@@ -29,9 +44,9 @@ CALM stands for **Coding Agent Liveness Map**. *Liveness*, because the map is ne
 >
 > "Memory integration [is] notably absent across all tools — a gap that remains."
 
-Those are the two things CALM is built around: **hard safety gates before risky edits**, and **memory that survives a session restart**. Most tools in this space stop at "help the agent find code faster." CALM adds the step after that: help it know when to *stop and check* before it edits, and stop forcing it to re-derive navigational state (have I run `diff_impact` yet? am I going in circles?) every single turn.
+Those are the two things CALM is built around: **hard safety gates before risky edits**, and **memory that survives a session restart**. Most tools in this space stop at "help the agent find code faster." CALM adds the step after that: help it know when to *stop and check* before it edits, and stop forcing it to re-derive navigational state (have I run `diff_impact` yet? am I going in circles?) every single turn. The trade-off is honest, not hidden: CALM covers 6 languages with a full call graph rather than the 40+ some LSP-based tools reach, in exchange for that depth — confidence-graded edges, hard pre-edit gates, durable memory.
 
-Full comparison against Serena, CodeGraph, grepai, Semble, GitNexus, Sourcegraph/Cody, Cursor, and Aider lives in [`docs/comparison.md`](docs/comparison.md) (Vietnamese) — not just docs-based claims: [`benchmarks/b11_extended_competitor_ab/`](benchmarks/b11_extended_competitor_ab/) actually installs and calls 5 real competitor MCP servers against the same corpus. Two findings worth stating plainly: on `pre_edit_blast_radius` (find every real caller before a risky edit), CodeGraph returns 4 symbols total and misses 4 of 5 real caller files (1/5 recall) while CALM finds 5/5; and on a real edit attempt against a verified hub symbol with no confirmation given, CALM's `edit_context`/`edit_symbol` gate refuses (`CONFIRM_REQUIRED`) while Serena's `replace_symbol_body` — which has no `confirm`/`force` field in its schema at all — just rewrites the file. (The benchmark also corrected an earlier claim of its own: Serena does have durable cross-restart memory via `write_memory`/`read_memory`, contra what a first pass had assumed — see the same doc for that correction.) Short version: CALM trades language breadth (6 languages with a full call graph, vs. e.g. Serena's 40+ via LSP) for depth — confidence-graded edges, hard pre-edit gates, and durable memory that the broader-coverage tools generally don't have.
+That's a claim worth checking rather than taking on faith. [`docs/comparison.md`](docs/comparison.md) has the detailed, methodology-first write-up against other tools in this category, and [`benchmarks/`](benchmarks/) goes further than docs-based comparison — it actually installs and calls real competitor MCP servers against the same corpus, reports bad numbers alongside good ones by policy, and corrects its own earlier mistakes in the open when a re-test finds one.
 
 ## Philosophy
 
@@ -45,20 +60,20 @@ The end goal is reduced cognitive load: the agent spends its budget on the work 
 
 ## Proof, not promises
 
-Numbers are cheap to claim and easy to fake. These are measured, today (2026-07-08), by pointing CALM's own `fitness_report`/`indexing_status` at its own codebase — not aspirational:
+Numbers are cheap to claim and easy to fake. These are measured, today (2026-07-09), by pointing CALM's own `fitness_report`/`indexing_status` at its own codebase — not aspirational, and reproducible by running the same two commands yourself:
 
 | Metric | Measured value |
 |---|---|
-| Codebase indexed | **1,727 symbols, 3,598 edges, 126 files** — 12 languages present in this repo alone |
-| Hub concentration (`hub_pct`) | 14.6% — 215 hub symbols (well under the 20% gate) |
-| Self dead-code rate (`dead_code_pct`, coverage-aware) | **2.4%** (gate: ≤ 10%) |
-| Edge coverage (`edge_coverage_pct`) | 71.2% of symbols have at least one call edge (gate: ≥ 60%) |
+| Codebase indexed | **1,742 symbols, 3,540 edges, 126 files** — 11 languages present in this repo alone |
+| Hub concentration (`hub_pct`) | 14.7% — 218 hub symbols (well under the 20% gate) |
+| Self dead-code rate (`dead_code_pct`, coverage-aware) | **2.5%** (gate: ≤ 10%) |
+| Edge coverage (`edge_coverage_pct`) | 70.0% of symbols have at least one call edge (gate: ≥ 60%) |
 | High-complexity functions (`high_complexity_pct`) | 2.6% (gate: ≤ 15%) |
 | Architecture boundary violations | 0 (declared rules actively enforced, not aspirational) |
 | Call edges resolved to `formal` (rust-analyzer ground truth), an earlier measurement on a smaller graph | **1,619 / 2,096 — 77.2%**, up from 0% before the SCIP overlay existed |
-| Full test suite (default features) | **717 passed, 0 failed** (9 ignored — live-binary integration tests for external tools, e.g. `rust-analyzer`/`scip-go`/`scip-java`, not installed in every environment) |
+| Full test suite (default features) | **725 passed** (9 ignored — live-binary integration tests for external tools, e.g. `rust-analyzer`/`scip-go`/`scip-java`, not installed in every environment) — see [`Testing`](#testing) for notes on environment-sensitive `watcher_integration` tests |
 
-That SCIP-overlay number is worth pausing on, and it's no longer a Rust-only trick — see the next section. As a live example from re-running this exact repo's index in this sandbox (no `rust-analyzer` installed here, only Python/Node toolchains reachable): `scip-python` still matched 59.4% of previously-unresolved call sites and inserted 114 formerly-invisible edges; `scip-typescript` ran too, found the (tiny) JS/TS surface, and reported a 2% match rate — an honest number for a repo that's 99% Rust, not a hidden failure. Nothing crashed or blocked on the missing Rust tooling; each provider just independently did what it could and silently sat out what it couldn't, exactly per the "graceful degradation" design.
+That SCIP-overlay number is no longer a Rust-only trick — it now covers 8 languages (see the next section), and each provider degrades gracefully on its own: a language with no matching toolchain installed just sits out silently, at zero cost, instead of failing the whole overlay pass.
 
 ## Quick start
 
@@ -111,7 +126,7 @@ This repo ships ready-made config for Claude Code (`.mcp.json`), Cursor (`.curso
 
 ```
 agent: repo_overview()
-  → 126 files, 1,727 symbols, 215 hub symbols, indexing_phase=ready
+  → 126 files, 1,742 symbols, 218 hub symbols, indexing_phase=ready
 
 agent: "I need to change getUserByEmail"
   → locate("getUserByEmail")        # find the file + symbol metadata
@@ -266,6 +281,8 @@ cargo test --test parity_test test_formal_edges   # Stack Graphs regression corp
 ```
 
 Three CI jobs run on every PR: `verify` (fmt/clippy/test/audit), `stack-graphs-corpus` (formal-resolver parity), `embeddings` (clippy + test with the `embeddings` feature).
+
+> **Note:** `crates/calm-server/tests/watcher_integration.rs` waits on real filesystem-event delivery under a hard timeout. These tests are environment-sensitive and may fail in constrained containers (inotify/I/O limitations). If you hit failures, re-run in isolation (`cargo test -p calm-server --test watcher_integration`) on an unconstrained machine and treat it as a real regression only if it still fails there.
 
 ## Further reading
 

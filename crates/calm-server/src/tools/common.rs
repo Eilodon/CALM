@@ -1,4 +1,3 @@
-use super::guardrails::*;
 use super::inspect::*;
 use super::*;
 
@@ -19,6 +18,7 @@ impl CalmServer {
         calm_core::db::schema::init_db(&conn)?;
         drop(conn);
         let coverage = calm_core::analysis::coverage::load_coverage(&project_root);
+        let tool_router = CalmServer::tool_router_for_preset(&preset);
         Ok(Self {
             project_root,
             db_path,
@@ -32,6 +32,7 @@ impl CalmServer {
             session_log: Arc::new(Mutex::new(SessionLog::default())),
             edit_lock: Arc::new(Mutex::new(())),
             preset,
+            tool_router,
         })
     }
     /// Opens a new dedicated read-only connection to the same DB file.
@@ -66,13 +67,12 @@ impl CalmServer {
     /// Wraps `telemetry::timed_tool`, additionally bumping the session's tool-call
     /// counter. Kept as a method (rather than changing `timed_tool`'s signature)
     /// since only this type has access to `session_log`.
-    pub(crate) fn timed_tool(&self, name: &str, body: impl FnOnce() -> String) -> String {
+pub(crate) fn timed_tool<T: serde::Serialize>(&self, name: &str, body: impl FnOnce() -> T) -> T {
         if let Ok(mut log) = self.session_log.lock() {
             log.tool_calls += 1;
         }
         crate::telemetry::timed_tool(name, body)
     }
-
     pub(crate) fn track_symbol(&self, qualified_name: &str) {
         if let Ok(mut log) = self.session_log.lock() {
             let now = log.tool_calls;
@@ -416,12 +416,163 @@ pub(crate) fn filter_suggested_next(
     }
 }
 
-pub(crate) fn not_found_json(symbol: &str) -> String {
-    error_json(
+/// Typed `{"error": {"code","message","recoverable"}}` envelope.
+pub(crate) fn error_output(code: &str, message: &str, recoverable: bool) -> ErrorOutput {
+    ErrorOutput {
+        error: ErrorDetail {
+            code: code.into(),
+            message: message.into(),
+            recoverable,
+        },
+    }
+}
+
+#[derive(Serialize, JsonSchema)]
+pub(crate) struct ErrorOutput {
+    pub(crate) error: ErrorDetail,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub(crate) struct ErrorDetail {
+    pub(crate) code: String,
+    pub(crate) message: String,
+    pub(crate) recoverable: bool,
+}
+
+/// Typed not-found envelope for `ResolvedOutcome::not_found`.
+pub(crate) fn not_found_error(symbol: &str) -> ErrorOutput {
+    error_output(
         "NOT_FOUND",
         &format!("Symbol '{symbol}' not found in index"),
         false,
     )
+}
+
+/// Typed `{"error": {"code": "DB_ERROR", ...}}` for the read-connection
+/// failure every read-only tool guards against. All tools now emit this
+/// shape via `ToolOutcome::error` / `ResolvedOutcome::error`.
+pub(crate) fn error_detail(code: &str, message: &str, recoverable: bool) -> ErrorDetail {
+    ErrorDetail {
+        code: code.into(),
+        message: message.into(),
+        recoverable,
+    }
+}
+pub(crate) fn db_error<T>(e: impl std::fmt::Display) -> ToolOutcome<T> {
+    ToolOutcome::error(error_detail(
+        "DB_ERROR",
+        &format!("db connection failed: {e}"),
+        true,
+    ))
+}
+
+/// Same as `db_error`, for tools whose success path can also be
+/// `Ambiguous` (anything built on `resolve_symbol`).
+pub(crate) fn db_error_resolved<T>(e: impl std::fmt::Display) -> ResolvedOutcome<T> {
+    ResolvedOutcome::error(error_detail(
+        "DB_ERROR",
+        &format!("db connection failed: {e}"),
+        true,
+    ))
+}
+
+/// Shared success/error envelope for tools with no ambiguous-name branch
+/// (i.e. no `resolve_symbol` call).
+///
+/// NOT a `#[serde(untagged)]` enum: rmcp 2.2.0's `Json<T>` requires T's
+/// JSON Schema to have root `"type": "object"` (`schema_for_output`
+/// panics otherwise — an untagged enum's schema is a bare `oneOf`/`anyOf`
+/// with no top-level `"type"`). So this is a genuine struct with optional/
+/// flattened fields instead. Exactly one of `error` / the flattened `T` is
+/// ever `Some` at a time — enforced by only constructing through `error`/
+/// `success` below, never a struct literal — which reproduces the exact
+/// same wire shape tools emitted as a bare JSON string before this type
+/// existed (`{"error": {...}}` or `T`'s fields directly at the root).
+#[derive(Serialize, JsonSchema)]
+pub(crate) struct ToolOutcome<T> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<ErrorDetail>,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    success: Option<T>,
+}
+
+impl<T> ToolOutcome<T> {
+    pub(crate) fn error(detail: ErrorDetail) -> Self {
+        ToolOutcome {
+            error: Some(detail),
+            success: None,
+        }
+    }
+
+    pub(crate) fn success(value: T) -> Self {
+        ToolOutcome {
+            error: None,
+            success: Some(value),
+        }
+    }
+
+    /// Bridges `edit_symbol` (which resolves a name first) into the same
+    /// `ResolvedOutcome` envelope as other `resolve_symbol`-based tools.
+    pub(crate) fn into_resolved(self) -> ResolvedOutcome<T> {
+        if let Some(detail) = self.error {
+            ResolvedOutcome::error(detail)
+        } else if let Some(value) = self.success {
+            ResolvedOutcome::success(value)
+        } else {
+            ResolvedOutcome::error(error_detail(
+                "INTERNAL",
+                "empty ToolOutcome",
+                false,
+            ))
+        }
+    }
+}
+
+/// Same as `ToolOutcome<T>`, plus the `ambiguous` branch every
+/// `resolve_symbol`-based tool can also produce — same flatten-based,
+/// root-`type:object` reasoning as `ToolOutcome<T>` above.
+#[derive(Serialize, JsonSchema)]
+pub(crate) struct ResolvedOutcome<T> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<ErrorDetail>,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    ambiguous: Option<AmbiguousResult>,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    success: Option<T>,
+}
+
+impl<T> ResolvedOutcome<T> {
+    pub(crate) fn error(detail: ErrorDetail) -> Self {
+        ResolvedOutcome {
+            error: Some(detail),
+            ambiguous: None,
+            success: None,
+        }
+    }
+
+    /// Bridges the existing `SymbolResolution` match arms: `NotFound`/
+    /// `Ambiguous` map onto their typed shape here. `Found` is left to the
+    /// caller — it needs tool-specific work (`track_symbol`, health
+    /// lookups, ...) that doesn't belong in a generic helper.
+    pub(crate) fn not_found(symbol: &str) -> Self {
+        Self::error(not_found_error(symbol).error)
+    }
+
+    pub(crate) fn ambiguous(candidates: &[CandidateRow]) -> Self {
+        ResolvedOutcome {
+            error: None,
+            ambiguous: Some(to_ambiguous(candidates)),
+            success: None,
+        }
+    }
+
+    pub(crate) fn success(value: T) -> Self {
+        ResolvedOutcome {
+            error: None,
+            ambiguous: None,
+            success: Some(value),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -623,20 +774,20 @@ pub(crate) fn resolve_symbol(
     }
 }
 
-pub(crate) fn ambiguous_json(candidates: &[CandidateRow]) -> String {
+/// Build the typed `AmbiguousResult` payload for `ResolvedOutcome::ambiguous`.
+pub(crate) fn to_ambiguous(candidates: &[CandidateRow]) -> AmbiguousResult {
     let total = candidates.len();
     let shown = candidates
         .iter()
         .take(MAX_AMBIGUOUS_CANDIDATES)
         .map(CandidateRow::to_ambiguous_candidate)
         .collect();
-    serde_json::to_string_pretty(&AmbiguousResult {
+    AmbiguousResult {
         ambiguous: true,
         total,
         truncated: total > MAX_AMBIGUOUS_CANDIDATES,
         candidates: shown,
-    })
-    .unwrap_or_default()
+    }
 }
 
 // ---------------------------------------------------------------------------

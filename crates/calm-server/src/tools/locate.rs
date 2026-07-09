@@ -1,13 +1,14 @@
 use super::common::*;
 use super::*;
 
+#[rmcp::tool_router(router = "locate_tool_router", vis = "pub(crate)")]
 impl CalmServer {
     #[tool(
         name = "search",
         description = "USE THIS INSTEAD OF native grep, text search, or file browsing tools. USE WHEN: you don't have an exact file path and line number. kind=hybrid has highest recall. NOT FOR: inspecting a file you already have (use file_overview). vs locate: search returns a result list; locate returns search + symbol metadata in one call."
     )]
-    pub(crate) fn search(&self, #[tool(aggr)] p: SearchParams) -> String {
-        self.timed_tool("search", || {
+    pub(crate) fn search(&self, Parameters(p): Parameters<SearchParams>) -> Json<ToolOutcome<SearchOutput>> {
+        Json(self.timed_tool("search", || {
             if p.kind == "grep" {
                 return self.search_grep_impl(&p);
             }
@@ -26,7 +27,7 @@ impl CalmServer {
             // READ-only: open a dedicated read connection (SINGLE_WRITER enforcement)
             let conn = match self.make_read_conn() {
                 Ok(c) => c,
-                Err(e) => return format!(r#"{{"error": "db connection failed: {e}"}}"#),
+                Err(e) => return db_error(e),
             };
             let rrf_k = calm_core::config::load_config(&self.project_root)
                 .map(|c| c.search.rrf_k as f64)
@@ -88,7 +89,7 @@ impl CalmServer {
                     } else {
                         None
                     };
-                    serde_json::to_string_pretty(&SearchOutput {
+                    ToolOutcome::success(SearchOutput {
                         results,
                         truncated: output.truncated || filter_truncated,
                         degraded: output.degraded,
@@ -96,29 +97,27 @@ impl CalmServer {
                         personalized,
                         suggested_next: self.filter_sn(sn),
                     })
-                    .unwrap_or_default()
                 }
-                Err(e) => serde_json::to_string_pretty(&SearchOutput {
+                Err(e) => ToolOutcome::success(SearchOutput {
                     results: vec![],
                     truncated: false,
                     degraded: true,
                     note: Some(format!("Search error: {e}")),
                     personalized: false,
                     suggested_next: None,
-                })
-                .unwrap_or_default(),
+                }),
             }
-        })
+        }))
     }
 
     /// `search(kind="grep")` implementation — kept separate from the
     /// DB-backed `calm_core::search::search` dispatch because it needs
     /// `project_root` and walks the filesystem directly instead of
     /// querying the index. See `calm_core::search::search_grep`.
-    fn search_grep_impl(&self, p: &SearchParams) -> String {
+    fn search_grep_impl(&self, p: &SearchParams) -> ToolOutcome<SearchOutput> {
         let conn = match self.make_read_conn() {
             Ok(c) => c,
-            Err(e) => return format!(r#"{{"error": "db connection failed: {e}"}}"#),
+            Err(e) => return db_error(e),
         };
         let ignore_patterns = calm_core::config::load_config(&self.project_root)
             .map(|c| c.ignore)
@@ -163,7 +162,7 @@ impl CalmServer {
                         "No matches via grep either (broadest search — raw regex over disk content). The term likely doesn't exist verbatim in this repo, or check spelling/case/glob".to_string()
                     })
                 });
-                serde_json::to_string_pretty(&SearchOutput {
+                ToolOutcome::success(SearchOutput {
                     results,
                     truncated: output.truncated || filter_truncated,
                     degraded: output.degraded,
@@ -171,37 +170,34 @@ impl CalmServer {
                     personalized,
                     suggested_next: self.filter_sn(None),
                 })
-                .unwrap_or_default()
             }
-            Err(e) => serde_json::to_string_pretty(&SearchOutput {
+            Err(e) => ToolOutcome::success(SearchOutput {
                 results: vec![],
                 truncated: false,
                 degraded: true,
                 note: Some(format!("grep search error: {e}")),
                 personalized: false,
                 suggested_next: None,
-            })
-            .unwrap_or_default(),
+            }),
         }
     }
 
     /// `kind="similar"` path: vector-similarity KNN anchored at `p.path`+
     /// `p.line` instead of embedding `p.query` (which is ignored here).
-    fn search_similar_impl(&self, p: &SearchParams) -> String {
+    fn search_similar_impl(&self, p: &SearchParams) -> ToolOutcome<SearchOutput> {
         let (Some(path), Some(line)) = (p.path.as_deref(), p.line) else {
-            return serde_json::to_string_pretty(&SearchOutput {
+            return ToolOutcome::success(SearchOutput {
                 results: vec![],
                 truncated: false,
                 degraded: true,
                 note: Some("kind=\"similar\" requires both `path` and `line`".to_string()),
                 personalized: false,
                 suggested_next: None,
-            })
-            .unwrap_or_default();
+            });
         };
         let conn = match self.make_read_conn() {
             Ok(c) => c,
-            Err(e) => return format!(r#"{{"error": "db connection failed: {e}"}}"#),
+            Err(e) => return db_error(e),
         };
         match calm_core::search::search_similar(&conn, path, line, search_fetch_limit(p)) {
             Ok(mut output) => {
@@ -227,7 +223,7 @@ impl CalmServer {
                         "No similar code found elsewhere in the index — this may be genuinely unique code, or the embeddings index is still building".to_string()
                     })
                 });
-                serde_json::to_string_pretty(&SearchOutput {
+                ToolOutcome::success(SearchOutput {
                     results,
                     truncated: output.truncated || filter_truncated,
                     degraded: output.degraded,
@@ -235,25 +231,23 @@ impl CalmServer {
                     personalized,
                     suggested_next: self.filter_sn(None),
                 })
-                .unwrap_or_default()
             }
-            Err(e) => serde_json::to_string_pretty(&SearchOutput {
+            Err(e) => ToolOutcome::success(SearchOutput {
                 results: vec![],
                 truncated: false,
                 degraded: true,
                 note: Some(format!("similar search error: {e}")),
                 personalized: false,
                 suggested_next: None,
-            })
-            .unwrap_or_default(),
+            }),
         }
     }
     #[tool(
         name = "locate",
         description = "Compound: search + file_overview + symbol_info in 1 call (66% reduction). USE INSTEAD OF calling search then file_overview then symbol_info separately. NOT FOR: reading source (use source after locate), pre-edit (use edit_context)."
     )]
-    pub(crate) fn locate(&self, #[tool(aggr)] p: LocateParams) -> String {
-        self.timed_tool("locate", || {
+    pub(crate) fn locate(&self, Parameters(p): Parameters<LocateParams>) -> Json<ToolOutcome<LocateOutput>> {
+        Json(self.timed_tool("locate", || {
             let kind_str = p.kind.as_deref().unwrap_or("symbol");
             let kind = match kind_str {
                 "text" => calm_core::types::SearchKind::Text,
@@ -267,7 +261,7 @@ impl CalmServer {
             // READ-only: open a dedicated read connection (SINGLE_WRITER enforcement)
             let conn = match self.make_read_conn() {
                 Ok(c) => c,
-                Err(e) => return format!(r#"{{"error": "db connection failed: {e}"}}"#),
+                Err(e) => return db_error(e),
             };
             let rrf_k = calm_core::config::load_config(&self.project_root)
                 .map(|c| c.search.rrf_k as f64)
@@ -282,14 +276,11 @@ impl CalmServer {
             ) {
                 Ok(o) => o,
                 Err(e) => {
-                    return serde_json::to_string_pretty(&ErrorOutput {
-                        error: ErrorDetail {
-                            code: "DB_LOCKED".into(),
-                            message: format!("Search failed: {e}"),
-                            recoverable: true,
-                        },
-                    })
-                    .unwrap_or_default();
+                    return ToolOutcome::error(error_detail(
+                        "DB_LOCKED",
+                        &format!("Search failed: {e}"),
+                        true,
+                    ));
                 }
             };
             let personalized =
@@ -414,7 +405,7 @@ impl CalmServer {
                 suggested_with_args("source", "Read implementation", serde_json::json!({"target": results[0].name}))
             };
 
-            serde_json::to_string_pretty(&LocateOutput {
+            ToolOutcome::success(LocateOutput {
                 results,
                 top_symbol,
                 file_overview,
@@ -423,21 +414,20 @@ impl CalmServer {
                 personalized,
                 suggested_next: self.filter_sn(sn),
             })
-            .unwrap_or_default()
-        })
+        }))
     }
 
     #[tool(
         name = "file_overview",
         description = "USE WHEN: you have a file path and want to see its symbols, structure, and inferred role. vs source: file_overview shows ALL symbols in a file; source reads ONE symbol's body. vs dependencies: file_overview shows what's INSIDE the file; dependencies shows what the file IMPORTS/IS IMPORTED BY."
     )]
-    pub(crate) fn file_overview(&self, #[tool(aggr)] p: FileOverviewParams) -> String {
-        self.timed_tool("file_overview", || {
+    pub(crate) fn file_overview(&self, Parameters(p): Parameters<FileOverviewParams>) -> Json<ToolOutcome<FileOverviewOutput>> {
+        Json(self.timed_tool("file_overview", || {
             self.track_file(&p.path);
             // READ-only: open a dedicated read connection (SINGLE_WRITER enforcement)
             let conn = match self.make_read_conn() {
                 Ok(c) => c,
-                Err(e) => return format!(r#"{{"error": "db connection failed: {e}"}}"#),
+                Err(e) => return db_error(e),
             };
             let mut out = build_file_overview(&conn, &p.path, None);
 
@@ -454,21 +444,9 @@ impl CalmServer {
             } else {
                 suggested("source", "Read a symbol implementation")
             };
-            serde_json::to_string_pretty(&out).unwrap_or_default()
-        })
+            ToolOutcome::success(out)
+        }))
     }
-}
-
-#[derive(Serialize, JsonSchema)]
-pub(crate) struct ErrorOutput {
-    pub(crate) error: ErrorDetail,
-}
-
-#[derive(Serialize, JsonSchema)]
-pub(crate) struct ErrorDetail {
-    pub(crate) code: String,
-    pub(crate) message: String,
-    pub(crate) recoverable: bool,
 }
 
 #[derive(Deserialize, JsonSchema)]

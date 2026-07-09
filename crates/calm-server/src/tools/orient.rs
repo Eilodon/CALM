@@ -1,17 +1,18 @@
 use super::common::*;
 use super::*;
 
+#[rmcp::tool_router(router = "orient_tool_router", vis = "pub(crate)")]
 impl CalmServer {
     #[tool(
         name = "repo_overview",
         description = "ALWAYS call this FIRST at the start of every session — never skip. USE WHEN: starting a new session, switching projects, or after server restart. NOT FOR: per-file details (use file_overview), searching for symbols (use search/locate)."
     )]
-    pub(crate) fn repo_overview(&self) -> String {
-        self.timed_tool("repo_overview", || {
+    pub(crate) fn repo_overview(&self) -> Json<ToolOutcome<RepoOverviewOutput>> {
+        Json(self.timed_tool("repo_overview", || {
             // READ-only: open a dedicated read connection (SINGLE_WRITER enforcement)
             let conn = match self.make_read_conn() {
                 Ok(c) => c,
-                Err(e) => return format!(r#"{{"error": "db connection failed: {e}"}}"#),
+                Err(e) => return db_error(e),
             };
             let total_symbols: i64 = conn
                 .query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0))
@@ -161,7 +162,7 @@ impl CalmServer {
                 suggested("locate", "Start exploration")
             };
 
-            serde_json::to_string_pretty(&RepoOverviewOutput {
+            ToolOutcome::success(RepoOverviewOutput {
                 languages,
                 indexing_phase: phase,
                 embeddings_status: embed_status,
@@ -186,16 +187,14 @@ impl CalmServer {
 RULES: Never use native grep/read on project files. is_hub:true → extra caution. Follow suggested_next."#.into(),
                 suggested_next: self.filter_sn(sn),
             })
-            .unwrap_or_default()
-        })
+        }))
     }
-
     #[tool(
         name = "hotspots",
         description = "Proactive churn × complexity analysis. USE WHEN: starting exploration of a codebase or after orientation to identify high-risk files before diving in."
     )]
-    pub(crate) fn hotspots(&self, #[tool(aggr)] p: HotspotsParams) -> String {
-        self.timed_tool("hotspots", || {
+    pub(crate) fn hotspots(&self, Parameters(p): Parameters<HotspotsParams>) -> Json<ToolOutcome<HotspotsOutput>> {
+        Json(self.timed_tool("hotspots", || {
             let config = calm_core::config::load_config(&self.project_root).unwrap_or_default();
             let hc = &config.hotspots;
             let top_n = p.top_n.unwrap_or(hc.default_top_n);
@@ -206,7 +205,7 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
             let result = {
                 let conn = match self.make_read_conn() {
                     Ok(c) => c,
-                    Err(e) => return format!(r#"{{"error": "db connection failed: {e}"}}"#),
+                    Err(e) => return db_error(e),
                 };
                 calm_core::analysis::hotspot::compute_hotspots(
                     &self.project_root,
@@ -232,7 +231,7 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
                 args: Some(serde_json::json!({"path": h.path})),
             });
 
-            serde_json::to_string_pretty(&HotspotsOutput {
+            ToolOutcome::success(HotspotsOutput {
                 hotspots,
                 count,
                 git_available: result.git_available,
@@ -242,19 +241,17 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
                 note: result.note,
                 suggested_next: self.filter_sn(sn),
             })
-            .unwrap_or_default()
-        })
+        }))
     }
-
     #[tool(
         name = "fitness_report",
         description = "Repo-wide codebase health snapshot (hub concentration, dead code, complexity, edge coverage, architecture-boundary/config-drift violations) against configurable thresholds — the same checks `calm fitness-check` runs in CI, queryable mid-session instead of waiting on a pipeline. USE WHEN: you want a big-picture health pulse-check. NOT FOR: per-file/per-symbol risk (use hotspots/edit_context for that)."
     )]
-    pub(crate) fn fitness_report(&self) -> String {
-        self.timed_tool("fitness_report", || {
+    pub(crate) fn fitness_report(&self) -> Json<ToolOutcome<FitnessReportOutput>> {
+        Json(self.timed_tool("fitness_report", || {
             let conn = match self.make_read_conn() {
                 Ok(c) => c,
-                Err(e) => return format!(r#"{{"error": "db connection failed: {e}"}}"#),
+                Err(e) => return db_error(e),
             };
 
             // Same discovery convention as `calm fitness-check --config
@@ -282,7 +279,13 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
                 &config_drift_doc_paths,
             ) {
                 Ok(r) => r,
-                Err(e) => return format!(r#"{{"error": "fitness check failed: {e}"}}"#),
+                Err(e) => {
+                    return ToolOutcome::error(error_detail(
+                        "FITNESS_CHECK_FAILED",
+                        &format!("fitness check failed: {e}"),
+                        true,
+                    ));
+                }
             };
 
             let sn = if result.passed {
@@ -294,7 +297,7 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
                 )
             };
 
-            serde_json::to_string_pretty(&FitnessReportOutput {
+            ToolOutcome::success(FitnessReportOutput {
                 passed: result.passed,
                 checks: result.checks.into_iter().map(Into::into).collect(),
                 metrics: result.metrics.into(),
@@ -306,10 +309,8 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
                 config_drift: result.config_drift.into_iter().map(Into::into).collect(),
                 suggested_next: self.filter_sn(sn),
             })
-            .unwrap_or_default()
-        })
-    }
-}
+        }))
+    }}
 
 #[derive(Serialize, JsonSchema)]
 pub(crate) struct FitnessCheckItemOutput {
