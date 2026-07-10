@@ -118,7 +118,8 @@ fn daemon_survives_forwarders_process_group_sigterm() {
     let connect_pid = connect.id() as i32;
 
     assert!(
-        wait_for(Duration::from_secs(10), || read_daemon_pid(project.path()).is_some()),
+        wait_for(Duration::from_secs(10), || read_daemon_pid(project.path())
+            .is_some()),
         "daemon.meta must appear once calm connect has spawned and bound the daemon"
     );
     let daemon_pid_before = read_daemon_pid(project.path()).unwrap();
@@ -245,7 +246,8 @@ fn calm_connect_respawns_a_daemon_running_a_stale_build() {
     let _ = first.wait();
 
     assert!(
-        wait_for(Duration::from_secs(10), || read_daemon_pid(project.path()).is_some()),
+        wait_for(Duration::from_secs(10), || read_daemon_pid(project.path())
+            .is_some()),
         "the first connect must spawn a daemon"
     );
     let original_pid = read_daemon_pid(project.path()).unwrap();
@@ -279,8 +281,8 @@ fn calm_connect_respawns_a_daemon_running_a_stale_build() {
         "calm connect must succeed by respawning, not error out"
     );
 
-    let new_pid = read_daemon_pid(project.path())
-        .expect("daemon.meta must exist again after the respawn");
+    let new_pid =
+        read_daemon_pid(project.path()).expect("daemon.meta must exist again after the respawn");
     assert_ne!(
         original_pid, new_pid,
         "a version mismatch must cause a genuine respawn — same pid here means the old \
@@ -312,7 +314,8 @@ fn daemon_calm_dir_and_socket_have_restrictive_permissions() {
     let _ = connect.wait();
 
     assert!(
-        wait_for(Duration::from_secs(10), || read_daemon_pid(project.path()).is_some()),
+        wait_for(Duration::from_secs(10), || read_daemon_pid(project.path())
+            .is_some()),
         "connect must spawn a daemon"
     );
 
@@ -326,8 +329,15 @@ fn daemon_calm_dir_and_socket_have_restrictive_permissions() {
         "this test's tempdir-based project path is short, so the natural \
          .calm/daemon.sock path (not the length-fallback) must be in use"
     );
-    let socket_mode = std::fs::metadata(&socket_path).unwrap().permissions().mode() & 0o777;
-    assert_eq!(socket_mode, 0o600, "the daemon socket must be chmod'd 0600 before any accept()");
+    let socket_mode = std::fs::metadata(&socket_path)
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        socket_mode, 0o600,
+        "the daemon socket must be chmod'd 0600 before any accept()"
+    );
 
     let pid = read_daemon_pid(project.path()).unwrap();
     unsafe {

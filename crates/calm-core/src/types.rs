@@ -196,7 +196,7 @@ pub enum SymbolKind {
     Heading,
 }
 impl SymbolKind {
-pub fn as_str(&self) -> &'static str {
+    pub fn as_str(&self) -> &'static str {
         match self {
             Self::Function => "function",
             Self::Class => "class",
@@ -211,7 +211,8 @@ pub fn as_str(&self) -> &'static str {
             Self::Impl => "impl",
             Self::Heading => "heading",
         }
-    }}
+    }
+}
 
 #[cfg(test)]
 mod tests {

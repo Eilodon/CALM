@@ -154,11 +154,14 @@ fn lock_losing_process_exits_promptly_on_sigterm_even_though_owner_never_exits()
                     .filter_map(|e| e.ok())
                     .map(|e| {
                         let tid = e.file_name();
-                        let st = std::fs::read_to_string(
-                            format!("/proc/{}/task/{}/status", loser.id(), tid.to_string_lossy()),
-                        )
+                        let st = std::fs::read_to_string(format!(
+                            "/proc/{}/task/{}/status",
+                            loser.id(),
+                            tid.to_string_lossy()
+                        ))
                         .unwrap_or_default();
-                        let state_line = st.lines().find(|l| l.starts_with("State:")).unwrap_or("?");
+                        let state_line =
+                            st.lines().find(|l| l.starts_with("State:")).unwrap_or("?");
                         let wchan = std::fs::read_to_string(format!(
                             "/proc/{}/task/{}/wchan",
                             loser.id(),

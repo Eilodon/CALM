@@ -742,8 +742,7 @@ fn parse_unix_listen(listen: &str) -> Result<PathBuf> {
 /// CLI value; re-canonicalized here independently since this runs before
 /// `Commands::Serve`'s own canonicalization.
 fn init_daemon_tracing(project_root: &std::path::Path) -> Result<()> {
-    let root =
-        std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
+    let root = std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
     let calm_dir = root.join(".calm");
     // `calm_server::daemon::create_calm_dir` (atomic 0700), NOT a plain
     // `create_dir_all` — this runs *before* `serve_unix_daemon`'s own call

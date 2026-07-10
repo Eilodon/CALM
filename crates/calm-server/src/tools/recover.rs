@@ -7,7 +7,10 @@ impl CalmServer {
         name = "indexing_status",
         description = "USE WHEN: you need file-level index stats, embedding error details, or to trigger embedding recovery. NOT a replacement for repo_overview at session start. retry_embeddings=true triggers re-download of embedding model."
     )]
-    pub(crate) fn indexing_status(&self, Parameters(p): Parameters<IndexingStatusParams>) -> Json<ToolOutcome<IndexingStatusOutput>> {
+    pub(crate) fn indexing_status(
+        &self,
+        Parameters(p): Parameters<IndexingStatusParams>,
+    ) -> Json<ToolOutcome<IndexingStatusOutput>> {
         Json(self.timed_tool("indexing_status", || {
             // READ-only: open a dedicated read connection (SINGLE_WRITER enforcement)
             let conn = match self.make_read_conn() {
@@ -262,7 +265,8 @@ impl CalmServer {
                 suggested_next: sn,
             })
         }))
-    }}
+    }
+}
 
 pub(crate) fn compute_frontier_entries(
     conn: &rusqlite::Connection,

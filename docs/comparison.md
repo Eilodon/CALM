@@ -8,7 +8,7 @@ không phải bảng xếp hạng cố định.
 
 | Công cụ | Ngôn ngữ | Call-graph / blast-radius | Sửa file trực tiếp | An toàn trước khi sửa | Memory bền qua session | Điều hướng/workflow tích hợp |
 |---|---|---|---|---|---|---|
-| **`calm`** | 6 Tier-0 (call-graph đầy đủ) + 8 Tier-0.5 (symbol nông) | Có — `callers`/`callees`/`edit_context`/`diff_impact` | Có — `edit_lines`/`edit_symbol` | Có — hash-verified conflict guard, hard-refuse hub/high-caller nếu thiếu `confirm:true`, `diff_impact` bắt buộc trước commit | Có — `remember`/`recall`, bền qua restart | Có — `suggested_next` mọi response, 8-stage workflow (`AGENTS.md`) |
+| **`calm`** | 6 Tier-0 (call-graph đầy đủ) + 9 Tier-0.5 (grammar thật + call-graph khi feature bật, 7/9 bật sẵn theo mặc định) | Có — `callers`/`callees`/`edit_context`/`diff_impact` | Có — `edit_lines`/`edit_symbol` | Có — hash-verified conflict guard, hard-refuse hub/high-caller nếu thiếu `confirm:true`, `diff_impact` bắt buộc trước commit | Có — `remember`/`recall`, bền qua restart | Có — `suggested_next` mọi response, 8-stage workflow (`AGENTS.md`) |
 | **Serena** | 40+ (qua LSP) | Hạn chế — chủ yếu symbol reference, không chấm điểm rủi ro | Có, mức symbol | **Không** — verified trực tiếp (xem B11): `replace_symbol_body` không có field `confirm`/`force` nào trong schema, sửa thật một hub symbol không cần xác nhận | **Có** — verified trực tiếp (xem B11): `write_memory`/`read_memory`, bền qua process restart. *(Trước đây bảng này ghi "Không" — sai, đã sửa sau khi test thật thấy Serena có 6 memory tool: write/read/list/delete/rename/edit_memory.)* | Không |
 | **CodeGraph** | 23, graph đầy đủ | Có, đầy đủ | **Không** — chỉ query, read-only | N/A (không sửa file) | File watcher (không phải memory diễn giải) | Không |
 | **grepai** | Đa ngôn ngữ qua tree-sitter | Có — `trace_callers`/`trace_callees`/`trace_graph`, cộng semantic search (Ollama, 100% local) | **Không** — chỉ query, read-only | N/A (không sửa file) | Không | Không |
@@ -57,9 +57,12 @@ ai có memory" không còn đúng sau khi test thật ít nhất 1 tool trong nh
 
 ## Khi nào không nên chọn `calm` (hoặc nên cân nhắc thêm)
 
-- Codebase chủ yếu nằm ngoài 6 ngôn ngữ Tier-0 (ví dụ Kotlin/Swift/PHP là chính) — `calm` vẫn parse
-  được (Tier-0.5) nhưng không có call-graph, nên giá trị cốt lõi (blast-radius) yếu đi nhiều; CodeGraph
-  (23 ngôn ngữ, graph đầy đủ) có thể phù hợp hơn cho trường hợp này.
+- Codebase chủ yếu nằm ngoài 6 ngôn ngữ Tier-0 và cả 9 Tier-0.5 (C/C++/C#/Ruby/PHP/Shell/R/Kotlin/Swift
+  — 2 cái cuối cần tự bật feature `lang-kotlin`/`lang-swift`, không mặc định) — ví dụ codebase chủ yếu
+  Scala/Dart/Lua/Elixir/... (25-language expansion plan đang mở rộng dần, xem
+  `docs/superskills/plans/2026-07-10-25-language-expansion.md`) — `calm` không parse được gì ngoài
+  text search, giá trị cốt lõi (blast-radius) mất hẳn; CodeGraph (23 ngôn ngữ, graph đầy đủ) có thể
+  phù hợp hơn cho trường hợp này.
 - Bạn chỉ cần tra cứu/tìm kiếm nhanh, không cần agent tự sửa file qua MCP — các tool read-only
   thuần (CodeGraph, CodeGraphContext, claude-context) nhẹ hơn, cộng đồng lớn hơn, ít bề mặt để lo.
 - Bạn làm việc ở quy mô **nhiều repo / enterprise**, cần tìm kiếm và điều hướng xuyên repo —

@@ -1,6 +1,6 @@
-mod scip_overlay;
 #[cfg(unix)]
 pub mod daemon;
+mod scip_overlay;
 pub mod telemetry;
 pub mod tools;
 pub mod watcher;
@@ -226,7 +226,12 @@ pub async fn bootstrap(
                     // `embeddings_status: "disabled"` forever, even though the DB
                     // the winner maintains already has real embeddings in it.
                     if semantic.enabled {
-                        load_embedder_readonly(&semantic, &embedder, &embed_status, &last_embed_error);
+                        load_embedder_readonly(
+                            &semantic,
+                            &embedder,
+                            &embed_status,
+                            &last_embed_error,
+                        );
                     }
                     // Poll (not a single indefinite blocking call) until the
                     // current owner exits and this process can take over —
@@ -466,7 +471,8 @@ pub async fn serve_stdio_with_preset(
 
     tracing::info!("Server shut down cleanly");
     Ok(())
-}/// call: the configured model is the vendored default, that vendored asset
+}
+/// call: the configured model is the vendored default, that vendored asset
 /// is unusable (see `calm_core::embedding::default_vendored_asset_unusable`),
 /// and the config has not opted into a network fallback. Pulled out as a
 /// pure function (taking the three already-evaluated booleans, not

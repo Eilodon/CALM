@@ -24,7 +24,9 @@ use std::time::Duration;
 use rusqlite::Connection;
 
 use crate::config::{LspConfig, RefreshPolicy};
-use crate::lsp::client::{DefinitionOutcome, LspClient, PositionEncoding, path_to_uri, uri_to_path};
+use crate::lsp::client::{
+    DefinitionOutcome, LspClient, PositionEncoding, path_to_uri, uri_to_path,
+};
 use crate::scip::runner::resolve_binary;
 
 /// Bounds every individual LSP request round-trip. Live probe data
@@ -553,8 +555,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            crate::scip::ingest::resolve_unique_symbol_at_filtered(&conn, "a.rs", 4, true)
-                .unwrap(),
+            crate::scip::ingest::resolve_unique_symbol_at_filtered(&conn, "a.rs", 4, true).unwrap(),
             Some("a.rs::Outer::inner".to_string())
         );
     }

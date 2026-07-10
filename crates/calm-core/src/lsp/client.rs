@@ -28,11 +28,10 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use lsp_types::{
-    ClientCapabilities, DidOpenTextDocumentParams, GeneralClientCapabilities,
-    GotoDefinitionParams, GotoDefinitionResponse, InitializeParams, InitializeResult,
-    InitializedParams, PartialResultParams, Position, PositionEncodingKind,
-    TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams, Uri,
-    WorkDoneProgressParams,
+    ClientCapabilities, DidOpenTextDocumentParams, GeneralClientCapabilities, GotoDefinitionParams,
+    GotoDefinitionResponse, InitializeParams, InitializeResult, InitializedParams,
+    PartialResultParams, Position, PositionEncodingKind, TextDocumentIdentifier, TextDocumentItem,
+    TextDocumentPositionParams, Uri, WorkDoneProgressParams,
 };
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -193,7 +192,10 @@ impl LspClient {
             .await
         {
             Ok(v) => v,
-            Err(e) if e.downcast_ref::<JsonRpcError>().is_some_and(|j| j.code == CONTENT_MODIFIED) => {
+            Err(e)
+                if e.downcast_ref::<JsonRpcError>()
+                    .is_some_and(|j| j.code == CONTENT_MODIFIED) =>
+            {
                 return Ok(DefinitionOutcome::Retryable);
             }
             Err(e) => return Err(e),
@@ -233,7 +235,12 @@ impl LspClient {
         loop {
             let msg = tokio::time::timeout_at(deadline, self.read_message())
                 .await
-                .map_err(|_| anyhow!("LSP request {method} timed out after {:?}", self.request_timeout))??;
+                .map_err(|_| {
+                    anyhow!(
+                        "LSP request {method} timed out after {:?}",
+                        self.request_timeout
+                    )
+                })??;
             // A message WITH a `method` is never a response, even when its
             // id numerically collides with ours (rust-analyzer's own request
             // ids start at 0 — observed colliding live). Requests get a

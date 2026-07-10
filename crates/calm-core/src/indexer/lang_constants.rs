@@ -179,44 +179,71 @@ pub fn get_lang_constants(lang: &str) -> Option<LangConstants> {
             ],
             class_name_field: "name",
         }),
+        // Kotlin: `get_lang_constants` had a full entry for this language
+        // long before any tree-sitter-kotlin dependency existed at all
+        // (`parse_tree` had zero match arm for it — always fell back to
+        // shallow line-scan) — every field below was an untested guess.
+        // Verified 2026-07-10 against the real grammar
+        // (tree-sitter-kotlin-ng 1.1.0) via a throwaway AST-dump test:
+        // - No node kind named "interface_declaration" exists at all
+        //   (confirmed via node-types.json) — `interface Foo {}` parses as a
+        //   plain `class_declaration`, already covered without a separate arm.
+        // - `call_expression` has ZERO fields (`fields: []` in
+        //   node-types.json, not `"callee"` as previously guessed) — the
+        //   callee is just whichever expression comes first: a bare
+        //   `identifier` for `println(...)`, or a `navigation_expression`
+        //   for `this.foo()`/`Repo.save()`. `call_function_field:
+        //   "$first_child"` is a sentinel `walk_calls` (parser.rs)
+        //   special-cases to grab the call node's own first child
+        //   regardless of kind, then let `split_receiver_callee` do its
+        //   normal dot-splitting on that node's raw text — see
+        //   `walk_calls`'s doc comment for why this is safe for every other
+        //   language (the sentinel string is never used as a real
+        //   field/kind name elsewhere).
         "kotlin" => Some(LangConstants {
             function_node_types: &[
                 "function_declaration",
                 "class_declaration",
-                "interface_declaration",
                 "object_declaration",
             ],
             name_field: "name",
-            docstring_type: Some("comment"),
+            // KDoc block comments (`/** ... */`); no node kind literally
+            // named "comment" exists in this grammar (confirmed via
+            // node-types.json — only "line_comment"/"block_comment").
+            docstring_type: Some("block_comment"),
             call_node_types: &["call_expression"],
-            call_function_field: "callee", // Kotlin uses "callee", not "function"
+            call_function_field: "$first_child",
             call_function_field_by_kind: &[],
-            class_node_types: &[
-                "class_declaration",
-                "interface_declaration",
-                "object_declaration",
-            ],
+            class_node_types: &["class_declaration", "object_declaration"],
             class_name_field: "name",
         }),
+        // Swift: same history as Kotlin above — every field was an untested
+        // guess until verified 2026-07-10 against the real grammar
+        // (tree-sitter-swift =0.7.0, pinned below its published latest for an
+        // unrelated ABI reason — see the workspace root Cargo.toml comment).
+        // - No node kind named "struct_declaration" or "enum_declaration"
+        //   exists at all (confirmed via node-types.json) — `struct Foo {}`/
+        //   `enum Foo {}` both parse as plain `class_declaration`, same
+        //   unification pattern as Kotlin's `interface` above. This loses
+        //   the struct/enum/class distinction in `SymbolKind` (all become
+        //   Class) — a documented scope cut, not a bug: distinguishing them
+        //   would require inspecting a keyword child's text, not just the
+        //   node kind.
+        // - `call_expression` has ZERO fields, same shape as Kotlin — same
+        //   `"$first_child"` sentinel applies (see Kotlin's comment above
+        //   and `walk_calls`'s doc comment in parser.rs).
         "swift" => Some(LangConstants {
             function_node_types: &[
                 "function_declaration",
                 "class_declaration",
-                "struct_declaration",
-                "enum_declaration",
                 "protocol_declaration",
             ],
             name_field: "name",
             docstring_type: Some("comment"),
-            call_node_types: &["function_call_expression"],
-            call_function_field: "function",
+            call_node_types: &["call_expression"],
+            call_function_field: "$first_child",
             call_function_field_by_kind: &[],
-            class_node_types: &[
-                "class_declaration",
-                "struct_declaration",
-                "enum_declaration",
-                "protocol_declaration",
-            ],
+            class_node_types: &["class_declaration", "protocol_declaration"],
             class_name_field: "name",
         }),
         "csharp" => Some(LangConstants {

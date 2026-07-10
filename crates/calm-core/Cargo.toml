@@ -38,6 +38,8 @@ tree-sitter-php     = { workspace = true, optional = true }
 tree-sitter-c-sharp = { workspace = true, optional = true }
 tree-sitter-bash    = { workspace = true, optional = true }
 tree-sitter-r       = { workspace = true, optional = true }
+tree-sitter-kotlin-ng = { workspace = true, optional = true }
+tree-sitter-swift    = { workspace = true, optional = true }
 scip = { version = "0.9", optional = true }
 protobuf = { version = "=3.7.2", optional = true }
 tempfile = { version = "3", optional = true }
@@ -70,10 +72,15 @@ lang-php    = ["dep:tree-sitter-php"]
 lang-csharp = ["dep:tree-sitter-c-sharp"]
 lang-shell  = ["dep:tree-sitter-bash"]
 lang-r      = ["dep:tree-sitter-r"]
-# kotlin and swift use incompatible tree-sitter versions — regex fallback always active.
-# lang-kotlin and lang-swift are no-op stubs kept for API stability.
-lang-kotlin = []
-lang-swift  = []
+# kotlin/swift (2026-07-10 plan): real tree-sitter grammars, not the old
+# no-op stubs — see the workspace root Cargo.toml comment for why the prior
+# "incompatible tree-sitter versions" framing was wrong (no dependency had
+# ever been declared at all). Deliberately kept OUT of the `tier0-5` bundle
+# for now: first release cycle with a real grammar for either language,
+# opt-in only until proven stable, same caution as when tier0-5 itself was
+# first introduced.
+lang-kotlin = ["dep:tree-sitter-kotlin-ng"]
+lang-swift  = ["dep:tree-sitter-swift"]
 # Bundle: all seven tree-sitter-upgraded Tier-0.5 languages at once.
 tier0-5 = ["lang-c", "lang-cpp", "lang-ruby", "lang-php", "lang-csharp", "lang-shell", "lang-r"]
 # SCIP overlay (rust-analyzer batch `scip`) upgrades existing Rust call edges

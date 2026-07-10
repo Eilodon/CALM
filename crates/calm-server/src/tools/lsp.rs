@@ -7,7 +7,10 @@ impl CalmServer {
         name = "lsp_refresh",
         description = "Manually run the LSP resolve-time overlay (rust-analyzer textDocument/definition over stdio) right now, bypassing the configured refresh policy — this overlay never runs automatically on save by default (rust.lsp.policy defaults to on_demand, unlike SCIP's on_save). Upgrades ambiguous/textual call edges to formal by resolving each call site interactively against a live rust-analyzer session. USE WHEN: you need formal-tier call edges for Rust immediately and rust-analyzer is available. Can be slow — spawns a persistent LSP server and does one round-trip per unresolved call site — not for routine/automatic use."
     )]
-    pub(crate) fn lsp_refresh(&self, Parameters(_p): Parameters<LspRefreshParams>) -> Json<ToolOutcome<LspRefreshOutput>> {
+    pub(crate) fn lsp_refresh(
+        &self,
+        Parameters(_p): Parameters<LspRefreshParams>,
+    ) -> Json<ToolOutcome<LspRefreshOutput>> {
         Json(self.timed_tool("lsp_refresh", || {
             #[cfg(feature = "lsp-overlay")]
             {
@@ -29,11 +32,9 @@ impl CalmServer {
                             "Check the graph for newly formal edges",
                         )),
                     }),
-                    Err(e) => ToolOutcome::error(error_detail(
-                        "LSP_REFRESH_FAILED",
-                        &e.to_string(),
-                        true,
-                    )),
+                    Err(e) => {
+                        ToolOutcome::error(error_detail("LSP_REFRESH_FAILED", &e.to_string(), true))
+                    }
                 }
             }
             #[cfg(not(feature = "lsp-overlay"))]

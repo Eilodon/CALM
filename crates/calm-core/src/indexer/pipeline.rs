@@ -1428,7 +1428,8 @@ pub fn run_indexing_pipeline_cancellable(
     *phase.write().unwrap() = IndexingPhase::Ready;
 
     Ok(PipelineOutcome::Completed)
-}/// Incremental reindex: re-parse only files whose content hash changed (or are
+}
+/// Incremental reindex: re-parse only files whose content hash changed (or are
 /// new), drop rows for deleted files, then rebuild the graph once if anything
 /// changed. Cheap to call repeatedly — the basis for the file watcher.
 /// Outcome of a cancellable `reindex_changed` run — mirrors `PipelineOutcome`,
@@ -1594,7 +1595,8 @@ pub fn reindex_changed_cancellable(
     }
     tx.commit()?;
     Ok(ReindexOutcome::Completed(summary))
-}#[cfg(test)]
+}
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::db::schema::init_db;

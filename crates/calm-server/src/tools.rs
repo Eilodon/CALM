@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
-use rmcp::tool;
 use rmcp::handler::server::wrapper::{Json, Parameters};
+use rmcp::tool;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tracing::Instrument;
@@ -361,9 +361,7 @@ impl rmcp::ServerHandler for CalmServer {
                 .enable_prompts()
                 .build(),
         )
-        .with_instructions(
-            "CALM (Coding Agent Liveness Map) MCP server — codebase analysis tools",
-        )
+        .with_instructions("CALM (Coding Agent Liveness Map) MCP server — codebase analysis tools")
     }
 
     // Hand-written instead of relying on `#[tool_router]`'s bare merged
@@ -412,7 +410,8 @@ impl rmcp::ServerHandler for CalmServer {
             tool = %request.name,
             traceparent = %traceparent
         );
-        let tool_context = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        let tool_context =
+            rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
         self.tool_router.call(tool_context).instrument(span).await
     }
     fn list_prompts(
@@ -438,22 +437,23 @@ impl rmcp::ServerHandler for CalmServer {
         Output = Result<rmcp::model::GetPromptResult, rmcp::model::ErrorData>,
     > + Send
     + '_ {
-        let result = match render_prompt(&request.name, &request.arguments) {
-            Some(text) => {
-                let mut result = rmcp::model::GetPromptResult::new(vec![
-                    rmcp::model::PromptMessage::new_text(rmcp::model::Role::User, text),
-                ]);
-                result.description = ci_prompts()
-                    .into_iter()
-                    .find(|p| p.name == request.name)
-                    .and_then(|p| p.description);
-                Ok(result)
-            }
-            None => Err(rmcp::model::ErrorData::invalid_params(
-                format!("unknown prompt: {}", request.name),
-                None,
-            )),
-        };
+        let result =
+            match render_prompt(&request.name, &request.arguments) {
+                Some(text) => {
+                    let mut result = rmcp::model::GetPromptResult::new(vec![
+                        rmcp::model::PromptMessage::new_text(rmcp::model::Role::User, text),
+                    ]);
+                    result.description = ci_prompts()
+                        .into_iter()
+                        .find(|p| p.name == request.name)
+                        .and_then(|p| p.description);
+                    Ok(result)
+                }
+                None => Err(rmcp::model::ErrorData::invalid_params(
+                    format!("unknown prompt: {}", request.name),
+                    None,
+                )),
+            };
         std::future::ready(result)
     }
 }
@@ -759,11 +759,15 @@ mod tests {
         }
         *server.phase_handle().write().unwrap() = IndexingPhase::Ready;
 
-        let v = jv(server.symbol_info(rmcp::handler::server::wrapper::Parameters(SymbolInfoParams {
-            symbol: "target".into(),
-            path: None,
-            line: None,
-        })));
+        let v = jv(
+            server.symbol_info(rmcp::handler::server::wrapper::Parameters(
+                SymbolInfoParams {
+                    symbol: "target".into(),
+                    path: None,
+                    line: None,
+                },
+            )),
+        );
         let by_conf = &v["health"]["caller_count_by_confidence"];
 
         assert_eq!(
@@ -813,11 +817,13 @@ mod tests {
                       context\n\
                      +new line\n";
 
-        let output = server.diff_impact(rmcp::handler::server::wrapper::Parameters(DiffImpactParams {
-            diff: Some(diff.to_string()),
-            staged: None,
-            commits: None,
-        }));
+        let output = server.diff_impact(rmcp::handler::server::wrapper::Parameters(
+            DiffImpactParams {
+                diff: Some(diff.to_string()),
+                staged: None,
+                commits: None,
+            },
+        ));
         let v = jv(output);
 
         assert_eq!(v["files_changed"], serde_json::json!(["src/foo.rs"]));
@@ -878,11 +884,13 @@ mod tests {
                      +fn another() {}\n\
                      +\n";
 
-        let output = server.diff_impact(rmcp::handler::server::wrapper::Parameters(DiffImpactParams {
-            diff: Some(diff.to_string()),
-            staged: None,
-            commits: None,
-        }));
+        let output = server.diff_impact(rmcp::handler::server::wrapper::Parameters(
+            DiffImpactParams {
+                diff: Some(diff.to_string()),
+                staged: None,
+                commits: None,
+            },
+        ));
         let v = jv(output);
 
         assert!(v["unindexed_files"].as_array().unwrap().is_empty());
@@ -959,11 +967,13 @@ mod tests {
                       body\n\
                       }\n";
 
-        let output = server.diff_impact(rmcp::handler::server::wrapper::Parameters(DiffImpactParams {
-            diff: Some(diff.to_string()),
-            staged: None,
-            commits: None,
-        }));
+        let output = server.diff_impact(rmcp::handler::server::wrapper::Parameters(
+            DiffImpactParams {
+                diff: Some(diff.to_string()),
+                staged: None,
+                commits: None,
+            },
+        ));
         let v = jv(output);
 
         assert_eq!(v["affected_symbols"].as_array().unwrap().len(), 1);
@@ -1034,11 +1044,13 @@ mod tests {
                      +    top_n: u32,\n\
                       ) -> CoChangeResult {\n";
 
-        let output = server.diff_impact(rmcp::handler::server::wrapper::Parameters(DiffImpactParams {
-            diff: Some(diff.to_string()),
-            staged: None,
-            commits: None,
-        }));
+        let output = server.diff_impact(rmcp::handler::server::wrapper::Parameters(
+            DiffImpactParams {
+                diff: Some(diff.to_string()),
+                staged: None,
+                commits: None,
+            },
+        ));
         let v = jv(output);
 
         assert_eq!(v["affected_symbols"].as_array().unwrap().len(), 1);
@@ -1076,11 +1088,13 @@ mod tests {
                      @@ -0,0 +1,3 @@\n\
                      +fn new_fn() {}\n";
 
-        let output = server.diff_impact(rmcp::handler::server::wrapper::Parameters(DiffImpactParams {
-            diff: Some(diff.to_string()),
-            staged: None,
-            commits: None,
-        }));
+        let output = server.diff_impact(rmcp::handler::server::wrapper::Parameters(
+            DiffImpactParams {
+                diff: Some(diff.to_string()),
+                staged: None,
+                commits: None,
+            },
+        ));
         let v = jv(output);
 
         assert_eq!(
@@ -1116,11 +1130,13 @@ mod tests {
                       Title\n\\
                      +New paragraph\n";
 
-        let output = server.diff_impact(rmcp::handler::server::wrapper::Parameters(DiffImpactParams {
-            diff: Some(diff.to_string()),
-            staged: None,
-            commits: None,
-        }));
+        let output = server.diff_impact(rmcp::handler::server::wrapper::Parameters(
+            DiffImpactParams {
+                diff: Some(diff.to_string()),
+                staged: None,
+                commits: None,
+            },
+        ));
         let v = jv(output);
 
         assert_eq!(
@@ -1155,11 +1171,13 @@ mod tests {
                      @@ -0,0 +1,1 @@\n\
                      +fn fake() {}\n";
 
-        let output = server.diff_impact(rmcp::handler::server::wrapper::Parameters(DiffImpactParams {
-            diff: Some(diff.to_string()),
-            staged: None,
-            commits: None,
-        }));
+        let output = server.diff_impact(rmcp::handler::server::wrapper::Parameters(
+            DiffImpactParams {
+                diff: Some(diff.to_string()),
+                staged: None,
+                commits: None,
+            },
+        ));
         let v = jv(output);
 
         assert_eq!(
@@ -1206,11 +1224,13 @@ mod tests {
                       pub mod a;\n\
                      +pub mod b;\n";
 
-        let output = server.diff_impact(rmcp::handler::server::wrapper::Parameters(DiffImpactParams {
-            diff: Some(diff.to_string()),
-            staged: None,
-            commits: None,
-        }));
+        let output = server.diff_impact(rmcp::handler::server::wrapper::Parameters(
+            DiffImpactParams {
+                diff: Some(diff.to_string()),
+                staged: None,
+                commits: None,
+            },
+        ));
         let v = jv(output);
 
         assert!(v["unindexed_files"].as_array().unwrap().is_empty());
@@ -1257,11 +1277,13 @@ mod tests {
                       pragma solidity ^0.8.0;\n\
                      +contract Token {}\n";
 
-        let output = server.diff_impact(rmcp::handler::server::wrapper::Parameters(DiffImpactParams {
-            diff: Some(diff.to_string()),
-            staged: None,
-            commits: None,
-        }));
+        let output = server.diff_impact(rmcp::handler::server::wrapper::Parameters(
+            DiffImpactParams {
+                diff: Some(diff.to_string()),
+                staged: None,
+                commits: None,
+            },
+        ));
         let v = jv(output);
 
         assert_eq!(
@@ -1461,13 +1483,15 @@ mod tests {
             .unwrap();
         }
 
-        let v = jv(server.callers(rmcp::handler::server::wrapper::Parameters(CallersParams {
-            symbol: "foo".into(),
-            path: None,
-            line: None,
-            transitive: false,
-            max_depth: None,
-        })));
+        let v = jv(
+            server.callers(rmcp::handler::server::wrapper::Parameters(CallersParams {
+                symbol: "foo".into(),
+                path: None,
+                line: None,
+                transitive: false,
+                max_depth: None,
+            })),
+        );
 
         assert_eq!(v["edges_ready"], false, "edges not built yet in this test");
         assert_eq!(v["direct"][0]["line"], 2);
@@ -1508,13 +1532,15 @@ mod tests {
             .unwrap();
         }
 
-        let v = jv(server.callers(rmcp::handler::server::wrapper::Parameters(CallersParams {
-            symbol: "a".into(),
-            path: None,
-            line: None,
-            transitive: true,
-            max_depth: Some(5),
-        })));
+        let v = jv(
+            server.callers(rmcp::handler::server::wrapper::Parameters(CallersParams {
+                symbol: "a".into(),
+                path: None,
+                line: None,
+                transitive: true,
+                max_depth: Some(5),
+            })),
+        );
 
         assert_eq!(v["transitive_count"], 2, "b at depth 1, c at depth 2");
         assert_eq!(v["transitive_capped"], false);
@@ -1549,11 +1575,13 @@ mod tests {
             .unwrap();
         }
 
-        let output = server.edit_context(rmcp::handler::server::wrapper::Parameters(EditContextParams {
-            symbol: "a".into(),
-            path: None,
-            line: None,
-        }));
+        let output = server.edit_context(rmcp::handler::server::wrapper::Parameters(
+            EditContextParams {
+                symbol: "a".into(),
+                path: None,
+                line: None,
+            },
+        ));
         let v = jv(output);
 
         assert_eq!(v["blast_radius"]["transitive"], 1);
@@ -1604,11 +1632,13 @@ mod tests {
             }
         }
 
-        let output = server.edit_context(rmcp::handler::server::wrapper::Parameters(EditContextParams {
-            symbol: "has".into(),
-            path: None,
-            line: None,
-        }));
+        let output = server.edit_context(rmcp::handler::server::wrapper::Parameters(
+            EditContextParams {
+                symbol: "has".into(),
+                path: None,
+                line: None,
+            },
+        ));
         let v = jv(output);
 
         assert_eq!(
@@ -1669,11 +1699,13 @@ mod tests {
             .unwrap();
         }
 
-        let output = server.edit_context(rmcp::handler::server::wrapper::Parameters(EditContextParams {
-            symbol: "model_fn".into(),
-            path: None,
-            line: None,
-        }));
+        let output = server.edit_context(rmcp::handler::server::wrapper::Parameters(
+            EditContextParams {
+                symbol: "model_fn".into(),
+                path: None,
+                line: None,
+            },
+        ));
         let v = jv(output);
 
         let co_changed = v["co_changed_files"].as_array().unwrap();
@@ -1704,11 +1736,13 @@ mod tests {
             .unwrap();
         }
 
-        let output = server.edit_context(rmcp::handler::server::wrapper::Parameters(EditContextParams {
-            symbol: "a".into(),
-            path: None,
-            line: None,
-        }));
+        let output = server.edit_context(rmcp::handler::server::wrapper::Parameters(
+            EditContextParams {
+                symbol: "a".into(),
+                path: None,
+                line: None,
+            },
+        ));
         let v = jv(output);
         assert!(
             v.get("trend").is_none(),
@@ -1746,11 +1780,13 @@ mod tests {
             .unwrap();
         }
 
-        let output = server.edit_context(rmcp::handler::server::wrapper::Parameters(EditContextParams {
-            symbol: "a".into(),
-            path: None,
-            line: None,
-        }));
+        let output = server.edit_context(rmcp::handler::server::wrapper::Parameters(
+            EditContextParams {
+                symbol: "a".into(),
+                path: None,
+                line: None,
+            },
+        ));
         let v = jv(output);
 
         assert_eq!(v["trend"]["compared_to"], "2000-01-01");
@@ -1768,11 +1804,13 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
 
-        let output = server.diff_impact(rmcp::handler::server::wrapper::Parameters(DiffImpactParams {
-            diff: Some("diff --git a/x b/x\n".into()),
-            staged: Some(true),
-            commits: None,
-        }));
+        let output = server.diff_impact(rmcp::handler::server::wrapper::Parameters(
+            DiffImpactParams {
+                diff: Some("diff --git a/x b/x\n".into()),
+                staged: Some(true),
+                commits: None,
+            },
+        ));
         let v = jv(output);
         assert_eq!(v["error"]["code"], "INVALID_INPUT");
 
@@ -1813,11 +1851,13 @@ mod tests {
         std::fs::write(dir.join("foo.rs"), "fn foo() {\n    1\n}\n").unwrap();
 
         let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
-        let output = server.diff_impact(rmcp::handler::server::wrapper::Parameters(DiffImpactParams {
-            diff: None,
-            staged: None,
-            commits: None,
-        }));
+        let output = server.diff_impact(rmcp::handler::server::wrapper::Parameters(
+            DiffImpactParams {
+                diff: None,
+                staged: None,
+                commits: None,
+            },
+        ));
         let v = jv(output);
 
         assert!(v.get("error").is_none(), "expected success, got error: {v}");
@@ -1846,14 +1886,18 @@ mod tests {
             .unwrap();
         }
 
-        let _ = server.symbol_info(rmcp::handler::server::wrapper::Parameters(SymbolInfoParams {
-            symbol: "foo".into(),
-            path: None,
-            line: None,
-        }));
-        let _ = server.file_overview(rmcp::handler::server::wrapper::Parameters(FileOverviewParams {
-            path: "src/foo.rs".into(),
-        }));
+        let _ = server.symbol_info(rmcp::handler::server::wrapper::Parameters(
+            SymbolInfoParams {
+                symbol: "foo".into(),
+                path: None,
+                line: None,
+            },
+        ));
+        let _ = server.file_overview(rmcp::handler::server::wrapper::Parameters(
+            FileOverviewParams {
+                path: "src/foo.rs".into(),
+            },
+        ));
 
         let v = jv(server.session_context());
 
@@ -2124,11 +2168,15 @@ mod tests {
         // Same `name` + `path`, but two distinct `qualified_name`s — path alone
         // does not disambiguate, so this must stay ambiguous rather than
         // silently picking the first row.
-        let v = jv(server.symbol_info(rmcp::handler::server::wrapper::Parameters(SymbolInfoParams {
-            symbol: "method".into(),
-            path: Some("src/multi.py".into()),
-            line: None,
-        })));
+        let v = jv(
+            server.symbol_info(rmcp::handler::server::wrapper::Parameters(
+                SymbolInfoParams {
+                    symbol: "method".into(),
+                    path: Some("src/multi.py".into()),
+                    line: None,
+                },
+            )),
+        );
 
         assert_eq!(v["ambiguous"], true);
         assert_eq!(v["candidates"].as_array().unwrap().len(), 2);
@@ -2168,11 +2216,13 @@ mod tests {
         }
 
         // No line hint: stays ambiguous, same as before this feature existed.
-        let ambiguous = server.symbol_info(rmcp::handler::server::wrapper::Parameters(SymbolInfoParams {
-            symbol: "load".into(),
-            path: Some("src/embedding.rs".into()),
-            line: None,
-        }));
+        let ambiguous = server.symbol_info(rmcp::handler::server::wrapper::Parameters(
+            SymbolInfoParams {
+                symbol: "load".into(),
+                path: Some("src/embedding.rs".into()),
+                line: None,
+            },
+        ));
         let v = jv(ambiguous);
         assert_eq!(
             v["ambiguous"], true,
@@ -2180,21 +2230,25 @@ mod tests {
         );
 
         // A line inside the real impl's range resolves to exactly that one.
-        let resolved = server.symbol_info(rmcp::handler::server::wrapper::Parameters(SymbolInfoParams {
-            symbol: "load".into(),
-            path: Some("src/embedding.rs".into()),
-            line: Some(15),
-        }));
+        let resolved = server.symbol_info(rmcp::handler::server::wrapper::Parameters(
+            SymbolInfoParams {
+                symbol: "load".into(),
+                path: Some("src/embedding.rs".into()),
+                line: Some(15),
+            },
+        ));
         let v = jv(resolved);
         assert_eq!(v["qualified_name"], "real_impl::load", "got: {v}");
 
         // A line hint matching neither candidate degrades to the unnarrowed
         // (ambiguous) set rather than reporting NotFound.
-        let stale_hint = server.symbol_info(rmcp::handler::server::wrapper::Parameters(SymbolInfoParams {
-            symbol: "load".into(),
-            path: Some("src/embedding.rs".into()),
-            line: Some(9999),
-        }));
+        let stale_hint = server.symbol_info(rmcp::handler::server::wrapper::Parameters(
+            SymbolInfoParams {
+                symbol: "load".into(),
+                path: Some("src/embedding.rs".into()),
+                line: Some(9999),
+            },
+        ));
         let v = jv(stale_hint);
         assert_eq!(
             v["ambiguous"], true,
@@ -2230,15 +2284,17 @@ mod tests {
 
         // Requested 10 hops exceeds the configured max_allowed_hops=5 — with the
         // old hardcoded literal (20) this would NOT have been clamped.
-        let v = jv(server.path(rmcp::handler::server::wrapper::Parameters(PathParams {
-            from_symbol: "a".into(),
-            to_symbol: "b".into(),
-            from_path: None,
-            to_path: None,
-            from_line: None,
-            to_line: None,
-            max_hops: Some(10),
-        })));
+        let v = jv(
+            server.path(rmcp::handler::server::wrapper::Parameters(PathParams {
+                from_symbol: "a".into(),
+                to_symbol: "b".into(),
+                from_path: None,
+                to_path: None,
+                from_line: None,
+                to_line: None,
+                max_hops: Some(10),
+            })),
+        );
 
         assert_eq!(v["hops_clamped"], true);
 
@@ -2338,10 +2394,14 @@ mod tests {
             .unwrap();
         }
 
-        let v = jv(server.understand(rmcp::handler::server::wrapper::Parameters(UnderstandParams {
-            query: "foo".into(),
-            kind: None,
-        })));
+        let v = jv(
+            server.understand(rmcp::handler::server::wrapper::Parameters(
+                UnderstandParams {
+                    query: "foo".into(),
+                    kind: None,
+                },
+            )),
+        );
 
         assert_eq!(v["symbol"]["qualified_name"], "foo.py::foo");
         assert_eq!(v["source"]["language"], "python");
@@ -2368,9 +2428,11 @@ mod tests {
             .unwrap();
         }
 
-        let output = server.file_overview(rmcp::handler::server::wrapper::Parameters(FileOverviewParams {
-            path: "a.py".into(),
-        }));
+        let output = server.file_overview(rmcp::handler::server::wrapper::Parameters(
+            FileOverviewParams {
+                path: "a.py".into(),
+            },
+        ));
         let v = jv(output);
 
         assert_eq!(v["symbols"][0]["caller_count"], 7);
@@ -2400,13 +2462,15 @@ mod tests {
             .unwrap();
         }
 
-        let v = jv(server.source(rmcp::handler::server::wrapper::Parameters(SourceParams {
-            symbol: "foo".into(),
-            path: None,
-            line: None,
-            include_metadata: false,
-            if_none_match: None,
-        })));
+        let v = jv(
+            server.source(rmcp::handler::server::wrapper::Parameters(SourceParams {
+                symbol: "foo".into(),
+                path: None,
+                line: None,
+                include_metadata: false,
+                if_none_match: None,
+            })),
+        );
 
         assert_eq!(v["data_source"], "disk");
         assert!(
@@ -2435,13 +2499,15 @@ mod tests {
             .unwrap();
         }
 
-        let first = jv(server.source(rmcp::handler::server::wrapper::Parameters(SourceParams {
-            symbol: "foo".into(),
-            path: None,
-            line: None,
-            include_metadata: false,
-            if_none_match: None,
-        })));
+        let first = jv(
+            server.source(rmcp::handler::server::wrapper::Parameters(SourceParams {
+                symbol: "foo".into(),
+                path: None,
+                line: None,
+                include_metadata: false,
+                if_none_match: None,
+            })),
+        );
         let etag = first["etag"]
             .as_str()
             .expect("first call must report an etag")
@@ -2455,27 +2521,37 @@ mod tests {
             "first call must include the full source body"
         );
 
-        let second = jv(server.source(rmcp::handler::server::wrapper::Parameters(SourceParams {
-            symbol: "foo".into(),
-            path: None,
-            line: None,
-            include_metadata: false,
-            if_none_match: Some(etag.clone()),
-        })));
-        assert_eq!(second["not_modified"], true, "matching if_none_match must report not_modified: {second}");
-        assert_eq!(second["etag"], etag, "etag must stay stable across calls when content is unchanged");
+        let second = jv(
+            server.source(rmcp::handler::server::wrapper::Parameters(SourceParams {
+                symbol: "foo".into(),
+                path: None,
+                line: None,
+                include_metadata: false,
+                if_none_match: Some(etag.clone()),
+            })),
+        );
+        assert_eq!(
+            second["not_modified"], true,
+            "matching if_none_match must report not_modified: {second}"
+        );
+        assert_eq!(
+            second["etag"], etag,
+            "etag must stay stable across calls when content is unchanged"
+        );
         assert_eq!(
             second["source"], "",
             "not_modified response must omit the source body: {second}"
         );
 
-        let stale = jv(server.source(rmcp::handler::server::wrapper::Parameters(SourceParams {
-            symbol: "foo".into(),
-            path: None,
-            line: None,
-            include_metadata: false,
-            if_none_match: Some("deadbeefdeadbeef".into()),
-        })));
+        let stale = jv(
+            server.source(rmcp::handler::server::wrapper::Parameters(SourceParams {
+                symbol: "foo".into(),
+                path: None,
+                line: None,
+                include_metadata: false,
+                if_none_match: Some("deadbeefdeadbeef".into()),
+            })),
+        );
         assert!(
             stale.get("not_modified").is_none(),
             "a stale/wrong if_none_match must fall through to a full response: {stale}"
@@ -2493,7 +2569,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ci_symbols_batch_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("a.py"), "def foo():\n    pass\n\n\ndef bar():\n    foo()\n").unwrap();
+        std::fs::write(
+            dir.join("a.py"),
+            "def foo():\n    pass\n\n\ndef bar():\n    foo()\n",
+        )
+        .unwrap();
         let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
 
         {
@@ -2518,17 +2598,19 @@ mod tests {
             .unwrap();
         }
 
-        let v = jv(server.symbols_batch(rmcp::handler::server::wrapper::Parameters(
-            SymbolsBatchParams {
-                qualified_names: vec![
-                    "a.py::foo".into(),
-                    "a.py::bar".into(),
-                    "a.py::does_not_exist".into(),
-                ],
-                include_callers: true,
-                include_callees: true,
-            },
-        )));
+        let v = jv(
+            server.symbols_batch(rmcp::handler::server::wrapper::Parameters(
+                SymbolsBatchParams {
+                    qualified_names: vec![
+                        "a.py::foo".into(),
+                        "a.py::bar".into(),
+                        "a.py::does_not_exist".into(),
+                    ],
+                    include_callers: true,
+                    include_callees: true,
+                },
+            )),
+        );
 
         assert_eq!(v["found_count"], 2);
         assert_eq!(v["not_found_count"], 1);
@@ -2581,13 +2663,15 @@ mod tests {
             .unwrap();
         }
 
-        let v = jv(server.symbols_batch(rmcp::handler::server::wrapper::Parameters(
-            SymbolsBatchParams {
-                qualified_names: vec!["a.py::foo".into()],
-                include_callers: false,
-                include_callees: false,
-            },
-        )));
+        let v = jv(
+            server.symbols_batch(rmcp::handler::server::wrapper::Parameters(
+                SymbolsBatchParams {
+                    qualified_names: vec!["a.py::foo".into()],
+                    include_callers: false,
+                    include_callees: false,
+                },
+            )),
+        );
 
         assert_eq!(v["found_count"], 1);
         assert_eq!(v["not_found_count"], 0);
@@ -2614,13 +2698,15 @@ mod tests {
             .unwrap();
         }
 
-        let v = jv(server.source(rmcp::handler::server::wrapper::Parameters(SourceParams {
-            symbol: "foo".into(),
-            path: None,
-            line: None,
-            include_metadata: false,
-            if_none_match: None,
-        })));
+        let v = jv(
+            server.source(rmcp::handler::server::wrapper::Parameters(SourceParams {
+                symbol: "foo".into(),
+                path: None,
+                line: None,
+                include_metadata: false,
+                if_none_match: None,
+            })),
+        );
         assert!(
             v.get("content_warning").is_none(),
             "clean code must omit content_warning entirely, got: {v}"
@@ -2652,13 +2738,15 @@ mod tests {
             .unwrap();
         }
 
-        let v = jv(server.source(rmcp::handler::server::wrapper::Parameters(SourceParams {
-            symbol: "foo".into(),
-            path: None,
-            line: None,
-            include_metadata: false,
-            if_none_match: None,
-        })));
+        let v = jv(
+            server.source(rmcp::handler::server::wrapper::Parameters(SourceParams {
+                symbol: "foo".into(),
+                path: None,
+                line: None,
+                include_metadata: false,
+                if_none_match: None,
+            })),
+        );
 
         let warning = v["content_warning"]
             .as_str()
@@ -2695,10 +2783,14 @@ mod tests {
             .unwrap();
         }
 
-        let v = jv(server.understand(rmcp::handler::server::wrapper::Parameters(UnderstandParams {
-            query: "foo".into(),
-            kind: None,
-        })));
+        let v = jv(
+            server.understand(rmcp::handler::server::wrapper::Parameters(
+                UnderstandParams {
+                    query: "foo".into(),
+                    kind: None,
+                },
+            )),
+        );
         let warning = v["source"]["content_warning"].as_str().expect(
             "understand.source.content_warning must be present for injection-shaped source",
         );
@@ -2726,9 +2818,13 @@ mod tests {
             .unwrap();
         }
 
-        let v = jv(server.dependencies(rmcp::handler::server::wrapper::Parameters(DependenciesParams {
-            path: "a.py".into(),
-        })));
+        let v = jv(
+            server.dependencies(rmcp::handler::server::wrapper::Parameters(
+                DependenciesParams {
+                    path: "a.py".into(),
+                },
+            )),
+        );
 
         assert_eq!(
             v["imports"][0]["symbols_used"],
@@ -2762,11 +2858,15 @@ mod tests {
                 .unwrap();
             }
         }
-        let v = jv(server.symbol_info(rmcp::handler::server::wrapper::Parameters(SymbolInfoParams {
-            symbol: "default".into(),
-            path: None,
-            line: None,
-        })));
+        let v = jv(
+            server.symbol_info(rmcp::handler::server::wrapper::Parameters(
+                SymbolInfoParams {
+                    symbol: "default".into(),
+                    path: None,
+                    line: None,
+                },
+            )),
+        );
         assert_eq!(v["ambiguous"], true);
         assert_eq!(v["total"], 13, "must report the full match count");
         assert_eq!(v["truncated"], true, "13 > cap of 10 must set truncated");
@@ -2809,13 +2909,15 @@ mod tests {
             )
             .unwrap();
         }
-        let v = jv(server.callers(rmcp::handler::server::wrapper::Parameters(CallersParams {
-            symbol: "as_str".into(),
-            path: Some("a.rs".into()),
-            line: Some(41),
-            transitive: false,
-            max_depth: None,
-        })));
+        let v = jv(
+            server.callers(rmcp::handler::server::wrapper::Parameters(CallersParams {
+                symbol: "as_str".into(),
+                path: Some("a.rs".into()),
+                line: Some(41),
+                transitive: false,
+                max_depth: None,
+            })),
+        );
         assert_eq!(
             v["direct_count"], 1,
             "only the resolved caller is a confident direct caller"
@@ -2862,9 +2964,13 @@ mod tests {
             )
             .unwrap();
         }
-        let v = jv(server.dependencies(rmcp::handler::server::wrapper::Parameters(DependenciesParams {
-            path: "embedding.rs".into(),
-        })));
+        let v = jv(
+            server.dependencies(rmcp::handler::server::wrapper::Parameters(
+                DependenciesParams {
+                    path: "embedding.rs".into(),
+                },
+            )),
+        );
         let call_deps: Vec<String> = v["call_dependents"]
             .as_array()
             .unwrap()
@@ -2912,9 +3018,13 @@ mod tests {
             )
             .unwrap();
         }
-        let v = jv(server.dependencies(rmcp::handler::server::wrapper::Parameters(DependenciesParams {
-            path: "embedding.rs".into(),
-        })));
+        let v = jv(
+            server.dependencies(rmcp::handler::server::wrapper::Parameters(
+                DependenciesParams {
+                    path: "embedding.rs".into(),
+                },
+            )),
+        );
         let glob_deps: Vec<String> = v["glob_reexport_dependents"]
             .as_array()
             .unwrap()
@@ -2962,9 +3072,13 @@ mod tests {
             .unwrap();
         }
 
-        let v = jv(server.dependencies(rmcp::handler::server::wrapper::Parameters(DependenciesParams {
-            path: "a.py".into(),
-        })));
+        let v = jv(
+            server.dependencies(rmcp::handler::server::wrapper::Parameters(
+                DependenciesParams {
+                    path: "a.py".into(),
+                },
+            )),
+        );
 
         assert_eq!(v["imports"].as_array().unwrap().len(), 1);
         assert_eq!(v["imports_truncated"], true);
@@ -2995,9 +3109,13 @@ mod tests {
             .unwrap();
         }
 
-        let v = jv(server.indexing_status(rmcp::handler::server::wrapper::Parameters(IndexingStatusParams {
-            retry_embeddings: false,
-        })));
+        let v = jv(
+            server.indexing_status(rmcp::handler::server::wrapper::Parameters(
+                IndexingStatusParams {
+                    retry_embeddings: false,
+                },
+            )),
+        );
 
         assert_eq!(v["files_indexed"], 1);
         assert_eq!(v["files_total"], 2, "both a.py and b.py exist on disk");
@@ -3082,11 +3200,15 @@ mod tests {
             .unwrap();
         }
 
-        let v = jv(server.symbol_info(rmcp::handler::server::wrapper::Parameters(SymbolInfoParams {
-            symbol: "my_fn".into(),
-            path: None,
-            line: None,
-        })));
+        let v = jv(
+            server.symbol_info(rmcp::handler::server::wrapper::Parameters(
+                SymbolInfoParams {
+                    symbol: "my_fn".into(),
+                    path: None,
+                    line: None,
+                },
+            )),
+        );
 
         // coreness must be present and equal to 3
         assert_eq!(
@@ -3133,11 +3255,15 @@ mod tests {
             .unwrap();
         }
 
-        let v = jv(server.symbol_info(rmcp::handler::server::wrapper::Parameters(SymbolInfoParams {
-            symbol: "my_fn2".into(),
-            path: None,
-            line: None,
-        })));
+        let v = jv(
+            server.symbol_info(rmcp::handler::server::wrapper::Parameters(
+                SymbolInfoParams {
+                    symbol: "my_fn2".into(),
+                    path: None,
+                    line: None,
+                },
+            )),
+        );
 
         // When edges not ready, coreness must be null (not missing)
         assert!(
@@ -3636,16 +3762,20 @@ mod tests {
     fn remember_rejects_empty_topic_or_content() {
         let (dir, server) = test_server("remember_empty");
 
-        let v = jv(server.remember(rmcp::handler::server::wrapper::Parameters(RememberParams {
-            topic: "  ".into(),
-            content: "something".into(),
-        })));
+        let v = jv(
+            server.remember(rmcp::handler::server::wrapper::Parameters(RememberParams {
+                topic: "  ".into(),
+                content: "something".into(),
+            })),
+        );
         assert!(v.get("error").is_some());
 
-        let v = jv(server.remember(rmcp::handler::server::wrapper::Parameters(RememberParams {
-            topic: "topic".into(),
-            content: "".into(),
-        })));
+        let v = jv(
+            server.remember(rmcp::handler::server::wrapper::Parameters(RememberParams {
+                topic: "topic".into(),
+                content: "".into(),
+            })),
+        );
         assert!(v.get("error").is_some());
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -4012,16 +4142,18 @@ mod tests {
         let (dir, server) = test_server("edit_preview");
         std::fs::write(dir.join("a.py"), "def helper():\n    return 1\n").unwrap();
 
-        let out = server.edit_lines(rmcp::handler::server::wrapper::Parameters(EditLinesParams {
-            path: "a.py".into(),
-            edits: vec![EditHunkParam {
-                start_line: 2,
-                end_line: 2,
-                expected_hash: None,
-                new_text: "    return 2\n".into(),
-            }],
-            confirm: false,
-        }));
+        let out = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
+            EditLinesParams {
+                path: "a.py".into(),
+                edits: vec![EditHunkParam {
+                    start_line: 2,
+                    end_line: 2,
+                    expected_hash: None,
+                    new_text: "    return 2\n".into(),
+                }],
+                confirm: false,
+            },
+        ));
         let v = jv(out);
         assert_eq!(v["applied"], false);
         assert_eq!(v["hunks"][0]["status"], "preview");
@@ -4041,16 +4173,18 @@ mod tests {
         let (dir, server) = test_server("edit_conflict");
         std::fs::write(dir.join("a.py"), "def helper():\n    return 1\n").unwrap();
 
-        let out = server.edit_lines(rmcp::handler::server::wrapper::Parameters(EditLinesParams {
-            path: "a.py".into(),
-            edits: vec![EditHunkParam {
-                start_line: 2,
-                end_line: 2,
-                expected_hash: Some("deadbeefdeadbeef".into()),
-                new_text: "    return 2\n".into(),
-            }],
-            confirm: false,
-        }));
+        let out = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
+            EditLinesParams {
+                path: "a.py".into(),
+                edits: vec![EditHunkParam {
+                    start_line: 2,
+                    end_line: 2,
+                    expected_hash: Some("deadbeefdeadbeef".into()),
+                    new_text: "    return 2\n".into(),
+                }],
+                confirm: false,
+            },
+        ));
         let v = jv(out);
         assert_eq!(v["applied"], false);
         assert_eq!(v["hunks"][0]["status"], "conflict");
@@ -4069,16 +4203,18 @@ mod tests {
         std::fs::write(dir.join("a.py"), "def helper():\n    return 1\n").unwrap();
         let hash = calm_core::edit::range_checksum("def helper():\n    return 1\n", 2, 2).unwrap();
 
-        let out = server.edit_lines(rmcp::handler::server::wrapper::Parameters(EditLinesParams {
-            path: "a.py".into(),
-            edits: vec![EditHunkParam {
-                start_line: 2,
-                end_line: 2,
-                expected_hash: Some(hash),
-                new_text: "    return 2\n".into(),
-            }],
-            confirm: false,
-        }));
+        let out = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
+            EditLinesParams {
+                path: "a.py".into(),
+                edits: vec![EditHunkParam {
+                    start_line: 2,
+                    end_line: 2,
+                    expected_hash: Some(hash),
+                    new_text: "    return 2\n".into(),
+                }],
+                confirm: false,
+            },
+        ));
         let v = jv(out);
         assert_eq!(v["applied"], true, "response: {v}");
         assert_eq!(v["hunks"][0]["status"], "applied");
@@ -4122,16 +4258,18 @@ mod tests {
         assert_eq!(before["pending_diff_impact"], false);
         assert!(before.get("files_pending_diff_impact").is_none());
 
-        server.edit_lines(rmcp::handler::server::wrapper::Parameters(EditLinesParams {
-            path: "a.py".into(),
-            edits: vec![EditHunkParam {
-                start_line: 2,
-                end_line: 2,
-                expected_hash: Some(hash),
-                new_text: "    return 2\n".into(),
-            }],
-            confirm: false,
-        }));
+        server.edit_lines(rmcp::handler::server::wrapper::Parameters(
+            EditLinesParams {
+                path: "a.py".into(),
+                edits: vec![EditHunkParam {
+                    start_line: 2,
+                    end_line: 2,
+                    expected_hash: Some(hash),
+                    new_text: "    return 2\n".into(),
+                }],
+                confirm: false,
+            },
+        ));
 
         let after_edit = jv(server.session_context());
         assert_eq!(after_edit["pending_diff_impact"], true, "{after_edit}");
@@ -4143,11 +4281,13 @@ mod tests {
 
         // Any diff_impact call — even against unrelated raw diff text —
         // clears the pending set.
-        server.diff_impact(rmcp::handler::server::wrapper::Parameters(DiffImpactParams {
-            diff: Some("diff --git a/unrelated.rs b/unrelated.rs\n".into()),
-            staged: None,
-            commits: None,
-        }));
+        server.diff_impact(rmcp::handler::server::wrapper::Parameters(
+            DiffImpactParams {
+                diff: Some("diff --git a/unrelated.rs b/unrelated.rs\n".into()),
+                staged: None,
+                commits: None,
+            },
+        ));
 
         let after_verify = jv(server.session_context());
         assert_eq!(after_verify["pending_diff_impact"], false, "{after_verify}");
@@ -4161,16 +4301,18 @@ mod tests {
         std::fs::write(dir.join("a.py"), "def helper():\n    return 1\n").unwrap();
         let hash = calm_core::edit::range_checksum("def helper():\n    return 1\n", 2, 2).unwrap();
 
-        let out = server.edit_lines(rmcp::handler::server::wrapper::Parameters(EditLinesParams {
-            path: "a.py".into(),
-            edits: vec![EditHunkParam {
-                start_line: 2,
-                end_line: 2,
-                expected_hash: Some(hash),
-                new_text: "    return (\n".into(), // unbalanced paren — syntax error
-            }],
-            confirm: false,
-        }));
+        let out = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
+            EditLinesParams {
+                path: "a.py".into(),
+                edits: vec![EditHunkParam {
+                    start_line: 2,
+                    end_line: 2,
+                    expected_hash: Some(hash),
+                    new_text: "    return (\n".into(), // unbalanced paren — syntax error
+                }],
+                confirm: false,
+            },
+        ));
         let v = jv(out);
         assert_eq!(v["error"]["code"], "PARSE_ERROR");
 
@@ -4199,16 +4341,18 @@ mod tests {
             .unwrap();
         }
 
-        let without_confirm = server.edit_lines(rmcp::handler::server::wrapper::Parameters(EditLinesParams {
-            path: "a.py".into(),
-            edits: vec![EditHunkParam {
-                start_line: 2,
-                end_line: 2,
-                expected_hash: Some(hash.clone()),
-                new_text: "    return 2\n".into(),
-            }],
-            confirm: false,
-        }));
+        let without_confirm = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
+            EditLinesParams {
+                path: "a.py".into(),
+                edits: vec![EditHunkParam {
+                    start_line: 2,
+                    end_line: 2,
+                    expected_hash: Some(hash.clone()),
+                    new_text: "    return 2\n".into(),
+                }],
+                confirm: false,
+            },
+        ));
         let v = jv(without_confirm);
         assert_eq!(v["error"]["code"], "CONFIRM_REQUIRED", "response: {v}");
         assert_eq!(
@@ -4216,16 +4360,18 @@ mod tests {
             "def helper():\n    return 1\n"
         );
 
-        let with_confirm = server.edit_lines(rmcp::handler::server::wrapper::Parameters(EditLinesParams {
-            path: "a.py".into(),
-            edits: vec![EditHunkParam {
-                start_line: 2,
-                end_line: 2,
-                expected_hash: Some(hash),
-                new_text: "    return 2\n".into(),
-            }],
-            confirm: true,
-        }));
+        let with_confirm = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
+            EditLinesParams {
+                path: "a.py".into(),
+                edits: vec![EditHunkParam {
+                    start_line: 2,
+                    end_line: 2,
+                    expected_hash: Some(hash),
+                    new_text: "    return 2\n".into(),
+                }],
+                confirm: true,
+            },
+        ));
         let v = jv(with_confirm);
         assert_eq!(v["applied"], true, "response: {v}");
         assert_eq!(
@@ -4245,24 +4391,26 @@ mod tests {
         let hash_a = calm_core::edit::range_checksum(content, 2, 2).unwrap();
         let hash_b = calm_core::edit::range_checksum(content, 6, 6).unwrap();
 
-        let out = server.edit_lines(rmcp::handler::server::wrapper::Parameters(EditLinesParams {
-            path: "m.py".into(),
-            edits: vec![
-                EditHunkParam {
-                    start_line: 2,
-                    end_line: 2,
-                    expected_hash: Some(hash_a),
-                    new_text: "    return 10\n".into(),
-                },
-                EditHunkParam {
-                    start_line: 6,
-                    end_line: 6,
-                    expected_hash: Some(hash_b),
-                    new_text: "    return 20\n".into(),
-                },
-            ],
-            confirm: false,
-        }));
+        let out = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
+            EditLinesParams {
+                path: "m.py".into(),
+                edits: vec![
+                    EditHunkParam {
+                        start_line: 2,
+                        end_line: 2,
+                        expected_hash: Some(hash_a),
+                        new_text: "    return 10\n".into(),
+                    },
+                    EditHunkParam {
+                        start_line: 6,
+                        end_line: 6,
+                        expected_hash: Some(hash_b),
+                        new_text: "    return 20\n".into(),
+                    },
+                ],
+                confirm: false,
+            },
+        ));
         let v = jv(out);
         assert_eq!(v["applied"], true, "response: {v}");
 
@@ -4290,14 +4438,16 @@ mod tests {
         }
         let hash = calm_core::edit::range_checksum("def helper():\n    return 1\n", 1, 2).unwrap();
 
-        let out = server.edit_symbol(rmcp::handler::server::wrapper::Parameters(EditSymbolParams {
-            symbol: "helper".into(),
-            path: None,
-            line: None,
-            expected_hash: Some(hash),
-            new_text: "def helper():\n    return 42\n".into(),
-            confirm: false,
-        }));
+        let out = server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
+            EditSymbolParams {
+                symbol: "helper".into(),
+                path: None,
+                line: None,
+                expected_hash: Some(hash),
+                new_text: "def helper():\n    return 42\n".into(),
+                confirm: false,
+            },
+        ));
         let v = jv(out);
         assert_eq!(v["applied"], true, "response: {v}");
         assert_eq!(v["path"], "a.py");

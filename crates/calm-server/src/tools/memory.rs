@@ -7,7 +7,10 @@ impl CalmServer {
         name = "remember",
         description = "Save a durable, interpretive note (architecture decision, gotcha, rationale) under a short topic key. Persists across sessions and server restarts — unlike session_context, which only tracks the current session's navigation. USE WHEN: you've learned something a future session should know that the graph/AST can't capture on its own (a WHY, not a fact derivable from code). Upserts: calling again with the same topic overwrites its content."
     )]
-    pub(crate) fn remember(&self, Parameters(p): Parameters<RememberParams>) -> Json<ToolOutcome<RememberOutput>> {
+    pub(crate) fn remember(
+        &self,
+        Parameters(p): Parameters<RememberParams>,
+    ) -> Json<ToolOutcome<RememberOutput>> {
         Json(self.timed_tool("remember", || {
             let topic = p.topic.trim();
             let content = p.content.trim();
@@ -63,7 +66,10 @@ impl CalmServer {
         name = "recall",
         description = "Retrieve durable notes saved by remember. USE WHEN: starting work on a topic you might have left notes about, or checking for known gotchas before touching an area. Pass `topic` for one exact note, `query` for a keyword search across all notes, or neither to list everything (most recently updated first)."
     )]
-    pub(crate) fn recall(&self, Parameters(p): Parameters<RecallParams>) -> Json<ToolOutcome<RecallOutput>> {
+    pub(crate) fn recall(
+        &self,
+        Parameters(p): Parameters<RecallParams>,
+    ) -> Json<ToolOutcome<RecallOutput>> {
         Json(self.timed_tool("recall", || {
             const RECALL_LIMIT: i64 = 50;
 

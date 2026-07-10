@@ -143,7 +143,7 @@ agent: "I need to change getUserByEmail"
 
 ### Multi-tier indexing
 - **6 Tier-0 languages** — Python, TypeScript, JavaScript, Java, Rust, Go — get full `tree-sitter` AST parsing, a real call graph, an import graph, and multi-tier resolution.
-- **9 Tier-0.5 languages** — C, C++, C#, Ruby, PHP, Kotlin, Swift, Shell, R — get regex/line-scan symbol extraction (no call graph or import resolution) by default, upgraded to full AST parsing, call-graph and import resolution when the matching optional grammar feature is compiled in (on by default via the `tier0-5` feature bundle).
+- **9 Tier-0.5 languages** — C, C++, C#, Ruby, PHP, Shell, R (real grammar on by default via the `tier0-5` feature bundle), plus Kotlin and Swift (real grammar behind their own separate `lang-kotlin`/`lang-swift` opt-in features, not yet bundled into `tier0-5`) — get full `tree-sitter` AST parsing with call-graph and import resolution when the matching grammar feature is compiled in; falls back to regex/line-scan symbol extraction (no call graph) only when it isn't.
 - **SQL gets its own standalone indexer** (`sqlparser`, real grammar parsing, not regex) — extracts tables/views/procedures accurately across Postgres/MySQL/SQL Server dialects, but stops short of a call graph, since "calls" isn't a coherent concept across SQL dialects the way it is for the languages above.
 - **Incremental watcher** — only changed files get re-parsed (FNV-1a content hash diff); the call graph rebuilds incrementally, parallelized with `rayon`. `calm serve` picks incremental reindex automatically whenever an index already exists.
 

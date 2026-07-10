@@ -190,7 +190,8 @@ mod tests {
         });
 
         assert!(
-            rx.recv_timeout(std::time::Duration::from_millis(200)).is_err(),
+            rx.recv_timeout(std::time::Duration::from_millis(200))
+                .is_err(),
             "acquire_blocking must not return while the first lock is held"
         );
 

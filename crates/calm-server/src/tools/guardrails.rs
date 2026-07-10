@@ -12,7 +12,10 @@ impl CalmServer {
         name = "edit_context",
         description = "ALWAYS CALL THIS before any code modification — mandatory, never skip. USE WHEN: you are about to edit, refactor, or delete a symbol. NOT FOR: read-only inspection (use symbol_info + source). NOT post-edit (use diff_impact)."
     )]
-    pub(crate) fn edit_context(&self, Parameters(p): Parameters<EditContextParams>) -> Json<ResolvedOutcome<EditContextOutput>> {
+    pub(crate) fn edit_context(
+        &self,
+        Parameters(p): Parameters<EditContextParams>,
+    ) -> Json<ResolvedOutcome<EditContextOutput>> {
         Json(self.timed_tool("edit_context", || {
             // READ-only: open a dedicated read connection (SINGLE_WRITER enforcement)
             let conn = match self.make_read_conn() {
@@ -22,7 +25,9 @@ impl CalmServer {
             let resolution = resolve_symbol(&conn, &p.symbol, p.path.as_deref(), p.line);
             let c = match resolution {
                 SymbolResolution::NotFound => return ResolvedOutcome::not_found(&p.symbol),
-                SymbolResolution::Ambiguous(candidates) => return ResolvedOutcome::ambiguous(&candidates),
+                SymbolResolution::Ambiguous(candidates) => {
+                    return ResolvedOutcome::ambiguous(&candidates);
+                }
                 SymbolResolution::Found(c) => *c,
             };
             self.track_symbol(&c.qualified_name);
@@ -215,7 +220,10 @@ impl CalmServer {
         name = "diff_impact",
         description = "CALL THIS after every code change, BEFORE commit or push — never skip. USE WHEN: you have uncommitted changes and want to verify blast radius. NOT FOR: pre-edit analysis (use edit_context). vs edit_context: edit_context=pre-edit; diff_impact=post-edit. Omit all three for the unstaged working-tree diff, or provide at most one of: diff, staged=true, commits=<range>."
     )]
-    pub(crate) fn diff_impact(&self, Parameters(p): Parameters<DiffImpactParams>) -> Json<ToolOutcome<DiffImpactOutput>> {
+    pub(crate) fn diff_impact(
+        &self,
+        Parameters(p): Parameters<DiffImpactParams>,
+    ) -> Json<ToolOutcome<DiffImpactOutput>> {
         Json(self.timed_tool("diff_impact", || {
             self.clear_written_files();
 
@@ -496,7 +504,6 @@ impl CalmServer {
         }))
     }
 }
-
 
 #[derive(Deserialize, JsonSchema)]
 #[allow(dead_code)]

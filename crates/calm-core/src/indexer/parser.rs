@@ -59,6 +59,21 @@ fn node_kind_to_symbol_kind(node_kind: &str, in_class: bool) -> SymbolKind {
         // `impl`/`impl Trait for` block without a corresponding consumer.
         "impl_item" => SymbolKind::Impl,
         "interface_declaration" => SymbolKind::Interface,
+        // Kotlin's `object` (singleton declaration) — closest existing kind
+        // is Class (it has a body, can hold methods/properties, no
+        // dedicated Object/Singleton variant exists). Found via a real
+        // end-to-end index of a fixture file: without this arm, a
+        // top-level `object Foo {}` silently fell through to the generic
+        // Function/Method default below and was labeled `SymbolKind::Function`
+        // — plausible-looking but wrong, the exact kind of bug the shallow
+        // unit tests (which never call this function on kotlin/swift input)
+        // can't catch.
+        "object_declaration" => SymbolKind::Class,
+        // Swift's `protocol` is exactly Swift's version of an interface —
+        // same category of gap as `object_declaration` above, found the
+        // same way (`Named` reported as `SymbolKind::Function` on a real
+        // indexed fixture instead of Interface).
+        "protocol_declaration" => SymbolKind::Interface,
         "enum_item" => SymbolKind::Enum, // Rust
         // TS `enum_declaration`, Java `enum_declaration`, C# `enum_declaration`,
         // C/C++ `enum_specifier` — one shared arm since the mapping only sees
@@ -116,9 +131,13 @@ pub fn parse_tree(source: &str, language: &str) -> Option<tree_sitter::Tree> {
         "ruby" => tree_sitter_ruby::LANGUAGE.into(),
         #[cfg(feature = "lang-php")]
         "php" => tree_sitter_php::LANGUAGE_PHP.into(),
-        // kotlin and swift: lang-kotlin / lang-swift are no-op feature stubs;
-        // their tree-sitter crates use incompatible API versions. These languages
-        // always fall back to regex extraction in extract_file_data.
+        // kotlin/swift (2026-07-10): real grammars, not the old no-op stubs —
+        // see lang_constants.rs's "kotlin"/"swift" arms for the AST-dump
+        // verification that corrected several never-tested field guesses.
+        #[cfg(feature = "lang-kotlin")]
+        "kotlin" => tree_sitter_kotlin_ng::LANGUAGE.into(),
+        #[cfg(feature = "lang-swift")]
+        "swift" => tree_sitter_swift::LANGUAGE.into(),
         #[cfg(feature = "lang-csharp")]
         "csharp" => tree_sitter_c_sharp::LANGUAGE.into(),
         #[cfg(feature = "lang-shell")]
@@ -1101,19 +1120,44 @@ fn walk_calls(
             .iter()
             .find(|(kind, _)| *kind == node.kind())
             .map_or(consts.call_function_field, |(_, f)| f)
-        && let Some(fn_node) = node.child_by_field_name(field_name).or_else(|| {
-            // Fallback for a callee that isn't a named field at all — PHP's
-            // `object_creation_expression` (`new Foo(...)`) names its callee
-            // as a plain positional child of node-KIND "name" (confirmed via
-            // the real grammar: no "type"/"name" field exists on this node),
-            // not a field. Reuses `field_name` as the node-kind to search
-            // for, so this only ever changes behavior for a
-            // `call_function_field_by_kind` entry that's already known not
-            // to resolve as a field — every pre-existing (call kind, field)
-            // pairing still resolves via the field lookup above, unchanged.
-            let mut cur = node.walk();
-            node.children(&mut cur).find(|c| c.kind() == field_name)
-        })
+        && let Some(fn_node) = node
+            .child_by_field_name(field_name)
+            .or_else(|| {
+                // Fallback for a callee that isn't a named field at all — PHP's
+                // `object_creation_expression` (`new Foo(...)`) names its callee
+                // as a plain positional child of node-KIND "name" (confirmed via
+                // the real grammar: no "type"/"name" field exists on this node),
+                // not a field. Reuses `field_name` as the node-kind to search
+                // for, so this only ever changes behavior for a
+                // `call_function_field_by_kind` entry that's already known not
+                // to resolve as a field — every pre-existing (call kind, field)
+                // pairing still resolves via the field lookup above, unchanged.
+                let mut cur = node.walk();
+                node.children(&mut cur).find(|c| c.kind() == field_name)
+            })
+            .or_else(|| {
+                // Sentinel for grammars where the call node has NO fields at all
+                // and the callee can't be pinned to one fixed child kind either
+                // — confirmed via real `node-types.json` for both Kotlin's and
+                // Swift's `call_expression` (`fields: []`): the callee is
+                // whichever expression comes first — a bare identifier for
+                // `println(...)`, or a `navigation_expression` for `this.foo()`/
+                // `Repo.save()`. Rather than teach this function a new node kind
+                // per language, just take the call node's own first child
+                // verbatim — its raw text ("println", or "this.foo") is exactly
+                // what `split_receiver_callee` below already knows how to split
+                // on the last `.`/`->`/`::`, so no new receiver-parsing logic is
+                // needed either. Only ever reached when `field_name` is this
+                // exact sentinel string, which no other language's
+                // `call_function_field`/`call_function_field_by_kind` uses —
+                // provably zero behavior change for every other language.
+                if field_name == "$first_child" {
+                    let mut cur = node.walk();
+                    node.children(&mut cur).next()
+                } else {
+                    None
+                }
+            })
         && let Some((mut receiver, callee, mut receiver_is_type_path)) =
             split_receiver_callee(&source[fn_node.byte_range()])
     {
@@ -2123,7 +2167,10 @@ pub fn extract_markdown_symbols(source: &str, path: &str) -> Vec<ParsedSymbol> {
 
     for (idx, line) in source.lines().enumerate() {
         let trimmed = line.trim_start();
-        let fence_len = trimmed.chars().take_while(|&c| c == '`' || c == '~').count();
+        let fence_len = trimmed
+            .chars()
+            .take_while(|&c| c == '`' || c == '~')
+            .count();
         if fence_len >= 3 {
             let marker = trimmed.chars().next();
             if in_fence {
@@ -3314,6 +3361,112 @@ public class FooTest {
         assert!(names.contains(&"fetchData"), "should detect func");
         assert!(names.contains(&"Config"), "should detect struct");
         assert!(names.contains(&"Updatable"), "should detect protocol");
+    }
+
+    // Locks the ABI-14 grammar pin (Cargo.toml) the same way
+    // `test_tier0_5_grammar_loads_ruby`/etc. already do for the other
+    // Tier-0.5 languages — a future `cargo update` picking a newer,
+    // ABI-incompatible patch would silently regress this to shallow
+    // line-scan (`parse_tree`'s `.ok()?`) without this test catching it.
+    #[test]
+    #[cfg(feature = "lang-kotlin")]
+    fn test_tier0_5_grammar_loads_kotlin() {
+        assert!(
+            parse_tree("fun main() {}", "kotlin").is_some(),
+            "tree-sitter-kotlin-ng grammar should load and parse"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "lang-swift")]
+    fn test_tier0_5_grammar_loads_swift() {
+        assert!(
+            parse_tree("func main() {}", "swift").is_some(),
+            "tree-sitter-swift grammar should load and parse"
+        );
+    }
+
+    // Real-grammar call-accuracy tests, same convention as
+    // `test_ruby_real_grammar_symbols_and_calls_are_accurate` (born
+    // `4439d3a` 2026-07-03) — asserts both a bare call and a
+    // receiver-qualified call produce real call edges. This exact test
+    // shape is what would have caught Kotlin/Swift's phantom
+    // `interface_declaration`/`struct_declaration`/`enum_declaration` node
+    // kinds and the wrong `"callee"` field guess, had they ever shipped
+    // untested.
+    #[test]
+    #[cfg(feature = "lang-kotlin")]
+    fn test_kotlin_real_grammar_symbols_and_calls_are_accurate() {
+        let code = "class Greeter {\n    fun hello() {\n        println(\"hi\")\n        this.logIt()\n    }\n    fun logIt() {}\n}\nobject Singleton {\n    fun instance() {}\n}\n";
+        let symbols = extract_symbols(code, "kotlin", "a.kt").unwrap();
+        let names = shallow_names(&symbols);
+        assert!(names.contains(&"Greeter"), "should detect class");
+        assert!(names.contains(&"hello"), "should detect method");
+        // Found via a real end-to-end index of a fixture file (unit tests
+        // alone never exercise `node_kind_to_symbol_kind` on kotlin/swift
+        // input): `object_declaration` had no arm there, so a top-level
+        // `object Singleton {}` silently fell through to the generic
+        // Function/Method default and was mislabeled `SymbolKind::Function`
+        // instead of `Class`.
+        let singleton = symbols
+            .iter()
+            .find(|s| s.name == "Singleton")
+            .expect("should detect object declaration");
+        assert_eq!(
+            singleton.kind,
+            SymbolKind::Class,
+            "Kotlin `object` should map to SymbolKind::Class, not the generic Function/Method fallback"
+        );
+        let calls = extract_calls(code, "kotlin", "a.kt").unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.enclosing_name == "hello" && c.callee == "println"),
+            "bare call should produce a call edge: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c.enclosing_name == "hello"
+                && c.callee == "logIt"
+                && c.receiver.as_deref() == Some("this")),
+            "receiver-qualified call should produce a call edge with receiver: {calls:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "lang-swift")]
+    fn test_swift_real_grammar_symbols_and_calls_are_accurate() {
+        let code = "class Greeter {\n    func hello() {\n        print(\"hi\")\n        self.logIt()\n    }\n    func logIt() {}\n}\nprotocol Named {\n    func getName() -> String\n}\n";
+        let symbols = extract_symbols(code, "swift", "a.swift").unwrap();
+        let names = shallow_names(&symbols);
+        assert!(names.contains(&"Greeter"), "should detect class");
+        assert!(names.contains(&"hello"), "should detect method");
+        // Same category of gap as Kotlin's `object_declaration` above,
+        // found the same way (real end-to-end index of a fixture file):
+        // `protocol_declaration` had no arm in `node_kind_to_symbol_kind`,
+        // so `protocol Named {}` was mislabeled `SymbolKind::Function`
+        // instead of `Interface`.
+        let named = symbols
+            .iter()
+            .find(|s| s.name == "Named")
+            .expect("should detect protocol declaration");
+        assert_eq!(
+            named.kind,
+            SymbolKind::Interface,
+            "Swift `protocol` should map to SymbolKind::Interface, not the generic Function/Method fallback"
+        );
+        let calls = extract_calls(code, "swift", "a.swift").unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.enclosing_name == "hello" && c.callee == "print"),
+            "bare call should produce a call edge: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c.enclosing_name == "hello"
+                && c.callee == "logIt"
+                && c.receiver.as_deref() == Some("self")),
+            "receiver-qualified call should produce a call edge with receiver: {calls:?}"
+        );
     }
 
     #[test]

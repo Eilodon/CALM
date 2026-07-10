@@ -193,7 +193,10 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
         name = "hotspots",
         description = "Proactive churn × complexity analysis. USE WHEN: starting exploration of a codebase or after orientation to identify high-risk files before diving in."
     )]
-    pub(crate) fn hotspots(&self, Parameters(p): Parameters<HotspotsParams>) -> Json<ToolOutcome<HotspotsOutput>> {
+    pub(crate) fn hotspots(
+        &self,
+        Parameters(p): Parameters<HotspotsParams>,
+    ) -> Json<ToolOutcome<HotspotsOutput>> {
         Json(self.timed_tool("hotspots", || {
             let config = calm_core::config::load_config(&self.project_root).unwrap_or_default();
             let hc = &config.hotspots;
@@ -310,7 +313,8 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
                 suggested_next: self.filter_sn(sn),
             })
         }))
-    }}
+    }
+}
 
 #[derive(Serialize, JsonSchema)]
 pub(crate) struct FitnessCheckItemOutput {

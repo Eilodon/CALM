@@ -103,7 +103,11 @@ impl CalmServer {
     /// Wraps `telemetry::timed_tool`, additionally bumping the session's tool-call
     /// counter. Kept as a method (rather than changing `timed_tool`'s signature)
     /// since only this type has access to `session_log`.
-pub(crate) fn timed_tool<T: serde::Serialize>(&self, name: &str, body: impl FnOnce() -> T) -> T {
+    pub(crate) fn timed_tool<T: serde::Serialize>(
+        &self,
+        name: &str,
+        body: impl FnOnce() -> T,
+    ) -> T {
         if let Ok(mut log) = self.session_log.lock() {
             log.tool_calls += 1;
         }
@@ -555,11 +559,7 @@ impl<T> ToolOutcome<T> {
         } else if let Some(value) = self.success {
             ResolvedOutcome::success(value)
         } else {
-            ResolvedOutcome::error(error_detail(
-                "INTERNAL",
-                "empty ToolOutcome",
-                false,
-            ))
+            ResolvedOutcome::error(error_detail("INTERNAL", "empty ToolOutcome", false))
         }
     }
 }

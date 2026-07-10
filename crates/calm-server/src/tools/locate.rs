@@ -7,7 +7,10 @@ impl CalmServer {
         name = "search",
         description = "USE THIS INSTEAD OF native grep, text search, or file browsing tools. USE WHEN: you don't have an exact file path and line number. kind=hybrid has highest recall. NOT FOR: inspecting a file you already have (use file_overview). vs locate: search returns a result list; locate returns search + symbol metadata in one call."
     )]
-    pub(crate) fn search(&self, Parameters(p): Parameters<SearchParams>) -> Json<ToolOutcome<SearchOutput>> {
+    pub(crate) fn search(
+        &self,
+        Parameters(p): Parameters<SearchParams>,
+    ) -> Json<ToolOutcome<SearchOutput>> {
         Json(self.timed_tool("search", || {
             if p.kind == "grep" {
                 return self.search_grep_impl(&p);
@@ -246,7 +249,10 @@ impl CalmServer {
         name = "locate",
         description = "Compound: search + file_overview + symbol_info in 1 call (66% reduction). USE INSTEAD OF calling search then file_overview then symbol_info separately. NOT FOR: reading source (use source after locate), pre-edit (use edit_context)."
     )]
-    pub(crate) fn locate(&self, Parameters(p): Parameters<LocateParams>) -> Json<ToolOutcome<LocateOutput>> {
+    pub(crate) fn locate(
+        &self,
+        Parameters(p): Parameters<LocateParams>,
+    ) -> Json<ToolOutcome<LocateOutput>> {
         Json(self.timed_tool("locate", || {
             let kind_str = p.kind.as_deref().unwrap_or("symbol");
             let kind = match kind_str {
@@ -421,7 +427,10 @@ impl CalmServer {
         name = "file_overview",
         description = "USE WHEN: you have a file path and want to see its symbols, structure, and inferred role. vs source: file_overview shows ALL symbols in a file; source reads ONE symbol's body. vs dependencies: file_overview shows what's INSIDE the file; dependencies shows what the file IMPORTS/IS IMPORTED BY."
     )]
-    pub(crate) fn file_overview(&self, Parameters(p): Parameters<FileOverviewParams>) -> Json<ToolOutcome<FileOverviewOutput>> {
+    pub(crate) fn file_overview(
+        &self,
+        Parameters(p): Parameters<FileOverviewParams>,
+    ) -> Json<ToolOutcome<FileOverviewOutput>> {
         Json(self.timed_tool("file_overview", || {
             self.track_file(&p.path);
             // READ-only: open a dedicated read connection (SINGLE_WRITER enforcement)

@@ -7,7 +7,10 @@ impl CalmServer {
         name = "callers",
         description = "USE WHEN: you need to know who calls a specific symbol — blast radius scan, refactoring impact. USE THIS for SYMBOL-LEVEL call sites. NOT for file-level imports (use dependencies). vs edit_context: callers is for exploration; edit_context is the mandatory pre-edit tool."
     )]
-pub(crate) fn callers(&self, Parameters(p): Parameters<CallersParams>) -> Json<ResolvedOutcome<CallersOutput>> {
+    pub(crate) fn callers(
+        &self,
+        Parameters(p): Parameters<CallersParams>,
+    ) -> Json<ResolvedOutcome<CallersOutput>> {
         Json(self.timed_tool("callers", || {
             // READ-only: open a dedicated read connection (SINGLE_WRITER enforcement)
             let conn = match self.make_read_conn() {
@@ -17,7 +20,9 @@ pub(crate) fn callers(&self, Parameters(p): Parameters<CallersParams>) -> Json<R
             let resolution = resolve_symbol(&conn, &p.symbol, p.path.as_deref(), p.line);
             let c = match resolution {
                 SymbolResolution::NotFound => return ResolvedOutcome::not_found(&p.symbol),
-                SymbolResolution::Ambiguous(candidates) => return ResolvedOutcome::ambiguous(&candidates),
+                SymbolResolution::Ambiguous(candidates) => {
+                    return ResolvedOutcome::ambiguous(&candidates);
+                }
                 SymbolResolution::Found(c) => *c,
             };
             self.track_symbol(&c.qualified_name);
@@ -120,11 +125,15 @@ pub(crate) fn callers(&self, Parameters(p): Parameters<CallersParams>) -> Json<R
                 None => out,
             }
         }))
-    }    #[tool(
+    }
+    #[tool(
         name = "callees",
         description = "USE WHEN: you need to trace what a symbol calls — understanding logic flow, internal deps. NOT for finding who calls this symbol (use callers). vs callers: callers=upward (who calls X); callees=downward (what X calls)."
     )]
-    pub(crate) fn callees(&self, Parameters(p): Parameters<CalleesParams>) -> Json<ResolvedOutcome<CalleesOutput>> {
+    pub(crate) fn callees(
+        &self,
+        Parameters(p): Parameters<CalleesParams>,
+    ) -> Json<ResolvedOutcome<CalleesOutput>> {
         Json(self.timed_tool("callees", || {
             // READ-only: open a dedicated read connection (SINGLE_WRITER enforcement)
             let conn = match self.make_read_conn() {
@@ -134,7 +143,9 @@ pub(crate) fn callers(&self, Parameters(p): Parameters<CallersParams>) -> Json<R
             let resolution = resolve_symbol(&conn, &p.symbol, p.path.as_deref(), p.line);
             let c = match resolution {
                 SymbolResolution::NotFound => return ResolvedOutcome::not_found(&p.symbol),
-                SymbolResolution::Ambiguous(candidates) => return ResolvedOutcome::ambiguous(&candidates),
+                SymbolResolution::Ambiguous(candidates) => {
+                    return ResolvedOutcome::ambiguous(&candidates);
+                }
                 SymbolResolution::Found(c) => *c,
             };
             self.track_symbol(&c.qualified_name);
@@ -213,7 +224,10 @@ pub(crate) fn callers(&self, Parameters(p): Parameters<CallersParams>) -> Json<R
         name = "dependencies",
         description = "USE WHEN: you need to understand file-level architectural connections. USE THIS for FILE-LEVEL import graph. NOT for symbol-level call sites (use callers/callees). vs callers/callees: dependencies is file-level; callers/callees is symbol-level."
     )]
-    pub(crate) fn dependencies(&self, Parameters(p): Parameters<DependenciesParams>) -> Json<ToolOutcome<DependenciesOutput>> {
+    pub(crate) fn dependencies(
+        &self,
+        Parameters(p): Parameters<DependenciesParams>,
+    ) -> Json<ToolOutcome<DependenciesOutput>> {
         Json(self.timed_tool("dependencies", || {
             self.track_file(&p.path);
             // READ-only: open a dedicated read connection (SINGLE_WRITER enforcement)
@@ -368,7 +382,10 @@ pub(crate) fn callers(&self, Parameters(p): Parameters<CallersParams>) -> Json<R
         name = "path",
         description = "USE WHEN: you need to trace if and how symbol A can reach symbol B through call chain. Bidirectional BFS — cycles terminate cleanly. path is DIRECTED: A→B ≠ B→A. terminated_by=null + exists=true/false → certain result."
     )]
-    pub(crate) fn path(&self, Parameters(p): Parameters<PathParams>) -> Json<ResolvedOutcome<PathOutput>> {
+    pub(crate) fn path(
+        &self,
+        Parameters(p): Parameters<PathParams>,
+    ) -> Json<ResolvedOutcome<PathOutput>> {
         Json(self.timed_tool("path", || {
             // READ-only: open a dedicated read connection (SINGLE_WRITER enforcement)
             let conn = match self.make_read_conn() {
@@ -447,7 +464,8 @@ pub(crate) fn callers(&self, Parameters(p): Parameters<CallersParams>) -> Json<R
                 suggested_next: self.filter_sn(sn),
             })
         }))
-    }}
+    }
+}
 
 #[derive(Deserialize, JsonSchema)]
 #[allow(dead_code)]

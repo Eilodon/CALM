@@ -7,7 +7,10 @@ impl CalmServer {
         name = "edit_lines",
         description = "The only write-capable tool in ci — line-range granularity, works on ANY tracked file (source code, Cargo.toml, docs — not just parsed symbols). NOT FOR: symbol-scoped edits with auto-resolved range (use edit_symbol). Requires expected_hash from a prior call's current_hash (or edit_context's range_checksum for a whole symbol); omit it to preview a range's hash/content without writing anything. All hunks in one call apply to the same file and must be disjoint (non-overlapping)."
     )]
-    pub(crate) fn edit_lines(&self, Parameters(p): Parameters<EditLinesParams>) -> Json<ToolOutcome<EditLinesOutput>> {
+    pub(crate) fn edit_lines(
+        &self,
+        Parameters(p): Parameters<EditLinesParams>,
+    ) -> Json<ToolOutcome<EditLinesOutput>> {
         Json(self.timed_tool("edit_lines", || {
             let hunks: Vec<calm_core::edit::HunkRequest> = p
                 .edits
@@ -27,7 +30,10 @@ impl CalmServer {
         name = "edit_symbol",
         description = "Sugar over edit_lines: resolves symbol (+ optional path/line, same disambiguation contract as edit_context) to its [line_start, line_end] and replaces the whole thing in one hunk. USE WHEN: replacing an entire function/class/method body by name. NOT FOR: editing a single line inside a symbol, or anything outside a parsed symbol (an import line, Cargo.toml) — use edit_lines directly for those."
     )]
-    pub(crate) fn edit_symbol(&self, Parameters(p): Parameters<EditSymbolParams>) -> Json<ResolvedOutcome<EditLinesOutput>> {
+    pub(crate) fn edit_symbol(
+        &self,
+        Parameters(p): Parameters<EditSymbolParams>,
+    ) -> Json<ResolvedOutcome<EditLinesOutput>> {
         Json(self.timed_tool("edit_symbol", || {
             let c = {
                 let conn = match self.make_read_conn() {
@@ -48,7 +54,8 @@ impl CalmServer {
                 expected_hash: p.expected_hash,
                 new_text: p.new_text,
             };
-            self.edit_lines_impl(&c.path, vec![hunk], p.confirm).into_resolved()
+            self.edit_lines_impl(&c.path, vec![hunk], p.confirm)
+                .into_resolved()
         }))
     }
 
@@ -120,11 +127,7 @@ impl CalmServer {
         let outcome = match calm_core::edit::apply_hunks(&original, &hunks) {
             Ok(o) => o,
             Err(e) => {
-                return ToolOutcome::error(error_detail(
-                    "INVALID_HUNKS",
-                    &e.to_string(),
-                    false,
-                ));
+                return ToolOutcome::error(error_detail("INVALID_HUNKS", &e.to_string(), false));
             }
         };
 

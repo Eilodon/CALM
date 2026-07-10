@@ -20,7 +20,7 @@ use anyhow::{Context, Result};
 use tokio_util::sync::CancellationToken;
 
 use crate::tools::CalmServer;
-use crate::{bootstrap, shutdown_and_checkpoint, Bootstrapped};
+use crate::{Bootstrapped, bootstrap, shutdown_and_checkpoint};
 
 /// Runs CALM as a daemon listening on `socket_path`. Returns once shut down
 /// cleanly (SIGINT/SIGTERM via the same `CancellationToken` `bootstrap`
@@ -261,7 +261,10 @@ async fn bind_or_yield(
 ) -> Result<Option<tokio::net::UnixListener>> {
     let calm_dir_for_lock = calm_dir.to_path_buf();
     let _spawn_lock = tokio::task::spawn_blocking(move || {
-        calm_core::db::instance_lock::acquire_blocking_named(&calm_dir_for_lock, "daemon-spawn.lock")
+        calm_core::db::instance_lock::acquire_blocking_named(
+            &calm_dir_for_lock,
+            "daemon-spawn.lock",
+        )
     })
     .await
     .context("daemon-spawn.lock acquisition task panicked")??;
