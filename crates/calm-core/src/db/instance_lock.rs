@@ -26,7 +26,16 @@ pub struct IndexerLock(#[allow(dead_code)] File);
 /// read-only against the DB the owning process keeps fresh — still fully
 /// functional, just not the one doing the (re)indexing.
 pub fn try_acquire(calm_dir: &Path) -> Option<IndexerLock> {
-    let path = calm_dir.join("indexer.lock");
+    try_acquire_named(calm_dir, "indexer.lock")
+}
+
+/// Same as `try_acquire`, but against `<calm_dir>/<file_name>` instead of
+/// the hardcoded `indexer.lock` — lets a second, independently-meaning lock
+/// (e.g. a daemon's spawn-arbitration lock) reuse this exact flock/promotion
+/// machinery without overloading `indexer.lock`'s own meaning ("I am this
+/// project's writer/indexer"). `try_acquire` is a thin wrapper over this.
+pub fn try_acquire_named(calm_dir: &Path, file_name: &str) -> Option<IndexerLock> {
+    let path = calm_dir.join(file_name);
     let file = OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -108,7 +117,30 @@ pub fn acquire_blocking_cancellable(
     calm_dir: &Path,
     cancel: &dyn Fn() -> bool,
 ) -> std::io::Result<Option<IndexerLock>> {
-    let path = calm_dir.join("indexer.lock");
+    acquire_blocking_cancellable_named(calm_dir, "indexer.lock", cancel)
+}
+
+/// Non-cancellable sibling of `acquire_blocking_cancellable_named` — blocks
+/// unconditionally until the named lock is acquired. Intended for short,
+/// rare, startup-only critical sections (e.g. a daemon's spawn-arbitration
+/// lock) where there's nothing meaningful to cancel back out to; callers
+/// needing SIGTERM-responsiveness should use the cancellable form instead,
+/// same tradeoff `acquire_blocking` already documents for `indexer.lock`.
+pub fn acquire_blocking_named(calm_dir: &Path, file_name: &str) -> std::io::Result<IndexerLock> {
+    acquire_blocking_cancellable_named(calm_dir, file_name, &|| false)
+        .map(|opt| opt.expect("cancel closure always returns false, so this is always Some"))
+}
+
+/// Same as `acquire_blocking_cancellable`, but against
+/// `<calm_dir>/<file_name>` instead of the hardcoded `indexer.lock` — see
+/// `try_acquire_named`'s doc comment for why a second lock needs its own
+/// name rather than overloading `indexer.lock`'s meaning.
+pub fn acquire_blocking_cancellable_named(
+    calm_dir: &Path,
+    file_name: &str,
+    cancel: &dyn Fn() -> bool,
+) -> std::io::Result<Option<IndexerLock>> {
+    let path = calm_dir.join(file_name);
     let file = OpenOptions::new()
         .create(true)
         .truncate(false)

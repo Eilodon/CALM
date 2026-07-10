@@ -1864,6 +1864,52 @@ mod tests {
     }
 
     #[test]
+    fn for_connection_isolates_session_log_but_shares_indexer_state() {
+        // Daemon (M2) correctness property: a fresh per-connection
+        // `CalmServer` must not leak one session's explored-files history
+        // into another's (`SessionLog` is per-connection), while indexer/
+        // embedder/edit-lock state stays the one shared instance every
+        // connection sees (everything else is per-daemon, not per-session).
+        let dir = std::env::temp_dir().join(format!("ci_for_connection_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let shared = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        let conn_a = shared.for_connection();
+        let conn_b = shared.for_connection();
+
+        // Shared: same underlying Arc, not just an equal value — proves
+        // `for_connection` clones the handle rather than constructing a
+        // fresh one, so e.g. the background indexer's phase updates are
+        // visible to every connection immediately, not just the one that
+        // happened to be alive when indexing finished.
+        assert!(std::sync::Arc::ptr_eq(
+            &conn_a.phase_handle(),
+            &conn_b.phase_handle()
+        ));
+        assert!(std::sync::Arc::ptr_eq(
+            &shared.phase_handle(),
+            &conn_a.phase_handle()
+        ));
+
+        // Isolated: conn_a's explored-file history must never appear on
+        // conn_b's session_context, or one agent's frontier would leak into
+        // another agent's sharing the same daemon.
+        conn_a.track_file("src/only_in_a.rs");
+
+        let a_ctx = jv(conn_a.session_context());
+        let b_ctx = jv(conn_b.session_context());
+
+        assert_eq!(
+            a_ctx["explored_files"],
+            serde_json::json!(["src/only_in_a.rs"])
+        );
+        assert_eq!(b_ctx["explored_files"], serde_json::json!([]));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn session_context_includes_frontier_field() {
         let dir = std::env::temp_dir().join(format!("ci_sc_frontier_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);

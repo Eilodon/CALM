@@ -1,4 +1,5 @@
 mod scip_overlay;
+pub mod daemon;
 pub mod telemetry;
 pub mod tools;
 pub mod watcher;
@@ -425,7 +426,7 @@ pub async fn bootstrap(
 /// session for `serve_stdio_with_preset`, or once at daemon accept-loop exit
 /// for a daemon — never per-connection, since the checkpoint belongs to the
 /// shared DB writer's lifetime, not any individual session's.
-fn shutdown_and_checkpoint(db_path: &std::path::Path) {
+pub(crate) fn shutdown_and_checkpoint(db_path: &std::path::Path) {
     if let Ok(conn) = calm_core::db::conn::open_writer(db_path) {
         match conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
             Ok((
@@ -719,7 +720,7 @@ pub fn doctor(project_root: &std::path::Path) -> Result<()> {
 /// time) so the two can be compared as plain strings. `None` when this
 /// isn't a git checkout or git isn't available — not an error, just means
 /// freshness can't be checked.
-fn current_git_head_short(project_root: &std::path::Path) -> Option<String> {
+pub(crate) fn current_git_head_short(project_root: &std::path::Path) -> Option<String> {
     let output = std::process::Command::new("git")
         .args(["rev-parse", "--short=12", "HEAD"])
         .current_dir(project_root)

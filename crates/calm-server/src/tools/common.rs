@@ -49,6 +49,28 @@ impl CalmServer {
             tool_router,
         })
     }
+
+    /// Builds a fresh per-connection `CalmServer` from a daemon-shared
+    /// instance — every field is cloned (cheap: everything but
+    /// `session_log`/`preset`/`project_root`/`db_path`/`tool_router` is
+    /// already `Arc<RwLock/Mutex<_>>`) except `session_log`, which gets a
+    /// brand-new `SessionLog` so one connection's explored-files/explored-
+    /// symbols history can never leak into another session sharing the same
+    /// daemon. `edit_lock` is deliberately NOT reset here — it must stay the
+    /// one lock shared by every connection to keep serializing
+    /// `edit_lines`/`edit_symbol` writes against the one shared DB writer
+    /// (today, each `calm serve` process has its own `edit_lock`, only
+    /// soft-serialized across processes via SQLite's `busy_timeout` — a
+    /// daemon sharing one real `edit_lock` is a strict improvement, real
+    /// mutual exclusion instead of best-effort). `preset`/`project_root`/
+    /// `db_path`/`tool_router` also stay shared/frozen at whatever the
+    /// daemon was spawned with — first-writer-wins, per ADR-0005.
+    pub fn for_connection(&self) -> Self {
+        Self {
+            session_log: Arc::new(Mutex::new(SessionLog::default())),
+            ..self.clone()
+        }
+    }
     /// Opens a new dedicated read-only connection to the same DB file.
     /// Sets `PRAGMA query_only = ON` immediately so any accidental write in a
     /// tool handler is rejected at the SQLite level.

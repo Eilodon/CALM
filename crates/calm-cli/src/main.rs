@@ -27,6 +27,14 @@ enum Commands {
         /// Tool preset to register. If not provided, uses preset from config.json (default: "full").
         #[arg(long)]
         preset: Option<String>,
+        /// Listen on a Unix domain socket instead of stdio, running as a
+        /// shared daemon serving many `calm connect` forwarders off one
+        /// background indexer/watcher/embedder (ADR-0005), e.g.
+        /// `--listen unix:.calm/daemon.sock`. Opt-in: omitting this flag
+        /// keeps today's one-process-per-client stdio behavior unchanged.
+        /// Unix-only (errors at runtime on other platforms).
+        #[arg(long)]
+        listen: Option<String>,
     },
     /// One-shot index of the project
     Index {
@@ -119,21 +127,42 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive(tracing::Level::INFO.into()),
-        )
-        .with_writer(std::io::stderr)
-        .init();
-
     let cli = Cli::parse();
+
+    // Daemon mode (`--listen`) detaches from the client's stdio (a future
+    // `calm connect` spawns it with every fd null'd) so stderr disappears
+    // the moment that happens. Decide the tracing writer *before* the
+    // one-shot global `.init()` call below, based on a cheap peek at the
+    // parsed command, rather than initializing unconditionally to stderr
+    // and having daemon mode silently lose all its own logs.
+    let daemon_project_root: Option<PathBuf> = match &cli.command {
+        Commands::Serve {
+            listen: Some(_),
+            project_root,
+            ..
+        } => Some(project_root.clone()),
+        _ => None,
+    };
+
+    match &daemon_project_root {
+        Some(root) => init_daemon_tracing(root)?,
+        None => {
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::from_default_env()
+                        .add_directive(tracing::Level::INFO.into()),
+                )
+                .with_writer(std::io::stderr)
+                .init();
+        }
+    }
 
     match cli.command {
         Commands::Serve {
             project_root,
             db_path,
             preset,
+            listen,
         } => {
             let root = std::fs::canonicalize(&project_root)?;
             let db = db_path.unwrap_or_else(|| calm_server::default_db_path(&root));
@@ -143,6 +172,32 @@ async fn main() -> Result<()> {
             // rather than silently degrade to defaults.
             let config = calm_core::config::load_config(&root)?;
             let effective_preset = preset.unwrap_or_else(|| config.preset.clone());
+
+            if let Some(listen) = listen {
+                #[cfg(unix)]
+                {
+                    let socket_path = parse_unix_listen(&listen)?;
+                    tracing::info!(
+                        "Starting CALM daemon for {} (preset={}, socket={})",
+                        root.display(),
+                        effective_preset,
+                        socket_path.display()
+                    );
+                    return calm_server::daemon::serve_unix_daemon(
+                        root,
+                        db,
+                        effective_preset,
+                        socket_path,
+                    )
+                    .await;
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = listen;
+                    anyhow::bail!("--listen is only supported on Unix");
+                }
+            }
+
             tracing::info!(
                 "Starting MCP server for {} (preset={})",
                 root.display(),
@@ -649,6 +704,45 @@ fn manual_mcp_config_snippet(bin_path: &str) -> String {
     format!(
         "{{\n  \"mcpServers\": {{\n    \"calm\": {{\n      \"command\": \"{bin_path}\",\n      \"args\": [\"serve\"]\n    }}\n  }}\n}}"
     )
+}
+
+/// Parses `--listen`'s `unix:PATH` form into a socket path. v1 supports
+/// only the `unix:` scheme (Unix domain sockets) — no TCP, matching
+/// ADR-0005's decision to keep the daemon off any network-reachable
+/// transport by default.
+#[cfg(unix)]
+fn parse_unix_listen(listen: &str) -> Result<PathBuf> {
+    listen
+        .strip_prefix("unix:")
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("--listen must be of the form unix:PATH, got {listen:?}"))
+}
+
+/// Global tracing subscriber for daemon mode: once this process detaches
+/// with every fd null'd (see `crates/calm-server/src/daemon.rs`'s doc
+/// comment), stderr disappears — logging to a file instead is the only way
+/// to debug an idle-timeout eviction or a background-indexer panic after
+/// the fact. `project_root` is the raw (possibly relative/uncanonicalized)
+/// CLI value; re-canonicalized here independently since this runs before
+/// `Commands::Serve`'s own canonicalization.
+fn init_daemon_tracing(project_root: &std::path::Path) -> Result<()> {
+    let root =
+        std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
+    let calm_dir = root.join(".calm");
+    std::fs::create_dir_all(&calm_dir)?;
+    let log_path = calm_dir.join("daemon.log");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)?;
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive(tracing::Level::INFO.into()),
+        )
+        .with_writer(file)
+        .init();
+    Ok(())
 }
 
 #[cfg(test)]
