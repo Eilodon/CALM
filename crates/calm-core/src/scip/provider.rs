@@ -3,13 +3,40 @@
 //! copying this whole `scip/` module — see the plan doc
 //! `docs/superskills/plans/2026-07-07-eight-lang-formal-tier.md` §3 (P0.4).
 //!
-//! `RUST`, `GO` (P2.1), and `PYTHON` (P2.4) exist today. Fields sketched in
-//! the plan's P0.4 design for multi-root marker-file discovery, prereq
-//! gating, and refresh policy are still deliberately NOT here — neither Go's
-//! nor Python's single-project case needed them (Go's `go.work`
-//! multi-module handling is a documented upstream `scip-go` limitation, not
-//! something this table papers over yet; scip-python indexes one `--cwd`
-//! tree per invocation). Add them when a provider actually needs them.
+//! 8 entries exist today: `RUST`, `GO` (P2.1), `PYTHON` (P2.4), `TYPESCRIPT`
+//! (P3.2, covers JS+TS), `JAVA` (P2.2), `CSHARP` (P2.3), `PHP` (P2.5), and
+//! `CLANG` (P3.1, scaffold-only — see its own doc comment). Fields sketched
+//! in the plan's P0.4 design for multi-root marker-file discovery, prereq
+//! gating, and refresh policy are still deliberately NOT here — none of the
+//! single-project cases needed them yet (Go's `go.work` multi-module
+//! handling is a documented upstream `scip-go` limitation, not something
+//! this table papers over yet; scip-python/scip-typescript each index one
+//! `--cwd` tree per invocation). Add them when a provider actually needs
+//! them.
+//!
+//! **Live-verification history is uneven across these 8 — "the code exists"
+//! and "confirmed working right now" are two different claims, don't conflate
+//! them** (audited 2026-07-10). `GO`, `JAVA`, `CSHARP`, and `PHP` were each
+//! manually verified live-passing exactly once, by the session that
+//! implemented them, against a real indexer binary with a real toolchain
+//! (see `docs/superskills/plans/2026-07-07-eight-lang-formal-tier.md` §5's
+//! table for the exact fixture results and match rates — e.g. Go 0.67,
+//! Java 1.00). None of that has been *continuously* re-verified since,
+//! though: `RUST` is the only provider with a real green run in GitHub
+//! Actions CI history (`.github/workflows/scip-nightly.yml`, run
+//! 2026-07-08) — every nightly run new enough to include the other
+//! providers either predates the relevant commit or failed before reaching
+//! the test step. `PHP`'s own `scip-php` install is currently, actively
+//! broken in CI as of that audit: Composer refuses `davidrjenni/scip-php`
+//! because its `google/protobuf` dependency range is blocked by security
+//! advisory PKSA-tcfz-w4fm-hhk9 (see the pinned-version workaround in
+//! `scip-nightly.yml`). `PYTHON` and `TYPESCRIPT` were independently
+//! re-confirmed live-passing by hand in a plain dev sandbox during the same
+//! 2026-07-10 audit (both run through `npx` with no extra toolchain install,
+//! so friction — and therefore real-world reach — is far lower than
+//! Go/Java/C#/PHP, which all need a locally installed toolchain). `CLANG`
+//! has no live-verification path at all, ever, by design — see its own doc
+//! comment below for the two independent blockers.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -52,7 +79,8 @@ pub struct ScipProvider {
     /// `scip.cache`.
     pub cache_file_name: &'static str,
 }
-/// The only entry in the table today. `run_overlay`/`overlay_status` in
+/// The original entry (P0.4) — no longer the only one, see the module doc
+/// comment above for the full 8-entry list and their live-verification status.
 /// `mod.rs` are thin Rust-specific wrappers around the generic
 /// `run_overlay_for`/`overlay_status_for` built against this value — see
 /// those wrappers for why their signatures still take `RustConfig` directly
