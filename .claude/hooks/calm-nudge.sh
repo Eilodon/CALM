@@ -51,6 +51,43 @@ edit_context_called=$(jq -r '.edit_context_called // false' <<<"$state" 2>/dev/n
 needs_diff_impact=$(jq -r '.needs_diff_impact // false' <<<"$state" 2>/dev/null || echo false)
 nudge_counts=$(jq -c '.nudge_counts // {}' <<<"$state" 2>/dev/null || echo '{}')
 
+# --- decision-log JSONL: one line per hook invocation, resolved at exit
+# regardless of which code path returned. This is the audit trail the
+# per-session *state* file above can't provide on its own — state answers
+# "what do I currently believe for this session", the log answers "what
+# did every single hook invocation actually decide", after the fact,
+# across sessions. Modeled on zzet/gortex's hook-decisions.jsonl: that log
+# is literally how their user discovered a 91%-of-calls silently-skipped
+# hook bug (issue #241) — grepping decision history for a suspicious gap
+# (e.g. many Edit calls, zero denies) is only possible if every
+# invocation left a record, not just the ones that happened to deny/nudge.
+# Shared across sessions (unlike the per-session state file), so it is
+# NOT covered by that file's own mtime-based cleanup — instead capped by
+# line count each run so it can't grow unbounded.
+decision_log="$state_dir/decisions.jsonl"
+decision_log_cap=5000
+decision="allow"
+decision_detail=""
+log_decision() {
+  jq -nc \
+    --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --arg session "$session_id" \
+    --arg tool "$tool_name" \
+    --arg decision "$decision" \
+    --arg detail "$decision_detail" \
+    --arg file "$file_path" \
+    '{ts: $ts, session_id: $session, tool_name: $tool, decision: $decision, detail: $detail, file_path: ($file | select(. != "") // null)}' \
+    >>"$decision_log" 2>/dev/null || true
+  if [ -f "$decision_log" ]; then
+    lines=$(wc -l <"$decision_log" 2>/dev/null || echo 0)
+    if [ "${lines:-0}" -gt "$decision_log_cap" ]; then
+      tail -n "$decision_log_cap" "$decision_log" >"$decision_log.tmp" 2>/dev/null \
+        && mv "$decision_log.tmp" "$decision_log" 2>/dev/null || true
+    fi
+  fi
+}
+trap log_decision EXIT
+
 save_state() {
   jq -n --argjson ec "$1" --argjson nd "$2" --argjson nc "$3" \
     '{edit_context_called: $ec, needs_diff_impact: $nd, nudge_counts: $nc}' \
@@ -58,6 +95,8 @@ save_state() {
 }
 
 deny() {
+  decision="deny"
+  decision_detail="$1"
   jq -n --arg reason "$1" \
     '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: $reason}}'
   exit 0
@@ -79,10 +118,14 @@ nudge() {
   local key="$1" msg="$2" count
   count=$(jq -r --arg k "$key" '.[$k] // 0' <<<"$nudge_counts")
   if [ "$count" -ge "$NUDGE_CAP" ]; then
+    decision="allow_nudge_capped"
+    decision_detail="$key"
     exit 0
   fi
   nudge_counts=$(jq -c --arg k "$key" '.[$k] = ((.[$k] // 0) + 1)' <<<"$nudge_counts")
   save_state "$edit_context_called" "$needs_diff_impact" "$nudge_counts"
+  decision="nudge"
+  decision_detail="$key"
   jq -n --arg msg "$msg" \
     '{hookSpecificOutput: {hookEventName: "PreToolUse", additionalContext: $msg}}'
   exit 0
@@ -241,10 +284,12 @@ resolve_git_target_root() {
 # PreToolUse (before the call runs) since attempting the check is what
 # matters here, and PreToolUse is all that's needed to observe it.
 if [ "$tool_name" = "mcp__calm__edit_context" ]; then
+  decision_detail="state:edit_context_called=true"
   save_state true "$needs_diff_impact" "$nudge_counts"
   exit 0
 fi
 if [ "$tool_name" = "mcp__calm__diff_impact" ]; then
+  decision_detail="state:needs_diff_impact=false"
   save_state "$edit_context_called" false "$nudge_counts"
   exit 0
 fi
@@ -253,6 +298,7 @@ if [ "$tool_name" = "mcp__calm__edit_lines" ] || [ "$tool_name" = "mcp__calm__ed
   # just like native Edit/Write, so the Stage 7 diff_impact gate below must
   # still apply. Not treated as satisfying edit_context_called: they carry
   # their own stricter per-call risk gate instead (see header comment).
+  decision_detail="state:needs_diff_impact=true"
   save_state "$edit_context_called" true "$nudge_counts"
   exit 0
 fi
@@ -274,6 +320,7 @@ case "$tool_name" in
     fi
     ;;
   Edit)
+    decision_detail="state:needs_diff_impact=true"
     save_state "$edit_context_called" true "$nudge_counts"
     if is_code_file "$file_path" && [ "$edit_context_called" != "true" ]; then
       deny "MANDATORY per AGENTS.md Stage 5 — call mcp__calm__edit_context(symbol) before editing $file_path, never skip (especially if is_hub). Call it once for the symbol you are about to change, then retry this edit. Also consider mcp__calm__edit_symbol/edit_lines (AGENTS.md Stage 6) instead of this native Edit — it can apply the change directly, hash-verified and risk-gated, chaining off edit_context's range_checksum."
