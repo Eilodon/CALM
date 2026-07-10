@@ -211,10 +211,12 @@ mod tests {
         assert!(!is_relevant_path(Path::new(".calm/index.db")));
         assert!(!is_relevant_path(Path::new("proj/.git/index")));
         assert!(!is_relevant_path(Path::new("target/debug/foo.rs")));
-        // Non-source files are ignored.
-        assert!(!is_relevant_path(Path::new("README.md")));
+        // Markdown headings are indexed (see `extract_markdown_symbols`),
+        // so a README edit must trigger a reindex like any source file.
+        assert!(is_relevant_path(Path::new("README.md")));
+        // Genuinely non-indexed extensions are still ignored.
+        assert!(!is_relevant_path(Path::new("NOTES.txt")));
     }
-
     #[test]
     fn coverage_paths_matched_by_exact_relative_location() {
         let root = Path::new("/proj");

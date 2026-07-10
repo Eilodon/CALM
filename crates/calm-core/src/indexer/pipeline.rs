@@ -276,6 +276,23 @@ fn extract_file_data(
         };
     }
 
+    // Markdown: same standalone-module shape as the SQL branch above, not
+    // a tree-sitter grammar — dedicated fence-aware heading scan (see
+    // `indexer::parser::extract_markdown_symbols`'s doc comment for why it
+    // isn't routed through the shared `extract_symbols_shallow` instead).
+    if lang == "markdown" {
+        let symbols = crate::indexer::parser::extract_markdown_symbols(source, rel);
+        let symbol_count = symbols.len();
+        let chunks = chunk_pending(source, &symbols);
+        return ExtractedFile {
+            symbols,
+            import_edges: Vec::new(),
+            call_sites: Vec::new(),
+            symbol_count,
+            chunks,
+        };
+    }
+
     let Some(tree) = parse_tree(source, lang) else {
         // Tier-0.5: no tree-sitter grammar for this language — extract symbols
         // via lightweight line-scan (no calls, no imports, no resolver tiers).
@@ -4158,6 +4175,61 @@ impl StructB {
             ),
             1,
             "view->table edge must be resolved+reference, not call"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_markdown_headings_end_to_end() {
+        let dir = std::env::temp_dir().join(format!("ci_idx_markdown_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("README.md"),
+            "# Getting Started\n\nSome intro text.\n\n## Installation\n\n```bash\n# not a heading, a shell comment\npip install foo\n```\n\n## Usage\n\ntext\n",
+        )
+        .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
+
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM file_index WHERE path = 'README.md' AND language = 'markdown'"
+            ),
+            1
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM symbols WHERE name = 'Getting Started' AND kind = 'heading' AND language = 'markdown' AND path = 'README.md'"
+            ),
+            1
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM symbols WHERE name = 'Installation' AND kind = 'heading'"
+            ),
+            1
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM symbols WHERE name = 'Usage' AND kind = 'heading'"
+            ),
+            1
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM symbols WHERE name LIKE '%not a heading%'"
+            ),
+            0,
+            "a '#'-prefixed line inside a fenced bash example must not become a heading symbol"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

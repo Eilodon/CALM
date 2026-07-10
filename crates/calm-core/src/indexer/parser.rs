@@ -1134,7 +1134,11 @@ fn walk_calls(
         // immediate receiver (mirrors the "receiver = last segment" rule
         // `split_receiver_callee` already uses for chained access); "scope"
         // additionally marks a type-path call (`Foo::bar()`), like Rust's
-        // `::`.
+        // `::`. Ruby's `call` node names this same slot "receiver" instead
+        // (confirmed via the real grammar's `node-types.json` — no other
+        // language's call node in this table uses that field name, so this
+        // arm is Ruby-only in practice) — `self.log_it()`/`Rails.logger.info`
+        // would otherwise carry a callee with no receiver at all.
         if receiver.is_none() {
             if let Some(obj) = node.child_by_field_name("object") {
                 receiver = last_ident_segment(&source[obj.byte_range()]);
@@ -1142,6 +1146,8 @@ fn walk_calls(
                 let seg = last_ident_segment(&source[scope.byte_range()]);
                 receiver_is_type_path = seg.as_deref().is_some_and(is_type_like);
                 receiver = if receiver_is_type_path { seg } else { None };
+            } else if let Some(recv) = node.child_by_field_name("receiver") {
+                receiver = last_ident_segment(&source[recv.byte_range()]);
             }
         }
         out.push(RawCall {
@@ -2100,6 +2106,83 @@ pub fn extract_symbols_shallow(source: &str, language: &str, path: &str) -> Vec<
     out
 }
 
+/// Markdown ATX headings (`#`..`######`) as searchable symbols — not a
+/// tree-sitter grammar, standalone line-scan same shape as
+/// `indexer::sql`'s extractor (see `extract_file_data`'s `lang ==
+/// "markdown"` branch). Deliberately NOT routed through the shared
+/// `extract_symbols_shallow`/`detect_shallow`/`is_comment_line`: their
+/// default `#`-as-comment rule would eat every heading, and that dispatch
+/// is stateless per-line so it can't track fenced-code-block state —
+/// needed here so a `# comment` inside a ```python/```bash doc example
+/// isn't mistaken for a heading.
+pub fn extract_markdown_symbols(source: &str, path: &str) -> Vec<ParsedSymbol> {
+    let mut out: Vec<ParsedSymbol> = Vec::new();
+    let mut seen = std::collections::HashSet::<String>::new();
+    let mut in_fence = false;
+    let mut fence_marker: Option<char> = None;
+
+    for (idx, line) in source.lines().enumerate() {
+        let trimmed = line.trim_start();
+        let fence_len = trimmed.chars().take_while(|&c| c == '`' || c == '~').count();
+        if fence_len >= 3 {
+            let marker = trimmed.chars().next();
+            if in_fence {
+                if marker == fence_marker {
+                    in_fence = false;
+                    fence_marker = None;
+                }
+            } else {
+                in_fence = true;
+                fence_marker = marker;
+            }
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        // CommonMark: 4+ leading spaces makes this a code block, not a
+        // heading — checked against the untrimmed line, not `trimmed`.
+        if line.len() - trimmed.len() >= 4 {
+            continue;
+        }
+        let hashes = trimmed.chars().take_while(|&c| c == '#').count();
+        if hashes == 0 || hashes > 6 {
+            continue;
+        }
+        let rest = &trimmed[hashes..];
+        if !rest.is_empty() && !rest.starts_with(' ') && !rest.starts_with('\t') {
+            // e.g. `#!/usr/bin/env` in a fence-less snippet, or a bare
+            // hashtag-like token — not a heading per CommonMark.
+            continue;
+        }
+        let text = rest.trim().trim_end_matches('#').trim();
+        if text.is_empty() {
+            continue;
+        }
+        let mut qn = format!("{}::{}", path, text);
+        if !seen.insert(qn.clone()) {
+            qn = format!("{}#{}", qn, idx + 1);
+            seen.insert(qn.clone());
+        }
+        out.push(ParsedSymbol {
+            qualified_name: qn,
+            name: text.to_string(),
+            kind: SymbolKind::Heading,
+            language: "markdown".to_string(),
+            path: path.to_string(),
+            line_start: idx + 1,
+            line_end: idx + 1,
+            signature: trimmed.chars().take(120).collect(),
+            docstring: String::new(),
+            name_tokens: tokenize_identifier(text),
+            is_entry_point: false,
+            is_test: false,
+            class_context: None,
+            complexity: 1,
+        });
+    }
+    out
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3066,6 +3149,39 @@ public class FooTest {
         assert_eq!(find(&symbols, "hello").kind, SymbolKind::Method);
     }
 
+    /// Regression test for the 2026-07-10 fix: `call_node_types` used to say
+    /// `"method_call"`, a node kind that does not exist in the vendored
+    /// `tree-sitter-ruby` grammar (the real one is `"call"`) — so every
+    /// single Ruby call, in every repo, silently produced zero call edges,
+    /// with no error. This test asserts the actual behavior that regressed:
+    /// a bare paren-less call (`puts "hi"`), and a receiver call
+    /// (`self.log_it`) that must resolve to the sibling method in the same
+    /// class, not just appear as an unresolved textual mention.
+    #[test]
+    #[cfg(feature = "lang-ruby")]
+    fn test_ruby_real_grammar_symbols_and_calls_are_accurate() {
+        let code = "class Greeter\n  def hello\n    puts \"hi\"\n    self.log_it\n  end\n\n  def log_it\n    puts(\"logged\")\n  end\nend\n";
+        let symbols = extract_symbols(code, "ruby", "test.rb").unwrap();
+        let names = shallow_names(&symbols);
+        assert!(names.contains(&"Greeter"));
+        assert!(names.contains(&"hello"));
+        assert!(names.contains(&"log_it"));
+
+        let calls = extract_calls(code, "ruby", "test.rb").unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.enclosing_name == "hello" && c.callee == "puts"),
+            "bare paren-less call must produce a call edge, got: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c.enclosing_name == "hello"
+                && c.callee == "log_it"
+                && c.receiver.as_deref() == Some("self")),
+            "self.log_it must produce a call edge with receiver captured, got: {calls:?}"
+        );
+    }
+
     // ---------------------------------------------------------------
     // Tier-0.5 shallow extraction tests
     // ---------------------------------------------------------------
@@ -3126,6 +3242,59 @@ public class FooTest {
         );
     }
 
+    #[test]
+    fn test_markdown_headings_are_extracted_with_line_numbers_and_kind() {
+        let code = "# Title\n\nsome text\n\n## Section One\n\ntext\n\n### Sub Section\n\n#Not A Heading (no space)\n";
+        let syms = extract_markdown_symbols(code, "README.md");
+        let names: Vec<&str> = syms.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["Title", "Section One", "Sub Section"]);
+        assert!(syms.iter().all(|s| s.kind == SymbolKind::Heading));
+
+        let title = syms.iter().find(|s| s.name == "Title").unwrap();
+        assert_eq!(title.line_start, 1);
+        assert_eq!(title.line_end, 1);
+
+        let section = syms.iter().find(|s| s.name == "Section One").unwrap();
+        assert_eq!(section.line_start, 5);
+        assert_eq!(section.qualified_name, "README.md::Section One");
+    }
+
+    #[test]
+    fn test_markdown_headings_ignore_fenced_code_block_content() {
+        let code = "# Real Heading\n\n```python\n# not a heading, this is a python comment\ndef foo():\n    pass\n```\n\n## Also Real\n";
+        let syms = extract_markdown_symbols(code, "doc.md");
+        let names: Vec<&str> = syms.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["Real Heading", "Also Real"],
+            "a '#'-prefixed line inside a fenced code block must not be treated as a heading"
+        );
+    }
+
+    #[test]
+    fn test_markdown_headings_ignore_shebang_and_hashtag_like_lines() {
+        let code = "#!/usr/bin/env markdown\n#hashtag with no space\n####### too many hashes\n# \n## Real One\n";
+        let syms = extract_markdown_symbols(code, "a.md");
+        let names: Vec<&str> = syms.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["Real One"]);
+    }
+
+    #[test]
+    fn test_markdown_language_routes_through_extract_file_data_shape() {
+        // language_for_extension must map .md to "markdown" so the indexer
+        // pipeline actually reaches extract_markdown_symbols at all.
+        assert_eq!(
+            crate::indexer::lang_constants::language_for_extension("md"),
+            Some("markdown")
+        );
+        assert_eq!(
+            crate::indexer::lang_constants::language_for_extension("markdown"),
+            Some("markdown")
+        );
+        // Markdown has no tree-sitter grammar, ever — extract_file_data's
+        // dedicated branch is the only path that can produce symbols for it.
+        assert!(parse_tree("# x", "markdown").is_none());
+    }
     #[test]
     fn test_shallow_kotlin() {
         let code = "data class User(val name: String)\nfun greet(user: User) {}\ninterface Repository {}\n";

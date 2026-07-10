@@ -190,10 +190,13 @@ pub enum SymbolKind {
     Struct,
     Trait,
     Impl,
+    /// A markdown ATX heading (`#`..`######`), indexed as a searchable
+    /// symbol so docs sections show up in `search`/`locate` the same way
+    /// code symbols do. Never has call/reference edges.
+    Heading,
 }
-
 impl SymbolKind {
-    pub fn as_str(&self) -> &'static str {
+pub fn as_str(&self) -> &'static str {
         match self {
             Self::Function => "function",
             Self::Class => "class",
@@ -206,9 +209,9 @@ impl SymbolKind {
             Self::Struct => "struct",
             Self::Trait => "trait",
             Self::Impl => "impl",
+            Self::Heading => "heading",
         }
-    }
-}
+    }}
 
 #[cfg(test)]
 mod tests {

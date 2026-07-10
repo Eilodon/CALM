@@ -411,6 +411,11 @@ pub fn language_for_extension(ext: &str) -> Option<&'static str> {
         // `indexer::sql`'s module doc comment for why.
         "sql" => Some("sql"),
 
+        // Standalone module, same shape as `sql` above — not tree-sitter,
+        // dedicated fence-aware line-scan for ATX headings only (see
+        // `indexer::parser::extract_markdown_symbols`).
+        "md" | "markdown" => Some("markdown"),
+
         _ => None,
     }
 }

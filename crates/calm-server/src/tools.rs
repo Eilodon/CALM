@@ -1104,11 +1104,14 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
 
-        let diff = "diff --git a/README.md b/README.md\n\
-                     --- a/README.md\n\
-                     +++ b/README.md\n\
-                     @@ -1,1 +1,2 @@\n\
-                      Title\n\
+        // NOTES.txt, not README.md: markdown headings are indexed now (see
+        // `extract_markdown_symbols`), so a .md file is no longer
+        // out-of-scope — .txt still has no `language_for_extension` entry.
+        let diff = "diff --git a/NOTES.txt b/NOTES.txt\n\\
+                     --- a/NOTES.txt\n\\
+                     +++ b/NOTES.txt\n\\
+                     @@ -1,1 +1,2 @@\n\\
+                      Title\n\\
                      +New paragraph\n";
 
         let output = server.diff_impact(rmcp::handler::server::wrapper::Parameters(DiffImpactParams {
@@ -1120,7 +1123,7 @@ mod tests {
 
         assert_eq!(
             v["unindexed_files"],
-            serde_json::json!([{"path": "README.md", "reason": "out_of_scope"}])
+            serde_json::json!([{"path": "NOTES.txt", "reason": "out_of_scope"}])
         );
         assert_eq!(
             v["aggregate_risk"], "low",
@@ -1129,7 +1132,6 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
-
     /// A `.rs` file under a dotdir (e.g. `.claude/`) has a recognized source
     /// extension but sits in a path the walker never descends into (see
     /// `calm_core::walk::path_has_ignored_dir_component`) — must be
