@@ -7,7 +7,7 @@ impl CalmServer {
         name = "callers",
         description = "USE WHEN: you need to know who calls a specific symbol — blast radius scan, refactoring impact. USE THIS for SYMBOL-LEVEL call sites. NOT for file-level imports (use dependencies). vs edit_context: callers is for exploration; edit_context is the mandatory pre-edit tool."
     )]
-    pub(crate) fn callers(&self, Parameters(p): Parameters<CallersParams>) -> Json<ResolvedOutcome<CallersOutput>> {
+pub(crate) fn callers(&self, Parameters(p): Parameters<CallersParams>) -> Json<ResolvedOutcome<CallersOutput>> {
         Json(self.timed_tool("callers", || {
             // READ-only: open a dedicated read connection (SINGLE_WRITER enforcement)
             let conn = match self.make_read_conn() {
@@ -98,7 +98,12 @@ impl CalmServer {
             } else {
                 None
             };
-            ResolvedOutcome::success(CallersOutput {
+            // Zero direct AND zero ambiguous callers is the exact "0 usages"
+            // trap a pre-edit safety check can be fooled by — attach an
+            // advisory caveat rather than let an empty list read as proof.
+            let no_usage_caveat =
+                (count == 0 && ambiguous_count == 0).then(|| Caveat::no_direct_usage(&p.symbol));
+            let out = ResolvedOutcome::success(CallersOutput {
                 symbol: p.symbol,
                 edges_ready: self.edges_ready(),
                 direct,
@@ -109,10 +114,13 @@ impl CalmServer {
                 transitive_count,
                 transitive_capped,
                 suggested_next: self.filter_sn(sn),
-            })
+            });
+            match no_usage_caveat {
+                Some(cv) => out.with_caveat(cv),
+                None => out,
+            }
         }))
-    }
-    #[tool(
+    }    #[tool(
         name = "callees",
         description = "USE WHEN: you need to trace what a symbol calls — understanding logic flow, internal deps. NOT for finding who calls this symbol (use callers). vs callers: callers=upward (who calls X); callees=downward (what X calls)."
     )]

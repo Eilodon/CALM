@@ -542,6 +542,57 @@ impl<T> ToolOutcome<T> {
     }
 }
 
+/// Structured, machine-checkable hint attached to a tool result whose
+/// literal content (empty list / not-found) could otherwise be misread as
+/// proof of absence. `class` lets a safety gate branch without parsing
+/// `message`; `message` is the human-readable explanation. Design mirrors
+/// zzet/gortex's `ZeroEdgeCaveat` (Apache-2.0) — reimplemented against
+/// CALM's own resolver shape, not a line-for-line port.
+#[derive(Serialize, JsonSchema)]
+pub(crate) struct Caveat {
+    pub(crate) class: &'static str,
+    pub(crate) message: String,
+}
+
+impl Caveat {
+    /// The queried symbol did not resolve to anything in the index at all
+    /// — the most common cause of an unpleasant "0 results" surprise, and
+    /// almost always a typo, wrong case, or a file in an excluded path
+    /// rather than the symbol genuinely not existing.
+    pub(crate) fn not_found(symbol: &str) -> Self {
+        Caveat {
+            class: "not_found",
+            message: format!(
+                "no symbol named '{symbol}' is in the index — likely a typo, wrong \
+                 case, or the file lives in an excluded path (target/, node_modules/, \
+                 dist/, build/, __pycache__/, venv/, legacy/, dotdirs). Run \
+                 search(kind=\"hybrid\") to find the exact name before concluding it \
+                 doesn't exist — a not-found result here is not proof the symbol is \
+                 unused or absent from the codebase."
+            ),
+        }
+    }
+
+    /// The symbol resolved, but the specific edge/usage query on it came
+    /// back with zero rows. Distinct from `not_found`: the symbol is real,
+    /// but static analysis may simply not see how it's reached (dynamic
+    /// dispatch, reflection, string-based invocation, or a public API
+    /// consumed outside this repo).
+    pub(crate) fn no_direct_usage(symbol: &str) -> Self {
+        Caveat {
+            class: "no_direct_usage",
+            message: format!(
+                "'{symbol}' has zero direct callers in the index. This can mean \
+                 genuine dead code, but it can also mean call sites use dynamic \
+                 dispatch, reflection, or string-based invocation that static \
+                 analysis can't resolve, or that '{symbol}' is a public API consumed \
+                 outside this repo. Do not treat this as proof of no usage without \
+                 also checking dependencies() and the symbol's exported visibility."
+            ),
+        }
+    }
+}
+
 /// Same as `ToolOutcome<T>`, plus the `ambiguous` branch every
 /// `resolve_symbol`-based tool can also produce — same flatten-based,
 /// root-`type:object` reasoning as `ToolOutcome<T>` above.
@@ -553,6 +604,11 @@ pub(crate) struct ResolvedOutcome<T> {
     ambiguous: Option<AmbiguousResult>,
     #[serde(flatten, skip_serializing_if = "Option::is_none")]
     success: Option<T>,
+    /// Advisory hint on an empty/not-found result. Never set alongside a
+    /// populated `success` unless a tool opts in via `with_caveat` (e.g.
+    /// `callers` on zero direct callers).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    caveat: Option<Caveat>,
 }
 
 impl<T> ResolvedOutcome<T> {
@@ -561,6 +617,7 @@ impl<T> ResolvedOutcome<T> {
             error: Some(detail),
             ambiguous: None,
             success: None,
+            caveat: None,
         }
     }
 
@@ -569,7 +626,9 @@ impl<T> ResolvedOutcome<T> {
     /// caller — it needs tool-specific work (`track_symbol`, health
     /// lookups, ...) that doesn't belong in a generic helper.
     pub(crate) fn not_found(symbol: &str) -> Self {
-        Self::error(not_found_error(symbol).error)
+        let mut out = Self::error(not_found_error(symbol).error);
+        out.caveat = Some(Caveat::not_found(symbol));
+        out
     }
 
     pub(crate) fn ambiguous(candidates: &[CandidateRow]) -> Self {
@@ -577,6 +636,7 @@ impl<T> ResolvedOutcome<T> {
             error: None,
             ambiguous: Some(to_ambiguous(candidates)),
             success: None,
+            caveat: None,
         }
     }
 
@@ -585,7 +645,16 @@ impl<T> ResolvedOutcome<T> {
             error: None,
             ambiguous: None,
             success: Some(value),
+            caveat: None,
         }
+    }
+
+    /// Attaches an advisory caveat to an already-built success result —
+    /// e.g. `callers` on a resolved symbol with zero direct callers. Never
+    /// overrides `error`/`ambiguous`; only meaningful after `success`.
+    pub(crate) fn with_caveat(mut self, caveat: Caveat) -> Self {
+        self.caveat = Some(caveat);
+        self
     }
 }
 
