@@ -16,6 +16,9 @@ anyhow = { workspace = true }
 rmcp = { workspace = true }
 schemars = { workspace = true }
 
+[dev-dependencies]
+tracing-subscriber = { workspace = true }
+
 [features]
 default = ["embeddings", "tier0-5", "scip-overlay"]
 embeddings = ["calm-core/embeddings"]
