@@ -2437,6 +2437,115 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn symbols_batch_reports_found_missing_and_edges() {
+        let dir = std::env::temp_dir().join(format!("ci_symbols_batch_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.py"), "def foo():\n    pass\n\n\ndef bar():\n    foo()\n").unwrap();
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.py::foo', 'foo', 'function', 'python', 'a.py', 1, 2, 'def foo():', '', 'foo', 1, 0, 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.py::bar', 'bar', 'function', 'python', 'a.py', 5, 6, 'def bar():', '', 'bar', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO call_edges (from_symbol, to_symbol, from_path, to_path, edge_confidence, call_site_line)
+                 VALUES ('a.py::bar', 'a.py::foo', 'a.py', 'a.py', 'resolved', 6)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let v = jv(server.symbols_batch(rmcp::handler::server::wrapper::Parameters(
+            SymbolsBatchParams {
+                qualified_names: vec![
+                    "a.py::foo".into(),
+                    "a.py::bar".into(),
+                    "a.py::does_not_exist".into(),
+                ],
+                include_callers: true,
+                include_callees: true,
+            },
+        )));
+
+        assert_eq!(v["found_count"], 2);
+        assert_eq!(v["not_found_count"], 1);
+        assert_eq!(v["truncated"], false);
+        assert!(
+            v["caveat"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("a.py::does_not_exist"),
+            "caveat should name the missing id, got: {v}"
+        );
+
+        let results = v["results"].as_array().unwrap();
+        assert_eq!(results.len(), 3, "results must preserve input order/count");
+
+        let foo = &results[0];
+        assert_eq!(foo["qualified_name"], "a.py::foo");
+        assert_eq!(foo["found"], true);
+        assert!(foo["source"].as_str().unwrap().contains("def foo"));
+        assert_eq!(foo["direct_callers"][0]["symbol"], "a.py::bar");
+
+        let bar = &results[1];
+        assert_eq!(bar["qualified_name"], "a.py::bar");
+        assert_eq!(bar["found"], true);
+        assert_eq!(bar["direct_callees"][0]["symbol"], "a.py::foo");
+
+        let missing = &results[2];
+        assert_eq!(missing["qualified_name"], "a.py::does_not_exist");
+        assert_eq!(missing["found"], false);
+        assert!(missing.get("source").is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn symbols_batch_no_caveat_when_all_found() {
+        let dir = std::env::temp_dir().join(format!("ci_symbols_batch_ok_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.py"), "def foo():\n    pass\n").unwrap();
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.py::foo', 'foo', 'function', 'python', 'a.py', 1, 2, 'def foo():', '', 'foo', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let v = jv(server.symbols_batch(rmcp::handler::server::wrapper::Parameters(
+            SymbolsBatchParams {
+                qualified_names: vec!["a.py::foo".into()],
+                include_callers: false,
+                include_callees: false,
+            },
+        )));
+
+        assert_eq!(v["found_count"], 1);
+        assert_eq!(v["not_found_count"], 0);
+        assert!(v.get("caveat").is_none());
+        assert!(v["results"][0].get("direct_callers").is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     #[test]
     fn source_omits_content_warning_for_clean_code() {
         let dir = std::env::temp_dir().join(format!("ci_source_clean_{}", std::process::id()));

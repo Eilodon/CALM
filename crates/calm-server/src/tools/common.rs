@@ -591,6 +591,26 @@ impl Caveat {
             ),
         }
     }
+
+    /// Some, but not all, of a `symbols_batch` call's requested
+    /// `qualified_names` matched nothing in the index. Names the first
+    /// few missing ids so the caller doesn't have to diff the request
+    /// against `results` to see which ones failed.
+    pub(crate) fn batch_some_not_found(missing: &[String]) -> Self {
+        let sample: Vec<&str> = missing.iter().take(5).map(|s| s.as_str()).collect();
+        Caveat {
+            class: "batch_some_not_found",
+            message: format!(
+                "{} of the requested qualified_names were not found in the index \
+                 (e.g. {}). symbols_batch does no fuzzy matching — a near-miss id \
+                 comes back found:false rather than silently substituting the \
+                 closest name. Run search(kind=\"hybrid\") to get the exact \
+                 qualified_name for each missing entry.",
+                missing.len(),
+                sample.join(", "),
+            ),
+        }
+    }
 }
 
 /// Same as `ToolOutcome<T>`, plus the `ambiguous` branch every

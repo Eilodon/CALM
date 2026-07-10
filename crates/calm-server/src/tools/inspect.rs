@@ -287,7 +287,257 @@ pub(crate) fn source(&self, Parameters(p): Parameters<SourceParams>) -> Json<Res
                 suggested_next: self.filter_sn(sn),
             })
         }))
-    }}
+    }
+
+    #[tool(
+        name = "symbols_batch",
+        description = "USE WHEN: you need source (+ optionally direct callers/callees) for several EXACT qualified_names in one round trip — e.g. following up on a locate/search result list. Requires exact qualified_name, not a bare symbol name: an id that doesn't match exactly comes back found:false instead of fuzzy-substituting the closest name (unlike understand's fuzzy search). NOT FOR: a single bare-name lookup (use source/symbol_info) or exploring an unknown name (use search/locate first to get exact qualified_names). Capped at 50 ids per call."
+    )]
+    pub(crate) fn symbols_batch(&self, Parameters(p): Parameters<SymbolsBatchParams>) -> Json<ToolOutcome<SymbolsBatchOutput>> {
+        Json(self.timed_tool("symbols_batch", || {
+            let conn = match self.make_read_conn() {
+                Ok(c) => c,
+                Err(e) => return db_error(e),
+            };
+
+            let mut seen = std::collections::HashSet::new();
+            let mut ids: Vec<String> = Vec::new();
+            for qn in &p.qualified_names {
+                if seen.insert(qn.clone()) {
+                    ids.push(qn.clone());
+                }
+            }
+            let truncated = ids.len() > SYMBOLS_BATCH_MAX;
+            ids.truncate(SYMBOLS_BATCH_MAX);
+
+            if ids.is_empty() {
+                return ToolOutcome::success(SymbolsBatchOutput {
+                    results: vec![],
+                    found_count: 0,
+                    not_found_count: 0,
+                    truncated: false,
+                    caveat: None,
+                    suggested_next: suggested(
+                        "search",
+                        "Provide at least one qualified_name — get exact ids from search/locate",
+                    ),
+                });
+            }
+
+            const CHUNK: usize = 200;
+            let mut found: std::collections::HashMap<String, CandidateRow> = std::collections::HashMap::new();
+            for chunk in ids.chunks(CHUNK) {
+                let placeholders = chunk
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _)| format!("?{}", i + 1))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let sql = format!(
+                    "SELECT name, qualified_name, kind, path, line_start, line_end, signature, docstring, caller_count, is_hub, language, class_context, is_entry_point, is_test, coreness
+                     FROM symbols WHERE qualified_name IN ({placeholders})"
+                );
+                if let Ok(mut stmt) = conn.prepare(&sql) {
+                    if let Ok(iter) = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                        Ok(CandidateRow {
+                            name: row.get(0)?,
+                            qualified_name: row.get(1)?,
+                            kind: row.get(2)?,
+                            path: row.get(3)?,
+                            line_start: row.get(4)?,
+                            line_end: row.get(5)?,
+                            signature: row.get(6)?,
+                            docstring: row.get(7)?,
+                            caller_count: row.get(8)?,
+                            is_hub: row.get::<_, i64>(9)? != 0,
+                            language: row.get(10)?,
+                            class_context: row.get(11)?,
+                            is_entry_point: row.get::<_, i64>(12)? != 0,
+                            is_test: row.get::<_, i64>(13)? != 0,
+                            coreness: row.get(14)?,
+                        })
+                    }) {
+                        for r in iter.flatten() {
+                            found.insert(r.qualified_name.clone(), r);
+                        }
+                    }
+                }
+            }
+
+            let found_ids: Vec<String> = found.keys().cloned().collect();
+            let mut callers_by_symbol: std::collections::HashMap<String, Vec<CallerEntry>> = std::collections::HashMap::new();
+            let mut callees_by_symbol: std::collections::HashMap<String, Vec<CalleeEntry>> = std::collections::HashMap::new();
+
+            if p.include_callers && !found_ids.is_empty() {
+                for chunk in found_ids.chunks(CHUNK) {
+                    let placeholders = chunk
+                        .iter()
+                        .enumerate()
+                        .map(|(i, _)| format!("?{}", i + 1))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let sql = format!(
+                        "SELECT to_symbol, from_symbol, from_path, edge_confidence, call_site_line, edge_kind
+                         FROM call_edges WHERE to_symbol IN ({placeholders}) AND ruled_out_by_scip = 0"
+                    );
+                    if let Ok(mut stmt) = conn.prepare(&sql) {
+                        if let Ok(iter) = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                            let to_symbol: String = row.get(0)?;
+                            let from_path: String = row.get::<_, String>(2).unwrap_or_default();
+                            let line: Option<i64> = row.get(4)?;
+                            Ok((
+                                to_symbol,
+                                CallerEntry {
+                                    symbol: row.get(1)?,
+                                    preview: line_preview(&self.project_root, &from_path, line),
+                                    path: from_path,
+                                    edge_confidence: row.get(3)?,
+                                    edge_kind: row.get(5)?,
+                                    line,
+                                },
+                            ))
+                        }) {
+                            for (to_symbol, entry) in iter.flatten() {
+                                callers_by_symbol.entry(to_symbol).or_default().push(entry);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if p.include_callees && !found_ids.is_empty() {
+                let mut raw: Vec<(String, String, String, String, String, Option<i64>)> = Vec::new();
+                for chunk in found_ids.chunks(CHUNK) {
+                    let placeholders = chunk
+                        .iter()
+                        .enumerate()
+                        .map(|(i, _)| format!("?{}", i + 1))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let sql = format!(
+                        "SELECT from_symbol, to_symbol, to_path, edge_confidence, edge_kind, call_site_line
+                         FROM call_edges WHERE from_symbol IN ({placeholders}) AND ruled_out_by_scip = 0"
+                    );
+                    if let Ok(mut stmt) = conn.prepare(&sql) {
+                        if let Ok(iter) = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2).unwrap_or_default(),
+                                row.get::<_, String>(3)?,
+                                row.get::<_, String>(4)?,
+                                row.get::<_, Option<i64>>(5)?,
+                            ))
+                        }) {
+                            raw.extend(iter.flatten());
+                        }
+                    }
+                }
+                for (from_symbol, to_symbol, to_path, edge_confidence, edge_kind, line) in raw {
+                    let from_file_path = found.get(&from_symbol).map(|c| c.path.clone()).unwrap_or_default();
+                    callees_by_symbol.entry(from_symbol).or_default().push(CalleeEntry {
+                        symbol: to_symbol,
+                        path: to_path,
+                        edge_confidence,
+                        edge_kind,
+                        preview: line_preview(&self.project_root, &from_file_path, line),
+                        line,
+                    });
+                }
+            }
+
+            let mut results = Vec::with_capacity(ids.len());
+            let mut found_count = 0usize;
+            let mut missing: Vec<String> = Vec::new();
+
+            for qn in &ids {
+                if let Some(row) = found.get(qn) {
+                    found_count += 1;
+                    self.track_symbol(&row.qualified_name);
+                    self.track_file(&row.path);
+
+                    let full_path = self.project_root.join(&row.path);
+                    let (source, token_estimate, content_warning) = match std::fs::read_to_string(&full_path) {
+                        Ok(content) => {
+                            let lines: Vec<&str> = content.lines().collect();
+                            let start = (row.line_start as usize).saturating_sub(1);
+                            let end = (row.line_end as usize).min(lines.len());
+                            let sanitized = sanitize_source_output(&lines[start..end].join("\n"));
+                            let tok = estimate_tokens(&sanitized);
+                            let warn = injection_warning(&sanitized);
+                            (Some(sanitized), Some(tok), warn)
+                        }
+                        Err(_) => (None, None, None),
+                    };
+
+                    results.push(SymbolsBatchEntry {
+                        qualified_name: qn.clone(),
+                        found: true,
+                        name: Some(row.name.clone()),
+                        kind: Some(row.kind.clone()),
+                        path: Some(row.path.clone()),
+                        line_start: Some(row.line_start),
+                        line_end: Some(row.line_end),
+                        language: Some(row.language.clone()),
+                        is_hub: Some(row.is_hub),
+                        source,
+                        token_estimate,
+                        content_warning,
+                        direct_callers: callers_by_symbol.remove(qn).unwrap_or_default(),
+                        direct_callees: callees_by_symbol.remove(qn).unwrap_or_default(),
+                    });
+                } else {
+                    missing.push(qn.clone());
+                    results.push(SymbolsBatchEntry {
+                        qualified_name: qn.clone(),
+                        found: false,
+                        name: None,
+                        kind: None,
+                        path: None,
+                        line_start: None,
+                        line_end: None,
+                        language: None,
+                        is_hub: None,
+                        source: None,
+                        token_estimate: None,
+                        content_warning: None,
+                        direct_callers: vec![],
+                        direct_callees: vec![],
+                    });
+                }
+            }
+
+            let not_found_count = missing.len();
+            let caveat = if missing.is_empty() {
+                None
+            } else {
+                Some(Caveat::batch_some_not_found(&missing))
+            };
+            let sn = if not_found_count > 0 {
+                suggested(
+                    "search",
+                    "Look up the correct qualified_name for the missing ids",
+                )
+            } else if results.iter().any(|r| r.is_hub == Some(true)) {
+                suggested(
+                    "edit_context",
+                    "Hub symbol(s) in this batch — check blast radius before modifying",
+                )
+            } else {
+                None
+            };
+
+            ToolOutcome::success(SymbolsBatchOutput {
+                results,
+                found_count,
+                not_found_count,
+                truncated,
+                caveat,
+                suggested_next: self.filter_sn(sn),
+            })
+        }))
+    }
+}
 
 #[derive(Deserialize, JsonSchema)]
 #[allow(dead_code)]
@@ -538,6 +788,75 @@ pub(crate) struct UnderstandOutput {
     pub(crate) callers_summary: Vec<CallerEntry>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) edges_ready: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) suggested_next: Option<SuggestedNext>,
+}
+
+// ---------------------------------------------------------------------------
+// Tool: symbols_batch
+// ---------------------------------------------------------------------------
+
+const SYMBOLS_BATCH_MAX: usize = 50;
+
+#[derive(Deserialize, JsonSchema)]
+pub(crate) struct SymbolsBatchParams {
+    /// Exact `qualified_name`s to fetch (e.g. `path/to/file.rs::Type::method`)
+    /// — NOT bare names. Get these from a prior `search`/`locate` call. This
+    /// tool does no fuzzy matching: an id that doesn't match exactly comes
+    /// back `found: false` for that entry rather than silently substituting
+    /// the closest name. Capped at 50 entries per call (extras are dropped,
+    /// see `truncated`).
+    pub(crate) qualified_names: Vec<String>,
+    /// `true` to also include each found symbol's direct callers (same
+    /// shape as `callers`'s `direct` field — no transitive/ambiguous split).
+    #[serde(default)]
+    pub(crate) include_callers: bool,
+    /// `true` to also include each found symbol's direct callees.
+    #[serde(default)]
+    pub(crate) include_callees: bool,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub(crate) struct SymbolsBatchEntry {
+    pub(crate) qualified_name: String,
+    pub(crate) found: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) line_start: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) line_end: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) language: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) is_hub: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) token_estimate: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) content_warning: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub(crate) direct_callers: Vec<CallerEntry>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub(crate) direct_callees: Vec<CalleeEntry>,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub(crate) struct SymbolsBatchOutput {
+    pub(crate) results: Vec<SymbolsBatchEntry>,
+    pub(crate) found_count: usize,
+    pub(crate) not_found_count: usize,
+    /// `true` when more than `SYMBOLS_BATCH_MAX` distinct ids were
+    /// requested — only the first `SYMBOLS_BATCH_MAX` (input order, after
+    /// dedup) were looked up.
+    pub(crate) truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) caveat: Option<Caveat>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) suggested_next: Option<SuggestedNext>,
 }
