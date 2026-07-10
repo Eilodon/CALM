@@ -74,6 +74,18 @@ tree-sitter-swift = "=0.7.0"
 # (normal) — `tree-sitter` itself is only a dev-dependency there, so it
 # doesn't propagate to us.
 tree-sitter-scala = "=0.24.1"
+# Phase C (2026-07-11): tree-sitter-dart has no git tags on its source repo
+# (github.com/ast-grep/tree-sitter-dart) — verified ABI by downloading each
+# published .crate tarball directly from static.crates.io and grepping the
+# vendored src/parser.c. 0.0.4 is the newest ABI-14 release; 0.1.0/0.2.0 jumped
+# to ABI 15. Unlike every other Tier-0.5 grammar in this file, 0.0.4's real
+# dependency (checked its own Cargo.toml.orig, not crates.io's dependency API
+# which only reports the LATEST version's shape) is a direct, unbounded
+# `tree-sitter = ">=0.20.8"` — no tree-sitter-language shim, predates that
+# pattern. Also uses the OLD binding API: a bare `tree_sitter_dart::language()
+# -> Language` function, not the modern `LANGUAGE: LanguageFn` const + 
+# `.into()` every other grammar here uses — see lang_constants.rs's ts_lang_dart.
+tree-sitter-dart = "=0.0.4"
 # Stack Graphs (formal name resolution)
 stack-graphs = "0.14"
 tree-sitter-stack-graphs = "0.10"

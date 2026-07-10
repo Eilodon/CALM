@@ -41,6 +41,7 @@ tree-sitter-r       = { workspace = true, optional = true }
 tree-sitter-kotlin-ng = { workspace = true, optional = true }
 tree-sitter-swift    = { workspace = true, optional = true }
 tree-sitter-scala    = { workspace = true, optional = true }
+tree-sitter-dart     = { workspace = true, optional = true }
 scip = { version = "0.9", optional = true }
 protobuf = { version = "=3.7.2", optional = true }
 tempfile = { version = "3", optional = true }
@@ -85,6 +86,7 @@ lang-swift  = ["dep:tree-sitter-swift"]
 # Phase C (2026-07-11): same opt-in-only posture as kotlin/swift above — not
 # bundled into tier0-5 yet.
 lang-scala  = ["dep:tree-sitter-scala"]
+lang-dart   = ["dep:tree-sitter-dart"]
 # Bundle: all seven tree-sitter-upgraded Tier-0.5 languages at once.
 tier0-5 = ["lang-c", "lang-cpp", "lang-ruby", "lang-php", "lang-csharp", "lang-shell", "lang-r"]
 # SCIP overlay (rust-analyzer batch `scip`) upgrades existing Rust call edges

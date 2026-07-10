@@ -260,6 +260,46 @@ fn resolve_name_node<'a>(
                 None
             }
         }
+        // Dart (tree-sitter-dart 0.0.4 — an older, hand-written grammar; the
+        // only ABI-14-compatible published version, see lang_constants.rs's
+        // Dart entry): a method/constructor's name sits 2 levels deep with
+        // no field path all the way down. `class_member_definition` wraps
+        // either `method_signature` (a method with a body) or `declaration`
+        // (an abstract/interface method with no body, a constructor, OR a
+        // plain field — the last of which correctly falls through to `None`
+        // below since it has neither a `function_signature` nor
+        // `constructor_signature` child). Verified via a real AST dump, not
+        // guessed: both `function_signature` and `constructor_signature` are
+        // *unnamed* positional children of that wrapper (no field to jump
+        // straight to), but each carries a real `name` field of its own once
+        // reached.
+        "class_member_definition" => {
+            let mut cursor = node.walk();
+            node.children(&mut cursor).find_map(|wrapper| {
+                if !matches!(wrapper.kind(), "method_signature" | "declaration") {
+                    return None;
+                }
+                let mut inner_cursor = wrapper.walk();
+                wrapper.children(&mut inner_cursor).find_map(|inner| {
+                    if matches!(inner.kind(), "function_signature" | "constructor_signature") {
+                        inner.child_by_field_name("name")
+                    } else {
+                        None
+                    }
+                })
+            })
+        }
+        // Dart top-level function declarations (`void main() {...}`) parse
+        // as a bare `lambda_expression` at the compilation-unit level in
+        // this grammar — the same node kind a true anonymous callback
+        // (`(x) => x + 1`) also produces. The two are told apart by whether
+        // `parameters` (a `function_signature`) itself has a `name` field:
+        // present for a real top-level declaration, absent for an anonymous
+        // lambda — so this safely returns `None` for the latter instead of
+        // manufacturing a fake symbol, same guard shape as the R arm above.
+        "lambda_expression" => node
+            .child_by_field_name("parameters")
+            .and_then(|p| p.child_by_field_name("name")),
         _ => None,
     }
 }
@@ -1987,6 +2027,32 @@ pub(crate) fn detect_scala(s: &str) -> Option<(String, SymbolKind)> {
     }
     None
 }
+
+// Dart shallow fallback: class-only, deliberately no function detection.
+// Unlike every other Tier-0.5 language here, Dart has no keyword
+// ("def"/"fun"/"function") preceding a top-level or method declaration —
+// it's just `ReturnType name(params) {`, indistinguishable by a one-line
+// regex/prefix scan from a field declaration or a call continuation
+// without risking real false positives. The real tree-sitter path (when
+// the `lang-dart` grammar is compiled in) handles this correctly via
+// `resolve_name_node`'s dedicated arms; this fallback only ever runs when
+// that grammar isn't available, so a class-only shallow index is a
+// documented, honest scope cut rather than a guess that could misfire.
+pub(crate) fn detect_dart(s: &str) -> Option<(String, SymbolKind)> {
+    let class_kws: &[(&str, SymbolKind)] = &[
+        ("class ", SymbolKind::Class),
+        ("abstract class ", SymbolKind::Class),
+        ("mixin ", SymbolKind::Class),
+    ];
+    for (kw, kind) in class_kws {
+        if let Some(rest) = s.strip_prefix(kw)
+            && let Some(name) = ident_at_start(rest)
+        {
+            return Some((name, *kind));
+        }
+    }
+    None
+}
 fn detect_shallow(trimmed: &str, language: &str) -> Option<(String, SymbolKind)> {
     let spec = crate::indexer::lang_constants::find_spec(language)?;
     let s = strip_modifiers(trimmed, spec.modifier_keywords);
@@ -3417,6 +3483,16 @@ public class FooTest {
         assert!(names.contains(&"Repository"), "should detect sealed trait");
         assert!(names.contains(&"Singleton"), "should detect object");
     }
+
+    #[test]
+    fn test_shallow_dart() {
+        let code = "class Greeter {\nabstract class Named {\nmixin Loggable {\n";
+        let syms = extract_symbols_shallow(code, "dart", "a.dart");
+        let names = shallow_names(&syms);
+        assert!(names.contains(&"Greeter"), "should detect class");
+        assert!(names.contains(&"Named"), "should detect abstract class");
+        assert!(names.contains(&"Loggable"), "should detect mixin");
+    }
     #[test]
     fn test_shallow_shell() {
         let code = "function setup() {\nbuild() {\n  echo hi\n}\n";
@@ -3721,5 +3797,83 @@ class Foo {
         assert!(!bar.looks_option_or_result_chained);
         let baz = calls.iter().find(|c| c.callee == "baz").unwrap();
         assert!(baz.looks_option_or_result_chained);
+    }
+
+    #[test]
+    #[cfg(feature = "lang-dart")]
+    fn test_tier0_5_grammar_loads_dart() {
+        assert!(
+            parse_tree("void main() {}", "dart").is_some(),
+            "tree-sitter-dart grammar should load and parse — locks the pinned ABI \
+             (=0.0.4, ABI 14, the newest ABI-14 release since this grammar has no git \
+             tags — verified by downloading each published .crate tarball and grepping \
+             src/parser.c directly); a caret-range bump to 0.1.0+ (ABI 15) would \
+             silently regress this to shallow line-scan"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "lang-dart")]
+    fn test_dart_real_grammar_symbols_are_accurate() {
+        // tree-sitter-dart 0.0.4 (an older, hand-written grammar — see
+        // lang_constants.rs's Dart entry) has no dedicated call-expression
+        // node kind at all (calls are a generic member_access/selector/
+        // argument_part postfix chain shared with plain field access) —
+        // call-graph extraction is a documented scope cut, not an oversight.
+        // This test locks that gap in place (asserts calls stay empty) so a
+        // future accidental `call_node_types` entry that doesn't actually
+        // work correctly gets caught instead of silently shipping partial
+        // call edges.
+        let code = "class Greeter {\n  String name;\n\n  Greeter(this.name);\n\n  String greet() {\n    print(\"hello\");\n    return this.formatGreeting(name);\n  }\n\n  String formatGreeting(String n) {\n    return \"Hello, \" + n;\n  }\n}\n\nabstract class Named {\n  String getName();\n}\n\nvoid main() {\n  var g = Greeter(\"world\");\n  g.greet();\n}\n";
+        let symbols = extract_symbols(code, "dart", "a.dart").unwrap();
+        let names = shallow_names(&symbols);
+        assert!(names.contains(&"Greeter"), "should detect class");
+        assert!(names.contains(&"greet"), "should detect method with a body");
+        assert!(
+            names.contains(&"formatGreeting"),
+            "should detect second method with a body"
+        );
+        assert!(
+            names.contains(&"getName"),
+            "should detect abstract method (no body) inside an abstract class"
+        );
+        assert!(
+            names.contains(&"main"),
+            "should detect top-level function (parses as a named `lambda_expression`, \
+             not a dedicated top-level-function node kind, in this grammar)"
+        );
+
+        let greeter = symbols
+            .iter()
+            .find(|s| s.name == "Greeter" && s.kind == SymbolKind::Class)
+            .expect("Greeter should map to SymbolKind::Class");
+        assert!(greeter.class_context.is_none());
+
+        let greet = symbols
+            .iter()
+            .find(|s| s.name == "greet")
+            .expect("greet method should be found");
+        assert_eq!(
+            greet.class_context.as_deref(),
+            Some("Greeter"),
+            "greet's class_context should be Greeter"
+        );
+
+        let main_fn = symbols
+            .iter()
+            .find(|s| s.name == "main")
+            .expect("main should be found");
+        assert!(
+            main_fn.class_context.is_none(),
+            "top-level main should have no class_context"
+        );
+
+        let calls = extract_calls(code, "dart", "a.dart").unwrap();
+        assert!(
+            calls.is_empty(),
+            "Dart call-graph extraction is a documented scope cut (no clean \
+             call-expression node in this grammar) — see this test's doc comment; \
+             calls: {calls:?}"
+        );
     }
 }

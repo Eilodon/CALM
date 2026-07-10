@@ -213,6 +213,20 @@ fn ts_lang_scala() -> Option<tree_sitter::Language> {
     None
 }
 
+// tree-sitter-dart's Rust binding predates the modern `LANGUAGE: LanguageFn`
+// const convention every other grammar here uses — it's a bare
+// `language() -> tree_sitter::Language` function instead (verified by
+// downloading the actual published 0.0.4 .crate tarball and reading
+// bindings/rust/lib.rs directly, not assumed from the newer 0.2.0's shape).
+#[cfg(feature = "lang-dart")]
+fn ts_lang_dart() -> Option<tree_sitter::Language> {
+    Some(tree_sitter_dart::language())
+}
+#[cfg(not(feature = "lang-dart"))]
+fn ts_lang_dart() -> Option<tree_sitter::Language> {
+    None
+}
+
 const JS_TS_CONSTANTS: LangConstants = LangConstants {
     function_node_types: &[
         "function_declaration",
@@ -925,6 +939,65 @@ pub static LANGUAGES: &[LanguageSpec] = &[
             "case ",
         ],
         shallow_detect: Some(crate::indexer::parser::detect_scala),
+    },
+    // Dart (Phase C, 2026-07-11): tree-sitter-dart has no git tags on its
+    // source repo (github.com/ast-grep/tree-sitter-dart) — ABI verified by
+    // downloading each published .crate tarball directly from
+    // static.crates.io and grepping the vendored src/parser.c. 0.0.4 is the
+    // newest ABI-14 release; 0.1.0/0.2.0 jumped to ABI 15. This is also an
+    // older, hand-written grammar with a structurally different shape from
+    // every other language here — verified via a real AST dump, not
+    // guessed:
+    // - No dedicated call-expression node kind at all (calls are a generic
+    //   member_access/selector/argument_part postfix chain shared with
+    //   plain field access) — call-graph extraction is a DELIBERATE,
+    //   documented scope cut for this first pass (`call_node_types` is
+    //   empty), not an oversight. See `test_dart_real_grammar_symbols_are_
+    //   accurate` in parser.rs, which locks this gap in place.
+    // - A method/constructor's name sits 2 levels deep with no field path
+    //   all the way down (`class_member_definition` wraps `method_signature`
+    //   or `declaration`, which in turn wraps an unnamed `function_signature`/
+    //   `constructor_signature` positional child that finally has a real
+    //   `name` field) — handled by a dedicated `resolve_name_node` arm in
+    //   parser.rs, same pattern as C's declarator-chain walk.
+    // - A top-level function declaration (`void main() {...}`) parses as a
+    //   bare `lambda_expression` — the same node kind a true anonymous
+    //   callback produces — disambiguated by whether its `parameters`
+    //   (`function_signature`) has a `name` field (see `resolve_name_node`).
+    LanguageSpec {
+        name: "dart",
+        aliases: &[],
+        extensions: &["dart"],
+        constants: LangConstants {
+            function_node_types: &[
+                "class_definition",
+                "class_member_definition",
+                "lambda_expression",
+            ],
+            name_field: "name",
+            // Dart doc comments (`/// ...`) are a distinct node kind in this
+            // grammar, not folded into the generic "comment" kind (confirmed
+            // via node-types.json).
+            docstring_type: Some("documentation_comment"),
+            call_node_types: &[],
+            call_function_field: "",
+            call_function_field_by_kind: &[],
+            class_node_types: &["class_definition"],
+            class_name_field: "name",
+        },
+        ts_language: ts_lang_dart,
+        branch_node_kinds: &[
+            "if_statement",
+            "for_statement",
+            "while_statement",
+            "switch_label",
+            "catch_clause",
+        ],
+        decorator_node_kinds: &[],
+        binding_kinds: &[],
+        line_comment_prefixes: DEFAULT_COMMENT_PREFIXES,
+        modifier_keywords: &[],
+        shallow_detect: Some(crate::indexer::parser::detect_dart),
     },
 ];
 
