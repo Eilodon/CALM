@@ -15,6 +15,7 @@ tracing = { workspace = true }
 anyhow = { workspace = true }
 rmcp = { workspace = true }
 schemars = { workspace = true }
+libc = "0.2"
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }

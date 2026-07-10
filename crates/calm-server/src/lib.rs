@@ -22,6 +22,48 @@ pub type EmbedderHandle = Arc<RwLock<Option<Arc<Embedder>>>>;
 /// watcher whenever the coverage file itself changes on disk.
 pub type CoverageHandle = Arc<RwLock<calm_core::analysis::coverage::CoverageData>>;
 
+/// Hard ceiling (whole seconds — `libc::alarm`'s own resolution) on graceful
+/// shutdown after SIGINT/SIGTERM, before the kernel itself terminates this
+/// process. See `serve_stdio_with_preset`'s SIGTERM handler for why this is
+/// a raw POSIX `alarm()` rather than an in-process async timer — generous
+/// enough for a real in-flight parse batch/lock-poll/WAL-checkpoint to
+/// finish normally, short enough that a client that killed us isn't left
+/// wondering for long.
+const SHUTDOWN_WATCHDOG_SECS: libc::c_uint = 10;
+
+/// Arms a raw POSIX `alarm()` for `SHUTDOWN_WATCHDOG_SECS` real seconds and
+/// deliberately leaves SIGALRM's disposition at its OS default (`Term`).
+///
+/// Why not an in-process async watchdog (`tokio::time::sleep` + explicit
+/// exit)? That was the first approach tried here, and it did not work: `rmcp`'s
+/// stdio transport reads stdin via (effectively) `tokio::io::stdin()`, which
+/// Tokio's own docs acknowledge is implemented as an ordinary *blocking*
+/// `read()` on a dedicated OS thread with "no way to cancel" it — confirmed
+/// directly in this investigation via `/proc/<pid>/task/*/wchan` showing a
+/// thread parked in `anon_pipe_read` seconds after `ct.cancel()` had already
+/// fired. An async watchdog spawned on the *same* Tokio runtime never fired
+/// either (its own `tokio::time::sleep` never woke, even at 500ms) — most
+/// likely the runtime's timer/IO driver sharing something with whatever that
+/// blocked thread was holding, though the exact mechanism was never fully
+/// pinned down. A raw `alarm()` sidesteps the question entirely: it's a
+/// kernel timer, not a userspace one, so it fires regardless of whether this
+/// process's async runtime, worker threads, or libc's `exit()`/`atexit`
+/// machinery are healthy — the same reason a plain `kill -ALRM` always works
+/// on a wedged process when nothing else will short of SIGKILL.
+///
+/// If graceful shutdown completes and the process exits normally before the
+/// alarm fires, the pending alarm is simply discarded by the OS along with
+/// the rest of the process's state — nothing needs to explicitly cancel it.
+#[cfg(unix)]
+fn arm_shutdown_watchdog() {
+    unsafe {
+        libc::alarm(SHUTDOWN_WATCHDOG_SECS);
+    }
+}
+
+#[cfg(not(unix))]
+fn arm_shutdown_watchdog() {}
+
 pub async fn serve_stdio(project_root: PathBuf, db_path: PathBuf) -> Result<()> {
     serve_stdio_with_preset(project_root, db_path, "full".into()).await
 }
@@ -40,6 +82,7 @@ pub async fn serve_stdio_with_preset(
     tokio::spawn(async move {
         tokio::signal::ctrl_c().await.ok();
         tracing::info!("Received SIGINT, shutting down");
+        arm_shutdown_watchdog();
         ct_clone.cancel();
     });
 
@@ -62,6 +105,7 @@ pub async fn serve_stdio_with_preset(
                 Ok(mut term) => {
                     term.recv().await;
                     tracing::info!("Received SIGTERM, shutting down");
+                    arm_shutdown_watchdog();
                     ct_term.cancel();
                 }
                 Err(e) => tracing::warn!("Failed to install SIGTERM handler: {e}"),
@@ -93,6 +137,19 @@ pub async fn serve_stdio_with_preset(
     tokio::spawn(async move {
         let handle = tokio::task::spawn_blocking(move || {
             tracing::info!("Background indexer thread started");
+
+            // Checked at every safe bail-out point below (lock-acquire wait,
+            // between index/reindex parse batches, before starting the SCIP
+            // overlay pass) — without this, a SIGTERM arriving mid-run had
+            // nothing to interrupt this `spawn_blocking` task with, and
+            // Tokio's runtime-drop blocks process exit until every
+            // outstanding blocking-pool task returns on its own. See the
+            // SIGTERM-hang investigation this closure's cancellation checks
+            // fix: a process could take 15+ seconds (or hang until SIGKILL)
+            // to exit even after cleanly receiving and handling SIGTERM,
+            // because nothing downstream of `ct.cancel()` ever looked at it
+            // until the (already cancellation-aware) watch loop far below.
+            let cancel = || watch_ct.is_cancelled();
 
             // Every `calm serve` process used to spawn its own indexer+watcher
             // against the same shared DB — harmless with one process, but N
@@ -148,19 +205,27 @@ pub async fn serve_stdio_with_preset(
                     if semantic.enabled {
                         load_embedder_readonly(&semantic, &embedder, &embed_status, &last_embed_error);
                     }
-                    // Block (not poll) until the current owner exits and this
-                    // process can take over — see `acquire_blocking`'s doc
-                    // comment for why blocking is correct here: the OS wakes
-                    // this thread the instant the lock is released, whether
-                    // via a graceful shutdown or the kernel's own `flock`
-                    // release on an ungraceful death, with no interval to
-                    // tune and no missed-promotion window.
-                    match calm_core::db::instance_lock::acquire_blocking(&lock_dir) {
-                        Ok(lock) => {
+                    // Poll (not a single indefinite blocking call) until the
+                    // current owner exits and this process can take over —
+                    // see `acquire_blocking_cancellable`'s doc comment for why
+                    // polling is correct here: an OS `flock` wait has no
+                    // interruption mechanism, so `cancel` can only ever be
+                    // noticed between attempts, not via a wakeup.
+                    match calm_core::db::instance_lock::acquire_blocking_cancellable(
+                        &lock_dir, &cancel,
+                    ) {
+                        Ok(Some(lock)) => {
                             tracing::info!(
                                 "Promoted to indexer/watcher owner — previous owner exited"
                             );
                             lock
+                        }
+                        Ok(None) => {
+                            tracing::info!(
+                                "Shutdown requested while waiting to become indexer/watcher \
+                                 owner — exiting read-only without promoting"
+                            );
+                            return;
                         }
                         Err(e) => {
                             tracing::warn!(
@@ -183,50 +248,90 @@ pub async fn serve_stdio_with_preset(
                     .query_row("SELECT COUNT(*) FROM file_index", [], |r| r.get(0))
                     .unwrap_or(0);
 
-                let index_result: Result<(), String> = if existing_files > 0 {
+                enum IndexOutcome {
+                    Ok,
+                    Cancelled,
+                    Err(String),
+                }
+
+                let index_outcome: IndexOutcome = if existing_files > 0 {
                     tracing::info!(
                         "Existing index found ({existing_files} files) — incremental reindex"
                     );
                     *phase.write().unwrap() = calm_core::types::IndexingPhase::Parsing;
-                    match calm_core::indexer::pipeline::reindex_changed(&mut conn, &indexer_root) {
-                        Ok(summary) => {
+                    match calm_core::indexer::pipeline::reindex_changed_cancellable(
+                        &mut conn,
+                        &indexer_root,
+                        &cancel,
+                    ) {
+                        Ok(calm_core::indexer::pipeline::ReindexOutcome::Completed(summary)) => {
                             tracing::info!(
                                 "Incremental reindex: {} changed, {} deleted",
                                 summary.changed,
                                 summary.deleted
                             );
                             *phase.write().unwrap() = calm_core::types::IndexingPhase::Ready;
-                            Ok(())
+                            IndexOutcome::Ok
+                        }
+                        Ok(calm_core::indexer::pipeline::ReindexOutcome::Cancelled) => {
+                            IndexOutcome::Cancelled
                         }
                         Err(e) => {
                             tracing::error!(
                                 "Incremental reindex failed, falling back to full: {e}"
                             );
-                            calm_core::indexer::pipeline::run_indexing_pipeline(
+                            match calm_core::indexer::pipeline::run_indexing_pipeline_cancellable(
                                 &mut conn,
                                 &indexer_root,
                                 phase.clone(),
-                            )
-                            .map_err(|e| e.to_string())
+                                &cancel,
+                            ) {
+                                Ok(calm_core::indexer::pipeline::PipelineOutcome::Completed) => {
+                                    IndexOutcome::Ok
+                                }
+                                Ok(calm_core::indexer::pipeline::PipelineOutcome::Cancelled) => {
+                                    IndexOutcome::Cancelled
+                                }
+                                Err(e) => IndexOutcome::Err(e.to_string()),
+                            }
                         }
                     }
                 } else {
                     tracing::info!("No existing index — running full index");
-                    calm_core::indexer::pipeline::run_indexing_pipeline(
+                    match calm_core::indexer::pipeline::run_indexing_pipeline_cancellable(
                         &mut conn,
                         &indexer_root,
                         phase.clone(),
-                    )
-                    .map_err(|e| e.to_string())
+                        &cancel,
+                    ) {
+                        Ok(calm_core::indexer::pipeline::PipelineOutcome::Completed) => {
+                            IndexOutcome::Ok
+                        }
+                        Ok(calm_core::indexer::pipeline::PipelineOutcome::Cancelled) => {
+                            IndexOutcome::Cancelled
+                        }
+                        Err(e) => IndexOutcome::Err(e.to_string()),
+                    }
                 };
 
-                let index_ok = match &index_result {
-                    Ok(()) => {
+                // Shutdown requested mid-index: stop immediately rather than
+                // continuing on to embeddings/SCIP-overlay/the watch loop —
+                // exactly the sequence that used to keep this spawn_blocking
+                // task (and therefore the whole process) alive well past
+                // `ct.cancel()` having already fired.
+                if matches!(index_outcome, IndexOutcome::Cancelled) {
+                    tracing::info!("Background indexer stopped early — shutdown requested");
+                    return;
+                }
+
+                let index_ok = match &index_outcome {
+                    IndexOutcome::Ok => {
                         tracing::info!("Background indexing completed");
                         *last_index_error.write().unwrap() = None;
                         true
                     }
-                    Err(e) => {
+                    IndexOutcome::Cancelled => unreachable!("handled above"),
+                    IndexOutcome::Err(e) => {
                         tracing::error!("Background indexer failed: {e}");
                         *phase.write().unwrap() = calm_core::types::IndexingPhase::Failed;
                         *last_index_error.write().unwrap() = Some(e.clone());
@@ -319,8 +424,7 @@ pub async fn serve_stdio_with_preset(
 
     tracing::info!("Server shut down cleanly");
     Ok(())
-}
-/// True when semantic search should stop before ever attempting a network
+}/// True when semantic search should stop before ever attempting a network
 /// call: the configured model is the vendored default, that vendored asset
 /// is unusable (see `calm_core::embedding::default_vendored_asset_unusable`),
 /// and the config has not opted into a network fallback. Pulled out as a

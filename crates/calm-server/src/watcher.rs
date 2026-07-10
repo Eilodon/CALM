@@ -65,6 +65,9 @@ fn event_touches_coverage(res: &notify::Result<notify::Event>, project_root: &Pa
 /// Block on the watch loop until `ct` is cancelled. Intended to run inside a
 /// `spawn_blocking` task after the initial full index completes. When an embedder
 /// is loaded, newly (re)indexed symbols are embedded after each reindex.
+/// Block on the watch loop until `ct` is cancelled. Intended to run inside a
+/// `spawn_blocking` task after the initial full index completes. When an embedder
+/// is loaded, newly (re)indexed symbols are embedded after each reindex.
 pub fn run_watch_loop(
     project_root: PathBuf,
     db_path: PathBuf,
@@ -90,6 +93,13 @@ pub fn run_watch_loop(
         return;
     }
     tracing::info!("File watcher active on {}", project_root.display());
+
+    // Checked between reindex parse batches too (not just once per loop
+    // iteration here) — a single `reindex_changed` call on a large changed
+    // set (e.g. a git branch switch touching thousands of files) can itself
+    // run long enough to matter during shutdown, even though this outer loop
+    // already re-checks `ct` every ~1s between events.
+    let cancel = || ct.is_cancelled();
 
     loop {
         if ct.is_cancelled() {
@@ -148,8 +158,14 @@ pub fn run_watch_loop(
 
         match calm_core::db::conn::open_writer(&db_path) {
             Ok(mut conn) => {
-                match calm_core::indexer::pipeline::reindex_changed(&mut conn, &project_root) {
-                    Ok(s) if !s.is_noop() => {
+                match calm_core::indexer::pipeline::reindex_changed_cancellable(
+                    &mut conn,
+                    &project_root,
+                    &cancel,
+                ) {
+                    Ok(calm_core::indexer::pipeline::ReindexOutcome::Completed(s))
+                        if !s.is_noop() =>
+                    {
                         tracing::info!(
                             "Incremental reindex: {} changed, {} deleted",
                             s.changed,
@@ -181,7 +197,7 @@ pub fn run_watch_loop(
                         // why running all 8 concurrently (rather than the
                         // sequential loop this used to be) is safe.
                         #[cfg(feature = "scip-overlay")]
-                        {
+                        if !cancel() {
                             // Drop this thread's write connection before fanning
                             // out — the 8 language overlays below each open their
                             // own instead.
@@ -189,7 +205,8 @@ pub fn run_watch_loop(
                             crate::scip_overlay::run_all(&project_root, &db_path);
                         }
                     }
-                    Ok(_) => {}
+                    Ok(calm_core::indexer::pipeline::ReindexOutcome::Completed(_)) => {}
+                    Ok(calm_core::indexer::pipeline::ReindexOutcome::Cancelled) => break,
                     Err(e) => tracing::error!("Incremental reindex failed: {e}"),
                 }
             }
@@ -198,7 +215,6 @@ pub fn run_watch_loop(
     }
     tracing::info!("File watcher stopped");
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1284,11 +1284,45 @@ fn normalize_rel(base_dir: &str, rel: &str) -> String {
 /// Scan → extract symbols + call sites (tree-sitter) → rebuild graph
 /// (caller_count, coreness, is_hub). Everything is one transaction so the graph
 /// is never observed half-built.
+/// Outcome of a cancellable pipeline run — distinguishes "finished" from
+/// "bailed early because `cancel` returned true", so a caller on a shutdown
+/// path can log/handle the two differently (a cancellation is not a
+/// failure).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PipelineOutcome {
+    Completed,
+    Cancelled,
+}
+
+/// Full (re)index of a project tree into `conn`.
+///
+/// Scan → extract symbols + call sites (tree-sitter) → rebuild graph
+/// (caller_count, coreness, is_hub). Everything is one transaction so the graph
+/// is never observed half-built.
 pub fn run_indexing_pipeline(
     conn: &mut Connection,
     project_root: &Path,
     phase: std::sync::Arc<std::sync::RwLock<crate::types::IndexingPhase>>,
 ) -> rusqlite::Result<()> {
+    run_indexing_pipeline_cancellable(conn, project_root, phase, &|| false).map(|_| ())
+}
+
+/// Same as `run_indexing_pipeline`, but checked against `cancel` between
+/// parse batches — a full index of a large repo can take many seconds, and
+/// without this a shutdown-triggered `CancellationToken` has nothing to stop
+/// the in-flight `spawn_blocking` task it runs in, so the process can't exit
+/// until the whole scan finishes (Tokio's runtime shutdown blocks on
+/// outstanding blocking-pool tasks — see `serve_stdio_with_preset`'s SIGTERM
+/// handler comment). Bailing mid-loop drops `tx` without committing — SQLite
+/// rolls it back automatically, so a cancelled run leaves the graph exactly
+/// as it was before this call, the same "never half-built" guarantee a
+/// completed run has.
+pub fn run_indexing_pipeline_cancellable(
+    conn: &mut Connection,
+    project_root: &Path,
+    phase: std::sync::Arc<std::sync::RwLock<crate::types::IndexingPhase>>,
+    cancel: &dyn Fn() -> bool,
+) -> rusqlite::Result<PipelineOutcome> {
     use crate::types::IndexingPhase;
 
     let config = crate::config::load_config(project_root).unwrap_or_default();
@@ -1307,6 +1341,10 @@ pub fn run_indexing_pipeline(
     let mut files = Vec::new();
     collect_source_files(project_root, &ignore_patterns, &mut files);
     files.sort();
+
+    if cancel() {
+        return Ok(PipelineOutcome::Cancelled);
+    }
 
     *phase.write().unwrap() = IndexingPhase::Parsing;
 
@@ -1328,6 +1366,9 @@ pub fn run_indexing_pipeline(
     tx.execute("DELETE FROM code_chunks", [])?;
 
     for batch in files.chunks(PARSE_BATCH_SIZE) {
+        if cancel() {
+            return Ok(PipelineOutcome::Cancelled);
+        }
         // `lang: None` + `data: None` means a recognized-unparsed-extension
         // file (see `is_recognized_unparsed_extension`) — still earns a
         // `file_index` row below (path/hash/mtime, `language` NULL,
@@ -1386,8 +1427,18 @@ pub fn run_indexing_pipeline(
 
     *phase.write().unwrap() = IndexingPhase::Ready;
 
-    Ok(())
+    Ok(PipelineOutcome::Completed)
+}/// Incremental reindex: re-parse only files whose content hash changed (or are
+/// new), drop rows for deleted files, then rebuild the graph once if anything
+/// changed. Cheap to call repeatedly — the basis for the file watcher.
+/// Outcome of a cancellable `reindex_changed` run — mirrors `PipelineOutcome`,
+/// carrying the summary through on the completed path.
+#[derive(Debug)]
+pub enum ReindexOutcome {
+    Completed(ReindexSummary),
+    Cancelled,
 }
+
 /// Incremental reindex: re-parse only files whose content hash changed (or are
 /// new), drop rows for deleted files, then rebuild the graph once if anything
 /// changed. Cheap to call repeatedly — the basis for the file watcher.
@@ -1395,6 +1446,25 @@ pub fn reindex_changed(
     conn: &mut Connection,
     project_root: &Path,
 ) -> rusqlite::Result<ReindexSummary> {
+    match reindex_changed_cancellable(conn, project_root, &|| false)? {
+        ReindexOutcome::Completed(summary) => Ok(summary),
+        ReindexOutcome::Cancelled => {
+            unreachable!("cancel closure always returns false")
+        }
+    }
+}
+
+/// Same as `reindex_changed`, but checked against `cancel` between parse
+/// batches — see `run_indexing_pipeline_cancellable`'s doc comment for why
+/// this matters on the shutdown path (a large changed-file set, e.g. a git
+/// branch switch, can take long enough to matter even inside the already
+/// per-event-cancellable watch loop). Bailing mid-loop drops `tx` without
+/// committing — same rollback guarantee as the full-index cancellable path.
+pub fn reindex_changed_cancellable(
+    conn: &mut Connection,
+    project_root: &Path,
+    cancel: &dyn Fn() -> bool,
+) -> rusqlite::Result<ReindexOutcome> {
     let config = crate::config::load_config(project_root).unwrap_or_default();
     let entry_point_patterns = config.entry_points;
     let ignore_patterns = config.ignore;
@@ -1416,6 +1486,10 @@ pub fn reindex_changed(
     let mut files = Vec::new();
     collect_source_files(project_root, &ignore_patterns, &mut files);
     files.sort();
+
+    if cancel() {
+        return Ok(ReindexOutcome::Cancelled);
+    }
 
     // Read + hash every file in parallel, then decide sequentially which ones
     // actually changed before paying the parse+resolve cost on just those.
@@ -1468,6 +1542,9 @@ pub fn reindex_changed(
     let mut summary = ReindexSummary::default();
 
     for batch in changed.chunks(PARSE_BATCH_SIZE) {
+        if cancel() {
+            return Ok(ReindexOutcome::Cancelled);
+        }
         let extracted: Vec<(&Candidate, Option<ExtractedFile>)> = batch
             .par_iter()
             .map(|c| {
@@ -1516,9 +1593,8 @@ pub fn reindex_changed(
         )?;
     }
     tx.commit()?;
-    Ok(summary)
-}
-#[cfg(test)]
+    Ok(ReindexOutcome::Completed(summary))
+}#[cfg(test)]
 mod tests {
     use super::*;
     use crate::db::schema::init_db;

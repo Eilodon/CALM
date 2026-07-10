@@ -205,6 +205,7 @@ dependencies = [
  "calm-core",
  "calm-server",
  "clap",
+ "libc",
  "rusqlite",
  "serde_json",
  "tempfile",
@@ -262,6 +263,7 @@ version = "0.1.1"
 dependencies = [
  "anyhow",
  "calm-core",
+ "libc",
  "notify",
  "rmcp",
  "rusqlite",
