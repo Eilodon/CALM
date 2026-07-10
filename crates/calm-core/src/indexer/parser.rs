@@ -959,13 +959,26 @@ fn split_receiver_callee(raw: &str) -> Option<(Option<String>, String, bool)> {
     // the dot branch (as it always has), not being hijacked by the `::`.
     let dot = raw.rfind('.').map(|i| (i, i + 1));
     let arrow = raw.rfind("->").map(|i| (i, i + 2));
-    let dot_or_arrow = match (dot, arrow) {
-        (Some(d), Some(a)) => Some(if a.0 > d.0 { a } else { d }),
-        (Some(d), None) => Some(d),
-        (None, Some(a)) => Some(a),
-        (None, None) => None,
-    };
-    if let Some((idx, end)) = dot_or_arrow {
+    // Lua's method-call `:` (`self:foo()`, `g:greet()`) joins this same
+    // priority tier — same reasoning as `->`: no other supported language's
+    // callee text ever contains a genuine single `:`. Deliberately EXCLUDES
+    // any `:` adjacent to another `:` so it never fires on the `::` pair
+    // Rust turbofish/PHP static calls/Ruby namespaces use (those keep
+    // falling through to the unchanged `::` tier below) — found via a real
+    // test failure (`self:formatGreeting()` resolving to callee "self",
+    // receiver None) when Lua support was added, not guessed.
+    let colon = raw
+        .rfind(':')
+        .filter(|&i| {
+            raw.as_bytes().get(i.wrapping_sub(1)) != Some(&b':')
+                && raw.as_bytes().get(i + 1) != Some(&b':')
+        })
+        .map(|i| (i, i + 1));
+    let dot_or_arrow_or_colon = [dot, arrow, colon]
+        .into_iter()
+        .flatten()
+        .max_by_key(|&(i, _)| i);
+    if let Some((idx, end)) = dot_or_arrow_or_colon {
         let (left, right) = raw.split_at(idx);
         let callee = leading_ident(&right[end - idx..])?;
         // Immediate receiver = last segment of the left side.
@@ -2052,6 +2065,28 @@ pub(crate) fn detect_dart(s: &str) -> Option<(String, SymbolKind)> {
         }
     }
     None
+}
+
+// Lua identifiers in shallow mode may carry a table/method qualifier
+// (`Greeter.new`, `Greeter:greet`) since Lua has no separate class name
+// syntax — matches the real tree-sitter path's behavior for the same forms
+// (see lang_constants.rs's Lua LangConstants comment).
+fn lua_ident_at_start(s: &str) -> Option<String> {
+    let s = s.trim_start();
+    let end = s
+        .find(|c: char| !c.is_alphanumeric() && c != '_' && c != '.' && c != ':')
+        .unwrap_or(s.len());
+    let name = &s[..end];
+    if name.is_empty() || name.starts_with(|c: char| c.is_ascii_digit()) {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+pub(crate) fn detect_lua(s: &str) -> Option<(String, SymbolKind)> {
+    let rest = s.strip_prefix("function ")?;
+    let name = lua_ident_at_start(rest)?;
+    Some((name, SymbolKind::Function))
 }
 fn detect_shallow(trimmed: &str, language: &str) -> Option<(String, SymbolKind)> {
     let spec = crate::indexer::lang_constants::find_spec(language)?;
@@ -3493,6 +3528,22 @@ public class FooTest {
         assert!(names.contains(&"Named"), "should detect abstract class");
         assert!(names.contains(&"Loggable"), "should detect mixin");
     }
+
+    #[test]
+    fn test_shallow_lua() {
+        let code = "local function main()\nfunction Greeter.new(name)\nfunction Greeter:greet()\n";
+        let syms = extract_symbols_shallow(code, "lua", "a.lua");
+        let names = shallow_names(&syms);
+        assert!(names.contains(&"main"), "should detect local function");
+        assert!(
+            names.contains(&"Greeter.new"),
+            "should detect dot-qualified function"
+        );
+        assert!(
+            names.contains(&"Greeter:greet"),
+            "should detect method-colon function"
+        );
+    }
     #[test]
     fn test_shallow_shell() {
         let code = "function setup() {\nbuild() {\n  echo hi\n}\n";
@@ -3874,6 +3925,66 @@ class Foo {
             "Dart call-graph extraction is a documented scope cut (no clean \
              call-expression node in this grammar) — see this test's doc comment; \
              calls: {calls:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "lang-lua")]
+    fn test_tier0_5_grammar_loads_lua() {
+        assert!(
+            parse_tree("function main() end", "lua").is_some(),
+            "tree-sitter-lua grammar should load and parse — locks the pinned ABI \
+             (=0.2.0, ABI 14); a caret-range bump to 0.4.1+ (ABI 15) would silently \
+             regress this to shallow line-scan"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "lang-lua")]
+    fn test_lua_real_grammar_symbols_and_calls_are_accurate() {
+        // Lua has no class syntax (OOP is convention over tables +
+        // metatables, not a grammar-level construct) — `class_node_types`
+        // is empty, so every function is SymbolKind::Function with no
+        // class_context, even a `function Greeter:greet()` method-colon
+        // definition. Its `name` field's raw text keeps the qualifier
+        // ("Greeter:greet"/"Greeter.new") rather than splitting out a bare
+        // name — a documented rough edge (still findable via `name_tokens`
+        // tokenization splitting on `.`/`:`), not a bug.
+        let code = "local Greeter = {}\n\nfunction Greeter.new(name)\n  return setmetatable({}, Greeter)\nend\n\nfunction Greeter:greet()\n  print(\"hello\")\n  self:formatGreeting()\nend\n\nlocal function main()\n  local g = Greeter.new(\"world\")\n  g:greet()\nend\n";
+        let symbols = extract_symbols(code, "lua", "a.lua").unwrap();
+        let names = shallow_names(&symbols);
+        assert!(
+            names.contains(&"Greeter.new"),
+            "should detect dot-qualified function: {names:?}"
+        );
+        assert!(
+            names.contains(&"Greeter:greet"),
+            "should detect method-colon function: {names:?}"
+        );
+        assert!(
+            names.contains(&"main"),
+            "should detect `local function` (same node kind as global \
+             `function`, just referenced via a different field on its parent): {names:?}"
+        );
+
+        let calls = extract_calls(code, "lua", "a.lua").unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.enclosing_name == "Greeter:greet" && c.callee == "print"),
+            "bare call should produce a call edge: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c.enclosing_name == "Greeter:greet"
+                && c.callee == "formatGreeting"
+                && c.receiver.as_deref() == Some("self")),
+            "method-colon call should produce a call edge with receiver: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c.enclosing_name == "main"
+                && c.callee == "greet"
+                && c.receiver.as_deref() == Some("g")),
+            "method-colon call on a local var should produce a call edge with receiver: {calls:?}"
         );
     }
 }

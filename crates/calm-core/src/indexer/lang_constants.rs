@@ -227,6 +227,15 @@ fn ts_lang_dart() -> Option<tree_sitter::Language> {
     None
 }
 
+#[cfg(feature = "lang-lua")]
+fn ts_lang_lua() -> Option<tree_sitter::Language> {
+    Some(tree_sitter_lua::LANGUAGE.into())
+}
+#[cfg(not(feature = "lang-lua"))]
+fn ts_lang_lua() -> Option<tree_sitter::Language> {
+    None
+}
+
 const JS_TS_CONSTANTS: LangConstants = LangConstants {
     function_node_types: &[
         "function_declaration",
@@ -998,6 +1007,63 @@ pub static LANGUAGES: &[LanguageSpec] = &[
         line_comment_prefixes: DEFAULT_COMMENT_PREFIXES,
         modifier_keywords: &[],
         shallow_detect: Some(crate::indexer::parser::detect_dart),
+    },
+    // Lua (Phase C, 2026-07-11): verified against the real grammar
+    // (tree-sitter-lua 0.2.0, pinned below its published latest 0.5.0 for
+    // the same ABI-14-vs-15 reason as every other Tier-0.5 grammar here) via
+    // a throwaway AST-dump test on a fixture covering a dot-qualified
+    // function (`function Greeter.new(...)`), a method-colon function
+    // (`function Greeter:greet()`), a `local function`, and both a bare and
+    // a method-colon call site.
+    //
+    // `function_declaration`'s "name" field and `function_call`'s "name"
+    // field both work UNIFORMLY across every call/definition shape (bare
+    // identifier, dot-qualified, or method-colon) — no `"$first_child"`
+    // sentinel needed, unlike Kotlin/Swift. `local function foo()` produces
+    // the exact same `function_declaration` node as a global `function
+    // foo()`, just referenced via a different field ("local_declaration")
+    // on its parent `chunk` — the generic node-kind walk sees it either way,
+    // no special case needed.
+    //
+    // Lua has no class/OOP syntax at the grammar level (metatables are a
+    // runtime convention, not a parseable construct) — `class_node_types`
+    // is empty, so every function is `SymbolKind::Function` with no
+    // `class_context`, and a method-colon function's `name` field text
+    // keeps its qualifier ("Greeter:greet", not bare "greet") — a
+    // documented rough edge, not a bug (still findable via `name_tokens`
+    // tokenization splitting on `.`/`:`). See
+    // `test_lua_real_grammar_symbols_and_calls_are_accurate` in parser.rs.
+    LanguageSpec {
+        name: "lua",
+        aliases: &[],
+        extensions: &["lua"],
+        constants: LangConstants {
+            function_node_types: &["function_declaration"],
+            name_field: "name",
+            docstring_type: Some("comment"),
+            call_node_types: &["function_call"],
+            call_function_field: "name",
+            call_function_field_by_kind: &[],
+            class_node_types: &[],
+            class_name_field: "name",
+        },
+        ts_language: ts_lang_lua,
+        branch_node_kinds: &[
+            "if_statement",
+            "elseif_statement",
+            "while_statement",
+            "for_statement",
+            "repeat_statement",
+        ],
+        decorator_node_kinds: &[],
+        binding_kinds: &[],
+        // Lua line comments are `--`/`--[[ ... ]]`, not `//`/`#`-style —
+        // neither of the two shared groups applies.
+        line_comment_prefixes: &["--"],
+        // "local " so `local function foo()` reduces to the plain
+        // `function foo()` the shallow detector's prefix check matches.
+        modifier_keywords: &["local "],
+        shallow_detect: Some(crate::indexer::parser::detect_lua),
     },
 ];
 

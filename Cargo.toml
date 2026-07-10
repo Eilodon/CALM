@@ -86,6 +86,13 @@ tree-sitter-scala = "=0.24.1"
 # -> Language` function, not the modern `LANGUAGE: LanguageFn` const + 
 # `.into()` every other grammar here uses — see lang_constants.rs's ts_lang_dart.
 tree-sitter-dart = "=0.0.4"
+# Phase C (2026-07-11): same ABI-cliff pattern as scala/dart above, verified
+# the same way (downloaded each published .crate tarball, grepped
+# src/parser.c). 0.2.0 is the newest ABI-14 release; 0.4.1/0.5.0 jumped to
+# ABI 15. Real dependency (its own Cargo.toml, not crates.io's dependency
+# API) is the modern `tree-sitter-language = "0.1.0"` shim, same pattern as
+# kotlin-ng/scala.
+tree-sitter-lua = "=0.2.0"
 # Stack Graphs (formal name resolution)
 stack-graphs = "0.14"
 tree-sitter-stack-graphs = "0.10"
