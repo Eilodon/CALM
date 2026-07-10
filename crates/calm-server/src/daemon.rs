@@ -198,7 +198,26 @@ fn is_idle(
 }
 
 #[cfg(unix)]
-fn create_calm_dir(calm_dir: &Path) -> Result<()> {
+/// Creates `calm_dir` at exactly `0700` if it doesn't already exist. Public
+/// so `calm-cli`'s `init_daemon_tracing` (which must create `.calm/` to
+/// write `daemon.log` into, and runs *before* `serve_unix_daemon` — tracing
+/// has to be initialized before anything can log) can reuse this instead of
+/// a plain `create_dir_all`, which found this exact bug: two independent
+/// call sites both trying to create `.calm/`, one atomic-0700 and one
+/// umask-default, racing to be first — whichever lost hit this function's
+/// own "already exists → treat as success" branch and silently left `.calm/`
+/// at the loose winner's permissions instead of `0700`. Caught by
+/// `daemon_calm_dir_and_socket_have_restrictive_permissions`
+/// (`crates/calm-cli/tests/daemon_integration.rs`), not by inspection.
+///
+/// Deliberately does NOT retroactively `chmod` an already-existing `.calm/`
+/// (e.g. one left behind at default permissions by `calm index`/`calm serve`
+/// non-daemon mode, before any daemon ever ran on this project) — that's a
+/// pre-existing exposure this feature doesn't make worse, and silently
+/// tightening a directory a user may have intentionally left shared would
+/// be a surprising side effect of starting a daemon, not an obvious win.
+/// Out of scope for now; revisit only if real usage shows it's wrong.
+pub fn create_calm_dir(calm_dir: &Path) -> Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     // Atomic-at-creation `0700`, not create-then-`chmod` — a create-then-
     // chmod window would briefly leave `.calm/` at the process umask's
@@ -360,7 +379,19 @@ fn remove_daemon_meta(calm_dir: &Path) {
 pub async fn connect_or_spawn(project_root: PathBuf) -> Result<()> {
     let root = std::fs::canonicalize(&project_root).context("resolving --project-root")?;
     let calm_dir = root.join(".calm");
-    std::fs::create_dir_all(&calm_dir)?;
+    // Deliberately NOT `create_dir_all(&calm_dir)` here: `.calm/` must be
+    // created exactly once, atomically at `0700`, by `create_calm_dir` on
+    // the daemon side — creating it here first (a plain `create_dir_all`
+    // has no mode control, so it lands at whatever the umask gives, often
+    // world-readable) would let this forwarder's directory win the race
+    // against the daemon's own locked-down creation, and `create_calm_dir`'s
+    // "already exists → treat as success" branch would then silently leave
+    // it at the wrong permissions forever. Found via this exact assertion
+    // failing in `daemon_calm_dir_and_socket_have_restrictive_permissions`
+    // (`crates/calm-cli/tests/daemon_integration.rs`) — nothing downstream
+    // of this line actually needs `.calm/` to exist yet: `resolve_socket_path`
+    // only builds a `PathBuf`, and `read_daemon_meta`/`connect()` already
+    // handle a missing directory/file gracefully.
     let socket_path = resolve_socket_path(&calm_dir);
 
     let stream = connect_live_and_current(&root, &calm_dir, &socket_path).await?;

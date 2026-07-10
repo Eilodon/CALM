@@ -745,7 +745,16 @@ fn init_daemon_tracing(project_root: &std::path::Path) -> Result<()> {
     let root =
         std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
     let calm_dir = root.join(".calm");
-    std::fs::create_dir_all(&calm_dir)?;
+    // `calm_server::daemon::create_calm_dir` (atomic 0700), NOT a plain
+    // `create_dir_all` — this runs *before* `serve_unix_daemon`'s own call
+    // to the same function (tracing has to be initialized before anything
+    // can log), so a loose `create_dir_all` here would win the race to
+    // create `.calm/` first, and `create_calm_dir`'s "already exists →
+    // treat as success" branch would then silently leave it at whatever
+    // permissive default this one used instead of `0700`. Found via
+    // `daemon_calm_dir_and_socket_have_restrictive_permissions`
+    // (`crates/calm-cli/tests/daemon_integration.rs`), not by inspection.
+    calm_server::daemon::create_calm_dir(&calm_dir)?;
     let log_path = calm_dir.join("daemon.log");
     let file = std::fs::OpenOptions::new()
         .create(true)
