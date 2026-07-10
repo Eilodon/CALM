@@ -8,6 +8,8 @@ pub mod gitignore;
 pub mod graph;
 pub mod indexer;
 pub mod memory;
+#[cfg(feature = "lsp-overlay")]
+pub mod lsp;
 pub mod resolver;
 pub mod sanitize;
 #[cfg(feature = "scip-overlay")]

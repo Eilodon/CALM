@@ -231,6 +231,28 @@ impl CalmServer {
                         tracing::error!("edit_lines: incremental chunk embedding failed: {e}");
                     }
                 }
+                // This reindex just ran rebuild_graph, which DELETEs every
+                // call_edges row — including all `formal` upgrades from the
+                // SCIP/LSP overlays — and re-resolves syntactically. The
+                // watcher can't restore them either: by the time its file
+                // event fires, this reindex already updated the hashes, so
+                // its own reindex_changed is a no-op and its overlay hook
+                // never runs. Root cause of the formal tier silently dying
+                // after every CALM-tool edit (observed live 2026-07-10:
+                // 0 formal edges in a DB whose sidecar recorded 2863
+                // upgrades 30 minutes earlier). Fire-and-forget on a
+                // background thread — same posture as the watcher's own
+                // post-reindex hook — so the edit response isn't held for a
+                // ~20s rust-analyzer batch run; `run_all_coalesced` keeps
+                // rapid successive edits from stacking concurrent passes.
+                #[cfg(feature = "scip-overlay")]
+                {
+                    let root = self.project_root.clone();
+                    let db = self.db_path.clone();
+                    std::thread::spawn(move || {
+                        crate::scip_overlay::run_all_coalesced(&root, &db);
+                    });
+                }
             }
             Ok(_) => {}
             Err(e) => {

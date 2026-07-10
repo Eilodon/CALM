@@ -41,6 +41,8 @@ tree-sitter-r       = { workspace = true, optional = true }
 scip = { version = "0.9", optional = true }
 protobuf = { version = "=3.7.2", optional = true }
 tempfile = { version = "3", optional = true }
+lsp-types = { version = "0.97", optional = true }
+tokio = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = "3"
@@ -87,3 +89,18 @@ tier0-5 = ["lang-c", "lang-cpp", "lang-ruby", "lang-php", "lang-csharp", "lang-s
 # serving; and `ScipConfig` auto-detects rust-analyzer on PATH/rustup/VS
 # Code, silently no-op'ing (zero behavior change) on a machine without it.
 scip-overlay = ["dep:scip", "dep:protobuf", "dep:tempfile"]
+# LSP resolve-time overlay (rust-analyzer `textDocument/definition` over
+# stdio) — see `LspConfig`'s doc comment (config.rs) for the cost-shape
+# reasoning behind its `OnDemand` default, and `lsp/overlay.rs` for why this
+# is a separate pass from `scip-overlay` rather than folded into it. First
+# `tokio::process` usage in this crate — every other subprocess spawn here
+# (`scip/runner.rs`, etc.) is sync `std::process::Command`, unsuited to a
+# persistent bidirectional LSP session. The async session runs on its own
+# dedicated OS thread with its own single-threaded runtime (`lsp/overlay.rs`)
+# — NOT an inline `block_on`, which panics when the caller already sits on
+# the server's ambient tokio runtime (reproduced in the 2026-07-10 review).
+# Depends on `scip-overlay` deliberately: reuses its rust-analyzer binary
+# discovery (`scip/runner.rs::resolve_binary`) and location→symbol resolution
+# (`scip/ingest.rs`) instead of duplicating them — `crate::scip` doesn't
+# compile without that feature.
+lsp-overlay = ["dep:lsp-types", "dep:tokio", "scip-overlay"]

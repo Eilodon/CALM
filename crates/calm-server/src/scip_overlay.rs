@@ -21,8 +21,46 @@
 //! that this actually parallelizes.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use calm_core::scip::ingest::IngestStats;
+
+/// Coalescing gate for `run_all_coalesced` — one overlay pass in flight at a
+/// time process-wide, with at most one queued rerun. Without this, rapid
+/// successive triggers (e.g. an agent making several `edit_lines` calls in a
+/// row) would stack concurrent rust-analyzer batch runs, each pegging CPU
+/// for ~20s+ on a repo this size.
+static OVERLAY_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+static OVERLAY_RERUN: AtomicBool = AtomicBool::new(false);
+
+/// `run_all`, but concurrent callers coalesce: if a pass is already running,
+/// flag a single rerun (so edges from the newest reindex still get covered
+/// once the current pass finishes) and return immediately. Used by every
+/// *incremental* trigger — the watcher loop and the edit tools' post-write
+/// reindex — while startup (`lib.rs`) keeps calling `run_all` directly (a
+/// single, naturally serialized call).
+pub fn run_all_coalesced(root: &Path, db_path: &Path) {
+    if OVERLAY_IN_FLIGHT
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        OVERLAY_RERUN.store(true, Ordering::Release);
+        return;
+    }
+    loop {
+        OVERLAY_RERUN.store(false, Ordering::Release);
+        run_all(root, db_path);
+        if !OVERLAY_RERUN.load(Ordering::Acquire) {
+            break;
+        }
+    }
+    OVERLAY_IN_FLIGHT.store(false, Ordering::Release);
+    // Close the lost-wakeup window: a rerun flagged between the final load
+    // above and the in-flight release would otherwise be dropped silently.
+    if OVERLAY_RERUN.swap(false, Ordering::AcqRel) {
+        run_all_coalesced(root, db_path);
+    }
+}
 
 /// Runs the rust + go + python + js + java + csharp + php + clang SCIP
 /// overlays concurrently against `db_path`, each on its own DB connection.

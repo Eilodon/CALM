@@ -278,3 +278,52 @@ tiền lệ cho live-LSP.
 - **Bundle sẵn LSP server vào launcher (giống prebuilt binary hiện tại)**: bị bác cho pilot này —
   license/kích thước/nền tảng khác nhau quá nhiều giữa 15 server để bundle đồng loạt; có thể xét
   lại riêng từng server sau khi pilot chứng minh giá trị.
+
+## Update 2026-07-10: live-LSP overlay đã implement — cho Rust, không phải Go, và vì sao đó là lệch có chủ đích
+
+**Trạng thái**: live-LSP resolve-time overlay đã implement (`crates/calm-core/src/lsp/`,
+tool `lsp_refresh`, feature `lsp-overlay` opt-in, KHÔNG nằm trong default), pilot trên
+**Rust/rust-analyzer** — lệch so với Pilot Plan Go/gopls ở trên. Ghi nhận lý do để người đọc
+sau biết đây là quyết định có cân nhắc, không phải bỏ sót ADR:
+
+1. **Tiền đề "Go chưa có SCIP indexer trưởng thành" (Update 2026-07-04) đã stale**: `scip-go`
+   provider ship vào CALM ngày 2026-07-08 (P2.1, commit 6603e49), cùng đợt với 5 provider khác.
+   Cả 8 ngôn ngữ chính giờ đều có batch SCIP — nhóm "cần live-LSP vì thiếu SCIP" chỉ còn
+   ruby/kotlin/swift/shell/r/sql, đúng nhóm Decision §6 xếp loại "server chưa đủ trưởng thành".
+   Lợi thế accuracy của live-LSP-cho-Go so với scip-go không còn rõ ràng như lúc viết Pilot Plan.
+2. **Giá trị biên đo thật (self-repo, 2026-07-10)**: sau một pass SCIP tươi, Rust còn 772/~6300
+   edge dưới `formal` (~12%) đủ điều kiện cho LSP thử. Vì batch SCIP và live-LSP dùng **cùng một
+   engine** (rust-analyzer), phần dư này chủ yếu là case engine khó (macro, dynamic dispatch) —
+   yield kỳ vọng khiêm tốn. E2E thực tế trên fixture xác nhận cả hai mặt: `attempted=2,
+   upgraded=1` — và edge được nâng chính là **trait-method dispatch** (`call_dynamic →
+   Runner::run` qua `dyn Runner`), lớp edge mà cả resolver cú pháp lẫn name-match không bao giờ
+   chứng minh được. Vai trò thật của overlay này: **lớp bổ sung sau SCIP**, không thay thế.
+3. **Vì sao vẫn ship cho Rust trước**: (a) protocol plumbing (Content-Length framing, encoding
+   negotiation, id-routing, warm-up/retry) là phần tái dùng được cho MỌI ngôn ngữ sau này —
+   `LspClient` không có gì Rust-specific; (b) rust-analyzer là server duy nhất đã có sẵn cơ chế
+   binary-discovery trong repo (`scip/runner.rs::resolve_binary`); (c) đo được ngay trên chính
+   repo này. Mở rộng sang ngôn ngữ khác = thêm binary-discovery + config block, không phải viết
+   lại client.
+
+**Dữ liệu probe sống rust-analyzer 1.96 (2026-07-10) — các hành vi wire mà spec không nói rõ,
+implement nào cũng phải xử lý**:
+- Chấp nhận `positionEncodings: ["utf-8"]` khi negotiate → cột = byte offset, khỏi cần UTF-16 math.
+- `textDocument/definition` trả `null` (không phải error!) trong lúc index ban đầu chưa xong —
+  ~5.4s trên fixture 2-crate tí hon; giữa chừng có error `-32801 content modified`. Client
+  one-shot không retry sẽ upgrade 0 edge mà không có dấu hiệu gì. Bắt buộc warm-up retry.
+- Server gửi server→client REQUEST (`workspace/diagnostic/refresh`) với id 0,1,... — **va chạm số
+  với id space của client**. Response routing bắt buộc phải loại message có `method`, và phải
+  stub-reply (null result đủ) để server không treo chờ.
+
+**Nguyên tắc §2 (detect-once, fail-silent), §3 (additive-only), §5 (tái dùng rank `Formal` +
+`formal_source='lsp'` để phân nguồn)**: giữ nguyên, thực thi đúng. §1 (strict opt-in): giữ
+nguyên cho live-LSP như Update 2026-07-04 (2) quy định — feature `lsp-overlay` không nằm trong
+default, policy mặc định `on_demand` (không bao giờ tự chạy on-save cho tới khi đo latency thật).
+
+**Bug hạ tầng tìm ra trong cùng đợt audit (điều kiện tiên quyết cho mọi overlay)**: edit qua
+CALM tool (`edit_lines`/`edit_symbol`) → reindex nội tuyến wipe toàn bộ `call_edges` (gồm cả
+formal) nhưng không chạy lại overlay; watcher sau đó thấy hash đã cập nhật → no-op → tầng formal
+chết im lặng cho tới thay đổi kế tiếp đi đúng đường watcher (quan sát sống: DB 0 formal trong khi
+sidecar ghi 2863 upgrade 30 phút trước). Đã fix: edit-tool giờ fan-out overlay nền sau reindex
+non-noop, có coalescing guard chống stack rust-analyzer khi edit liên tiếp. Không fix bug này thì
+mọi upgrade của cả SCIP lẫn LSP đều chỉ sống tới lần edit kế tiếp.

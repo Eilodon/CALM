@@ -567,6 +567,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         crate::db::schema::init_db(&conn).unwrap();
         let rust = RustConfig {
+            lsp: crate::config::LspConfig::default(),
             scip: crate::config::ScipConfig {
                 enabled: Some(false),
                 binary: None,
@@ -744,6 +745,7 @@ mod tests {
         )
         .unwrap();
         let rust = RustConfig {
+            lsp: crate::config::LspConfig::default(),
             scip: crate::config::ScipConfig {
                 enabled: Some(true),
                 binary: None,
@@ -884,6 +886,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         crate::db::schema::init_db(&conn).unwrap();
         let rust = RustConfig {
+            lsp: crate::config::LspConfig::default(),
             scip: crate::config::ScipConfig {
                 enabled: Some(false),
                 binary: None,
@@ -911,6 +914,7 @@ mod tests {
         crate::indexer::pipeline::run_indexing_pipeline(&mut conn, &fixture, phase).unwrap();
 
         let rust = RustConfig {
+            lsp: crate::config::LspConfig::default(),
             scip: crate::config::ScipConfig {
                 enabled: Some(true),
                 binary: None,

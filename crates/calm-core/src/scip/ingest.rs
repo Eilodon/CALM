@@ -384,10 +384,30 @@ fn resolve_unique_symbol_at(
     path: &str,
     line: i64,
 ) -> rusqlite::Result<Option<String>> {
-    let mut stmt = conn.prepare(
+    resolve_unique_symbol_at_filtered(conn, path, line, false)
+}
+
+/// Narrowest-span-wins location→symbol resolution, shared with the LSP
+/// overlay (`crate::lsp::overlay`), which passes `exclude_headings: true`
+/// because markdown ATX headings are indexed as symbols but are never call
+/// targets — SCIP's own callers only ever hand this Rust/Go/... source
+/// locations, where no heading rows exist, so `false` preserves their exact
+/// pre-existing behavior. A tie for narrowest span returns `None` (genuinely
+/// ambiguous — stay conservative) for both callers.
+pub(crate) fn resolve_unique_symbol_at_filtered(
+    conn: &Connection,
+    path: &str,
+    line: i64,
+    exclude_headings: bool,
+) -> rusqlite::Result<Option<String>> {
+    let sql = if exclude_headings {
         "SELECT qualified_name, line_start, line_end FROM symbols \
-         WHERE path = ?1 AND line_start <= ?2 AND line_end >= ?2",
-    )?;
+         WHERE path = ?1 AND line_start <= ?2 AND line_end >= ?2 AND kind != 'heading'"
+    } else {
+        "SELECT qualified_name, line_start, line_end FROM symbols \
+         WHERE path = ?1 AND line_start <= ?2 AND line_end >= ?2"
+    };
+    let mut stmt = conn.prepare(sql)?;
     let candidates: Vec<(String, i64, i64)> = stmt
         .query_map(rusqlite::params![path, line], |r| {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?))

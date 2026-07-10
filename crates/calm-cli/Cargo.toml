@@ -35,3 +35,7 @@ lang-shell  = ["calm-core/lang-shell",  "calm-server/lang-shell"]
 lang-r      = ["calm-core/lang-r",      "calm-server/lang-r"]
 tier0-5     = ["calm-core/tier0-5",     "calm-server/tier0-5"]
 scip-overlay = ["calm-core/scip-overlay", "calm-server/scip-overlay"]
+# Opt-in, not in `default` yet — see calm-core's `lsp-overlay` feature comment.
+# Without this passthrough the feature is unreachable from the shipped `calm`
+# binary entirely (caught in the 2026-07-10 review).
+lsp-overlay  = ["calm-core/lsp-overlay",  "calm-server/lsp-overlay"]

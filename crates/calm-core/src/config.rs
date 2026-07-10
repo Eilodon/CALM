@@ -96,6 +96,71 @@ impl Default for HubThresholdConfig {
 #[serde(default)]
 pub struct RustConfig {
     pub scip: ScipConfig,
+    /// LSP-backed resolve-time overlay (rust-analyzer `textDocument/definition`
+    /// over stdio) — upgrades `ambiguous`/`textual` edges the same way SCIP's
+    /// batch overlay does, but resolves interactively per call site instead of
+    /// a one-shot `scip` dump. Distinct config block (not reusing `ScipConfig`)
+    /// because the two overlays have different cost shapes: SCIP's `enabled`/
+    /// `policy` gate a single batch subprocess run, `LspConfig`'s gate a
+    /// persistent subprocess plus one request per unresolved call site.
+    #[serde(default)]
+    pub lsp: LspConfig,
+}
+
+/// Config for the LSP resolve-time overlay (`lsp_refresh` MCP tool / `calm lsp
+/// run`). Mirrors `ScipConfig`'s three-state `enabled` + `RefreshPolicy`
+/// shape deliberately — same reasoning applies here, see `ScipConfig`'s own
+/// doc comment. Defaults to `policy: OnDemand` (not `OnSave`, unlike
+/// `ScipConfig`'s default): a persistent LSP subprocess plus one
+/// `textDocument/definition` round-trip per unresolved call site is a
+/// materially heavier per-reindex cost than SCIP's single cached batch dump,
+/// and `rebuild_graph` deletes+rebuilds all of `call_edges` on every reindex
+/// that touches any file (`pipeline.rs::rebuild_graph`) — so an `OnSave`
+/// default here would re-spawn rust-analyzer and re-resolve every ambiguous
+/// call site on every single file save. Never auto-upgrade this default to
+/// `OnSave` without first measuring real per-save latency at project scale.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct LspConfig {
+    /// Three-state, same semantics as `ScipConfig::enabled`: unset (default)
+    /// auto-detects `rust-analyzer` and silently no-ops if absent; `Some(true)`
+    /// forces on and logs once if the binary isn't found; `Some(false)` never
+    /// even probes for it.
+    pub enabled: Option<bool>,
+    /// Optional explicit rust-analyzer binary path (else the same
+    /// PATH/rustup/VS-Code auto-detect `ScipConfig::binary` uses, via
+    /// `scip::runner::resolve_binary`).
+    pub binary: Option<String>,
+    /// Gates whether an *automatic* caller (background watcher, `calm index`)
+    /// may run this overlay. Never gates an explicit manual refresh (the
+    /// `lsp_refresh` MCP tool), which always runs regardless of policy — same
+    /// contract as `ScipConfig::policy`. Default `OnDemand`: see this
+    /// struct's own doc comment for why `OnSave` is not a safe default here
+    /// the way it is for `ScipConfig`.
+    #[serde(default = "default_lsp_policy")]
+    pub policy: RefreshPolicy,
+}
+
+/// Hand-written (not derived) so the Rust-side default agrees with the serde
+/// default: `#[derive(Default)]` would fill `policy` from
+/// `RefreshPolicy::default()` — `OnSave`, the exact value this config's doc
+/// comment forbids as a default — because derive never consults
+/// `#[serde(default = "fn")]` attributes (those only apply during
+/// deserialization of a present-but-partial `lsp` table). Caught in the
+/// 2026-07-10 review pass: every unconfigured project (`RustConfig::default()`,
+/// `load_config(...).unwrap_or_default()`) got `OnSave` silently.
+impl Default for LspConfig {
+    fn default() -> Self {
+        Self {
+            enabled: None,
+            binary: None,
+            policy: default_lsp_policy(),
+        }
+    }
+}
+
+fn default_lsp_policy() -> RefreshPolicy {
+    RefreshPolicy::OnDemand
 }
 
 /// Go's overlay config (P2.1) — same `ScipConfig` shape as Rust's (three-state

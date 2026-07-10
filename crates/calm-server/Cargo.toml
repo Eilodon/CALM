@@ -34,3 +34,7 @@ lang-shell  = ["calm-core/lang-shell"]
 lang-r      = ["calm-core/lang-r"]
 tier0-5     = ["calm-core/tier0-5"]
 scip-overlay = ["calm-core/scip-overlay"]
+# Opt-in, not in `default` yet — brand new, unverified at real project scale.
+# See calm-core's `lsp-overlay` feature comment and `LspConfig`'s doc comment
+# (config.rs) for why its default policy is `on_demand`, never `on_save`.
+lsp-overlay  = ["calm-core/lsp-overlay"]

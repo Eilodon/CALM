@@ -202,7 +202,7 @@ pub fn run_watch_loop(
                             // out — the 8 language overlays below each open their
                             // own instead.
                             drop(conn);
-                            crate::scip_overlay::run_all(&project_root, &db_path);
+                            crate::scip_overlay::run_all_coalesced(&project_root, &db_path);
                         }
                     }
                     Ok(calm_core::indexer::pipeline::ReindexOutcome::Completed(_)) => {}
