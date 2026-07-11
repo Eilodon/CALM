@@ -53,6 +53,7 @@ fn node_kind_to_symbol_kind(node_kind: &str, in_class: bool) -> SymbolKind {
         // have direct "name" fields (see lang_constants.rs) but previously had
         // no arm here, so they silently fell through to Function/Method.
         "class_specifier" => SymbolKind::Class,
+        "class_statement" => SymbolKind::Class, // PowerShell
         "struct_specifier" => SymbolKind::Struct,
         "struct_declaration" => SymbolKind::Struct, // C#
         "trait_item" => SymbolKind::Trait,
@@ -117,7 +118,13 @@ fn node_kind_to_symbol_kind(node_kind: &str, in_class: bool) -> SymbolKind {
         | "union_specifier"
         | "delegate_declaration" => SymbolKind::Type,
         // Explicit method nodes are always Method regardless of scope.
-        "method_declaration" | "method_definition" => SymbolKind::Method,
+        // PowerShell's `class_method_definition` is unambiguous by node
+        // kind alone (distinct from `function_statement`) — joins this
+        // group even though it gets no class_context (see lang_constants.rs's
+        // PowerShell entry).
+        "method_declaration" | "method_definition" | "class_method_definition" => {
+            SymbolKind::Method
+        }
         // JS/TS `const foo = () => {}` — treated as a variable holding a function.
         "lexical_declaration" => SymbolKind::Variable,
         // Zig top-level `const`/`var` (`const std = @import(...)`,
@@ -440,6 +447,26 @@ fn resolve_name_node<'a>(
             } else {
                 None
             }
+        }
+        // PowerShell: `class_statement`, `class_method_definition`, and
+        // `function_statement` all have ZERO fields (confirmed via
+        // node-types.json) — every name is a bare positional child, found
+        // by kind rather than field name. `class_statement`'s own name and
+        // `class_method_definition`'s method name are BOTH kind
+        // "simple_name" (confirmed via a real AST dump: a method's
+        // optional `[ReturnType]` sits before it, so "find the first
+        // simple_name child" is what actually locates the name, not a
+        // fixed child index). `function_statement` uses a different kind,
+        // "function_name", for the same purpose.
+        "class_statement" | "class_method_definition" => {
+            let mut cursor = node.walk();
+            node.children(&mut cursor)
+                .find(|c| c.kind() == "simple_name")
+        }
+        "function_statement" => {
+            let mut cursor = node.walk();
+            node.children(&mut cursor)
+                .find(|c| c.kind() == "function_name")
         }
         _ => None,
     }
@@ -1067,10 +1094,18 @@ pub struct RawCall {
 
 /// Keep the leading identifier of a segment (drop generics/parens/whitespace).
 fn leading_ident(seg: &str) -> Option<String> {
+    // '-' is included for PowerShell's Verb-Noun command convention
+    // (`Write-Host`, `Get-ChildItem`) — a single token in that grammar, but
+    // otherwise never part of a real identifier in any currently supported
+    // language (all of which use '-' only as the subtraction operator,
+    // never inside a bare identifier), so this is safe to extend globally:
+    // confirmed via the full test suite staying green after this change.
+    // Found via a real test failure (`Write-Host` resolving to callee
+    // "Write" instead of "Write-Host"), not guessed.
     let ident: String = seg
         .trim()
         .chars()
-        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
         .collect();
     if ident.is_empty() { None } else { Some(ident) }
 }
@@ -2320,6 +2355,35 @@ pub(crate) fn detect_zig(s: &str) -> Option<(String, SymbolKind)> {
         {
             return Some((name, SymbolKind::Variable));
         }
+    }
+    None
+}
+
+// PowerShell function names commonly use the Verb-Noun convention
+// (`Get-Something`) — the plain `ident_at_start` (alnum/underscore only)
+// would truncate at the hyphen, so this needs its own hyphen-tolerant scan.
+fn powershell_ident_at_start(s: &str) -> Option<String> {
+    let s = s.trim_start();
+    let end = s
+        .find(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
+        .unwrap_or(s.len());
+    let name = &s[..end];
+    if name.is_empty() || name.starts_with(|c: char| c.is_ascii_digit()) {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+pub(crate) fn detect_powershell(s: &str) -> Option<(String, SymbolKind)> {
+    if let Some(rest) = s.strip_prefix("function ")
+        && let Some(name) = powershell_ident_at_start(rest)
+    {
+        return Some((name, SymbolKind::Function));
+    }
+    if let Some(rest) = s.strip_prefix("class ")
+        && let Some(name) = ident_at_start(rest)
+    {
+        return Some((name, SymbolKind::Class));
     }
     None
 }
@@ -3819,6 +3883,18 @@ public class FooTest {
         assert!(names.contains(&"std"), "should detect const");
         assert!(names.contains(&"counter"), "should detect var");
     }
+
+    #[test]
+    fn test_shallow_powershell() {
+        let code = "function Get-Greeting {\nclass Greeter {\n";
+        let syms = extract_symbols_shallow(code, "powershell", "a.ps1");
+        let names = shallow_names(&syms);
+        assert!(
+            names.contains(&"Get-Greeting"),
+            "should detect hyphenated Verb-Noun function name"
+        );
+        assert!(names.contains(&"Greeter"), "should detect class");
+    }
     #[test]
     fn test_shallow_shell() {
         let code = "function setup() {\nbuild() {\n  echo hi\n}\n";
@@ -4563,6 +4639,81 @@ class Foo {
                 && c.callee == "greet"
                 && c.receiver.as_deref() == Some("g")),
             "call on a local var should produce a call edge with receiver: {calls:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "lang-powershell")]
+    fn test_tier0_5_grammar_loads_powershell() {
+        assert!(
+            parse_tree("function Main {\n    Write-Host \"hi\"\n}\n", "powershell").is_some(),
+            "tree-sitter-powershell grammar should load and parse — locks the pinned ABI \
+             (=0.25.9, ABI 14); a caret-range bump to 0.25.10+ (ABI 15) would silently \
+             regress this to shallow line-scan"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "lang-powershell")]
+    fn test_powershell_real_grammar_symbols_and_calls_are_accurate() {
+        // PowerShell has TWO distinct call mechanisms, confirmed via a real
+        // AST dump: `command` (bare shell-style, `Write-Host "hello"` or a
+        // user function called command-style, `Greet "world"` — has a
+        // direct "command_name" field) and `invokation_expression`
+        // (`.Method()` calls — zero fields, receiver/member_name/args are
+        // all separate positional children, not one combined dotted-text
+        // span the existing "$first_child" sentinel could split). Only
+        // `command` is wired for call-graph extraction this pass —
+        // `.Method()` calls are a documented scope cut, same category as
+        // Dart's full call-graph cut but narrower (command-style calls,
+        // the more pervasive style in real PowerShell scripts, still work).
+        //
+        // `class_statement`/`class_method_definition`/`function_statement`
+        // all have ZERO fields — every name is a positional child, found by
+        // kind ("simple_name" for the former two, "function_name" for the
+        // latter, confirmed distinct via the dump).
+        let code = "class Greeter {\n    [string]$Name\n\n    [string] Greet() {\n        Write-Host \"hello\"\n        return $this.FormatGreeting()\n    }\n\n    [string] FormatGreeting() {\n        return \"Hello, \" + $this.Name\n    }\n}\n\nfunction Main {\n    $g = [Greeter]::new()\n    $g.Greet()\n}\n";
+        let symbols = extract_symbols(code, "powershell", "a.ps1").unwrap();
+        let names = shallow_names(&symbols);
+        assert!(
+            names.contains(&"Greeter"),
+            "should detect class_statement: {names:?}"
+        );
+        assert!(
+            names.contains(&"Greet"),
+            "should detect class_method_definition: {names:?}"
+        );
+        assert!(
+            names.contains(&"FormatGreeting"),
+            "should detect second class_method_definition: {names:?}"
+        );
+        assert!(
+            names.contains(&"Main"),
+            "should detect function_statement: {names:?}"
+        );
+
+        let greeter = symbols
+            .iter()
+            .find(|s| s.name == "Greeter")
+            .expect("Greeter should be found");
+        assert_eq!(greeter.kind, SymbolKind::Class);
+        let greet = symbols
+            .iter()
+            .find(|s| s.name == "Greet")
+            .expect("Greet should be found");
+        assert_eq!(
+            greet.kind,
+            SymbolKind::Method,
+            "class_method_definition is unambiguous by node kind alone, no \
+             class_context needed to tell it apart from a free function"
+        );
+
+        let calls = extract_calls(code, "powershell", "a.ps1").unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.enclosing_name == "Greet" && c.callee == "Write-Host"),
+            "command-style call should produce a call edge: {calls:?}"
         );
     }
 }

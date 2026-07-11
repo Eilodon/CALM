@@ -291,6 +291,15 @@ fn ts_lang_zig() -> Option<tree_sitter::Language> {
     None
 }
 
+#[cfg(feature = "lang-powershell")]
+fn ts_lang_powershell() -> Option<tree_sitter::Language> {
+    Some(tree_sitter_powershell::LANGUAGE.into())
+}
+#[cfg(not(feature = "lang-powershell"))]
+fn ts_lang_powershell() -> Option<tree_sitter::Language> {
+    None
+}
+
 const JS_TS_CONSTANTS: LangConstants = LangConstants {
     function_node_types: &[
         "function_declaration",
@@ -1376,6 +1385,65 @@ pub static LANGUAGES: &[LanguageSpec] = &[
             "comptime ",
         ],
         shallow_detect: Some(crate::indexer::parser::detect_zig),
+    },
+    // PowerShell (Phase C, 2026-07-11): 0.25.9 is the newest ABI-14
+    // release; 0.25.10 jumped to ABI 15 — a within-0.25.x cliff, not just at
+    // a minor bump, confirming version numbers alone are never trustworthy
+    // (see the workspace root Cargo.toml comment). Verified via a real AST
+    // dump on a fixture covering a class with a property and two methods
+    // (one calling the other via `.`), and a top-level function using both
+    // a command-style call and a static-method invocation.
+    //
+    // `class_statement`/`class_method_definition`/`function_statement` all
+    // have ZERO fields — every name is a positional child, found by kind
+    // ("simple_name" for the first two, "function_name" for the last).
+    // `class_method_definition` is unambiguous by node kind alone (distinct
+    // from `function_statement`), so it maps straight to SymbolKind::Method
+    // without needing class_context.
+    //
+    // Deliberate scope cut: PowerShell has TWO call mechanisms — `command`
+    // (bare shell-style, `Write-Host "hi"`, has a direct "command_name"
+    // field) and `invokation_expression` (`.Method()`/`[Type]::Static()`
+    // calls, ZERO fields, receiver/member-name/args are separate positional
+    // children rather than one combined dotted-text span the existing
+    // `"$first_child"` sentinel could split). Only `command` is wired for
+    // call-graph extraction this pass; `.Method()` calls are not, a
+    // narrower version of Dart's full call-graph cut (the more pervasive
+    // command-style calls in real PowerShell scripts still work). See
+    // `test_powershell_real_grammar_symbols_and_calls_are_accurate` in
+    // parser.rs.
+    LanguageSpec {
+        name: "powershell",
+        aliases: &[],
+        extensions: &["ps1", "psm1", "psd1"],
+        constants: LangConstants {
+            function_node_types: &[
+                "function_statement",
+                "class_statement",
+                "class_method_definition",
+            ],
+            name_field: "name",
+            docstring_type: Some("comment"),
+            call_node_types: &["command"],
+            call_function_field: "command_name",
+            call_function_field_by_kind: &[],
+            class_node_types: &[],
+            class_name_field: "name",
+            definition_macro_names: &[],
+        },
+        ts_language: ts_lang_powershell,
+        branch_node_kinds: &[
+            "if_statement",
+            "while_statement",
+            "for_statement",
+            "foreach_statement",
+            "switch_statement",
+        ],
+        decorator_node_kinds: &[],
+        binding_kinds: &[],
+        line_comment_prefixes: DEFAULT_COMMENT_PREFIXES,
+        modifier_keywords: &["static ", "hidden "],
+        shallow_detect: Some(crate::indexer::parser::detect_powershell),
     },
 ];
 

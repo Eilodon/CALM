@@ -116,6 +116,13 @@ tree-sitter-ocaml = "=0.24.2"
 # (1.1.2, unchanged since Dec 2024) is already ABI 14 — no cliff to pin
 # below. Real dependency is the modern `tree-sitter-language = "0.1"` shim.
 tree-sitter-zig = "=1.1.2"
+# Phase C (2026-07-11): same ABI-cliff pattern, verified the same way
+# (downloaded each published .crate tarball, grepped src/parser.c). 0.25.9
+# is the newest ABI-14 release; 0.25.10 jumped to ABI 15 (a within-0.25.x
+# cliff, not just at a 0.26.0 minor bump — confirms the plan's warning that
+# version-number heuristics alone aren't reliable). Real dependency is the
+# modern `tree-sitter-language = "0.1"` shim.
+tree-sitter-powershell = "=0.25.9"
 # Stack Graphs (formal name resolution)
 stack-graphs = "0.14"
 tree-sitter-stack-graphs = "0.10"
