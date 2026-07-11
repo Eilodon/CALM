@@ -123,6 +123,19 @@ pub(crate) struct SessionSummary {
     pub(crate) last_touched_file: Option<String>,
     pub(crate) last_touched_at: String,
     pub(crate) tool_calls: u64,
+    /// Qualified name of the most recent symbol this session ran
+    /// `edit_context` on — advisory intent-visibility, not a reservation:
+    /// no other session is blocked from touching the same symbol, and this
+    /// is never cleared once the edit actually happens, so a stale value
+    /// here just means "this session was looking at X as of
+    /// `last_touched_at`/`tool_calls`", the same "as of" caveat every other
+    /// field on this struct already carries. Closes part of the gap between
+    /// `active_sessions` only ever recording *past* touches
+    /// (`touch_active_session`) and a session's actual *current* intent —
+    /// still no reservation/locking semantics, same posture as the rest of
+    /// this struct.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) reviewing_symbol: Option<String>,
 }
 
 /// Fingerprint of one `edit_context` call for one symbol this session —
@@ -2297,6 +2310,53 @@ mod tests {
         assert!(
             other.iter().all(|s| s["session_id"] != id_a),
             "conn_a's own entry must never appear in its own other_active_sessions: {a_ctx}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_context_other_active_sessions_reflects_edit_context_review() {
+        let dir = std::env::temp_dir().join(format!("ci_reviewing_symbol_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let shared = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        {
+            let conn = shared.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('mod.reviewed_fn', 'reviewed_fn', 'function', 'rust', 'src/a.rs', 1, 1, '', '', 'reviewed_fn', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let conn_a = shared.for_connection();
+        let conn_b = shared.for_connection();
+
+        // conn_a must not see any intent yet — nothing reviewed so far.
+        let before = jv(conn_a.session_context());
+        assert!(
+            before["other_active_sessions"][0]["reviewing_symbol"].is_null(),
+            "{before}"
+        );
+
+        conn_b.edit_context(rmcp::handler::server::wrapper::Parameters(
+            EditContextParams {
+                symbol: "reviewed_fn".into(),
+                path: None,
+                line: None,
+                if_none_match: None,
+            },
+        ));
+
+        let after = jv(conn_a.session_context());
+        let other = after["other_active_sessions"].as_array().unwrap();
+        assert_eq!(
+            other[0]["reviewing_symbol"],
+            serde_json::json!("mod.reviewed_fn"),
+            "conn_a must see conn_b's edit_context review as intent, not just past touches: {after}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -5088,6 +5148,91 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_lines_rejects_path_traversal_outside_project_root() {
+        let (dir, server) = test_server("edit_traversal");
+        let outside_dir = dir
+            .parent()
+            .unwrap()
+            .join(format!("ci_edit_traversal_outside_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&outside_dir);
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        std::fs::write(outside_dir.join("secret.txt"), "top secret\n").unwrap();
+
+        let traversal_path = format!(
+            "../{}/secret.txt",
+            outside_dir.file_name().unwrap().to_str().unwrap()
+        );
+
+        let out = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
+            EditLinesParams {
+                path: traversal_path,
+                edits: vec![EditHunkParam {
+                    start_line: 1,
+                    end_line: 1,
+                    expected_hash: Some("irrelevant".into()),
+                    new_text: "pwned\n".into(),
+                }],
+                confirm: false,
+                reason: None,
+            },
+        ));
+        let v = jv(out);
+        assert_eq!(v["error"]["code"], "PATH_ESCAPES_PROJECT_ROOT", "{v}");
+
+        assert_eq!(
+            std::fs::read_to_string(outside_dir.join("secret.txt")).unwrap(),
+            "top secret\n",
+            "a `..`-traversal edit must never touch a file outside the project root"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&outside_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn edit_lines_rejects_symlink_escaping_project_root() {
+        let (dir, server) = test_server("edit_symlink_escape");
+        let outside_dir = dir
+            .parent()
+            .unwrap()
+            .join(format!("ci_edit_symlink_outside_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&outside_dir);
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        std::fs::write(outside_dir.join("secret.txt"), "top secret\n").unwrap();
+
+        // A symlink INSIDE the project root pointing at a file OUTSIDE it —
+        // the GhostApproval-class case: a host's confirm dialog would show
+        // "link.txt", not the real target this actually resolves to.
+        std::os::unix::fs::symlink(outside_dir.join("secret.txt"), dir.join("link.txt")).unwrap();
+
+        let out = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
+            EditLinesParams {
+                path: "link.txt".into(),
+                edits: vec![EditHunkParam {
+                    start_line: 1,
+                    end_line: 1,
+                    expected_hash: Some("irrelevant".into()),
+                    new_text: "pwned\n".into(),
+                }],
+                confirm: false,
+                reason: None,
+            },
+        ));
+        let v = jv(out);
+        assert_eq!(v["error"]["code"], "PATH_ESCAPES_PROJECT_ROOT", "{v}");
+
+        assert_eq!(
+            std::fs::read_to_string(outside_dir.join("secret.txt")).unwrap(),
+            "top secret\n",
+            "a symlink escaping the project root must never be written through"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&outside_dir);
     }
 
     #[test]

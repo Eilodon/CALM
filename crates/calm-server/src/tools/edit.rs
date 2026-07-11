@@ -151,7 +151,10 @@ impl CalmServer {
             }
         };
 
-        let full_path = self.project_root.join(path);
+        let full_path = match resolve_repo_path(&self.project_root, path) {
+            Ok(p) => p,
+            Err(e) => return ToolOutcome::error(e),
+        };
         let original = match std::fs::read_to_string(&full_path) {
             Ok(s) => s,
             Err(e) => {
@@ -285,6 +288,16 @@ impl CalmServer {
                 }
             }
             if !missing.is_empty() {
+                tracing::info!(
+                    target: crate::telemetry::AUDIT_TARGET,
+                    session_id = self.session_id,
+                    decision = "denied",
+                    reason_code = "EDIT_CONTEXT_REQUIRED",
+                    path,
+                    symbol = missing[0],
+                    risk = risk.as_deref().unwrap_or("none"),
+                    hub_hit,
+                );
                 return ToolOutcome::error(error_detail(
                     "EDIT_CONTEXT_REQUIRED",
                     &format!(
@@ -305,6 +318,15 @@ impl CalmServer {
                 reviewed_risk_levels
             );
             if !confirm {
+                tracing::info!(
+                    target: crate::telemetry::AUDIT_TARGET,
+                    session_id = self.session_id,
+                    decision = "denied",
+                    reason_code = "CONFIRM_REQUIRED",
+                    path,
+                    risk = risk.as_deref().unwrap_or("none"),
+                    hub_hit,
+                );
                 return ToolOutcome::error(error_detail(
                     "CONFIRM_REQUIRED",
                     &format!("this edit touches {why} — pass confirm:true to proceed"),
@@ -326,6 +348,16 @@ impl CalmServer {
                 })
             };
             if !cites_real_signal {
+                tracing::info!(
+                    target: crate::telemetry::AUDIT_TARGET,
+                    session_id = self.session_id,
+                    decision = "denied",
+                    reason_code = "REASON_NOT_GROUNDED",
+                    path,
+                    reason,
+                    risk = risk.as_deref().unwrap_or("none"),
+                    hub_hit,
+                );
                 let examples: Vec<&str> = known_caller_qns
                     .iter()
                     .map(|qn| qn.rsplit("::").next().unwrap_or(qn.as_str()))
@@ -354,6 +386,27 @@ impl CalmServer {
                 &format!("failed to write {path}: {e}"),
                 false,
             ));
+        }
+        {
+            // One audit event per successful write, unconditional (not just
+            // hub/high-risk touches) — the "who/when/confirmed-or-refused/
+            // hash-before-after" trail; see AUDIT_TARGET's doc comment.
+            let hash_of = |c: &str| {
+                let n = c.lines().count().max(1);
+                calm_core::edit::range_checksum(c, 1, n).unwrap_or_else(|| "empty".to_string())
+            };
+            tracing::info!(
+                target: crate::telemetry::AUDIT_TARGET,
+                session_id = self.session_id,
+                decision = "applied",
+                path,
+                hunks = hunks_output.len() as u64,
+                risk = risk.as_deref().unwrap_or("none"),
+                hub_hit,
+                confirmed = confirm,
+                old_hash = hash_of(&original),
+                new_hash = hash_of(&new_content),
+            );
         }
 
         // From here on the file on disk already holds the new content, so an
@@ -563,13 +616,59 @@ fn compute_touch_risk(
 /// Languages without a parse tree (docs, configs, shallow-tier grammars)
 /// fall back to the indexed range; the anchor-line hash pre-filled by
 /// `insertion_hunk` still conflict-checks the write either way.
+/// Resolves `path` (repo-relative, caller-supplied) against `project_root`
+/// and verifies the *real* location — after any `..` traversal or symlink
+/// is followed — stays inside it. Both callers require the target to
+/// already exist (`edit_lines_impl` only edits existing files;
+/// `insertion_hunk_for` reads one to compute an insertion point), so
+/// canonicalizing the full path directly, rather than just its parent, is
+/// enough to catch an escape via any path component, including the leaf
+/// itself being a symlink.
+///
+/// Independently discovered via code review while cross-checking CALM
+/// against Wiz's "GhostApproval" report (2026-07-08,
+/// wiz.io/blog/ghostapproval-a-trust-boundary-gap-in-ai-coding-assistants),
+/// which documented the same *class* of bug (CWE-61 symlink following +
+/// UI misrepresentation, not a TOCTOU race as sometimes summarized) in
+/// several AI coding assistants' own file-write paths. CALM never renders
+/// a confirmation dialog itself, but a host MCP client's dialog shows
+/// `path` exactly as supplied here — an unvalidated traversal/symlink
+/// escape at this layer is still an informed-consent bypass one level
+/// down, regardless of what the host displays.
+fn resolve_repo_path(
+    project_root: &std::path::Path,
+    path: &str,
+) -> Result<std::path::PathBuf, ErrorDetail> {
+    let candidate = project_root.join(path);
+    let real = std::fs::canonicalize(&candidate).map_err(|e| {
+        error_detail("READ_FAILED", &format!("could not read {path}: {e}"), false)
+    })?;
+    // `project_root` isn't guaranteed canonical by every caller (tests in
+    // particular construct `CalmServer` directly from an uncanonicalized
+    // temp dir) — canonicalize both sides rather than assume the
+    // constructor already did, so this check can't be defeated simply by
+    // an un-canonicalized root.
+    let root = std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
+    if !real.starts_with(&root) {
+        return Err(error_detail(
+            "PATH_ESCAPES_PROJECT_ROOT",
+            &format!(
+                "{path} resolves outside the project root (via `..` traversal or a symlink) \
+                 — refusing to read or write it"
+            ),
+            false,
+        ));
+    }
+    Ok(real)
+}
+
 fn insertion_hunk_for(
     project_root: &std::path::Path,
     c: &CandidateRow,
     position: calm_core::edit::InsertPosition,
     new_text: &str,
 ) -> Result<calm_core::edit::HunkRequest, ErrorDetail> {
-    let full_path = project_root.join(&c.path);
+    let full_path = resolve_repo_path(project_root, &c.path)?;
     let live = std::fs::read_to_string(&full_path).map_err(|e| {
         error_detail(
             "READ_FAILED",

@@ -92,6 +92,7 @@ impl CalmServer {
                     last_touched_file: None,
                     last_touched_at: utc_now_iso8601(),
                     tool_calls: 0,
+                    reviewing_symbol: None,
                 },
             );
         }
@@ -249,14 +250,33 @@ impl CalmServer {
             .lock()
             .map(|log| log.tool_calls)
             .unwrap_or(0);
-        if let Ok(mut sessions) = self.active_sessions.lock() {
-            if let Some(entry) = sessions.get_mut(&self.session_id) {
-                if let Some(path) = path {
-                    entry.last_touched_file = Some(path.to_string());
-                }
-                entry.last_touched_at = utc_now_iso8601();
-                entry.tool_calls = tool_calls;
+        if let Ok(mut sessions) = self.active_sessions.lock()
+            && let Some(entry) = sessions.get_mut(&self.session_id)
+        {
+            if let Some(path) = path {
+                entry.last_touched_file = Some(path.to_string());
             }
+            entry.last_touched_at = utc_now_iso8601();
+            entry.tool_calls = tool_calls;
+        }
+    }
+
+    /// Publishes "this session is currently reviewing `qualified_name`" to
+    /// the *shared* `active_sessions` registry — the multi-agent-visible
+    /// counterpart to `record_edit_context_review`'s session-local record.
+    /// Called from `edit_context` (the mandatory pre-edit tool), so another
+    /// concurrent session calling `session_context` can see *intent*
+    /// ("session 3 just reviewed `foo` — probably about to edit it"), not
+    /// just the *past* touches `touch_active_session` already tracked.
+    /// Deliberately advisory only, same posture as the rest of
+    /// `SessionSummary`: this never blocks, reserves, or locks anything —
+    /// two sessions can review (or even edit) the same symbol regardless.
+    pub(crate) fn note_reviewing(&self, qualified_name: &str) {
+        if let Ok(mut sessions) = self.active_sessions.lock()
+            && let Some(entry) = sessions.get_mut(&self.session_id)
+        {
+            entry.reviewing_symbol = Some(qualified_name.to_string());
+            entry.last_touched_at = utc_now_iso8601();
         }
     }
 

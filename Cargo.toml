@@ -159,7 +159,7 @@ tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
 notify = "6.1"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 rmcp = { version = "2", features = ["server", "transport-io", "macros"] }
 schemars = "1"
 clap = { version = "4", features = ["derive"] }

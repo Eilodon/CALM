@@ -214,6 +214,7 @@ impl CalmServer {
                 &callers.iter().map(|e| e.symbol.clone()).collect::<Vec<_>>(),
                 risk.as_deref().unwrap_or("unknown"),
             );
+            self.note_reviewing(&c.qualified_name);
             let trend = calm_core::fitness::compute_trend(
                 &conn,
                 &c.qualified_name,

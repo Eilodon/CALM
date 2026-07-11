@@ -933,6 +933,7 @@ mod tests {
                 last_touched_file: None,
                 last_touched_at: "2026-07-11T00:00:00Z".into(),
                 tool_calls: 0,
+                reviewing_symbol: None,
             },
         );
 

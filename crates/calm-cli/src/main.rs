@@ -788,17 +788,42 @@ fn init_daemon_tracing(project_root: &std::path::Path) -> Result<()> {
     // `daemon_calm_dir_and_socket_have_restrictive_permissions`
     // (`crates/calm-cli/tests/daemon_integration.rs`), not by inspection.
     calm_server::daemon::create_calm_dir(&calm_dir)?;
-    let log_path = calm_dir.join("daemon.log");
-    let file = std::fs::OpenOptions::new()
+
+    use tracing_subscriber::prelude::*;
+
+    let log_file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&log_path)?;
-    tracing_subscriber::fmt()
-        .with_env_filter(
+        .open(calm_dir.join("daemon.log"))?;
+    let human_layer = tracing_subscriber::fmt::layer()
+        .with_writer(log_file)
+        .with_filter(
             tracing_subscriber::EnvFilter::from_default_env()
                 .add_directive(tracing::Level::INFO.into()),
-        )
-        .with_writer(file)
+        );
+
+    // Structured, SIEM-ingestible sibling of `daemon.log`: same process,
+    // separate file, JSON-formatted, scoped to only the
+    // `calm_server::telemetry::AUDIT_TARGET` target via `filter_fn` — every
+    // other INFO-level line (the bulk of daemon.log) is excluded here, so
+    // this file only ever holds edit-decision events (EDIT_CONTEXT_REQUIRED/
+    // CONFIRM_REQUIRED/REASON_NOT_GROUNDED denials, and applied writes with
+    // their before/after hashes) instead of duplicating the human log in a
+    // different format.
+    let audit_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(calm_dir.join("audit.log"))?;
+    let audit_layer = tracing_subscriber::fmt::layer()
+        .json()
+        .with_writer(audit_file)
+        .with_filter(tracing_subscriber::filter::filter_fn(|meta| {
+            meta.target() == calm_server::telemetry::AUDIT_TARGET
+        }));
+
+    tracing_subscriber::registry()
+        .with(human_layer)
+        .with(audit_layer)
         .init();
     Ok(())
 }

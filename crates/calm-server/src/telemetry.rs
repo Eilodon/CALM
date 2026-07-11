@@ -1,3 +1,14 @@
+/// `tracing` target for structured, SIEM-ingestible audit events — distinct
+/// from the default target so a subscriber can route these to a dedicated
+/// sink (e.g. a JSON-formatted `.calm/audit.log`) without duplicating every
+/// other INFO-level log line into it. Emitted at `edit_lines`/`edit_symbol`'s
+/// decision points (EDIT_CONTEXT_REQUIRED/CONFIRM_REQUIRED/REASON_NOT_GROUNDED
+/// denials, and successful writes) — the "who/when/confirmed-or-refused/
+/// hash-before-after" trail MCP's own 2026 roadmap names as the least-defined
+/// of its four priorities and open for the community to shape
+/// (blog.modelcontextprotocol.io/posts/2026-mcp-roadmap, 2026-03-09).
+pub const AUDIT_TARGET: &str = "calm_audit";
+
 pub fn timed_tool<T: serde::Serialize>(name: &str, body: impl FnOnce() -> T) -> T {
     let start = std::time::Instant::now();
     let result = body();
@@ -5,15 +16,15 @@ pub fn timed_tool<T: serde::Serialize>(name: &str, body: impl FnOnce() -> T) -> 
     let serialized = serde_json::to_string(&result).ok();
     let result_size = serialized.as_ref().map(|s| s.len()).unwrap_or(0);
 
-    // Advisory, non-blocking: every one of the 22 tools passes its result
-    // through this one choke point, so this is the single place that can
-    // scan a tool's FULL output for prompt-injection-shaped text without
-    // touching each tool's own (differently-shaped) output struct. Today
-    // only `source`/`understand` carry a `content_warning` field on their
-    // own `source` text specifically — this covers the other tools' free
-    // text too (docstrings, call-site previews, search snippets, ...),
-    // logged rather than injected into the response (T's shape is opaque
-    // here, and changing it would break every tool's `Json<T>` schema).
+    // Advisory, non-blocking: every tool's result passes through this one
+    // choke point, so this is the single place that can scan a tool's FULL
+    // output for prompt-injection-shaped text without touching each tool's
+    // own (differently-shaped) output struct. Today only `source`/
+    // `understand` carry a `content_warning` field on their own `source`
+    // text specifically — this covers the other tools' free text too
+    // (docstrings, call-site previews, search snippets, ...), logged rather
+    // than injected into the response (T's shape is opaque here, and
+    // changing it would break every tool's `Json<T>` schema).
     if let Some(s) = &serialized {
         let hits = calm_core::sanitize::detect_injection_patterns(s);
         if !hits.is_empty() {
