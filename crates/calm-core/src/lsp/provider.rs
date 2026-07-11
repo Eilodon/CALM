@@ -59,7 +59,13 @@ pub const CLANGD: LspProvider = LspProvider {
 /// PATH, then `$GOBIN`, then `~/go/bin` — same search shape as
 /// `scip::runner::go_resolve_binary`, different binary name (`gopls`, the
 /// persistent LSP server `go install golang.org/x/tools/gopls@latest`
-/// installs, not `scip-go`'s one-shot batch indexer).
+/// installs, not `scip-go`'s one-shot batch indexer). Uses `gopls_runs`
+/// (its own `version` SUBCOMMAND, not the shared `binary_runs`'s `--version`
+/// FLAG) — confirmed live (2026-07-11): `gopls --version` errors with exit
+/// 2 ("flag provided but not defined: -version") and prints its own help
+/// text to stdout instead, so `binary_runs` would have silently reported a
+/// real, working gopls as "not found." Same failure class already
+/// documented for PHP's `php_binary_runs` in `scip::runner`.
 fn gopls_resolve_binary(override_bin: Option<&str>, _root: &Path) -> Option<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Some(b) = override_bin {
@@ -72,7 +78,19 @@ fn gopls_resolve_binary(override_bin: Option<&str>, _root: &Path) -> Option<Path
     if let Some(home) = dirs_home() {
         candidates.push(home.join("go").join("bin").join("gopls"));
     }
-    candidates.into_iter().find(|c| binary_runs(c))
+    candidates.into_iter().find(|c| gopls_runs(c))
+}
+
+/// `gopls version` (subcommand) — see `gopls_resolve_binary`'s doc comment
+/// for why this can't reuse the shared `binary_runs` (`--version` flag).
+fn gopls_runs(path: &Path) -> bool {
+    std::process::Command::new(path)
+        .arg("version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 /// PATH (`clangd`), then Debian/Ubuntu's unaliased versioned package names.

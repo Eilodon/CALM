@@ -685,4 +685,208 @@ mod tests {
             .unwrap();
         assert_eq!(n as usize, stats.upgraded);
     }
+
+    /// Live integration: real `gopls` against `multi_lang_workspace/go`
+    /// (Phase D.4, 2026-07-11). Ignored by default — needs `gopls` on PATH
+    /// and a real `go build`-capable module (this fixture's own `go.mod`).
+    ///
+    /// `route`'s type switch (`switch h := v.(type) { case AlphaHandler: ...
+    /// case BetaHandler: ... }`) is the Go analogue of Kotlin's `is X ->`
+    /// smart cast: CALM's syntactic resolver can't follow the type switch,
+    /// so `h.Process()` in both branches lands as `ambiguous` with the same
+    /// 2 candidates (`AlphaHandler::Process`/`BetaHandler::Process`) before
+    /// this overlay runs. `gopls`'s real `go/types` analysis narrows `h`'s
+    /// static type per-branch and resolves each call to its own specific
+    /// target, ruling out the other branch's candidate — verified once by
+    /// hand before this test was written (indexed the fixture, ran gopls
+    /// through the LSP overlay: both ambiguous call sites resolved to the
+    /// correct branch-specific target, the wrong cross-pairing at each site
+    /// stayed ambiguous).
+    #[test]
+    #[ignore]
+    fn gopls_overlay_upgrades_ambiguous_type_switch_calls_on_the_multi_lang_fixture() {
+        let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/multi_lang_workspace/go");
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        let phase = std::sync::Arc::new(std::sync::RwLock::new(
+            crate::types::IndexingPhase::Scanning,
+        ));
+        crate::indexer::pipeline::run_indexing_pipeline(&mut conn, &fixture, phase).unwrap();
+
+        let before_alpha: String = conn
+            .query_row(
+                "SELECT edge_confidence FROM call_edges \
+                 WHERE from_symbol = 'handlers.go::route' \
+                   AND to_symbol = 'handlers.go::AlphaHandler::Process' \
+                   AND call_site_line = 32",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            before_alpha, "ambiguous",
+            "fixture must start ambiguous — CALM's syntactic resolver can't follow a Go type switch"
+        );
+
+        let cfg = LspConfig {
+            enabled: Some(true),
+            binary: None,
+            policy: RefreshPolicy::OnDemand,
+        };
+        let stats = run_lsp_overlay(&conn, &fixture, &provider::GOPLS, &cfg, true).unwrap();
+        assert!(
+            stats.upgraded > 0,
+            "expected at least one edge upgraded to formal (attempted={})",
+            stats.attempted
+        );
+
+        // Line 32 (`case AlphaHandler: return h.Process()`) must resolve to
+        // AlphaHandler's own Process, not BetaHandler's.
+        let (alpha_conf, alpha_src): (String, Option<String>) = conn
+            .query_row(
+                "SELECT edge_confidence, formal_source FROM call_edges \
+                 WHERE from_symbol = 'handlers.go::route' \
+                   AND to_symbol = 'handlers.go::AlphaHandler::Process' \
+                   AND call_site_line = 32",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(alpha_conf, "formal");
+        assert_eq!(alpha_src.as_deref(), Some("lsp"));
+
+        // Line 34 (`case BetaHandler: return h.Process()`) must resolve to
+        // BetaHandler's own Process, not AlphaHandler's.
+        let (beta_conf, beta_src): (String, Option<String>) = conn
+            .query_row(
+                "SELECT edge_confidence, formal_source FROM call_edges \
+                 WHERE from_symbol = 'handlers.go::route' \
+                   AND to_symbol = 'handlers.go::BetaHandler::Process' \
+                   AND call_site_line = 34",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(beta_conf, "formal");
+        assert_eq!(beta_src.as_deref(), Some("lsp"));
+
+        // The wrong cross-pairing at each site must still be ambiguous —
+        // the actual disambiguation proof, not just "something changed".
+        let wrong_at_32: String = conn
+            .query_row(
+                "SELECT edge_confidence FROM call_edges \
+                 WHERE from_symbol = 'handlers.go::route' \
+                   AND to_symbol = 'handlers.go::BetaHandler::Process' \
+                   AND call_site_line = 32",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(wrong_at_32, "ambiguous");
+        let wrong_at_34: String = conn
+            .query_row(
+                "SELECT edge_confidence FROM call_edges \
+                 WHERE from_symbol = 'handlers.go::route' \
+                   AND to_symbol = 'handlers.go::AlphaHandler::Process' \
+                   AND call_site_line = 34",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(wrong_at_34, "ambiguous");
+    }
+
+    /// Live integration: real `clangd` against `multi_lang_workspace/cpp`
+    /// (Phase D.3, 2026-07-11). Ignored by default — needs `clangd` on
+    /// PATH; no `compile_commands.json` required for this fixture (a
+    /// single self-contained translation unit with no external
+    /// dependencies beyond its own local header — clangd's fallback
+    /// compilation database handles this fine).
+    ///
+    /// `process(int)`/`process(double)` are real C++ overloads with the
+    /// SAME name — CALM's syntactic resolver has no type-checker, so it
+    /// can't perform overload resolution and lands the single bare call
+    /// `process(x)` (`x: int`) as `ambiguous` with both candidates before
+    /// this overlay runs. `clangd`'s real Clang-based overload resolution
+    /// picks the exact `int` overload and rules out the `double` one —
+    /// verified once by hand before this test was written (indexed the
+    /// fixture, ran clangd through the LSP overlay: the call resolved to
+    /// the `int` overload only).
+    ///
+    /// (An earlier fixture design tried `auto*` + `static_cast` dispatch,
+    /// mirroring the Kotlin/Go smart-cast tests — but CALM's C++ resolver
+    /// doesn't do `auto` type deduction at all, so it creates NO
+    /// `call_edges` row for that pattern, not even an `ambiguous` one,
+    /// leaving nothing for this overlay to upgrade. Free-function overload
+    /// name collision is the pattern that actually produces an eligible
+    /// `ambiguous` row for C++, confirmed empirically, not assumed.)
+    #[test]
+    #[ignore]
+    fn clangd_overlay_upgrades_ambiguous_overload_call_on_the_multi_lang_fixture() {
+        let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/multi_lang_workspace/cpp");
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        let phase = std::sync::Arc::new(std::sync::RwLock::new(
+            crate::types::IndexingPhase::Scanning,
+        ));
+        crate::indexer::pipeline::run_indexing_pipeline(&mut conn, &fixture, phase).unwrap();
+
+        let before_int: String = conn
+            .query_row(
+                "SELECT edge_confidence FROM call_edges \
+                 WHERE from_symbol = 'Overloads.cpp::dispatchOverload' \
+                   AND to_symbol = 'Overloads.cpp::process' \
+                   AND call_site_line = 12",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            before_int, "ambiguous",
+            "fixture must start ambiguous — CALM has no C++ overload resolution"
+        );
+
+        let cfg = LspConfig {
+            enabled: Some(true),
+            binary: None,
+            policy: RefreshPolicy::OnDemand,
+        };
+        let stats = run_lsp_overlay(&conn, &fixture, &provider::CLANGD, &cfg, true).unwrap();
+        assert!(
+            stats.upgraded > 0,
+            "expected at least one edge upgraded to formal (attempted={})",
+            stats.attempted
+        );
+
+        // The int overload (declared first, lines 3-5) must resolve —
+        // matches the call site's actual argument type.
+        let (int_conf, int_src): (String, Option<String>) = conn
+            .query_row(
+                "SELECT edge_confidence, formal_source FROM call_edges \
+                 WHERE from_symbol = 'Overloads.cpp::dispatchOverload' \
+                   AND to_symbol = 'Overloads.cpp::process' \
+                   AND call_site_line = 12",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(int_conf, "formal");
+        assert_eq!(int_src.as_deref(), Some("lsp"));
+
+        // The double overload (lines 7-9, qualified_name suffixed #7) must
+        // still be ambiguous — the actual disambiguation proof.
+        let double_conf: String = conn
+            .query_row(
+                "SELECT edge_confidence FROM call_edges \
+                 WHERE from_symbol = 'Overloads.cpp::dispatchOverload' \
+                   AND to_symbol = 'Overloads.cpp::process#7' \
+                   AND call_site_line = 12",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(double_conf, "ambiguous");
+    }
 }
