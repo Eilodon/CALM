@@ -354,7 +354,7 @@ const HASH_STYLE_COMMENT_PREFIXES: &[&str] = &["#", "//", "*"];
 
 /// Single source of truth for every language this indexer dispatches on by
 /// name. Order is insertion order (Tier-0 first, then Tier-0.5); lookup is a
-/// linear scan via `find_spec` — fine at this size (15 entries, a handful
+/// linear scan via `find_spec` — fine at this size (24 entries, a handful
 /// of calls per indexed file), no need for a `phf`/hash map.
 pub static LANGUAGES: &[LanguageSpec] = &[
     LanguageSpec {
@@ -1529,7 +1529,7 @@ pub static LANGUAGES: &[LanguageSpec] = &[
 ];
 
 /// Look up a language's full descriptor by its canonical name or a known
-/// alias. Linear scan over `LANGUAGES` (15 entries) — cheap relative to the
+/// alias. Linear scan over `LANGUAGES` (24 entries) — cheap relative to the
 /// tree-sitter parse it gates.
 pub fn find_spec(name: &str) -> Option<&'static LanguageSpec> {
     LANGUAGES

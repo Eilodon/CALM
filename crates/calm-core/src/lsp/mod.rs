@@ -10,11 +10,12 @@
 //! candidates of ~6300), and batch SCIP and this overlay query the *same*
 //! analysis engine for Rust, so the expected yield there is modest — this is
 //! a supplementary evidence layer behind the explicit `lsp_refresh` tool,
-//! not a replacement for the SCIP overlay. gopls/clangd have no SCIP
-//! counterpart in this codebase at all (`scip-clang` is scaffolded but
-//! never live-verified — see `scip::provider::CLANG`'s doc comment), so for
-//! those two languages this overlay is the *only* formal-tier path, not a
-//! supplementary one.
+//! not a replacement for the SCIP overlay. `clangd` has no live-verified
+//! SCIP counterpart in this codebase (`scip-clang` is scaffolded but never
+//! live-verified — see `scip::provider::CLANG`'s doc comment), so for C/C++
+//! this overlay is the only formal-tier path with any live verification.
+//! `gopls` does have one (`scip::provider::GO`, live-verified) — for Go this
+//! overlay is a supplementary path, not the only one.
 //!
 //! Depends on the `scip-overlay` feature (see `Cargo.toml`): binary
 //! discovery helpers (`scip::runner::binary_runs`/`dirs_home`) and

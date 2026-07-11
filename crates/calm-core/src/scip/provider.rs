@@ -3,9 +3,11 @@
 //! copying this whole `scip/` module — see the plan doc
 //! `docs/superskills/plans/2026-07-07-eight-lang-formal-tier.md` §3 (P0.4).
 //!
-//! 8 entries exist today: `RUST`, `GO` (P2.1), `PYTHON` (P2.4), `TYPESCRIPT`
-//! (P3.2, covers JS+TS), `JAVA` (P2.2), `CSHARP` (P2.3), `PHP` (P2.5), and
-//! `CLANG` (P3.1, scaffold-only — see its own doc comment). Fields sketched
+//! 9 entries exist today: `RUST`, `GO` (P2.1), `PYTHON` (P2.4), `TYPESCRIPT`
+//! (P3.2, covers JS+TS), `JAVA` (P2.2, also covers Kotlin via a `dirty_langs`
+//! piggyback — see its own doc comment), `CSHARP` (P2.3), `PHP` (P2.5),
+//! `RUBY` (Phase D.1, 2026-07-11), and `CLANG` (P3.1, scaffold-only — see
+//! its own doc comment). Fields sketched
 //! in the plan's P0.4 design for multi-root marker-file discovery, prereq
 //! gating, and refresh policy are still deliberately NOT here — none of the
 //! single-project cases needed them yet (Go's `go.work` multi-module
@@ -14,12 +16,13 @@
 //! `--cwd` tree per invocation). Add them when a provider actually needs
 //! them.
 //!
-//! **Live-verification history is uneven across these 8 — "the code exists"
+//! **Live-verification history is uneven across these 9 — "the code exists"
 //! and "confirmed working right now" are two different claims, don't conflate
-//! them** (audited 2026-07-10). `GO`, `JAVA`, `CSHARP`, and `PHP` were each
-//! manually verified live-passing exactly once, by the session that
-//! implemented them, against a real indexer binary with a real toolchain
-//! (see `docs/superskills/plans/2026-07-07-eight-lang-formal-tier.md` §5's
+//! them** (audited 2026-07-10, `RUBY` added 2026-07-11). `GO`, `JAVA`,
+//! `CSHARP`, and `PHP` were each manually verified live-passing exactly once,
+//! by the session that implemented them, against a real indexer binary with
+//! a real toolchain (see
+//! `docs/superskills/plans/2026-07-07-eight-lang-formal-tier.md` §5's
 //! table for the exact fixture results and match rates — e.g. Go 0.67,
 //! Java 1.00). None of that has been *continuously* re-verified since,
 //! though: `RUST` is the only provider with a real green run in GitHub
@@ -34,9 +37,10 @@
 //! re-confirmed live-passing by hand in a plain dev sandbox during the same
 //! 2026-07-10 audit (both run through `npx` with no extra toolchain install,
 //! so friction — and therefore real-world reach — is far lower than
-//! Go/Java/C#/PHP, which all need a locally installed toolchain). `CLANG`
-//! has no live-verification path at all, ever, by design — see its own doc
-//! comment below for the two independent blockers.
+//! Go/Java/C#/PHP, which all need a locally installed toolchain). `RUBY`
+//! was live end-to-end verified on 2026-07-11, the day it was added.
+//! `CLANG` has no live-verification path at all, ever, by design — see its
+//! own doc comment below for the two independent blockers.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;

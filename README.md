@@ -3,11 +3,11 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![CI](https://github.com/Eilodon/CALM/actions/workflows/ci.yml/badge.svg)](https://github.com/Eilodon/CALM/actions/workflows/ci.yml)
 [![npm](https://img.shields.io/npm/v/%40eilodon%2Fcalm-mcp?label=npm)](https://www.npmjs.com/package/@eilodon/calm-mcp)
-![Languages](https://img.shields.io/badge/languages-11%20parsed%20%C2%B7%208%20formal--verified-informational)
+![Languages](https://img.shields.io/badge/languages-24%20parsed%20%C2%B7%206%20call--graph%20%C2%B7%2012%20formal--verified-informational)
 
 **A live, graph-verified map of your codebase — so an AI coding agent can edit with its eyes open instead of grepping in the dark.**
 
-Real call graphs, not vector-similarity guesses · hard safety gates before risky edits · memory that survives a restart.
+Real call graphs, not vector-similarity guesses · hard safety gates before risky edits · memory that survives a restart — and, below, proven head-to-head against real competitor MCP servers instead of just asserted.
 
 ---
 
@@ -29,11 +29,12 @@ CALM stands for **Coding Agent Liveness Map**. *Liveness*, because the map is ne
 
 ## What you get
 
-- **A real call graph, not a vector-similarity guess.** `callers`/`callees`/`edit_context` tell an agent exactly who depends on the code it's about to touch — full `tree-sitter` call graphs for 6 languages (Python, TypeScript, JavaScript, Java, Rust, Go), lighter symbol-level coverage for 9 more.
-- **Edits that can't silently break things.** Every write is hash-verified against the exact line range, syntax-checked before it ever touches disk, and hub/high-fan-in symbols hard-refuse without an explicit `confirm:true` — a policy only a tool with a real dependency graph can enforce.
-- **Compiler-grade ground truth, on demand.** Optional SCIP overlays (`rust-analyzer`, `scip-go`, `scip-python`, and 5 more) upgrade "best guess" edges to formally verified ones across 8 languages, with zero behavior change on a machine that doesn't have the toolchain installed.
+- **A real call graph, not a vector-similarity guess.** `callers`/`callees`/`edit_context` tell an agent exactly who depends on the code it's about to touch — full `tree-sitter` call graphs for 6 languages (Python, TypeScript, JavaScript, Java, Rust, Go), plus call-graph coverage for 17 more languages behind opt-in grammar features (24 languages parsed in total; see [Multi-tier indexing](#multi-tier-indexing)).
+- **Edits that can't silently break things.** Every write is hash-verified against the exact line range, syntax-checked before it ever touches disk, and hub/high-fan-in symbols hard-refuse without an explicit `confirm:true` — a policy only a tool with a real dependency graph can enforce. Proven, not just claimed: in a head-to-head run against a real competitor MCP server, that gate refused an unconfirmed edit to a verified hub symbol — the competitor had no such gate, and rewrote the file. See [Proven against real competitors](#proven-against-real-competitors-not-just-claimed).
+- **Compiler-grade ground truth, on demand.** SCIP overlays (`rust-analyzer`, `scip-go`, `scip-python`, `scip-ruby`, and more) and live LSP overlays (`gopls`, `clangd`) upgrade "best guess" edges to formally verified ones across 12 languages, with zero behavior change on a machine that doesn't have the toolchain installed.
 - **Memory that survives a restart.** `remember`/`recall` keep architecture decisions and gotchas around across sessions instead of making the agent re-derive them from scratch every time.
 - **A codebase that grades itself.** `fitness_report` turns hub concentration, dead code, and architecture-boundary violations into a queryable, CI-enforceable signal instead of a one-off audit.
+- **Safe under concurrent sessions.** A cross-process edit lock and single-writer indexing model mean two editor sessions on the same repo don't corrupt each other's writes or double-index — see [Concurrency & reliability](#concurrency--reliability).
 - **Local-first.** No code leaves your machine for indexing, search, or editing; the one narrow exception (a default embedding model download) is opt-out-able. MIT-licensed.
 
 ## Where CALM sits in this space
@@ -44,9 +45,19 @@ CALM stands for **Coding Agent Liveness Map**. *Liveness*, because the map is ne
 >
 > "Memory integration [is] notably absent across all tools — a gap that remains."
 
-Those are the two things CALM is built around: **hard safety gates before risky edits**, and **memory that survives a session restart**. Most tools in this space stop at "help the agent find code faster." CALM adds the step after that: help it know when to *stop and check* before it edits, and stop forcing it to re-derive navigational state (have I run `diff_impact` yet? am I going in circles?) every single turn. The trade-off is honest, not hidden: CALM covers 6 languages with a full call graph rather than the 40+ some LSP-based tools reach, in exchange for that depth — confidence-graded edges, hard pre-edit gates, durable memory.
+Those are the two things CALM is built around: **hard safety gates before risky edits**, and **memory that survives a session restart**. We didn't just take that survey on faith, either — [`benchmarks/b11_extended_competitor_ab/`](benchmarks/b11_extended_competitor_ab/) installs real competitor MCP servers and calls them, and the live results are more nuanced than the quote: one competitor (Serena) *does* have working cross-session memory, so that part of the "gap" isn't universal — but the pre-edit safety gate gap held up exactly as described, and CALM demonstrated it isn't hypothetical (see below).
+
+The trade-off is honest, not hidden: CALM's full-call-graph tier is still 6 languages, not the 40+ some pure-LSP tools reach out of the box — but tree-sitter parsing itself now spans 24 languages, and 12 of those have a formal- or LSP-verified upgrade path wired, so that gap is narrower than it used to be. What doesn't change is the differentiation underneath: confidence-graded edges, hard pre-edit gates, durable memory — and, as of the latest head-to-head run, those aren't just claimed.
 
 That's a claim worth checking rather than taking on faith. [`docs/comparison.md`](docs/comparison.md) has the detailed, methodology-first write-up against other tools in this category, and [`benchmarks/`](benchmarks/) goes further than docs-based comparison — it actually installs and calls real competitor MCP servers against the same corpus, reports bad numbers alongside good ones by policy, and corrects its own earlier mistakes in the open when a re-test finds one.
+
+### Is CALM the right fit?
+
+**Good fit:** agents that edit code directly, not just answer questions about it · single-repo codebases in a Tier-0/Tier-0.5 language · teams that want cross-session memory instead of re-deriving context every run · projects running multiple MCP clients (Claude Code, Cursor, VS Code, Windsurf, JetBrains) against the same repo · local-first users who don't want to depend on an embedding API.
+
+**Not the fit today:** multi-repo/cross-repo enterprise search (Sourcegraph/Cody are built for that scale) · a language nowhere in CALM's current 24-language tree-sitter set.
+
+CALM is under continuous, active development — the language matrix, the concurrency model, and the benchmark suite below all shipped or grew within the current week, not a one-time launch.
 
 ## Philosophy
 
@@ -60,20 +71,36 @@ The end goal is reduced cognitive load: the agent spends its budget on the work 
 
 ## Proof, not promises
 
-Numbers are cheap to claim and easy to fake. These are measured, today (2026-07-09), by pointing CALM's own `fitness_report`/`indexing_status` at its own codebase — not aspirational, and reproducible by running the same two commands yourself:
+Numbers are cheap to claim and easy to fake. These are measured, today (2026-07-11), by pointing CALM's own `fitness_report`/`repo_overview` at its own codebase — not aspirational, and reproducible by running the same two tool calls yourself:
 
 | Metric | Measured value |
 |---|---|
-| Codebase indexed | **1,742 symbols, 3,540 edges, 126 files** — 11 languages present in this repo alone |
-| Hub concentration (`hub_pct`) | 14.7% — 218 hub symbols (well under the 20% gate) |
-| Self dead-code rate (`dead_code_pct`, coverage-aware) | **2.5%** (gate: ≤ 10%) |
-| Edge coverage (`edge_coverage_pct`) | 70.0% of symbols have at least one call edge (gate: ≥ 60%) |
-| High-complexity functions (`high_complexity_pct`) | 2.6% (gate: ≤ 15%) |
+| Codebase indexed | **183 files, 2,590 symbols** — 15 languages present in this repo alone |
+| Hub concentration (`hub_pct`) | 9.2% — 164 hub symbols (gate: ≤ 20%) |
+| Self dead-code rate (`dead_code_pct`, coverage-aware) | 6.5% (gate: ≤ 10%) |
+| Edge coverage (`edge_coverage_pct`) | 69.6% of symbols have at least one call edge (gate: ≥ 60%) |
+| High-complexity functions (`high_complexity_pct`) | 2.4% (gate: ≤ 15%) |
 | Architecture boundary violations | 0 (declared rules actively enforced, not aspirational) |
-| Call edges resolved to `formal` (rust-analyzer ground truth), an earlier measurement on a smaller graph | **1,619 / 2,096 — 77.2%**, up from 0% before the SCIP overlay existed |
-| Full test suite (default features) | **725 passed** (9 ignored — live-binary integration tests for external tools, e.g. `rust-analyzer`/`scip-go`/`scip-java`, not installed in every environment) — see [`Testing`](#testing) for notes on environment-sensitive `watcher_integration` tests |
+| Full test suite (default features) | **781 passed**, 0 failed (11 ignored — live-binary integration tests for external tools, e.g. `rust-analyzer`/`scip-go`/`scip-java`, not installed in every environment) — see [`Testing`](#testing) |
 
-That SCIP-overlay number is no longer a Rust-only trick — it now covers 8 languages (see the next section), and each provider degrades gracefully on its own: a language with no matching toolchain installed just sits out silently, at zero cost, instead of failing the whole overlay pass.
+For context on the SCIP overlay's actual lift: an earlier measurement found 1,619 / 2,096 Rust call edges (77.2%) upgraded to `formal` (rust-analyzer ground truth) on a smaller snapshot of this graph, up from 0% before the overlay existed — not re-measured at the current graph size, but the mechanism hasn't changed. A separate, stricter Rust-only measurement against a full `rust-analyzer` SCIP oracle (precision/recall, not just "% upgraded") found precision 0.795 / recall 0.193 for the pre-overlay syntactic resolver alone — i.e. what it claims is usually right, but it was missing most of the oracle's edges before the SCIP overlay closes that gap; that number predates the overlay and hasn't been re-run since (see [`benchmarks/b2_call_graph_quality/`](benchmarks/b2_call_graph_quality/)). Reported here, unflattering parts included, because that's this project's own stated benchmark policy.
+
+### Proven against real competitors, not just claimed
+
+[`benchmarks/b11_extended_competitor_ab/`](benchmarks/b11_extended_competitor_ab/) installs and calls **CodeGraph, Semble, grepai, and Serena** — real MCP servers, not simulated — against an isolated git worktree of this repo, 5 repeats per task, with a correctness oracle for every task:
+
+| Task | CALM | Best competitor | Worst competitor |
+|---|---|---|---|
+| `find_callers` (recall) | **2/2** | Serena / grepai / Semble — 2/2 | CodeGraph — **1/2** (misses a cross-crate caller) |
+| `pre_edit_blast_radius` (recall) | **5/5** | grepai / Serena — 5/5 | CodeGraph — **1/5** (same miss, larger radius) |
+| `risk_gate_refusal` | **refused** the unconfirmed edit | — | Serena had no `confirm`/`force` field — **it rewrote the file** |
+| `memory_recall` (survives restart) | **yes** | Serena — also yes | CodeGraph / grepai / Semble — no persistent memory |
+
+Reported honestly, including where CALM isn't the cheapest: on `locate_and_inspect`, CALM's token-compression ratio (7.7x) was the lowest of the five tools tested (Serena reached 238.5x); on `find_callers`, CALM used more tokens than a naive grep baseline (0.6x ratio). The pattern across all four tasks: CALM is not always the cheapest, but its correctness stayed at or near the ceiling every time, and it's the only tool tested whose safety gate actually stopped a bad edit instead of just being able to answer questions about one. Full methodology, all tasks, and raw numbers in the benchmark's own README.
+
+### Language coverage, measured not asserted
+
+[`benchmarks/resolution/`](benchmarks/resolution/) runs the tier-distribution baseline (resolved / inferred / textual / ambiguous split — no oracle, one real OSS repo per language) across all **19** newly-added or Tier-0.5 languages, most recently extended to cover the 11 languages from the 25-language expansion's Phase B/C batch. Headline findings reported as-is, including the unflattering ones: Kotlin (89.6%) and OCaml (86.3%) land mostly in the `ambiguous` tier from common short method-name collisions (the same pattern already seen on C++); Dart produces symbols but **zero** call edges, a documented grammar limitation (no call-expression node in that tree-sitter grammar), not a bug; `inferred%` is 0.0% across all 11 because Tier-2 type inference is only wired for the original Tier-0 languages so far. Full per-language table in the benchmark's own README.
 
 ## Quick start
 
@@ -126,7 +153,7 @@ This repo ships ready-made config for Claude Code (`.mcp.json`), Cursor (`.curso
 
 ```
 agent: repo_overview()
-  → 126 files, 1,742 symbols, 218 hub symbols, indexing_phase=ready
+  → 183 files, 2,590 symbols, 164 hub symbols, indexing_phase=ready
 
 agent: "I need to change getUserByEmail"
   → locate("getUserByEmail")        # find the file + symbol metadata
@@ -142,14 +169,19 @@ agent: "I need to change getUserByEmail"
 ## How CALM works
 
 ### Multi-tier indexing
-- **6 Tier-0 languages** — Python, TypeScript, JavaScript, Java, Rust, Go — get full `tree-sitter` AST parsing, a real call graph, an import graph, and multi-tier resolution.
-- **9 Tier-0.5 languages** — C, C++, C#, Ruby, PHP, Shell, R (real grammar on by default via the `tier0-5` feature bundle), plus Kotlin and Swift (real grammar behind their own separate `lang-kotlin`/`lang-swift` opt-in features, not yet bundled into `tier0-5`) — get full `tree-sitter` AST parsing with call-graph and import resolution when the matching grammar feature is compiled in; falls back to regex/line-scan symbol extraction (no call graph) only when it isn't.
+- **6 Tier-0 languages** — Python, TypeScript, JavaScript, Java, Rust, Go — get full `tree-sitter` AST parsing, a real call graph, an import graph, and multi-tier resolution, always on, no feature flag required.
+- **18 Tier-0.5 languages** — full `tree-sitter` AST parsing with call-graph and import resolution, gated behind Cargo features:
+  - **On by default** (`tier0-5` feature bundle): C, C++, C#, Ruby, PHP, Shell, R.
+  - **Opt-in, one feature flag each**: Kotlin, Swift (`lang-kotlin`/`lang-swift`), plus Scala, Dart, Lua, Elixir, Haskell, OCaml, Zig, PowerShell, Groovy — the 9 languages added in the 25-language expansion's Phase C batch. Falls back to regex/line-scan symbol extraction (no call graph) only when the matching grammar feature isn't compiled in.
+  - Dart is the one exception worth calling out by name: it parses symbols cleanly but produces zero call edges, because its tree-sitter grammar has no call-expression node — a documented limitation, not a bug.
 - **SQL gets its own standalone indexer** (`sqlparser`, real grammar parsing, not regex) — extracts tables/views/procedures accurately across Postgres/MySQL/SQL Server dialects, but stops short of a call graph, since "calls" isn't a coherent concept across SQL dialects the way it is for the languages above.
 - **Incremental watcher** — only changed files get re-parsed (FNV-1a content hash diff); the call graph rebuilds incrementally, parallelized with `rayon`. `calm serve` picks incremental reindex automatically whenever an index already exists.
 
 ### A call graph you can actually trust
 - **Every edge carries a confidence label** — `resolved` / `inferred` / `formal` / `textual` (plus `ambiguous`/`unresolved` fallback tiers when a call site's target genuinely can't be pinned down) — so an agent knows when it's looking at a sure thing versus a best guess.
-- **SCIP overlay — formal, compiler-grade ground truth for 8 languages, not just Rust**: Rust (`rust-analyzer`), Go (`scip-go`), Python (`scip-python`), JavaScript/TypeScript (`scip-typescript`), Java (`scip-java`), C# (`scip-dotnet`), PHP (`scip-php`), and C/C++ (`scip-clang`, shipped and unit-tested but without a live-binary integration test yet — see `docs/superskills/plans/2026-07-07-eight-lang-formal-tier.md`). Each language is a data-driven `ScipProvider` entry (`crates/calm-core/src/scip/provider.rs`), not a copy-pasted module — adding a 9th language is one table row. Every provider auto-detects its own binary and silently sits out if it isn't there (zero behavior change on a machine missing that toolchain — verified per-language in `scip/mod.rs`'s test suite), runs under a hard timeout, and caches against a per-language fingerprint (lockfile/build-file hash + toolchain + dirty source keys) so an unchanged project never re-pays the cost. Beyond upgrading existing edges to `formal`, a gated-insert mode recovers edges the syntactic resolver never even attempted (Rust alone: +3 edges from a 27.7% match rate in one measured run) — gated specifically through real call-site rows, so a non-call reference (a type mention, a field access) can never fabricate a fake call edge. Trigger it on demand with `calm scip-run --lang <rust|go|python|javascript|java|csharp|php|c|all>` or the `scip_refresh` MCP tool; `calm index --scip-file <path.scip> --sub-root <dir>` ingests a pre-built SCIP index instead, for CI/sandboxed runs with no network access to install an indexer.
+- **SCIP overlay — formal, compiler-grade ground truth, 9 providers spanning 12 languages**: Rust (`rust-analyzer`), Go (`scip-go`), Python (`scip-python`), JavaScript + TypeScript (`scip-typescript`), Java (`scip-java` — also indexes Kotlin in the same pass, since `scip-java` bundles a `kotlinc` plugin for mixed Gradle/Maven modules), C# (`scip-dotnet`), PHP (`scip-php`), Ruby (`scip-ruby`/Sorbet, the newest addition), and C/C++ (`scip-clang`, shipped and unit-tested but not yet live-verified end-to-end). Each language is a data-driven `ScipProvider` entry (`crates/calm-core/src/scip/provider.rs`), not a copy-pasted module — adding another language is one table row. Every provider auto-detects its own binary and silently sits out if it isn't there (zero behavior change on a machine missing that toolchain), runs under a hard timeout, and caches against a per-language fingerprint (lockfile/build-file hash + toolchain + dirty source keys) so an unchanged project never re-pays the cost. Verification maturity varies honestly by language: Rust runs green in nightly CI continuously; Go/Java/C#/Ruby were verified live at implementation time; C/C++'s `scip-clang` path has never been live-verified (sandbox/network blockers) — treat it as wired, not proven, until it has been.
+- **LSP overlay — a second, complementary path to formal edges**: for Go (`gopls`) and C/C++ (`clangd`) — plus Rust's `rust-analyzer` on a live-session path, distinct from its batch SCIP export — a real language server resolves ambiguous/textual call sites interactively, on demand. This doesn't run automatically (`policy` defaults to `on_demand`); trigger it explicitly with the `lsp_refresh` tool or `calm scip-run`/equivalent CLI. It matters most for C/C++ today, where it's the only live-verified formal path since the SCIP one isn't yet.
+- Trigger either overlay on demand with `calm scip-run --lang <rust|go|python|javascript|java|csharp|php|ruby|c|all>` or the `scip_refresh`/`lsp_refresh` MCP tools; `calm index --scip-file <path.scip> --sub-root <dir>` ingests a pre-built SCIP index instead, for CI/sandboxed runs with no network access to install an indexer.
 - **Graph metrics — `coreness` (k-core) and `is_hub`** — flag the symbols central enough that touching them is inherently higher-risk. `repo_overview.core_symbols` reuses the same metric to sketch the architecture's "skeleton" on the very first call (inspired by Aider's PageRank repo-map, but built on a metric CALM already computes rather than a separate pass).
 
 ### Search that actually finds things
@@ -163,6 +195,13 @@ agent: "I need to change getUserByEmail"
 - **Hub and high-fan-in symbols require an explicit `confirm:true`** — a policy only a tool with a real call graph can enforce.
 - **Atomic writes, immediate reindex** — temp file + fsync + rename, then reindexed synchronously (not waiting on the file watcher); the response comes back with post-edit risk/callers, like a miniature `diff_impact`.
 - **Hook-enforced, not just documented** — under Claude Code, `.claude/hooks/calm-nudge.sh` actually blocks the first `Edit` of a session until `edit_context` has been called, and blocks `git commit`/`git push` if files changed since the last `diff_impact`. `session_context`'s `pending_diff_impact` gives the same signal on any other MCP client.
+
+### Concurrency & reliability
+Running CALM from more than one editor session on the same repo used to mean N independent indexers, N SQLite connections, and N copies of the embedding model in RAM — real pain found by pointing CALM's own instrumentation at this repo mid-session. That's been closed from multiple directions:
+- **Cross-process edit lock** — an OS `flock` on `.calm/edit.lock`, layered underneath the in-process hash check, closes a narrow TOCTOU window where two separate processes could both pass a stale-hash check and the second write would silently discard the first.
+- **Single-instance indexing lock, with promotion** — only one `calm serve` process per project root ever runs the background indexer/watcher; a losing process auto-promotes to owner if the current owner exits mid-session, instead of a second editor session being stuck read-only forever.
+- **A real SIGTERM watchdog** — a raw kernel `alarm()` guarantees the process exits even when the MCP transport's stdio-read thread is blocked in an uncancellable OS read, a bug that a purely async watchdog silently never caught.
+- **An opt-in shared-daemon model** — `calm serve --listen unix:PATH` runs one owning daemon; `calm connect` gives every other session a lightweight forwarder over the same socket instead of its own full process, with automatic stale-build detection (`daemon.meta`) that respawns the daemon after a rebuild instead of silently serving an old binary. This is implemented and dogfooded internally, but not yet the default entry point for the npm/plugin distribution — worth knowing about if you're running many concurrent sessions today and want to opt in early.
 
 ### The codebase grading itself
 - **`calm fitness-check` / `fitness_report`** — 9 metrics (hub concentration, dead code, hotspot risk, edge coverage, cyclomatic complexity, architecture-boundary violations, doc-drift) checked against thresholds in `thresholds.toml`, queryable mid-session or as a CI gate.
@@ -179,17 +218,17 @@ agent: "I need to change getUserByEmail"
 ### Honest about its own freshness
 - **Index state machine surfaced everywhere** — `scanning → parsing → building_edges → ready`, so an agent never mistakes stale data for current.
 - **Build-freshness check** — `calm doctor` compares the commit the running binary was built from against the repo's current `HEAD`; `scripts/mcp-launcher.sh` checks source mtimes before trusting an existing `target/{debug,release}/calm`, rebuilding rather than silently serving a stale binary.
-- **Single-instance indexing lock** — only one `calm serve` process per project root ever runs the background indexer/watcher (an OS-level advisory lock); a second concurrent process (e.g. two editor sessions on the same repo) serves tool calls read-only against the same fresh DB instead of racing a redundant reindex against it.
 
 ### Safe by default
-- **Output sanitization** — `source`/`understand` redact credential-shaped text (PEM keys, GitHub/AWS/Slack tokens, JWTs, password assignments) before it's ever returned, and flag a `content_warning` when code contains prompt-injection-shaped text (`"ignore previous instructions"`, fake `system:` markers) — flagged, never silently altered, since a false positive there would corrupt real code.
+- **Output sanitization** — `source`/`understand` redact credential-shaped text (PEM keys, GitHub/AWS/Slack tokens, JWTs, password assignments) before it's ever returned, and flag a `content_warning` when code contains prompt-injection-shaped text — flagged, never silently altered, since a false positive there would corrupt real code. The heuristic (`calm_core::sanitize`, 19 labeled patterns) covers plain-English phrasing (`"ignore previous instructions"`), chat-template role-marker spoofing (ChatML `<|im_start|>`, `[INST]`/`[SYS]` brackets, fake `system:`/Markdown-heading role markers), fake tool/turn-boundary tags (`</tool_result>`, `<system>`), jailbreak/persona-override phrasing, exfiltration phrasing (prompt/secret-reveal requests), zero-width Unicode obfuscation, and a first pass at Vietnamese-language equivalents — deliberately excludes anything with real false-positive risk (e.g. generic tag-density scoring, homoglyph detection) rather than guess.
+- **`scan_text` — the same detection, on demand, for anything that didn't come through the index.** `source`/`understand`'s `content_warning` only covers indexed source; every tool's own output is separately scanned (advisory-logged, not surfaced) at one central choke point (`timed_tool`). Neither covers content an agent fetches itself — a WebFetch/WebSearch result, a subagent's report. `scan_text` closes that gap: point it at any text and get the same labeled hits back, entirely local and regex-based — no dependency on a hosted LLM safety classifier being available, so it keeps working even when that classifier isn't.
 - **Local-only** — no outbound calls for the code/data path. The one narrow exception is the semantic-search default model download, which is a single public, static file fetch, opt-out-able, and unrelated to your repo's contents ever leaving the machine.
 
 ## Crate layout
 
-- `crates/calm-core/` — the index engine: `tree-sitter` parsing, SQLite schema, the multi-tier resolver (conservative → inferred → formal/Stack-Graphs or SCIP), graph algorithms (coreness, hub detection), FTS5/semantic search, analysis (hotspots, coverage, codeowners, diff-impact, dead-code), fitness metrics, gitignore management.
-- `crates/calm-server/` — the MCP server (`rmcp` over stdio), exposing 22 tools plus the incremental file watcher.
-- `crates/calm-cli/` — the CLI: `calm init`, `calm index`, `calm serve`, `calm setup`, `calm fitness-check`, `calm doctor`.
+- `crates/calm-core/` — the index engine: `tree-sitter` parsing, SQLite schema, the multi-tier resolver (conservative → inferred → formal/Stack-Graphs, SCIP, or LSP), graph algorithms (coreness, hub detection), FTS5/semantic search, analysis (hotspots, coverage, codeowners, diff-impact, dead-code), fitness metrics, gitignore management.
+- `crates/calm-server/` — the MCP server (`rmcp` over stdio or a unix-socket daemon), exposing 25 tools plus the incremental file watcher.
+- `crates/calm-cli/` — the CLI: `calm init`, `calm index`, `calm serve`, `calm connect`, `calm setup`, `calm fitness-check`, `calm doctor`.
 
 ## CLI reference
 
@@ -198,6 +237,8 @@ calm init     --project-root .    # writes .calm/config.json with defaults
 calm index    --project-root .    # one-shot full index (Scanning → Parsing → BuildingEdges → Ready)
                                  # also embeds symbols+chunks if semantic_search.enabled=true
 calm serve    --project-root .    # MCP server over stdio + incremental reindex + file watcher
+calm serve    --project-root . --listen unix:/path/to/daemon.sock   # run as a shared daemon (opt-in)
+calm connect  --project-root .    # lightweight forwarder to an already-running daemon (opt-in, Unix)
 calm serve    --project-root /project --db-path /data/index.db   # separate DB path (container deployment)
 calm serve    --project-root . --preset orient   # register only the "orient" phase's tools
 calm doctor   --project-root .    # validates config, DB (symbols/files/metrics history), git
@@ -206,11 +247,11 @@ calm fitness-check --project-root .                             # CI gate, exits
 calm fitness-check --project-root . --json                      # JSON output
 calm fitness-check --project-root . --config thresholds.toml    # custom thresholds
 calm scip-run --project-root . --lang go        # force one SCIP provider to run now, bypassing refresh policy
-calm scip-run --project-root .                  # --lang omitted = run every provider ("rust,go,python,javascript,java,csharp,php,c")
+calm scip-run --project-root .                  # --lang omitted = run every provider ("rust,go,python,javascript,java,csharp,php,ruby,c")
 calm index    --project-root . --scip-file build/index.scip --sub-root services/api   # ingest a pre-built SCIP index (CI/sandboxed, no external indexer install needed)
 ```
 
-## 22 MCP tools for AI agents
+## 25 MCP tools for AI agents
 
 CLI presets filter tools by workflow phase: `orient`, `trace`, `edit`, `compound`, `full` (default) via `calm serve --preset` or the `preset` field in `config.json`. Every response carries `suggested_next` to point at the next step — full detail on each tool and the complete workflow lives in [AGENTS.md](AGENTS.md).
 
@@ -218,11 +259,11 @@ CLI presets filter tools by workflow phase: `orient`, `trace`, `edit`, `compound
 |---|---|
 | Orient | `repo_overview`, `hotspots`, `fitness_report` (health snapshot — same metrics as `calm fitness-check`, queryable mid-session), `indexing_status` |
 | Locate | `locate`, `search`, `file_overview` |
-| Inspect | `source`, `symbol_info`, `understand` |
+| Inspect | `source`, `symbol_info`, `understand`, `symbols_batch` (source + callers/callees for several exact `qualified_name`s in one round trip) |
 | Trace | `callers`, `callees`, `path`, `dependencies` |
 | Edit | `edit_context` (mandatory before any edit), `edit_lines`/`edit_symbol` (the one write tool — hash-verified, risk-gated), `diff_impact` (mandatory before commit) — the first and last are hook-enforced under Claude Code (see `.claude/hooks/calm-nudge.sh`); `session_context`'s `pending_diff_impact` is the equivalent signal on any other MCP client |
 | Recover | `session_context`, `remember`, `recall` |
-| Advanced | `scip_refresh` — force one or every SCIP provider to run now, bypassing the automatic refresh policy (`full` preset only, not in the four workflow-phase presets above — a deliberate manual/rare-use escape hatch, not a step in the default flow) |
+| Advanced | `scip_refresh`, `lsp_refresh` — force one or every SCIP/LSP provider to run now, bypassing the automatic refresh policy. `scan_text` — run the same prompt-injection/credential heuristics `source`/`understand` use against *any* text you supply (a WebFetch/WebSearch result, a subagent's report, pasted content) — local and offline, independent of any hosted LLM safety classifier. All three: `full` preset only, not in the four workflow-phase presets above — deliberate manual/rare-use escape hatches, not steps in the default flow |
 
 ### MCP Prompts — workflows packaged as slash-commands
 
@@ -286,9 +327,9 @@ Three CI jobs run on every PR: `verify` (fmt/clippy/test/audit), `stack-graphs-c
 
 ## Further reading
 
-Resolver internals, ADRs, and migration plans live in [`docs/`](docs/) (mostly Vietnamese) — start with [`docs/comparison.md`](docs/comparison.md) for positioning or [`docs/legacy/architecture-design.md`](docs/legacy/architecture-design.md) for the original technical design. [`docs/adr/`](docs/adr/) holds the individual architecture decision records (Stack Graphs scope, the formal-resolver approach, the LSP-optional confidence upgrade); [`docs/superskills/plans/2026-07-07-eight-lang-formal-tier.md`](docs/superskills/plans/2026-07-07-eight-lang-formal-tier.md) is the working plan behind the 8-language SCIP overlay described above, including what was cut from scope and why.
+Resolver internals, ADRs, and migration plans live in [`docs/`](docs/) (mostly Vietnamese) — start with [`docs/comparison.md`](docs/comparison.md) for positioning or [`docs/legacy/architecture-design.md`](docs/legacy/architecture-design.md) for the original technical design. [`docs/adr/`](docs/adr/) holds the individual architecture decision records (Stack Graphs scope, the formal-resolver approach, the LSP-optional confidence upgrade, the daemon+forwarder concurrency model); [`docs/superskills/plans/`](docs/superskills/plans/) holds the working plans behind the language-expansion and formal-tier work, including what was cut from scope and why.
 
-[`benchmarks/`](benchmarks/) has the measurement suite behind every number in this README — B2 (call-graph precision/recall vs. a SCIP oracle), B11 (real tool calls against 5 live competitor MCP servers, not self-reported numbers), and `resolution/` (tier-distribution baseline across 8 real OSS repos, one per newly-added language). Every benchmark's README reports bad numbers alongside good ones on purpose — see `benchmarks/README.md`'s own stated policy on that.
+[`benchmarks/`](benchmarks/) has the measurement suite behind every number in this README — B2 (call-graph precision/recall vs. a SCIP oracle), B11 (real tool calls against 4 live competitor MCP servers, not self-reported numbers), and `resolution/` (tier-distribution baseline across 19 real OSS repos, one per language). Every benchmark's README reports bad numbers alongside good ones on purpose — see `benchmarks/README.md`'s own stated policy on that.
 
 ## License
 
