@@ -313,11 +313,164 @@ fn run_and_refresh(
 /// Run the Go overlay (`provider::GO`) — the Go-specific counterpart to the
 /// Rust-only block each of the 3 production call sites (`lib.rs`,
 /// `watcher.rs`, `main.rs`) already had before this existed.
+/// Multi-module counterpart to `run_and_refresh`/`run_overlay_for`, for a
+/// project using `go.work`. `scip-go` has no native workspace flag of its
+/// own — a documented upstream limitation (Sourcegraph's own docs say to
+/// run the indexer once per module root and rebase paths) — so this runs
+/// `scip-go` once per member module (each at its own module root, so
+/// `go_build_command`'s `--module-root` is correct per module) and ingests
+/// each with `sub_root` = that module's path relative to `root`, reusing
+/// the exact rebase mechanism `parse::parse_index` already had for
+/// precisely this case (the same one the CLI's `--sub-root` flag exposes
+/// for a pre-built `.scip` file). One combined cache key/cache file/stats
+/// file at the project root, not per-module — Phase 1 doesn't attempt
+/// per-module incremental skip (any member's go.mod/go.sum change
+/// re-indexes every module); that's a real optimization left for if/when
+/// dogfooding on an actual multi-module Go project shows it's worth the
+/// extra complexity, not guessed up front.
+fn run_go_workspace_overlay(
+    conn: &Connection,
+    root: &Path,
+    cfg: &ScipConfig,
+    modules: &[std::path::PathBuf],
+    force: bool,
+) -> anyhow::Result<ingest::IngestStats> {
+    let provider = &provider::GO;
+    if cfg.enabled == Some(false) {
+        return Ok(ingest::IngestStats::default());
+    }
+    if !provider_has_any_files(conn, provider) {
+        return Ok(ingest::IngestStats::default());
+    }
+    let dirty = source_dirty_keys(conn, provider.dirty_langs);
+    if !force && !policy_allows_automatic_run(cfg.policy, root, provider) {
+        tracing::info!(
+            "SCIP overlay (go, {} workspace modules): refresh policy ({}) skips this automatic run — \
+             use `calm scip run --lang go` or the `scip_refresh` MCP tool to force it",
+            modules.len(),
+            cfg.policy,
+        );
+        return Ok(ingest::IngestStats::default());
+    }
+    let Some(bin) = (provider.resolve_binary)(cfg.binary.as_deref(), root) else {
+        if cfg.enabled == Some(true) {
+            tracing::info!("SCIP overlay enabled but no go indexer found — skipping");
+        }
+        return Ok(ingest::IngestStats::default());
+    };
+
+    let cache_path = root.join(".calm").join(provider.cache_file_name);
+    let key = (provider.cache_key)(&bin, root, &dirty);
+    if std::fs::read_to_string(&cache_path).is_ok_and(|prev| prev.trim() == key) {
+        tracing::info!(
+            "SCIP overlay (go, workspace): cache key unchanged, skipping indexer run"
+        );
+        return Ok(ingest::IngestStats::default());
+    }
+
+    let insert_missing = cfg.insert_missing != Some(false);
+    let mut total = ingest::IngestStats::default();
+    let mut match_rate_sum = 0.0;
+    let mut ok_modules = 0usize;
+
+    for module_rel in modules {
+        let module_root = root.join(module_rel);
+        if !module_root.is_dir() {
+            tracing::warn!(
+                "SCIP overlay (go workspace): module {} listed in go.work but not found on disk — skipping",
+                module_rel.display()
+            );
+            continue;
+        }
+        let tmp = match tempfile::Builder::new().suffix(".scip").tempfile() {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("SCIP overlay (go workspace): tempfile create failed: {e}");
+                continue;
+            }
+        };
+        if let Err(e) = runner::run_indexer(provider, &bin, &module_root, tmp.path()) {
+            tracing::warn!(
+                "SCIP overlay (go workspace, module {}) run failed, keeping syntactic graph: {e}",
+                module_rel.display()
+            );
+            continue;
+        }
+        let occ = match parse::parse_scip_file(tmp.path(), module_rel) {
+            Ok(o) => o,
+            Err(e) => {
+                tracing::warn!(
+                    "SCIP parse failed (go workspace, module {}): {e}",
+                    module_rel.display()
+                );
+                continue;
+            }
+        };
+        let stats = ingest::ingest_occurrences(conn, &occ, insert_missing)?;
+        tracing::info!(
+            "SCIP overlay (go, module {}): {} edges upgraded to formal, {} fan-out siblings ruled out, \
+             {} edges inserted, match_rate={:.2}",
+            module_rel.display(),
+            stats.upgraded,
+            stats.ruled_out,
+            stats.inserted,
+            stats.match_rate
+        );
+        total.upgraded += stats.upgraded;
+        total.ruled_out += stats.ruled_out;
+        total.inserted += stats.inserted;
+        match_rate_sum += stats.match_rate;
+        ok_modules += 1;
+    }
+    total.match_rate = if ok_modules > 0 {
+        match_rate_sum / ok_modules as f64
+    } else {
+        0.0
+    };
+
+    if total.upgraded > 0 || total.ruled_out > 0 || total.inserted > 0 {
+        crate::indexer::pipeline::refresh_caller_counts(conn)?;
+    }
+
+    // Best-effort, same posture as `run_overlay_for`'s equivalent writes —
+    // a failed write here just costs the next run a redundant re-index.
+    let _ = std::fs::write(&cache_path, &key);
+    let stats_path = root.join(".calm").join(stats_file_name(provider));
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let _ = std::fs::write(
+        &stats_path,
+        serde_json::json!({
+            "upgraded": total.upgraded,
+            "ruled_out": total.ruled_out,
+            "inserted": total.inserted,
+            "match_rate": total.match_rate,
+            "last_run_unix": now_unix,
+            "workspace_modules": modules.len(),
+        })
+        .to_string(),
+    );
+
+    Ok(total)
+}
+
+/// Run the Go overlay (`provider::GO`) — the Go-specific counterpart to the
+/// Rust-only block each of the 3 production call sites (`lib.rs`,
+/// `watcher.rs`, `main.rs`) already had before this existed. Branches to
+/// `run_go_workspace_overlay` when `root` has a `go.work` file (see
+/// `provider::parse_go_work_modules`); every other language, and a
+/// single-module Go project (the common case — no `go.work` present at
+/// all), takes the unchanged single-root `run_and_refresh` path.
 pub fn run_go_overlay_and_log(
     conn: &Connection,
     root: &Path,
     cfg: &crate::config::GoConfig,
 ) -> anyhow::Result<ingest::IngestStats> {
+    if let Some(modules) = provider::parse_go_work_modules(root) {
+        return run_go_workspace_overlay(conn, root, &cfg.scip, &modules, false);
+    }
     run_and_refresh(&provider::GO, conn, root, &cfg.scip, false)
 }
 
@@ -455,7 +608,12 @@ pub fn refresh_language(
     for lang in want {
         let stats = match *lang {
             "rust" => run_and_refresh(&provider::RUST, conn, root, &config.rust.scip, true)?,
-            "go" => run_and_refresh(&provider::GO, conn, root, &config.go.scip, true)?,
+            "go" => match provider::parse_go_work_modules(root) {
+                Some(modules) => {
+                    run_go_workspace_overlay(conn, root, &config.go.scip, &modules, true)?
+                }
+                None => run_and_refresh(&provider::GO, conn, root, &config.go.scip, true)?,
+            },
             "python" => run_and_refresh(&provider::PYTHON, conn, root, &config.python.scip, true)?,
             "javascript" => {
                 run_and_refresh(&provider::TYPESCRIPT, conn, root, &config.js.scip, true)?
@@ -997,6 +1155,149 @@ mod tests {
             )
             .unwrap();
         assert_eq!(conf, "formal");
+    }
+
+    #[test]
+    fn parse_go_work_returns_none_when_no_go_work_file_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(provider::parse_go_work_modules(dir.path()), None);
+    }
+
+    #[test]
+    fn parse_go_work_single_line_use_directives() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("go.work"),
+            "go 1.22\n\nuse ./moda\nuse ./modb\n",
+        )
+        .unwrap();
+        let modules = provider::parse_go_work_modules(dir.path()).unwrap();
+        assert_eq!(
+            modules,
+            vec![std::path::PathBuf::from("./moda"), std::path::PathBuf::from("./modb")]
+        );
+    }
+
+    #[test]
+    fn parse_go_work_grouped_use_block() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("go.work"),
+            "go 1.22\n\nuse (\n\t./moda\n\t./modb\n)\n",
+        )
+        .unwrap();
+        let modules = provider::parse_go_work_modules(dir.path()).unwrap();
+        assert_eq!(
+            modules,
+            vec![std::path::PathBuf::from("./moda"), std::path::PathBuf::from("./modb")]
+        );
+    }
+
+    #[test]
+    fn parse_go_work_ignores_comments_and_non_use_directives() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("go.work"),
+            "go 1.22 // pinned toolchain\n\n// a leading comment\nuse ./moda // trailing comment\nreplace example.com/foo => ./vendor/foo\nuse (\n\t./modb\n)\n",
+        )
+        .unwrap();
+        let modules = provider::parse_go_work_modules(dir.path()).unwrap();
+        assert_eq!(
+            modules,
+            vec![std::path::PathBuf::from("./moda"), std::path::PathBuf::from("./modb")]
+        );
+    }
+
+    #[test]
+    fn run_go_workspace_overlay_short_circuits_when_explicitly_disabled() {
+        // Deterministic, no real `scip-go` binary needed — proves the
+        // guard clauses run before any subprocess spawn, same contract as
+        // `run_overlay_for`'s equivalent early-return.
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        let cfg = crate::config::ScipConfig {
+            enabled: Some(false),
+            binary: None,
+            insert_missing: None,
+            policy: crate::config::RefreshPolicy::OnSave,
+        };
+        let modules = vec![std::path::PathBuf::from("./moda")];
+        let stats =
+            run_go_workspace_overlay(&conn, std::path::Path::new("."), &cfg, &modules, false)
+                .unwrap();
+        assert_eq!(stats, ingest::IngestStats::default());
+    }
+
+    #[test]
+    fn run_go_workspace_overlay_short_circuits_when_no_go_files_indexed() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        let cfg = crate::config::ScipConfig {
+            enabled: Some(true),
+            binary: None,
+            insert_missing: None,
+            policy: crate::config::RefreshPolicy::OnSave,
+        };
+        let modules = vec![std::path::PathBuf::from("./moda")];
+        // No `file_index` rows of language "go" at all — must return the
+        // default (empty) stats without ever attempting to resolve a
+        // `scip-go` binary or spawn anything.
+        let stats =
+            run_go_workspace_overlay(&conn, std::path::Path::new("."), &cfg, &modules, false)
+                .unwrap();
+        assert_eq!(stats, ingest::IngestStats::default());
+    }
+
+    /// Live integration: real `scip-go`, run once per member module, against
+    /// the 2-module `go_workspace` fixture — proves module enumeration +
+    /// per-module `sub_root` rebasing both work end-to-end, not just the
+    /// pure `parse_go_work_modules` parsing logic above. Ignored by default,
+    /// same reason and same `scip-go` install path as the single-module live
+    /// test above; unlike that one, this fixture/test pair has not yet been
+    /// run against a real `scip-go` binary in any environment (none was
+    /// available while writing it — see the roadmap plan's own note on this)
+    /// — treat a first real run's result with appropriately less confidence
+    /// than the already-proven single-module path until it has been.
+    #[test]
+    #[ignore]
+    fn go_workspace_overlay_upgrades_edges_in_both_member_modules() {
+        let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/go_workspace");
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        let phase = std::sync::Arc::new(std::sync::RwLock::new(
+            crate::types::IndexingPhase::Scanning,
+        ));
+        crate::indexer::pipeline::run_indexing_pipeline(&mut conn, &fixture, phase).unwrap();
+
+        let go = crate::config::GoConfig {
+            scip: crate::config::ScipConfig {
+                enabled: Some(true),
+                binary: None,
+                insert_missing: None,
+                policy: crate::config::RefreshPolicy::OnSave,
+            },
+            lsp: crate::config::LspConfig::default(),
+        };
+        let stats = run_go_overlay_and_log(&conn, &fixture, &go).unwrap();
+        assert!(
+            stats.upgraded >= 2,
+            "expected at least one upgraded edge per module (2 modules), got: {stats:?}"
+        );
+
+        for (module, from_sym, to_sym) in [
+            ("moda", "moda/main.go::main", "moda/helper.go::Greet"),
+            ("modb", "modb/main.go::main", "modb/helper.go::Greet"),
+        ] {
+            let conf: String = conn
+                .query_row(
+                    "SELECT edge_confidence FROM call_edges WHERE from_symbol = ?1 AND to_symbol = ?2",
+                    [from_sym, to_sym],
+                    |r| r.get(0),
+                )
+                .unwrap_or_else(|e| panic!("module {module}: edge {from_sym} -> {to_sym} not found ({e})"));
+            assert_eq!(conf, "formal", "module {module}: edge should be upgraded to formal");
+        }
     }
 
     /// Live integration: real `scip-python` (via `npx`) against

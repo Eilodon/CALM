@@ -11,6 +11,11 @@ language notes:
 
 - `go/` — `main.go` calls `Greet` (defined in `helper.go`) with no import:
   same-package resolution (P1.3 Tier-1.5 same-dir preference; P2.1 scip-go).
+  Single-module only — the sibling `../go_workspace/` fixture (own README)
+  covers the `go.work` multi-module case (P2.1 V2), kept separate rather
+  than added as a subdirectory here since it's a different scenario
+  (module enumeration + `sub_root` rebasing), not another "standard gap"
+  in the same per-language sense as the rest of this fixture set.
 - `java/` — `Main` calls `Helper.greet` statically, same package, no import
   (P1.3; P2.2 scip-java).
 - `csharp/` — `Program` calls `Helper.Greet` via `using MultiLang;` (P1.5

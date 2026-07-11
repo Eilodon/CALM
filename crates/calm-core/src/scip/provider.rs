@@ -9,12 +9,19 @@
 //! `RUBY` (Phase D.1, 2026-07-11), and `CLANG` (P3.1, scaffold-only — see
 //! its own doc comment). Fields sketched
 //! in the plan's P0.4 design for multi-root marker-file discovery, prereq
-//! gating, and refresh policy are still deliberately NOT here — none of the
-//! single-project cases needed them yet (Go's `go.work` multi-module
-//! handling is a documented upstream `scip-go` limitation, not something
-//! this table papers over yet; scip-python/scip-typescript each index one
-//! `--cwd` tree per invocation). Add them when a provider actually needs
-//! them.
+//! gating, and refresh policy are still deliberately NOT here — `ScipProvider`
+//! itself stays single-root/single-output on purpose. Go's `go.work`
+//! multi-module case (a documented upstream `scip-go` limitation — no native
+//! workspace flag, confirmed against Sourcegraph's own docs) is handled one
+//! level up instead: `scip::mod::run_go_workspace_overlay` detects
+//! `go.work` (`parse_go_work_modules` below) and runs this same
+//! single-root `GO` provider once per member module, reusing
+//! `parse::parse_index`'s `rebase_prefix` (which was already built with
+//! exactly this case in mind) rather than widening the struct itself.
+//! scip-python/scip-typescript still each index one `--cwd` tree per
+//! invocation, unchanged. Add real multi-root fields to `ScipProvider`
+//! itself only if a second provider needs the same treatment Go just got.
+//!
 //!
 //! **Live-verification history is uneven across these 9 — "the code exists"
 //! and "confirmed working right now" are two different claims, don't conflate
@@ -136,12 +143,75 @@ pub const GO: ScipProvider = ScipProvider {
     cache_file_name: "scip-go.cache",
 };
 
+/// Detects and parses `go.work` at `root`, returning the member module
+/// directories declared in its `use` directives (relative to `root`), or
+/// `None` when no `go.work` file exists — the common, single-module case,
+/// where every caller must fall back to the existing single-root path with
+/// zero behavior change. Handles both `use ./path` (single-line) and
+/// `use (\n    ./a\n    ./b\n)` (grouped) forms, which is everything module
+/// enumeration needs; `go`/`toolchain`/`replace` directives are ignored.
+/// `scip-go` has no native workspace/`go.work` flag of its own — a
+/// documented upstream limitation (Sourcegraph's own docs: run the indexer
+/// once per module root, then rebase paths) — this is what lets the
+/// orchestration in `scip/mod.rs` (`run_go_workspace_overlay`) enumerate
+/// modules and run/ingest each one separately, reusing the exact
+/// `sub_root`/`rebase_prefix` mechanism `parse::parse_index` already had
+/// for precisely this case.
+pub(crate) fn parse_go_work_modules(root: &Path) -> Option<Vec<std::path::PathBuf>> {
+    let text = std::fs::read_to_string(root.join("go.work")).ok()?;
+    let mut modules = Vec::new();
+    let mut in_use_block = false;
+    for raw_line in text.lines() {
+        let line = raw_line.split("//").next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        if in_use_block {
+            if line == ")" {
+                in_use_block = false;
+            } else {
+                modules.push(std::path::PathBuf::from(line));
+            }
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("use ") {
+            let rest = rest.trim();
+            if rest == "(" {
+                in_use_block = true;
+            } else if !rest.is_empty() {
+                modules.push(std::path::PathBuf::from(rest));
+            }
+        }
+    }
+    if modules.is_empty() { None } else { Some(modules) }
+}
+
 fn go_cache_key(bin: &Path, root: &Path, dirty: &[String]) -> String {
+    // Workspace (go.work) case: fold every member module's go.sum/go.mod
+    // into the material so a change in *any* module invalidates the whole
+    // cached run — Phase 1 doesn't attempt per-module incremental skip (see
+    // `run_go_workspace_overlay`'s doc comment for why that's deliberately
+    // out of scope). Single-module case (the common one) is byte-for-byte
+    // the same computation as before this function grew this branch.
+    let (sum_material, mod_material) = match parse_go_work_modules(root) {
+        Some(modules) => {
+            let mut sums = String::new();
+            let mut mods = String::new();
+            for m in &modules {
+                sums.push_str(&go_sum_hash(&root.join(m)));
+                sums.push(',');
+                mods.push_str(&go_mod_hash(&root.join(m)));
+                mods.push(',');
+            }
+            (sums, mods)
+        }
+        None => (go_sum_hash(root), go_mod_hash(root)),
+    };
     super::cache::overlay_cache_key(
         &super::runner::binary_version(bin),
         &super::runner::go_toolchain_fingerprint(root),
-        &go_sum_hash(root),
-        &go_mod_hash(root),
+        &sum_material,
+        &mod_material,
         dirty,
     )
 }
