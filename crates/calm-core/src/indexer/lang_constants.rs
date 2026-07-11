@@ -269,6 +269,19 @@ fn ts_lang_haskell() -> Option<tree_sitter::Language> {
     None
 }
 
+// tree-sitter-ocaml bundles 3 grammars (ocaml/interface/type) in one crate;
+// this workspace only wires the main "ocaml" one (.ml files), via
+// LANGUAGE_OCAML — not the modern bare `LANGUAGE` const every single-grammar
+// crate here uses.
+#[cfg(feature = "lang-ocaml")]
+fn ts_lang_ocaml() -> Option<tree_sitter::Language> {
+    Some(tree_sitter_ocaml::LANGUAGE_OCAML.into())
+}
+#[cfg(not(feature = "lang-ocaml"))]
+fn ts_lang_ocaml() -> Option<tree_sitter::Language> {
+    None
+}
+
 const JS_TS_CONSTANTS: LangConstants = LangConstants {
     function_node_types: &[
         "function_declaration",
@@ -1223,6 +1236,68 @@ pub static LANGUAGES: &[LanguageSpec] = &[
         line_comment_prefixes: &["--"],
         modifier_keywords: &[],
         shallow_detect: Some(crate::indexer::parser::detect_haskell),
+    },
+    // OCaml (Phase C, 2026-07-11): 0.24.2 is the newest ABI-14 release;
+    // 0.25.0 jumped to ABI 15 (same cliff pattern as scala/dart/lua).
+    // Verified via a real AST dump on a fixture covering a record `type`,
+    // two `let`-bound functions (one calling the other), a top-level
+    // zero-arg `let main () = ...`, and a nested `let g = ... in ...`.
+    //
+    // `application_expression`'s "function" field is the callee uniformly
+    // (bare or qualified) — no sentinel needed, though OCaml curries like
+    // Haskell, so a multi-arg call produces one call-edge per application
+    // link (same minor precision rough edge, not a correctness bug, already
+    // documented for Haskell above).
+    //
+    // `let_binding` needed a dedicated `resolve_name_node` arm: its "pattern"
+    // field is a bare `value_name` for a simple binding, but the SAME node
+    // kind and shape also represents a local `let x = ... in ...` — told
+    // apart by checking the GRANDPARENT ("structure"/"compilation_unit" vs
+    // "let_expression"), one level further up than Haskell's "bind" needed.
+    // A destructuring pattern (`let (a, b) = ...`) is also correctly
+    // excluded (no single name to extract).
+    //
+    // Deliberate scope cut for this pass: `module_binding`/`module_definition`
+    // (`module Foo = struct ... end`) are NOT extracted as symbols and are
+    // NOT a `class_node_types` entry — unlike Haskell's "instance"/Rust's
+    // "impl_item", OCaml's module name is a positional child with no field
+    // at all (not even for class_context purposes), and threading that
+    // through `walk_symbols`' class_context computation (itself
+    // field-based, used by every language) was judged more risk than this
+    // pass's budget covers. Left as documented future work.
+    LanguageSpec {
+        name: "ocaml",
+        aliases: &[],
+        extensions: &["ml"],
+        constants: LangConstants {
+            function_node_types: &["let_binding", "type_binding"],
+            name_field: "name",
+            docstring_type: Some("comment"),
+            call_node_types: &["application_expression"],
+            call_function_field: "function",
+            call_function_field_by_kind: &[],
+            class_node_types: &[],
+            class_name_field: "name",
+            definition_macro_names: &[],
+        },
+        ts_language: ts_lang_ocaml,
+        branch_node_kinds: &[
+            "if_expression",
+            "match_expression",
+            "try_expression",
+            "guard",
+        ],
+        decorator_node_kinds: &[],
+        binding_kinds: &[],
+        // OCaml only has `(* ... *)` block comments — no `//`/`#`-style
+        // line comments exist at all. This just gates the shallow-fallback
+        // line-scan's comment-skip check (`is_comment_line`, a per-line
+        // startswith test, not comment-span tracking), so a lone "(*"
+        // prefix is enough to skip a comment-opening line without any
+        // false-positive risk elsewhere.
+        line_comment_prefixes: &["(*"],
+        modifier_keywords: &[],
+        shallow_detect: Some(crate::indexer::parser::detect_ocaml),
     },
 ];
 

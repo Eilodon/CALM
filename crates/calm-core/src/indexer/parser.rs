@@ -105,7 +105,10 @@ fn node_kind_to_symbol_kind(node_kind: &str, in_class: bool) -> SymbolKind {
         // covers both sum types and single-constructor records; no separate
         // struct/enum distinction attempted (documented scope cut, same
         // category as Swift's class_declaration unification).
+        // OCaml's `type_binding` (`type greeter = { name : string }`) joins
+        // this same group.
         "data_type"
+        | "type_binding"
         | "type_alias_declaration"
         | "type_spec"
         | "type_alias"
@@ -381,6 +384,33 @@ fn resolve_name_node<'a>(
         "bind" => {
             if node.parent().is_some_and(|p| p.kind() == "declarations") {
                 node.child_by_field_name("name")
+            } else {
+                None
+            }
+        }
+        // OCaml: `let_binding` (direct "pattern" field, itself a bare
+        // `value_name` for a simple non-destructuring binding) is the SAME
+        // node kind for a real top-level definition (`let greet g = ...`)
+        // and a local `let x = ... in ...` expression — same ambiguity
+        // class as Haskell's "bind" above, but distinguished one level up:
+        // every let_binding's immediate parent is always a
+        // `value_definition` wrapper (for `and`-chains); THAT wrapper's own
+        // parent is what actually tells them apart —
+        // "structure"/"compilation_unit" for a real module-level
+        // definition, vs "let_expression" for a local one. A destructuring
+        // pattern (`let (a, b) = ...`, `pattern` kind != "value_name")
+        // correctly returns `None` too — there's no single name to extract.
+        "let_binding" => {
+            let pattern = node.child_by_field_name("pattern")?;
+            if pattern.kind() != "value_name" {
+                return None;
+            }
+            let grandparent_kind = node.parent().and_then(|p| p.parent()).map(|gp| gp.kind());
+            if matches!(
+                grandparent_kind,
+                Some("structure") | Some("compilation_unit")
+            ) {
+                Some(pattern)
             } else {
                 None
             }
@@ -2226,6 +2256,31 @@ pub(crate) fn detect_haskell(s: &str) -> Option<(String, SymbolKind)> {
     }
     None
 }
+
+// OCaml shallow fallback: "let rec " checked before the plainer "let " (a
+// prefix of it) so `let rec foo x = ...` doesn't misdetect "rec" as the
+// name. Like Haskell, no real way to tell a top-level `let` from a nested
+// `let ... in` by a one-line prefix scan alone (the real tree-sitter path
+// uses a grandparent-node check instead — see lang_constants.rs's OCaml
+// entry); this fallback only runs when that grammar isn't compiled in, so
+// accepting some over-detection here (unlike Haskell, which just skips
+// function detection entirely) is a documented, honest tradeoff for this
+// safety-net path specifically.
+pub(crate) fn detect_ocaml(s: &str) -> Option<(String, SymbolKind)> {
+    if let Some(rest) = s.strip_prefix("type ")
+        && let Some(name) = ident_at_start(rest)
+    {
+        return Some((name, SymbolKind::Type));
+    }
+    for kw in ["let rec ", "let "] {
+        if let Some(rest) = s.strip_prefix(kw)
+            && let Some(name) = ident_at_start(rest)
+        {
+            return Some((name, SymbolKind::Function));
+        }
+    }
+    None
+}
 fn detect_shallow(trimmed: &str, language: &str) -> Option<(String, SymbolKind)> {
     let spec = crate::indexer::lang_constants::find_spec(language)?;
     let s = strip_modifiers(trimmed, spec.modifier_keywords);
@@ -3701,6 +3756,17 @@ public class FooTest {
         assert!(names.contains(&"Age"), "should detect newtype");
         assert!(names.contains(&"Named"), "should detect class");
     }
+
+    #[test]
+    fn test_shallow_ocaml() {
+        let code =
+            "type greeter = { name : string }\nlet greet g = g.name\nlet rec loop n = loop n\n";
+        let syms = extract_symbols_shallow(code, "ocaml", "a.ml");
+        let names = shallow_names(&syms);
+        assert!(names.contains(&"greeter"), "should detect type");
+        assert!(names.contains(&"greet"), "should detect let");
+        assert!(names.contains(&"loop"), "should detect let rec");
+    }
     #[test]
     fn test_shallow_shell() {
         let code = "function setup() {\nbuild() {\n  echo hi\n}\n";
@@ -4293,6 +4359,79 @@ class Foo {
                 .iter()
                 .any(|c| c.enclosing_name == "main" && c.callee == "putStrLn"),
             "call inside main should produce a call edge: {calls:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "lang-ocaml")]
+    fn test_tier0_5_grammar_loads_ocaml() {
+        assert!(
+            parse_tree("let main () = print_string \"hi\"\n", "ocaml").is_some(),
+            "tree-sitter-ocaml grammar should load and parse — locks the pinned ABI \
+             (=0.24.2, ABI 14); a caret-range bump to 0.25.0+ (ABI 15) would silently \
+             regress this to shallow line-scan"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "lang-ocaml")]
+    fn test_ocaml_real_grammar_symbols_and_calls_are_accurate() {
+        // OCaml's `let_binding` (has a direct "pattern" field, itself a
+        // bare `value_name` for a simple non-destructuring binding) is the
+        // EXACT SAME node kind for a real top-level definition
+        // (`let greet g = ...`) and a local `let x = ... in ...` expression
+        // (e.g. `let g = {...} in ...` inside main) — confirmed via a real
+        // AST dump, same ambiguity class as Haskell's "bind". Distinguished
+        // by the GRANDPARENT this time (every let_binding's immediate
+        // parent is always a `value_definition` wrapper, for `and`-chains):
+        // "structure"/"compilation_unit" for a real definition, vs
+        // "let_expression" for a local one. This fixture's local
+        // `let g = ...` inside `main` must NOT appear as a symbol.
+        let code = "type greeter = { name : string }\n\nlet format_greeting g =\n  \"Hello, \" ^ g.name\n\nlet greet g =\n  print_string \"hello\";\n  format_greeting g\n\nlet main () =\n  let g = { name = \"world\" } in\n  print_string (greet g)\n";
+        let symbols = extract_symbols(code, "ocaml", "a.ml").unwrap();
+        let names = shallow_names(&symbols);
+        assert!(
+            names.contains(&"greeter"),
+            "should detect type_binding: {names:?}"
+        );
+        assert!(
+            names.contains(&"greet"),
+            "should detect let_binding function: {names:?}"
+        );
+        assert!(
+            names.contains(&"format_greeting"),
+            "should detect second let_binding function: {names:?}"
+        );
+        assert!(
+            names.contains(&"main"),
+            "should detect top-level zero-arg let_binding: {names:?}"
+        );
+        assert_eq!(
+            names.iter().filter(|&&n| n == "g").count(),
+            0,
+            "the local `let g = ... in ...` inside main must NOT be extracted as \
+             a symbol — catches the exact bug a naive let_binding arm (no \
+             grandparent check) would produce: {names:?}"
+        );
+
+        let greeter = symbols
+            .iter()
+            .find(|s| s.name == "greeter")
+            .expect("greeter should be found");
+        assert_eq!(greeter.kind, SymbolKind::Type);
+
+        let calls = extract_calls(code, "ocaml", "a.ml").unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.enclosing_name == "greet" && c.callee == "print_string"),
+            "bare call inside greet should produce a call edge: {calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.enclosing_name == "greet" && c.callee == "format_greeting"),
+            "second call inside greet should produce a call edge: {calls:?}"
         );
     }
 }

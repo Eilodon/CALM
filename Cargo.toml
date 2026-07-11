@@ -104,6 +104,14 @@ tree-sitter-elixir = "=0.3.5"
 # pinned EXACT per this file's policy. Real dependency is the modern
 # `tree-sitter-language = "0.1"` shim.
 tree-sitter-haskell = "=0.23.1"
+# Phase C (2026-07-11): same ABI-cliff pattern as scala/dart/lua above,
+# verified the same way. This crate bundles 3 separate grammars (ocaml,
+# ocaml_interface for .mli, ocaml_type) — the pinned ABI check was run
+# against grammars/ocaml/src/parser.c specifically, the one this workspace
+# actually uses (see lang_constants.rs's ts_lang_ocaml, LANGUAGE_OCAML).
+# 0.24.2 is the newest ABI-14 release; 0.25.0 jumped to ABI 15. Real
+# dependency is the modern `tree-sitter-language = "0.1"` shim.
+tree-sitter-ocaml = "=0.24.2"
 # Stack Graphs (formal name resolution)
 stack-graphs = "0.14"
 tree-sitter-stack-graphs = "0.10"
