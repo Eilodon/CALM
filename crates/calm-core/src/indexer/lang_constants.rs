@@ -300,6 +300,15 @@ fn ts_lang_powershell() -> Option<tree_sitter::Language> {
     None
 }
 
+#[cfg(feature = "lang-groovy")]
+fn ts_lang_groovy() -> Option<tree_sitter::Language> {
+    Some(tree_sitter_groovy::LANGUAGE.into())
+}
+#[cfg(not(feature = "lang-groovy"))]
+fn ts_lang_groovy() -> Option<tree_sitter::Language> {
+    None
+}
+
 const JS_TS_CONSTANTS: LangConstants = LangConstants {
     function_node_types: &[
         "function_declaration",
@@ -1444,6 +1453,78 @@ pub static LANGUAGES: &[LanguageSpec] = &[
         line_comment_prefixes: DEFAULT_COMMENT_PREFIXES,
         modifier_keywords: &["static ", "hidden "],
         shallow_detect: Some(crate::indexer::parser::detect_powershell),
+    },
+    // Groovy (Phase C, 2026-07-11, final language — replaced Perl in the
+    // original 25-language list, see the workspace root Cargo.toml comment
+    // and §1.4/§9 Q2 of the plan doc): only one version has ever been
+    // published (0.1.2), re-verified ABI 14 directly rather than trusted
+    // from the original planning session's memory note.
+    //
+    // The cleanest addition of all 9 Phase C languages: verified via a real
+    // AST dump that `method_declaration`/`class_declaration`/
+    // `interface_declaration`/`function_definition` (top-level `def`) all
+    // have a direct "name" field, and `method_invocation` a direct
+    // "name"+"object" field pair — an exact match for Java's shapes (this
+    // grammar is visibly Java-derived). Zero new resolve_name_node special
+    // cases needed; class_declaration's own "name" field means
+    // class_context propagation for methods works normally too (unlike
+    // zig/ocaml/powershell's positional-only definitional nodes), and
+    // `function_definition` needs no new node_kind_to_symbol_kind arm
+    // either — it already falls through to the shared C/C++/PHP default
+    // arm, which happens to want the identical "Method if nested in a
+    // class, Function otherwise" behavior Groovy's top-level `def` needs.
+    //
+    // Deliberate scope cut, found via a REAL parse error, not assumed:
+    // Groovy's paren-less "command" call style (`println "hello"`, grammar
+    // node `juxt_function_call`) produced an ERROR node when tried inside a
+    // class method body with this grammar version — `call_node_types` only
+    // includes `method_invocation` (explicit parens), not
+    // `juxt_function_call`. See
+    // `test_groovy_real_grammar_symbols_and_calls_are_accurate` in
+    // parser.rs.
+    LanguageSpec {
+        name: "groovy",
+        aliases: &[],
+        extensions: &["groovy", "gvy", "gy", "gsh"],
+        constants: LangConstants {
+            function_node_types: &[
+                "method_declaration",
+                "class_declaration",
+                "interface_declaration",
+                "function_definition",
+            ],
+            name_field: "name",
+            docstring_type: Some("block_comment"),
+            call_node_types: &["method_invocation"],
+            call_function_field: "name",
+            call_function_field_by_kind: &[],
+            class_node_types: &["class_declaration", "interface_declaration"],
+            class_name_field: "name",
+            definition_macro_names: &[],
+        },
+        ts_language: ts_lang_groovy,
+        branch_node_kinds: &[
+            "if_statement",
+            "for_statement",
+            "while_statement",
+            "do_statement",
+            "switch_label",
+            "switch_rule",
+            "catch_clause",
+            "ternary_expression",
+        ],
+        decorator_node_kinds: &["marker_annotation", "annotation"],
+        binding_kinds: &[],
+        line_comment_prefixes: DEFAULT_COMMENT_PREFIXES,
+        modifier_keywords: &[
+            "public ",
+            "private ",
+            "protected ",
+            "static ",
+            "abstract ",
+            "final ",
+        ],
+        shallow_detect: Some(crate::indexer::parser::detect_groovy),
     },
 ];
 

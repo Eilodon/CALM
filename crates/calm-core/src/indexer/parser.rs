@@ -2387,6 +2387,27 @@ pub(crate) fn detect_powershell(s: &str) -> Option<(String, SymbolKind)> {
     }
     None
 }
+
+pub(crate) fn detect_groovy(s: &str) -> Option<(String, SymbolKind)> {
+    let class_kws: &[(&str, SymbolKind)] = &[
+        ("class ", SymbolKind::Class),
+        ("interface ", SymbolKind::Interface),
+        ("trait ", SymbolKind::Trait),
+    ];
+    for (kw, kind) in class_kws {
+        if let Some(rest) = s.strip_prefix(kw)
+            && let Some(name) = ident_at_start(rest)
+        {
+            return Some((name, *kind));
+        }
+    }
+    if let Some(rest) = s.strip_prefix("def ")
+        && let Some(name) = ident_at_start(rest)
+    {
+        return Some((name, SymbolKind::Function));
+    }
+    None
+}
 fn detect_shallow(trimmed: &str, language: &str) -> Option<(String, SymbolKind)> {
     let spec = crate::indexer::lang_constants::find_spec(language)?;
     let s = strip_modifiers(trimmed, spec.modifier_keywords);
@@ -3895,6 +3916,16 @@ public class FooTest {
         );
         assert!(names.contains(&"Greeter"), "should detect class");
     }
+
+    #[test]
+    fn test_shallow_groovy() {
+        let code = "class Greeter {\ninterface Named {\ndef greet() {\n";
+        let syms = extract_symbols_shallow(code, "groovy", "a.groovy");
+        let names = shallow_names(&syms);
+        assert!(names.contains(&"Greeter"), "should detect class");
+        assert!(names.contains(&"Named"), "should detect interface");
+        assert!(names.contains(&"greet"), "should detect def");
+    }
     #[test]
     fn test_shallow_shell() {
         let code = "function setup() {\nbuild() {\n  echo hi\n}\n";
@@ -4714,6 +4745,92 @@ class Foo {
                 .iter()
                 .any(|c| c.enclosing_name == "Greet" && c.callee == "Write-Host"),
             "command-style call should produce a call edge: {calls:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "lang-groovy")]
+    fn test_tier0_5_grammar_loads_groovy() {
+        assert!(
+            parse_tree("def main() {}\n", "groovy").is_some(),
+            "tree-sitter-groovy grammar should load and parse — locks the pinned ABI \
+             (=0.1.2, ABI 14)"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "lang-groovy")]
+    fn test_groovy_real_grammar_symbols_and_calls_are_accurate() {
+        // Groovy is the closest grammar to an existing language so far
+        // (Java) — verified via a real AST dump: `method_declaration`/
+        // `class_declaration`/`interface_declaration`/`function_definition`
+        // (top-level `def`) all have a direct "name" field, and
+        // `method_invocation` a direct "name"+"object" field pair, exactly
+        // matching Java's shapes — zero new resolve_name_node/
+        // node_kind_to_symbol_kind special cases needed (function_definition
+        // already falls through to the shared C/C++/PHP default arm, which
+        // happens to want the identical Method-if-nested/Function-otherwise
+        // behavior).
+        //
+        // Deliberate scope cut, found via a REAL parse error (not assumed):
+        // Groovy's paren-less "command" call style (`println "hello"`,
+        // grammar node `juxt_function_call`) produced an ERROR node when
+        // tried inside a class method body with this grammar version —
+        // `call_node_types` only includes `method_invocation` (explicit
+        // parens), not `juxt_function_call`.
+        let code = "class Greeter {\n    String name\n\n    String greet() {\n        this.formatGreeting()\n        return name\n    }\n\n    String formatGreeting() {\n        return \"Hello, \" + name\n    }\n}\n\ninterface Named {\n    String getName()\n}\n\ndef main() {\n    def g = new Greeter()\n    g.greet()\n}\n";
+        let symbols = extract_symbols(code, "groovy", "a.groovy").unwrap();
+        let names = shallow_names(&symbols);
+        assert!(
+            names.contains(&"Greeter"),
+            "should detect class_declaration: {names:?}"
+        );
+        assert!(names.contains(&"greet"), "should detect method: {names:?}");
+        assert!(
+            names.contains(&"formatGreeting"),
+            "should detect second method: {names:?}"
+        );
+        assert!(
+            names.contains(&"Named"),
+            "should detect interface_declaration: {names:?}"
+        );
+        assert!(
+            names.contains(&"getName"),
+            "should detect abstract interface method: {names:?}"
+        );
+        assert!(
+            names.contains(&"main"),
+            "should detect top-level def (function_definition): {names:?}"
+        );
+
+        let greeter = symbols.iter().find(|s| s.name == "Greeter").unwrap();
+        assert_eq!(greeter.kind, SymbolKind::Class);
+        let named = symbols.iter().find(|s| s.name == "Named").unwrap();
+        assert_eq!(named.kind, SymbolKind::Interface);
+        let greet = symbols.iter().find(|s| s.name == "greet").unwrap();
+        assert_eq!(
+            greet.kind,
+            SymbolKind::Method,
+            "class_declaration DOES have a direct name field (unlike zig/ocaml/\
+             powershell), so class_context propagation works normally here"
+        );
+        assert_eq!(greet.class_context.as_deref(), Some("Greeter"));
+        let main_fn = symbols.iter().find(|s| s.name == "main").unwrap();
+        assert_eq!(main_fn.kind, SymbolKind::Function);
+        assert!(main_fn.class_context.is_none());
+
+        let calls = extract_calls(code, "groovy", "a.groovy").unwrap();
+        assert!(
+            calls.iter().any(|c| c.enclosing_name == "greet"
+                && c.callee == "formatGreeting"
+                && c.receiver.as_deref() == Some("this")),
+            "method-call-with-receiver should produce a call edge: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c.enclosing_name == "main"
+                && c.callee == "greet"
+                && c.receiver.as_deref() == Some("g")),
+            "call on a local var should produce a call edge with receiver: {calls:?}"
         );
     }
 }

@@ -48,6 +48,7 @@ tree-sitter-haskell  = { workspace = true, optional = true }
 tree-sitter-ocaml    = { workspace = true, optional = true }
 tree-sitter-zig      = { workspace = true, optional = true }
 tree-sitter-powershell = { workspace = true, optional = true }
+tree-sitter-groovy = { workspace = true, optional = true }
 scip = { version = "0.9", optional = true }
 protobuf = { version = "=3.7.2", optional = true }
 tempfile = { version = "3", optional = true }
@@ -99,6 +100,7 @@ lang-haskell = ["dep:tree-sitter-haskell"]
 lang-ocaml = ["dep:tree-sitter-ocaml"]
 lang-zig = ["dep:tree-sitter-zig"]
 lang-powershell = ["dep:tree-sitter-powershell"]
+lang-groovy = ["dep:tree-sitter-groovy"]
 # Bundle: all seven tree-sitter-upgraded Tier-0.5 languages at once.
 tier0-5 = ["lang-c", "lang-cpp", "lang-ruby", "lang-php", "lang-csharp", "lang-shell", "lang-r"]
 # SCIP overlay (rust-analyzer batch `scip`) upgrades existing Rust call edges
