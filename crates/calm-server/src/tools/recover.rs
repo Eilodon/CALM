@@ -5,7 +5,13 @@ use super::*;
 impl CalmServer {
     #[tool(
         name = "indexing_status",
-        description = "USE WHEN: you need file-level index stats, embedding error details, or to trigger embedding recovery. NOT a replacement for repo_overview at session start. retry_embeddings=true triggers re-download of embedding model."
+        description = "USE WHEN: you need file-level index stats, embedding error details, or to trigger embedding recovery. NOT a replacement for repo_overview at session start. retry_embeddings=true triggers re-download of embedding model.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     pub(crate) fn indexing_status(
         &self,
@@ -185,7 +191,13 @@ impl CalmServer {
     }
     #[tool(
         name = "session_context",
-        description = "USE WHEN: after 10+ tool calls without convergence, or when starting a new sub-task. Tracks explored symbols, files, and tool call count."
+        description = "USE WHEN: after 10+ tool calls without convergence, or when starting a new sub-task. Tracks explored symbols, files, and tool call count.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     pub(crate) fn session_context(&self) -> Json<ToolOutcome<SessionContextOutput>> {
         Json(self.timed_tool("session_context", || {

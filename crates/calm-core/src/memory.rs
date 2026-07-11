@@ -120,6 +120,31 @@ pub fn ref_count(conn: &Connection, topic: &str) -> rusqlite::Result<i64> {
     )
 }
 
+/// Notes whose captured file references include `path` — the ambient-
+/// injection candidate set for `edit_context`/`locate`'s `related_notes`
+/// (docs/superskills/specs/2026-07-11-superskills-inspired-features.md #3
+/// v2). Ordered most-recently-updated first. Deliberately does NOT apply
+/// specificity-gating (hub files needing a symbol-name match) or content-
+/// safety filtering (`injection_warning`) — those are policy decisions the
+/// caller makes with data (`is_hub`, the resolved symbol name) this module
+/// doesn't have; this just answers "which notes mention this file at all."
+pub fn notes_for_path(
+    conn: &Connection,
+    path: &str,
+    limit: usize,
+) -> rusqlite::Result<Vec<(String, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT p.topic, p.content FROM project_memory_refs r \
+         JOIN project_memory p ON p.topic = r.topic \
+         WHERE r.ref_path = ?1 \
+         ORDER BY p.updated_at DESC LIMIT ?2",
+    )?;
+    stmt.query_map(rusqlite::params![path, limit as i64], |row| {
+        Ok((row.get(0)?, row.get(1)?))
+    })?
+    .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

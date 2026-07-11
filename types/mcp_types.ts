@@ -8,6 +8,14 @@ export interface Health {
   caller_count_by_confidence: { resolved: number; inferred: number; textual: number } | null;
 }
 
+
+export interface RelatedNoteOutput {
+  topic: string;
+  excerpt: string;
+  specificity: "symbol" | "file";
+  staleness: "fresh" | "stale" | "gone" | "unknown";
+}
+
 export interface SuggestedNext {
   tool: string;
   reason: string;
@@ -258,9 +266,163 @@ export type EditContextOutput = {
   risk_assessment: { level: "low" | "medium" | "high" | "critical"; reasons: string[] };
   edges_ready: boolean;
   index_freshness: { last_sync_ms: number; pending_files: number; stale_callers: boolean };
+  /**
+   * Notes saved via `remember` that reference this symbol's file, surfaced
+   * automatically (no separate `recall` call needed). Empty is the common
+   * case. On a hub file, a note only qualifies if its text mentions this
+   * symbol's name (`specificity: "symbol"`) — a plain file-level match
+   * (`specificity: "file"`) is only used on non-hub files, to avoid one
+   * stale note burying every symbol in a large/important file. A note
+   * whose text trips the same prompt-injection heuristic `source`'s
+   * `content_warning` uses is dropped from this automatic surface (still
+   * visible via an explicit `recall` call).
+   */
+  related_notes: RelatedNoteOutput[];
   note: string;
   suggested_next?: SuggestedNext;
 } | AmbiguousResult;
+
+
+export interface EditHunkInput {
+  start_line: number;
+  end_line: number;
+  /** Omit to preview this range's hash/content instead of writing. */
+  expected_hash?: string;
+  new_text: string;
+}
+
+export interface EditLinesInput {
+  path: string;
+  /** Must be disjoint (non-overlapping); applied bottom-up in one call. */
+  edits: EditHunkInput[];
+  /**
+   * Required `true` when any touched range falls inside a `risk_assessment:
+   * "high"` symbol or one with `is_hub: true`. On its own this is no longer
+   * sufficient for such a touch — see `reason`.
+   */
+  confirm?: boolean;
+  /**
+   * Required (non-empty, and referencing a real caller `edit_context`
+   * returned for the touched symbol) when touching a hub/high-risk symbol;
+   * ignored otherwise. `edit_context` must also have been called for that
+   * symbol THIS session — a stale/never-run review rejects with
+   * `EDIT_CONTEXT_REQUIRED` before `reason`/`confirm` are even checked. See
+   * `UnifiedError`'s `EDIT_CONTEXT_REQUIRED`/`CONFIRM_REQUIRED`/
+   * `REASON_NOT_GROUNDED` codes for the 3-layer gate this backs.
+   */
+  reason?: string;
+}
+
+export interface EditSymbolInput {
+  /** Bare symbol name (not a `path::name` qualified name). */
+  symbol: string;
+  path?: string;
+  line?: number;
+  /** Ignored by insertion `position` modes, which anchor/hash themselves. */
+  expected_hash?: string;
+  new_text: string;
+  position?: "replace" | "before" | "after" | "append_inside";
+  /** Same gate as `EditLinesInput.confirm` — see there. */
+  confirm?: boolean;
+  /** Same gate as `EditLinesInput.reason` — see there. */
+  reason?: string;
+}
+
+export interface TouchedSymbolOutput {
+  qualified_name: string;
+  caller_count: number;
+  is_hub: boolean;
+}
+
+export interface EditHunkResultOutput {
+  start_line: number;
+  end_line: number;
+  status: "applied" | "preview" | "conflict";
+  /** Hash of the range's content before this call — retry with this as `expected_hash`. */
+  current_hash: string;
+  old_text: string;
+  /** Only present when `status == "applied"`. */
+  new_end_line?: number;
+  /** Present when this range's pre-edit content is byte-identical to N other line windows of the file — a hash match proves content, not position. */
+  other_matches?: number;
+}
+
+/**
+ * `edit_lines` returns this directly; `edit_symbol` returns
+ * `EditLinesOutput | AmbiguousResult` (name resolution can be ambiguous).
+ */
+export interface EditLinesOutput {
+  path: string;
+  applied: boolean;
+  hunks: EditHunkResultOutput[];
+  /** "clean" | "skipped_unrecognized_language" — absent when nothing was written. */
+  parse_status?: string | null;
+  /** Symbols overlapping the touched ranges (post-edit positions once applied). */
+  touched_symbols: TouchedSymbolOutput[];
+  risk_assessment?: string | null;
+  /** `true` only when `applied` but the post-write index refresh failed — the file on disk is correct, do NOT re-apply. */
+  index_stale?: boolean | null;
+  note?: string | null;
+  suggested_next?: SuggestedNext;
+}
+
+
+export interface PatternDebtRegisterInput {
+  /** Bare symbol name (not a `path::name` qualified name). */
+  symbol: string;
+  path?: string;
+  line?: number;
+  /** Free-text description of the bug/duplication pattern this anchor tracks. */
+  note: string;
+}
+
+export type PatternDebtRegisterOutput = {
+  /** Stable id for this anchor — pass to `pattern_debt_status(topic)`. Always equal to `anchor_qualified_name` at registration time. */
+  topic: string;
+  anchor_qualified_name: string;
+  /** Similar-instance count at registration time (excludes the anchor itself), from `search(kind="similar")` above a fixed similarity threshold. */
+  baseline_count: number;
+  suggested_next?: SuggestedNext;
+} | AmbiguousResult;
+
+export interface PatternDebtStatusInput {
+  /** Check one anchor by its topic. Omit to check every currently-`open` anchor instead (capped — see the output's `truncated`). */
+  topic?: string;
+}
+
+export interface PatternDebtLocationOutput {
+  qualified_name: string;
+  path: string;
+  line_start: number | null;
+  score: number;
+}
+
+export interface PatternDebtEntryOutput {
+  topic: string;
+  anchor_qualified_name: string;
+  note: string;
+  baseline_count: number;
+  /**
+   * `"open"` (similar instances still found) | `"resolved"` (none found
+   * this check) | `"anchor_lost"` (the symbol was renamed/removed/split
+   * since registration — never silently reported as resolved), or a
+   * `"<status> (check_unavailable_this_run)"` suffix when this particular
+   * check couldn't run (e.g. embeddings not ready) — the persisted status
+   * shown is what it was *before* this call, never guessed.
+   */
+  status: string;
+  /** Similar-instance count from this check. `null`/absent when the anchor is lost or the check was unavailable. */
+  current_count?: number | null;
+  remaining_locations: PatternDebtLocationOutput[];
+  checked_at: string;
+}
+
+export interface PatternDebtStatusOutput {
+  entries: PatternDebtEntryOutput[];
+  /** `true` when more than the cap (30) of open entries exist — re-run with an explicit `topic` to check the rest. */
+  truncated: boolean;
+  suggested_next?: SuggestedNext;
+}
 
 export interface SessionContextInput {}
 
@@ -364,6 +526,8 @@ export interface LocateOutput {
     symbol?: SymbolInfoOutput;
   };
   edges_ready: boolean;
+  /** Notes referencing `top_result.symbol`'s file — same rules as `EditContextOutput.related_notes`. Empty when there's no top result or no matching notes. */
+  related_notes: RelatedNoteOutput[];
   note?: string;
   embeddings_status?: "disabled" | "downloading" | "embedding" | "ready" | "failed";
   suggested_next?: SuggestedNext;
@@ -452,7 +616,27 @@ export interface UnderstandOutput {
  */
 export interface UnifiedError {
   error: {
-    code: "NOT_FOUND" | "INDEX_PARTIAL" | "PARSE_FAILED" | "TIMEOUT" | "DB_LOCKED" | "INVALID_INPUT" | "FEATURE_UNAVAILABLE" | "EMBEDDING_FAILED";
+    /**
+     * Illustrative, not exhaustive — this file mirrors a subset of tools
+     * (see the comment at the top for full coverage caveats). Codes shown
+     * here span the general-purpose ones plus the `edit_lines`/`edit_symbol`
+     * write-gate-specific ones (`CONFIRM_REQUIRED`, `EDIT_CONTEXT_REQUIRED`,
+     * `REASON_NOT_GROUNDED`) and `pattern_debt_register`'s
+     * `EMBEDDINGS_NOT_READY`.
+     */
+    code:
+      | "NOT_FOUND"
+      | "INDEX_PARTIAL"
+      | "PARSE_FAILED"
+      | "TIMEOUT"
+      | "DB_LOCKED"
+      | "INVALID_INPUT"
+      | "FEATURE_UNAVAILABLE"
+      | "EMBEDDING_FAILED"
+      | "CONFIRM_REQUIRED"
+      | "EDIT_CONTEXT_REQUIRED"
+      | "REASON_NOT_GROUNDED"
+      | "EMBEDDINGS_NOT_READY";
     message: string;
     recoverable: boolean;
     suggestions?: string[];

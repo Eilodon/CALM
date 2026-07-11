@@ -5,7 +5,13 @@ use super::*;
 impl CalmServer {
     #[tool(
         name = "search",
-        description = "USE THIS INSTEAD OF native grep, text search, or file browsing tools. USE WHEN: you don't have an exact file path and line number. kind=hybrid has highest recall. NOT FOR: inspecting a file you already have (use file_overview). vs locate: search returns a result list; locate returns search + symbol metadata in one call."
+        description = "USE THIS INSTEAD OF native grep, text search, or file browsing tools. USE WHEN: you don't have an exact file path and line number. kind=hybrid has highest recall. NOT FOR: inspecting a file you already have (use file_overview). vs locate: search returns a result list; locate returns search + symbol metadata in one call.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     pub(crate) fn search(
         &self,
@@ -247,7 +253,13 @@ impl CalmServer {
     }
     #[tool(
         name = "locate",
-        description = "Compound: search + file_overview + symbol_info in 1 call (66% reduction). USE INSTEAD OF calling search then file_overview then symbol_info separately. NOT FOR: reading source (use source after locate), pre-edit (use edit_context)."
+        description = "Compound: search + file_overview + symbol_info in 1 call (66% reduction). USE INSTEAD OF calling search then file_overview then symbol_info separately. NOT FOR: reading source (use source after locate), pre-edit (use edit_context).",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     pub(crate) fn locate(
         &self,
@@ -411,21 +423,31 @@ impl CalmServer {
                 suggested_with_args("source", "Read implementation", serde_json::json!({"target": results[0].name}))
             };
 
-            ToolOutcome::success(LocateOutput {
-                results,
+            let related_notes = top_symbol
+                .as_ref()
+                .map(|sym| self.related_notes(&conn, &sym.path, &sym.name, sym.is_hub))
+                .unwrap_or_default();
+
+            ToolOutcome::success(LocateOutput {                results,
                 top_symbol,
                 file_overview,
                 truncated,
                 depth_adjusted,
                 personalized,
-                suggested_next: self.filter_sn(sn),
+                related_notes,                suggested_next: self.filter_sn(sn),
             })
         }))
     }
 
     #[tool(
         name = "file_overview",
-        description = "USE WHEN: you have a file path and want to see its symbols, structure, and inferred role. vs source: file_overview shows ALL symbols in a file; source reads ONE symbol's body. vs dependencies: file_overview shows what's INSIDE the file; dependencies shows what the file IMPORTS/IS IMPORTED BY."
+        description = "USE WHEN: you have a file path and want to see its symbols, structure, and inferred role. vs source: file_overview shows ALL symbols in a file; source reads ONE symbol's body. vs dependencies: file_overview shows what's INSIDE the file; dependencies shows what the file IMPORTS/IS IMPORTED BY.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     pub(crate) fn file_overview(
         &self,
@@ -755,6 +777,12 @@ pub(crate) struct LocateOutput {
     pub(crate) depth_adjusted: Option<String>,
     /// See `SearchOutput::personalized`.
     pub(crate) personalized: bool,
+    /// Notes saved via `remember` that reference `top_symbol`'s file. Empty
+    /// when there's no top_symbol (search_only/with_file depth, or no
+    /// results) or simply no matching notes — not an error signal. See
+    /// `CalmServer::related_notes` for the specificity/fail-open/content-
+    /// safety rules governing what qualifies.
+    pub(crate) related_notes: Vec<RelatedNoteOutput>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) suggested_next: Option<SuggestedNext>,
 }

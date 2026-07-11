@@ -178,6 +178,52 @@ impl CalmServer {
         self.touch_active_session(Some(path));
     }
 
+    /// Current `session_log.tool_calls` count — the freshness clock
+    /// `record_edit_context_review`/`edit_context_review` compare against.
+    pub(crate) fn session_tool_calls(&self) -> u64 {
+        self.session_log
+            .lock()
+            .map(|log| log.tool_calls)
+            .unwrap_or(0)
+    }
+
+    /// Records that `edit_context` just ran for `qualified_name` this
+    /// session — the structural half of `edit_symbol`/`edit_lines`' confirm
+    /// gate (docs/superskills/specs/2026-07-11-superskills-inspired-features.md
+    /// #5 v2). `caller_qns` should be the same confidence-ordered list
+    /// `edit_context` itself returned (capped upstream); this stores at most 5.
+    pub(crate) fn record_edit_context_review(
+        &self,
+        qualified_name: &str,
+        caller_qns: &[String],
+        risk_level: &str,
+    ) {
+        if let Ok(mut log) = self.session_log.lock() {
+            let at = log.tool_calls;
+            log.edit_context_reviewed.insert(
+                qualified_name.to_string(),
+                EditContextReview {
+                    at,
+                    caller_qns: caller_qns.iter().take(5).cloned().collect(),
+                    risk_level: risk_level.to_string(),
+                },
+            );
+        }
+    }
+
+    /// Looks up `qualified_name`'s most recent `edit_context` review this
+    /// session, if any — `None` when it was never reviewed (or a prior review
+    /// exists for a *different* qualified_name, e.g. after a rename). Cloned
+    /// out from behind the lock rather than returning a guard, matching every
+    /// other `session_log` accessor in this file (`session_context`,
+    /// `written_files_snapshot`).
+    pub(crate) fn edit_context_review(&self, qualified_name: &str) -> Option<EditContextReview> {
+        self.session_log
+            .lock()
+            .ok()
+            .and_then(|log| log.edit_context_reviewed.get(qualified_name).cloned())
+    }
+
     /// Records that `path` was written via `edit_lines`/`edit_symbol` — see
     /// `SessionLog::written_files`. Call once per successful write.
     pub(crate) fn mark_written(&self, path: &str) {
@@ -972,6 +1018,105 @@ pub(crate) fn resolve_symbol(
     }
 }
 
+/// Ambient "related notes" surfaced automatically on `edit_context`/
+/// `locate` (docs/superskills/specs/2026-07-11-superskills-inspired-features.md
+/// #3 v2) — closes 3 audit findings against the original design:
+/// (1) specificity-gating: a hub file's notes only qualify if their text
+/// mentions `symbol_name`, so a stale file-level note doesn't bury every
+/// symbol in a large/important file forever; a non-hub file keeps the
+/// looser file-level match (low noise risk there by construction).
+/// (2) fail-open: any lookup error returns an empty list, never propagates
+/// — mirrors `capture_refs`'s own "best-effort" precedent in this same
+/// module family, so a bug here can never break `edit_context`/`locate`
+/// themselves. (3) content-safety: a note whose text trips
+/// `injection_warning` is dropped from this *automatic* surface — it
+/// remains fully visible via an explicit `recall()` call, where the
+/// existing Stage-3 "source is untrusted" wariness already applies.
+impl CalmServer {
+    /// Ambient "related notes" surfaced automatically on `edit_context`/
+    /// `locate` (docs/superskills/specs/2026-07-11-superskills-inspired-features.md
+    /// #3 v2) — closes 3 audit findings against the original design:
+    /// (1) specificity-gating: a hub file's notes only qualify if their text
+    /// mentions `symbol_name`, so a stale file-level note doesn't bury every
+    /// symbol in a large/important file forever; a non-hub file keeps the
+    /// looser file-level match (low noise risk there by construction).
+    /// (2) fail-open: any lookup error returns an empty list, never propagates
+    /// — mirrors `capture_refs`'s own "best-effort" precedent in this same
+    /// module family, so a bug here can never break `edit_context`/`locate`
+    /// themselves. (3) content-safety: a note whose text trips
+    /// `injection_warning` is dropped from this *automatic* surface — it
+    /// remains fully visible via an explicit `recall()` call, where the
+    /// existing Stage-3 "source is untrusted" wariness already applies.
+    pub(crate) fn related_notes(
+        &self,
+        conn: &rusqlite::Connection,
+        path: &str,
+        symbol_name: &str,
+        is_hub: bool,
+    ) -> Vec<RelatedNoteOutput> {
+        const CAP: usize = 2;
+        // Overfetch: hub-gating and injection-filtering below can both drop
+        // candidates, so asking for exactly CAP would under-return once either
+        // filter removes anything.
+        const OVERFETCH: usize = 8;
+
+        let candidates = match calm_core::memory::notes_for_path(conn, path, OVERFETCH) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("related_notes: lookup failed for {path}: {e}");
+                return Vec::new();
+            }
+        };
+
+        let mut out = Vec::with_capacity(CAP);
+        for (topic, content) in candidates {
+            if out.len() >= CAP {
+                break;
+            }
+            let mentions_symbol = !symbol_name.is_empty() && content.contains(symbol_name);
+            if is_hub && !mentions_symbol {
+                continue;
+            }
+            if injection_warning(&content).is_some() {
+                continue;
+            }
+            let staleness =
+                match calm_core::memory::check_staleness(conn, &self.project_root, &topic) {
+                    Ok(stale) if stale.is_empty() => "fresh",
+                    Ok(stale) if stale.iter().any(|s| s.status == "deleted") => "gone",
+                    Ok(_) => "stale",
+                    Err(_) => "unknown",
+                };
+            let excerpt: String = content.chars().take(160).collect();
+            out.push(RelatedNoteOutput {
+                topic,
+                excerpt,
+                specificity: if mentions_symbol { "symbol" } else { "file" },
+                staleness,
+            });
+        }
+        out
+    }
+}
+
+#[derive(Serialize, JsonSchema)]
+pub(crate) struct RelatedNoteOutput {
+    pub(crate) topic: String,
+    /// First 160 characters of the note's content — not the full note;
+    /// call `recall(topic=...)` for the whole thing.
+    pub(crate) excerpt: String,
+    /// `"symbol"` when the note's text mentions the resolved symbol's bare
+    /// name (higher trust), `"file"` when it only matched at file level
+    /// (the note references this file but may be about a different symbol
+    /// in it — calibrate trust accordingly).
+    pub(crate) specificity: &'static str,
+    /// `"fresh"` / `"stale"` / `"gone"` (same convention as `recall`'s
+    /// per-note staleness) / `"unknown"` when the staleness check itself
+    /// failed (fail-open: the note still surfaces, just without a
+    /// confident freshness read).
+    pub(crate) staleness: &'static str,
+}
+
 /// Build the typed `AmbiguousResult` payload for `ResolvedOutcome::ambiguous`.
 pub(crate) fn to_ambiguous(candidates: &[CandidateRow]) -> AmbiguousResult {
     let total = candidates.len();
@@ -1220,7 +1365,9 @@ pub(crate) struct CallerEntry {
 /// its confidence/path/line-number — still gets a fresh etag; two calls
 /// with the same set of `(symbol, path, edge_confidence, edge_kind, line,
 /// preview)` tuples in the same order are guaranteed to hash identically.
-pub(crate) fn hash_caller_entries<'a>(entries: impl IntoIterator<Item = &'a CallerEntry>) -> String {
+pub(crate) fn hash_caller_entries<'a>(
+    entries: impl IntoIterator<Item = &'a CallerEntry>,
+) -> String {
     let mut buf = String::new();
     for e in entries {
         buf.push_str(&e.symbol);
@@ -1258,7 +1405,9 @@ pub(crate) struct CalleeEntry {
 
 /// `CalleeEntry` counterpart of `hash_caller_entries` — same rationale and
 /// field set, just for `callees`'s direction.
-pub(crate) fn hash_callee_entries<'a>(entries: impl IntoIterator<Item = &'a CalleeEntry>) -> String {
+pub(crate) fn hash_callee_entries<'a>(
+    entries: impl IntoIterator<Item = &'a CalleeEntry>,
+) -> String {
     let mut buf = String::new();
     for e in entries {
         buf.push_str(&e.symbol);

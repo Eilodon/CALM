@@ -5,7 +5,13 @@ use super::*;
 impl CalmServer {
     #[tool(
         name = "remember",
-        description = "Save a durable, interpretive note (architecture decision, gotcha, rationale) under a short topic key. Persists across sessions and server restarts — unlike session_context, which only tracks the current session's navigation. USE WHEN: you've learned something a future session should know that the graph/AST can't capture on its own (a WHY, not a fact derivable from code). Upserts: calling again with the same topic overwrites its content."
+        description = "Save a durable, interpretive note (architecture decision, gotcha, rationale) under a short topic key. Persists across sessions and server restarts — unlike session_context, which only tracks the current session's navigation. USE WHEN: you've learned something a future session should know that the graph/AST can't capture on its own (a WHY, not a fact derivable from code). Upserts: calling again with the same topic overwrites its content.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     pub(crate) fn remember(
         &self,
@@ -64,7 +70,13 @@ impl CalmServer {
 
     #[tool(
         name = "recall",
-        description = "Retrieve durable notes saved by remember. USE WHEN: starting work on a topic you might have left notes about, or checking for known gotchas before touching an area. Pass `topic` for one exact note, `query` for a keyword search across all notes, or neither to list everything (most recently updated first)."
+        description = "Retrieve durable notes saved by remember. USE WHEN: starting work on a topic you might have left notes about, or checking for known gotchas before touching an area. Pass `topic` for one exact note, `query` for a keyword search across all notes, or neither to list everything (most recently updated first).",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     pub(crate) fn recall(
         &self,

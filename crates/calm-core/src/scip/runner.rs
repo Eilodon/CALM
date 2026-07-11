@@ -197,7 +197,10 @@ fn npx_can_run_scip_python(npx: &Path) -> bool {
 pub fn python_build_command(bin: &Path, root: &Path, out: &Path) -> Command {
     let mut cmd = Command::new(bin);
     if is_npx(bin) {
-        cmd.args(["--yes", "@sourcegraph/scip-python"]);
+        // Fail-closed, not `--yes` — same rationale as js_build_command
+        // above (audit-design finding #4a): don't let npx silently reach
+        // the npm registry for @sourcegraph/scip-python.
+        cmd.args(["--no-install", "@sourcegraph/scip-python"]);
     }
     let project_name = root
         .file_name()
@@ -312,7 +315,14 @@ fn npx_can_run_scip_typescript(npx: &Path) -> bool {
 pub fn js_build_command(bin: &Path, root: &Path, out: &Path) -> Command {
     let mut cmd = Command::new(bin);
     if is_npx(bin) {
-        cmd.args(["--yes", "@sourcegraph/scip-typescript"]);
+        // Fail-closed, not `--yes`: `--yes` lets npx silently fetch
+        // @sourcegraph/scip-typescript from the npm registry on first use —
+        // a real, CALM-controlled network path (audit-design finding #4a,
+        // docs/superskills/specs/2026-07-11-superskills-inspired-features.md).
+        // `--no-install` makes npx use an already-cached/installed copy only
+        // and fail loudly otherwise, matching the "local-only unless the
+        // user explicitly opted in" posture the rest of CALM already holds.
+        cmd.args(["--no-install", "@sourcegraph/scip-typescript"]);
     }
     cmd.arg("index")
         .arg("--infer-tsconfig")

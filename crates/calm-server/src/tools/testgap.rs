@@ -11,7 +11,13 @@ const DEFAULT_TOP_N: u32 = 20;
 impl CalmServer {
     #[tool(
         name = "test_gap_hotspots",
-        description = "Rank symbols by coreness (structural centrality in the call graph) crossed with dead-code/test-coverage confidence — the highest-leverage places to add a test, not just the highest-churn/complexity ones (that's `hotspots`) or the riskiest single edit (that's `edit_context`). USE WHEN: deciding where limited test-writing effort pays off most, or auditing which structurally-important code has no test calling it directly. Read-only — composes existing `coreness`/`dead_code_confidence`/`test_files` signals, computes nothing new."
+        description = "Rank symbols by coreness (structural centrality in the call graph) crossed with dead-code/test-coverage confidence — the highest-leverage places to add a test, not just the highest-churn/complexity ones (that's `hotspots`) or the riskiest single edit (that's `edit_context`). USE WHEN: deciding where limited test-writing effort pays off most, or auditing which structurally-important code has no test calling it directly. Read-only — composes existing `coreness`/`dead_code_confidence`/`test_files` signals, computes nothing new.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     pub(crate) fn test_gap_hotspots(
         &self,
@@ -185,7 +191,15 @@ mod tests {
         {
             let conn = server.db();
             // High coreness, zero callers, not an entry point — a real gap.
-            seed_symbol(&conn, "a.rs::core_no_tests", "core_no_tests", "a.rs", 0, 9, 0);
+            seed_symbol(
+                &conn,
+                "a.rs::core_no_tests",
+                "core_no_tests",
+                "a.rs",
+                0,
+                9,
+                0,
+            );
             // High coreness, well-called, not an entry point — also flagged
             // as a "gap" only if it truly has no direct test caller (which
             // it won't, since no call_edges rows exist in this fixture at
@@ -226,7 +240,9 @@ mod tests {
         let v = jv(server.test_gap_hotspots(P(TestGapHotspotsParams { top_n: None })));
         let gaps = v["gaps"].as_array().unwrap();
         assert!(
-            !gaps.iter().any(|g| g["qualified_name"] == "a.rs::well_tested"),
+            !gaps
+                .iter()
+                .any(|g| g["qualified_name"] == "a.rs::well_tested"),
             "well_tested has caller_count>0 (not dead) and a direct test caller — must not be a gap, got: {v}"
         );
 

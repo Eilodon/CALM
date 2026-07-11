@@ -10,7 +10,13 @@ const EDIT_CONTEXT_TREND_LOOKBACK_DAYS: i64 = 7;
 impl CalmServer {
     #[tool(
         name = "edit_context",
-        description = "ALWAYS CALL THIS before any code modification — mandatory, never skip. USE WHEN: you are about to edit, refactor, or delete a symbol. NOT FOR: read-only inspection (use symbol_info + source). NOT post-edit (use diff_impact)."
+        description = "ALWAYS CALL THIS before any code modification — mandatory, never skip. USE WHEN: you are about to edit, refactor, or delete a symbol. NOT FOR: read-only inspection (use symbol_info + source). NOT post-edit (use diff_impact).",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     pub(crate) fn edit_context(
         &self,
@@ -133,6 +139,7 @@ impl CalmServer {
                 .map(CoChangedFileOutput::from)
                 .collect();
 
+            let related_notes = self.related_notes(&conn, &c.path, &c.name, c.is_hub);
             // `callers` (shown in full above, `ambiguous` entries included so
             // the caller can judge each one) is not the same count as "risk of
             // touching this symbol" — an `ambiguous` edge is index-time fan-out
@@ -195,6 +202,18 @@ impl CalmServer {
             }
             let risk = Some(risk);
 
+            // Structural half of edit_symbol/edit_lines' confirm gate (docs/
+            // superskills/specs/2026-07-11-superskills-inspired-features.md
+            // #5 v2): record that edit_context ran for this symbol, plus the
+            // real caller identifiers a `reason` string will later need to
+            // cite — the content-grounded half. Uses the full, untruncated
+            // `callers` computed above, independent of the conditional-fetch
+            // etag branch below (a cache-hit response must not blank this).
+            self.record_edit_context_review(
+                &c.qualified_name,
+                &callers.iter().map(|e| e.symbol.clone()).collect::<Vec<_>>(),
+                risk.as_deref().unwrap_or("unknown"),
+            );
             let trend = calm_core::fitness::compute_trend(
                 &conn,
                 &c.qualified_name,
@@ -246,7 +265,7 @@ impl CalmServer {
                 dead_code_source: dead_code_source.to_string(),
                 trend,
                 co_changed_files,
-                edges_etag,
+                related_notes,                edges_etag,
                 edges_not_modified: edges_not_modified.then_some(true),
                 suggested_next: self.filter_sn(suggested(
                     "diff_impact",
@@ -258,7 +277,13 @@ impl CalmServer {
 
     #[tool(
         name = "diff_impact",
-        description = "CALL THIS after every code change, BEFORE commit or push — never skip. USE WHEN: you have uncommitted changes and want to verify blast radius. NOT FOR: pre-edit analysis (use edit_context). vs edit_context: edit_context=pre-edit; diff_impact=post-edit. Omit all three for the unstaged working-tree diff, or provide at most one of: diff, staged=true, commits=<range>."
+        description = "CALL THIS after every code change, BEFORE commit or push — never skip. USE WHEN: you have uncommitted changes and want to verify blast radius. NOT FOR: pre-edit analysis (use edit_context). vs edit_context: edit_context=pre-edit; diff_impact=post-edit. Omit all three for the unstaged working-tree diff, or provide at most one of: diff, staged=true, commits=<range>.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     pub(crate) fn diff_impact(
         &self,
@@ -664,6 +689,12 @@ pub(crate) struct EditContextOutput {
     /// symbol's file often enough to clear `config.cochange.min_co_changes`
     /// — not an error signal, most edits legitimately have none.
     pub(crate) co_changed_files: Vec<CoChangedFileOutput>,
+    /// Notes saved via `remember` that reference this symbol's file —
+    /// surfaced automatically so a known gotcha isn't missed just because
+    /// nobody thought to call `recall` first. Empty is the common case, not
+    /// an error signal. See `CalmServer::related_notes` for the specificity/
+    /// fail-open/content-safety rules governing what qualifies.
+    pub(crate) related_notes: Vec<RelatedNoteOutput>,
     /// Fingerprint of `callers`+`callees` only (see `if_none_match` on
     /// `EditContextParams`) — every other field above is always fresh on
     /// every call, never gated behind this.

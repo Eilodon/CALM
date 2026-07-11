@@ -5,7 +5,13 @@ use super::*;
 impl CalmServer {
     #[tool(
         name = "repo_overview",
-        description = "ALWAYS call this FIRST at the start of every session — never skip. USE WHEN: starting a new session, switching projects, or after server restart. NOT FOR: per-file details (use file_overview), searching for symbols (use search/locate)."
+        description = "ALWAYS call this FIRST at the start of every session — never skip. USE WHEN: starting a new session, switching projects, or after server restart. NOT FOR: per-file details (use file_overview), searching for symbols (use search/locate).",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     pub(crate) fn repo_overview(&self) -> Json<ToolOutcome<RepoOverviewOutput>> {
         Json(self.timed_tool("repo_overview", || {
@@ -191,7 +197,13 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
     }
     #[tool(
         name = "hotspots",
-        description = "Proactive churn × complexity analysis. USE WHEN: starting exploration of a codebase or after orientation to identify high-risk files before diving in."
+        description = "Proactive churn × complexity analysis. USE WHEN: starting exploration of a codebase or after orientation to identify high-risk files before diving in.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     pub(crate) fn hotspots(
         &self,
@@ -248,7 +260,13 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
     }
     #[tool(
         name = "fitness_report",
-        description = "Repo-wide codebase health snapshot (hub concentration, dead code, complexity, edge coverage, architecture-boundary/config-drift violations) against configurable thresholds — the same checks `calm fitness-check` runs in CI, queryable mid-session instead of waiting on a pipeline. USE WHEN: you want a big-picture health pulse-check. NOT FOR: per-file/per-symbol risk (use hotspots/edit_context for that)."
+        description = "Repo-wide codebase health snapshot (hub concentration, dead code, complexity, edge coverage, architecture-boundary/config-drift violations) against configurable thresholds — the same checks `calm fitness-check` runs in CI, queryable mid-session instead of waiting on a pipeline. USE WHEN: you want a big-picture health pulse-check. NOT FOR: per-file/per-symbol risk (use hotspots/edit_context for that).",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     pub(crate) fn fitness_report(&self) -> Json<ToolOutcome<FitnessReportOutput>> {
         Json(self.timed_tool("fitness_report", || {

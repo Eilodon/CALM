@@ -142,7 +142,33 @@ CREATE TABLE IF NOT EXISTS project_memory_refs (
     UNIQUE(topic, ref_path)
 );
 CREATE INDEX IF NOT EXISTS idx_project_memory_refs_topic ON project_memory_refs(topic);
-";
+-- Powers `notes_for_path`'s ambient-injection lookup (docs/superskills/specs/
+-- 2026-07-11-superskills-inspired-features.md #3 v2, edit_context/locate's
+-- `related_notes`) -- a reverse lookup by file path, the mirror image of
+-- the topic index above.
+CREATE INDEX IF NOT EXISTS idx_project_memory_refs_path ON project_memory_refs(ref_path);
+-- Pattern-debt tracker (docs/superskills/specs/2026-07-11-superskills-inspired-features.md
+-- #1, revised post-audit): a registered duplicate-code-pattern anchor, keyed
+-- by a stable `anchor_qualified_name` (NOT path+line -- a symbol's lines
+-- shift on every unrelated edit elsewhere in the file, but its qualified
+-- name survives until the symbol itself is renamed/removed/split, at which
+-- point `pattern_debt_status` reports `anchor_lost` explicitly instead of a
+-- false `resolved`). Deliberately a dedicated table, not folded into
+-- `project_memory`: its structured fields (baseline_count, status) would
+-- otherwise pollute `project_memory_fts`'s full-text index used by the
+-- unrelated `recall` tool.
+CREATE TABLE IF NOT EXISTS pattern_debt (
+    id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+    topic                  TEXT NOT NULL UNIQUE,
+    anchor_qualified_name  TEXT NOT NULL,
+    note                   TEXT NOT NULL,
+    baseline_count         INTEGER NOT NULL,
+    status                 TEXT NOT NULL DEFAULT 'open',
+    created_at             TEXT NOT NULL,
+    last_checked_at        TEXT,
+    last_checked_count     INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_pattern_debt_topic ON pattern_debt(topic);";
 
 const FTS5_SQL: &str = "
 CREATE VIRTUAL TABLE IF NOT EXISTS fts_exact USING fts5(

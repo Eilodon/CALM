@@ -5,7 +5,13 @@ use super::*;
 impl CalmServer {
     #[tool(
         name = "edit_lines",
-        description = "The only write-capable tool in ci — line-range granularity, works on ANY tracked file (source code, Cargo.toml, docs — not just parsed symbols). NOT FOR: symbol-scoped edits with auto-resolved range (use edit_symbol). Requires expected_hash from a prior call's current_hash (or edit_context's range_checksum for a whole symbol); omit it to preview a range's hash/content without writing anything. All hunks in one call apply to the same file and must be disjoint (non-overlapping)."
+        description = "The only write-capable tool in ci — line-range granularity, works on ANY tracked file (source code, Cargo.toml, docs — not just parsed symbols). NOT FOR: symbol-scoped edits with auto-resolved range (use edit_symbol). Requires expected_hash from a prior call's current_hash (or edit_context's range_checksum for a whole symbol); omit it to preview a range's hash/content without writing anything. All hunks in one call apply to the same file and must be disjoint (non-overlapping).",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
     )]
     pub(crate) fn edit_lines(
         &self,
@@ -22,13 +28,19 @@ impl CalmServer {
                     new_text: h.new_text,
                 })
                 .collect();
-            self.edit_lines_impl(&p.path, hunks, p.confirm)
+            self.edit_lines_impl(&p.path, hunks, p.confirm, p.reason.as_deref())
         }))
     }
 
     #[tool(
         name = "edit_symbol",
-        description = "Sugar over edit_lines: resolves symbol (+ optional path/line, same disambiguation contract as edit_context). Default position=\"replace\" swaps the symbol's whole [line_start, line_end] for new_text in one hunk (needs expected_hash). position=\"before\"/\"after\"/\"append_inside\" instead INSERTS new_text relative to the symbol, anchored on a fresh parse of the file on disk — no line numbers, no expected_hash, no preview round trip, immune to stale line offsets (append_inside = end of a class/function body; after = new sibling below it, e.g. a new test after the last existing test). USE WHEN: replacing an entire function/class/method body by name, or inserting new code relative to one. NOT FOR: editing a single line inside a symbol, or anything outside a parsed symbol (an import line, Cargo.toml) — use edit_lines directly for those."
+        description = "Sugar over edit_lines: resolves symbol (+ optional path/line, same disambiguation contract as edit_context). Default position=\"replace\" swaps the symbol's whole [line_start, line_end] for new_text in one hunk (needs expected_hash). position=\"before\"/\"after\"/\"append_inside\" instead INSERTS new_text relative to the symbol, anchored on a fresh parse of the file on disk — no line numbers, no expected_hash, no preview round trip, immune to stale line offsets (append_inside = end of a class/function body; after = new sibling below it, e.g. a new test after the last existing test). USE WHEN: replacing an entire function/class/method body by name, or inserting new code relative to one. NOT FOR: editing a single line inside a symbol, or anything outside a parsed symbol (an import line, Cargo.toml) — use edit_lines directly for those.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
     )]
     pub(crate) fn edit_symbol(
         &self,
@@ -77,7 +89,7 @@ impl CalmServer {
                     ));
                 }
             };
-            self.edit_lines_impl(&c.path, vec![hunk], p.confirm)
+            self.edit_lines_impl(&c.path, vec![hunk], p.confirm, p.reason.as_deref())
                 .into_resolved()
         }))
     }
@@ -97,6 +109,7 @@ impl CalmServer {
         path: &str,
         hunks: Vec<calm_core::edit::HunkRequest>,
         confirm: bool,
+        reason: Option<&str>,
     ) -> ToolOutcome<EditLinesOutput> {
         // In-process guard: serializes the whole read -> hash-check -> write
         // -> reindex sequence within this one `calm serve` process. rmcp
@@ -234,7 +247,7 @@ impl CalmServer {
             None => "skipped_unrecognized_language",
         };
 
-        let (risk, hub_hit, _pre_edit_touched) = {
+        let (risk, hub_hit, pre_touched) = {
             let conn = match self.make_read_conn() {
                 Ok(c) => c,
                 Err(e) => return db_error(e),
@@ -245,19 +258,94 @@ impl CalmServer {
                 .collect();
             compute_touch_risk(&conn, path, &ranges)
         };
-        if !confirm && (risk.as_deref() == Some("high") || hub_hit) {
+        if hub_hit || risk.as_deref() == Some("high") {
             let why = if hub_hit {
                 "a hub symbol (is_hub=true)".to_string()
             } else {
                 "a high-risk symbol (>10 callers)".to_string()
             };
-            return ToolOutcome::error(error_detail(
-                "CONFIRM_REQUIRED",
-                &format!("this edit touches {why} — pass confirm:true to proceed"),
-                true,
-            ));
-        }
 
+            // Structural half (docs/superskills/specs/2026-07-11-superskills-
+            // inspired-features.md #5 v2): edit_context must have run for
+            // EVERY touched symbol this session, and not have gone stale.
+            // Checked before `confirm` so the error names the real blocker
+            // instead of a generic "pass confirm:true" that wouldn't help.
+            const FRESHNESS_WINDOW_CALLS: u64 = 200;
+            let now = self.session_tool_calls();
+            let mut missing: Vec<&str> = Vec::new();
+            let mut known_caller_qns: Vec<String> = Vec::new();
+            let mut reviewed_risk_levels: Vec<String> = Vec::new();
+            for t in &pre_touched {
+                match self.edit_context_review(&t.qualified_name) {
+                    Some(r) if now.saturating_sub(r.at) <= FRESHNESS_WINDOW_CALLS => {
+                        known_caller_qns.extend(r.caller_qns);
+                        reviewed_risk_levels.push(r.risk_level);
+                    }
+                    _ => missing.push(t.qualified_name.as_str()),
+                }
+            }
+            if !missing.is_empty() {
+                return ToolOutcome::error(error_detail(
+                    "EDIT_CONTEXT_REQUIRED",
+                    &format!(
+                        "this edit touches {why} — call edit_context(\"{}\") first THIS \
+                         session before editing (a prior session's review, or one older \
+                         than {FRESHNESS_WINDOW_CALLS} tool calls, doesn't count)",
+                        missing[0]
+                    ),
+                    true,
+                ));
+            }
+            // Observability only — the gate itself never re-derives risk from
+            // this; it just makes "what was reviewed, and at what tier"
+            // greppable in server logs when investigating a disputed edit.
+            tracing::debug!(
+                "edit gate: {} touched symbol(s) reviewed this session at risk level(s) {:?}",
+                pre_touched.len(),
+                reviewed_risk_levels
+            );
+            if !confirm {
+                return ToolOutcome::error(error_detail(
+                    "CONFIRM_REQUIRED",
+                    &format!("this edit touches {why} — pass confirm:true to proceed"),
+                    true,
+                ));
+            }
+
+            // Content-grounded half: `reason` must cite a real caller
+            // edit_context returned, not a generic phrase — closes the gap a
+            // purely structural gate leaves open (calling edit_context and
+            // never reading the response is as cheap as never calling it).
+            let reason = reason.unwrap_or("").trim();
+            let cites_real_signal = if known_caller_qns.is_empty() {
+                !reason.is_empty()
+            } else {
+                known_caller_qns.iter().any(|qn| {
+                    let short = qn.rsplit("::").next().unwrap_or(qn);
+                    reason.contains(short)
+                })
+            };
+            if !cites_real_signal {
+                let examples: Vec<&str> = known_caller_qns
+                    .iter()
+                    .map(|qn| qn.rsplit("::").next().unwrap_or(qn.as_str()))
+                    .take(3)
+                    .collect();
+                return ToolOutcome::error(error_detail(
+                    "REASON_NOT_GROUNDED",
+                    &format!(
+                        "reason must reference at least one real caller edit_context \
+                         returned ({}), or explicitly state why none apply",
+                        if examples.is_empty() {
+                            "this symbol has no confirmed callers".to_string()
+                        } else {
+                            examples.join(", ")
+                        }
+                    ),
+                    true,
+                ));
+            }
+        }
         if let Err(e) = calm_core::edit::atomic_write(&full_path, &new_content) {
             drop(_cross_guard);
             drop(_guard);
@@ -570,9 +658,23 @@ pub(crate) struct EditLinesParams {
     /// Required `true` to write when any touched range falls inside a
     /// `risk_assessment: "high"` symbol or one with `is_hub: true` (see
     /// `edit_context`). Omitted/`false` rejects such an edit with an
-    /// explanation instead of proceeding.
+    /// explanation instead of proceeding. Two further requirements gate on
+    /// top of `confirm` for such a touch (docs/superskills/specs/
+    /// 2026-07-11-superskills-inspired-features.md #5 v2): `edit_context`
+    /// must have been called for the touched symbol(s) THIS session
+    /// (`EDIT_CONTEXT_REQUIRED` otherwise — merely having called it in a
+    /// prior session, or a stale review past the freshness window, doesn't
+    /// count), and `reason` must cite a real caller name from that exact
+    /// `edit_context` response (`REASON_NOT_GROUNDED` otherwise) —
+    /// `confirm: true` alone is never sufficient for a hub/high-risk touch.
     #[serde(default)]
     pub(crate) confirm: bool,
+    /// Required (non-empty, and referencing a real caller — see `confirm`)
+    /// when touching a hub/high-risk symbol. Ignored otherwise. State which
+    /// caller(s) you checked and why this change is safe for them — not a
+    /// free-form justification a generic phrase could satisfy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) reason: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -610,8 +712,14 @@ pub(crate) struct EditSymbolParams {
     /// line offset.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) position: Option<String>,
+    /// Same gate as `edit_lines`' `confirm` — including the `edit_context`-
+    /// this-session and `reason`-must-cite-a-real-caller requirements on
+    /// top of it for a hub/high-risk touch. See `EditLinesParams::confirm`.
     #[serde(default)]
     pub(crate) confirm: bool,
+    /// See `EditLinesParams::reason`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) reason: Option<String>,
 }
 
 #[derive(Serialize, JsonSchema)]

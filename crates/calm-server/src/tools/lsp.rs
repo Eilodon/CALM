@@ -5,7 +5,13 @@ use super::*;
 impl CalmServer {
     #[tool(
         name = "lsp_refresh",
-        description = "Manually run one or every LSP resolve-time overlay provider right now (rust-analyzer/gopls/clangd), bypassing the configured refresh policy — none of these run automatically on save by default (policy defaults to on_demand). Upgrades ambiguous/textual call edges to formal by resolving each call site interactively against a live LSP session. USE WHEN: you need formal-tier call edges for rust/go/c/cpp immediately and the relevant LSP server (rust-analyzer/gopls/clangd) is available. Can be slow — spawns a persistent LSP server and does one round-trip per unresolved call site — not for routine/automatic use."
+        description = "Manually run one or every LSP resolve-time overlay provider right now (rust-analyzer/gopls/clangd), bypassing the configured refresh policy — none of these run automatically on save by default (policy defaults to on_demand). Upgrades ambiguous/textual call edges to formal by resolving each call site interactively against a live LSP session. USE WHEN: you need formal-tier call edges for rust/go/c/cpp immediately and the relevant LSP server (rust-analyzer/gopls/clangd) is available. Can be slow — spawns a persistent LSP server and does one round-trip per unresolved call site — not for routine/automatic use. NETWORK: none of these three spawn via npx, but once running they may indirectly trigger the underlying build tool (cargo/go) to fetch dependencies if the project's own cache is incomplete — inherited from the environment, not added by CALM.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
     )]
     pub(crate) fn lsp_refresh(
         &self,
