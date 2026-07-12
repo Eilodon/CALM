@@ -198,11 +198,11 @@ Live dogfood qua daemon thật (raw socket, cùng cách đo §3.5(a)): `remember
 | Metric | Trước | Mục tiêu | Sau |
 |---|---|---|---|
 | `edit_lines` end-to-end reindex (CALM repo, .md file) | ~5.5s trước Phase A (full-walk 199 file: 5460/5554/5766/5500ms, daemon.log) | < 200ms | **Đạt gần mục tiêu, cải thiện ~15×** — sau `cached_formal_resolver()`: lần đầu/process (cold `OnceLock` init) ~5.3s (không tránh được, 1 lần/life-of-daemon), các lần sau đo được 0ms → 369ms qua nhiều lần gọi thật (daemon.log `tool_execution_completed`, không ước lượng) — số 369ms đáng tin hơn (0ms 1 vài lần có thể trùng no-op ngẫu nhiên). Vẫn chưa chắc chắn < 200ms mọi lần — cần đo thêm nhiều mẫu trước khi đánh dấu "đạt" tuyệt đối. Win thật sự của Phase A nằm ở đây (FormalResolver caching), không phải ở bỏ full-walk (xem note ở cột trước). 
-| Phần reindex+graph trong edit | _ms | < 150ms | |
-| Formal edges sống sót sau 1 edit (đếm `edge_confidence='formal'` trước/sau) | chết 100% | sống 100% trừ changed files | |
-| hub_pct trên CALM | 9.8% | 3-5% | |
-| `repo_overview(compact=true)` tokens (ước bằng chars/4) | ~2.4K | ≤ 1K | |
-| Golden equivalence 5-vòng | n/a | 3 lần chạy liên tiếp xanh | |
+| Phần reindex+graph trong edit | _ms | < 150ms | không đo tách riêng được khỏi tổng end-to-end ở trên trong session này — để lại cho lần đo tiếp theo |
+| Formal edges sống sót sau 1 edit (đếm `edge_confidence='formal'` trước/sau) | chết 100% | sống 100% trừ changed files | **N/A — Phase B bị bỏ qua theo quyết định tường minh của user** ("Bỏ qua Phase B hoàn toàn"), nên hành vi vẫn là full graph rebuild mỗi lần, KHÔNG có sống sót formal edges (chưa cải thiện, đúng như trước Plan 3) |
+| hub_pct trên CALM | 9.8% | 3-5% | **4.37%** (sau khi sửa `min_callers_bridge: 2→4`, sync lại `.calm/config.json` local đang override; `coreness_pct` giữ nguyên 75.0) — đạt mục tiêu |
+| `repo_overview(compact=true)` bytes (không có tokenizer sẵn để đo token thật) | ~2.4K token ước tính ban đầu | ≤ 1K token | **full 6592 bytes → compact 2676 bytes (giảm 59%)** đo qua daemon thật trên chính CALM (199 file, 2958 symbol) — quy đổi thô bytes/4 ≈ 1648→669 "token", cùng tỉ lệ giảm với mục tiêu gốc |
+| Golden equivalence 5-vòng | n/a | 3 lần chạy liên tiếp xanh | **N/A — hạ tầng test này chỉ cần cho Phase B, không được xây dựng vì Phase B bị hoãn** |
 
 **Sau khi xong toàn series:** cập nhật `docs/audit/2026-07-12-vheatm-deep-audit.md` — đánh dấu từng finding RESOLVED/DEFERRED kèm commit hash; `remember(topic="audit-2026-07-12-outcome", ...)` tóm tắt để phiên sau `recall` được; hẹn re-audit theo Attestation (sau Plan 3 hoặc 6 tháng).
 
