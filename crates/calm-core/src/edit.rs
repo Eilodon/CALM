@@ -235,10 +235,23 @@ pub fn apply_hunks(original: &str, hunks: &[HunkRequest]) -> Result<ApplyOutcome
 
     let mut working: Vec<String> = lines.iter().map(|s| s.to_string()).collect();
     for h in &sorted {
-        let new_lines: Vec<String> = split_lines_inclusive(&h.new_text)
+        let mut new_lines: Vec<String> = split_lines_inclusive(&h.new_text)
             .into_iter()
             .map(|s| s.to_string())
             .collect();
+        // A non-EOF hunk whose `new_text` is missing its trailing newline
+        // would otherwise fuse onto whatever untouched line follows it --
+        // silently merging two adjacent symbols onto one physical line (the
+        // root cause behind a real PARSE_ERROR landmine found in
+        // crates/calm-server/src/tools/orient.rs). Only normalize when the
+        // hunk doesn't reach the true end of the original file, so
+        // `test_no_trailing_newline_preserved`'s EOF behavior stays intact.
+        if h.end_line < lines.len()
+            && let Some(last) = new_lines.last_mut()
+            && !last.ends_with('\n')
+        {
+            last.push('\n');
+        }
         working.splice(h.start_line - 1..h.end_line, new_lines);
     }
     let new_content = working.concat();
@@ -249,6 +262,58 @@ pub fn apply_hunks(original: &str, hunks: &[HunkRequest]) -> Result<ApplyOutcome
         results,
         all_applied: true,
     })
+}
+
+#[derive(Debug, PartialEq)]
+pub enum MatchOutcome {
+    NotFound,
+    /// 1-indexed line numbers of every occurrence found, for a caller to
+    /// report back (mirrors `SymbolResolution::Ambiguous`'s shape).
+    Ambiguous(Vec<usize>),
+}
+
+/// Small-text-match mode: search for `old_text` within `content`'s
+/// `[line_start, line_end]` window (1-indexed, inclusive — same convention
+/// as `HunkRequest`), and if it occurs exactly once, build a `HunkRequest`
+/// that replaces just that occurrence with `new_text`. Reads the real
+/// current content to find the match, so `expected_hash` is computed here
+/// too — a stale match is structurally impossible, same guarantee
+/// `insertion_hunk` already provides for its anchor line.
+pub fn find_and_replace_hunk(
+    content: &str,
+    line_start: usize,
+    line_end: usize,
+    old_text: &str,
+    new_text: &str,
+) -> Result<HunkRequest, MatchOutcome> {
+    let lines = split_lines_inclusive(content);
+    if line_start < 1 || line_end < line_start || line_end > lines.len() {
+        return Err(MatchOutcome::NotFound);
+    }
+    let window_start_byte: usize = lines[..line_start - 1].iter().map(|l| l.len()).sum();
+    let window: String = lines[line_start - 1..line_end].concat();
+
+    let match_lines: Vec<usize> = window
+        .match_indices(old_text)
+        .map(|(byte_off, _)| {
+            let abs_byte = window_start_byte + byte_off;
+            content[..abs_byte].matches('\n').count() + 1
+        })
+        .collect();
+
+    match match_lines.len() {
+        0 => Err(MatchOutcome::NotFound),
+        1 => {
+            let full_new = window.replace(old_text, new_text);
+            Ok(HunkRequest {
+                start_line: line_start,
+                end_line: line_end,
+                expected_hash: Some(hash_content(&window)),
+                new_text: full_new,
+            })
+        }
+        _ => Err(MatchOutcome::Ambiguous(match_lines)),
+    }
 }
 
 /// Where `insertion_hunk` places `new_text` relative to a symbol's
@@ -566,6 +631,26 @@ mod tests {
         .unwrap();
         assert_eq!(outcome.new_content.unwrap(), "line1\nline2\nreplaced");
     }
+    #[test]
+    fn test_mid_file_hunk_missing_trailing_newline_does_not_fuse_next_line() {
+        // Regression test for the root cause behind the orient.rs:251 /
+        // trace.rs:539 PARSE_ERROR landmines: a replace hunk that doesn't
+        // reach EOF and whose new_text lacks a trailing newline must NOT
+        // fuse onto the next untouched line.
+        let original = "line1\nline2\nline3\n";
+        let old_hash = hash_content("line2\n");
+        let outcome = apply_hunks(
+            original,
+            &[HunkRequest {
+                start_line: 2,
+                end_line: 2,
+                expected_hash: Some(old_hash),
+                new_text: "replaced".to_string(), // deliberately no trailing \n
+            }],
+        )
+        .unwrap();
+        assert_eq!(outcome.new_content.unwrap(), "line1\nreplaced\nline3\n");
+    }
 
     #[test]
     fn test_unicode_multibyte_line_boundary_safe() {
@@ -582,6 +667,68 @@ mod tests {
         )
         .unwrap();
         assert_eq!(outcome.new_content.unwrap(), "日本語\n한국어\nEnglish\n");
+    }
+
+    #[test]
+    fn find_and_replace_hunk_unique_match_produces_correct_hunk() {
+        let content = "fn f() {\n    let x = 1;\n    let y = 2;\n}\n";
+        let hunk = find_and_replace_hunk(content, 1, 4, "let x = 1;", "let x = 99;").unwrap();
+        let outcome = apply_hunks(content, &[hunk]).unwrap();
+        assert_eq!(
+            outcome.new_content.unwrap(),
+            "fn f() {\n    let x = 99;\n    let y = 2;\n}\n"
+        );
+    }
+
+    #[test]
+    fn find_and_replace_hunk_zero_matches_is_not_found() {
+        let content = "fn f() {\n    let x = 1;\n}\n";
+        let err = find_and_replace_hunk(content, 1, 3, "nope", "x").unwrap_err();
+        assert!(matches!(err, MatchOutcome::NotFound));
+    }
+
+    #[test]
+    fn find_and_replace_hunk_multiple_matches_is_ambiguous_with_locations() {
+        let content = "fn f() {\n    let x = 1;\n    let x = 2;\n}\n";
+        let err = find_and_replace_hunk(content, 1, 4, "let x", "let z").unwrap_err();
+        match err {
+            MatchOutcome::Ambiguous(locations) => assert_eq!(locations, vec![2, 3]),
+            other => panic!("expected Ambiguous, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn find_and_replace_hunk_scopes_search_to_the_given_range() {
+        // A match outside [line_start, line_end] must not count.
+        let content = "let x = 1;\nfn f() {\n    let y = 2;\n}\n";
+        let err = find_and_replace_hunk(content, 2, 4, "let x", "let z").unwrap_err();
+        assert!(matches!(err, MatchOutcome::NotFound));
+    }
+
+    #[test]
+    fn find_and_replace_hunk_old_text_spanning_a_line_boundary() {
+        // Regression guard from task-risk-score's B3 gap: find_and_replace_hunk
+        // computes its own hash from the same window its own line-arithmetic
+        // derives, so a boundary bug here would be self-consistent and NOT
+        // caught by apply_hunks' hash check downstream -- must be verified
+        // directly against a real multi-line match.
+        let content = "fn f() {\n    let x =\n        1;\n}\n";
+        let hunk =
+            find_and_replace_hunk(content, 1, 4, "let x =\n        1;", "let x = 2;").unwrap();
+        let outcome = apply_hunks(content, &[hunk]).unwrap();
+        assert_eq!(outcome.new_content.unwrap(), "fn f() {\n    let x = 2;\n}\n");
+    }
+
+    #[test]
+    fn find_and_replace_hunk_multi_byte_utf8_old_text() {
+        let content = "fn f() {\n    let s = \"café 中文\";\n}\n";
+        let hunk =
+            find_and_replace_hunk(content, 1, 3, "café 中文", "bar").unwrap();
+        let outcome = apply_hunks(content, &[hunk]).unwrap();
+        assert_eq!(
+            outcome.new_content.unwrap(),
+            "fn f() {\n    let s = \"bar\";\n}\n"
+        );
     }
 
     #[test]
