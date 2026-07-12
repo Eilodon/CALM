@@ -20,13 +20,13 @@
 # This hook is still worth keeping for two reasons: (1) it's the only
 # mechanism available for local/non-cloud Claude Code, where there is no
 # environment Setup Script concept at all; (2) unlike
-# `calm-mcp-wrapper.sh` (.mcp.json's actual entrypoint, which as of
-# 2026-07-12 delegates to `mcp-launcher.sh`'s own freshness-checked
-# target/release -> target/debug fallback), this always runs `cargo build`,
-# so it also catches the binary being *stale* — e.g. mid-session edits to
-# calm's own source in a prior session. Kept synchronous so that when it
-# does win the race, the win is real (no async handoff for the MCP dial to
-# slip past).
+# `mcp-launcher.sh` (.mcp.json's actual entrypoint as of 2026-07-12, after
+# retiring the `calm-mcp-wrapper.sh` indirection layer — see its own
+# freshness-checked target/release -> target/debug -> download -> build
+# fallback), this always runs `cargo build`, so it also catches the binary
+# being *stale* — e.g. mid-session edits to calm's own source in a prior
+# session. Kept synchronous so that when it does win the race, the win is
+# real (no async handoff for the MCP dial to slip past).
 set -uo pipefail
 
 if ! command -v cargo >/dev/null 2>&1; then
@@ -64,8 +64,8 @@ $build_output" \
     '{hookSpecificOutput: {hookEventName: "SessionStart", additionalContext: $msg}}'
 fi
 # Best-effort, NON-blocking self-heal for target/release/calm (the actual
-# .mcp.json entrypoint's fast path, via calm-mcp-wrapper.sh ->
-# mcp-launcher.sh). Only fires when release is missing or older than the
+# .mcp.json entrypoint's fast path, via mcp-launcher.sh directly since
+# 2026-07-12). Only fires when release is missing or older than the
 # debug build just confirmed fresh above — i.e. genuinely stale, not on
 # every session. Never awaited: a release build measured ~9min in this repo
 # (vs. ~59s for debug) would blow this hook's own 300s timeout on nearly
@@ -77,13 +77,14 @@ fi
 #
 # Real incident this guards against (2026-07-12): a manual
 # `cargo clean -p calm-server` removed target/release/calm entirely, and
-# nothing rebuilt it afterward — calm-mcp-wrapper.sh's old hardcoded `exec`
-# had no fallback, so every new MCP session failed outright until someone
-# noticed and ran `cargo build --release` by hand. The wrapper now falls
-# back to target/debug/calm when release is missing (see mcp-launcher.sh),
-# so a session is never fully broken by this again — but without this
-# block, it would stay on the slower debug binary forever instead of
-# self-healing back to release.
+# nothing rebuilt it afterward — the old calm-mcp-wrapper.sh's hardcoded
+# `exec` had no fallback, so every new MCP session failed outright until
+# someone noticed and ran `cargo build --release` by hand.
+# `mcp-launcher.sh` (now .mcp.json's direct entrypoint, the wrapper having
+# been retired as redundant indirection) falls back to target/debug/calm
+# when release is missing, so a session is never fully broken by this
+# again — but without this block, it would stay on the slower debug binary
+# forever instead of self-healing back to release.
 release_bin="target/release/calm"
 debug_bin="target/debug/calm"
 if [ -x "$debug_bin" ] && { [ ! -x "$release_bin" ] || [ "$debug_bin" -nt "$release_bin" ]; }; then

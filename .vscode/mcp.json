@@ -2,7 +2,7 @@
   "servers": {
     "calm": {
       "command": "bash",
-      "args": ["scripts/calm-mcp-wrapper.sh"],
+      "args": ["scripts/mcp-launcher.sh"],
       "cwd": "${workspaceFolder}"
     }
   }

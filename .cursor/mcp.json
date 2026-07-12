@@ -1,7 +1,7 @@
 {
   "mcpServers": {
     "calm": {
-      "command": "${workspaceFolder}/scripts/calm-mcp-wrapper.sh",
+      "command": "${workspaceFolder}/scripts/mcp-launcher.sh",
       "args": []
     }
   }

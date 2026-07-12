@@ -7,13 +7,30 @@ name: Prebuild MCP binary
 # Script/SessionStart hook can only race, never structurally win — see
 # docs/cloud-environment-setup.md.
 #
-# `paths-ignore: ['.calm-bin/**']` is load-bearing: without it, this workflow's
-# own commit back to main would retrigger itself.
+# `paths:` is an allow-list, so this only fires when something that can
+# actually change the built binary changed — Rust source, workspace deps,
+# or the workflow itself. That's also what keeps it from retriggering on
+# its own commit back to main (.calm-bin/** was never in the list, so no
+# separate paths-ignore is needed for that).
+#
+# CORRECTION (2026-07-12): this used to be an unrestricted `push` trigger
+# with only `paths-ignore: ['.calm-bin/**']`, so *every* push to main —
+# docs, config, unrelated crates outside this workspace, anything — ran a
+# full `cross build --release` and re-committed/re-fetched a ~103MB LFS
+# blob. Combined with CI and the nightly SCIP overlay workflow also doing
+# `lfs: true` checkouts on every push/PR, this repo burned through its
+# GitHub account's Git LFS bandwidth budget (see the LFS-budget-exceeded
+# outage this same day: `git lfs fetch` failing repo-wide with "This
+# repository exceeded its LFS budget" across three separate workflows).
+# Narrowing the trigger doesn't undo that, but stops it recurring.
 on:
   push:
     branches: [main]
-    paths-ignore:
-      - '.calm-bin/**'
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/prebuild-mcp-binary.yml'
 
 permissions:
   contents: write
