@@ -58,16 +58,17 @@ impl CalmServer {
                 });
 
             let callers: Vec<CallerEntry> = {
-                let mut stmt = conn
-                    .prepare(
-                        "SELECT ce.from_symbol, ce.from_path, ce.edge_confidence, ce.call_site_line, ce.edge_kind
-                         FROM call_edges ce
-                         LEFT JOIN symbols s ON s.qualified_name = ce.from_symbol
-                         WHERE ce.to_symbol = ?1 AND ce.ruled_out_by_scip = 0
-                         ORDER BY COALESCE(s.is_test, 0) ASC, ce.from_path, ce.call_site_line",
-                    )
-                    .unwrap();
-                stmt.query_map(rusqlite::params![c.qualified_name], |row| {
+                let mut stmt = match conn.prepare(
+                    "SELECT ce.from_symbol, ce.from_path, ce.edge_confidence, ce.call_site_line, ce.edge_kind
+                     FROM call_edges ce
+                     LEFT JOIN symbols s ON s.qualified_name = ce.from_symbol
+                     WHERE ce.to_symbol = ?1 AND ce.ruled_out_by_scip = 0
+                     ORDER BY COALESCE(s.is_test, 0) ASC, ce.from_path, ce.call_site_line",
+                ) {
+                    Ok(s) => s,
+                    Err(e) => return db_error_resolved(e),
+                };
+                match stmt.query_map(rusqlite::params![c.qualified_name], |row| {
                     let path: String = row.get::<_, String>(1).unwrap_or_default();
                     let line: Option<i64> = row.get(3)?;
                     Ok(CallerEntry {
@@ -78,24 +79,25 @@ impl CalmServer {
                         edge_kind: row.get(4)?,
                         line,
                     })
-                })
-                .unwrap()
-                .filter_map(|r| r.ok())
-                .collect()
+                }) {
+                    Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+                    Err(e) => return db_error_resolved(e),
+                }
             };
 
             let callees: Vec<CalleeEntry> = {
-                let mut stmt = conn
-                    .prepare(
-                        "SELECT ce.to_symbol, ce.to_path, ce.edge_confidence, ce.call_site_line, ce.edge_kind
-                         FROM call_edges ce
-                         LEFT JOIN symbols s ON s.qualified_name = ce.to_symbol
-                         WHERE ce.from_symbol = ?1 AND ce.ruled_out_by_scip = 0
-                         ORDER BY COALESCE(s.is_test, 0) ASC, ce.to_path, ce.call_site_line",
-                    )
-                    .unwrap();
+                let mut stmt = match conn.prepare(
+                    "SELECT ce.to_symbol, ce.to_path, ce.edge_confidence, ce.call_site_line, ce.edge_kind
+                     FROM call_edges ce
+                     LEFT JOIN symbols s ON s.qualified_name = ce.to_symbol
+                     WHERE ce.from_symbol = ?1 AND ce.ruled_out_by_scip = 0
+                     ORDER BY COALESCE(s.is_test, 0) ASC, ce.to_path, ce.call_site_line",
+                ) {
+                    Ok(s) => s,
+                    Err(e) => return db_error_resolved(e),
+                };
                 let from_path = c.path.clone();
-                stmt.query_map(rusqlite::params![c.qualified_name], |row| {
+                match stmt.query_map(rusqlite::params![c.qualified_name], |row| {
                     let line: Option<i64> = row.get(3)?;
                     Ok(CalleeEntry {
                         symbol: row.get(0)?,
@@ -105,10 +107,10 @@ impl CalmServer {
                         preview: line_preview(&self.project_root, &from_path, line),
                         line,
                     })
-                })
-                .unwrap()
-                .filter_map(|r| r.ok())
-                .collect()
+                }) {
+                    Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+                    Err(e) => return db_error_resolved(e),
+                }
             };
 
             let blast_radius = {

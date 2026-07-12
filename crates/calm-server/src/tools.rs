@@ -1765,6 +1765,40 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn callers_reports_db_error_when_call_edges_table_missing() {
+        // audit F4 extended (Plan 1's resolve_reports_db_error_not_not_found
+        // pattern, applied to trace.rs::callers' own prepare()/query_map()):
+        // resolve_symbol must succeed (symbols table intact) so this actually
+        // exercises callers' OWN now-fixed unwrap, not resolve_symbol's.
+        let (dir, server) = test_server("callers_db_error");
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('mod.foo', 'foo', 'function', 'rust', 'src/lib.rs', 1, 1, 'fn foo()', '', 'foo', 1, 0, 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute("DROP TABLE call_edges", []).unwrap();
+        }
+
+        let v = jv(
+            server.callers(rmcp::handler::server::wrapper::Parameters(CallersParams {
+                symbol: "foo".into(),
+                path: None,
+                line: None,
+                transitive: false,
+                max_depth: None,
+                if_none_match: None,
+            })),
+        );
+        assert_eq!(v["error"]["code"], "DB_ERROR", "response: {v}");
+        assert_eq!(v["error"]["recoverable"], true, "response: {v}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Regression for Task 9: `transitive_count`/`transitive_capped` must
     /// reflect the actual BFS outcome, not be silently absent.
     #[test]

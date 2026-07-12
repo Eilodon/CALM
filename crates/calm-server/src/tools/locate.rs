@@ -381,9 +381,13 @@ impl CalmServer {
             let file_overview = if effective_depth == "search_only" {
                 None
             } else {
-                top.map(|t| {
-                    build_file_overview(&conn, &t.path, Some(LOCATE_FILE_OVERVIEW_SYMBOL_CAP))
-                })
+                match top
+                    .map(|t| build_file_overview(&conn, &t.path, Some(LOCATE_FILE_OVERVIEW_SYMBOL_CAP)))
+                    .transpose()
+                {
+                    Ok(fo) => fo,
+                    Err(e) => return db_error(e),
+                }
             };
 
             if effective_depth != "search_only"
@@ -460,7 +464,10 @@ impl CalmServer {
                 Ok(c) => c,
                 Err(e) => return db_error(e),
             };
-            let mut out = build_file_overview(&conn, &p.path, None);
+            let mut out = match build_file_overview(&conn, &p.path, None) {
+                Ok(o) => o,
+                Err(e) => return db_error(e),
+            };
 
             let hub_name: Option<String> = conn
                 .prepare("SELECT name FROM symbols WHERE path = ?1 AND is_hub = 1 LIMIT 1")
@@ -677,15 +684,13 @@ pub(crate) fn build_file_overview(
     conn: &rusqlite::Connection,
     path: &str,
     max_symbols: Option<usize>,
-) -> FileOverviewOutput {
+) -> Result<FileOverviewOutput, rusqlite::Error> {
     let mut symbols: Vec<FileOverviewSymbol> = {
-        let mut stmt = conn
-            .prepare(
-                "SELECT name, qualified_name, kind, line_start, line_end, \
-                 COALESCE(caller_count, 0), is_hub, signature
-                 FROM symbols WHERE path = ?1 ORDER BY line_start",
-            )
-            .unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT name, qualified_name, kind, line_start, line_end, \
+             COALESCE(caller_count, 0), is_hub, signature
+             FROM symbols WHERE path = ?1 ORDER BY line_start",
+        )?;
         stmt.query_map(rusqlite::params![path], |row| {
             Ok(FileOverviewSymbol {
                 name: row.get(0)?,
@@ -699,8 +704,7 @@ pub(crate) fn build_file_overview(
                 // `source()`'s body (see common.rs's `to_symbol_info`).
                 signature: calm_core::sanitize::sanitize_source_output(&row.get::<_, String>(7)?),
             })
-        })
-        .unwrap()
+        })?
         .filter_map(|r| r.ok())
         .collect()
     };
@@ -720,16 +724,15 @@ pub(crate) fn build_file_overview(
     if let Some(cap) = max_symbols {
         symbols.truncate(cap);
     }
-    FileOverviewOutput {
+    Ok(FileOverviewOutput {
         path: path.to_string(),
         language,
         symbols,
         symbol_count,
         symbols_truncated,
         suggested_next: None,
-    }
+    })
 }
-
 // ---------------------------------------------------------------------------
 // Tool 4: symbol_info
 // ---------------------------------------------------------------------------
@@ -840,7 +843,7 @@ mod tests {
             .unwrap();
         }
 
-        let capped = build_file_overview(&conn, "big.rs", Some(40));
+        let capped = build_file_overview(&conn, "big.rs", Some(40)).unwrap();
         assert_eq!(
             capped.symbol_count, 45,
             "symbol_count is the true file total"
@@ -852,7 +855,7 @@ mod tests {
         );
         assert!(capped.symbols_truncated);
 
-        let full = build_file_overview(&conn, "big.rs", None);
+        let full = build_file_overview(&conn, "big.rs", None).unwrap();
         assert_eq!(full.symbol_count, 45);
         assert_eq!(full.symbols.len(), 45, "no cap returns the full list");
         assert!(!full.symbols_truncated);

@@ -27,45 +27,50 @@ impl CalmServer {
                 .query_row("SELECT COUNT(*) FROM file_index", [], |r| r.get(0))
                 .unwrap_or(0);
 
-            let mut stmt = conn
+            let mut stmt = match conn
                 .prepare("SELECT DISTINCT language FROM file_index WHERE language IS NOT NULL")
-                .unwrap();
-            let languages: Vec<String> = stmt
-                .query_map([], |r| r.get(0))
-                .unwrap()
-                .filter_map(|r| r.ok())
-                .collect();
+            {
+                Ok(s) => s,
+                Err(e) => return db_error(e),
+            };
+            let languages: Vec<String> = match stmt.query_map([], |r| r.get(0)) {
+                Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+                Err(e) => return db_error(e),
+            };
 
             const ENTRY_POINTS_LIMIT: usize = 20;
             let entry_points: Vec<EntryPointItem> = {
-                let mut stmt = conn
-                    .prepare(
-                        "SELECT qualified_name, path FROM symbols \
-                         WHERE is_entry_point = 1 LIMIT ?1",
-                    )
-                    .unwrap();
-                stmt.query_map(rusqlite::params![ENTRY_POINTS_LIMIT as i64], |r| {
+                let mut stmt = match conn.prepare(
+                    "SELECT qualified_name, path FROM symbols \
+                     WHERE is_entry_point = 1 LIMIT ?1",
+                ) {
+                    Ok(s) => s,
+                    Err(e) => return db_error(e),
+                };
+                match stmt.query_map(rusqlite::params![ENTRY_POINTS_LIMIT as i64], |r| {
                     Ok(EntryPointItem {
                         qualified_name: r.get(0)?,
                         path: r.get(1)?,
                     })
-                })
-                .unwrap()
-                .filter_map(|r| r.ok())
-                .collect()
+                }) {
+                    Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+                    Err(e) => return db_error(e),
+                }
             };
 
             // Top-level directory (or bare filename for root files) of each
             // indexed file, grouped to give a coarse architectural map.
             let module_map: Vec<ModuleEntry> = {
-                let mut stmt = conn
-                    .prepare("SELECT path, symbol_count FROM file_index")
-                    .unwrap();
-                let rows: Vec<(String, i64)> = stmt
+                let mut stmt = match conn.prepare("SELECT path, symbol_count FROM file_index") {
+                    Ok(s) => s,
+                    Err(e) => return db_error(e),
+                };
+                let rows: Vec<(String, i64)> = match stmt
                     .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
-                    .unwrap()
-                    .filter_map(|r| r.ok())
-                    .collect();
+                {
+                    Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+                    Err(e) => return db_error(e),
+                };
 
                 let mut by_module: std::collections::BTreeMap<String, (i64, i64)> =
                     std::collections::BTreeMap::new();
@@ -131,16 +136,17 @@ impl CalmServer {
             // empty instead of a stale/partial ranking.
             const CORE_SYMBOLS_LIMIT: usize = 15;
             let core_symbols: Vec<CoreSymbolItem> = if self.edges_ready() {
-                let mut stmt = conn
-                    .prepare(
-                        "SELECT qualified_name, name, kind, path, coreness, caller_count, is_hub \
-                         FROM symbols \
-                         WHERE is_test = 0 AND coreness IS NOT NULL AND coreness > 0 \
-                         ORDER BY coreness DESC, caller_count DESC, qualified_name ASC \
-                         LIMIT ?1",
-                    )
-                    .unwrap();
-                stmt.query_map(rusqlite::params![CORE_SYMBOLS_LIMIT as i64], |r| {
+                let mut stmt = match conn.prepare(
+                    "SELECT qualified_name, name, kind, path, coreness, caller_count, is_hub \
+                     FROM symbols \
+                     WHERE is_test = 0 AND coreness IS NOT NULL AND coreness > 0 \
+                     ORDER BY coreness DESC, caller_count DESC, qualified_name ASC \
+                     LIMIT ?1",
+                ) {
+                    Ok(s) => s,
+                    Err(e) => return db_error(e),
+                };
+                match stmt.query_map(rusqlite::params![CORE_SYMBOLS_LIMIT as i64], |r| {
                     Ok(CoreSymbolItem {
                         qualified_name: r.get(0)?,
                         name: r.get(1)?,
@@ -150,10 +156,10 @@ impl CalmServer {
                         caller_count: r.get(5)?,
                         is_hub: r.get::<_, i64>(6)? != 0,
                     })
-                })
-                .unwrap()
-                .filter_map(|r| r.ok())
-                .collect()
+                }) {
+                    Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+                    Err(e) => return db_error(e),
+                }
             } else {
                 Vec::new()
             };
@@ -194,8 +200,7 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
                 suggested_next: self.filter_sn(sn),
             })
         }))
-    }
-    #[tool(
+    }    #[tool(
         name = "hotspots",
         description = "Proactive churn × complexity analysis. USE WHEN: starting exploration of a codebase or after orientation to identify high-risk files before diving in.",
         annotations(

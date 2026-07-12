@@ -278,16 +278,16 @@ impl CalmServer {
                 })
             });
 
-            let callers = symbol_info
-                .as_ref()
-                .map(|(info, _)| {
-                    let mut stmt = conn
-                        .prepare(
-                            "SELECT from_symbol, from_path, edge_confidence, call_site_line, edge_kind
-                             FROM call_edges WHERE to_symbol = ?1",
-                        )
-                        .unwrap();
-                    stmt.query_map(rusqlite::params![info.qualified_name], |row| {
+            let callers = match symbol_info.as_ref() {
+                Some((info, _)) => {
+                    let mut stmt = match conn.prepare(
+                        "SELECT from_symbol, from_path, edge_confidence, call_site_line, edge_kind
+                         FROM call_edges WHERE to_symbol = ?1",
+                    ) {
+                        Ok(s) => s,
+                        Err(e) => return db_error(e),
+                    };
+                    match stmt.query_map(rusqlite::params![info.qualified_name], |row| {
                         let path: String = row.get::<_, String>(1).unwrap_or_default();
                         let line: Option<i64> = row.get(3)?;
                         Ok(CallerEntry {
@@ -298,12 +298,13 @@ impl CalmServer {
                             edge_kind: row.get(4)?,
                             line,
                         })
-                    })
-                    .unwrap()
-                    .filter_map(|r| r.ok())
-                    .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
+                    }) {
+                        Ok(iter) => iter.filter_map(|r| r.ok()).collect::<Vec<_>>(),
+                        Err(e) => return db_error(e),
+                    }
+                }
+                None => Vec::new(),
+            };
 
             let sn = if let Some((ref info, _)) = symbol_info {
                 if info.is_hub {

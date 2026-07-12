@@ -40,16 +40,17 @@ impl CalmServer {
             let config = calm_core::config::load_config(&self.project_root).unwrap_or_default();
 
             let all: Vec<CallerEntry> = {
-                let mut stmt = conn
-                    .prepare(
-                        "SELECT ce.from_symbol, ce.from_path, ce.edge_confidence, ce.call_site_line, ce.edge_kind
-                         FROM call_edges ce
-                         LEFT JOIN symbols s ON s.qualified_name = ce.from_symbol
-                         WHERE ce.to_symbol = ?1 AND ce.ruled_out_by_scip = 0
-                         ORDER BY COALESCE(s.is_test, 0) ASC, ce.from_path, ce.call_site_line",
-                    )
-                    .unwrap();
-                stmt.query_map(rusqlite::params![c.qualified_name], |row| {
+                let mut stmt = match conn.prepare(
+                    "SELECT ce.from_symbol, ce.from_path, ce.edge_confidence, ce.call_site_line, ce.edge_kind
+                     FROM call_edges ce
+                     LEFT JOIN symbols s ON s.qualified_name = ce.from_symbol
+                     WHERE ce.to_symbol = ?1 AND ce.ruled_out_by_scip = 0
+                     ORDER BY COALESCE(s.is_test, 0) ASC, ce.from_path, ce.call_site_line",
+                ) {
+                    Ok(s) => s,
+                    Err(e) => return db_error_resolved(e),
+                };
+                let mapped = stmt.query_map(rusqlite::params![c.qualified_name], |row| {
                     let path: String = row.get::<_, String>(1).unwrap_or_default();
                     let line: Option<i64> = row.get(3)?;
                     Ok(CallerEntry {
@@ -60,10 +61,11 @@ impl CalmServer {
                         edge_kind: row.get(4)?,
                         line,
                     })
-                })
-                .unwrap()
-                .filter_map(|r| r.ok())
-                .collect()
+                });
+                match mapped {
+                    Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+                    Err(e) => return db_error_resolved(e),
+                }
             };
 
             let (transitive, transitive_count, transitive_capped) = if p.transitive {
@@ -217,19 +219,20 @@ impl CalmServer {
             let config = calm_core::config::load_config(&self.project_root).unwrap_or_default();
 
             let all: Vec<CalleeEntry> = {
-                let mut stmt = conn
-                    .prepare(
-                        "SELECT ce.to_symbol, ce.to_path, ce.edge_confidence, ce.call_site_line, ce.edge_kind
-                         FROM call_edges ce
-                         LEFT JOIN symbols s ON s.qualified_name = ce.to_symbol
-                         WHERE ce.from_symbol = ?1 AND ce.ruled_out_by_scip = 0
-                         ORDER BY COALESCE(s.is_test, 0) ASC, ce.to_path, ce.call_site_line",
-                    )
-                    .unwrap();
+                let mut stmt = match conn.prepare(
+                    "SELECT ce.to_symbol, ce.to_path, ce.edge_confidence, ce.call_site_line, ce.edge_kind
+                     FROM call_edges ce
+                     LEFT JOIN symbols s ON s.qualified_name = ce.to_symbol
+                     WHERE ce.from_symbol = ?1 AND ce.ruled_out_by_scip = 0
+                     ORDER BY COALESCE(s.is_test, 0) ASC, ce.to_path, ce.call_site_line",
+                ) {
+                    Ok(s) => s,
+                    Err(e) => return db_error_resolved(e),
+                };
                 // The call site lives in the symbol being inspected (`c.path`),
                 // not in the callee's own file (`to_path`).
                 let from_path = c.path.clone();
-                stmt.query_map(rusqlite::params![c.qualified_name], |row| {
+                let mapped = stmt.query_map(rusqlite::params![c.qualified_name], |row| {
                     let line: Option<i64> = row.get(3)?;
                     Ok(CalleeEntry {
                         symbol: row.get(0)?,
@@ -239,10 +242,11 @@ impl CalmServer {
                         preview: line_preview(&self.project_root, &from_path, line),
                         line,
                     })
-                })
-                .unwrap()
-                .filter_map(|r| r.ok())
-                .collect()
+                });
+                match mapped {
+                    Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+                    Err(e) => return db_error_resolved(e),
+                }
             };
 
             let (transitive, transitive_count, transitive_capped) = if p.transitive {
@@ -352,55 +356,55 @@ impl CalmServer {
                 .map(|c| c.dependencies)
                 .unwrap_or_default();
 
-            let mut stmt_imports = conn
-                .prepare(
-                    "SELECT from_path, COALESCE(to_path, ''), module_name, symbols_used
-                     FROM import_edges WHERE from_path = ?1 LIMIT ?2",
-                )
-                .unwrap();
+            let mut stmt_imports = match conn.prepare(
+                "SELECT from_path, COALESCE(to_path, ''), module_name, symbols_used
+                 FROM import_edges WHERE from_path = ?1 LIMIT ?2",
+            ) {
+                Ok(s) => s,
+                Err(e) => return db_error(e),
+            };
 
-            let imports: Vec<ImportEntry> = stmt_imports
-                .query_map(
-                    rusqlite::params![p.path, dep_config.max_imports as i64 + 1],
-                    |row| {
-                        Ok(ImportEntry {
-                            from_path: row.get(0)?,
-                            to_path: row.get(1)?,
-                            module_name: row.get(2)?,
-                            symbols_used: parse_symbols_used(&row.get::<_, String>(3)?),
-                        })
-                    },
-                )
-                .unwrap()
-                .filter_map(|r| r.ok())
-                .collect();
+            let imports: Vec<ImportEntry> = match stmt_imports.query_map(
+                rusqlite::params![p.path, dep_config.max_imports as i64 + 1],
+                |row| {
+                    Ok(ImportEntry {
+                        from_path: row.get(0)?,
+                        to_path: row.get(1)?,
+                        module_name: row.get(2)?,
+                        symbols_used: parse_symbols_used(&row.get::<_, String>(3)?),
+                    })
+                },
+            ) {
+                Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+                Err(e) => return db_error(e),
+            };
             let imports_truncated = imports.len() > dep_config.max_imports;
             let imports = imports.into_iter().take(dep_config.max_imports).collect();
 
             // Drop the first statement before preparing the second on the same conn
             drop(stmt_imports);
-            let mut stmt_imported_by = conn
-                .prepare(
-                    "SELECT from_path, COALESCE(to_path, ''), module_name, symbols_used
-                     FROM import_edges WHERE to_path = ?1 LIMIT ?2",
-                )
-                .unwrap();
+            let mut stmt_imported_by = match conn.prepare(
+                "SELECT from_path, COALESCE(to_path, ''), module_name, symbols_used
+                 FROM import_edges WHERE to_path = ?1 LIMIT ?2",
+            ) {
+                Ok(s) => s,
+                Err(e) => return db_error(e),
+            };
 
-            let imported_by: Vec<ImportEntry> = stmt_imported_by
-                .query_map(
-                    rusqlite::params![p.path, dep_config.max_imported_by as i64 + 1],
-                    |row| {
-                        Ok(ImportEntry {
-                            from_path: row.get(0)?,
-                            to_path: row.get(1)?,
-                            module_name: row.get(2)?,
-                            symbols_used: parse_symbols_used(&row.get::<_, String>(3)?),
-                        })
-                    },
-                )
-                .unwrap()
-                .filter_map(|r| r.ok())
-                .collect();
+            let imported_by: Vec<ImportEntry> = match stmt_imported_by.query_map(
+                rusqlite::params![p.path, dep_config.max_imported_by as i64 + 1],
+                |row| {
+                    Ok(ImportEntry {
+                        from_path: row.get(0)?,
+                        to_path: row.get(1)?,
+                        module_name: row.get(2)?,
+                        symbols_used: parse_symbols_used(&row.get::<_, String>(3)?),
+                    })
+                },
+            ) {
+                Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+                Err(e) => return db_error(e),
+            };
             let imported_by_truncated = imported_by.len() > dep_config.max_imported_by;
             let imported_by = imported_by
                 .into_iter()
@@ -416,21 +420,26 @@ impl CalmServer {
             let call_dependents: Vec<String> = {
                 let already: std::collections::HashSet<&str> =
                     imported_by.iter().map(|e| e.from_path.as_str()).collect();
-                let mut stmt = conn
-                    .prepare(
-                        "SELECT DISTINCT from_path FROM call_edges \
-                         WHERE to_path = ?1 AND from_path IS NOT NULL AND from_path != ?1 \
-                         ORDER BY from_path LIMIT ?2",
-                    )
-                    .unwrap();
-                stmt.query_map(
+                let stmt = conn.prepare(
+                    "SELECT DISTINCT from_path FROM call_edges \
+                     WHERE to_path = ?1 AND from_path IS NOT NULL AND from_path != ?1 \
+                     ORDER BY from_path LIMIT ?2",
+                );
+                let mut stmt = match stmt {
+                    Ok(s) => s,
+                    Err(e) => return db_error(e),
+                };
+                let mapped = stmt.query_map(
                     rusqlite::params![p.path, dep_config.max_imported_by as i64],
                     |row| row.get::<_, String>(0),
-                )
-                .unwrap()
-                .filter_map(|r| r.ok())
-                .filter(|f| !already.contains(f.as_str()))
-                .collect()
+                );
+                match mapped {
+                    Ok(iter) => iter
+                        .filter_map(|r| r.ok())
+                        .filter(|f| !already.contains(f.as_str()))
+                        .collect(),
+                    Err(e) => return db_error(e),
+                }
             };
 
             // Glob re-export dependents: files that reach this file's symbols
@@ -452,26 +461,31 @@ impl CalmServer {
                 let mut already: std::collections::HashSet<String> =
                     imported_by.iter().map(|e| e.from_path.clone()).collect();
                 already.extend(call_dependents.iter().cloned());
-                let mut stmt = conn
-                    .prepare(
-                        "SELECT DISTINCT g.from_path FROM import_edges g \
-                         JOIN import_edges d ON d.from_path = g.to_path \
-                         WHERE g.symbols_used = '[]' \
-                           AND g.to_path IS NOT NULL AND g.to_path != '' \
-                           AND g.from_path != ?1 \
-                           AND d.to_path = ?1 \
-                           AND d.symbols_used != '[]' \
-                         ORDER BY g.from_path LIMIT ?2",
-                    )
-                    .unwrap();
-                stmt.query_map(
+                let stmt = conn.prepare(
+                    "SELECT DISTINCT g.from_path FROM import_edges g \
+                     JOIN import_edges d ON d.from_path = g.to_path \
+                     WHERE g.symbols_used = '[]' \
+                       AND g.to_path IS NOT NULL AND g.to_path != '' \
+                       AND g.from_path != ?1 \
+                       AND d.to_path = ?1 \
+                       AND d.symbols_used != '[]' \
+                     ORDER BY g.from_path LIMIT ?2",
+                );
+                let mut stmt = match stmt {
+                    Ok(s) => s,
+                    Err(e) => return db_error(e),
+                };
+                let mapped = stmt.query_map(
                     rusqlite::params![p.path, dep_config.max_imported_by as i64],
                     |row| row.get::<_, String>(0),
-                )
-                .unwrap()
-                .filter_map(|r| r.ok())
-                .filter(|f| !already.contains(f))
-                .collect()
+                );
+                match mapped {
+                    Ok(iter) => iter
+                        .filter_map(|r| r.ok())
+                        .filter(|f| !already.contains(f))
+                        .collect(),
+                    Err(e) => return db_error(e),
+                }
             };
 
             let sn = if imported_by.len() > 20 {
@@ -490,8 +504,7 @@ impl CalmServer {
                 suggested_next: self.filter_sn(sn),
             })
         }))
-    }
-    #[tool(
+    }    #[tool(
         name = "path",
         description = "USE WHEN: you need to trace if and how symbol A can reach symbol B through call chain. Bidirectional BFS — cycles terminate cleanly. path is DIRECTED: A→B ≠ B→A. terminated_by=null + exists=true/false → certain result.",
         annotations(
