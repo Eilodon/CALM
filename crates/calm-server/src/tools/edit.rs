@@ -59,6 +59,64 @@ impl CalmServer {
         Parameters(p): Parameters<EditSymbolParams>,
     ) -> Json<ResolvedOutcome<EditLinesOutput>> {
         Json(self.timed_tool("edit_symbol", || {
+            if matches!(p.position.as_deref(), Some("top_of_file") | Some("end_of_file")) {
+                // No symbol resolution at all for these two modes -- pure
+                // file-relative anchors for brand-new module-level content
+                // (a new `use`, a new top-level function) with no existing
+                // sibling symbol to anchor on.
+                let path = match p.path.as_deref() {
+                    Some(p) => p,
+                    None => {
+                        return ResolvedOutcome::error(error_detail(
+                            "PATH_REQUIRED",
+                            "position=\"top_of_file\"/\"end_of_file\" needs `path` (no symbol \
+                             is resolved for these modes)",
+                            false,
+                        ));
+                    }
+                };
+                let full_path = match resolve_repo_path(&self.project_root, path) {
+                    Ok(p) => p,
+                    Err(e) => return ResolvedOutcome::error(e),
+                };
+                let live = match std::fs::read_to_string(&full_path) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        return ResolvedOutcome::error(error_detail(
+                            "READ_FAILED",
+                            &format!("could not read {path}: {e}"),
+                            false,
+                        ));
+                    }
+                };
+                let total_lines = live.lines().count().max(1);
+                let (line_start, line_end, insert_pos) = if p.position.as_deref()
+                    == Some("top_of_file")
+                {
+                    (1, 1, calm_core::edit::InsertPosition::Before)
+                } else {
+                    (1, total_lines, calm_core::edit::InsertPosition::After)
+                };
+                let hunk = match calm_core::edit::insertion_hunk(
+                    &live,
+                    line_start,
+                    line_end,
+                    insert_pos,
+                    &p.new_text,
+                ) {
+                    Some(h) => h,
+                    None => {
+                        return ResolvedOutcome::error(error_detail(
+                            "INVALID_RANGE",
+                            &format!("{path} appears to be empty or unreadable as text"),
+                            false,
+                        ));
+                    }
+                };
+                return self
+                    .edit_lines_impl(path, vec![hunk], p.confirm, p.reason.as_deref(), true)
+                    .into_resolved();
+            }
             let c = {
                 let conn = match self.make_read_conn() {
                     Ok(c) => c,
@@ -175,7 +233,8 @@ impl CalmServer {
                         "INVALID_POSITION",
                         &format!(
                             "unknown position {other:?} — use \"replace\" (default), \
-                             \"before\", \"after\", or \"append_inside\""
+                             \"before\", \"after\", \"append_inside\", \"top_of_file\", or \
+                             \"end_of_file\""
                         ),
                         false,
                     ));
@@ -1139,16 +1198,20 @@ pub(crate) struct EditSymbolParams {
     /// the new code to insert — the symbol itself is left untouched.
     pub(crate) new_text: String,
     /// One of `"replace"` (default), `"before"`, `"after"`,
-    /// `"append_inside"`. `"replace"` swaps the symbol's whole range for
-    /// `new_text`. The other three INSERT `new_text` relative to the
-    /// symbol: `"before"` = directly above it, `"after"` = directly below
-    /// it (a new sibling — e.g. add a test after the last test in a
-    /// module), `"append_inside"` = at the end of its body (above the
-    /// closing delimiter when one exists). Insertion modes re-resolve the
-    /// symbol's range from a fresh parse of the file on disk and pre-fill
-    /// the anchor hash themselves, so no `expected_hash`, preview round
-    /// trip, or line arithmetic is needed — they cannot land at a stale
-    /// line offset.
+    /// `"append_inside"`, `"top_of_file"`, `"end_of_file"`. `"replace"`
+    /// swaps the symbol's whole range for `new_text`. `"before"`/`"after"`/
+    /// `"append_inside"` INSERT `new_text` relative to the symbol:
+    /// `"before"` = directly above it, `"after"` = directly below it (a
+    /// new sibling — e.g. add a test after the last test in a module),
+    /// `"append_inside"` = at the end of its body (above the closing
+    /// delimiter when one exists). Insertion modes re-resolve the symbol's
+    /// range from a fresh parse of the file on disk and pre-fill the
+    /// anchor hash themselves, so no `expected_hash`, preview round trip,
+    /// or line arithmetic is needed — they cannot land at a stale line
+    /// offset. `"top_of_file"`/`"end_of_file"` insert relative to the
+    /// WHOLE FILE (`path` required, `symbol` ignored) — for brand-new
+    /// module-level content (a new `use`, a new top-level function) with
+    /// no existing sibling symbol to anchor on.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) position: Option<String>,
     /// Same gate as `edit_lines`' `confirm` — including the `edit_context`-

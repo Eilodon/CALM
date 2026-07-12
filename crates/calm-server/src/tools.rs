@@ -6420,6 +6420,86 @@ mod tests {
     }
 
     #[test]
+    fn edit_symbol_position_top_of_file_inserts_before_everything() {
+        let (dir, server) = test_server("edit_symbol_top_of_file");
+        std::fs::write(dir.join("f.rs"), "pub fn a() {}\n").unwrap();
+
+        let out = server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
+            EditSymbolParams {
+                symbol: "".into(),
+                path: Some("f.rs".into()),
+                line: None,
+                expected_hash: None,
+                new_text: "use std::fmt;\n".into(),
+                position: Some("top_of_file".into()),
+                confirm: false,
+                reason: None,
+                old_text: None,
+            },
+        ));
+        let v = jv(out);
+        assert_eq!(v["applied"], true, "response: {v}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("f.rs")).unwrap(),
+            "use std::fmt;\npub fn a() {}\n"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_symbol_position_end_of_file_appends_after_everything() {
+        let (dir, server) = test_server("edit_symbol_end_of_file");
+        std::fs::write(dir.join("f.rs"), "pub fn a() {}\n").unwrap();
+
+        let out = server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
+            EditSymbolParams {
+                symbol: "".into(),
+                path: Some("f.rs".into()),
+                line: None,
+                expected_hash: None,
+                new_text: "pub fn z() {}\n".into(),
+                position: Some("end_of_file".into()),
+                confirm: false,
+                reason: None,
+                old_text: None,
+            },
+        ));
+        let v = jv(out);
+        assert_eq!(v["applied"], true, "response: {v}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("f.rs")).unwrap(),
+            "pub fn a() {}\npub fn z() {}\n"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_symbol_position_top_of_file_requires_path() {
+        let (dir, server) = test_server("edit_symbol_top_of_file_no_path");
+        std::fs::write(dir.join("f.rs"), "pub fn a() {}\n").unwrap();
+
+        let out = server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
+            EditSymbolParams {
+                symbol: "".into(),
+                path: None,
+                line: None,
+                expected_hash: None,
+                new_text: "use std::fmt;\n".into(),
+                position: Some("top_of_file".into()),
+                confirm: false,
+                reason: None,
+                old_text: None,
+            },
+        ));
+        let v = jv(out);
+        assert_eq!(v["error"]["code"], "PATH_REQUIRED");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn edit_lines_reports_other_matches_on_generic_content() {
         let (dir, server) = test_server("edit_other_matches");
         std::fs::write(dir.join("a.rs"), "fn a() {\n}\nfn b() {\n}\n").unwrap();
