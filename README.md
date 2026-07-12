@@ -304,7 +304,7 @@ Everything below is more detail than this README needs to make its case — poin
 
 - [`docs/architecture.md`](docs/architecture.md) — the full technical deep-dive: multi-tier indexing, SCIP/LSP overlays, search internals, the edit safety net, concurrency, self-grading, memory, sanitization, and the design philosophy behind it all.
 - [`docs/comparison.md`](docs/comparison.md) — methodology-first positioning write-up against other tools in this category.
-- [`docs/`](docs/) — resolver internals, migration plans, and [`docs/legacy/architecture-design.md`](docs/legacy/architecture-design.md) for the original technical design (mostly Vietnamese).
+- [`docs/`](docs/) — resolver internals, migration plans, and other design notes not covered by `docs/architecture.md` above.
 - [`docs/adr/`](docs/adr/) — individual architecture decision records (Stack Graphs scope, the formal-resolver approach, the LSP-optional confidence upgrade, the daemon+forwarder concurrency model).
 - [`docs/mcp-client-setup.md`](docs/mcp-client-setup.md) — every MCP client install path in detail, including Windsurf/Devin Desktop and Codex global config.
 - [`AGENTS.md`](AGENTS.md) — the full tool-by-tool workflow guide this project's own agents follow.

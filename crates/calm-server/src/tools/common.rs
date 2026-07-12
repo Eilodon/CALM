@@ -244,6 +244,11 @@ impl CalmServer {
     /// promises, not symbol-level. A no-op whenever this entry was never
     /// inserted in the first place (a bare `new`/`new_with_preset` instance,
     /// `session_id == 0` — see `for_connection`).
+    /// audit H6: lock order invariant, codebase-wide — `session_log` is
+    /// always locked BEFORE `active_sessions` (see this function for the
+    /// canonical example). Any function that touches both must preserve
+    /// this order; reversing it is a deadlock waiting to happen against
+    /// another function that also locks both.
     fn touch_active_session(&self, path: Option<&str>) {
         let tool_calls = self
             .session_log

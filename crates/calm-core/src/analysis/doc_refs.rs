@@ -59,6 +59,16 @@ pub fn extract_path_refs(text: &str) -> Vec<String> {
         if preceding.contains("://") {
             continue;
         }
+        // audit H3: a `~/`-prefixed absolute home-dir path (e.g.
+        // `~/.codeium/windsurf/mcp_config.json`) is, like a URL, never a
+        // repo-relative reference. `path_ref_regex`'s char-class has no `~`
+        // (and no `/` as a leading char either), so the match actually
+        // starts right after the `~/` — check for that exact two-char
+        // suffix, not a bare trailing `~`, or this would miss every real
+        // case and only catch the never-occurring `~.foo` (no slash) form.
+        if preceding.ends_with("~/") {
+            continue;
+        }
         out.push(m.as_str().trim_start_matches("./").to_string());
     }
     out
@@ -97,6 +107,16 @@ mod tests {
         let refs = extract_path_refs("see https://example.com/foo.py for reference");
         assert!(refs.is_empty(), "got {refs:?}");
     }
+    /// audit H3: a `~/`-prefixed home-dir path must be skipped the same way
+    /// a URL is — it's never a repo-relative reference. Regression test for
+    /// the false positive `check_config_drift` reported against README.md's
+    /// real, correct Windsurf/Antigravity setup instructions.
+    #[test]
+    fn skips_home_dir_paths() {
+        let refs = extract_path_refs("edit `~/.codeium/windsurf/mcp_config.json`");
+        assert!(refs.is_empty(), "got {refs:?}");
+    }
+
 
     #[test]
     fn extracts_multiple_and_preserves_order() {

@@ -142,7 +142,7 @@ edit_context("getUserByEmail")
 `edit_context`'s `range_checksum` (whole-symbol content hash) feeds directly into Stage 6's `edit_symbol(expected_hash=range_checksum, ...)` — no extra round trip to learn the hash.
 
 **Signals**:
-- `risk_assessment.level == "critical"` or `"high"` → review ALL callers before proceeding
+- `risk_assessment.level == "high"` → review ALL callers before proceeding (audit H2: `edit_context`'s risk tiering only ever emits low/medium/high, never `"critical"` — that value only exists on Stage 7's `aggregate_risk`)
 - `index_freshness.stale_callers: true` → file changed since last index; results may lag
 - `edges_ready: false` → call graph still building; treat results as lower-confidence
 - `callers[].edge_confidence == "textual"` → may be false positives AND missed real callers

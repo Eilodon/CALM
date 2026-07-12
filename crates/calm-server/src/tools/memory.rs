@@ -254,8 +254,11 @@ pub(crate) struct RecallParams {
     /// Exact topic to fetch. Takes priority over `query` if both are set.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) topic: Option<String>,
-    /// Keyword search across topic + content (SQL LIKE, case-insensitive
-    /// for ASCII). Ignored if `topic` is set.
+    /// Keyword search across topic + content: FTS5 phrase match, bm25-ranked
+    /// (audit H1 — previously documented as "SQL LIKE, case-insensitive",
+    /// stale since the FTS5 migration; see `escape_fts5_query`). Input is
+    /// always escaped into a literal phrase before matching. Ignored if
+    /// `topic` is set.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) query: Option<String>,
 }
