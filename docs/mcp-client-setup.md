@@ -45,7 +45,29 @@ Package JS mỏng, tự chọn đúng binary prebuilt cho platform qua
 tarball npm). Xem [`../npm/README.md`](../npm/README.md) để biết cách
 publish/kiểm tra package này.
 
-### Sau khi cài xong bằng 1 trong 2 cách trên: `calm setup`
+### 3. Lệnh CLI add-server 1 dòng (client tự có sẵn, không cần sửa file tay)
+
+Không cần biết trước path file config — 2 client dưới đây tự ghi config
+đúng chỗ chỉ với 1 lệnh, đủ ngắn để chính agent (Claude/Codex, khi có quyền
+chạy shell) tự thực thi thay người dùng nếu được yêu cầu kiểu "cài CALM của
+Eilodon cho tui":
+
+```bash
+# Claude Code
+claude mcp add --transport stdio calm -- npx -y @eilodon/calm-mcp serve
+
+# Codex CLI
+codex mcp add calm -- npx -y @eilodon/calm-mcp serve
+```
+
+Cursor/VS Code/Windsurf/Antigravity chưa có lệnh CLI tương đương — nhưng vì
+agent của các tool này (ở chế độ agent/agentic mode) đều có quyền ghi file,
+agent vẫn tự sửa được đúng file config (`.cursor/mcp.json`,
+`.vscode/mcp.json`, `~/.codeium/windsurf/mcp_config.json`,
+`~/.gemini/config/mcp_config.json`) khi được yêu cầu — chỉ là không có 1
+lệnh built-in để gõ thẳng.
+
+### Sau khi cài xong bằng cách 1 hoặc 2 ở trên (không áp dụng cho cách 3 — `codex`/`claude mcp add` đã tự ghi config, không cần `calm setup`): `calm setup`
 
 Từ bên trong project bạn muốn `calm` phân tích:
 
@@ -120,14 +142,32 @@ top-level:
 
 Clone repo về là dùng được ngay với cả ba — không cần cấu hình thêm gì.
 
-## Windsurf (global config, không check-in được)
+## Windsurf / Devin Desktop (global config, không check-in được)
 
-Windsurf chỉ đọc config từ `~/.codeium/windsurf/mcp_config.json` (theo user,
-không có project-level) — không thể checkout kèm repo được, phải dán tay.
-Dán đoạn sau vào, thay `/absolute/path/to/CALM` bằng đường dẫn
-thật nơi bạn clone repo này (khác với 3 config trên, path ở đây **phải là
-tuyệt đối** vì không có khái niệm "project root" cho một file config toàn
-cục):
+Windsurf đổi thương hiệu thành **Devin Desktop** (Cognition, 6/2026) — vẫn
+cùng nền tảng Cascade cũ, đường dẫn config bên dưới không đổi.
+
+Windsurf/Devin chỉ đọc config từ `~/.codeium/windsurf/mcp_config.json` (theo
+user, không có project-level) — không thể checkout kèm repo được, phải dán
+tay. Cách đơn giản nhất, **không cần clone CALM**, dùng npx như phần Quick
+start ở README:
+
+```json
+{
+  "mcpServers": {
+    "calm": {
+      "command": "npx",
+      "args": ["-y", "@eilodon/calm-mcp", "serve"]
+    }
+  }
+}
+```
+
+Nếu bạn đang dev trên chính repo CALM (không phải project khác), trỏ thẳng
+vào `scripts/mcp-launcher.sh` thay vì npx — thay `/absolute/path/to/CALM`
+bằng đường dẫn thật nơi bạn clone repo này (khác với 3 config check-in ở
+trên, path ở đây **phải là tuyệt đối** vì không có khái niệm "project root"
+cho một file config toàn cục):
 
 ```json
 {
@@ -140,6 +180,14 @@ cục):
 }
 ```
 
+Devin Desktop cũng có "MCP Marketplace" riêng ngay trong panel Cascade
+(icon MCPs ở góc trên, hoặc Settings → Cascade → MCP Servers), hỗ trợ cài
+1-click qua deeplink dạng
+`windsurf://windsurf-mcp-registry?serverName=<tên-server>` — **CALM chưa
+được liệt kê ở đó tại thời điểm viết tài liệu này**, nên deeplink kiểu đó
+chưa dùng được cho CALM; dùng 1 trong 2 cách dán tay ở trên trong lúc chờ
+nộp vào marketplace đó.
+
 ## JetBrains AI Assistant
 
 Cấu hình qua UI settings riêng của JetBrains (không phải file check-in vào
@@ -148,9 +196,34 @@ tới `scripts/mcp-launcher.sh`).
 
 ## Codex CLI (OpenAI)
 
-Giống Windsurf/JetBrains — config toàn cục theo user (`~/.codex/config.toml`),
-không có project-level, dùng cú pháp TOML thay vì JSON. Mỗi server là một
-bảng `[mcp_servers.<tên>]`:
+**Cách nhanh nhất — 1 lệnh, không cần sửa file tay:**
+
+```bash
+codex mcp add calm -- npx -y @eilodon/calm-mcp serve
+```
+
+Lệnh này tự ghi vào config global (`~/.codex/config.toml`). Xem lại bằng
+`codex mcp list` hoặc `/mcp` trong Codex TUI.
+
+**CORRECTION (2026-07-12):** bản trước của mục này nói Codex "giống
+Windsurf/JetBrains — không có project-level, chỉ có config toàn cục" — sai,
+đã kiểm chứng lại với tài liệu OpenAI hiện tại. Codex **có hỗ trợ
+project-scoped config** qua `.codex/config.toml` ngay trong repo, chỉ cần
+project đó được đánh dấu "trusted" (cơ chế trust cụ thể chưa được tài liệu
+OpenAI mô tả chi tiết). Một số key nhạy cảm (`model_provider`,
+`model_providers`, `openai_base_url`, `notify`) bị khoá, không override được
+ở project-level — nhưng `mcp_servers.*` không nằm trong danh sách bị khoá,
+nên vẫn khai báo được CALM ở đây thay vì chỉ global:
+
+```toml
+# .codex/config.toml (check in cùng repo, cần project được Codex "trust")
+[mcp_servers.calm]
+command = "npx"
+args = ["-y", "@eilodon/calm-mcp", "serve"]
+```
+
+Hoặc nếu đang dev trên chính repo CALM, trỏ vào `scripts/mcp-launcher.sh`
+(path tuyệt đối, cùng lý do như Windsurf) thay vì npx:
 
 ```toml
 [mcp_servers.calm]
@@ -158,9 +231,14 @@ command = "bash"
 args = ["/absolute/path/to/CALM/scripts/mcp-launcher.sh"]
 ```
 
-Path tới `mcp-launcher.sh` **phải tuyệt đối**, cùng lý do như Windsurf. Xem
-lại bằng `codex mcp list` hoặc `/mcp` trong Codex TUI. Xem chi tiết:
-[developers.openai.com/codex/mcp](https://developers.openai.com/codex/mcp).
+Xem chi tiết: [developers.openai.com/codex/mcp](https://developers.openai.com/codex/mcp).
+
+**Codex Cloud (bản hosted/async, khác ChatGPT web):** chưa xác nhận được có
+setup-script/environment-config tương đương cho việc pre-build binary hay
+không — tài liệu công khai của OpenAI không đủ chi tiết ở phần này (khác
+với ChatGPT web, xác nhận là *không* đọc config Codex local, dùng cơ chế
+plugin riêng). Nếu cần hỗ trợ Codex Cloud thật sự, phải thử nghiệm trực
+tiếp thay vì suy đoán từ tài liệu.
 
 ## Antigravity (Google)
 
