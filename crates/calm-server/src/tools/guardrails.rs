@@ -173,9 +173,8 @@ impl CalmServer {
                 }
             };
 
-            let co_changed_files: Vec<CoChangedFileOutput> =
-                calm_core::analysis::cochange::compute_co_changes(
-                    &self.project_root,
+            let co_changed_files: Vec<CoChangedFileOutput> = self
+                .co_changes_cached(
                     &c.path,
                     &config.cochange.since,
                     config.cochange.min_co_changes,

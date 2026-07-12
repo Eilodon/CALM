@@ -245,6 +245,22 @@ pub struct CalmServer {
     /// `CalmServer`s at different tempdirs). Shared across `for_connection`
     /// clones like `phase`/`coverage`/etc. See `CalmServer::config`.
     config_cache: Arc<RwLock<Option<(Option<std::time::SystemTime>, calm_core::config::Config)>>>,
+    /// Single-slot TTL cache for `compute_co_changes` (audit F11b) —
+    /// `edit_context` is the mandatory-before-every-edit tool and used to
+    /// spawn a `git log` subprocess on every single call. Keyed by
+    /// `(target_path, since, min_co_changes, top_n)`: a single slot, not a
+    /// map, because the realistic access pattern is "the same file touched
+    /// repeatedly across one edit_context/edit_lines cycle", not many
+    /// distinct files in quick succession. See `CalmServer::co_changes_cached`.
+    co_change_cache: Arc<
+        RwLock<
+            Option<(
+                (String, String, usize, usize),
+                std::time::Instant,
+                calm_core::analysis::cochange::CoChangeResult,
+            )>,
+        >,
+    >,
     session_log: Arc<Mutex<SessionLog>>,
     /// This connection's own key into `active_sessions` below — `0` for a
     /// bare (non-daemon) `calm serve`/test-constructed instance, where
@@ -275,8 +291,7 @@ pub struct CalmServer {
     /// source of truth for both `list_tools` and `call_tool`'s preset
     /// scoping — no separate availability check needed at dispatch time.
     tool_router: rmcp::handler::server::router::tool::ToolRouter<CalmServer>,
-}
-impl CalmServer {
+}impl CalmServer {
     /// Merges every module's `#[tool_router]`-generated router into one —
     /// the unfiltered source of truth for "every tool this server
     /// implements", before preset scoping (see `tool_router_for_preset`).
@@ -4722,6 +4737,54 @@ mod tests {
 
         let second = server.config();
         assert_eq!(second.preset, "trace");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn co_changes_cached_serves_stale_result_within_ttl_after_git_removed() {
+        // audit F11b: proves a cache hit actually skips recomputation,
+        // using a real observable side effect instead of mocking Instant --
+        // remove .git after the first call so a FRESH compute_co_changes
+        // would report git_available: false, then confirm the second call
+        // (same key, well within the 60s TTL) still returns the original
+        // git_available: true result instead of the post-removal truth.
+        let (dir, server) = test_server("co_change_cache_ttl");
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t.test"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(dir.join("a.py"), "a").unwrap();
+        std::fs::write(dir.join("b.py"), "b").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "first"]);
+        std::fs::write(dir.join("a.py"), "a2").unwrap();
+        std::fs::write(dir.join("b.py"), "b2").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "second"]);
+
+        let first = server.co_changes_cached("a.py", "1 year", 1, 10);
+        assert!(first.git_available, "expected a real git repo: {first:?}");
+        assert!(
+            first.entries.iter().any(|e| e.path == "b.py"),
+            "a.py and b.py changed together twice: {first:?}"
+        );
+
+        std::fs::remove_dir_all(dir.join(".git")).unwrap();
+
+        let second = server.co_changes_cached("a.py", "1 year", 1, 10);
+        assert!(
+            second.git_available,
+            "expected the cached (stale) result, not a fresh recompute against the now-missing .git: {second:?}"
+        );
+        assert_eq!(second.entries.len(), first.entries.len());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

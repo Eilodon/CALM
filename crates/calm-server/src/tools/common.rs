@@ -79,6 +79,7 @@ impl CalmServer {
             owns_indexer_lock: Arc::new(RwLock::new(false)),
             coverage: Arc::new(RwLock::new(coverage)),
             config_cache: Arc::new(RwLock::new(None)),
+            co_change_cache: Arc::new(RwLock::new(None)),
             session_log: Arc::new(Mutex::new(SessionLog::default())),
             // `0` is never a real `for_connection`-allocated id (that
             // counter starts at 1 — see `next_session_id` below), so this
@@ -91,8 +92,7 @@ impl CalmServer {
             preset,
             tool_router,
         })
-    }
-    /// Builds a fresh per-connection `CalmServer` from a daemon-shared
+    }    /// Builds a fresh per-connection `CalmServer` from a daemon-shared
     /// instance — every field is cloned (cheap: everything but
     /// `session_log`/`session_id`/`preset`/`project_root`/`db_path`/
     /// `tool_router` is already `Arc<RwLock/Mutex<_>>`) except two
@@ -183,6 +183,46 @@ impl CalmServer {
         let cfg = calm_core::config::load_config(&self.project_root).unwrap_or_default();
         *self.config_cache.write_ok() = Some((current_mtime, cfg.clone()));
         cfg
+    }
+
+    /// Cached `compute_co_changes` (audit F11b): `edit_context` is the
+    /// mandatory-before-every-edit tool, and used to spawn a `git log`
+    /// subprocess on every single call regardless of whether the same file
+    /// was just inspected a moment ago. A cache hit (same target_path/since/
+    /// min_co_changes/top_n, within `CO_CHANGE_CACHE_TTL`) returns the
+    /// cached `CoChangeResult` clone without touching git at all. Git
+    /// history only changes on a new commit, so a short TTL is plenty fresh
+    /// for this tool's advisory purpose (co-changed files are a coupling
+    /// hint, not ground truth the caller acts on blindly).
+    pub(crate) fn co_changes_cached(
+        &self,
+        target_path: &str,
+        since: &str,
+        min_co_changes: usize,
+        top_n: usize,
+    ) -> calm_core::analysis::cochange::CoChangeResult {
+        const CO_CHANGE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+        let key = (
+            target_path.to_string(),
+            since.to_string(),
+            min_co_changes,
+            top_n,
+        );
+        if let Some((cached_key, at, result)) = self.co_change_cache.read_ok().as_ref()
+            && *cached_key == key
+            && at.elapsed() < CO_CHANGE_CACHE_TTL
+        {
+            return result.clone();
+        }
+        let result = calm_core::analysis::cochange::compute_co_changes(
+            &self.project_root,
+            target_path,
+            since,
+            min_co_changes,
+            top_n,
+        );
+        *self.co_change_cache.write_ok() = Some((key, std::time::Instant::now(), result.clone()));
+        result
     }
 
     /// Test-only write connection for seeding fixture data.
