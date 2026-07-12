@@ -206,13 +206,13 @@ let cites_real_signal = if known_caller_qns.is_empty() {
 
 ## Checklist kết thúc Plan 1
 
-- [ ] 7 commit (6 item + 1 hygiene batch) đều qua `diff_impact` gate, push lên branch làm việc
-- [ ] `cargo test --workspace` xanh; `cargo clippy --all-targets -- -D warnings` sạch
-- [ ] `fitness_report()` passed (H3 là điều kiện)
-- [ ] Rebuild release (`cargo build --release -p calm-cli --features embeddings,tier0-5,scip-overlay`) + restart daemon; dogfood: chạy lại kịch bản F2 (delete file → diff_impact) và F14 (edit hub với reason xấu) trên chính repo CALM
-  - **Recipe xác nhận thật trong session này (không phải suy đoán — đã tự gặp daemon stale thật và tự heal thành công bằng recipe này):** đừng chỉ `pkill calm` — MCP client cần một binary MỚI HƠN mọi source file mới re-exec vào connect mode (`mcp-launcher.sh`'s `is_binary_fresh`, mtime-based, xem `scripts/mcp-launcher.sh:165-181`). Cách chắc chắn nhất để force self-heal daemon đang chạy: `./target/release/calm connect --project-root <repo_root> </dev/null` — daemon tự so `daemon.meta`'s `build_info` (git SHA(+`-dirty`) tại compile time) với binary vửa exec, tự SIGTERM bản cũ + respawn nếu khác (log dòng `"is a stale build — signaling it to shut down and respawning"` nếu hoạt động đúng). Side effect: mọi session khác đang attach cùng daemon sẽ thấy `Connection closed` thoáng qua rồi tự reconnect ở tool-call kế tiếp — báo trước nếu ai đang có phiên khác mở trên repo này.
-  - **Verify sau restart:** `cat .calm/daemon.meta` phải cho `pid` mới; và (tương đương) `find crates Cargo.toml Cargo.lock -newer target/release/calm` phải rỗng trước khi tin dogfood test là chạy trên code mới.
-- [ ] Cập nhật `docs/pattern-debt-registry.yaml` nếu pattern `unwrap-in-handler` được đăng ký ở Plan 2 (xem Plan 2 §2.1)
+- [x] 7 commit (6 item + 1 hygiene batch) đều qua `diff_impact` gate, push lên branch làm việc — `2eef364` `657edc5` `181ca55` `e2ac36b` `2695331` `ba8ac29` `738f4ad`
+- [x] `cargo test --workspace` xanh (178 lib tests + 3 watcher integration; `daemon_integration.rs` có 3 test flaky KHÔNG liên quan đến Plan 1 — xác nhận fail giống hệt trên HEAD sạch qua `git stash`, socket contention với các daemon process cũ còn sót trong môi trường này); `cargo clippy --workspace --all-targets -- -D warnings` sạch
+- [x] `fitness_report()` passed — xác nhận `"passed":true`, `config_drift_count: 0` trên daemon mới rebuild
+- [x] Rebuild release + restart daemon (build_info `738f4ad4d24c` khớp HEAD, không `-dirty`); dogfood trực tiếp trên daemon mới: **F2** — `diff_impact` với diff xoá file không tồn tại → `reason:"deleted"`, `aggregate_risk:"low"` (không `unknown`); **F14** — `edit_symbol(resolve_symbol, reason="outsourced this properly, resourceful fix")` → `REASON_NOT_GROUNDED` (reason chứa "source" như substring giữa "outsourced"/"resourceful" — bug cũ sẽ PASS sai, fix mới DENY đúng)
+  - **Recipe xác nhận thật trong session này (không phải suy đoán — đã tự gặp daemon stale thật và tự heal thành công bằng recipe này):** đừng chỉ `pkill calm` — MCP client cần một binary MỚI HƠN mọi source file mới re-exec vào connect mode (`mcp-launcher.sh`'s `is_binary_fresh`, mtime-based, xem `scripts/mcp-launcher.sh:165-181`). Cách chắc chắn nhất để force self-heal daemon đang chạy: `./target/release/calm connect --project-root <repo_root> </dev/null` — daemon tự so `daemon.meta`'s `build_info` (git SHA(+`-dirty`) tại compile time) với binary vửa exec, tự SIGTERM bản cũ + respawn nếu khác (log dòng `"is a stale build — signaling it to shut down and respawning"` nếu hoạt động đúng). Side effect: mọi session khác đang attach cùng daemon sẽ thấy `Connection closed` thoáng qua rồi tự reconnect ở tool-call kế tiếp — xác nhận THẬT ở chính session này khi gọi `fitness_report()` ngay sau self-heal.
+  - **Verify sau restart:** `cat .calm/daemon.meta` → `pid` mới (3126895) + `build_info` khớp HEAD; `find crates Cargo.toml Cargo.lock -newer target/release/calm` → rỗng. Cả hai đã xác nhận trước khi dogfood.
+- [ ] Cập nhật `docs/pattern-debt-registry.yaml` nếu pattern `unwrap-in-handler` được đăng ký ở Plan 2 (xem Plan 2 §2.1) — **N/A cho đến khi Plan 2 chạy**, không phải bỏ sót
 
 ---
 
