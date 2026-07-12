@@ -916,6 +916,7 @@ fn rebuild_graph(
     resolve_import_targets(tx, crate_map, psr4, namespace_map)?;
     crate::graph::coreness::compute_coreness(tx)?;
     crate::graph::hub::update_is_hub_flags(tx, hub_config)?;
+    crate::graph::boundary::update_boundary_ambiguous_flags(tx)?;
     Ok(())
 }
 /// Recompute every symbol's `caller_count` from `call_edges`, using the same

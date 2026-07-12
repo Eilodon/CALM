@@ -122,3 +122,28 @@ fn constructor_binding_infers_receiver_type() {
         "expected >= inferred, got {conf}"
     );
 }
+
+#[test]
+fn reindex_flags_symbols_sharing_a_physical_line() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("f.rs"),
+        "pub fn a() {\n    1\n}    pub fn b() {\n    2\n}\n",
+    )
+    .unwrap();
+    let mut conn = Connection::open_in_memory().unwrap();
+    calm_core::db::schema::init_db(&conn).unwrap();
+    let phase = std::sync::Arc::new(std::sync::RwLock::new(
+        calm_core::types::IndexingPhase::Scanning,
+    ));
+    calm_core::indexer::pipeline::run_indexing_pipeline(&mut conn, dir.path(), phase).unwrap();
+
+    let flagged: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM symbols WHERE path = 'f.rs' AND boundary_ambiguous = 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(flagged, 2, "both a and b share line 3 and must be flagged");
+}
