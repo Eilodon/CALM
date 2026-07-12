@@ -289,6 +289,17 @@ if [ "$tool_name" = "mcp__calm__edit_context" ]; then
   exit 0
 fi
 if [ "$tool_name" = "mcp__calm__diff_impact" ]; then
+  # audit F6 (2026-07-12): the CALM-server-side gate (session_context's
+  # pending_diff_impact) now only clears on a genuinely successful
+  # diff_impact call — a failed one (bad input, git failure, DB error) no
+  # longer falsely satisfies it. This hook-side gate CANNOT match that:
+  # PreToolUse fires before the tool result is known, so there is no way
+  # to tell success from failure here. Left as-is deliberately (defense
+  # in depth, hook looser than server) rather than adding a PostToolUse
+  # hook — see the AUDIT NOTE on Item 1.3 in
+  # docs/plans/2026-07-12-upgrade-plan-1-correctness-safety.md for the
+  # real residual gap this leaves (a failing diff_impact call still
+  # satisfies this hook's gate) and why it's accepted for Plan 1's scope.
   decision_detail="state:needs_diff_impact=false"
   save_state "$edit_context_called" false "$nudge_counts"
   exit 0

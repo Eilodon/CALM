@@ -5200,6 +5200,60 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+    /// audit F6: a *failed* diff_impact call (invalid input here) must not
+    /// clear the pending_diff_impact gate — "the call was attempted" proves
+    /// nothing about whether a blast-radius check actually happened.
+    #[test]
+    fn diff_impact_error_does_not_clear_pending_gate() {
+        let (dir, server) = test_server("diff_impact_error_gate");
+        server.mark_written("a.rs");
+        assert_eq!(server.written_files_snapshot(), vec!["a.rs".to_string()]);
+
+        let output = server.diff_impact(rmcp::handler::server::wrapper::Parameters(
+            DiffImpactParams {
+                diff: Some("diff --git a/x b/x\n".into()),
+                staged: Some(true),
+                commits: None,
+            },
+        ));
+        let v = jv(output);
+        assert_eq!(v["error"]["code"], "INVALID_INPUT", "{v}");
+
+        assert_eq!(
+            server.written_files_snapshot(),
+            vec!["a.rs".to_string()],
+            "a failed diff_impact call must leave the pending gate set"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Counterpart to the above: a *successful* diff_impact call still
+    /// clears the gate, same as before audit F6.
+    #[test]
+    fn diff_impact_success_clears_pending_gate() {
+        let (dir, server) = test_server("diff_impact_success_gate");
+        server.mark_written("a.rs");
+        assert_eq!(server.written_files_snapshot(), vec!["a.rs".to_string()]);
+
+        let output = server.diff_impact(rmcp::handler::server::wrapper::Parameters(
+            DiffImpactParams {
+                diff: Some("diff --git a/unrelated.rs b/unrelated.rs\n".into()),
+                staged: None,
+                commits: None,
+            },
+        ));
+        let v = jv(output);
+        assert!(v.get("error").is_none(), "{v}");
+
+        assert!(
+            server.written_files_snapshot().is_empty(),
+            "a successful diff_impact call must clear the pending gate"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
 
     #[test]
     fn edit_lines_rejects_syntax_error_before_writing() {

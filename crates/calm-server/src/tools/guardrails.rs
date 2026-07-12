@@ -291,8 +291,6 @@ impl CalmServer {
         Parameters(p): Parameters<DiffImpactParams>,
     ) -> Json<ToolOutcome<DiffImpactOutput>> {
         Json(self.timed_tool("diff_impact", || {
-            self.clear_written_files();
-
             let input_count =
                 p.diff.is_some() as u8 + p.staged.is_some() as u8 + p.commits.is_some() as u8;
             if input_count > 1 {
@@ -574,6 +572,12 @@ impl CalmServer {
                 None
             };
 
+            // audit F6: only a genuinely successful analysis clears the
+            // pending_diff_impact gate — an INVALID_INPUT/FEATURE_UNAVAILABLE/
+            // db_error return above must leave it set, since "the call was
+            // attempted" proves nothing about whether the diff was actually
+            // analyzed.
+            self.clear_written_files();
             ToolOutcome::success(DiffImpactOutput {
                 files_changed,
                 affected_symbols,

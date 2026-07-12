@@ -290,12 +290,15 @@ impl CalmServer {
             .unwrap_or_default()
     }
 
-    /// Clears the written-files set — `diff_impact` calls this
-    /// unconditionally on every call (even for a caller-supplied raw
-    /// `diff`/`commits` range unrelated to these specific paths), since
-    /// attempting a blast-radius check at all is the signal that matters
-    /// here, matching the Claude-Code hook's own "reset every time
-    /// diff_impact runs" semantics for its (host-specific) equivalent gate.
+    /// Clears the written-files set — `diff_impact` calls this only from its
+    /// single success point (audit F6, previously called unconditionally at
+    /// entry). A *failed* call (bad input, git failure, DB error) proves
+    /// nothing about whether a blast-radius check actually happened, so it
+    /// must leave the gate set; only a genuine analysis satisfies it. Note
+    /// this is stricter than the Claude-Code hook's own (host-specific,
+    /// PreToolUse-only) equivalent gate, which still resets on every call
+    /// regardless of outcome since it fires before the result is known —
+    /// see the AUDIT NOTE on Item 1.3 in docs/plans/2026-07-12-upgrade-plan-1-correctness-safety.md.
     pub(crate) fn clear_written_files(&self) {
         if let Ok(mut log) = self.session_log.lock() {
             log.written_files.clear();
