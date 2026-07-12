@@ -295,7 +295,7 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
                 &conn,
                 &thresholds,
                 &self.project_root,
-                &self.coverage.read().unwrap(),
+                &self.coverage.read_ok(),
                 &boundary_rules,
                 &config_drift_doc_paths,
             ) {

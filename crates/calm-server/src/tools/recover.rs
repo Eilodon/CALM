@@ -53,8 +53,8 @@ impl CalmServer {
             };
 
             let phase = self.phase_str();
-            let indexing_error = self.last_index_error.read().unwrap().clone();
-            let embeddings_error = self.last_embed_error.read().unwrap().clone();
+            let indexing_error = self.last_index_error.read_ok().clone();
+            let embeddings_error = self.last_embed_error.read_ok().clone();
             let sn = if phase == "failed" {
                 suggested(
                     "indexing_status",
@@ -203,7 +203,7 @@ impl CalmServer {
         Json(self.timed_tool("session_context", || {
             // Release the lock before DB queries — avoid deadlock if db() is also contended.
             let (tool_calls, explored_symbols, explored_files, last_progress_at, session_started_at) = {
-                let log = self.session_log.lock().unwrap();
+                let log = self.session_log.lock_ok();
                 (
                     log.tool_calls,
                     log.explored_symbols.keys().cloned().collect::<Vec<_>>(),

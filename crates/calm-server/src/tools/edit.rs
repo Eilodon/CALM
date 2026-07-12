@@ -123,7 +123,7 @@ impl CalmServer {
         // validation, and the second writer's full-file replace would
         // silently discard the first writer's change even on disjoint line
         // ranges.
-        let _guard = self.edit_lock.lock().unwrap();
+        let _guard = self.edit_lock.lock_ok();
 
         // Cross-process guard: a *different* `calm serve` process (another
         // IDE session on the same project) has its own independent

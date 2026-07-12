@@ -37,7 +37,7 @@ impl CalmServer {
                     let mut out = c.to_symbol_info();
                     let edges_ready = self.edges_ready();
                     out.coreness = if edges_ready { c.coreness } else { None };
-                    let health = build_health(&conn, &self.coverage.read().unwrap(), &self.project_root, &c, edges_ready);
+                    let health = build_health(&conn, &self.coverage.read_ok(), &self.project_root, &c, edges_ready);
                     out.suggested_next = if c.is_hub {
                         suggested_with_args("edit_context", "Hub — check blast radius before modifying", serde_json::json!({"symbol": c.name, "path": c.path}))
                     } else if health.test_files.is_empty() {

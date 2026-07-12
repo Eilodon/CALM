@@ -1,6 +1,41 @@
 use super::inspect::*;
 use super::*;
 
+/// Poison-tolerant lock accessors (audit F4): every `Mutex`/`RwLock` field
+/// these are used on guards state whose only invariant is "contains a
+/// valid `T`" (a counter, an `Option`, a map, or `()`) — no cross-field
+/// invariant that a panic mid-update could leave torn, so recovering the
+/// guard on poison and carrying on is strictly better than letting one
+/// panicking tool call brick every subsequent call that needs the same
+/// lock for the rest of the process's life. If a lock this is used on ever
+/// grows a real cross-field invariant (e.g. "these two fields must stay in
+/// sync"), that lock must stop using these and go back to `.unwrap()` (or
+/// an explicit poison check) instead — poison-tolerance would silently
+/// hide a torn invariant rather than fail loudly.
+pub(crate) trait LockExt<T> {
+    fn lock_ok(&self) -> std::sync::MutexGuard<'_, T>;
+}
+
+impl<T> LockExt<T> for std::sync::Mutex<T> {
+    fn lock_ok(&self) -> std::sync::MutexGuard<'_, T> {
+        self.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+pub(crate) trait RwLockExt<T> {
+    fn read_ok(&self) -> std::sync::RwLockReadGuard<'_, T>;
+    fn write_ok(&self) -> std::sync::RwLockWriteGuard<'_, T>;
+}
+
+impl<T> RwLockExt<T> for std::sync::RwLock<T> {
+    fn read_ok(&self) -> std::sync::RwLockReadGuard<'_, T> {
+        self.read().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+    fn write_ok(&self) -> std::sync::RwLockWriteGuard<'_, T> {
+        self.write().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
 impl CalmServer {
     pub fn new(project_root: PathBuf, db_path: PathBuf) -> anyhow::Result<Self> {
         Self::new_with_preset(project_root, db_path, "full".into())
@@ -338,7 +373,7 @@ impl CalmServer {
             return false;
         }
         let (explored_files, explored_symbols, tool_calls) = {
-            let log = self.session_log.lock().unwrap();
+            let log = self.session_log.lock_ok();
             (
                 log.explored_files.clone(),
                 log.explored_symbols.clone(),
@@ -395,7 +430,7 @@ impl CalmServer {
 
     /// The loaded embedder, if semantic search is ready.
     pub(crate) fn embedder(&self) -> Option<Arc<Embedder>> {
-        self.embedder.read().unwrap().clone()
+        self.embedder.read_ok().clone()
     }
 
     pub(crate) fn filter_sn(&self, sn: Option<SuggestedNext>) -> Option<SuggestedNext> {
@@ -403,7 +438,7 @@ impl CalmServer {
     }
 
     pub(crate) fn embed_status_str(&self) -> String {
-        self.embed_status.read().unwrap().as_str().to_string()
+        self.embed_status.read_ok().as_str().to_string()
     }
 
     /// Re-runs the embedding bootstrap in the background when it previously
@@ -420,7 +455,7 @@ impl CalmServer {
         // Downloading) so two overlapping `retry_embeddings` requests can't
         // both spawn a bootstrap.
         {
-            let mut status = self.embed_status.write().unwrap();
+            let mut status = self.embed_status.write_ok();
             if *status != EmbedStatus::Failed && *status != EmbedStatus::OfflineUnavailable {
                 return;
             }
@@ -439,7 +474,7 @@ impl CalmServer {
         // query-time embedding instead (see `load_embedder_readonly`);
         // calling the write-capable path here would race the real owner's
         // writes.
-        let owns_lock = *self.owns_indexer_lock.read().unwrap();
+        let owns_lock = *self.owns_indexer_lock.read_ok();
         std::thread::spawn(move || {
             // Catches a panic inside the bootstrap so a bug there (or in a
             // future change to it) can't leave `status` stuck on
@@ -457,8 +492,8 @@ impl CalmServer {
                         ),
                         Err(e) => {
                             tracing::error!("Embeddings retry: failed to open DB: {e}");
-                            *status.write().unwrap() = EmbedStatus::Failed;
-                            *last_embed_error.write().unwrap() =
+                            *status.write_ok() = EmbedStatus::Failed;
+                            *last_embed_error.write_ok() =
                                 Some(format!("Embeddings retry: failed to open DB: {e}"));
                         }
                     }
@@ -468,7 +503,7 @@ impl CalmServer {
             }));
             if outcome.is_err() {
                 tracing::error!("Embeddings retry thread panicked");
-                *status.write().unwrap() = EmbedStatus::Failed;
+                *status.write_ok() = EmbedStatus::Failed;
             }
         });
     }
@@ -481,7 +516,7 @@ impl CalmServer {
         self.owns_indexer_lock.clone()
     }
     pub(crate) fn current_phase(&self) -> IndexingPhase {
-        *self.phase.read().unwrap()
+        *self.phase.read_ok()
     }
 
     /// Canonical `indexing_phase` string for tool responses.

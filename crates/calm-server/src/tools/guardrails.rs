@@ -194,7 +194,7 @@ impl CalmServer {
                     c.is_test,
                     is_private,
                     scope_clear,
-                    &self.coverage.read().unwrap(),
+                    &self.coverage.read_ok(),
                     &c.kind,
                 );
             if confirmed_caller_count == 0

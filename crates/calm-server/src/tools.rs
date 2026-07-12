@@ -5250,6 +5250,48 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn edit_lock_poison_does_not_brick_edits() {
+        // audit F4: edit_lock only ever guards `()` (a pure in-process
+        // serialization token, see edit_lines_impl's doc comment) -- a
+        // panic on some other thread while it happens to be held used to
+        // poison the Mutex, and lock().unwrap() on a poisoned Mutex panics
+        // forever after, bricking every edit_lines/edit_symbol call for
+        // the rest of the process's life. lock_ok() recovers instead.
+        let (dir, server) = test_server("edit_lock_poison");
+        std::fs::write(dir.join("a.py"), "def helper():\n    return 1\n").unwrap();
+
+        let lock = Arc::clone(&server.edit_lock);
+        let poisoner = std::thread::spawn(move || {
+            let _guard = lock.lock().unwrap();
+            panic!("simulated panic while holding edit_lock");
+        });
+        assert!(poisoner.join().is_err(), "poisoner thread should have panicked");
+        assert!(server.edit_lock.is_poisoned());
+
+        let hash = calm_core::edit::range_checksum("def helper():\n    return 1\n", 2, 2).unwrap();
+        let out = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
+            EditLinesParams {
+                path: "a.py".into(),
+                edits: vec![EditHunkParam {
+                    start_line: 2,
+                    end_line: 2,
+                    expected_hash: Some(hash),
+                    new_text: "    return 2\n".into(),
+                }],
+                confirm: false,
+                reason: None,
+            },
+        ));
+        let v = jv(out);
+        assert_eq!(
+            v["applied"], true,
+            "edit_lines must still succeed after edit_lock is poisoned: {v}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Host-agnostic equivalent of `.claude/hooks/ci-nudge.sh`'s
     /// `needs_diff_impact` gate: a write via `edit_lines` must surface as
     /// `pending_diff_impact`/`files_pending_diff_impact` in `session_context`

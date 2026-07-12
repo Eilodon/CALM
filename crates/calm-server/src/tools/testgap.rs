@@ -79,7 +79,7 @@ impl CalmServer {
                 .map(|rows| rows.filter_map(|r| r.ok()).collect())
                 .unwrap_or_default();
 
-            let coverage = self.coverage.read().unwrap();
+            let coverage = self.coverage.read_ok();
             let mut gaps: Vec<TestGapItem> = Vec::new();
             for c in &candidates {
                 let health =
