@@ -39,10 +39,10 @@ Các bước bên trong (mirror `reindex_changed_cancellable`, bỏ walk):
 2. Per path: `exists()`? không → trong tx: `remove_file_rows`, `summary.deleted += 1`. Có → ext→lang / recognized_unparsed check (không nhận diện → skip); đọc, `hash_content`, so `file_index.hash` — trùng → skip; khác → `extract_file_data` → `remove_file_rows` + `persist_file` + `upsert_file_index` (đúng trình tự 1559-1574).
 3. `!summary.is_noop()` → graph update: Phase A tạm gọi `rebuild_graph` như cũ (vẫn thắng lớn: bỏ được full-walk + full-hash); Phase B thay bằng incremental.
 4. Call site: `tools/edit.rs:423` — `reindex_changed(&mut write_conn, &self.project_root)` → `reindex_paths(&mut write_conn, &self.project_root, &[path.to_string()])`.
-5. Watcher (`crates/calm-server/src/watcher.rs`): **đọc file trước khi sửa** — nếu event batch đã mang path list, đổi sang `reindex_paths(batch)`; overflow/rename-mù (notify báo rescan) → fallback `reindex_changed` full. **[audit-design flag]** Trước khi tuyên bố Phase A "done" toàn diện, verify trực tiếp watcher.rs xem event batch hiện có giữ path list hay không — nếu KHÔNG giữ, phần thắng lớn nhất của Phase A (bỏ full-walk) chỉ áp dụng cho edit-tool path, không áp dụng cho watcher-driven reindex (branch switch, external editor) — ghi rõ kết quả verify vào đây, không giả định.
+5. Watcher (`crates/calm-server/src/watcher.rs`): **[audit-design flag — CONFIRMED, không còn ASSUMED]** đọc trực tiếp `run_watch_loop` (watcher.rs:71-217): vòng debounce chỉ track `coverage_touched: bool` + gọi `event_is_relevant(&res)` để quyết định có reindex hay không — KHÔNG bao giờ thu thập `res.paths` vào một list. Vẫn gọi `reindex_changed_cancellable` (full-walk) không đổi. **Quyết định cho Phase A:** để nguyên watcher như cũ (không phải thiếu sót âm thầm — giữ nguyên **có chủ đích**, ghi backlog “watcher path-tracking” cho phase sau nếu cần); phần thắng của Phase A **CHỈ** áp dụng cho edit-tool path (`edit_lines`/`edit_symbol`), không áp dụng cho watcher-driven reindex (branch switch, external editor) — đúng như nghi ngời.
 
-**Tests:** fixture 3 file; sửa 1 file qua `reindex_paths` → symbols file đó cập nhật, `file_index` 2 file kia giữ nguyên `indexed_at` (chứng minh không re-scan); xoá file → rows biến mất; path không tồn tại + chưa từng index → no-op không lỗi.
-**Done when:** edit trên repo CALM không còn đọc 195 file (thêm counter tạm/log debug xác nhận); test xanh.
+**Tests:** `test_reindex_paths_only_touches_given_paths_not_whole_repo` — fixture 3 file; sửa 1 file qua `reindex_paths` → symbols file đó cập nhật, `file_index` 2 file kia giữ nguyên `last_indexed` (chứng minh không re-scan); xoá file → rows biến mất; path không tồn tại + chưa từng index → no-op không lỗi. **XANH.**
+**Done when:** ĐÃ XONG — call site `tools/edit.rs:441` đổi sang `reindex_paths`; full workspace suite xanh (672 calm-core lib + 183 calm-server); dogfood live trên chính CALM xác nhận correctness (xem bảng đo cuối file).
 **Rollback:** call site đổi 1 dòng — revert dễ.
 
 ### Phase B — Incremental graph update  ⏱ ~2-3 ngày · giá trị lớn nhất
@@ -174,7 +174,7 @@ Key 32B random tại `.calm/memory.key` (0600, tạo lazy); cột mới `content
 **Nghiệm thu cuối (điền số thật):**
 | Metric | Trước | Mục tiêu | Sau |
 |---|---|---|---|
-| `edit_symbol` end-to-end (CALM repo, 1 dòng, non-hub) | _ms | < 200ms | |
+| `edit_lines` end-to-end reindex (CALM repo, .md file, dirty-path Phase A) | ~5.5s (full-walk 199 file, đo từ daemon.log trước Phase A: 5460/5554/5766/5500ms) | < 200ms | Phase A đơn độc (không cache formal): ²5.4s, không cải thiện đáng kể — nguyên nhân thật: `FormalResolver::load_*` (biên dịch stack-graph rules qua tree-sitter) là chi phí thật sự chiếm ưu thế (~5s), KHÔNG phải full-walk 199 file. **[audit-design flag — phát hiện mới ngoài phạm vi audit gốc, xác nhận qua dogfood Phase A]** Đã thêm `cached_formal_resolver()` (`static OnceLock`, process-wide, an toàn vì `resolve_file` chỉ nhận `&self`) thay cho xây mới mỗi lần reindex — đây mới là win thật sự (test suite: calm-core lib 105s→32s, watcher_integration 69s→33s). 
 | Phần reindex+graph trong edit | _ms | < 150ms | |
 | Formal edges sống sót sau 1 edit (đếm `edge_confidence='formal'` trước/sau) | chết 100% | sống 100% trừ changed files | |
 | hub_pct trên CALM | 9.8% | 3-5% | |

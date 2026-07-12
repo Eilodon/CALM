@@ -102,7 +102,7 @@ impl CalmServer {
     /// hunks in-memory (all-or-nothing, see `calm_core::edit::apply_hunks`) →
     /// pre-write syntax validation → risk gate (query-only, against
     /// pre-edit symbol ranges) → atomic write → reindex (same
-    /// `reindex_changed` + `embed_pending*` gate the file watcher uses, so
+    /// `reindex_paths` (dirty-path only, Plan 3 §3.1 Phase A) + `embed_pending*` gate the file watcher uses, so
     /// the DB is never observably staler than a watcher-driven update) →
     /// post-edit symbol lookup for the response. Failures BEFORE the write
     /// are tool errors; failures AFTER it surface as a success with
@@ -438,9 +438,10 @@ impl CalmServer {
         match calm_core::db::conn::open_writer(&self.db_path) {
             Err(e) => index_stale = Some(format!("could not open DB to reindex: {e}")),
             Ok(mut write_conn) => {
-                match calm_core::indexer::pipeline::reindex_changed(
+                match calm_core::indexer::pipeline::reindex_paths(
                     &mut write_conn,
                     &self.project_root,
+                    &[path.to_string()],
                 ) {
                     Ok(summary) if !summary.is_noop() => {
                         if let Some(model) = self.embedder() {

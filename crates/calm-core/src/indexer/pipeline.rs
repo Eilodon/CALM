@@ -1353,11 +1353,7 @@ pub fn run_indexing_pipeline_cancellable(
     // Initialize FormalResolver once per pipeline run; load rules for all supported
     // languages. Non-fatal if a language fails to load — that language falls back to
     // ConservativeResolver only.
-    let mut formal = crate::resolver::formal::FormalResolver::new();
-    let _ = formal.load_python(); // non-fatal: falls back silently on error
-    let _ = formal.load_typescript(); // non-fatal: falls back silently on error
-    let _ = formal.load_javascript(); // non-fatal: falls back silently on error
-    let _ = formal.load_java(); // non-fatal: falls back silently on error
+    let formal = cached_formal_resolver();
 
     let mut files = Vec::new();
     collect_source_files(project_root, &ignore_patterns, &mut files);
@@ -1482,6 +1478,33 @@ pub fn reindex_changed(
 /// branch switch, can take long enough to matter even inside the already
 /// per-event-cancellable watch loop). Bailing mid-loop drops `tx` without
 /// committing — same rollback guarantee as the full-index cancellable path.
+/// Process-wide cache for the stack-graph rule sets `FormalResolver` loads
+/// (`load_python`/`load_typescript`/`load_javascript`/`load_java`) — these
+/// compile `.tsg` rule files via tree-sitter at construction time, which
+/// measured live (this repo's own daemon, release build) is the single
+/// most expensive step in every reindex call: ~5s, dwarfing the O(repo)
+/// file-walk that Plan 3 §3.1 Phase A's `reindex_paths` removes — found
+/// while dogfooding Phase A's own latency win and confirming it barely
+/// moved end-to-end (see the plan doc's acceptance table). The rule sets
+/// never change during a process's lifetime (nothing reconfigures them),
+/// and `FormalResolver::resolve_file` takes `&self` only — read-only after
+/// construction — so one shared instance, built once and reused by every
+/// reindex call for the rest of the process's life, is both safe and the
+/// actual dominant win here, bigger than Phase A's own file-walk removal.
+static FORMAL_RESOLVER: std::sync::OnceLock<crate::resolver::formal::FormalResolver> =
+    std::sync::OnceLock::new();
+
+fn cached_formal_resolver() -> &'static crate::resolver::formal::FormalResolver {
+    FORMAL_RESOLVER.get_or_init(|| {
+        let mut formal = crate::resolver::formal::FormalResolver::new();
+        let _ = formal.load_python();
+        let _ = formal.load_typescript();
+        let _ = formal.load_javascript();
+        let _ = formal.load_java();
+        formal
+    })
+}
+
 pub fn reindex_changed_cancellable(
     conn: &mut Connection,
     project_root: &Path,
@@ -1491,11 +1514,7 @@ pub fn reindex_changed_cancellable(
     let entry_point_patterns = config.entry_points;
     let ignore_patterns = config.ignore;
 
-    let mut formal = crate::resolver::formal::FormalResolver::new();
-    let _ = formal.load_python();
-    let _ = formal.load_typescript();
-    let _ = formal.load_javascript();
-    let _ = formal.load_java();
+    let formal = cached_formal_resolver();
 
     let existing: HashMap<String, String> = {
         let mut stmt = conn.prepare("SELECT path, hash FROM file_index")?;
@@ -1616,6 +1635,115 @@ pub fn reindex_changed_cancellable(
     }
     tx.commit()?;
     Ok(ReindexOutcome::Completed(summary))
+}
+
+/// Reindex exactly the given `rel_paths` — no repo walk, no full-repo hash
+/// pass (unlike `reindex_changed`/`reindex_changed_cancellable`, which
+/// `collect_source_files` + re-read + re-hash *every* file to discover what
+/// changed even when the caller already knows precisely which file it just
+/// wrote). Used by the edit tool (`tools/edit.rs`), which knows the exact
+/// path from its own write. See
+/// `docs/plans/2026-07-12-upgrade-plan-3-architecture.md` §3.1 Phase A —
+/// the watcher path (`watcher.rs::run_watch_loop`) does NOT yet feed this:
+/// its debounce loop only tracks "was any relevant event seen" as a bool,
+/// never the actual touched paths from each `notify::Event`, so it still
+/// calls the full-walk `reindex_changed_cancellable` — left that way
+/// deliberately for this phase (confirmed by reading `run_watch_loop`, not
+/// assumed), tracked as follow-up in the plan doc rather than silently
+/// dropped.
+///
+/// A path no longer present on disk is treated as a deletion. A path whose
+/// content hash is unchanged from `file_index` is skipped entirely — no
+/// parse, no graph touch. Still calls `rebuild_graph` (the existing full
+/// call-graph rebuild) when anything actually changed; Phase B replaces
+/// that with an incremental update — this phase's win is purely skipping
+/// the O(repo size) walk+hash on every edit, independent of Phase B.
+pub fn reindex_paths(
+    conn: &mut Connection,
+    project_root: &Path,
+    rel_paths: &[String],
+) -> rusqlite::Result<ReindexSummary> {
+    use rusqlite::OptionalExtension;
+
+    let config = crate::config::load_config(project_root).unwrap_or_default();
+
+    let formal = cached_formal_resolver();
+
+    let now = now_secs();
+    let tx = conn.transaction()?;
+    let mut summary = ReindexSummary::default();
+
+    for rel in rel_paths {
+        let abs = project_root.join(rel);
+        let existing_hash: Option<String> = tx
+            .query_row(
+                "SELECT hash FROM file_index WHERE path = ?1",
+                [rel.as_str()],
+                |r| r.get(0),
+            )
+            .optional()?;
+
+        if !abs.exists() {
+            if existing_hash.is_some() {
+                remove_file_rows(&tx, rel)?;
+                summary.deleted += 1;
+            }
+            continue;
+        }
+
+        let ext = abs.extension().and_then(|e| e.to_str()).unwrap_or("");
+        let lang = language_for_extension(ext);
+        if lang.is_none() && !is_recognized_unparsed_extension(ext) {
+            // Not a recognized file type — nothing to index. If a stale
+            // row somehow exists for it (e.g. extension handling changed
+            // between versions), leave it for a full reindex to reconcile
+            // rather than guessing here.
+            continue;
+        }
+
+        let Ok(source) = std::fs::read_to_string(&abs) else {
+            // Unreadable (permissions, binary content, or a TOCTOU delete
+            // between the exists() check above and this read) — skip
+            // rather than guess; a subsequent full/watcher reindex will
+            // pick it up once it's readable (or gone) again.
+            continue;
+        };
+        let hash = hash_content(&source);
+        if existing_hash.as_deref() == Some(hash.as_str()) {
+            continue; // content unchanged — skip parse entirely
+        }
+
+        let data = lang.map(|lang| extract_file_data(rel, lang, &source, &config.entry_points, &formal));
+        remove_file_rows(&tx, rel)?;
+        if let Some(data) = &data {
+            persist_file(&tx, rel, &hash, data)?;
+        }
+        upsert_file_index(
+            &tx,
+            rel,
+            lang,
+            &hash,
+            mtime_secs(&abs),
+            data.as_ref().map(|d| d.symbol_count).unwrap_or(0),
+            now,
+        )?;
+        summary.changed += 1;
+    }
+
+    if !summary.is_noop() {
+        let crate_map = crate::indexer::crate_map::CrateMap::build(project_root);
+        let psr4 = crate::indexer::psr4::Psr4Map::build(project_root);
+        let namespace_map = crate::indexer::csharp_namespace::NamespaceMap::build(project_root);
+        rebuild_graph(
+            &tx,
+            &config.hub_threshold,
+            &crate_map,
+            &psr4,
+            &namespace_map,
+        )?;
+    }
+    tx.commit()?;
+    Ok(summary)
 }
 #[cfg(test)]
 mod tests {
@@ -1788,6 +1916,72 @@ mod tests {
             1,
             "Token.sol's file_index row must survive an incremental reindex"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Plan 3 §3.1 Phase A: reindex_paths must touch ONLY the given paths —
+    // no full-repo walk/hash, no re-scan of files not in the given list.
+    #[test]
+    fn test_reindex_paths_only_touches_given_paths_not_whole_repo() {
+        let dir =
+            std::env::temp_dir().join(format!("ci_idx_reindex_paths_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.py"), "def a():\n    pass\n").unwrap();
+        std::fs::write(dir.join("b.py"), "def b():\n    pass\n").unwrap();
+        std::fs::write(dir.join("c.py"), "def c():\n    pass\n").unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM file_index"), 3);
+
+        let last_indexed_of = |conn: &Connection, path: &str| -> f64 {
+            conn.query_row(
+                "SELECT last_indexed FROM file_index WHERE path = ?1",
+                [path],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let (b_before, c_before) = (last_indexed_of(&conn, "b.py"), last_indexed_of(&conn, "c.py"));
+        // A tick so a wrongly-touched row's timestamp would provably differ,
+        // not just coincidentally match down to float precision.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        std::fs::write(
+            dir.join("a.py"),
+            "def a():\n    pass\n\ndef a2():\n    pass\n",
+        )
+        .unwrap();
+        let summary = reindex_paths(&mut conn, &dir, &["a.py".to_string()]).unwrap();
+        assert_eq!(summary.changed, 1);
+        assert_eq!(summary.deleted, 0);
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM symbols WHERE path = 'a.py'"),
+            2,
+            "a.py's new symbol (a2) must be picked up"
+        );
+        assert_eq!(
+            (last_indexed_of(&conn, "b.py"), last_indexed_of(&conn, "c.py")),
+            (b_before, c_before),
+            "b.py/c.py must not be re-scanned — reindex_paths only touches the given paths"
+        );
+
+        // Deletion: a given path no longer on disk drops its rows.
+        std::fs::remove_file(dir.join("b.py")).unwrap();
+        let summary = reindex_paths(&mut conn, &dir, &["b.py".to_string()]).unwrap();
+        assert_eq!(summary.deleted, 1);
+        assert_eq!(summary.changed, 0);
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM file_index WHERE path = 'b.py'"),
+            0
+        );
+
+        // A path that's neither on disk nor ever indexed — no-op, no error.
+        let summary = reindex_paths(&mut conn, &dir, &["never_existed.py".to_string()]).unwrap();
+        assert!(summary.is_noop());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
