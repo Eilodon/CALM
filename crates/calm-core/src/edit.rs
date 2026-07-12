@@ -344,6 +344,14 @@ pub fn atomic_write(path: &Path, content: &str) -> std::io::Result<()> {
         .unwrap_or_default();
     let tmp_path = dir.join(format!(".{file_name}.ci-edit-{}.tmp", std::process::id()));
 
+    // Captured before the write so a set_permissions failure below can never
+    // make this function fail a write that already succeeded content-wise —
+    // audit F5: File::create(tmp) + rename() used to always hand the new
+    // file umask-derived perms, silently dropping the executable bit off
+    // scripts/*.sh (or any other non-default mode) on every edit_lines/
+    // edit_symbol write.
+    let original_perms = std::fs::metadata(path).ok().map(|m| m.permissions());
+
     let write_result = (|| -> std::io::Result<()> {
         let mut f = std::fs::File::create(&tmp_path)?;
         std::io::Write::write_all(&mut f, content.as_bytes())?;
@@ -352,7 +360,15 @@ pub fn atomic_write(path: &Path, content: &str) -> std::io::Result<()> {
     })();
 
     match write_result {
-        Ok(()) => std::fs::rename(&tmp_path, path),
+        Ok(()) => {
+            if let Some(perms) = original_perms {
+                // Best-effort: a permissions mismatch (e.g. read-only fs,
+                // owner mismatch) must not fail a write whose content
+                // already landed correctly.
+                let _ = std::fs::set_permissions(&tmp_path, perms);
+            }
+            std::fs::rename(&tmp_path, path)
+        }
         Err(e) => {
             let _ = std::fs::remove_file(&tmp_path);
             Err(e)
@@ -589,6 +605,29 @@ mod tests {
 
         atomic_write(&path, "new content\n").unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "new content\n");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    #[cfg(unix)]
+    fn test_atomic_write_preserves_original_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("ci_edit_atomic_perms_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("script.sh");
+        std::fs::write(&path, "#!/bin/sh\necho old\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        atomic_write(&path, "#!/bin/sh\necho new\n").unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o755,
+            "atomic_write must preserve the original file's mode, not hand the replacement umask-derived perms"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
