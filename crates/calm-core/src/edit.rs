@@ -731,6 +731,60 @@ mod tests {
         );
     }
 
+    proptest::proptest! {
+        #[test]
+        fn apply_hunks_never_fuses_two_untouched_lines(
+            prefix_lines in proptest::collection::vec("[a-z]{1,8}", 1..5),
+            hunk_new_text in proptest::collection::vec("[a-z]{1,8}", 0..3),
+            suffix_lines in proptest::collection::vec("[a-z]{1,8}", 1..5),
+            drop_trailing_newline in proptest::bool::ANY,
+        ) {
+            // Regression guard for this session's real bug (a mid-file
+            // replace hunk whose new_text lacked a trailing newline silently
+            // fused with the next untouched line -- root cause of the
+            // orient.rs:251/trace.rs:539 landmines). 20+ hand-written unit
+            // tests in this file missed this case; this fuzzes it directly.
+            let original: String = prefix_lines.iter()
+                .chain(std::iter::once(&"REPLACE_ME".to_string()))
+                .chain(suffix_lines.iter())
+                .map(|l| format!("{l}\n"))
+                .collect();
+            let replace_line = prefix_lines.len() + 1;
+
+            let mut new_text: String = hunk_new_text.iter().map(|l| format!("{l}\n")).collect();
+            if new_text.is_empty() {
+                new_text = "x\n".to_string();
+            }
+            if drop_trailing_newline && new_text.ends_with('\n') {
+                new_text.pop();
+            }
+
+            let old_hash = hash_content("REPLACE_ME\n");
+            let outcome = apply_hunks(
+                &original,
+                &[HunkRequest {
+                    start_line: replace_line,
+                    end_line: replace_line,
+                    expected_hash: Some(old_hash),
+                    new_text,
+                }],
+            ).unwrap();
+
+            let new_content = outcome.new_content.unwrap();
+            // The invariant this session's real bug violated: every line that
+            // was NOT part of the hunk must still be its own, intact physical
+            // line in the output -- specifically, the first suffix line must
+            // appear as a whole line, never fused onto the hunk's replacement.
+            if let Some(first_suffix) = suffix_lines.first() {
+                let expected_line = format!("{first_suffix}\n");
+                proptest::prop_assert!(
+                    new_content.split_inclusive('\n').any(|l| l == expected_line),
+                    "suffix line {first_suffix:?} was not preserved intact in {new_content:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_validate_syntax_detects_error_node() {
         assert_eq!(validate_syntax("def f():\n    pass\n", "py"), Some(true));
