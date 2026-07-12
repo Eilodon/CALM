@@ -60,6 +60,7 @@ tokio = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+proptest = "1"
 
 [features]
 # Semantic embeddings: pure-Rust static code embeddings (model2vec-rs).
