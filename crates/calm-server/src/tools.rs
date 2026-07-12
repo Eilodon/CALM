@@ -6378,6 +6378,48 @@ mod tests {
     }
 
     #[test]
+    fn edit_symbol_position_after_omits_ambiguity_note_even_with_duplicate_content() {
+        // Many identical `}` lines so the raw-hash ambiguity check WOULD fire
+        // for a line-range edit -- position="after" must not surface it since
+        // it re-anchors via a fresh live parse, not hash matching.
+        let (dir, server) = test_server("edit_symbol_after_no_ambiguity_note");
+        std::fs::write(
+            dir.join("f.rs"),
+            "pub fn a() {\n}\npub fn b() {\n}\npub fn c() {\n}\n",
+        )
+        .unwrap();
+
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point, boundary_ambiguous)
+                 VALUES ('f.rs::a', 'a', 'function', 'rust', 'f.rs', 1, 2, '', '', 'a', 0, 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let out = server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
+            EditSymbolParams {
+                symbol: "a".into(),
+                path: Some("f.rs".into()),
+                line: None,
+                expected_hash: None,
+                new_text: "pub fn a2() {\n}\n".into(),
+                position: Some("after".into()),
+                confirm: false,
+                reason: None,
+                old_text: None,
+            },
+        ));
+        let v = jv(out);
+        assert_eq!(v["applied"], true, "response: {v}");
+        assert!(v.get("note").is_none() || v["note"].is_null());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn edit_lines_reports_other_matches_on_generic_content() {
         let (dir, server) = test_server("edit_other_matches");
         std::fs::write(dir.join("a.rs"), "fn a() {\n}\nfn b() {\n}\n").unwrap();

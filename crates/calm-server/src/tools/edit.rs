@@ -40,7 +40,7 @@ impl CalmServer {
                     new_text: h.new_text,
                 })
                 .collect();
-            self.edit_lines_impl(&p.path, hunks, p.confirm, p.reason.as_deref())
+            self.edit_lines_impl(&p.path, hunks, p.confirm, p.reason.as_deref(), false)
         }))
     }
 
@@ -89,6 +89,13 @@ impl CalmServer {
                     true,
                 ));
             }
+            // Insertion modes re-anchor via a fresh live parse (see
+            // insertion_hunk_for), not raw hash matching, so the generic
+            // "content also appears elsewhere" ambiguity warning
+            // edit_lines_impl attaches for line-range hunks doesn't apply
+            // to them — see edit_lines_impl's position_anchored parameter.
+            let position_anchored =
+                matches!(p.position.as_deref(), Some("before" | "after" | "append_inside"));
             let hunk = match p.position.as_deref().unwrap_or("replace") {
                 "replace" => match &p.old_text {
                     None => calm_core::edit::HunkRequest {
@@ -174,8 +181,14 @@ impl CalmServer {
                     ));
                 }
             };
-            self.edit_lines_impl(&c.path, vec![hunk], p.confirm, p.reason.as_deref())
-                .into_resolved()
+            self.edit_lines_impl(
+                &c.path,
+                vec![hunk],
+                p.confirm,
+                p.reason.as_deref(),
+                position_anchored,
+            )
+            .into_resolved()
         }))
     }
 
@@ -195,6 +208,7 @@ impl CalmServer {
         hunks: Vec<calm_core::edit::HunkRequest>,
         confirm: bool,
         reason: Option<&str>,
+        position_anchored: bool,
     ) -> ToolOutcome<EditLinesOutput> {
         // In-process guard: serializes the whole read -> hash-check -> write
         // -> reindex sequence within this one `calm serve` process. rmcp
@@ -269,7 +283,9 @@ impl CalmServer {
         // line has dozens of twins), a stale line number can still hash-match
         // and the edit lands at the wrong spot. Surface that on every
         // response that reports such a hunk — preview AND applied.
-        let ambiguity_note = {
+        let ambiguity_note = if position_anchored {
+            None
+        } else {
             let flagged: Vec<String> = outcome
                 .results
                 .iter()
