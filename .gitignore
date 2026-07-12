@@ -17,6 +17,11 @@ crates/calm-core/tests/fixtures/multi_lang_workspace/kotlin/index.scip
 *.db-wal
 *.db-shm
 
+# Antigravity hook runtime state/logs (calm-guard port, see .agents/hooks/)
+# — mirrors .calm/.hook-state above, one per Antigravity session.
+.agents/hooks/.state/
+.agents/hooks/probe.log
+
 # scip-typescript's --infer-tsconfig side effect when the P3.2 ignored test
 # runs against the (deliberately tsconfig-less) js/ fixture directly.
 crates/calm-core/tests/fixtures/multi_lang_workspace/js/tsconfig.json

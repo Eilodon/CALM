@@ -1,8 +1,9 @@
 {
   "servers": {
     "calm": {
-      "command": "/home/ybao/B.1/CALM/scripts/calm-mcp-wrapper.sh",
-      "args": []
+      "command": "bash",
+      "args": ["scripts/calm-mcp-wrapper.sh"],
+      "cwd": "${workspaceFolder}"
     }
   }
 }
