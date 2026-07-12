@@ -34,11 +34,9 @@ impl CalmServer {
                 p.text
             };
 
+            let scan = calm_core::sanitize::detect_injection_patterns_ext(&scanned);
             let injection_hits: Vec<String> =
-                calm_core::sanitize::detect_injection_patterns(&scanned)
-                    .into_iter()
-                    .map(str::to_string)
-                    .collect();
+                scan.hits.into_iter().map(str::to_string).collect();
             let content_warning = calm_core::sanitize::injection_warning(&scanned);
             let contains_credential_shaped_text =
                 calm_core::sanitize::contains_credentials(&scanned);
@@ -52,12 +50,12 @@ impl CalmServer {
                 injection_hits,
                 content_warning,
                 contains_credential_shaped_text,
+                decode_scan_exhausted: scan.decode_scan_exhausted,
                 spotlighted_text,
                 suggested_next: self.filter_sn(None),
             })
         }))
-    }
-}
+    }}
 
 #[derive(Deserialize, JsonSchema)]
 pub(crate) struct ScanTextParams {
@@ -98,6 +96,13 @@ pub(crate) struct ScanTextOutput {
     /// `calm_core::sanitize::contains_credentials` — worth knowing before
     /// echoing fetched text back into a transcript, log, or commit message.
     pub(crate) contains_credential_shaped_text: bool,
+    /// `true` = some decode-candidate in `text` was never scanned because a
+    /// decode budget (audit F8) was hit — a `false`/empty `injection_hits`
+    /// alongside this is NOT a clean verdict; split the text and rescan.
+    /// Omitted (not just `false`) in the common case so existing callers
+    /// see no shape change.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) decode_scan_exhausted: bool,
     /// Present only when `wrap:true` was requested — `text` wrapped in a
     /// self-escaping `<untrusted-external-content>` delimiter (ADR-0006
     /// Tier 3). A labeling convention for your own context management, not
@@ -108,7 +113,6 @@ pub(crate) struct ScanTextOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) suggested_next: Option<SuggestedNext>,
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
