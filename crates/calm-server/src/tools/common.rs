@@ -418,8 +418,13 @@ impl CalmServer {
     /// report it transparently rather than silently.
     ///
     /// Guaranteed no-op (identical results, in identical order) when this
-    /// session hasn't explored anything yet, or `personalization_weight` is
-    /// configured to `0.0` — the common case for a session's first calls.
+    /// session hasn't explored anything yet, `personalization_weight` is
+    /// configured to `0.0` — the common case for a session's first calls —
+    /// or none of the computed boosts' paths appear in this particular
+    /// result set. The actual score math lives in `normalize_then_boost`
+    /// (a pure, `&self`-free function) so it's directly unit-testable
+    /// without a full `CalmServer`/DB fixture — see Plan 3 §3.2 and
+    /// `personalization_tests::normalize_then_boost_never_flips_a_large_gap`.
     pub(crate) fn apply_personalization_boost(
         &self,
         conn: &rusqlite::Connection,
@@ -445,25 +450,7 @@ impl CalmServer {
         }
 
         let boosts = compute_proximity_boosts(conn, &explored_files, &explored_symbols, tool_calls);
-        if boosts.is_empty() {
-            return false;
-        }
-
-        let mut adjusted = false;
-        for r in results.iter_mut() {
-            if let Some(&boost) = boosts.get(&r.path) {
-                r.score += weight * boost;
-                adjusted = true;
-            }
-        }
-        if adjusted {
-            results.sort_by(|a, b| {
-                b.score
-                    .partial_cmp(&a.score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-        }
-        adjusted
+        normalize_then_boost(results, &boosts, weight)
     }
 
     /// A handle the background indexer uses to advance the phase as it works.
@@ -1454,6 +1441,70 @@ fn compute_proximity_boosts(
     boosts
 }
 
+/// The pure score math behind `CalmServer::apply_personalization_boost`
+/// (Plan 3 §3.2), extracted as a free `&self`-free function so it's
+/// directly unit-testable without a `CalmServer`/DB fixture. Every
+/// result's `score` is min-max normalized to `[0,1]` across `results`
+/// FIRST, then `weight * boost` (0 for a result with no entry in `boosts`)
+/// is added — normalizing first matters because raw scores are on wildly
+/// different scales across search kinds (RRF top-1 ≈ 0.05-0.17, grep/file
+/// = 1.0 constant, bm25 1-30+, semantic 0-1); adding a fixed-magnitude
+/// boost directly to the raw score (the pre-Plan-3 behavior) let it swamp
+/// RRF results outright while doing nothing at all on bm25 — the exact
+/// contradiction of `apply_personalization_boost`'s own "never overriding
+/// a strong match" doc promise.
+///
+/// `compute_proximity_boosts` bounds every `boosts` value to `(0.0, 1.0]`,
+/// which makes that promise an actual invariant here: two results whose
+/// normalized scores differ by more than `weight` can never have their
+/// relative order flipped by any boost, since the largest a boost can ever
+/// move a score is `weight * 1.0 = weight` — see
+/// `personalization_tests::normalize_then_boost_never_flips_a_large_gap`.
+///
+/// Returns `false` (and leaves `results` completely untouched — not even
+/// re-normalized) when `boosts` is empty or none of its keys match any
+/// path in `results`, preserving `apply_personalization_boost`'s "no-op
+/// when nothing to boost" guarantee. Otherwise rewrites every result's
+/// `score` (not just the boosted ones — `score`'s scale changes from raw
+/// to normalized, a deliberate, documented trade-off: it was already
+/// opaque to callers/agents, and `personalized: true` is the field that
+/// reports this happened), re-sorts descending by the new score, and
+/// returns `true`.
+fn normalize_then_boost(
+    results: &mut [calm_core::search::SearchResult],
+    boosts: &std::collections::HashMap<String, f64>,
+    weight: f64,
+) -> bool {
+    if boosts.is_empty() || !results.iter().any(|r| boosts.contains_key(&r.path)) {
+        return false;
+    }
+
+    let (min, max) = results
+        .iter()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), r| {
+            (lo.min(r.score), hi.max(r.score))
+        });
+    let range = max - min;
+    let normalize = |s: f64| -> f64 {
+        if range > 0.0 {
+            (s - min) / range
+        } else {
+            0.5
+        }
+    };
+
+    for r in results.iter_mut() {
+        let boost = boosts.get(&r.path).copied().unwrap_or(0.0);
+        r.score = normalize(r.score) + weight * boost;
+    }
+    results.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    true
+}
+
 #[derive(Serialize, JsonSchema)]
 pub(crate) struct SymbolInfoOutput {
     pub(crate) name: String,
@@ -1829,5 +1880,154 @@ mod personalization_tests {
         let boosts = compute_proximity_boosts(&conn, &explored_files, &HashMap::new(), 5);
         // Must take the fresher connection's weight (1.0), not the older one's (1/6).
         assert_eq!(boosts.get("shared.rs"), Some(&1.0));
+    }
+
+
+    // Plan 3 §3.2 — tests for the pure `normalize_then_boost` score math
+    // (not `compute_proximity_boosts`, which the tests above already
+    // cover and this doesn't touch).
+
+    fn sr(path: &str, score: f64) -> calm_core::search::SearchResult {
+        calm_core::search::SearchResult {
+            name: path.to_string(),
+            qualified_name: path.to_string(),
+            path: path.to_string(),
+            kind: None,
+            line_start: None,
+            line_end: None,
+            score,
+            match_type: "symbol".to_string(),
+            snippet: None,
+            is_test: false,
+        }
+    }
+
+    #[test]
+    fn normalize_then_boost_leaves_results_untouched_when_no_path_matches() {
+        let mut results = vec![sr("unrelated.rs", 0.5)];
+        let mut boosts = HashMap::new();
+        boosts.insert("other.rs".to_string(), 1.0);
+        let adjusted = normalize_then_boost(&mut results, &boosts, 0.15);
+        assert!(!adjusted);
+        assert_eq!(
+            results[0].score, 0.5,
+            "score must be left exactly as-is, not even normalized, when nothing matches"
+        );
+    }
+
+    #[test]
+    fn normalize_then_boost_regression_top1_survives_neighbor_boost() {
+        // Reproduces the exact scenario from the original audit (F3): an RRF
+        // result set where the best match (top-1, score ~0.071) sits far
+        // above a "neighbor of an explored file" at rank 8 (score ~0.036) —
+        // before Plan 3's normalize-first fix, raw `score += weight * boost`
+        // (weight 0.15, boost up to 1.0) let the rank-8 neighbor jump
+        // straight to rank 1. Fails on the pre-fix math, passes after.
+        let scores = [0.071, 0.065, 0.058, 0.052, 0.047, 0.042, 0.039, 0.036];
+        let mut results: Vec<_> = scores
+            .iter()
+            .enumerate()
+            .map(|(i, &score)| sr(&format!("p{i}.rs"), score))
+            .collect();
+
+        let mut boosts = HashMap::new();
+        boosts.insert("p7.rs".to_string(), 1.0); // rank-8 (0-indexed 7), max boost
+
+        let adjusted = normalize_then_boost(&mut results, &boosts, 0.15);
+        assert!(adjusted);
+        assert_eq!(
+            results[0].path,
+            "p0.rs",
+            "the strongest original match must stay rank 1 — got order: {:?}",
+            results.iter().map(|r| &r.path).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn normalize_then_boost_never_flips_a_large_gap() {
+        // Property test: 50 random result sets spanning the 4 real score
+        // scales (RRF ~0.03-0.2, bm25 1-30, grep/file constant 1.0,
+        // semantic/cosine 0-1) plus random boosts in (0,1] — for every
+        // pair whose *normalized* scores differ by more than `weight`,
+        // boost must never flip their relative order. True by construction
+        // once boost is bounded to <=1.0 (the max any boost can move a
+        // score is `weight * 1.0`), but tested directly against the real
+        // implementation rather than just argued algebraically.
+        let weight = 0.15;
+        let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut next_u64 = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let next_f64 = |lo: f64, hi: f64, s: &mut dyn FnMut() -> u64| {
+            let r = (s() >> 11) as f64 / (1u64 << 53) as f64; // [0,1)
+            lo + r * (hi - lo)
+        };
+
+        for trial in 0..50 {
+            let n = 6;
+            let results_seed: Vec<(String, f64)> = (0..n)
+                .map(|i| {
+                    let score = match i % 4 {
+                        0 => next_f64(0.03, 0.2, &mut next_u64),
+                        1 => next_f64(1.0, 30.0, &mut next_u64),
+                        2 => 1.0,
+                        _ => next_f64(0.0, 1.0, &mut next_u64),
+                    };
+                    (format!("p{trial}_{i}.rs"), score)
+                })
+                .collect();
+            let mut results: Vec<_> = results_seed
+                .iter()
+                .map(|(p, s)| sr(p, *s))
+                .collect();
+
+            let (min, max) = results.iter().fold(
+                (f64::INFINITY, f64::NEG_INFINITY),
+                |(lo, hi), r| (lo.min(r.score), hi.max(r.score)),
+            );
+            let range = max - min;
+            let norm_of = |s: f64| if range > 0.0 { (s - min) / range } else { 0.5 };
+            let normalized: Vec<f64> = results.iter().map(|r| norm_of(r.score)).collect();
+            let paths: Vec<String> = results.iter().map(|r| r.path.clone()).collect();
+
+            let mut boosts = HashMap::new();
+            for path in &paths {
+                if next_u64() % 2 == 0 {
+                    boosts.insert(path.clone(), next_f64(0.0001, 1.0, &mut next_u64));
+                }
+            }
+            if boosts.is_empty() {
+                continue; // guaranteed no-op — nothing to check
+            }
+
+            assert!(normalize_then_boost(&mut results, &boosts, weight));
+            let rank_of = |path: &str| results.iter().position(|r| r.path == path).unwrap();
+
+            for i in 0..n {
+                for j in (i + 1)..n {
+                    let gap = (normalized[i] - normalized[j]).abs();
+                    if gap <= weight {
+                        continue;
+                    }
+                    let (stronger, weaker) = if normalized[i] > normalized[j] {
+                        (i, j)
+                    } else {
+                        (j, i)
+                    };
+                    assert!(
+                        rank_of(&paths[stronger]) < rank_of(&paths[weaker]),
+                        "trial {trial}: normalized gap {gap:.4} > weight {weight} but boost \
+                         flipped {} (norm {:.4}) behind {} (norm {:.4})",
+                        paths[stronger],
+                        normalized[stronger],
+                        paths[weaker],
+                        normalized[weaker]
+                    );
+                }
+            }
+        }
     }
 }

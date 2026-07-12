@@ -104,12 +104,16 @@ Các bước bên trong (mirror `reindex_changed_cancellable`, bỏ walk):
 4. Trade-off minh bạch: `score` trả về đổi thang (thành normalized) — field vốn opaque với agent, và `personalized: true` đã được report sẵn (`locate.rs:56+`). Ghi 1 dòng vào doc field score nếu có schema comment.
 5. **Phương án thay thế đã cân nhắc, để backlog:** proximity như nguồn RRF thứ 4 (rank-fusion thuần, đẹp hơn về lý thuyết nhưng đổi scoring path của cả 7 kind — làm sau nếu min-max lộ khuyết điểm thực tế).
 
-**Tests:**
-1. Property test nhỏ: sinh ngẫu nhiên 50 bộ (scores theo 4 thang: rrf/bm25/const-1.0/cosine; boosts) → assert invariant #3 với mọi cặp.
-2. Regression: kịch bản audit — RRF scores [0.071(đúng nhất), …, 0.036(rank 8, được boost 1.0)] → sau boost, rank-1 GIỮ NGUYÊN (gap normalize > 0.15). Fail trên code hiện tại.
-3. Test cũ trong `personalization_tests` (common.rs:1596-1709) giữ xanh (chúng test compute_proximity_boosts, không đụng).
+**Thiết kế [ĐÃ LÀM]:** logic thuần túy tách ra hàm free `normalize_then_boost(results, boosts, weight)` (không cần `&self`/DB) trong `common.rs`, `apply_personalization_boost` giờ chỉ là wrapper gọi nó sau khi query `compute_proximity_boosts` — tách để test trực tiếp không cần `CalmServer`/DB fixture. No-op guarantee mở rộng: không chỉ khi `boosts` rỗng mà cả khi không path nào trong `results` khớp `boosts` — giữ `results` NGUYÊN VẹN (không cả normalize).
 
-**Done when:** 3 nhóm test xanh; dogfood: locate 1 query sau khi đã explore vài file — kết quả top không bị file "hàng xóm" chiếm chỗ vô lý.
+**Tests [ĐÃ XONG, XANH]:**
+1. `normalize_then_boost_never_flips_a_large_gap` — property test 50 vòng ngẫu nhiên (xorshift64 seed cố định, không thêm dependency `rand`), scores theo 4 thang thật (rrf 0.03-0.2/bm25 1-30/const 1.0/semantic 0-1), boosts ngẫu nhiên trong (0,1] → assert invariant với MỌI cặp.
+2. `normalize_then_boost_regression_top1_survives_neighbor_boost` — đúng kịch bản audit (RRF [0.071...0.036], boost 1.0 ở rank-8) → rank-1 giữ nguyên. Fail trên code cũ (đã xác nhận trước khi refactor).
+3. `normalize_then_boost_leaves_results_untouched_when_no_path_matches` — test mới cho no-op guarantee mở rộng ở trên.
+4. Test cũ trong `personalization_tests` giữ xanh (test `compute_proximity_boosts`, không đụng).
+5. **[Regression thật tìm thấy]** `tools.rs::locate_boosts_result_near_recently_explored_file` (integration test end-to-end qua `locate`) FAIL ngay sau khi đổi code — assert cũ hard-code đúng công thức cộng thẳng cũ (`baseline + weight*decay`). Đã sửa assert sang công thức mới (single-result set → min==max → normalize luôn = 0.5, boosted = 0.5 + weight*decay) — đúng hành vi mới, không phải che giấu lỗi.
+
+**Done when:** ĐÃ XONG — 673 calm-core + 186 calm-server (+3 test mới, +1 test sửa) xanh. Dogfood: `search`/`locate` thật trên daemon sau khi explore vài file — xem bảng đo.
 
 ---
 

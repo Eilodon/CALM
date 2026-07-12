@@ -4546,7 +4546,6 @@ mod tests {
             bv["personalized"], false,
             "a session that hasn't explored anything must not personalize"
         );
-        let baseline_score = bv["results"][0]["score"].as_f64().unwrap();
 
         server.track_file("a.rs");
 
@@ -4555,13 +4554,22 @@ mod tests {
         assert_eq!(boostv["personalized"], true);
         let boosted_score = boostv["results"][0]["score"].as_f64().unwrap();
 
-        // track_file ran between two `locate` calls (each a tool call, so
-        // tool_calls is now 2); a.rs was touched at tool_calls=1 — distance 1,
-        // decay 1/(1+1)=0.5, default personalization_weight=0.15.
-        let expected_delta = 0.15 * 0.5;
+        // Plan 3 §3.2: personalization now min-max normalizes scores across
+        // the result set BEFORE adding weight*boost (see
+        // `normalize_then_boost` in tools/common.rs) — with only one result
+        // here, min == max, which normalize_then_boost's documented range=0
+        // fallback collapses to exactly 0.5 for every result, regardless of
+        // the pre-personalization raw score. track_file ran between the two
+        // `locate` calls (each a tool call, so tool_calls is now 2); a.rs
+        // was touched at tool_calls=1 — distance 1, decay 1/(1+1)=0.5,
+        // default personalization_weight=0.15.
+        let decay = 0.5;
+        let weight = 0.15;
+        let expected_boosted_score = 0.5 + weight * decay;
         assert!(
-            (boosted_score - baseline_score - expected_delta).abs() < 1e-9,
-            "expected +{expected_delta}, got baseline={baseline_score} boosted={boosted_score}"
+            (boosted_score - expected_boosted_score).abs() < 1e-9,
+            "single-result set: normalize collapses to 0.5, so boosted score should be \
+             0.5 + weight*decay = {expected_boosted_score}, got {boosted_score}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
