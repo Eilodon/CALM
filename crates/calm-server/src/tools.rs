@@ -6122,6 +6122,7 @@ mod tests {
                 position: None,
                 confirm: false,
                 reason: None,
+                old_text: None,
             },
         ));
         let v = jv(out);
@@ -6165,6 +6166,7 @@ mod tests {
                 position: None,
                 confirm: true,
                 reason: None,
+                old_text: None,
             },
         ));
         let v = jv(out);
@@ -6208,6 +6210,7 @@ mod tests {
                 position: Some("append_inside".into()),
                 confirm: false,
                 reason: None,
+                old_text: None,
             },
         ));
         let v = jv(out);
@@ -6246,6 +6249,7 @@ mod tests {
                 position: Some("after".into()),
                 confirm: false,
                 reason: None,
+                old_text: None,
             },
         ));
         let v = jv(out);
@@ -6803,6 +6807,7 @@ mod tests {
                     position: None,
                     confirm: true,
                     reason: Some("this should be safe, low risk, no problem".into()),
+                    old_text: None,
                 },
             )),
         );
@@ -6829,6 +6834,7 @@ mod tests {
                     reason: Some(
                         "checked process_order, still passes the same shape of value".into(),
                     ),
+                    old_text: None,
                 },
             )),
         );
@@ -6890,6 +6896,7 @@ mod tests {
                     position: None,
                     confirm: true,
                     reason: Some("renewed the flow, still correct".into()),
+                    old_text: None,
                 },
             )),
         );
@@ -6910,6 +6917,7 @@ mod tests {
                     position: None,
                     confirm: true,
                     reason: Some("checked CalmServer::new — return shape unchanged".into()),
+                    old_text: None,
                 },
             )),
         );
@@ -6966,6 +6974,7 @@ mod tests {
                     position: None,
                     confirm: true,
                     reason: Some("xrefresh_caller_countsy still fine".into()),
+                    old_text: None,
                 },
             )),
         );
@@ -6987,6 +6996,7 @@ mod tests {
                     position: None,
                     confirm: true,
                     reason: Some("cites refresh_caller_counts directly, unaffected".into()),
+                    old_text: None,
                 },
             )),
         );
@@ -7048,6 +7058,7 @@ mod tests {
                     position: None,
                     confirm: true,
                     reason: Some("checked run(), looks fine".into()),
+                    old_text: None,
                 },
             )),
         );
@@ -7068,6 +7079,7 @@ mod tests {
                     position: None,
                     confirm: true,
                     reason: Some("checked a.py::run, unaffected".into()),
+                    old_text: None,
                 },
             )),
         );

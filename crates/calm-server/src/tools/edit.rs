@@ -1087,6 +1087,17 @@ pub(crate) struct EditSymbolParams {
     /// See `EditLinesParams::reason`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) reason: Option<String>,
+    /// Small-text-match mode: when set, `new_text` replaces the FIRST
+    /// (and required-to-be-only) occurrence of `old_text` found within the
+    /// resolved symbol's current range, instead of replacing the whole
+    /// symbol. No line numbers, no `expected_hash` needed — the server
+    /// reads the symbol's live content to find the match, so staleness is
+    /// impossible by construction. Refused with `BOUNDARY_AMBIGUOUS` if
+    /// the target symbol carries that flag (its own range can't be
+    /// trusted as a search scope — see fitness_report). Ignored when
+    /// `position` is not `"replace"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) old_text: Option<String>,
 }
 
 #[derive(Serialize, JsonSchema)]
