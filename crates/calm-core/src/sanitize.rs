@@ -13,7 +13,16 @@ static CREDENTIAL_PATTERNS: LazyLock<Vec<CredentialPattern>> = LazyLock::new(|| 
             label: "PEM_PRIVATE_KEY",
         },
         CredentialPattern {
-            regex: Regex::new(r"(?i)(?:sk|rk)[-_][a-zA-Z0-9_-]{20,}").unwrap(),
+            // audit (root-caused 2026-07-12): no left-hand boundary meant this
+            // matched "sk"/"rk" ANYWHERE, including mid-identifier — every
+            // snake_case name starting with risk_/task_/desk_/disk_/ask_/mask_
+            // ("sk") or work_/mark_/park_/dark_/fork_/spark_ ("rk") followed by
+            // a long enough tail false-positived as a leaked key. Real key
+            // material (sk-, sk_live_, sk_test_, rk_live_, ...) always starts
+            // a token — never glued directly onto a preceding word character —
+            // so \b closes the false-positive class without needing lookbehind
+            // (which the `regex` crate doesn't support anyway).
+            regex: Regex::new(r"(?i)\b(?:sk|rk)[-_][a-zA-Z0-9_-]{20,}").unwrap(),
             label: "SECRET_KEY",
         },
         CredentialPattern {
@@ -493,6 +502,57 @@ mod tests {
         let code = r#"key = "sk_test_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij""#;
         let sanitized = sanitize_source_output(code);
         assert!(sanitized.contains("[REDACTED:SECRET_KEY]"));
+    }
+
+    /// Root-caused 2026-07-12: this exact bug corrupted CALM's own
+    /// `source()` output for `risk_level_from_caller_count` and
+    /// `escalate_risk_if_signature_changed` in production, live in this
+    /// repo, before the \b fix. Every one of these is a real identifier
+    /// shape from ordinary snake_case code, not a secret.
+    #[test]
+    fn test_secret_key_pattern_does_not_match_english_words_containing_sk_or_rk() {
+        let cases = [
+            "pub(crate) fn risk_level_from_caller_count(caller_count: i64) -> &'static str {",
+            "calm_core::analysis::diff_impact::escalate_risk_if_signature_changed(",
+            "let task_queue_size_and_limit = compute();",
+            "struct desk_organizer_widget_config;",
+            "fn disk_usage_snapshot_builder() {}",
+            "const ask_confirmation_before_delete: bool = true;",
+            "fn mask_sensitive_fields_in_output() {}",
+            "let spark_session_builder_config = init();",
+            "fn work_queue_drain_and_retry_loop() {}",
+            "struct dark_mode_toggle_persistence {}",
+        ];
+        for code in cases {
+            assert_eq!(
+                sanitize_source_output(code),
+                code,
+                "false positive on ordinary identifier: {code}"
+            );
+            assert!(
+                !contains_credentials(code),
+                "contains_credentials false positive on: {code}"
+            );
+        }
+    }
+
+    /// A real key is never glued directly onto a preceding word character —
+    /// the \b fix must still catch it whenever it starts at a real boundary
+    /// (quote, `=`, whitespace, start of string), matching the two positive
+    /// tests above plus a few more boundary shapes.
+    #[test]
+    fn test_secret_key_pattern_still_matches_at_real_token_boundaries() {
+        let cases = [
+            r#"key='sk-notarealkey00000000000000'"#,
+            "key=sk_notarealkey000000000000000",
+            " sk_notarealkey0000000000000000",
+        ];
+        for code in cases {
+            assert!(
+                sanitize_source_output(code).contains("[REDACTED:SECRET_KEY]"),
+                "missed a real key at a real token boundary: {code}"
+            );
+        }
     }
 
     #[test]
