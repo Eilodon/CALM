@@ -58,6 +58,12 @@ pub struct FitnessThresholds {
     /// `max_boundary_violations` — this only fires at all once a project
     /// opts in by declaring `doc_paths`.
     pub max_config_drift_count: i64,
+    /// Max allowed count of symbols flagged `boundary_ambiguous` (a
+    /// symbol's line_start or line_end shares a physical source line with
+    /// an adjacent symbol — see `graph::boundary::update_boundary_ambiguous_flags`).
+    /// Default 0, same reasoning as `max_boundary_violations`: this is a
+    /// landmine, not a tolerable-in-small-doses metric.
+    pub max_boundary_ambiguous_count: i64,
 }
 
 /// Per-symbol cyclomatic complexity above this is "high" for
@@ -84,9 +90,9 @@ impl Default for FitnessThresholds {
             max_high_complexity_pct: 15.0,
             max_boundary_violations: 0,
             max_config_drift_count: 0,
+            max_boundary_ambiguous_count: 0,
         }
-    }
-}
+    }}
 
 #[derive(Debug, Deserialize, Default)]
 struct TomlFile {
@@ -175,6 +181,9 @@ pub struct FitnessMetrics {
     /// `FitnessThresholds::max_high_complexity_pct`'s doc comment) is worth
     /// surfacing directly rather than only documented on the threshold field.
     pub high_complexity_pct_note: Option<String>,
+    /// Count of symbols flagged `boundary_ambiguous` — see
+    /// `graph::boundary::update_boundary_ambiguous_flags`.
+    pub boundary_ambiguous_count: i64,
 }
 /// Row shape needed to re-run `compute_dead_code_confidence` per symbol:
 /// (path, line_start, line_end, caller_count, is_entry_point, is_test, language, name, signature, kind).
@@ -200,6 +209,14 @@ pub fn collect_metrics(
         .query_row("SELECT COUNT(*) FROM symbols WHERE is_hub = 1", [], |r| {
             r.get(0)
         })
+        .unwrap_or(0);
+
+    let boundary_ambiguous_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM symbols WHERE boundary_ambiguous = 1",
+            [],
+            |r| r.get(0),
+        )
         .unwrap_or(0);
 
     let avg_coreness: f64 = conn
@@ -390,6 +407,7 @@ pub fn collect_metrics(
         edge_coverage_pct,
         high_complexity_pct,
         high_complexity_pct_note,
+        boundary_ambiguous_count,
     })
 }
 
@@ -443,6 +461,19 @@ pub fn run_fitness_check(
         message: format!(
             "Hub count {} (max {})",
             metrics.hub_count, thresholds.max_hub_count
+        ),
+    });
+
+    checks.push(FitnessCheckItem {
+        metric: "boundary_ambiguous_count".into(),
+        value: metrics.boundary_ambiguous_count as f64,
+        threshold: thresholds.max_boundary_ambiguous_count as f64,
+        passed: metrics.boundary_ambiguous_count <= thresholds.max_boundary_ambiguous_count,
+        message: format!(
+            "Symbols with an ambiguous line boundary (shared with a neighbor) {} (max {}) — \
+             edit_symbol replace on these is refused; see docs/superskills/specs/2026-07-13-\
+             calm-agent-experience-upgrade.md",
+            metrics.boundary_ambiguous_count, thresholds.max_boundary_ambiguous_count
         ),
     });
 
@@ -773,9 +804,8 @@ mod tests {
         )
         .unwrap();
         assert!(result.passed, "Empty DB should pass all checks");
-        assert_eq!(result.checks.len(), 9);
+        assert_eq!(result.checks.len(), 10);
     }
-
     #[test]
     fn test_hub_count_fail() {
         let conn = test_conn();
@@ -1350,6 +1380,36 @@ mod tests {
             result.boundary_violations[0].reason,
             "core must not depend on server"
         );
+    }
+
+    #[test]
+    fn boundary_ambiguous_count_fail_gates_fitness_check() {
+        let conn = test_conn();
+        conn.execute(
+            "INSERT INTO symbols (qualified_name, name, kind, path, language, line_start, line_end, signature, boundary_ambiguous) \
+             VALUES ('a', 'a', 'function', 'f.rs', 'rust', 1, 10, 'fn a()', 1)",
+            [],
+        )
+        .unwrap();
+
+        let result = run_fitness_check(
+            &conn,
+            &FitnessThresholds::default(),
+            &std::env::temp_dir(),
+            &CoverageData::none(),
+            &[],
+            &[],
+        )
+        .unwrap();
+
+        let check = result
+            .checks
+            .iter()
+            .find(|c| c.metric == "boundary_ambiguous_count")
+            .unwrap();
+        assert_eq!(check.value, 1.0);
+        assert!(!check.passed);
+        assert!(!result.passed);
     }
 
     #[test]
