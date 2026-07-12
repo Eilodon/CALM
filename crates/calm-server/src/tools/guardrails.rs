@@ -331,8 +331,10 @@ impl CalmServer {
             let files_changed: Vec<String> = file_diffs.iter().map(|f| f.path.clone()).collect();
 
             let mut unindexed_files: Vec<UnindexedFileOutput> = Vec::new();
-            let mut affected: Vec<std::collections::HashMap<String, serde_json::Value>> =
-                Vec::new();
+            // audit H4: built directly instead of via a HashMap<String, serde_json::Value>
+            // intermediate -- avoids a serialize-then-deserialize round trip on every call,
+            // and a typo'd map key silently dropping a symbol instead of failing to compile.
+            let mut affected: Vec<AffectedSymbolOutput> = Vec::new();
 
             // READ-only: open a dedicated read connection (SINGLE_WRITER enforcement)
             {
@@ -409,13 +411,14 @@ impl CalmServer {
                         continue;
                     }
 
-                    let mut stmt = conn
-                        .prepare(
-                            "SELECT qualified_name, name, kind, line_start, line_end, caller_count, signature
-                             FROM symbols WHERE path = ?1",
-                        )
-                        .unwrap();
-                    let rows: Vec<(String, String, String, i64, i64, i64, String)> = stmt
+                    let mut stmt = match conn.prepare(
+                        "SELECT qualified_name, name, kind, line_start, line_end, caller_count, signature
+                         FROM symbols WHERE path = ?1",
+                    ) {
+                        Ok(s) => s,
+                        Err(e) => return db_error(e),
+                    };
+                    let rows: Vec<(String, String, String, i64, i64, i64, String)> = match stmt
                         .query_map(rusqlite::params![fd.path], |row| {
                             Ok((
                                 row.get(0)?,
@@ -426,10 +429,10 @@ impl CalmServer {
                                 row.get(5)?,
                                 row.get(6)?,
                             ))
-                        })
-                        .unwrap()
-                        .filter_map(|r| r.ok())
-                        .collect();
+                        }) {
+                        Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+                        Err(e) => return db_error(e),
+                    };
 
                     for (qualified_name, name, kind, line_start, line_end, caller_count, signature) in
                         rows
@@ -496,26 +499,18 @@ impl CalmServer {
                             )
                         };
 
-                        let mut m: std::collections::HashMap<String, serde_json::Value> =
-                            std::collections::HashMap::new();
-                        m.insert("qualified_name".into(), serde_json::json!(qualified_name));
-                        m.insert("name".into(), serde_json::json!(name));
-                        m.insert("path".into(), serde_json::json!(fd.path));
-                        m.insert("kind".into(), serde_json::json!(kind));
-                        m.insert(
-                            "signature_changed".into(),
-                            serde_json::json!(signature_changed),
-                        );
-                        m.insert("symbol_is_new".into(), serde_json::json!(is_new_symbol));
-                        m.insert(
-                            "blast_radius".into(),
-                            serde_json::json!({"direct_callers": caller_count}),
-                        );
-                        m.insert(
-                            "risk_assessment".into(),
-                            serde_json::json!({"level": level, "reasons": reasons}),
-                        );
-                        affected.push(m);
+                        affected.push(AffectedSymbolOutput {
+                            qualified_name,
+                            name,
+                            path: fd.path.clone(),
+                            kind,
+                            signature_changed,
+                            symbol_is_new: is_new_symbol,
+                            blast_radius: BlastRadiusOutput {
+                                direct_callers: caller_count,
+                            },
+                            risk_assessment: RiskAssessmentOutput { level, reasons },
+                        });
                     }
                 }
             }
@@ -534,15 +529,7 @@ impl CalmServer {
                 &mut affected,
                 MAX_AFFECTED_SYMBOLS,
             );
-
-            let affected_symbols: Vec<AffectedSymbolOutput> = affected
-                .into_iter()
-                .filter_map(|m| {
-                    serde_json::to_value(m)
-                        .ok()
-                        .and_then(|v| serde_json::from_value(v).ok())
-                })
-                .collect();
+            let affected_symbols = affected;
 
             let codeowner_patterns =
                 calm_core::analysis::codeowners::load_codeowners(&self.project_root);
@@ -591,8 +578,7 @@ impl CalmServer {
                 suggested_next: self.filter_sn(sn),
             })
         }))
-    }
-}
+    }}
 
 #[derive(Deserialize, JsonSchema)]
 #[allow(dead_code)]
@@ -779,6 +765,18 @@ pub(crate) struct AffectedSymbolOutput {
     pub(crate) symbol_is_new: bool,
     pub(crate) blast_radius: BlastRadiusOutput,
     pub(crate) risk_assessment: RiskAssessmentOutput,
+}
+
+impl calm_core::analysis::diff_impact::AffectedSymbolFacts for AffectedSymbolOutput {
+    fn risk_level(&self) -> &str {
+        &self.risk_assessment.level
+    }
+    fn direct_callers(&self) -> i64 {
+        self.blast_radius.direct_callers
+    }
+    fn signature_changed(&self) -> bool {
+        self.signature_changed
+    }
 }
 
 #[derive(Serialize, JsonSchema)]

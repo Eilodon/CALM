@@ -337,8 +337,23 @@ pub fn is_new_symbol(
     start <= end && (start..=end).all(|line| added_lines.contains(&line))
 }
 
-pub fn compute_aggregate_risk(
-    affected_symbols: &[HashMap<String, serde_json::Value>],
+/// Read-only accessor for the 3 fields `compute_aggregate_risk` and
+/// `sort_affected_symbols` actually need. Generic over this instead of a
+/// concrete struct (audit H4) so a caller can hand these functions its own
+/// real output type directly -- the old design forced every caller through
+/// a `HashMap<String, serde_json::Value>` intermediate just so these two
+/// functions had a common type to accept, paying a serialize-then-
+/// deserialize round trip on every `diff_impact` call, and one where a
+/// typo'd map key silently dropped a symbol from the result (`filter_map`
+/// swallowing the deserialize error) instead of failing to compile.
+pub trait AffectedSymbolFacts {
+    fn risk_level(&self) -> &str;
+    fn direct_callers(&self) -> i64;
+    fn signature_changed(&self) -> bool;
+}
+
+pub fn compute_aggregate_risk<T: AffectedSymbolFacts>(
+    affected_symbols: &[T],
     unindexed_files: &[String],
 ) -> String {
     if !unindexed_files.is_empty() {
@@ -346,16 +361,11 @@ pub fn compute_aggregate_risk(
     }
     affected_symbols
         .iter()
-        .filter_map(|s| {
-            s.get("risk_assessment")
-                .and_then(|r| r.get("level"))
-                .and_then(|l| l.as_str())
-        })
+        .map(|s| s.risk_level())
         .max_by_key(|level| RiskOrder::parse(level) as u8)
         .unwrap_or("low")
         .to_string()
 }
-
 pub fn escalate_risk_if_signature_changed(
     signature_changed: bool,
     level: &str,
@@ -371,54 +381,47 @@ pub fn escalate_risk_if_signature_changed(
     level.to_string()
 }
 
-pub fn sort_affected_symbols(
-    symbols: &mut Vec<HashMap<String, serde_json::Value>>,
-    max_affected: usize,
-) {
+pub fn sort_affected_symbols<T: AffectedSymbolFacts>(symbols: &mut Vec<T>, max_affected: usize) {
     symbols.sort_by(|a, b| {
-        let risk_a = a
-            .get("risk_assessment")
-            .and_then(|r| r.get("level"))
-            .and_then(|l| l.as_str())
-            .unwrap_or("low");
-        let risk_b = b
-            .get("risk_assessment")
-            .and_then(|r| r.get("level"))
-            .and_then(|l| l.as_str())
-            .unwrap_or("low");
-        let sig_a = a
-            .get("signature_changed")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let sig_b = b
-            .get("signature_changed")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let blast_a = a
-            .get("blast_radius")
-            .and_then(|br| br.get("direct_callers"))
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
-        let blast_b = b
-            .get("blast_radius")
-            .and_then(|br| br.get("direct_callers"))
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
-
-        (RiskOrder::parse(risk_b) as u8, sig_b as u8, blast_b).cmp(&(
-            RiskOrder::parse(risk_a) as u8,
-            sig_a as u8,
-            blast_a,
-        ))
+        (
+            RiskOrder::parse(b.risk_level()) as u8,
+            b.signature_changed() as u8,
+            b.direct_callers(),
+        )
+            .cmp(&(
+                RiskOrder::parse(a.risk_level()) as u8,
+                a.signature_changed() as u8,
+                a.direct_callers(),
+            ))
     });
     symbols.truncate(max_affected);
 }
-
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Minimal `AffectedSymbolFacts` impl for unit-testing
+    /// `compute_aggregate_risk`/`sort_affected_symbols` in isolation, without
+    /// depending on calm-server's real `AffectedSymbolOutput` (audit H4).
+    struct TestSymbol {
+        risk_level: &'static str,
+        direct_callers: i64,
+        signature_changed: bool,
+    }
+
+    impl AffectedSymbolFacts for TestSymbol {
+        fn risk_level(&self) -> &str {
+            self.risk_level
+        }
+        fn direct_callers(&self) -> i64 {
+            self.direct_callers
+        }
+        fn signature_changed(&self) -> bool {
+            self.signature_changed
+        }
+    }
 
     #[test]
     fn test_is_signature_changed_overlap() {
@@ -563,24 +566,49 @@ mod tests {
 
     #[test]
     fn test_compute_aggregate_risk_with_unindexed() {
-        let result = compute_aggregate_risk(&[], &["new_file.rs".to_string()]);
+        let result = compute_aggregate_risk(&[] as &[TestSymbol], &["new_file.rs".to_string()]);
         assert_eq!(result, "unknown");
     }
-
     #[test]
     fn test_compute_aggregate_risk_max() {
-        let s1 = HashMap::from([(
-            "risk_assessment".to_string(),
-            serde_json::json!({"level": "low"}),
-        )]);
-        let s2 = HashMap::from([(
-            "risk_assessment".to_string(),
-            serde_json::json!({"level": "high"}),
-        )]);
+        let s1 = TestSymbol {
+            risk_level: "low",
+            direct_callers: 0,
+            signature_changed: false,
+        };
+        let s2 = TestSymbol {
+            risk_level: "high",
+            direct_callers: 0,
+            signature_changed: false,
+        };
         let result = compute_aggregate_risk(&[s1, s2], &[]);
         assert_eq!(result, "high");
     }
 
+    #[test]
+    fn sort_affected_symbols_orders_by_risk_then_signature_then_callers() {
+        let mut symbols = vec![
+            TestSymbol {
+                risk_level: "low",
+                direct_callers: 5,
+                signature_changed: false,
+            },
+            TestSymbol {
+                risk_level: "high",
+                direct_callers: 1,
+                signature_changed: false,
+            },
+            TestSymbol {
+                risk_level: "high",
+                direct_callers: 1,
+                signature_changed: true,
+            },
+        ];
+        sort_affected_symbols(&mut symbols, 10);
+        assert!(symbols[0].risk_level == "high" && symbols[0].signature_changed);
+        assert!(symbols[1].risk_level == "high" && !symbols[1].signature_changed);
+        assert_eq!(symbols[2].risk_level, "low");
+    }
     #[test]
     fn test_get_git_diff_no_args() {
         let dir = tempfile::tempdir().unwrap();
