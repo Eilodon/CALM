@@ -1211,10 +1211,38 @@ impl CalmServer {
             }
         };
 
+        // Plan 3 §3.5(d): loaded once per call, same reasoning as `recall`'s
+        // own batch load — this is the ambient/passive-injection surface
+        // (an agent doesn't ask for these, they just show up in
+        // edit_context/locate), so unlike `recall` (which reports
+        // "mismatch" explicitly and lets the agent judge), a note that
+        // fails MAC verification is dropped here rather than surfaced —
+        // silently trusting a possibly-forged note into a passive channel
+        // is the exact risk this feature exists to close. `None` (key
+        // unreadable) degrades to treating every candidate as unverifiable
+        // — NOT the same as verified, so nothing here gets dropped for that
+        // reason alone; only an explicit MAC mismatch drops a note.
+        let mac_key = calm_core::memory::load_or_create_mac_key(&self.project_root).ok();
+
         let mut out = Vec::with_capacity(CAP);
-        for (topic, content) in candidates {
+        for (topic, content, content_mac) in candidates {
             if out.len() >= CAP {
                 break;
+            }
+            if let Some(key) = &mac_key {
+                let integrity = calm_core::memory::verify_integrity(
+                    key,
+                    &topic,
+                    &content,
+                    content_mac.as_deref(),
+                );
+                if integrity == "mismatch" {
+                    tracing::warn!(
+                        "related_notes: dropping topic {topic:?} — content_mac mismatch \
+                         (possible out-of-band edit)"
+                    );
+                    continue;
+                }
             }
             let mentions_symbol = !symbol_name.is_empty() && content.contains(symbol_name);
             if is_hub && !mentions_symbol {

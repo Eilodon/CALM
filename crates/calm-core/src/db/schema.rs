@@ -319,6 +319,11 @@ fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
     // left NULL for a non-hub symbol) — lets the edit gate treat a bridge-
     // only touch less strictly than a degree hub without a second query.
     migrate_add_column(conn, "symbols", "hub_kind", "TEXT")?;
+    // Plan 3 §3.5(d): HMAC-SHA256(topic, content) over `memory::compute_mac`,
+    // written by `remember`. Nullable, not backfilled — a pre-existing note
+    // has no MAC to check, and `memory::verify_integrity` reports that case
+    // as `"unverified"`, distinct from `"ok"`/`"mismatch"`.
+    migrate_add_column(conn, "project_memory", "content_mac", "TEXT")?;
     migrate_fts_add_signature(conn)?;
     migrate_add_project_memory_fts(conn)?;
     Ok(())

@@ -33,11 +33,21 @@ impl CalmServer {
                 Err(e) => return db_error(e),
             };
             let now = utc_now_iso8601();
+            // Plan 3 §3.5(d): computed even if the key has to be generated
+            // on this very call (lazy — see `load_or_create_mac_key`'s doc
+            // comment) — best-effort like `capture_refs`/`content_warning`
+            // below: a key-file I/O failure (e.g. read-only `.calm/`)
+            // shouldn't block saving the note itself, just leave it
+            // unverifiable (`content_mac: NULL`, `recall` reports
+            // "unverified") exactly like a pre-feature note.
+            let content_mac = calm_core::memory::load_or_create_mac_key(&self.project_root)
+                .ok()
+                .map(|key| calm_core::memory::compute_mac(&key, topic, content));
             let result = conn.execute(
-                "INSERT INTO project_memory (topic, content, created_at, updated_at) \
-                 VALUES (?1, ?2, ?3, ?3) \
-                 ON CONFLICT(topic) DO UPDATE SET content = excluded.content, updated_at = excluded.updated_at",
-                rusqlite::params![topic, content, now],
+                "INSERT INTO project_memory (topic, content, content_mac, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?4) \
+                 ON CONFLICT(topic) DO UPDATE SET content = excluded.content, content_mac = excluded.content_mac, updated_at = excluded.updated_at",
+                rusqlite::params![topic, content, content_mac, now],
             );
             if let Err(e) = result {
                 return ToolOutcome::error(error_detail(
@@ -97,7 +107,7 @@ impl CalmServer {
                 p.topic.as_deref().map(str::trim).filter(|t| !t.is_empty())
             {
                 conn.prepare(
-                    "SELECT topic, content, updated_at FROM project_memory WHERE topic = ?1",
+                    "SELECT topic, content, updated_at, content_mac FROM project_memory WHERE topic = ?1",
                 )
                 .and_then(|mut stmt| {
                     stmt.query_map(rusqlite::params![topic], memory_note_row)?
@@ -106,7 +116,7 @@ impl CalmServer {
             } else if let Some(q) = p.query.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
                 let fts_query = Self::escape_fts5_query(q);
                 conn.prepare(
-                    "SELECT p.topic, p.content, p.updated_at \
+                    "SELECT p.topic, p.content, p.updated_at, p.content_mac \
                      FROM project_memory_fts \
                      JOIN project_memory p ON p.id = project_memory_fts.rowid \
                      WHERE project_memory_fts MATCH ?1 \
@@ -122,7 +132,7 @@ impl CalmServer {
                 })
             } else {
                 conn.prepare(
-                    "SELECT topic, content, updated_at FROM project_memory \
+                    "SELECT topic, content, updated_at, content_mac FROM project_memory \
                      ORDER BY updated_at DESC LIMIT ?1",
                 )
                 .and_then(|mut stmt| {
@@ -146,6 +156,15 @@ impl CalmServer {
             let mut notes: Vec<MemoryNote> =
                 notes.into_iter().take(RECALL_LIMIT as usize).collect();
 
+            // Plan 3 §3.5(d): loaded once for the whole batch, not per note
+            // — one small file read instead of N. `None` (key file
+            // unreadable/uncreatable) means every note in this response is
+            // reported "unverified" rather than silently treated as "ok":
+            // we genuinely can't tell, and "unverified" is the honest
+            // answer for "no baseline to check against," same as a
+            // pre-feature note with no stored MAC at all.
+            let mac_key = calm_core::memory::load_or_create_mac_key(&self.project_root).ok();
+
             // Per note: "unchecked" (no file-path refs were ever captured for
             // it — either the content had none, or none resolved at
             // `remember` time) stays the `memory_note_row` default; otherwise
@@ -156,6 +175,16 @@ impl CalmServer {
                 // content is untrusted storage text regardless of whether it
                 // happens to reference a file.
                 note.content_warning = calm_core::sanitize::injection_warning(&note.content);
+
+                note.integrity = match &mac_key {
+                    Some(key) => calm_core::memory::verify_integrity(
+                        key,
+                        &note.topic,
+                        &note.content,
+                        note.content_mac.as_deref(),
+                    ),
+                    None => "unverified",
+                };
 
                 let has_refs = calm_core::memory::ref_count(&conn, &note.topic).unwrap_or(0) > 0;
                 if !has_refs {
@@ -290,6 +319,12 @@ pub(crate) struct MemoryNote {
     pub(crate) staleness: &'static str,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) stale_refs: Vec<StaleRefOutput>,
+    /// Plan 3 §3.5(d): "ok" (`content_mac` present and verifies against
+    /// this project's key), "mismatch" (present but does NOT verify — the
+    /// row was altered by something other than `remember`), or
+    /// "unverified" (no `content_mac` stored — a note written before this
+    /// feature existed). Set by `recall` via `calm_core::memory::verify_integrity`.
+    pub(crate) integrity: &'static str,
     /// audit F7: same trust-surface treatment `source()` already gives file
     /// content — a note's `content` came from a prior `remember` call (this
     /// session or a past one) and is untrusted text, same as any other
@@ -297,6 +332,13 @@ pub(crate) struct MemoryNote {
     /// `None`/omitted when the content looks clean.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) content_warning: Option<String>,
+    /// Plan 3 §3.5(d): raw `content_mac` from the row, carried through from
+    /// `memory_note_row` to `recall`'s post-processing loop (which has the
+    /// project's MAC key, unlike this free function) purely as scratch
+    /// space — never serialized. `integrity` above is the field an agent
+    /// actually sees.
+    #[serde(skip)]
+    pub(crate) content_mac: Option<String>,
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -314,6 +356,8 @@ pub(crate) fn memory_note_row(row: &rusqlite::Row) -> rusqlite::Result<MemoryNot
         updated_at: row.get(2)?,
         staleness: "unchecked",
         stale_refs: Vec::new(),
+        integrity: "unverified",
         content_warning: None,
+        content_mac: row.get(3)?,
     })
 }
