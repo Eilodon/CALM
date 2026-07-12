@@ -1631,35 +1631,46 @@ const CALL_SITE_PREVIEW_MAX_CHARS: usize = 160;
 /// for a `CallerEntry`/`CalleeEntry` preview. Best-effort: missing files, a
 /// line number past EOF, or a `None` line all just yield `None` rather than
 /// an error — a preview is a convenience, not load-bearing.
-pub(crate) fn line_preview(
+/// Same semantics as `line_preview`, but reads each distinct file at most
+/// once regardless of how many `items` reference it (audit F11) — a hub
+/// symbol's `callers`/`callees` rows routinely repeat the same file dozens
+/// of times, each of which used to be its own full-file `read_to_string`.
+/// Returns previews in the same order as `items`.
+pub(crate) fn line_previews_batched(
     project_root: &std::path::Path,
-    path: &str,
-    line: Option<i64>,
-) -> Option<String> {
-    let line = line?;
-    if line < 1 {
-        return None;
-    }
-    let content = std::fs::read_to_string(project_root.join(path)).ok()?;
-    let raw = content.lines().nth((line - 1) as usize)?.trim();
-    if raw.is_empty() {
-        return None;
-    }
-    // Raw disk content, never indexed/DB-stored — redact here directly, same
-    // as `source()`'s body text, since this shared helper is the only point
-    // every caller's preview ever passes through.
-    let sanitized = calm_core::sanitize::sanitize_source_output(raw);
-    if sanitized.chars().count() > CALL_SITE_PREVIEW_MAX_CHARS {
-        Some(format!(
-            "{}…",
-            sanitized
-                .chars()
-                .take(CALL_SITE_PREVIEW_MAX_CHARS)
-                .collect::<String>()
-        ))
-    } else {
-        Some(sanitized)
-    }
+    items: &[(String, Option<i64>)],
+) -> Vec<Option<String>> {
+    let mut file_cache: std::collections::HashMap<&str, Option<String>> =
+        std::collections::HashMap::new();
+    items
+        .iter()
+        .map(|(path, line)| {
+            let line = (*line)?;
+            if line < 1 {
+                return None;
+            }
+            let content = file_cache
+                .entry(path.as_str())
+                .or_insert_with(|| std::fs::read_to_string(project_root.join(path)).ok())
+                .as_ref()?;
+            let raw = content.lines().nth((line - 1) as usize)?.trim();
+            if raw.is_empty() {
+                return None;
+            }
+            let sanitized = calm_core::sanitize::sanitize_source_output(raw);
+            if sanitized.chars().count() > CALL_SITE_PREVIEW_MAX_CHARS {
+                Some(format!(
+                    "{}…",
+                    sanitized
+                        .chars()
+                        .take(CALL_SITE_PREVIEW_MAX_CHARS)
+                        .collect::<String>()
+                ))
+            } else {
+                Some(sanitized)
+            }
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------

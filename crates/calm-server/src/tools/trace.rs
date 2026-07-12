@@ -50,22 +50,37 @@ impl CalmServer {
                     Ok(s) => s,
                     Err(e) => return db_error_resolved(e),
                 };
-                let mapped = stmt.query_map(rusqlite::params![c.qualified_name], |row| {
-                    let path: String = row.get::<_, String>(1).unwrap_or_default();
-                    let line: Option<i64> = row.get(3)?;
-                    Ok(CallerEntry {
-                        symbol: row.get(0)?,
-                        preview: line_preview(&self.project_root, &path, line),
-                        path,
-                        edge_confidence: row.get(2)?,
-                        edge_kind: row.get(4)?,
-                        line,
-                    })
-                });
-                match mapped {
+                let rows: Vec<(String, String, String, String, Option<i64>)> = match stmt
+                    .query_map(rusqlite::params![c.qualified_name], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1).unwrap_or_default(),
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, Option<i64>>(3)?,
+                        ))
+                    }) {
                     Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
                     Err(e) => return db_error_resolved(e),
-                }
+                };
+                let preview_items: Vec<(String, Option<i64>)> = rows
+                    .iter()
+                    .map(|(_, path, _, _, line)| (path.clone(), *line))
+                    .collect();
+                let previews = line_previews_batched(&self.project_root, &preview_items);
+                rows.into_iter()
+                    .zip(previews)
+                    .map(
+                        |((symbol, path, edge_confidence, edge_kind, line), preview)| CallerEntry {
+                            symbol,
+                            path,
+                            edge_confidence,
+                            edge_kind,
+                            line,
+                            preview,
+                        },
+                    )
+                    .collect()
             };
 
             let (transitive, transitive_count, transitive_capped) = if p.transitive {
@@ -229,24 +244,43 @@ impl CalmServer {
                     Ok(s) => s,
                     Err(e) => return db_error_resolved(e),
                 };
-                // The call site lives in the symbol being inspected (`c.path`),
-                // not in the callee's own file (`to_path`).
-                let from_path = c.path.clone();
-                let mapped = stmt.query_map(rusqlite::params![c.qualified_name], |row| {
-                    let line: Option<i64> = row.get(3)?;
-                    Ok(CalleeEntry {
-                        symbol: row.get(0)?,
-                        path: row.get::<_, String>(1).unwrap_or_default(),
-                        edge_confidence: row.get(2)?,
-                        edge_kind: row.get(4)?,
-                        preview: line_preview(&self.project_root, &from_path, line),
-                        line,
-                    })
-                });
-                match mapped {
+                let rows: Vec<(String, String, String, String, Option<i64>)> = match stmt
+                    .query_map(rusqlite::params![c.qualified_name], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1).unwrap_or_default(),
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, Option<i64>>(3)?,
+                        ))
+                    }) {
                     Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
                     Err(e) => return db_error_resolved(e),
-                }
+                };
+                // The call site lives in the symbol being inspected
+                // (`c.path`), not in the callee's own file (`to_path`) --
+                // every row's preview key is this same constant path, so
+                // line_previews_batched reads it exactly once no matter how
+                // many callees there are (audit F11).
+                let from_path = c.path.clone();
+                let preview_items: Vec<(String, Option<i64>)> = rows
+                    .iter()
+                    .map(|(_, _, _, _, line)| (from_path.clone(), *line))
+                    .collect();
+                let previews = line_previews_batched(&self.project_root, &preview_items);
+                rows.into_iter()
+                    .zip(previews)
+                    .map(
+                        |((symbol, path, edge_confidence, edge_kind, line), preview)| CalleeEntry {
+                            symbol,
+                            path,
+                            edge_confidence,
+                            edge_kind,
+                            line,
+                            preview,
+                        },
+                    )
+                    .collect()
             };
 
             let (transitive, transitive_count, transitive_capped) = if p.transitive {

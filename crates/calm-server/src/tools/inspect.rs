@@ -287,21 +287,37 @@ impl CalmServer {
                         Ok(s) => s,
                         Err(e) => return db_error(e),
                     };
-                    match stmt.query_map(rusqlite::params![info.qualified_name], |row| {
-                        let path: String = row.get::<_, String>(1).unwrap_or_default();
-                        let line: Option<i64> = row.get(3)?;
-                        Ok(CallerEntry {
-                            symbol: row.get(0)?,
-                            preview: line_preview(&self.project_root, &path, line),
-                            path,
-                            edge_confidence: row.get(2)?,
-                            edge_kind: row.get(4)?,
-                            line,
-                        })
-                    }) {
-                        Ok(iter) => iter.filter_map(|r| r.ok()).collect::<Vec<_>>(),
+                    let rows: Vec<(String, String, String, String, Option<i64>)> = match stmt
+                        .query_map(rusqlite::params![info.qualified_name], |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1).unwrap_or_default(),
+                                row.get::<_, String>(2)?,
+                                row.get::<_, String>(4)?,
+                                row.get::<_, Option<i64>>(3)?,
+                            ))
+                        }) {
+                        Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
                         Err(e) => return db_error(e),
-                    }
+                    };
+                    let preview_items: Vec<(String, Option<i64>)> = rows
+                        .iter()
+                        .map(|(_, path, _, _, line)| (path.clone(), *line))
+                        .collect();
+                    let previews = line_previews_batched(&self.project_root, &preview_items);
+                    rows.into_iter()
+                        .zip(previews)
+                        .map(|((symbol, path, edge_confidence, edge_kind, line), preview)| {
+                            CallerEntry {
+                                symbol,
+                                path,
+                                edge_confidence,
+                                edge_kind,
+                                line,
+                                preview,
+                            }
+                        })
+                        .collect::<Vec<_>>()
                 }
                 None => Vec::new(),
             };
@@ -415,6 +431,7 @@ impl CalmServer {
             let mut callees_by_symbol: std::collections::HashMap<String, Vec<CalleeEntry>> = std::collections::HashMap::new();
 
             if p.include_callers && !found_ids.is_empty() {
+                let mut raw: Vec<(String, String, String, String, String, Option<i64>)> = Vec::new();
                 for chunk in found_ids.chunks(CHUNK) {
                     let placeholders = chunk
                         .iter()
@@ -428,26 +445,35 @@ impl CalmServer {
                     );
                     if let Ok(mut stmt) = conn.prepare(&sql)
                         && let Ok(iter) = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
-                            let to_symbol: String = row.get(0)?;
-                            let from_path: String = row.get::<_, String>(2).unwrap_or_default();
-                            let line: Option<i64> = row.get(4)?;
                             Ok((
-                                to_symbol,
-                                CallerEntry {
-                                    symbol: row.get(1)?,
-                                    preview: line_preview(&self.project_root, &from_path, line),
-                                    path: from_path,
-                                    edge_confidence: row.get(3)?,
-                                    edge_kind: row.get(5)?,
-                                    line,
-                                },
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2).unwrap_or_default(),
+                                row.get::<_, String>(3)?,
+                                row.get::<_, String>(5)?,
+                                row.get::<_, Option<i64>>(4)?,
                             ))
                         })
                     {
-                        for (to_symbol, entry) in iter.flatten() {
-                            callers_by_symbol.entry(to_symbol).or_default().push(entry);
-                        }
+                        raw.extend(iter.flatten());
                     }
+                }
+                let preview_items: Vec<(String, Option<i64>)> = raw
+                    .iter()
+                    .map(|(_, _, from_path, _, _, line)| (from_path.clone(), *line))
+                    .collect();
+                let previews = line_previews_batched(&self.project_root, &preview_items);
+                for ((to_symbol, from_symbol, from_path, edge_confidence, edge_kind, line), preview) in
+                    raw.into_iter().zip(previews)
+                {
+                    callers_by_symbol.entry(to_symbol).or_default().push(CallerEntry {
+                        symbol: from_symbol,
+                        path: from_path,
+                        edge_confidence,
+                        edge_kind,
+                        line,
+                        preview,
+                    });
                 }
             }
 
@@ -479,15 +505,29 @@ impl CalmServer {
                         raw.extend(iter.flatten());
                     }
                 }
-                for (from_symbol, to_symbol, to_path, edge_confidence, edge_kind, line) in raw {
-                    let from_file_path = found.get(&from_symbol).map(|c| c.path.clone()).unwrap_or_default();
+                // Preview key is the CALLING symbol's own file (`from_symbol`'s
+                // indexed path), not `to_path` -- looked up before batching so
+                // line_previews_batched sees the real dedup key (audit F11).
+                let preview_items: Vec<(String, Option<i64>)> = raw
+                    .iter()
+                    .map(|(from_symbol, _, _, _, _, line)| {
+                        (
+                            found.get(from_symbol).map(|c| c.path.clone()).unwrap_or_default(),
+                            *line,
+                        )
+                    })
+                    .collect();
+                let previews = line_previews_batched(&self.project_root, &preview_items);
+                for ((from_symbol, to_symbol, to_path, edge_confidence, edge_kind, line), preview) in
+                    raw.into_iter().zip(previews)
+                {
                     callees_by_symbol.entry(from_symbol).or_default().push(CalleeEntry {
                         symbol: to_symbol,
                         path: to_path,
                         edge_confidence,
                         edge_kind,
-                        preview: line_preview(&self.project_root, &from_file_path, line),
                         line,
+                        preview,
                     });
                 }
             }
