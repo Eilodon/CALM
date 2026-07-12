@@ -260,7 +260,10 @@ impl CalmServer {
                 // Outranks frontier exploration — an unverified write is the
                 // more urgent gap regardless of client/host (this signal
                 // doesn't depend on the Claude-Code-only PreToolUse hook).
-                self.filter_sn(suggested(
+                // Plan 3 §3.5(b): same pending_diff_impact hook-enforced
+                // gate as edit_lines/edit_symbol's own hint, just surfaced
+                // here on a later check-in — gate:true for the same reason.
+                self.filter_sn(suggested_gated(
                     "diff_impact",
                     "Files written since the last diff_impact — verify blast radius before continuing",
                 ))

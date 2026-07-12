@@ -585,6 +585,7 @@ mod tests {
     use super::inspect::*;
     use super::locate::*;
     use super::memory::*;
+    use super::orient::*;
     use super::patterndebt::*;
     use super::recover::*;
     use super::trace::*;
@@ -1627,7 +1628,9 @@ mod tests {
             .unwrap();
         }
 
-        let v = jv(server.repo_overview());
+        let v = jv(server.repo_overview(rmcp::handler::server::wrapper::Parameters(
+            RepoOverviewParams { compact: false },
+        )));
 
         assert_eq!(v["entry_points"].as_array().unwrap().len(), 1);
         assert_eq!(v["entry_points"][0]["qualified_name"], "src.main");
@@ -1655,7 +1658,9 @@ mod tests {
     fn repo_overview_reports_memory_notes_count_without_content() {
         let (dir, server) = test_server("repo_overview_memory_count");
 
-        let empty = jv(server.repo_overview());
+        let empty = jv(server.repo_overview(rmcp::handler::server::wrapper::Parameters(
+            RepoOverviewParams { compact: false },
+        )));
         assert_eq!(empty["memory_notes_count"], 0, "{empty}");
 
         server.remember(rmcp::handler::server::wrapper::Parameters(RememberParams {
@@ -1667,7 +1672,9 @@ mod tests {
             content: "always run in a transaction".into(),
         }));
 
-        let with_notes = jv(server.repo_overview());
+        let with_notes = jv(server.repo_overview(rmcp::handler::server::wrapper::Parameters(
+            RepoOverviewParams { compact: false },
+        )));
         assert_eq!(with_notes["memory_notes_count"], 2, "{with_notes}");
         assert!(
             !with_notes.to_string().contains("state param"),
@@ -1715,7 +1722,9 @@ mod tests {
             .unwrap();
         }
 
-        let before_ready = jv(server.repo_overview());
+        let before_ready = jv(server.repo_overview(rmcp::handler::server::wrapper::Parameters(
+            RepoOverviewParams { compact: false },
+        )));
         assert_eq!(
             before_ready["core_symbols"],
             serde_json::json!([]),
@@ -1724,7 +1733,9 @@ mod tests {
 
         *server.phase_handle().write().unwrap() = IndexingPhase::Ready;
 
-        let after_ready = jv(server.repo_overview());
+        let after_ready = jv(server.repo_overview(rmcp::handler::server::wrapper::Parameters(
+            RepoOverviewParams { compact: false },
+        )));
         let core = after_ready["core_symbols"].as_array().unwrap();
         let names: Vec<&str> = core
             .iter()
@@ -1738,6 +1749,72 @@ mod tests {
         );
         assert_eq!(core[0]["coreness"], 5);
         assert_eq!(core[0]["is_hub"], true);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Plan 3 §3.5(a): `compact: true` drops `entry_points`/`workflow_guide`
+    /// entirely (both `#[serde(skip_serializing_if)]`, so the keys vanish
+    /// rather than serializing to `[]`/`null`) and caps `module_map` to 10 /
+    /// `core_symbols` to 8 — `compact: false` (the default) keeps full
+    /// detail, unaffected by either cap.
+    #[test]
+    fn repo_overview_compact_mode_drops_guide_and_caps_lists() {
+        let (dir, server) = test_server("repo_overview_compact");
+
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point, coreness, is_test)
+                 VALUES ('src.main', 'main', 'function', 'python', 'src/main.py', 1, 1, '', '', 'main', 1, 0, 1, 0, 0)",
+                [],
+            )
+            .unwrap();
+            for i in 0..12u32 {
+                conn.execute(
+                    "INSERT INTO file_index (path, hash, language, symbol_count, last_indexed) VALUES (?1, 'h', 'python', 1, 0.0)",
+                    rusqlite::params![format!("mod{i}/f.py", i = i)],
+                )
+                .unwrap();
+            }
+            for i in 0..10u32 {
+                conn.execute(
+                    "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point, coreness, is_test)
+                     VALUES (?1, ?2, 'function', 'python', 'core.py', 1, 1, '', '', ?2, 1, 0, 0, ?3, 0)",
+                    rusqlite::params![format!("mod.core{i}", i = i), format!("core{i}", i = i), 10 - i as i64],
+                )
+                .unwrap();
+            }
+        }
+        *server.phase_handle().write().unwrap() = IndexingPhase::Ready;
+
+        let full = jv(server.repo_overview(rmcp::handler::server::wrapper::Parameters(
+            RepoOverviewParams { compact: false },
+        )));
+        assert!(full.get("workflow_guide").is_some(), "{full}");
+        assert_eq!(full["entry_points"].as_array().unwrap().len(), 1);
+        assert!(full["module_map"].as_array().unwrap().len() > 10, "{full}");
+        assert_eq!(full["core_symbols"].as_array().unwrap().len(), 10);
+
+        let compact = jv(server.repo_overview(rmcp::handler::server::wrapper::Parameters(
+            RepoOverviewParams { compact: true },
+        )));
+        assert!(
+            compact.get("workflow_guide").is_none(),
+            "compact must drop workflow_guide entirely: {compact}"
+        );
+        assert!(
+            compact.get("entry_points").is_none(),
+            "compact must drop entry_points entirely: {compact}"
+        );
+        assert!(
+            compact["module_map"].as_array().unwrap().len() <= 10,
+            "compact module_map must be capped to 10: {compact}"
+        );
+        assert!(
+            compact["core_symbols"].as_array().unwrap().len() <= 8,
+            "compact core_symbols must be capped to 8: {compact}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2628,6 +2705,10 @@ mod tests {
             v["suggested_next"]["tool"].as_str(),
             Some("repo_overview"),
             "With empty frontier, must suggest repo_overview, got: {v}"
+        );
+        assert!(
+            v["suggested_next"].get("gate").is_none(),
+            "Plan 3 §3.5(b): an advisory hint must not carry `gate` at all, got: {v}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -5481,6 +5562,10 @@ mod tests {
             serde_json::json!(["a.py"])
         );
         assert_eq!(after_edit["suggested_next"]["tool"], "diff_impact");
+        assert_eq!(
+            after_edit["suggested_next"]["gate"], true,
+            "pending_diff_impact is hook-enforced — gate must be true: {after_edit}"
+        );
 
         // Any diff_impact call — even against unrelated raw diff text —
         // clears the pending set.

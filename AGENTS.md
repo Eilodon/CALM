@@ -17,7 +17,7 @@ Full stage-by-stage guide, all 8 Mandatory Rules, the Preset table, and Tool Qui
 
 ## Core Principles
 
-**Follow `suggested_next`.** Every tool response embeds the next step. You rarely need to decide — just follow the hint. Override only when you have explicit context the hint cannot account for.
+**Follow `suggested_next`.** Every tool response embeds the next step. You rarely need to decide — just follow the hint. Override only when you have explicit context the hint cannot account for. `suggested_next.gate: true` means the hint is hook-enforced (currently only `diff_impact` after a pending write) — skipping it will get the next disallowed action blocked, not just discouraged. Any other value (including the key being absent) is advisory — a strong recommendation, not a wall.
 
 **Never use native grep or file-read** when index tools are available. `locate` replaces search + file_overview + symbol_info in one call. `source` reads one symbol precisely instead of flooding context with an entire file.
 
@@ -40,6 +40,8 @@ fitness_report()         # hub/dead-code/complexity/coverage/boundary health vs 
 ```
 
 **Done when**: You know the languages, entry points, module structure, and highest-churn files. `suggested_next` points to `locate`.
+
+**Repeat calls in the same repo**: use `repo_overview(compact=true)` — drops `workflow_guide` (redundant once this file has been read once) and `entry_points`, caps `core_symbols` to 8 and `module_map` to 10. Keep `compact=false` (the default) for the first call of a session.
 
 **Signals**:
 - `indexing_phase != "ready"` → graph tools have degraded results; call `indexing_status` to monitor

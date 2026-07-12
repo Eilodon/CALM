@@ -644,7 +644,7 @@ impl CalmServer {
             risk_assessment: risk,
             index_stale: None,
             note: ambiguity_note,
-            suggested_next: self.filter_sn(suggested(
+            suggested_next: self.filter_sn(suggested_gated(
                 "diff_impact",
                 "Verify wider blast radius, especially if this touched a hub/high-risk symbol",
             )),

@@ -13,7 +13,10 @@ impl CalmServer {
             open_world_hint = false
         )
     )]
-    pub(crate) fn repo_overview(&self) -> Json<ToolOutcome<RepoOverviewOutput>> {
+    pub(crate) fn repo_overview(
+        &self,
+        Parameters(p): Parameters<RepoOverviewParams>,
+    ) -> Json<ToolOutcome<RepoOverviewOutput>> {
         Json(self.timed_tool("repo_overview", || {
             // READ-only: open a dedicated read connection (SINGLE_WRITER enforcement)
             let conn = match self.make_read_conn() {
@@ -38,8 +41,12 @@ impl CalmServer {
                 Err(e) => return db_error(e),
             };
 
+            // Plan 3 §3.5(a): compact mode skips this query entirely rather
+            // than running it and discarding the result.
             const ENTRY_POINTS_LIMIT: usize = 10;
-            let entry_points: Vec<EntryPointItem> = {
+            let entry_points: Vec<EntryPointItem> = if p.compact {
+                Vec::new()
+            } else {
                 // `main`-named functions first (the conventional place to
                 // start reading), then by caller_count desc — previously
                 // unordered (arbitrary rowid order) with a cap of 20; now
@@ -68,6 +75,9 @@ impl CalmServer {
 
             // Top-level directory (or bare filename for root files) of each
             // indexed file, grouped to give a coarse architectural map.
+            // Plan 3 §3.5(a): capped to 10 entries under compact mode (was
+            // always uncapped) — sorted by file_count desc first, so the
+            // cap keeps the most substantial modules.
             let module_map: Vec<ModuleEntry> = {
                 let mut stmt = match conn.prepare("SELECT path, symbol_count FROM file_index") {
                     Ok(s) => s,
@@ -102,6 +112,9 @@ impl CalmServer {
                     })
                     .collect();
                 modules.sort_by(|a, b| b.file_count.cmp(&a.file_count).then(a.name.cmp(&b.name)));
+                if p.compact {
+                    modules.truncate(10);
+                }
                 modules
             };
 
@@ -161,8 +174,9 @@ impl CalmServer {
             // importance" toward test scaffolding rather than real design.
             // Gated on `edges_ready` (same convention as `symbol_info`'s
             // `coreness` field) so a not-yet-built graph reports honestly
-            // empty instead of a stale/partial ranking.
-            const CORE_SYMBOLS_LIMIT: usize = 15;
+            // empty instead of a stale/partial ranking. Plan 3 §3.5(a):
+            // capped to 8 (was always 15) under compact mode.
+            let core_symbols_limit: usize = if p.compact { 8 } else { 15 };
             let core_symbols: Vec<CoreSymbolItem> = if self.edges_ready() {
                 let mut stmt = match conn.prepare(
                     "SELECT qualified_name, name, kind, path, coreness, caller_count, is_hub \
@@ -174,7 +188,7 @@ impl CalmServer {
                     Ok(s) => s,
                     Err(e) => return db_error(e),
                 };
-                match stmt.query_map(rusqlite::params![CORE_SYMBOLS_LIMIT as i64], |r| {
+                match stmt.query_map(rusqlite::params![core_symbols_limit as i64], |r| {
                     Ok(CoreSymbolItem {
                         qualified_name: r.get(0)?,
                         name: r.get(1)?,
@@ -202,6 +216,21 @@ impl CalmServer {
                 suggested("locate", "Start exploration")
             };
 
+            // Plan 3 §3.5(a): the single biggest chunk of a non-compact
+            // response (~600+ tokens) and redundant once the client already
+            // has it — e.g. baked into this repo's own AGENTS.md, which
+            // every session using this MCP server reads at session start.
+            let workflow_guide = (!p.compact).then(|| r#"WORKFLOW (8 stages) — follow suggested_next in every response:
+1 ORIENT   : repo_overview (ALWAYS first) → hotspots, fitness_report (optional health snapshot)
+2 LOCATE   : locate(query) [= search+file_overview+symbol_info in 1 call] | search(kind="hybrid"|"grep") | file_overview(path)
+3 INSPECT  : source(symbol) | understand(query) [= locate+source+callers in 1 call]
+4 TRACE    : callers / callees / path / dependencies — map blast radius
+5 PRE-EDIT : edit_context(symbol) — MANDATORY before ANY edit, never skip
+6 EDIT     : edit_symbol/edit_lines (preferred — hash-verified, risk-gated) | native file tools (new/untracked files only)
+7 VERIFY   : diff_impact(staged=true) — MANDATORY before commit/push, never skip
+8 RECOVER  : session_context() after 10+ calls | indexing_status() when index unclear
+RULES: Never use native grep/read on project files. is_hub:true → extra caution. Follow suggested_next."#.to_string());
+
             ToolOutcome::success(RepoOverviewOutput {
                 languages,
                 indexing_phase: phase,
@@ -215,16 +244,7 @@ impl CalmServer {
                 health_summary,
                 memory_notes_count,
                 core_symbols,
-                workflow_guide: r#"WORKFLOW (8 stages) — follow suggested_next in every response:
-1 ORIENT   : repo_overview (ALWAYS first) → hotspots, fitness_report (optional health snapshot)
-2 LOCATE   : locate(query) [= search+file_overview+symbol_info in 1 call] | search(kind="hybrid"|"grep") | file_overview(path)
-3 INSPECT  : source(symbol) | understand(query) [= locate+source+callers in 1 call]
-4 TRACE    : callers / callees / path / dependencies — map blast radius
-5 PRE-EDIT : edit_context(symbol) — MANDATORY before ANY edit, never skip
-6 EDIT     : edit_symbol/edit_lines (preferred — hash-verified, risk-gated) | native file tools (new/untracked files only)
-7 VERIFY   : diff_impact(staged=true) — MANDATORY before commit/push, never skip
-8 RECOVER  : session_context() after 10+ calls | indexing_status() when index unclear
-RULES: Never use native grep/read on project files. is_hub:true → extra caution. Follow suggested_next."#.into(),
+                workflow_guide,
                 suggested_next: self.filter_sn(sn),
             })
         }))
@@ -277,6 +297,7 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
                 tool: "file_overview".into(),
                 reason: "Inspect highest-risk file".into(),
                 args: Some(serde_json::json!({"path": h.path})),
+                gate: None,
             });
 
             ToolOutcome::success(HotspotsOutput {
@@ -491,6 +512,18 @@ pub(crate) struct HealthSummary {
     pub(crate) edges_ready: bool,
 }
 
+#[derive(Deserialize, JsonSchema)]
+pub(crate) struct RepoOverviewParams {
+    /// Plan 3 §3.5(a): trims a repeat-call response down to the parts that
+    /// change session to session — drops `workflow_guide` (redundant once
+    /// AGENTS.md has been read once) and `entry_points`, and caps
+    /// `core_symbols` to 8 / `module_map` to 10. Defaults to `false` (full
+    /// detail) so a session's FIRST `repo_overview` call — before AGENTS.md
+    /// has necessarily been internalized — stays complete by default.
+    #[serde(default)]
+    pub(crate) compact: bool,
+}
+
 #[derive(Serialize, JsonSchema)]
 pub(crate) struct RepoOverviewOutput {
     pub(crate) languages: Vec<String>,
@@ -500,6 +533,9 @@ pub(crate) struct RepoOverviewOutput {
     pub(crate) total_symbols: i64,
     pub(crate) total_files: i64,
     pub(crate) truncated: bool,
+    /// Empty (and therefore omitted) whenever `compact:true` — see
+    /// `RepoOverviewParams::compact`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) entry_points: Vec<EntryPointItem>,
     pub(crate) module_map: Vec<ModuleEntry>,
     pub(crate) health_summary: HealthSummary,
@@ -510,7 +546,12 @@ pub(crate) struct RepoOverviewOutput {
     /// `core_symbols` query's comment above for why it's coreness-ranked,
     /// `is_test`-excluded, and `coreness > 0`-floored.
     pub(crate) core_symbols: Vec<CoreSymbolItem>,
-    pub(crate) workflow_guide: String,
+    /// `None` whenever `compact:true` — the client is expected to already
+    /// have this (e.g. baked into `AGENTS.md`) by the time it calls
+    /// `repo_overview` a 2nd+ time in the same repo. See
+    /// `RepoOverviewParams::compact`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) workflow_guide: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) suggested_next: Option<SuggestedNext>,
 }

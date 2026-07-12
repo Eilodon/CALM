@@ -585,6 +585,14 @@ pub(crate) struct SuggestedNext {
     pub(crate) reason: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) args: Option<serde_json::Value>,
+    /// Plan 3 §3.5(b): `Some(true)` iff skipping `tool` is actually
+    /// hook-enforced (currently only the edit_context/edit_lines/edit_symbol
+    /// → diff_impact hints set this, via `suggested_gated`) — every other
+    /// hint is left unset (`None`), meaning advisory-only. Lets an agent
+    /// tell "you'll be blocked if you skip this" apart from "you probably
+    /// want this next" without re-deriving it from AGENTS.md prose each time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) gate: Option<bool>,
 }
 
 pub(crate) fn suggested(tool: &str, reason: &str) -> Option<SuggestedNext> {
@@ -592,6 +600,7 @@ pub(crate) fn suggested(tool: &str, reason: &str) -> Option<SuggestedNext> {
         tool: tool.into(),
         reason: reason.into(),
         args: None,
+        gate: None,
     })
 }
 
@@ -604,6 +613,20 @@ pub(crate) fn suggested_with_args(
         tool: tool.into(),
         reason: reason.into(),
         args: Some(args),
+        gate: None,
+    })
+}
+
+/// Plan 3 §3.5(b): same as `suggested`, but for the 2 hints backed by an
+/// actual hook enforcement (the pending-diff_impact gate) rather than a
+/// convention — sets `gate: Some(true)` so an agent can tell "mandatory,
+/// you will be blocked" from "recommended" without re-reading AGENTS.md.
+pub(crate) fn suggested_gated(tool: &str, reason: &str) -> Option<SuggestedNext> {
+    Some(SuggestedNext {
+        tool: tool.into(),
+        reason: reason.into(),
+        args: None,
+        gate: Some(true),
     })
 }
 

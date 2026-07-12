@@ -314,7 +314,7 @@ impl CalmServer {
                 co_changed_files,
                 related_notes,                edges_etag,
                 edges_not_modified: edges_not_modified.then_some(true),
-                suggested_next: self.filter_sn(suggested(
+                suggested_next: self.filter_sn(suggested_gated(
                     "diff_impact",
                     "MANDATORY after changes — verify blast radius",
                 )),
@@ -592,12 +592,14 @@ impl CalmServer {
                     tool: "callers".into(),
                     reason: "Verify high-risk callers manually".into(),
                     args: Some(serde_json::json!({"symbol": s.name})),
+                    gate: None,
                 })
             } else if aggregate_risk == "medium" {
                 affected_symbols.first().map(|s| SuggestedNext {
                     tool: "callers".into(),
                     reason: "Medium-risk changes — spot-check key callers".into(),
                     args: Some(serde_json::json!({"symbol": s.name})),
+                    gate: None,
                 })
             } else if aggregate_risk == "unknown" {
                 suggested("indexing_status", "Risk unknown — check index state")
