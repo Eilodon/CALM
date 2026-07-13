@@ -1,6 +1,6 @@
 {
   "name": "@eilodon/calm-mcp-linux-x64",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "description": "Prebuilt calm (CALM MCP) binary for linux-x64 — platform package for @eilodon/calm-mcp, not meant to be installed directly",
   "license": "MIT",
   "repository": {

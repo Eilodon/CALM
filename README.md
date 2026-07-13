@@ -73,7 +73,7 @@ CALM is under continuous, active development — the language matrix, the concur
 | Client | Modes | Fastest install |
 |---|---|---|
 | **Claude Code** | CLI · Web · IDE | `claude mcp add --transport stdio calm -- npx -y @eilodon/calm-mcp serve` |
-| **VS Code** | IDE (native MCP / Copilot Agent mode) | edit `.vscode/mcp.json` (snippet below) |
+| **VS Code** | IDE (native MCP / Copilot Agent mode) | `code --add-mcp '{"name":"calm","command":"npx","args":["-y","@eilodon/calm-mcp","serve"]}'` |
 | **Cursor** | IDE · Cloud (Background Agent) | [Add to Cursor →](cursor://anysphere.cursor-deeplink/mcp/install?name=calm&config=eyJjb21tYW5kIjoibnB4IiwiYXJncyI6WyIteSIsIkBlaWxvZG9uL2NhbG0tbWNwIiwic2VydmUiXX0=) |
 | **Windsurf / Devin Desktop** | IDE · Cloud | edit `~/.codeium/windsurf/mcp_config.json` |
 | **Codex** (OpenAI) | CLI · IDE | `codex mcp add calm -- npx -y @eilodon/calm-mcp serve` |
@@ -97,7 +97,7 @@ Full walkthrough for every client above, including exact global-config snippets 
 
 Drop that into `.mcp.json` (Claude Code/Cursor) or `.vscode/mcp.json` (VS Code uses a top-level `"servers"` key instead of `"mcpServers"`, same shape otherwise) at your project root. Claude Code plugin instead: `/plugin marketplace add Eilodon/CALM` then `/plugin install calm@CALM`.
 
-Prefer a native binary over npx? `curl -fsSL https://raw.githubusercontent.com/Eilodon/CALM/main/scripts/install.sh | sh`, then run `calm setup` from inside your project — it writes the same MCP config automatically, pointing at the binary you just installed.
+Prefer a native binary over npx? `curl -fsSL https://raw.githubusercontent.com/Eilodon/CALM/main/scripts/install.sh | sh`, then run `calm setup` from inside your project — it writes the same MCP config automatically, pointing at the binary you just installed. Add `calm setup --npx` instead to write the portable `npx` entry (shareable/committable — teammates and CI don't need the binary, and it tracks the published release).
 
 **Developing on CALM itself** (this repo):
 

@@ -1,6 +1,6 @@
 {
   "name": "@eilodon/calm-mcp-darwin-arm64",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "description": "Prebuilt calm (CALM MCP) binary for darwin-arm64 (Apple Silicon) — platform package for @eilodon/calm-mcp, not meant to be installed directly",
   "license": "MIT",
   "repository": {

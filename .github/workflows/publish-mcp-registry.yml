@@ -1,20 +1,28 @@
 name: Publish to MCP Registry
 
-# Manual trigger, not on-push — the npm package this points at
-# (@eilodon/calm-mcp) is published by hand today (npm/README.md documents
-# why: a deliberate human sanity-check before any CI automation touches the
-# real npm registry). The MCP Registry's own validation checks that the
-# npm package at the given version already exists, so this must run *after*
-# that manual `npm publish`, not race it on the same tag push. Once npm
-# publishing itself moves to CI, this can switch to `on: push: tags:` in
-# the same job. Run with: gh workflow run publish-mcp-registry.yml -f
-# version=0.1.4
+# Two ways in:
+#   1. workflow_call — the release train (release.yml) invokes this right
+#      after its npm-publish job, so a tag push now publishes to the MCP
+#      Registry automatically. The registry validates that the npm package
+#      at `version` already exists, which is why it's chained *after*
+#      npm-publish, never racing it.
+#   2. workflow_dispatch — kept for manual re-pushes (e.g. re-registering a
+#      version whose metadata changed) without cutting a new release. Run
+#      with: gh workflow run publish-mcp-registry.yml -f version=0.2.0
+# Either accepts the version with or without a leading `v` (the release
+# train passes the raw tag, e.g. `v0.2.0`); the job strips it.
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version already published to npm as @eilodon/calm-mcp (e.g. 0.1.4)'
+        description: 'Version already published to npm as @eilodon/calm-mcp (e.g. 0.2.0)'
         required: true
+  workflow_call:
+    inputs:
+      version:
+        description: 'Tag or version already published to npm (e.g. v0.2.0 or 0.2.0)'
+        required: true
+        type: string
 
 jobs:
   publish:
@@ -29,6 +37,7 @@ jobs:
         env:
           VERSION: ${{ inputs.version }}
         run: |
+          VERSION="${VERSION#v}"   # accept both `v0.2.0` (release train) and `0.2.0`
           jq --arg v "$VERSION" \
             '.version = $v | .packages[0].version = $v' \
             server.json > server.tmp.json

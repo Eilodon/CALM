@@ -121,6 +121,13 @@ enum Commands {
         /// instead of leaving it alone
         #[arg(long)]
         force: bool,
+        /// Write a portable `npx -y @eilodon/calm-mcp serve` entry instead
+        /// of an absolute path to this binary. Use when the config will be
+        /// committed and shared (teammates/CI that don't have this exact
+        /// binary) or when you want it to track the published npm release
+        /// automatically. Requires Node wherever it runs.
+        #[arg(long)]
+        npx: bool,
     },
     /// Manually run one or every SCIP provider's indexer right now (P2.6),
     /// bypassing the configured refresh policy — e.g. to force a run for a
@@ -655,10 +662,16 @@ async fn main() -> Result<()> {
         Commands::Setup {
             project_root,
             force,
+            npx,
         } => {
             let root = std::fs::canonicalize(&project_root)?;
             let bin_path = std::env::current_exe()?;
-            let bin_str = bin_path.to_string_lossy().to_string();
+            let bin_str = bin_path.to_string_lossy().into_owned();
+
+            // `--npx` writes a portable `npx -y @eilodon/calm-mcp serve`
+            // entry (shareable, tracks the published npm release); the
+            // default points at this exact binary via `write_mcp_config`.
+            let npx_args = ["-y", "@eilodon/calm-mcp", "serve"];
 
             println!("Configuring MCP clients in {}", root.display());
             println!();
@@ -673,7 +686,12 @@ async fn main() -> Result<()> {
             ];
             for (rel_path, top_key) in TARGETS {
                 let path = root.join(rel_path);
-                match write_mcp_config(&path, top_key, &bin_str, force) {
+                let result = if npx {
+                    write_mcp_config_entry(&path, top_key, &calm_entry("npx", &npx_args), force)
+                } else {
+                    write_mcp_config(&path, top_key, &bin_str, force)
+                };
+                match result {
                     Ok(action) => println!("  {rel_path}: {action}"),
                     Err(e) => println!("  {rel_path}: skipped ({e})"),
                 }
@@ -686,25 +704,50 @@ async fn main() -> Result<()> {
                 this by hand:"
             );
             println!();
-            println!("{}", manual_mcp_config_snippet(&bin_str));
+            let snippet = if npx {
+                manual_mcp_config_snippet("npx", &npx_args)
+            } else {
+                manual_mcp_config_snippet(&bin_str, &["serve"])
+            };
+            println!("{snippet}");
         }
     }
 
     Ok(())
 }
 
-/// Merges a `"calm"` entry into `path`'s top-level `top_key` object,
-/// creating the file (and parent dirs) if needed. Never touches unrelated
-/// entries — `calm setup` may run in a project that already wires up other
-/// MCP servers. Leaves an existing, *different* "calm" entry alone unless
-/// `force` is set, so re-running this inside a checkout that deliberately
-/// points at something else (e.g. this repo's own scripts/mcp-launcher.sh,
-/// which adds freshness checks and a source-build fallback a raw binary
-/// path doesn't have) can't silently downgrade that wiring.
+/// Builds the `{ "command", "args" }` MCP entry every client config shares,
+/// so the absolute-binary form and the portable `npx` form differ only in
+/// which `command`/`args` get passed in here.
+fn calm_entry(command: &str, args: &[&str]) -> serde_json::Value {
+    serde_json::json!({ "command": command, "args": args })
+}
+
+/// Merges a `"calm"` entry pointing at `bin_path` (invoked with `serve`)
+/// into `path`'s top-level `top_key` object. Thin wrapper over
+/// `write_mcp_config_entry` for the common absolute-binary case; `calm setup
+/// --npx` builds a portable entry and calls the entry form directly.
 fn write_mcp_config(
     path: &std::path::Path,
     top_key: &str,
     bin_path: &str,
+    force: bool,
+) -> Result<&'static str> {
+    write_mcp_config_entry(path, top_key, &calm_entry(bin_path, &["serve"]), force)
+}
+
+/// Merges `new_entry` as the `"calm"` server under `path`'s top-level
+/// `top_key` object, creating the file (and parent dirs) if needed. Never
+/// touches unrelated entries — `calm setup` may run in a project that
+/// already wires up other MCP servers. Leaves an existing, *different*
+/// "calm" entry alone unless `force` is set, so re-running this inside a
+/// checkout that deliberately points at something else (e.g. this repo's own
+/// scripts/mcp-launcher.sh, which adds freshness checks and a source-build
+/// fallback a raw binary path doesn't have) can't silently downgrade it.
+fn write_mcp_config_entry(
+    path: &std::path::Path,
+    top_key: &str,
+    new_entry: &serde_json::Value,
     force: bool,
 ) -> Result<&'static str> {
     if let Some(parent) = path.parent() {
@@ -728,17 +771,16 @@ fn write_mcp_config(
         anyhow::anyhow!("existing \"{top_key}\" field isn't a JSON object — leaving it untouched")
     })?;
 
-    let new_entry = serde_json::json!({ "command": bin_path, "args": ["serve"] });
     let action = match servers_obj.get("calm") {
         None => "wrote",
-        Some(existing) if existing == &new_entry => "up to date",
+        Some(existing) if existing == new_entry => "up to date",
         Some(_) if !force => "exists — pass --force to overwrite",
         Some(_) => "updated",
     };
     if action == "up to date" || action.starts_with("exists") {
         return Ok(action);
     }
-    servers_obj.insert("calm".to_string(), new_entry);
+    servers_obj.insert("calm".to_string(), new_entry.clone());
     std::fs::write(
         path,
         format!("{}\n", serde_json::to_string_pretty(&root_value)?),
@@ -750,9 +792,14 @@ fn write_mcp_config(
 /// project-level) config file — Windsurf (`~/.codeium/windsurf/mcp_config.json`)
 /// and JetBrains AI Assistant (its own settings UI) — mirrors
 /// docs/mcp-client-setup.md's existing hand-written snippet for those two.
-fn manual_mcp_config_snippet(bin_path: &str) -> String {
+/// Takes the same `command`/`args` the project-level files got, so the
+/// printed snippet matches whichever form (`--npx` or absolute path) the
+/// caller chose.
+fn manual_mcp_config_snippet(command: &str, args: &[&str]) -> String {
+    let doc = serde_json::json!({ "mcpServers": { "calm": calm_entry(command, args) } });
     format!(
-        "{{\n  \"mcpServers\": {{\n    \"calm\": {{\n      \"command\": \"{bin_path}\",\n      \"args\": [\"serve\"]\n    }}\n  }}\n}}"
+        "{}\n",
+        serde_json::to_string_pretty(&doc).expect("static JSON is always serializable")
     )
 }
 
@@ -943,11 +990,43 @@ mod tests {
 
     #[test]
     fn manual_mcp_config_snippet_is_valid_json_with_command() {
-        let snippet = manual_mcp_config_snippet("/usr/local/bin/calm");
+        let snippet = manual_mcp_config_snippet("/usr/local/bin/calm", &["serve"]);
         let parsed: serde_json::Value = serde_json::from_str(&snippet).unwrap();
         assert_eq!(
             parsed["mcpServers"]["calm"]["command"],
             "/usr/local/bin/calm"
+        );
+        assert_eq!(
+            parsed["mcpServers"]["calm"]["args"],
+            serde_json::json!(["serve"])
+        );
+    }
+
+    #[test]
+    fn calm_entry_builds_npx_form() {
+        let entry = calm_entry("npx", &["-y", "@eilodon/calm-mcp", "serve"]);
+        assert_eq!(entry["command"], "npx");
+        assert_eq!(
+            entry["args"],
+            serde_json::json!(["-y", "@eilodon/calm-mcp", "serve"])
+        );
+    }
+
+    #[test]
+    fn write_mcp_config_entry_writes_npx_form() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".mcp.json");
+        let entry = calm_entry("npx", &["-y", "@eilodon/calm-mcp", "serve"]);
+
+        let action = write_mcp_config_entry(&path, "mcpServers", &entry, false).unwrap();
+
+        assert_eq!(action, "wrote");
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(written["mcpServers"]["calm"]["command"], "npx");
+        assert_eq!(
+            written["mcpServers"]["calm"]["args"],
+            serde_json::json!(["-y", "@eilodon/calm-mcp", "serve"])
         );
     }
 }
