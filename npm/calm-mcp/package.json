@@ -1,6 +1,6 @@
 {
   "name": "@eilodon/calm-mcp",
-  "version": "0.1.5",
+  "version": "0.2.0",
   "mcpName": "io.github.Eilodon/calm-mcp",
   "description": "CALM — Coding Agent Liveness Map MCP server (Rust binary, no toolchain required to run it)",
   "license": "MIT",
@@ -19,8 +19,8 @@
     "node": ">=16"
   },
   "optionalDependencies": {
-    "@eilodon/calm-mcp-linux-x64": "0.1.4",
-    "@eilodon/calm-mcp-linux-arm64": "0.1.4",
-    "@eilodon/calm-mcp-darwin-arm64": "0.1.4"
+    "@eilodon/calm-mcp-linux-x64": "0.2.0",
+    "@eilodon/calm-mcp-linux-arm64": "0.2.0",
+    "@eilodon/calm-mcp-darwin-arm64": "0.2.0"
   }
 }

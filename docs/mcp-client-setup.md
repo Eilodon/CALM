@@ -47,10 +47,10 @@ publish/kiểm tra package này.
 
 ### 3. Lệnh CLI add-server 1 dòng (client tự có sẵn, không cần sửa file tay)
 
-Không cần biết trước path file config — 2 client dưới đây tự ghi config
-đúng chỗ chỉ với 1 lệnh, đủ ngắn để chính agent (Claude/Codex, khi có quyền
-chạy shell) tự thực thi thay người dùng nếu được yêu cầu kiểu "cài CALM của
-Eilodon cho tui":
+Không cần biết trước path file config — 3 client dưới đây tự ghi config
+đúng chỗ chỉ với 1 lệnh, đủ ngắn để chính agent (Claude/Codex/VS Code, khi
+có quyền chạy shell) tự thực thi thay người dùng nếu được yêu cầu kiểu "cài
+CALM của Eilodon cho tui":
 
 ```bash
 # Claude Code
@@ -58,9 +58,12 @@ claude mcp add --transport stdio calm -- npx -y @eilodon/calm-mcp serve
 
 # Codex CLI
 codex mcp add calm -- npx -y @eilodon/calm-mcp serve
+
+# VS Code (ghi thẳng vào user profile, không cần mở file config)
+code --add-mcp '{"name":"calm","command":"npx","args":["-y","@eilodon/calm-mcp","serve"]}'
 ```
 
-Cursor/VS Code/Windsurf/Antigravity chưa có lệnh CLI tương đương — nhưng vì
+Cursor/Windsurf/Antigravity chưa có lệnh CLI tương đương — nhưng vì
 agent của các tool này (ở chế độ agent/agentic mode) đều có quyền ghi file,
 agent vẫn tự sửa được đúng file config (`.cursor/mcp.json`,
 `.vscode/mcp.json`, `~/.codeium/windsurf/mcp_config.json`,
@@ -82,6 +85,11 @@ bạn từng dùng launcher script) thì `calm setup` mặc định để yên, 
 `calm setup --force` nếu thật sự muốn ghi đè. Windsurf/JetBrains vẫn phải dán
 tay (xem 2 phần riêng bên dưới) vì đó là global config, không phải
 project-level.
+
+Muốn config **portable/chia sẻ được** (commit `.mcp.json` vào repo cho cả
+team/CI, không phụ thuộc path binary trên máy bạn): `calm setup --npx` ghi
+entry dạng `npx -y @eilodon/calm-mcp serve` thay vì đường dẫn tuyệt đối — tự
+bám theo bản npm đã publish, chỉ cần Node ở nơi chạy.
 
 ## Launcher resolve binary theo 3 tầng
 

@@ -122,3 +122,55 @@ jobs:
           tags: |
             ghcr.io/eilodon/calm-mcp:${{ steps.version.outputs.version }}
             ghcr.io/eilodon/calm-mcp:latest
+
+  # Auto-publish the npm distribution once the GitHub Release for this tag
+  # exists (stage-release.sh downloads its assets — hence `needs: release`).
+  # This was deliberately manual until the first publish had been proven by
+  # hand (npm/README.md); v0.1.4 cleared that bar, so it now runs in CI,
+  # gated only on the NPM_TOKEN repo secret. Kept independent of build/docker
+  # so a missing/expired token can't block the GitHub Release itself — this
+  # job just fails visibly on 401 until the secret is (re)added.
+  npm-publish:
+    name: Publish npm packages
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      # GitHub masks secrets in logs; the token only lands in $HOME/.npmrc on
+      # the ephemeral runner. ubuntu-latest already ships node + npm.
+      - name: Authenticate to npm
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > "$HOME/.npmrc"
+
+      # Downloads all 3 platform binaries from THIS tag's release + stamps
+      # every package.json under npm/ (wrapper's optionalDependencies pins
+      # included) to the tag version — fixing any wrapper/platform version
+      # skew automatically at publish time.
+      - name: Stage platform binaries + versions from this tag's release
+        run: npm/stage-release.sh "${GITHUB_REF_NAME}"
+
+      # Platform packages first so the wrapper's optionalDependencies are
+      # already resolvable the instant anyone installs it (npm/README.md).
+      - name: Publish platform packages, then the wrapper
+        run: |
+          for pkg in calm-mcp-linux-x64 calm-mcp-linux-arm64 calm-mcp-darwin-arm64 calm-mcp; do
+            ( cd "npm/$pkg" && npm publish --access public )
+          done
+
+  # Register the just-published version's metadata in the official MCP
+  # Registry so cold clients (VS Code / Cursor / Claude Code registry search)
+  # can discover CALM by name. Runs after npm-publish because the registry
+  # validates that the npm package at this version already exists. Reuses the
+  # standalone publish-mcp-registry.yml (still runnable by hand for re-pushes)
+  # via workflow_call so the mcp-publisher logic lives in exactly one place.
+  mcp-registry:
+    name: Publish to MCP Registry
+    needs: npm-publish
+    permissions:
+      id-token: write # OIDC auth to the registry — this repo's identity
+      contents: read
+    uses: ./.github/workflows/publish-mcp-registry.yml
+    with:
+      version: ${{ github.ref_name }}

@@ -10,10 +10,12 @@ uses (esbuild, swc, ripgrep wrappers): a thin JS entrypoint package
 installs only the one matching binary for whoever's running it — no
 postinstall network fetch, no arbitrary script execution.
 
-**Nothing here is published automatically yet** — this is intentionally a
-manual first publish (see the memory note this was scoped from) so the
-package name/scope gets a human sanity check against the real registry
-before any CI automation is wired to it.
+**Publishing is now automated in CI** — `.github/workflows/release.yml`'s
+`npm-publish` job runs `stage-release.sh` + `npm publish` on every `vX.Y.Z`
+tag (gated on the `NPM_TOKEN` repo secret), then chains the MCP Registry
+publish. The manual steps below stay valid as a first-time reference and for
+out-of-band re-publishes; the very first publish (v0.1.4) was done by hand as
+a deliberate human sanity check before the automation was wired in.
 
 ## Migration from `@eilodon/ci-mcp`
 
@@ -79,10 +81,12 @@ node bin/calm-mcp.js --version          # only works once a platform package's
                                         # or a manual node_modules symlink
 ```
 
-## Once this is stable: adding CI automation
+## CI automation (now wired)
 
-If/when the manual flow above has been run at least once successfully, the
-natural next step is a `release.yml` job that runs `stage-release.sh` +
-`npm publish` automatically, gated on an `NPM_TOKEN` repo secret — deferred
-for now by deliberate choice, not an oversight; see the `oss-launch-distribution`
-project memory for why.
+`release.yml` runs `stage-release.sh` + `npm publish` for all four packages
+automatically on a `vX.Y.Z` tag push, gated on an `NPM_TOKEN` repo secret (an
+npm automation token for the `@eilodon` scope). Add that secret once (Settings
+→ Secrets and variables → Actions) to arm it; without it the `npm-publish` job
+fails visibly on 401 while the GitHub Release itself still succeeds. The
+`mcp-registry` job then registers the version metadata. The manual flow above
+remains the fallback for re-publishing a version out of band.

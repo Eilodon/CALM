@@ -223,7 +223,7 @@ checksum = "8ae3f5d315924270530207e2a68396c3cc547f6dca3fbdca317cfb1a51edb593"
 
 [[package]]
 name = "calm-cli"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "calm-core",
@@ -240,7 +240,7 @@ dependencies = [
 
 [[package]]
 name = "calm-core"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "fs4",
@@ -300,7 +300,7 @@ dependencies = [
 
 [[package]]
 name = "calm-server"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "calm-core",
