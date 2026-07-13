@@ -136,11 +136,44 @@ fn rel_path(project_root: &Path, file: &Path) -> String {
         .replace('\\', "/")
 }
 
+/// Which graph-rebuild path a non-noop reindex actually took. `Full` is the
+/// only variant that exists before Phase B T4 wires `incremental_graph_update`
+/// in — `Incremental`/`FullFallback` are plumbed now (Phase B T3) so
+/// `ReindexSummary`'s shape doesn't change again when T4 lands, but nothing
+/// constructs them yet. See docs/plans/2026-07-13-phase-b-incremental-graph-update.md §4 T3/T4.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum GraphMode {
+    #[default]
+    Full,
+    Incremental,
+    /// delta too large / flag off / etc. — human-readable, not matched on.
+    FullFallback(String),
+}
+
 /// Result of an incremental reindex pass.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct ReindexSummary {
     pub changed: usize,
     pub deleted: usize,
+    /// Every path `remove_file_rows` ran against this pass — both
+    /// content-changed (still on disk) and deleted files, i.e. exactly
+    /// Phase B plan §3's `delta_seed = changed ∪ deleted rel_paths`. One flat
+    /// list rather than two separate vecs since nothing downstream needs the
+    /// changed/deleted split — `summary.changed`/`summary.deleted` above
+    /// already carry those counts.
+    pub changed_paths: Vec<String>,
+    /// Phase B plan D2: `old_names ∪ new_names` for every path in
+    /// `changed_paths` — `old_names` read from `symbols` before
+    /// `remove_file_rows` clears them, `new_names` from the freshly parsed
+    /// `ExtractedFile.symbols` (no second SELECT). Union, not symmetric
+    /// difference: a signature-only change (name unchanged) still needs its
+    /// name in here so return-shape-filter-dependent sites elsewhere
+    /// re-resolve — see D2's full proof in the plan doc.
+    pub names_delta: HashSet<String>,
+    /// Which rebuild path this pass took — `Full` unconditionally until
+    /// Phase B T4 wires incremental in. Left at `GraphMode::default()`
+    /// (`Full`) when the pass was a no-op (no rebuild ran at all).
+    pub graph_mode: GraphMode,
 }
 
 impl ReindexSummary {
@@ -158,6 +191,17 @@ fn remove_file_rows(tx: &rusqlite::Transaction, rel: &str) -> rusqlite::Result<(
     tx.execute("DELETE FROM file_index WHERE path = ?1", [rel])?;
     tx.execute("DELETE FROM code_chunks WHERE path = ?1", [rel])?;
     Ok(())
+}
+
+/// Bare `name`s currently persisted for `path`, read BEFORE
+/// `remove_file_rows` clears them — the `old_names` half of Phase B plan
+/// D2's `names_delta = old_names ∪ new_names` union; the `new_names` half
+/// comes straight from a freshly parsed `ExtractedFile.symbols`, no second
+/// SELECT needed there.
+fn names_for_path(tx: &rusqlite::Transaction, path: &str) -> rusqlite::Result<HashSet<String>> {
+    let mut stmt = tx.prepare("SELECT DISTINCT name FROM symbols WHERE path = ?1")?;
+    stmt.query_map([path], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<HashSet<String>>>()
 }
 
 /// `lang` is `None` for a recognized-but-unparsed extension (see
@@ -1754,8 +1798,12 @@ pub fn reindex_changed_cancellable(
             .collect();
 
         for (c, data) in &extracted {
+            summary.names_delta.extend(names_for_path(&tx, &c.rel)?);
             remove_file_rows(&tx, &c.rel)?;
             if let Some(data) = data {
+                summary
+                    .names_delta
+                    .extend(data.symbols.iter().map(|s| s.name.clone()));
                 persist_file(&tx, &c.rel, &c.hash, data)?;
             }
             upsert_file_index(
@@ -1768,13 +1816,16 @@ pub fn reindex_changed_cancellable(
                 now,
             )?;
             summary.changed += 1;
+            summary.changed_paths.push(c.rel.clone());
         }
     }
 
     for path in existing.keys() {
         if !seen_paths.contains(path) {
+            summary.names_delta.extend(names_for_path(&tx, path)?);
             remove_file_rows(&tx, path)?;
             summary.deleted += 1;
+            summary.changed_paths.push(path.clone());
         }
     }
 
@@ -1787,6 +1838,7 @@ pub fn reindex_changed_cancellable(
             &psr4,
             &namespace_map,
         )?;
+        summary.graph_mode = GraphMode::Full;
     }
     tx.commit()?;
     Ok(ReindexOutcome::Completed(summary))
@@ -1840,8 +1892,10 @@ pub fn reindex_paths(
 
         if !abs.exists() {
             if existing_hash.is_some() {
+                summary.names_delta.extend(names_for_path(&tx, rel)?);
                 remove_file_rows(&tx, rel)?;
                 summary.deleted += 1;
+                summary.changed_paths.push(rel.clone());
             }
             continue;
         }
@@ -1869,8 +1923,12 @@ pub fn reindex_paths(
         }
 
         let data = lang.map(|lang| extract_file_data(rel, lang, &source, &config.entry_points, &formal));
+        summary.names_delta.extend(names_for_path(&tx, rel)?);
         remove_file_rows(&tx, rel)?;
         if let Some(data) = &data {
+            summary
+                .names_delta
+                .extend(data.symbols.iter().map(|s| s.name.clone()));
             persist_file(&tx, rel, &hash, data)?;
         }
         upsert_file_index(
@@ -1883,6 +1941,7 @@ pub fn reindex_paths(
             now,
         )?;
         summary.changed += 1;
+        summary.changed_paths.push(rel.clone());
     }
 
     if !summary.is_noop() {
@@ -1894,6 +1953,7 @@ pub fn reindex_paths(
             &psr4,
             &namespace_map,
         )?;
+        summary.graph_mode = GraphMode::Full;
     }
     tx.commit()?;
     Ok(summary)
@@ -4033,11 +4093,8 @@ impl StructB {
         std::fs::write(dir.join("a.py"), original).unwrap();
         let s = reindex_changed(&mut conn, &dir).unwrap();
         assert_eq!(
-            s,
-            ReindexSummary {
-                changed: 1,
-                deleted: 0
-            },
+            (s.changed, s.deleted),
+            (1, 0),
             "a revert to prior content is still a content-hash change and must be picked up"
         );
         assert_eq!(
@@ -4078,13 +4135,7 @@ impl StructB {
         // Add a second file that calls helper → new symbol + cross-file edge.
         std::fs::write(dir.join("b.py"), "def caller():\n    helper()\n").unwrap();
         let s = reindex_changed(&mut conn, &dir).unwrap();
-        assert_eq!(
-            s,
-            ReindexSummary {
-                changed: 1,
-                deleted: 0
-            }
-        );
+        assert_eq!((s.changed, s.deleted), (1, 0));
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM symbols"), 2);
         assert_eq!(
             count(
@@ -4097,13 +4148,7 @@ impl StructB {
         // Modify b.py to no longer call helper → edge drops, caller_count → 0.
         std::fs::write(dir.join("b.py"), "def caller():\n    pass\n").unwrap();
         let s = reindex_changed(&mut conn, &dir).unwrap();
-        assert_eq!(
-            s,
-            ReindexSummary {
-                changed: 1,
-                deleted: 0
-            }
-        );
+        assert_eq!((s.changed, s.deleted), (1, 0));
         assert_eq!(
             count(
                 &conn,
@@ -4115,13 +4160,7 @@ impl StructB {
         // Delete b.py → its symbol disappears.
         std::fs::remove_file(dir.join("b.py")).unwrap();
         let s = reindex_changed(&mut conn, &dir).unwrap();
-        assert_eq!(
-            s,
-            ReindexSummary {
-                changed: 0,
-                deleted: 1
-            }
-        );
+        assert_eq!((s.changed, s.deleted), (0, 1));
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM symbols"), 1);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -4165,13 +4204,7 @@ impl StructB {
         .unwrap();
         std::fs::write(dir.join("b.py"), "def other():\n    pass\n").unwrap();
         let s = reindex_changed(&mut conn, &dir).unwrap();
-        assert_eq!(
-            s,
-            ReindexSummary {
-                changed: 2,
-                deleted: 0
-            }
-        );
+        assert_eq!((s.changed, s.deleted), (2, 0));
 
         // Exactly one chunk per file — the stale a.py chunk was replaced, not
         // accumulated alongside the new one.
@@ -4195,13 +4228,7 @@ impl StructB {
         // Delete a.py → its chunk disappears; b.py's chunk is untouched.
         std::fs::remove_file(dir.join("a.py")).unwrap();
         let s = reindex_changed(&mut conn, &dir).unwrap();
-        assert_eq!(
-            s,
-            ReindexSummary {
-                changed: 0,
-                deleted: 1
-            }
-        );
+        assert_eq!((s.changed, s.deleted), (0, 1));
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM code_chunks"), 1);
         assert_eq!(
             count(
