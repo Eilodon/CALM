@@ -141,11 +141,22 @@ impl CalmServer {
                     |r| r.get(0),
                 )
                 .unwrap_or(0);
+            // Root-cause fix for the F10 calibration bug: repo_overview is
+            // mandatory-first-call-per-session (AGENTS.md Stage 1), which
+            // makes it the one place an agent is guaranteed to see a local
+            // config.json/.calm/config.json override before trusting any
+            // hub/calibration-sensitive number this server reports.
+            let config_override = calm_core::config::resolve_config_path(&self.project_root)
+                .map(|path| ConfigOverrideSummary {
+                    source: path.display().to_string(),
+                    overridden_fields: calm_core::config::diff_from_default(&self.config()),
+                });
             let health_summary = HealthSummary {
                 hub_count,
                 hub_degree_count,
                 hub_bridge_count,
                 edges_ready: self.edges_ready(),
+                config_override,
             };
 
             // Count only, never content — deliberately not auto-surfacing note
@@ -248,7 +259,8 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
                 suggested_next: self.filter_sn(sn),
             })
         }))
-    }    #[tool(
+    }
+    #[tool(
         name = "hotspots",
         description = "Proactive churn × complexity analysis. USE WHEN: starting exploration of a codebase or after orientation to identify high-risk files before diving in.",
         annotations(
@@ -510,8 +522,25 @@ pub(crate) struct HealthSummary {
     pub(crate) hub_degree_count: i64,
     pub(crate) hub_bridge_count: i64,
     pub(crate) edges_ready: bool,
+    /// Root-cause fix for the F10 calibration bug: surfaces a local
+    /// `config.json`/`.calm/config.json` override that silently shadows
+    /// `Config::default()` (previously zero visibility outside a server
+    /// log line). `None` when no override file exists — the common case.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) config_override: Option<ConfigOverrideSummary>,
 }
 
+#[derive(Serialize, JsonSchema)]
+pub(crate) struct ConfigOverrideSummary {
+    /// Path of the config.json/.calm/config.json file being read.
+    pub(crate) source: String,
+    /// Dot-separated field paths (e.g. `"hub_threshold.min_callers_bridge"`)
+    /// that differ from `Config::default()`. Can be empty when an override
+    /// file exists but happens to match every default right now — still
+    /// worth surfacing `source`, since it will silently start overriding
+    /// the moment a code-level default next changes.
+    pub(crate) overridden_fields: Vec<String>,
+}
 #[derive(Deserialize, JsonSchema)]
 pub(crate) struct RepoOverviewParams {
     /// Plan 3 §3.5(a): trims a repeat-call response down to the parts that

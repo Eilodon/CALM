@@ -700,7 +700,7 @@ pub fn load_config(project_root: &Path) -> anyhow::Result<Config> {
 /// exists — single source of truth for that resolution order so
 /// `config_mtime` (audit F12's cache-key helper) can never drift from
 /// what `load_config` itself would actually load.
-fn resolve_config_path(project_root: &Path) -> Option<std::path::PathBuf> {
+pub fn resolve_config_path(project_root: &Path) -> Option<std::path::PathBuf> {
     [
         project_root.join("config.json"),
         project_root.join(".calm").join("config.json"),
@@ -708,7 +708,6 @@ fn resolve_config_path(project_root: &Path) -> Option<std::path::PathBuf> {
     .into_iter()
     .find(|p| p.exists())
 }
-
 /// mtime of whichever config file `load_config` would currently read
 /// (`None` when neither exists) — a cache-invalidation key: unchanged
 /// mtime means the previously-loaded `Config` is still current, without
@@ -718,6 +717,49 @@ fn resolve_config_path(project_root: &Path) -> Option<std::path::PathBuf> {
 /// human timescale, not by an automated rewrite loop.
 pub fn config_mtime(project_root: &Path) -> Option<std::time::SystemTime> {
     resolve_config_path(project_root).and_then(|p| std::fs::metadata(p).ok()?.modified().ok())
+}
+
+/// Root-cause fix for the F10 calibration bug: a local `config.json`/
+/// `.calm/config.json` can silently override any nested field of
+/// `Config::default()` (struct-level `#[serde(default)]` means the file
+/// only needs to mention the fields it overrides), with previously zero
+/// visibility into which fields were actually shadowed. Diffs `loaded`
+/// against `Config::default()` generically via `serde_json::Value` (dot-
+/// separated field paths, e.g. `"hub_threshold.min_callers_bridge"`) so
+/// this never rots when new `Config` fields are added later — no manual
+/// `PartialEq`/diff maintenance required.
+pub fn diff_from_default(loaded: &Config) -> Vec<String> {
+    let default_value = serde_json::to_value(Config::default()).unwrap_or(serde_json::Value::Null);
+    let loaded_value = serde_json::to_value(loaded).unwrap_or(serde_json::Value::Null);
+    let mut paths = Vec::new();
+    collect_diff_paths(&default_value, &loaded_value, "", &mut paths);
+    paths
+}
+
+fn collect_diff_paths(
+    default: &serde_json::Value,
+    loaded: &serde_json::Value,
+    prefix: &str,
+    out: &mut Vec<String>,
+) {
+    if let (serde_json::Value::Object(d), serde_json::Value::Object(l)) = (default, loaded) {
+        let mut keys: Vec<&String> = d.keys().chain(l.keys()).collect();
+        keys.sort();
+        keys.dedup();
+        for key in keys {
+            let next_prefix = if prefix.is_empty() {
+                key.clone()
+            } else {
+                format!("{prefix}.{key}")
+            };
+            match (d.get(key), l.get(key)) {
+                (Some(dv), Some(lv)) => collect_diff_paths(dv, lv, &next_prefix, out),
+                _ => out.push(next_prefix),
+            }
+        }
+    } else if default != loaded {
+        out.push(prefix.to_string());
+    }
 }
 pub fn default_config_json() -> String {
     serde_json::to_string_pretty(&Config::default()).unwrap_or_default()
@@ -856,6 +898,33 @@ mod tests {
         f.set_modified(later).unwrap();
 
         assert_eq!(crate::config::config_mtime(&tmp), Some(later));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn diff_from_default_is_empty_for_pure_defaults() {
+        assert!(diff_from_default(&Config::default()).is_empty());
+    }
+
+    #[test]
+    fn diff_from_default_reports_only_the_overridden_nested_field() {
+        // Regression test for the F10 calibration bug: a config.json that
+        // only overrides one nested field (hub_threshold.min_callers_bridge)
+        // must be reported precisely -- not the whole hub_threshold object,
+        // and nothing from unrelated sections.
+        let tmp = std::env::temp_dir().join(format!("ci_cfg_diff_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(
+            tmp.join("config.json"),
+            r#"{"hub_threshold": {"min_callers_bridge": 2}}"#,
+        )
+        .unwrap();
+
+        let loaded = load_config(&tmp).unwrap();
+        let diff = diff_from_default(&loaded);
+        assert_eq!(diff, vec!["hub_threshold.min_callers_bridge".to_string()]);
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

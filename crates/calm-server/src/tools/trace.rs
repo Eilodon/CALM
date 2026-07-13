@@ -536,7 +536,8 @@ impl CalmServer {
                 suggested_next: self.filter_sn(sn),
             })
         }))
-    }    #[tool(
+    }
+    #[tool(
         name = "path",
         description = "USE WHEN: you need to trace if and how symbol A can reach symbol B through call chain. Bidirectional BFS — cycles terminate cleanly. path is DIRECTED: A→B ≠ B→A. terminated_by=null + exists=true/false → certain result.",
         annotations(
