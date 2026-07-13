@@ -103,18 +103,32 @@ pub struct HubThresholdConfig {
 
 /// Phase B (`docs/plans/2026-07-13-phase-b-incremental-graph-update.md`)
 /// indexing-pipeline flags.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct IndexingConfig {
     /// Route `reindex_paths`/`reindex_changed_cancellable`'s non-noop passes
-    /// through `incremental_graph_update` (scoped re-resolve) instead of the
-    /// full `rebuild_graph` sweep. Default `false` per plan D8: this whole
-    /// code path stays dead weight, never executed by any build, until it
-    /// has passed golden-equivalence on a real indexed DB (plan T6) and this
-    /// default flips. `calm index` (CLI one-shot / fresh index) always goes
-    /// through `run_indexing_pipeline_cancellable`, which never reads this
-    /// flag — a permanent full-rebuild escape hatch independent of it.
+    /// through `incremental_graph_update` (scoped re-resolve, keeping the
+    /// formal edges of unchanged files alive) instead of the full
+    /// `rebuild_graph` sweep. Default `true` since plan T6: golden-
+    /// equivalence (incremental == full) passed on both the fixture driver
+    /// and a copy of the real CALM DB, and live dogfooding put the
+    /// reindex+graph path at 88–188 ms vs ~337 ms for a full rebuild. `calm
+    /// index` (CLI one-shot / fresh index) always goes through
+    /// `run_indexing_pipeline_cancellable`, which never reads this flag — a
+    /// permanent full-rebuild path. Set `false` in config.json to force
+    /// every reindex back to full rebuild (the rollback switch).
     pub incremental_graph: bool,
+}
+
+impl Default for IndexingConfig {
+    fn default() -> Self {
+        // Flipped false → true at plan T6 (see the field's doc comment) once
+        // golden-equivalence passed on the real indexed DB — before that,
+        // this whole code path was dead weight no build ever executed.
+        Self {
+            incremental_graph: true,
+        }
+    }
 }
 
 impl Default for HubThresholdConfig {
@@ -974,5 +988,23 @@ mod scip_config_tests {
         let json = r#"{"rust":{"scip":{"enabled":false}}}"#;
         let c: Config = serde_json::from_str(json).unwrap();
         assert_eq!(c.rust.scip.enabled, Some(false));
+    }
+
+    #[test]
+    fn incremental_graph_defaults_on_and_opt_out_parses() {
+        // Plan T6.4 flipped this default false → true after golden-equivalence
+        // passed on the real DB. Lock both: the default, and that config.json
+        // can still force it off (the rollback switch).
+        assert!(
+            IndexingConfig::default().incremental_graph,
+            "default must be true since T6.4"
+        );
+        assert!(Config::default().indexing.incremental_graph);
+        let off: Config =
+            serde_json::from_str(r#"{"indexing":{"incremental_graph":false}}"#).unwrap();
+        assert!(
+            !off.indexing.incremental_graph,
+            "config.json must be able to force it off"
+        );
     }
 }

@@ -937,7 +937,9 @@ fn flag_off_is_bitwise_full_rebuild() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("ws");
     copy_dir_recursive(&fixture_root(), &root);
-    // Deliberately no enable_incremental_graph(&root) call — default is off.
+    // Flag forced OFF explicitly — since plan T6.4 the compile-time default
+    // is `true`, so this must actively disable to keep testing the OFF path.
+    disable_incremental_graph(&root);
 
     let mut db = index_fresh(&root);
     write_seed_files(&root);
