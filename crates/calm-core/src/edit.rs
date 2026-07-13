@@ -135,6 +135,28 @@ pub fn range_checksum(content: &str, start_line: usize, end_line: usize) -> Opti
     Some(hash_content(&lines[start_line - 1..end_line].concat()))
 }
 
+/// Render `body` (already sanitized) with `cat -n`-style absolute
+/// line-number gutters, matching the `<n>\t<line>` shape a coding agent
+/// reads from a native file read — so a CALM `source` read is directly
+/// usable to pick an `edit_lines`/`edit_symbol` hunk without counting
+/// lines by hand. `first_line` is the 1-indexed absolute line number of
+/// `body`'s first line (a symbol's `line_start`, or a range read's start).
+///
+/// Gutters are added AFTER sanitize/injection detection so they are never
+/// scanned as content, and they never affect the etag — which hashes the
+/// raw file range (`range_checksum`), independent of this rendering. An
+/// empty `body` renders to an empty string.
+pub fn with_line_gutters(body: &str, first_line: i64) -> String {
+    if body.is_empty() {
+        return String::new();
+    }
+    body.lines()
+        .enumerate()
+        .map(|(i, line)| format!("{}\t{}", first_line + i as i64, line))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Byte-faithful line split: each element keeps its own line terminator
 /// (`\n`, or `\r\n` since `\r` isn't a split point and stays attached to
 /// the preceding text), and the final element has none if the file doesn't
@@ -473,6 +495,23 @@ mod tests {
         let content = "a\nb\n";
         assert_eq!(range_checksum(content, 1, 5), None);
         assert_eq!(range_checksum(content, 0, 1), None);
+    }
+
+    #[test]
+    fn test_with_line_gutters_numbers_from_first_line() {
+        // Absolute numbering starts at `first_line`, tab-separated, matching
+        // the `<n>\t<line>` shape a native file read emits.
+        let body = "fn foo() {\n    bar();\n}";
+        assert_eq!(
+            with_line_gutters(body, 64),
+            "64\tfn foo() {\n65\t    bar();\n66\t}"
+        );
+        // Empty body renders to empty (no phantom "1\t" line).
+        assert_eq!(with_line_gutters("", 5), "");
+        // A blank interior line still gets its own number.
+        assert_eq!(with_line_gutters("a\n\nb", 1), "1\ta\n2\t\n3\tb");
+        // Single line.
+        assert_eq!(with_line_gutters("solo", 42), "42\tsolo");
     }
 
     #[test]
