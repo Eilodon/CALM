@@ -575,20 +575,44 @@ fn persist_file(
 ///
 /// This is pure DB work (no file parsing), so incremental passes only re-parse
 /// the files that actually changed while the graph stays globally consistent.
-fn rebuild_graph(
+// (qualified_name, path, language) — candidate list entry shared by
+// `by_name`/`by_name_class` lookups in `ResolutionCtx`.
+type SymbolCandidate = (String, String, String);
+
+/// Per-site candidate lookup tables shared by every call site in one
+/// resolution pass — built once via `build_resolution_context`, consumed by
+/// `resolve_sites_to_edges`. Split out of `rebuild_graph` (Phase B plan D4,
+/// docs/plans/2026-07-13-phase-b-incremental-graph-update.md) so
+/// `incremental_graph_update` can reuse the exact same resolution logic
+/// instead of a second, divergence-prone copy.
+struct ResolutionCtx<'a> {
+    by_name: HashMap<String, Vec<SymbolCandidate>>,
+    by_name_class: HashMap<(String, String), Vec<SymbolCandidate>>,
+    sig_by_qn: HashMap<String, String>,
+    path_lang: HashMap<String, String>,
+    caller_usings: HashMap<String, HashSet<String>>,
+    namespace_map: &'a crate::indexer::csharp_namespace::NamespaceMap,
+}
+
+/// Build the candidate-lookup tables `resolve_sites_to_edges` narrows
+/// against: `by_name`/`by_name_class` (bare-name and `Type::method` lookup),
+/// `sig_by_qn` (return-shape filter), `path_lang` (same-language filter),
+/// `caller_usings` (C# same-namespace filter). One global `SELECT` over
+/// `symbols`/`import_edges` — same cost whether the caller is about to
+/// resolve every site (`rebuild_graph`) or only a delta
+/// (`incremental_graph_update`, Phase B plan §3 step 5: resolution inputs
+/// like a candidate's own signature can change even when the *site* calling
+/// it didn't, so the lookup tables themselves are never scoped to the delta).
+fn build_resolution_context<'a>(
     tx: &rusqlite::Transaction,
-    hub_config: &crate::config::HubThresholdConfig,
-    crate_map: &crate::indexer::crate_map::CrateMap,
-    psr4: &crate::indexer::psr4::Psr4Map,
-    namespace_map: &crate::indexer::csharp_namespace::NamespaceMap,
-) -> rusqlite::Result<()> {
+    namespace_map: &'a crate::indexer::csharp_namespace::NamespaceMap,
+) -> rusqlite::Result<ResolutionCtx<'a>> {
     // name → [(qn, path, language)] for tier-1; (name, class) → [(qn, path,
     // language)] for tier-2. `language` rides along so a call site can never
     // resolve to a same-named symbol written in a different language (see
     // `path_lang` and the same-language filter below) — a bare-name/textual
     // match across languages is never a real call, just an incidental name
     // collision (e.g. a Rust `new` and a Python `new` sharing `by_name`).
-    type SymbolCandidate = (String, String, String); // (qualified_name, path, language)
     let mut by_name: HashMap<String, Vec<SymbolCandidate>> = HashMap::new();
     let mut by_name_class: HashMap<(String, String), Vec<SymbolCandidate>> = HashMap::new();
     // qualified_name → signature, so the `MAX_CALLEE_CANDIDATES` fallback below
@@ -634,28 +658,6 @@ fn rebuild_graph(
         }
     }
 
-    let sites: Vec<CallSiteRow> = {
-        let mut stmt = tx.prepare(
-            "SELECT from_path, enclosing_qn, callee_name, call_line, confidence, target_class, \
-                    looks_option_or_result_chained, module_hint, edge_kind \
-             FROM call_sites",
-        )?;
-        stmt.query_map([], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, Option<i64>>(3)?,
-                r.get::<_, String>(4)?,
-                r.get::<_, Option<String>>(5)?,
-                r.get::<_, i64>(6)? != 0,
-                r.get::<_, Option<String>>(7)?,
-                r.get::<_, String>(8)?,
-            ))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?
-    };
-
     // C# `using X;` directives, per caller file — feeds the same-namespace
     // candidate narrowing below (8-language plan P1.5's "using -> namespace"
     // remainder). `import_edges` is already populated by this point (this
@@ -679,11 +681,36 @@ fn rebuild_graph(
         }
     }
 
+    Ok(ResolutionCtx {
+        by_name,
+        by_name_class,
+        sig_by_qn,
+        path_lang,
+        caller_usings,
+        namespace_map,
+    })
+}
+
+/// Narrow every call site in `sites` against `ctx` and produce the final,
+/// deduped `CallEdge` list — a pure function of `(ctx, sites)` with no DB
+/// access (the caller owns the DELETE/INSERT scope, letting `rebuild_graph`
+/// clear all edges and `incremental_graph_update`, Phase B T4, clear only
+/// `from_path IN delta_paths`, per plan D1/D4). Shared unchanged by both, so
+/// resolution logic can never diverge between full and incremental runs.
+///
+/// `sites` order matters: `seen_pairs` dedup below keeps the FIRST site's
+/// line/confidence per (caller, callee) pair ("first call site wins"), so
+/// callers MUST load `sites` in a stable, explicit order (`ORDER BY id`) —
+/// an unordered `SELECT` relies on SQLite's incidental full-table-scan
+/// (rowid) order, which silently breaks the moment a `WHERE` clause makes
+/// the query planner prefer an index instead (exactly what incremental's
+/// delta-scoped load does) — see Phase B plan A-3.
+fn resolve_sites_to_edges(ctx: &ResolutionCtx, sites: &[CallSiteRow]) -> Vec<CallEdge> {
     // One edge per (caller, callee, call-site line) — distinct sites in the same caller stay separate (so `callers`/`callees` show every site); exact same-line dupes are deduped.
     // Confidence is the resolver's verdict recorded at extraction time. A tier-2
     // call (target_class set) resolves the method within that class only.
     //
-    // Candidate lookup (HashMap reads against `by_name`/`by_name_class`) is pure
+    // Candidate lookup (HashMap reads against `ctx.by_name`/`ctx.by_name_class`) is pure
     // CPU work independent per site, so it runs in parallel; the dedup merge
     // below stays sequential, walking sites in their original order so the
     // "first call site wins" line/confidence attribution is unchanged.
@@ -720,8 +747,8 @@ fn rebuild_graph(
                 _,
             )| {
                 let targets = match target_class {
-                    Some(cls) => by_name_class.get(&(callee.clone(), cls.clone())),
-                    None => by_name.get(callee),
+                    Some(cls) => ctx.by_name_class.get(&(callee.clone(), cls.clone())),
+                    None => ctx.by_name.get(callee),
                 };
                 let Some(t) = targets else {
                     return (Vec::new(), false);
@@ -736,7 +763,7 @@ fn rebuild_graph(
                 // constraint rather than a preference — the rest of this
                 // function is unchanged from here on, just operating on the
                 // now same-language-only, language-stripped candidate list.
-                let caller_lang = path_lang.get(from_path);
+                let caller_lang = ctx.path_lang.get(from_path);
                 let same_lang: Vec<(String, String)> = t
                     .iter()
                     .filter(|(_, _, lang)| Some(lang) == caller_lang)
@@ -757,7 +784,7 @@ fn rebuild_graph(
                     filtered = t
                         .iter()
                         .filter(|(qn, _)| {
-                            sig_by_qn
+                            ctx.sig_by_qn
                                 .get(qn)
                                 .is_some_and(|sig| signature_returns_option_or_result(sig))
                         })
@@ -838,10 +865,10 @@ fn rebuild_graph(
                     if caller_lang.map(String::as_str) != Some("csharp") {
                         return None;
                     }
-                    let usings = caller_usings.get(from_path)?;
+                    let usings = ctx.caller_usings.get(from_path)?;
                     let ns_matches: Vec<_> = t
                         .iter()
-                        .filter(|(_, p)| usings.iter().any(|ns| namespace_map.contains(ns, p)))
+                        .filter(|(_, p)| usings.iter().any(|ns| ctx.namespace_map.contains(ns, p)))
                         .cloned()
                         .collect();
                     (!ns_matches.is_empty()).then_some(ns_matches)
@@ -897,12 +924,51 @@ fn rebuild_graph(
             });
         }
     }
+    edges
+}
+
+fn rebuild_graph(
+    tx: &rusqlite::Transaction,
+    hub_config: &crate::config::HubThresholdConfig,
+    crate_map: &crate::indexer::crate_map::CrateMap,
+    psr4: &crate::indexer::psr4::Psr4Map,
+    namespace_map: &crate::indexer::csharp_namespace::NamespaceMap,
+) -> rusqlite::Result<()> {
+    let ctx = build_resolution_context(tx, namespace_map)?;
+
+    // Stable, explicit order (Phase B plan T2/A-3) so full and future
+    // incremental resolution attribute `seen_pairs` dedup identically in
+    // `resolve_sites_to_edges` — see that function's doc comment.
+    let sites: Vec<CallSiteRow> = {
+        let mut stmt = tx.prepare(
+            "SELECT from_path, enclosing_qn, callee_name, call_line, confidence, target_class, \
+                    looks_option_or_result_chained, module_hint, edge_kind \
+             FROM call_sites ORDER BY id",
+        )?;
+        stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<i64>>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, Option<String>>(5)?,
+                r.get::<_, i64>(6)? != 0,
+                r.get::<_, Option<String>>(7)?,
+                r.get::<_, String>(8)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    let edges = resolve_sites_to_edges(&ctx, &sites);
 
     tx.execute("DELETE FROM call_edges", [])?;
     insert_call_edges_batch(tx, &edges)?;
-    // Every `formal` row at this point came from the stack-graphs upgrade at
-    // this function's own confidence-assignment loop above (`formally_resolved`)
-    // — the SCIP overlay (`scip::ingest::ingest_occurrences`) is a separate,
+    // Every `formal` row at this point came from the stack-graphs upgrade
+    // already baked into `confidence` at extraction time, carried through
+    // unchanged by `resolve_sites_to_edges`'s confidence-assignment loop —
+    // the SCIP overlay (`scip::ingest::ingest_occurrences`) is a separate,
     // later UPDATE pass that runs after this one and sets `formal_source =
     // 'scip'` itself. Cheaper than threading a new field through
     // `CallSiteData`/`CallEdge`/`insert_call_edges_batch` for what's
@@ -919,6 +985,7 @@ fn rebuild_graph(
     crate::graph::boundary::update_boundary_ambiguous_flags(tx)?;
     Ok(())
 }
+
 /// Recompute every symbol's `caller_count` from `call_edges`, using the same
 /// "confirmed caller" definition as the `callers` tool's `direct_count`
 /// (`ruled_out_by_scip = 0` and not `ambiguous`-confidence): an `ambiguous`
