@@ -183,7 +183,11 @@ pub(crate) fn parse_go_work_modules(root: &Path) -> Option<Vec<std::path::PathBu
             }
         }
     }
-    if modules.is_empty() { None } else { Some(modules) }
+    if modules.is_empty() {
+        None
+    } else {
+        Some(modules)
+    }
 }
 
 fn go_cache_key(bin: &Path, root: &Path, dirty: &[String]) -> String {

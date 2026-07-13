@@ -623,7 +623,8 @@ impl CalmServer {
                 suggested_next: self.filter_sn(sn),
             })
         }))
-    }}
+    }
+}
 
 #[derive(Deserialize, JsonSchema)]
 #[allow(dead_code)]

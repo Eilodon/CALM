@@ -35,8 +35,7 @@ impl CalmServer {
             };
 
             let scan = calm_core::sanitize::detect_injection_patterns_ext(&scanned);
-            let injection_hits: Vec<String> =
-                scan.hits.into_iter().map(str::to_string).collect();
+            let injection_hits: Vec<String> = scan.hits.into_iter().map(str::to_string).collect();
             let content_warning = calm_core::sanitize::injection_warning(&scanned);
             let contains_credential_shaped_text =
                 calm_core::sanitize::contains_credentials(&scanned);
@@ -55,7 +54,8 @@ impl CalmServer {
                 suggested_next: self.filter_sn(None),
             })
         }))
-    }}
+    }
+}
 
 #[derive(Deserialize, JsonSchema)]
 pub(crate) struct ScanTextParams {

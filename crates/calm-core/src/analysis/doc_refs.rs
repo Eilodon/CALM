@@ -117,7 +117,6 @@ mod tests {
         assert!(refs.is_empty(), "got {refs:?}");
     }
 
-
     #[test]
     fn extracts_multiple_and_preserves_order() {
         let refs =

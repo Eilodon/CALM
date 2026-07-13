@@ -40,16 +40,16 @@ pub fn load_or_create_mac_key(project_root: &Path) -> std::io::Result<[u8; MAC_K
     let calm_dir = project_root.join(".calm");
     let key_path = calm_dir.join(MAC_KEY_FILENAME);
 
-    if let Ok(bytes) = std::fs::read(&key_path) {
-        if bytes.len() == MAC_KEY_LEN {
-            let mut key = [0u8; MAC_KEY_LEN];
-            key.copy_from_slice(&bytes);
-            return Ok(key);
-        }
-        // Wrong length (truncated write, foreign file, ...) — fall through
-        // and regenerate rather than trust a key that isn't what this
-        // function itself would have written.
+    if let Ok(bytes) = std::fs::read(&key_path)
+        && bytes.len() == MAC_KEY_LEN
+    {
+        let mut key = [0u8; MAC_KEY_LEN];
+        key.copy_from_slice(&bytes);
+        return Ok(key);
     }
+    // Wrong length (truncated write, foreign file, ...) or unreadable — fall
+    // through and regenerate rather than trust a key that isn't what this
+    // function itself would have written.
 
     std::fs::create_dir_all(&calm_dir)?;
     let mut key = [0u8; MAC_KEY_LEN];
@@ -126,11 +126,7 @@ pub fn verify_integrity(
             // at which point they can also just read the plaintext `content`
             // column directly — timing side-channels on this comparison
             // leak nothing an on-disk read doesn't already.
-            if stored == expected {
-                "ok"
-            } else {
-                "mismatch"
-            }
+            if stored == expected { "ok" } else { "mismatch" }
         }
     }
 }
@@ -395,7 +391,10 @@ mod tests {
         let dir = temp_project("mac_key_persist");
         let k1 = load_or_create_mac_key(&dir).unwrap();
         let k2 = load_or_create_mac_key(&dir).unwrap();
-        assert_eq!(k1, k2, "second call must read back the same key, not regenerate");
+        assert_eq!(
+            k1, k2,
+            "second call must read back the same key, not regenerate"
+        );
         assert!(dir.join(".calm").join("memory.key").is_file());
     }
 
@@ -420,7 +419,11 @@ mod tests {
             .unwrap()
             .permissions()
             .mode();
-        assert_eq!(mode & 0o777, 0o600, "key file must not be group/other readable");
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "key file must not be group/other readable"
+        );
     }
 
     #[test]
@@ -430,9 +433,21 @@ mod tests {
         let m1 = compute_mac(&key_a, "topic", "content");
         let m2 = compute_mac(&key_a, "topic", "content");
         assert_eq!(m1, m2, "same inputs must produce the same MAC");
-        assert_ne!(m1, compute_mac(&key_b, "topic", "content"), "different key must change the MAC");
-        assert_ne!(m1, compute_mac(&key_a, "topic", "different"), "different content must change the MAC");
-        assert_ne!(m1, compute_mac(&key_a, "different", "content"), "different topic must change the MAC");
+        assert_ne!(
+            m1,
+            compute_mac(&key_b, "topic", "content"),
+            "different key must change the MAC"
+        );
+        assert_ne!(
+            m1,
+            compute_mac(&key_a, "topic", "different"),
+            "different content must change the MAC"
+        );
+        assert_ne!(
+            m1,
+            compute_mac(&key_a, "different", "content"),
+            "different topic must change the MAC"
+        );
     }
 
     #[test]
@@ -442,10 +457,7 @@ mod tests {
         // could exploit to reuse a MAC computed for a different (topic,
         // content) split.
         let key = [7u8; MAC_KEY_LEN];
-        assert_ne!(
-            compute_mac(&key, "ab", "c"),
-            compute_mac(&key, "a", "bc"),
-        );
+        assert_ne!(compute_mac(&key, "ab", "c"), compute_mac(&key, "a", "bc"),);
     }
 
     #[test]

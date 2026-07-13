@@ -249,8 +249,13 @@ fn session_context_sees_a_second_live_connection_and_stops_seeing_it_after_it_cl
     let mut stdout_a = BufReader::new(child_a.stdout.take().unwrap());
     stdin_a.write_all(initialize).unwrap();
     let mut init_a = String::new();
-    stdout_a.read_line(&mut init_a).expect("A: initialize response");
-    assert!(init_a.contains("\"protocolVersion\""), "A: bad initialize response: {init_a}");
+    stdout_a
+        .read_line(&mut init_a)
+        .expect("A: initialize response");
+    assert!(
+        init_a.contains("\"protocolVersion\""),
+        "A: bad initialize response: {init_a}"
+    );
     // MCP requires an `initialized` notification before any other request —
     // list_tools doubles as a second no-op-ish call that also confirms A's
     // session is fully live before B connects.
@@ -259,7 +264,9 @@ fn session_context_sees_a_second_live_connection_and_stops_seeing_it_after_it_cl
     stdin_a.write_all(initialized).unwrap();
     stdin_a.write_all(list_tools).unwrap();
     let mut list_a = String::new();
-    stdout_a.read_line(&mut list_a).expect("A: tools/list response");
+    stdout_a
+        .read_line(&mut list_a)
+        .expect("A: tools/list response");
 
     // Connection B: connects to the now-live daemon spawned by A (does not
     // spawn its own).
@@ -276,8 +283,13 @@ fn session_context_sees_a_second_live_connection_and_stops_seeing_it_after_it_cl
     let mut stdout_b = BufReader::new(child_b.stdout.take().unwrap());
     stdin_b.write_all(initialize).unwrap();
     let mut init_b = String::new();
-    stdout_b.read_line(&mut init_b).expect("B: initialize response");
-    assert!(init_b.contains("\"protocolVersion\""), "B: bad initialize response: {init_b}");
+    stdout_b
+        .read_line(&mut init_b)
+        .expect("B: initialize response");
+    assert!(
+        init_b.contains("\"protocolVersion\""),
+        "B: bad initialize response: {init_b}"
+    );
     stdin_b.write_all(initialized).unwrap();
 
     // B asks session_context — A must show up in other_active_sessions.
@@ -286,8 +298,8 @@ fn session_context_sees_a_second_live_connection_and_stops_seeing_it_after_it_cl
     stdout_b
         .read_line(&mut ctx_b_line)
         .expect("B: session_context response");
-    let ctx_b: serde_json::Value =
-        serde_json::from_str(&ctx_b_line).unwrap_or_else(|e| panic!("B: bad JSON ({e}): {ctx_b_line}"));
+    let ctx_b: serde_json::Value = serde_json::from_str(&ctx_b_line)
+        .unwrap_or_else(|e| panic!("B: bad JSON ({e}): {ctx_b_line}"));
     let text = ctx_b["result"]["content"][0]["text"]
         .as_str()
         .unwrap_or_else(|| panic!("B: unexpected tools/call shape: {ctx_b}"));

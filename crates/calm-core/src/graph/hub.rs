@@ -141,7 +141,6 @@ mod tests {
         assert_eq!(is_hub, 0, "low caller should not be hub");
     }
 
-
     // Plan 3 §3.3 (F10): hub_kind must classify each symbol into exactly
     // 'degree' | 'bridge' | 'both' | NULL, independent of the existing
     // is_hub boolean (still tested above).

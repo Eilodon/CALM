@@ -362,9 +362,7 @@ fn run_go_workspace_overlay(
     let cache_path = root.join(".calm").join(provider.cache_file_name);
     let key = (provider.cache_key)(&bin, root, &dirty);
     if std::fs::read_to_string(&cache_path).is_ok_and(|prev| prev.trim() == key) {
-        tracing::info!(
-            "SCIP overlay (go, workspace): cache key unchanged, skipping indexer run"
-        );
+        tracing::info!("SCIP overlay (go, workspace): cache key unchanged, skipping indexer run");
         return Ok(ingest::IngestStats::default());
     }
 
@@ -1174,7 +1172,10 @@ mod tests {
         let modules = provider::parse_go_work_modules(dir.path()).unwrap();
         assert_eq!(
             modules,
-            vec![std::path::PathBuf::from("./moda"), std::path::PathBuf::from("./modb")]
+            vec![
+                std::path::PathBuf::from("./moda"),
+                std::path::PathBuf::from("./modb")
+            ]
         );
     }
 
@@ -1189,7 +1190,10 @@ mod tests {
         let modules = provider::parse_go_work_modules(dir.path()).unwrap();
         assert_eq!(
             modules,
-            vec![std::path::PathBuf::from("./moda"), std::path::PathBuf::from("./modb")]
+            vec![
+                std::path::PathBuf::from("./moda"),
+                std::path::PathBuf::from("./modb")
+            ]
         );
     }
 
@@ -1204,7 +1208,10 @@ mod tests {
         let modules = provider::parse_go_work_modules(dir.path()).unwrap();
         assert_eq!(
             modules,
-            vec![std::path::PathBuf::from("./moda"), std::path::PathBuf::from("./modb")]
+            vec![
+                std::path::PathBuf::from("./moda"),
+                std::path::PathBuf::from("./modb")
+            ]
         );
     }
 
@@ -1296,7 +1303,10 @@ mod tests {
                     |r| r.get(0),
                 )
                 .unwrap_or_else(|e| panic!("module {module}: edge {from_sym} -> {to_sym} not found ({e})"));
-            assert_eq!(conf, "formal", "module {module}: edge should be upgraded to formal");
+            assert_eq!(
+                conf, "formal",
+                "module {module}: edge should be upgraded to formal"
+            );
         }
     }
 

@@ -1404,7 +1404,7 @@ pub fn run_indexing_pipeline_cancellable(
                 let hash = hash_content(&source);
                 let mtime = mtime_secs(file);
                 let data = lang.map(|lang| {
-                    extract_file_data(&rel, lang, &source, &entry_point_patterns, &formal)
+                    extract_file_data(&rel, lang, &source, &entry_point_patterns, formal)
                 });
                 Some((rel, lang, hash, mtime, data))
             })
@@ -1569,11 +1569,7 @@ fn cached_resolution_maps(
             && c.cargo_lock_mtime == cargo_lock_mtime
             && c.composer_json_mtime == composer_json_mtime;
         if fresh_enough && manifests_unchanged {
-            return (
-                c.crate_map.clone(),
-                c.psr4.clone(),
-                c.namespace_map.clone(),
-            );
+            return (c.crate_map.clone(), c.psr4.clone(), c.namespace_map.clone());
         }
     }
 
@@ -1680,7 +1676,7 @@ pub fn reindex_changed_cancellable(
             .par_iter()
             .map(|c| {
                 let data = c.lang.map(|lang| {
-                    extract_file_data(&c.rel, lang, &c.source, &entry_point_patterns, &formal)
+                    extract_file_data(&c.rel, lang, &c.source, &entry_point_patterns, formal)
                 });
                 (c, data)
             })
@@ -1801,7 +1797,8 @@ pub fn reindex_paths(
             continue; // content unchanged — skip parse entirely
         }
 
-        let data = lang.map(|lang| extract_file_data(rel, lang, &source, &config.entry_points, &formal));
+        let data =
+            lang.map(|lang| extract_file_data(rel, lang, &source, &config.entry_points, formal));
         remove_file_rows(&tx, rel)?;
         if let Some(data) = &data {
             persist_file(&tx, rel, &hash, data)?;
@@ -2010,8 +2007,7 @@ mod tests {
     // no full-repo walk/hash, no re-scan of files not in the given list.
     #[test]
     fn test_reindex_paths_only_touches_given_paths_not_whole_repo() {
-        let dir =
-            std::env::temp_dir().join(format!("ci_idx_reindex_paths_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ci_idx_reindex_paths_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("a.py"), "def a():\n    pass\n").unwrap();
@@ -2031,7 +2027,10 @@ mod tests {
             )
             .unwrap()
         };
-        let (b_before, c_before) = (last_indexed_of(&conn, "b.py"), last_indexed_of(&conn, "c.py"));
+        let (b_before, c_before) = (
+            last_indexed_of(&conn, "b.py"),
+            last_indexed_of(&conn, "c.py"),
+        );
         // A tick so a wrongly-touched row's timestamp would provably differ,
         // not just coincidentally match down to float precision.
         std::thread::sleep(std::time::Duration::from_millis(10));
@@ -2050,7 +2049,10 @@ mod tests {
             "a.py's new symbol (a2) must be picked up"
         );
         assert_eq!(
-            (last_indexed_of(&conn, "b.py"), last_indexed_of(&conn, "c.py")),
+            (
+                last_indexed_of(&conn, "b.py"),
+                last_indexed_of(&conn, "c.py")
+            ),
             (b_before, c_before),
             "b.py/c.py must not be re-scanned — reindex_paths only touches the given paths"
         );

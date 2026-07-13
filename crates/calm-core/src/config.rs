@@ -867,7 +867,8 @@ mod tests {
         // Same candidate order as load_config: bare config.json wins over
         // .calm/config.json when both exist (audit F12 -- config_mtime must
         // never pick a different file than load_config would).
-        let tmp = std::env::temp_dir().join(format!("ci_cfg_mtime_precedence_{}", std::process::id()));
+        let tmp =
+            std::env::temp_dir().join(format!("ci_cfg_mtime_precedence_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(tmp.join(".calm")).unwrap();
         std::fs::write(tmp.join(".calm").join("config.json"), "{}").unwrap();

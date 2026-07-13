@@ -92,7 +92,8 @@ impl Default for FitnessThresholds {
             max_config_drift_count: 0,
             max_boundary_ambiguous_count: 0,
         }
-    }}
+    }
+}
 
 #[derive(Debug, Deserialize, Default)]
 struct TomlFile {

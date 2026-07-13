@@ -55,5 +55,4 @@ mod tests {
             .unwrap();
         assert_eq!(mode, 1, "1 == NORMAL (0=OFF, 1=NORMAL, 2=FULL, 3=EXTRA)");
     }
-
 }

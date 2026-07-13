@@ -59,7 +59,10 @@ impl CalmServer {
         Parameters(p): Parameters<EditSymbolParams>,
     ) -> Json<ResolvedOutcome<EditLinesOutput>> {
         Json(self.timed_tool("edit_symbol", || {
-            if matches!(p.position.as_deref(), Some("top_of_file") | Some("end_of_file")) {
+            if matches!(
+                p.position.as_deref(),
+                Some("top_of_file") | Some("end_of_file")
+            ) {
                 // No symbol resolution at all for these two modes -- pure
                 // file-relative anchors for brand-new module-level content
                 // (a new `use`, a new top-level function) with no existing
@@ -90,13 +93,12 @@ impl CalmServer {
                     }
                 };
                 let total_lines = live.lines().count().max(1);
-                let (line_start, line_end, insert_pos) = if p.position.as_deref()
-                    == Some("top_of_file")
-                {
-                    (1, 1, calm_core::edit::InsertPosition::Before)
-                } else {
-                    (1, total_lines, calm_core::edit::InsertPosition::After)
-                };
+                let (line_start, line_end, insert_pos) =
+                    if p.position.as_deref() == Some("top_of_file") {
+                        (1, 1, calm_core::edit::InsertPosition::Before)
+                    } else {
+                        (1, total_lines, calm_core::edit::InsertPosition::After)
+                    };
                 let hunk = match calm_core::edit::insertion_hunk(
                     &live,
                     line_start,
@@ -152,8 +154,10 @@ impl CalmServer {
             // "content also appears elsewhere" ambiguity warning
             // edit_lines_impl attaches for line-range hunks doesn't apply
             // to them — see edit_lines_impl's position_anchored parameter.
-            let position_anchored =
-                matches!(p.position.as_deref(), Some("before" | "after" | "append_inside"));
+            let position_anchored = matches!(
+                p.position.as_deref(),
+                Some("before" | "after" | "append_inside")
+            );
             let hunk = match p.position.as_deref().unwrap_or("replace") {
                 "replace" => match &p.old_text {
                     None => calm_core::edit::HunkRequest {
@@ -720,33 +724,28 @@ impl CalmServer {
         // contention with a concurrent edit's reindex. EMBED_BG (module-level
         // static above) serializes concurrent background embed jobs against
         // each other, not against reindex_paths itself.
-        if should_embed_bg {
-            if let Some(model) = self.embedder() {
-                let db_path = self.db_path.clone();
-                std::thread::spawn(move || {
-                    let _bg_guard = EMBED_BG.lock_ok();
-                    match calm_core::db::conn::open_writer(&db_path) {
-                        Ok(bg_conn) => {
-                            if let Err(e) =
-                                calm_core::embedding::embed_pending(&bg_conn, model.as_ref())
-                            {
-                                tracing::error!("edit_lines: background embedding failed: {e}");
-                            }
-                            if let Err(e) = calm_core::embedding::embed_pending_chunks(
-                                &bg_conn,
-                                model.as_ref(),
-                            ) {
-                                tracing::error!(
-                                    "edit_lines: background chunk embedding failed: {e}"
-                                );
-                            }
+        if should_embed_bg && let Some(model) = self.embedder() {
+            let db_path = self.db_path.clone();
+            std::thread::spawn(move || {
+                let _bg_guard = EMBED_BG.lock_ok();
+                match calm_core::db::conn::open_writer(&db_path) {
+                    Ok(bg_conn) => {
+                        if let Err(e) =
+                            calm_core::embedding::embed_pending(&bg_conn, model.as_ref())
+                        {
+                            tracing::error!("edit_lines: background embedding failed: {e}");
                         }
-                        Err(e) => tracing::error!(
-                            "edit_lines: could not open DB for background embedding: {e}"
-                        ),
+                        if let Err(e) =
+                            calm_core::embedding::embed_pending_chunks(&bg_conn, model.as_ref())
+                        {
+                            tracing::error!("edit_lines: background chunk embedding failed: {e}");
+                        }
                     }
-                });
-            }
+                    Err(e) => tracing::error!(
+                        "edit_lines: could not open DB for background embedding: {e}"
+                    ),
+                }
+            });
         }
 
         // Session tracking must reflect what hit the disk even when the
@@ -889,7 +888,12 @@ fn compute_touch_risk(
     conn: &rusqlite::Connection,
     path: &str,
     ranges: &[(i64, i64)],
-) -> (Option<String>, bool, Option<String>, Vec<TouchedSymbolOutput>) {
+) -> (
+    Option<String>,
+    bool,
+    Option<String>,
+    Vec<TouchedSymbolOutput>,
+) {
     let rows = symbols_overlapping_ranges(conn, path, ranges);
     let mut max_callers = 0i64;
     let mut hub_hit = false;
@@ -932,7 +936,11 @@ fn all_caller_edges_confident(conn: &rusqlite::Connection, qualified_names: &[St
     if qualified_names.is_empty() {
         return false;
     }
-    let placeholders = qualified_names.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let placeholders = qualified_names
+        .iter()
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(",");
     let sql = format!(
         "SELECT COUNT(*), SUM(CASE WHEN edge_confidence IN ('resolved','formal') THEN 1 ELSE 0 END) \
          FROM call_edges WHERE to_symbol IN ({placeholders})"
@@ -985,9 +993,8 @@ fn resolve_repo_path(
     path: &str,
 ) -> Result<std::path::PathBuf, ErrorDetail> {
     let candidate = project_root.join(path);
-    let real = std::fs::canonicalize(&candidate).map_err(|e| {
-        error_detail("READ_FAILED", &format!("could not read {path}: {e}"), false)
-    })?;
+    let real = std::fs::canonicalize(&candidate)
+        .map_err(|e| error_detail("READ_FAILED", &format!("could not read {path}: {e}"), false))?;
     // `project_root` isn't guaranteed canonical by every caller (tests in
     // particular construct `CalmServer` directly from an uncanonicalized
     // temp dir) — canonicalize both sides rather than assume the

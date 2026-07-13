@@ -498,7 +498,7 @@ impl FormalResolver {
         // which also need indexing into `db` below so they're stitchable.
         let builtin_files = graph
             .add_from_graph(builtins)
-            .map_err(|h| anyhow::anyhow!("Duplicate builtin file: {}", &graph[h]))?;
+            .map_err(|h| anyhow::anyhow!("Duplicate builtin file: {}", graph[h]))?;
 
         let file = graph.get_or_create_file(file_path);
 

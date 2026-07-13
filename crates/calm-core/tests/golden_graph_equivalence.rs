@@ -195,7 +195,10 @@ fn index_fresh(root: &Path) -> Connection {
 
 /// Continued-index step: the same entry point the file watcher uses, and the
 /// one whose graph stage T4 will switch to `incremental_graph_update`.
-fn reindex_continued(conn: &mut Connection, root: &Path) -> calm_core::indexer::pipeline::ReindexSummary {
+fn reindex_continued(
+    conn: &mut Connection,
+    root: &Path,
+) -> calm_core::indexer::pipeline::ReindexSummary {
     match calm_core::indexer::pipeline::reindex_changed_cancellable(conn, root, &|| false).unwrap()
     {
         calm_core::indexer::pipeline::ReindexOutcome::Completed(summary) => summary,

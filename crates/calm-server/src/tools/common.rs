@@ -18,7 +18,8 @@ pub(crate) trait LockExt<T> {
 
 impl<T> LockExt<T> for std::sync::Mutex<T> {
     fn lock_ok(&self) -> std::sync::MutexGuard<'_, T> {
-        self.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -29,10 +30,12 @@ pub(crate) trait RwLockExt<T> {
 
 impl<T> RwLockExt<T> for std::sync::RwLock<T> {
     fn read_ok(&self) -> std::sync::RwLockReadGuard<'_, T> {
-        self.read().unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
     fn write_ok(&self) -> std::sync::RwLockWriteGuard<'_, T> {
-        self.write().unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -92,7 +95,8 @@ impl CalmServer {
             preset,
             tool_router,
         })
-    }    /// Builds a fresh per-connection `CalmServer` from a daemon-shared
+    }
+    /// Builds a fresh per-connection `CalmServer` from a daemon-shared
     /// instance — every field is cloned (cheap: everything but
     /// `session_log`/`session_id`/`preset`/`project_root`/`db_path`/
     /// `tool_router` is already `Arc<RwLock/Mutex<_>>`) except two
@@ -1553,13 +1557,7 @@ fn normalize_then_boost(
             (lo.min(r.score), hi.max(r.score))
         });
     let range = max - min;
-    let normalize = |s: f64| -> f64 {
-        if range > 0.0 {
-            (s - min) / range
-        } else {
-            0.5
-        }
-    };
+    let normalize = |s: f64| -> f64 { if range > 0.0 { (s - min) / range } else { 0.5 } };
 
     for r in results.iter_mut() {
         let boost = boosts.get(&r.path).copied().unwrap_or(0.0);
@@ -1950,7 +1948,6 @@ mod personalization_tests {
         assert_eq!(boosts.get("shared.rs"), Some(&1.0));
     }
 
-
     // Plan 3 §3.2 — tests for the pure `normalize_then_boost` score math
     // (not `compute_proximity_boosts`, which the tests above already
     // cover and this doesn't touch).
@@ -2047,15 +2044,13 @@ mod personalization_tests {
                     (format!("p{trial}_{i}.rs"), score)
                 })
                 .collect();
-            let mut results: Vec<_> = results_seed
-                .iter()
-                .map(|(p, s)| sr(p, *s))
-                .collect();
+            let mut results: Vec<_> = results_seed.iter().map(|(p, s)| sr(p, *s)).collect();
 
-            let (min, max) = results.iter().fold(
-                (f64::INFINITY, f64::NEG_INFINITY),
-                |(lo, hi), r| (lo.min(r.score), hi.max(r.score)),
-            );
+            let (min, max) = results
+                .iter()
+                .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), r| {
+                    (lo.min(r.score), hi.max(r.score))
+                });
             let range = max - min;
             let norm_of = |s: f64| if range > 0.0 { (s - min) / range } else { 0.5 };
             let normalized: Vec<f64> = results.iter().map(|r| norm_of(r.score)).collect();

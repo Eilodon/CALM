@@ -128,7 +128,10 @@ const INJECTION_PATTERN_SOURCES: &[(&str, &str)] = &[
         r"(?i)reveal (your|the) (system prompt|instructions)",
         "PROMPT_EXFIL",
     ),
-    (r"(?i)do not (tell|inform|notify) the user", "HIDE_FROM_USER"),
+    (
+        r"(?i)do not (tell|inform|notify) the user",
+        "HIDE_FROM_USER",
+    ),
     (
         r"(?i)without (telling|informing|notifying) the user",
         "HIDE_FROM_USER",
@@ -296,7 +299,10 @@ fn collect_decoded_hits(
     // encodes longer than a decoy hash/SHA (audit F8) — this is a heuristic
     // prioritization on top of the tries/successes split above, not the
     // primary bound.
-    let mut candidates: Vec<&str> = DECODE_CANDIDATE.find_iter(text).map(|m| m.as_str()).collect();
+    let mut candidates: Vec<&str> = DECODE_CANDIDATE
+        .find_iter(text)
+        .map(|m| m.as_str())
+        .collect();
     candidates.sort_by_key(|c| std::cmp::Reverse(c.len()));
 
     for candidate in candidates {
@@ -375,11 +381,7 @@ fn decode_base64(s: &str, url_safe: bool) -> Option<Vec<u8>> {
             out.push(((buf >> bits) & 0xFF) as u8);
         }
     }
-    if out.is_empty() {
-        None
-    } else {
-        Some(out)
-    }
+    if out.is_empty() { None } else { Some(out) }
 }
 
 fn decode_hex(s: &str) -> Option<Vec<u8>> {
@@ -1030,9 +1032,11 @@ mod tests {
     fn test_wrap_untrusted_wraps_with_source() {
         let wrapped = wrap_untrusted("hello world", "webfetch");
         assert!(wrapped.starts_with("<untrusted-external-content source=\"webfetch\">"));
-        assert!(wrapped
-            .trim_end()
-            .ends_with("</untrusted-external-content>"));
+        assert!(
+            wrapped
+                .trim_end()
+                .ends_with("</untrusted-external-content>")
+        );
         assert!(wrapped.contains("hello world"));
     }
 

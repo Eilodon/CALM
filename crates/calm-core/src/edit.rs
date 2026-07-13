@@ -716,14 +716,16 @@ mod tests {
         let hunk =
             find_and_replace_hunk(content, 1, 4, "let x =\n        1;", "let x = 2;").unwrap();
         let outcome = apply_hunks(content, &[hunk]).unwrap();
-        assert_eq!(outcome.new_content.unwrap(), "fn f() {\n    let x = 2;\n}\n");
+        assert_eq!(
+            outcome.new_content.unwrap(),
+            "fn f() {\n    let x = 2;\n}\n"
+        );
     }
 
     #[test]
     fn find_and_replace_hunk_multi_byte_utf8_old_text() {
         let content = "fn f() {\n    let s = \"café 中文\";\n}\n";
-        let hunk =
-            find_and_replace_hunk(content, 1, 3, "café 中文", "bar").unwrap();
+        let hunk = find_and_replace_hunk(content, 1, 3, "café 中文", "bar").unwrap();
         let outcome = apply_hunks(content, &[hunk]).unwrap();
         assert_eq!(
             outcome.new_content.unwrap(),
