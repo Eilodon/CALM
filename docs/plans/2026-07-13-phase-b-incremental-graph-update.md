@@ -134,3 +134,18 @@ pub fn incremental_graph_update(
 ### Gate Result
 <!-- PASS | PASS WITH FLAGS | HOLD -->
 PASS WITH FLAGS — 1 HIGH (delta under-selection) có mitigation nhiều lớp cụ thể trong plan (proof-table §3.1 + single-resolver D4 + targeted tests + real-DB round T6); 2 MED có mitigation hoặc chấp-nhận-có-ghi-nhận. Điều kiện cứng trước khi flip default `true` (T6): golden ≥1 vòng trên DB CALM thật xanh + 8 test T5 xanh + số đo <150ms có thật. Thứ tự task T1→T7 là bắt buộc — đặc biệt T1 (hạ tầng golden) và T2 (refactor một-resolver) phải đi trước mọi dòng code thuật toán mới, đúng điều kiện user đặt khi hoãn Phase B.
+
+---
+
+## Execution outcome (2026-07-13) — DONE
+
+T1→T7 shipped in order. Commits: `d6481e1` (plan) → `0806531` (T4) → `fe873bf` (T5) → `7df3800` (T6.1 real-DB golden + A-1 chunk test) → `313b623` (T6.5 graph_mode observability) → `efbd9d2` (T6.4 default flip). T2/T3 landed within the T4 series.
+
+**Gate conditions met:** golden equivalence (incremental == full) green on the fixture driver (18 comparisons, permanent/CI) AND a copy of the real CALM repo (`#[ignore]`, ~206s); A-1 chunk boundary (`names_delta`>500) covered; full calm-core (698+12) & calm-server (202+3) suites green after the flip. Live measurement via daemon `edit_reindex_completed{reindex_ms,graph_mode}`: **88ms** minimal-delta / **188ms** fan-out to largest file / **337ms** fallback — <150ms met for typical edits, incremental 1.8–4× faster than full. `graph_mode` (`incremental` / `full_fallback:delta_paths.len()=76 > 50`) visible in `indexing_status`. Formal edges outside the delta survive (T5 `scip_flag_survives_edit_of_other_file` + live).
+
+**Corrections found during execution:**
+- Abductive-2 / condition (c) refined: no real function/method name in CALM hits the `MAX_CALLEE_CANDIDATES`(20) fan-out threshold naturally (max ~18), and D4's single resolver makes that branch produce IDENTICAL output in both paths anyway — so it is NOT a differential-correctness risk. The real-DB round's genuine value is scale (large `by_name` map, real cross-language resolution), not “exercising fan-out”. Seed files for the real-DB test therefore use repo-UNIQUE names — a collision with a hot name like `new` (~740 sites) would blow the delta past the 50-file fallback and mask the incremental path.
+- Finding B (perf-cliff, live-confirmed): editing a file that defines a hot name (`common.rs` defines `CalmServer::new`) fans `names_delta` out to 76 files >50 → correct `full_fallback`, not a slow incremental. This is the fallback working as designed, observable via `graph_mode`.
+- A-1 was un-tested at T5 despite the plan hinting it; added `names_delta_over_chunk_size_matches_full` at T6.1.
+
+**T7 carried-forward obligation — `embed_pending*` idempotency re-verified (Plan 3 FM2):** `embed_pending`/`embed_pending_chunks` (`embedding.rs:320/397`) select only rows `WHERE id NOT IN (SELECT symbol_id FROM embedding_vecs)` and store via `INSERT OR REPLACE`, so re-running is idempotent by construction; `EMBED_BG` mutex (edit.rs:14) still serializes background embeds. Phase B changes the GRAPH-update path only — it does not change embed frequency (still one spawn per non-noop reindex) or the embed contract — so it introduces no new embed race. A background embed racing a subsequent reindex can at worst leave an orphaned `embedding_vecs` row (invisible to `knn`, which JOINs `symbols`), identical to pre-Phase-B behavior. No code change needed.
