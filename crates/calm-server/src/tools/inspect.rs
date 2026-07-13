@@ -67,28 +67,38 @@ impl CalmServer {
     ) -> Json<ResolvedOutcome<SourceOutput>> {
         Json(self.timed_tool("source", || {
             // READ-only: open a dedicated read connection (SINGLE_WRITER enforcement)
-            let resolution = {
-                let conn = match self.make_read_conn() {
-                    Ok(c) => c,
-                    Err(e) => return db_error_resolved(e),
-                };
-                match resolve_symbol(&conn, &p.symbol, p.path.as_deref(), p.line) {
-                    Ok(r) => r,
-                    Err(e) => return db_error_resolved(e),
-                }
+            let conn = match self.make_read_conn() {
+                Ok(c) => c,
+                Err(e) => return db_error_resolved(e),
+            };
+
+            // Range mode: `symbol` omitted → read a raw [line, end_line]
+            // window straight from `path`, no symbol resolution. Covers
+            // module-level / between-symbol code that no symbol range spans.
+            let symbol_name = match p.symbol.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                Some(s) => s.to_string(),
+                None => return self.source_range(&conn, &p),
+            };
+
+            let resolution = match resolve_symbol(&conn, &symbol_name, p.path.as_deref(), p.line) {
+                Ok(r) => r,
+                Err(e) => return db_error_resolved(e),
             };
             let c = match resolution {
-                SymbolResolution::NotFound => return ResolvedOutcome::not_found(&p.symbol),
+                SymbolResolution::NotFound => return ResolvedOutcome::not_found(&symbol_name),
                 SymbolResolution::Ambiguous(candidates) => {
                     return ResolvedOutcome::ambiguous(&candidates);
                 }
                 SymbolResolution::Found(c) => *c,
             };
+            // Release the read connection before file IO (mirrors the original
+            // scoping); range mode above keeps it for its language lookup.
+            drop(conn);
             self.track_symbol(&c.qualified_name);
             self.track_file(&c.path);
 
             let full_path = self.project_root.join(&c.path);
-            let (source, data_source, etag) = match std::fs::read_to_string(&full_path) {
+            let (raw_source, data_source, etag) = match std::fs::read_to_string(&full_path) {
                 Ok(content) => {
                     let lines: Vec<&str> = content.lines().collect();
                     let start = (c.line_start as usize).saturating_sub(1);
@@ -103,13 +113,32 @@ impl CalmServer {
                 Err(_) => ("(source file not readable)".into(), "unavailable", None),
             };
 
-            let sn = if p.include_metadata && c.is_hub {
-                suggested("edit_context", "Hub — mandatory pre-edit context")
+            // A non-hub symbol read fresh from disk is directly edit-ready:
+            // `etag` IS the whole-symbol `expected_hash` (range_checksum ==
+            // apply_hunks hashing), so point straight at edit_symbol with the
+            // hash prefilled — no preview round trip. Hubs keep the mandatory
+            // edit_context suggestion; an unreadable file falls back to callers.
+            let sn = if c.is_hub {
+                suggested_with_args(
+                    "edit_context",
+                    "Hub — mandatory pre-edit context",
+                    serde_json::json!({"symbol": symbol_name.clone(), "path": c.path.clone()}),
+                )
+            } else if let Some(hash) = etag.as_deref() {
+                suggested_with_args(
+                    "edit_symbol",
+                    "Whole-symbol edit ready — this etag is the expected_hash (no preview needed)",
+                    serde_json::json!({
+                        "symbol": symbol_name.clone(),
+                        "path": c.path.clone(),
+                        "expected_hash": hash,
+                    }),
+                )
             } else {
                 suggested_with_args(
                     "callers",
                     "Check who uses this before modifying",
-                    serde_json::json!({"symbol": p.symbol}),
+                    serde_json::json!({"symbol": symbol_name.clone()}),
                 )
             };
             let sn = self.filter_sn(sn);
@@ -118,7 +147,7 @@ impl CalmServer {
             // range — skip re-sending the body entirely.
             if etag.is_some() && p.if_none_match.as_deref() == etag.as_deref() {
                 return ResolvedOutcome::success(SourceOutput {
-                    symbol: p.symbol,
+                    symbol: symbol_name,
                     path: c.path,
                     line_start: c.line_start,
                     line_end: c.line_end,
@@ -134,7 +163,16 @@ impl CalmServer {
                 });
             }
 
-            let sanitized = sanitize_source_output(&source);
+            // Sanitize + injection-detect on the RAW body, THEN add gutters so
+            // the line numbers are never scanned as content and never alter
+            // the etag.
+            let sanitized = sanitize_source_output(&raw_source);
+            let content_warning = injection_warning(&sanitized);
+            let rendered = if p.line_numbers {
+                calm_core::edit::with_line_gutters(&sanitized, c.line_start)
+            } else {
+                sanitized
+            };
 
             let metadata = p.include_metadata.then(|| SourceMetadata {
                 // Verbatim source text at index time — redact the same as
@@ -145,14 +183,13 @@ impl CalmServer {
                 is_hub: c.is_hub,
             });
 
-            let token_estimate = estimate_tokens(&sanitized);
-            let content_warning = injection_warning(&sanitized);
+            let token_estimate = estimate_tokens(&rendered);
             ResolvedOutcome::success(SourceOutput {
-                symbol: p.symbol,
+                symbol: symbol_name,
                 path: c.path,
                 line_start: c.line_start,
                 line_end: c.line_end,
-                source: sanitized,
+                source: rendered,
                 language: c.language,
                 token_estimate,
                 data_source: data_source.to_string(),
@@ -163,6 +200,104 @@ impl CalmServer {
                 suggested_next: sn,
             })
         }))
+    }
+
+    /// Range mode for `source`: read a raw `[line, end_line]` window from a
+    /// file with no symbol resolution — for module-level / between-symbol
+    /// code that no symbol range covers (the last legitimate reason to reach
+    /// for a native file read). `line_numbers` and `etag` behave exactly as
+    /// in symbol mode: `etag` is the `range_checksum` of the window, directly
+    /// usable as an `edit_lines` `expected_hash` for it.
+    fn source_range(
+        &self,
+        conn: &rusqlite::Connection,
+        p: &SourceParams,
+    ) -> ResolvedOutcome<SourceOutput> {
+        let path = match p.path.as_deref() {
+            Some(pth) if !pth.is_empty() => pth,
+            _ => {
+                return ResolvedOutcome::error(error_detail(
+                    "INVALID_PARAMS",
+                    "range mode needs `path` (plus `line` and `end_line`) when `symbol` is omitted",
+                    false,
+                ));
+            }
+        };
+        let (start, end_req) = match (p.line, p.end_line) {
+            (Some(s), Some(e)) if s >= 1 && e >= s => (s, e),
+            _ => {
+                return ResolvedOutcome::error(error_detail(
+                    "INVALID_PARAMS",
+                    "range mode needs `line` (start) and `end_line` (end), 1-indexed with end >= start",
+                    false,
+                ));
+            }
+        };
+        self.track_file(path);
+        let full_path = self.project_root.join(path);
+        let content = match std::fs::read_to_string(&full_path) {
+            Ok(c) => c,
+            Err(_) => {
+                return ResolvedOutcome::error(error_detail(
+                    "FILE_NOT_READABLE",
+                    &format!("could not read file `{path}` from disk"),
+                    false,
+                ));
+            }
+        };
+        let lines: Vec<&str> = content.lines().collect();
+        if start as usize > lines.len() {
+            return ResolvedOutcome::error(error_detail(
+                "INVALID_PARAMS",
+                &format!(
+                    "range start line {start} is past end of file ({} lines)",
+                    lines.len()
+                ),
+                false,
+            ));
+        }
+        let s = start as usize - 1;
+        let e = (end_req as usize).min(lines.len());
+        let raw = lines[s..e].join("\n");
+        let etag = calm_core::edit::range_checksum(&content, start as usize, e);
+        // Reuse whatever language the file's symbols were indexed as (any row
+        // for this path); empty if the file has no indexed symbols.
+        let language: String = conn
+            .query_row(
+                "SELECT language FROM symbols WHERE path = ?1 LIMIT 1",
+                rusqlite::params![path],
+                |row| row.get(0),
+            )
+            .unwrap_or_default();
+
+        let sanitized = sanitize_source_output(&raw);
+        let content_warning = injection_warning(&sanitized);
+        let rendered = if p.line_numbers {
+            calm_core::edit::with_line_gutters(&sanitized, start)
+        } else {
+            sanitized
+        };
+        let token_estimate = estimate_tokens(&rendered);
+        let sn = self.filter_sn(suggested_with_args(
+            "edit_lines",
+            "Range read — edit this window directly (etag is the expected_hash)",
+            serde_json::json!({ "path": path }),
+        ));
+        ResolvedOutcome::success(SourceOutput {
+            symbol: String::new(),
+            path: path.to_string(),
+            line_start: start,
+            line_end: e as i64,
+            source: rendered,
+            language,
+            token_estimate,
+            data_source: "disk".to_string(),
+            metadata: None,
+            content_warning,
+            etag,
+            not_modified: None,
+            suggested_next: sn,
+        })
     }
     #[tool(
         name = "understand",
@@ -258,9 +393,13 @@ impl CalmServer {
                 let lines: Vec<&str> = content.lines().collect();
                 let start = (info.line_start as usize).saturating_sub(1);
                 let end = (info.line_end as usize).min(lines.len());
-                let source = sanitize_source_output(&lines[start..end].join("\n"));
+                let raw = sanitize_source_output(&lines[start..end].join("\n"));
+                let content_warning = injection_warning(&raw);
+                // Numbered by default: `understand` is a pre-edit/comprehension
+                // tool, so its embedded body carries absolute line gutters
+                // (matching `source`'s default) to be directly edit-ready.
+                let source = calm_core::edit::with_line_gutters(&raw, info.line_start);
                 let token_estimate = estimate_tokens(&source);
-                let content_warning = injection_warning(&source);
                 Some(SourceOutput {
                     symbol: info.name.clone(),
                     path: info.path.clone(),
@@ -775,27 +914,49 @@ pub(crate) fn is_test_file(path: &str) -> bool {
 
 #[derive(Deserialize, JsonSchema)]
 pub(crate) struct SourceParams {
-    /// Bare symbol name (not a `path::name` qualified name).
-    pub(crate) symbol: String,
+    /// Bare symbol name (not a `path::name` qualified name). Omit ONLY in
+    /// range mode (see `end_line`), where a raw line window is read directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) symbol: Option<String>,
     /// Narrows the search to one file when `symbol` alone is ambiguous
-    /// across the repo. Repo-relative path.
+    /// across the repo. Repo-relative path. Required in range mode.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) path: Option<String>,
     /// Disambiguates same-named symbols in the same file — any line within
     /// the intended candidate's range (see an earlier `ambiguous` response's
-    /// `line_start`/`line_end`).
+    /// `line_start`/`line_end`). In range mode (symbol omitted) this is the
+    /// 1-indexed START line of the window to read.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) line: Option<i64>,
+    /// Range mode: 1-indexed, inclusive END line of a raw window read
+    /// directly from `path` with no symbol resolution — for module-level or
+    /// between-symbol code no symbol range covers. Requires `path` + `line`
+    /// (the start) and `symbol` omitted. Ignored in symbol mode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) end_line: Option<i64>,
     /// `true` to also return `metadata` (signature, docstring,
     /// caller_count, is_hub) alongside the source text. `false` (default)
-    /// omits it — plain source text only.
+    /// omits it — plain source text only. No metadata in range mode.
     #[serde(default)]
     pub(crate) include_metadata: bool,
+    /// Whether `source` carries `<n>\t<line>` absolute line-number gutters
+    /// (like a native file read), so it is directly usable to pick an
+    /// `edit_lines`/`edit_symbol` hunk without counting lines. Defaults to
+    /// `true`; pass `false` for raw, gutter-free text (e.g. to copy a
+    /// snippet verbatim). Never affects `etag` (which hashes the raw range).
+    #[serde(default = "default_line_numbers")]
+    pub(crate) line_numbers: bool,
     /// `etag` from a prior `source` call on this exact symbol range — if it
     /// still matches, the response omits `source`/`metadata` and sets
     /// `not_modified: true` instead of re-sending the body.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) if_none_match: Option<String>,
+}
+
+/// serde default for `SourceParams::line_numbers`: numbered output is the
+/// default so a CALM `source` read is edit-ready without an extra flag.
+fn default_line_numbers() -> bool {
+    true
 }
 #[derive(Serialize, JsonSchema)]
 pub(crate) struct SourceMetadata {

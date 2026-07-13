@@ -172,15 +172,39 @@ emit_commit_tally() {
   exit 0
 }
 
+# Normalize a path to repo-relative form so the edit_context gate compares
+# like with like. This is load-bearing: `mcp__calm__edit_context`'s `path`
+# arg is repo-relative (CALM's convention), but Claude Code hands native
+# Edit/Write an ABSOLUTE `file_path`. An earlier version exact-matched the
+# two and thus false-denied every native Edit that a *relative* edit_context
+# had legitimately unlocked — the exact cry-wolf this hook exists to avoid.
+# Strips the git toplevel prefix from an absolute path; leaves an already
+# -relative path (or one outside the repo) unchanged.
+to_repo_relative() {
+  local p="$1" root
+  case "$p" in
+    /*)
+      root=$(git rev-parse --show-toplevel 2>/dev/null)
+      if [ -n "$root" ] && [ "${p#"$root"/}" != "$p" ]; then
+        printf '%s' "${p#"$root"/}"
+      else
+        printf '%s' "$p"
+      fi
+      ;;
+    *) printf '%s' "$p" ;;
+  esac
+}
+
 # True if `path` has had edit_context called for it THIS session — per-FILE
 # state (not per-symbol: correlating each individual edit to a specific
 # prior edit_context(symbol) call still isn't reliable from a shell hook,
-# see this file's header comment; per-file *is* reliably trackable, since
-# both mcp__calm__edit_context and native Edit/Write receive repo-relative
-# or absolute paths consistently within one Claude Code session's
-# tool_input shape). Exact string match against the recorded path set.
+# see this file's header comment; per-file *is* reliably trackable). Both
+# the recorded set and the queried path are normalized to repo-relative via
+# `to_repo_relative` first, so a relative edit_context and an absolute
+# native Edit for the same file match.
 file_has_edit_context() {
-  jq -e --arg p "$1" 'index($p) != null' <<<"$edit_context_files" >/dev/null 2>&1
+  local p; p=$(to_repo_relative "$1")
+  jq -e --arg p "$p" 'index($p) != null' <<<"$edit_context_files" >/dev/null 2>&1
 }
 
 deny() {
@@ -303,7 +327,18 @@ is_clearly_non_code_file() {
 # indexed and must not be suppressed just because its own name starts with
 # a dot.
 is_definitely_unindexed_path() {
-  local p="$1" check_path seg
+  local p="$1" check_path seg root
+  # Outside the repo root entirely (e.g. a /tmp scratchpad file, a $HOME
+  # dotfile): CALM only indexes under the project root, so it can never cover
+  # this path — native Read/Edit is correct and edit_context can't resolve a
+  # symbol here, so gating on it would cry wolf. Only for ABSOLUTE paths; a
+  # relative path is by definition inside the cwd/repo.
+  if [ "${p#/}" != "$p" ]; then
+    root=$(git rev-parse --show-toplevel 2>/dev/null)
+    if [ -n "$root" ] && [ "$p" != "$root" ] && [ "${p#"$root"/}" = "$p" ]; then
+      return 0
+    fi
+  fi
   if [ -d "$p" ]; then
     check_path="$p"
   else
@@ -411,6 +446,7 @@ resolve_git_target_root() {
 # matters here, and PreToolUse is all that's needed to observe it.
 if [ "$tool_name" = "mcp__calm__edit_context" ]; then
   ec_path=$(jq -r '.tool_input.path // ""' <<<"$input")
+  [ -n "$ec_path" ] && ec_path=$(to_repo_relative "$ec_path")
   decision_detail="state:edit_context_files+=${ec_path:-<any>}"
   if [ -n "$ec_path" ]; then
     edit_context_files=$(jq -c --arg p "$ec_path" '. + [$p] | unique' <<<"$edit_context_files")
