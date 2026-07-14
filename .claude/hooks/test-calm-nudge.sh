@@ -36,6 +36,24 @@ fail() {
   exit 1
 }
 
+# Runs a run_hook* invocation, capturing stdout into $out, stderr into
+# $hook_err, and the exit code into $hook_ec, without tripping `set -e`.
+# deny() signals via exit code 2 + stderr now (2026-07-14, see its own
+# comment in calm-nudge.sh for why), not JSON stdout + exit 0 -- a plain
+# `out=$(run_hook ...)` would abort this whole suite the instant a real
+# deny fires, since $(...)'s exit status becomes the assignment's.
+capture() {
+  local errfile
+  errfile=$(mktemp)
+  if out=$("$@" 2>"$errfile"); then
+    hook_ec=0
+  else
+    hook_ec=$?
+  fi
+  hook_err=$(cat "$errfile")
+  rm -f "$errfile"
+}
+
 # 1. edit_context on a.rs, then native Edit on a.rs -> ALLOWED (no deny)
 run_hook "mcp__calm__edit_context" "crates/calm-core/src/a.rs" "SomeSymbol" >/dev/null
 out=$(run_hook "Edit" "crates/calm-core/src/a.rs")
@@ -46,17 +64,17 @@ fi
 # 2. native Edit on a DIFFERENT file b.rs, same session, no edit_context for
 #    it -> DENIED even though edit_context was called for a.rs above (this
 #    is the exact regression Task C1 fixes: a session-wide unlock would
-#    have allowed this).
-out=$(run_hook "Edit" "crates/calm-core/src/b.rs")
-if ! echo "$out" | jq -e '.hookSpecificOutput.permissionDecision == "deny"' >/dev/null 2>&1; then
-  fail "expected deny for b.rs (never edit_context'd this session), got: $out"
+#    have allowed this). Deny is exit code 2 + stderr now, not JSON stdout
+#    -- see deny()'s own comment in calm-nudge.sh.
+capture run_hook "Edit" "crates/calm-core/src/b.rs"
+if [ "$hook_ec" -ne 2 ]; then
+  fail "expected deny (exit 2) for b.rs (never edit_context'd this session), got exit $hook_ec, stderr: $hook_err"
 fi
-reason=$(echo "$out" | jq -r '.hookSpecificOutput.permissionDecisionReason')
-if [[ "$reason" != *"b.rs"* ]]; then
-  fail "deny reason must name b.rs specifically, got: $reason"
+if [[ "$hook_err" != *"b.rs"* ]]; then
+  fail "deny reason must name b.rs specifically, got: $hook_err"
 fi
-if [[ "$reason" != *"other file(s), but not this one"* ]]; then
-  fail "deny reason must explain that edit_context was satisfied for OTHER files but not this one (message-wording regression), got: $reason"
+if [[ "$hook_err" != *"other file(s), but not this one"* ]]; then
+  fail "deny reason must explain that edit_context was satisfied for OTHER files but not this one (message-wording regression), got: $hook_err"
 fi
 
 # 3. edit_context on b.rs now unlocks it too (per-file, additive, not
@@ -100,9 +118,9 @@ if [ -f .calm/index.db ]; then
     "SELECT name FROM symbols GROUP BY name HAVING COUNT(*) > 1 LIMIT 1;" 2>/dev/null || true)
   if [ -n "$multi_name" ]; then
     run_hook_symbol_only "mcp__calm__edit_context" "$multi_name" >/dev/null
-    out=$(run_hook "Edit" "crates/calm-core/src/never_edit_contexted.rs")
-    if ! echo "$out" | jq -e '.hookSpecificOutput.permissionDecision == "deny"' >/dev/null 2>&1; then
-      fail "expected deny: an ambiguous symbol name (>1 row) must not unlock any file, got: $out"
+    capture run_hook "Edit" "crates/calm-core/src/never_edit_contexted.rs"
+    if [ "$hook_ec" -ne 2 ]; then
+      fail "expected deny (exit 2): an ambiguous symbol name (>1 row) must not unlock any file, got exit $hook_ec, stderr: $hook_err"
     fi
   fi
 fi
@@ -221,9 +239,9 @@ is_silent "$out" || fail "expected silence for a piped Bash grep at PostToolUse,
 # 11. Deny messages also carry the tool-discovery hint -- edit_context is
 #     just as deferrable as search/locate, and a hard deny whose only
 #     remediation is an unloadable tool is a real deadlock, not just noise.
-out=$(run_hook "Edit" "crates/calm-core/src/never_edit_contexted2.rs")
-echo "$out" | jq -r '.hookSpecificOutput.permissionDecisionReason' | grep -q "tool-discovery step" \
-  || fail "expected TOOL_DISCOVERY_HINT in the edit_context deny reason, got: $out"
+capture run_hook "Edit" "crates/calm-core/src/never_edit_contexted2.rs"
+echo "$hook_err" | grep -q "tool-discovery step" \
+  || fail "expected TOOL_DISCOVERY_HINT in the edit_context deny reason, got: $hook_err"
 
 # 12. Read on a short (<80 line) real indexed source file -> SILENT.
 out=$(run_hook_read_path "$(pwd)/crates/calm-core/src/lib.rs")
@@ -294,9 +312,21 @@ echo "$out" | jq -e '.hookSpecificOutput.additionalContext' >/dev/null 2>&1 \
 # 20. F2 regression: a real code file with no prior edit_context this
 #     session must still hard-deny -- is_prose_file must not have widened
 #     the exemption beyond .md/.txt.
-out=$(run_hook "Edit" "crates/calm-core/src/never_edit_contexted3.rs")
-echo "$out" | jq -e '.hookSpecificOutput.permissionDecision == "deny"' >/dev/null 2>&1 \
-  || fail "F2 regression: expected deny for a real .rs file with no prior edit_context, got: $out"
+capture run_hook "Edit" "crates/calm-core/src/never_edit_contexted3.rs"
+[ "$hook_ec" -eq 2 ] \
+  || fail "F2 regression: expected deny (exit 2) for a real .rs file with no prior edit_context, got exit $hook_ec, stderr: $hook_err"
+
+# 20b. Stage 7 (diff_impact-before-commit) hard deny -- previously had NO
+#      automated coverage at all (found while migrating deny() to exit 2).
+#      Test 20 just above already set needs_diff_impact=true for
+#      session_id_test via its own (denied) Edit attempt -- save_state runs
+#      before the Stage 5 check either way -- so a same-session git commit
+#      here hits Stage 7's gate on real state, not a synthetic setup.
+capture run_hook_bash "git commit -m test"
+[ "$hook_ec" -eq 2 ] \
+  || fail "Stage 7: expected deny (exit 2) for a commit with changes since the last diff_impact check, got exit $hook_ec, stderr: $hook_err"
+[[ "$hook_err" == *"Stage 7"* && "$hook_err" == *"diff_impact"* ]] \
+  || fail "Stage 7: deny reason must name the diff_impact gate, got: $hook_err"
 
 # 21. F4 (2026-07-14 audit-design): a non-UUID session_id WITHOUT
 #     CALM_NUDGE_STATE_DIR set must route to decisions.jsonl.manual, not

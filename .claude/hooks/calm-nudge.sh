@@ -233,14 +233,29 @@ trap log_decision EXIT
 # so an occasional dropped increment is the acceptable failure mode, a hung
 # hook invocation is not.
 STATE_LOCK_FD=""
+# 2026-07-14, found while migrating deny() to exit-2 (see deny()'s own
+# comment): `exec {FD}>file 2>/dev/null` -- a bare `exec` with ONLY
+# redirects, no command -- applies EVERY one of its redirects to the
+# CURRENT SHELL PERMANENTLY, not just to a single command. The trailing
+# `2>/dev/null` here was meant to suppress an error message if opening the
+# lock file itself failed, but it silently, permanently redirected this
+# script's real stderr to /dev/null for the rest of the process the very
+# first time this ran successfully -- invisible until now purely because
+# nothing previously read this script's stderr (the old deny()
+# communicated over stdout instead). Wrapping the exec in a `{ ...; }`
+# group scopes `2>/dev/null` to just that group (bash saves/restores the
+# fd around a redirected group, unlike a bare `exec`), while the
+# `{STATE_LOCK_FD}>file` redirect inside it still applies permanently as
+# intended -- that's the one part of this we actually want to persist
+# until release_state_lock closes it.
 acquire_state_lock() {
-  exec {STATE_LOCK_FD}>"${state_file}.lock" 2>/dev/null || { STATE_LOCK_FD=""; return; }
+  { exec {STATE_LOCK_FD}>"${state_file}.lock"; } 2>/dev/null || { STATE_LOCK_FD=""; return; }
   flock -w 2 "$STATE_LOCK_FD" 2>/dev/null || true
 }
 release_state_lock() {
   [ -n "$STATE_LOCK_FD" ] || return 0
   flock -u "$STATE_LOCK_FD" 2>/dev/null || true
-  exec {STATE_LOCK_FD}>&- 2>/dev/null || true
+  { exec {STATE_LOCK_FD}>&-; } 2>/dev/null || true
   STATE_LOCK_FD=""
 }
 
@@ -529,12 +544,34 @@ file_has_edit_context() {
   jq -e --arg p "$p" 'index($p) != null' <<<"$edit_context_files" >/dev/null 2>&1
 }
 
+# Denies the current PreToolUse call (Stage 5 edit_context, Stage 7
+# diff_impact -- see this file's own header and this function's call
+# sites). Signals via exit code 2 + stderr, not the JSON
+# `permissionDecision: "deny"` + `exit 0` form this used until 2026-07-14:
+# verified externally (`gh issue view`, not a blog summary --
+# docs/superskills/specs/2026-07-14-calm-mcp-external-onboarding.md's Item
+# B external-research addendum) that the JSON form has a real, repeated,
+# multi-version bug history in anthropics/claude-code -- #4669 (deny
+# silently ignored, tool ran anyway, 3 independent reporters, never
+# confirmed fixed, auto-closed by an inactivity bot) and #39344 (a
+# DIFFERENT hook's "ask" silently overrode a static permissions.deny rule,
+# fixed only in v2.1.101). Exit code 2 is the more primitive mechanism
+# (official docs: "Exit 2 means a blocking error... stderr text is fed
+# back to Claude... PreToolUse blocks the tool call") and sidesteps the
+# whole JSON-output interaction surface those bugs lived in.
+#
+# Still best-effort, not a claim of unbypassable enforcement -- Anthropic's
+# own docs say to prefer the static permission system over hooks for hard
+# enforcement, precisely because hooks have this bug history. CALM's
+# per-file/per-session contextual logic ("has edit_context run for THIS
+# file THIS session") can't be expressed as a static permission rule, so a
+# hook is what's available here, used honestly as defense-in-depth rather
+# than a guarantee nothing can bypass it.
 deny() {
   decision="deny"
   decision_detail="$1"
-  jq -n --arg reason "$1" \
-    '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: $reason}}'
-  exit 0
+  echo "$1" >&2
+  exit 2
 }
 
 # Max times to show the *same* nudge (by key) within one session. LLM agents
