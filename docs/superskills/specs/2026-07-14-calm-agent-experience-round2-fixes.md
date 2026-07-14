@@ -244,3 +244,41 @@ HOLD on F1 and F2 specifically -- both have a concrete, cheaply-fixable design d
 **F2 (revised):** scope narrowed from `is_clearly_non_code_file` (which also matches `.yml`/`.json`/`.toml`/`.lock`) to a new, smaller prose-only check (`.md`/`.txt` only) -- config/lock files keep the full hard gate, since they can carry real operational blast radius outside CALM's call graph. Introduce a distinct helper (e.g. `is_prose_file`) rather than repurposing the existing denylist, so the two concerns ("not source code, for search-nudge purposes" vs "provably has no blast radius, for edit-gate purposes") don't silently drift back together if either list changes later.
 
 **F5 (mitigation, not a design change):** the fast pure-bash pre-check must sit *after* `trap log_decision EXIT` is registered (already line 151, before any dispatch) and must still fall through to it — implemented as an early `return`-equivalent that still reaches the trap, never a bare `exit` that could bypass it. Add one `test-calm-nudge.sh` case asserting a `cargo build`-style irrelevant Bash command still produces exactly one `decisions.jsonl` line.
+
+## F3 Results — hand-audit of the would_deny:read_native shadow log
+
+Ran 2026-07-14, after F2/F4 shipped. 27 real events in `decisions.jsonl` carry `would_deny: "read_native"` (grew from the 26 seen during the audit pass — a few landed during this same implementation session). Split by extension:
+
+- **11/27 (41%) are `.md` files** (`AGENTS.md` ×6, `README.md` ×2,
+  `docs/plans/2026-07-14-calm-agent-experience-audit-and-backlog.md` ×1,
+  `docs/superskills/specs/2026-07-13-calm-agent-experience-upgrade.md` ×2).
+  Whole-file native `Read` on prose is frequently the *correct* choice —
+  narrative docs don't decompose into an independently-useful symbol the
+  way a function does — so this slice is NOT a clean "miss" pool. Same
+  underlying insight as F2 (prose vs. code needs a different rule), now
+  confirmed on the read side too, not just edit_context.
+- **16/27 (59%) are `.rs` files**, and every one of the 9 distinct files
+  behind them is substantial: `crates/calm-server/src/tools.rs` (8183
+  lines), `crates/calm-server/src/tools/edit.rs` (1640),
+  `crates/calm-server/src/tools/inspect.rs` (1132),
+  `crates/calm-core/src/edit.rs` (1102), `crates/calm-server/src/tools/
+  orient.rs` (772), `crates/calm-cli/tests/daemon_integration.rs` (542),
+  `crates/calm-server/src/tools/recover.rs` (606),
+  `crates/calm-core/src/memory.rs` (484),
+  `crates/calm-server/src/tools/testgap.rs` (313). Zero short/borderline
+  files in this set — `file_worth_symbol_read`'s 80-line threshold is
+  doing its job correctly for code. Every one of these 16 is a genuine,
+  clean case where `source(symbol)`/`file_overview` would have avoided
+  flooding context with thousands of irrelevant lines.
+
+**Conclusion for any future Read/Grep hard-gate work:** the real-code slice
+(16/27, 59%) supports that a hard gate would be both safe and correctly
+targeted — no false-positive candidates found among them. The prose slice
+(11/27, 41%) should NOT feed that decision as-is; a future hard gate must
+reuse F2's `is_prose_file()` exemption (or an equivalent) rather than
+gating on `is_indexed_file` + length alone, the same way F2 already had to
+learn for the edit_context gate. This halves the effective evidence pool
+for "is hardening safe" from 27 down to 16 — still zero observed false
+positives in that narrowed pool, but a smaller sample than the raw count
+suggested. No hard-gate code changed as part of this pass (F3 was
+analysis-only per the audit-design gate).
