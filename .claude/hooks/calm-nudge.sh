@@ -63,6 +63,29 @@ session_id=$(jq -r '.session_id // "unknown"' <<<"$input")
 # a dual-event script.
 hook_event=$(jq -r '.hook_event_name // ""' <<<"$input")
 
+# F5 (2026-07-14 audit-design mitigation, docs/superskills/specs/2026-07-14-
+# calm-agent-experience-round2-fixes.md): true when this is a PreToolUse
+# Bash call whose command provably never reaches a branch below that reads
+# edit_context_files/needs_diff_impact/nudge_counts -- every Bash
+# sub-branch this hook has (git commit/push, grep/rg/ag, find, rustfmt/
+# cargo fmt) is gated on one of these exact words appearing (word-boundary,
+# same technique those branches themselves use below), so "none of them
+# appear" means none of those branches do anything with the parsed state
+# either -- real measured overhead paid for zero signal otherwise (session
+# 75bc8f50 alone: 385 Bash-triggered hook invocations, well under 15% of
+# which touch any sub-branch that needs this state). Deliberately does NOT
+# skip mkdir/decision_log/trap below (audit Failure Mode 3: log_decision
+# must still fire on every invocation) -- only the session-state cat+3x jq
+# parse a few lines down, which this function is checked immediately
+# before. Conservative on purpose: a command containing one of these words
+# for an unrelated reason (e.g. "cargo build" mentioning nothing here) just
+# takes the slow path for no benefit, never the reverse.
+bash_command_needs_no_session_state() {
+  [ "$tool_name" = "Bash" ] || return 1
+  [ "$hook_event" = "PostToolUse" ] && return 1
+  ! grep -qE '\b(git|grep|rg|ag|find|rustfmt|fmt)\b' <<<"$command"
+}
+
 # --- session state (survives across PreToolUse calls within one session) ---
 # .calm/ is already gitignored (see .gitignore) so state files never
 # get committed; created defensively in case `ci init`/`ci serve` hasn't
@@ -78,16 +101,28 @@ hook_event=$(jq -r '.hook_event_name // ""' <<<"$input")
 state_dir="${CALM_NUDGE_STATE_DIR:-.calm/.hook-state}"
 mkdir -p "$state_dir" 2>/dev/null || true
 state_file="$state_dir/${session_id}.json"
-# Opportunistic cleanup of stale state from old sessions — cheap, best-effort.
-find "$state_dir" -maxdepth 1 -name '*.json' -mtime +1 -delete 2>/dev/null || true
+# Opportunistic cleanup of stale state from old sessions. F5 (2026-07-14):
+# probabilistic, not every invocation -- a maintenance task with no
+# correctness requirement to run every time (unlike log_decision, which
+# must), unlike a directory scan's cost which IS paid every time it runs.
+# 1-in-20 still bounds unbounded growth of $state_dir without paying that
+# scan on every single hook call.
+if [ $((RANDOM % 20)) -eq 0 ]; then
+  find "$state_dir" -maxdepth 1 -name '*.json' -mtime +1 -delete 2>/dev/null || true
+fi
 
 state='{}'
-if [ -f "$state_file" ]; then
-  state=$(cat "$state_file" 2>/dev/null || echo '{}')
+edit_context_files='[]'
+needs_diff_impact=false
+nudge_counts='{}'
+if ! bash_command_needs_no_session_state; then
+  if [ -f "$state_file" ]; then
+    state=$(cat "$state_file" 2>/dev/null || echo '{}')
+  fi
+  edit_context_files=$(jq -c '.edit_context_files // []' <<<"$state" 2>/dev/null || echo '[]')
+  needs_diff_impact=$(jq -r '.needs_diff_impact // false' <<<"$state" 2>/dev/null || echo false)
+  nudge_counts=$(jq -c '.nudge_counts // {}' <<<"$state" 2>/dev/null || echo '{}')
 fi
-edit_context_files=$(jq -c '.edit_context_files // []' <<<"$state" 2>/dev/null || echo '[]')
-needs_diff_impact=$(jq -r '.needs_diff_impact // false' <<<"$state" 2>/dev/null || echo false)
-nudge_counts=$(jq -c '.nudge_counts // {}' <<<"$state" 2>/dev/null || echo '{}')
 
 # --- decision-log JSONL: one line per hook invocation, resolved at exit
 # regardless of which code path returned. This is the audit trail the
