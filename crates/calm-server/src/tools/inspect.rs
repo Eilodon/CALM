@@ -875,14 +875,32 @@ pub(crate) fn build_health(
     };
 
     let mut test_files = Vec::new();
-    if let Ok(mut stmt) =
-        conn.prepare("SELECT DISTINCT from_path FROM call_edges WHERE to_symbol = ?1")
-    {
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT DISTINCT ce.from_path, s.is_test FROM call_edges ce \
+         LEFT JOIN symbols s ON s.qualified_name = ce.from_symbol \
+         WHERE ce.to_symbol = ?1",
+    ) {
         let _ = stmt
-            .query_map([&c.qualified_name], |row| row.get::<_, String>(0))
+            .query_map([&c.qualified_name], |row| {
+                let path: String = row.get(0)?;
+                let caller_is_test: Option<i64> = row.get(1)?;
+                Ok((path, caller_is_test))
+            })
             .map(|rows| {
-                for path in rows.flatten() {
-                    if is_test_file(&path) && !test_files.contains(&path) {
+                // Prefer the parser's attribute-detected `is_test` on the
+                // CALLING symbol (`#[test]`/`#[tokio::test]`/pytest/JUnit
+                // convention — see `detect_is_test`) over a filename guess:
+                // a caller's own file may not look test-ish (e.g. Rust's
+                // idiomatic `#[cfg(test)] mod tests` centralized in a
+                // "parent" file like `tools.rs`, which `is_test_file` can't
+                // see) while still genuinely being a test. Keep the
+                // filename heuristic as an OR fallback for callers the
+                // `symbols` table has no row for (LEFT JOIN miss —
+                // `caller_is_test` is `None`), so no existing detection is
+                // lost, only widened.
+                for (path, caller_is_test) in rows.flatten() {
+                    let is_test_caller = caller_is_test == Some(1) || is_test_file(&path);
+                    if is_test_caller && !test_files.contains(&path) {
                         test_files.push(path);
                     }
                 }

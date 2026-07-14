@@ -108,7 +108,7 @@ impl CalmServer {
     /// `overlay_status_for` returning `None`) rather than reporting a
     /// misleading `available: false`.
     #[cfg(feature = "scip-overlay")]
-    fn per_language_overlay_statuses(
+    pub(crate) fn per_language_overlay_statuses(
         &self,
         conn: &rusqlite::Connection,
     ) -> Vec<PerLanguageOverlayStatus> {

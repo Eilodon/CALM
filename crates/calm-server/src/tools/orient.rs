@@ -151,12 +151,31 @@ impl CalmServer {
                     source: path.display().to_string(),
                     overridden_fields: calm_core::config::diff_from_default(&self.config()),
                 });
+            #[cfg(feature = "scip-overlay")]
+            const WEAK_MATCH_RATE_THRESHOLD: f64 = 0.5;
+            #[cfg(feature = "scip-overlay")]
+            let weak_cross_reference_languages: Vec<super::recover::PerLanguageOverlayStatus> =
+                self.per_language_overlay_statuses(&conn)
+                    .into_iter()
+                    .filter(|s| languages.contains(&s.lang))
+                    .filter(|s| {
+                        !s.status.available
+                            || s.status
+                                .last_match_rate
+                                .is_some_and(|r| r < WEAK_MATCH_RATE_THRESHOLD)
+                    })
+                    .collect();
+            #[cfg(not(feature = "scip-overlay"))]
+            let weak_cross_reference_languages: Vec<super::recover::PerLanguageOverlayStatus> =
+                Vec::new();
+
             let health_summary = HealthSummary {
                 hub_count,
                 hub_degree_count,
                 hub_bridge_count,
                 edges_ready: self.edges_ready(),
                 config_override,
+                weak_cross_reference_languages,
             };
 
             // Count only, never content — deliberately not auto-surfacing note
@@ -528,6 +547,20 @@ pub(crate) struct HealthSummary {
     /// log line). `None` when no override file exists — the common case.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) config_override: Option<ConfigOverrideSummary>,
+    /// 2026-07-14 audit finding: an agent had no way to learn "cross-
+    /// reference resolution for language X is much weaker than for Rust"
+    /// without a separate `indexing_status` call most sessions never make
+    /// — `repo_overview` is the one call every session is guaranteed to
+    /// make (AGENTS.md Stage 1). Populated only for languages this repo
+    /// actually has files in (`languages` above) whose SCIP overlay is
+    /// either unavailable, or measured below `WEAK_MATCH_RATE_THRESHOLD` —
+    /// raw data, not a verdict: a low/absent overlay leaves the
+    /// conservative heuristic resolver still providing weaker-confidence
+    /// edges, not zero resolution. Empty (the common case for
+    /// well-supported languages, or a build without the `scip-overlay`
+    /// feature) when nothing qualifies.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) weak_cross_reference_languages: Vec<super::recover::PerLanguageOverlayStatus>,
 }
 
 #[derive(Serialize, JsonSchema)]

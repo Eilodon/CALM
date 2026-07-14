@@ -251,6 +251,53 @@ mod tests {
     }
 
     #[test]
+    fn test_gap_hotspots_recognizes_test_caller_in_a_non_test_named_file() {
+        // Regression test for a real bug found 2026-07-14: `build_health`
+        // used to detect "has a direct test" purely from the CALLING file's
+        // NAME (`is_test_file`: must contain "test"/"spec" or start with
+        // "tests/"). CALM's own `#[cfg(test)] mod tests` lives centralized
+        // in `tools.rs` (no test-ish name), so every one of its 171 tests
+        // was invisible to this heuristic even though `call_edges` and the
+        // `symbols.is_test` flag both correctly recorded the relationship —
+        // verified live against this project's own index.db before fixing.
+        // This seeds the exact shape: a caller symbol with `is_test = 1`
+        // living in a file named `lib.rs` (no test-ish substring at all).
+        let dir = std::env::temp_dir().join(format!("ci_testgap_nontest_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+        {
+            let conn = server.db();
+            seed_symbol(&conn, "a.rs::well_tested2", "well_tested2", "a.rs", 3, 9, 0);
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point, is_test, coreness) \
+                 VALUES ('lib.rs::mod_tests::it_works2', 'it_works2', 'function', 'rust', 'lib.rs', 1, 5, 'fn it_works2()', '', 'it_works2', 0, 0, 0, 1, 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO call_edges (from_symbol, to_symbol, from_path, edge_confidence) \
+                 VALUES ('lib.rs::mod_tests::it_works2', 'a.rs::well_tested2', 'lib.rs', 'resolved')",
+                [],
+            )
+            .unwrap();
+        }
+        *server.phase_handle().write().unwrap() = IndexingPhase::Ready;
+
+        let v = jv(server.test_gap_hotspots(P(TestGapHotspotsParams { top_n: None })));
+        let gaps = v["gaps"].as_array().unwrap();
+        assert!(
+            !gaps
+                .iter()
+                .any(|g| g["qualified_name"] == "a.rs::well_tested2"),
+            "well_tested2 has a caller whose SYMBOL is_test=1, even though the caller's \
+             FILE name (lib.rs) doesn't look test-ish — must not be a gap, got: {v}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_gap_hotspots_reports_honest_empty_when_edges_not_ready() {
         let dir = std::env::temp_dir().join(format!("ci_testgap_noedges_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);

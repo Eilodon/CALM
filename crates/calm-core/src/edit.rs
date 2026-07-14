@@ -418,6 +418,57 @@ pub fn validate_syntax(new_content: &str, extension: &str) -> Option<bool> {
     Some(!tree.root_node().has_error())
 }
 
+/// Counts tree-sitter `ERROR`/`MISSING` nodes in a parsed tree.
+fn count_parse_errors(node: tree_sitter::Node) -> usize {
+    let mut count = usize::from(node.is_error() || node.is_missing());
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        count += count_parse_errors(child);
+    }
+    count
+}
+
+/// Root-cause fix for a real false-positive found 2026-07-14: `validate_syntax`
+/// re-parses the WHOLE resulting file and rejects the write if `has_error()`
+/// is true anywhere in it — including pre-existing regions the edit never
+/// touched. This goes wrong whenever the file already contains a construct
+/// newer than the vendored grammar (verified case: `&raw const`/`&raw mut`,
+/// stable Rust syntax that `tree-sitter-rust` 0.23.3 has no rule for and
+/// marks as an `ERROR` node at every occurrence — confirmed the file still
+/// compiles clean with `rustc`, and confirmed a byte-identical no-op
+/// "replacement" of an unrelated line range was rejected with the exact
+/// same `PARSE_ERROR`, proving the failure had nothing to do with what was
+/// being written). Bumping the grammar isn't a safe narrow fix here: this
+/// workspace's `tree-sitter` core is deliberately held at an ABI level
+/// (13-14) that ~15 other exact-pinned language grammars (see this crate's
+/// workspace `Cargo.toml` comments) depend on; jumping it to unlock a newer
+/// `tree-sitter-rust` risks an ABI cliff across all of them.
+///
+/// `validate_syntax_diff` fixes this at the right layer instead: an edit is
+/// only rejected if it introduces MORE parse-error nodes than the file
+/// already had, never for errors that pre-date this write. A hunk that
+/// actually breaks syntax (mismatched brace/paren/quote) always adds at
+/// least one new error node relative to the original, so real breakage is
+/// still caught — only pre-existing grammar-coverage gaps stop being
+/// mistaken for edit-introduced ones.
+///
+/// `Some(true)` = clean, or no more errors than `original` already had.
+/// `Some(false)` = this edit strictly increased the error-node count.
+/// `None` = `extension` has no recognized grammar — callers must treat this
+/// as "allow the write", same convention as `validate_syntax`.
+pub fn validate_syntax_diff(original: &str, new_content: &str, extension: &str) -> Option<bool> {
+    let language = language_for_extension(extension)?;
+    let new_errors = parse_tree(new_content, language)
+        .map(|t| count_parse_errors(t.root_node()))?;
+    if new_errors == 0 {
+        return Some(true);
+    }
+    let original_errors = parse_tree(original, language)
+        .map(|t| count_parse_errors(t.root_node()))
+        .unwrap_or(0);
+    Some(new_errors <= original_errors)
+}
+
 /// Write `content` to `path` atomically: write to a temp file in the same
 /// directory, then `rename()` over the target. A concurrent reader (the
 /// file watcher's `notify` handler, an editor, `search_grep`) can never

@@ -838,10 +838,23 @@ fn init_daemon_tracing(project_root: &std::path::Path) -> Result<()> {
 
     use tracing_subscriber::prelude::*;
 
-    let log_file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(calm_dir.join("daemon.log"))?;
+    let mut log_opts = std::fs::OpenOptions::new();
+    log_opts.create(true).append(true);
+    // 0600 at creation time (existing files keep whatever mode they already
+    // have -- `mode()` only affects the O_CREAT case): found via a real
+    // audit 2026-07-14 that this and `audit.log` below both inherited the
+    // umask-derived default (0664 observed), inconsistent with the 0600
+    // this workspace deliberately uses for `.calm/memory.key` (see its own
+    // doc comment) and `.calm/` itself (`create_calm_dir`, 0700). Neither
+    // file holds secret material today, but both reveal file paths and
+    // session activity to any other local user on a shared box, which
+    // wasn't the intended posture.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        log_opts.mode(0o600);
+    }
+    let log_file = log_opts.open(calm_dir.join("daemon.log"))?;
     let human_layer = tracing_subscriber::fmt::layer()
         .with_writer(log_file)
         .with_filter(
@@ -857,10 +870,14 @@ fn init_daemon_tracing(project_root: &std::path::Path) -> Result<()> {
     // CONFIRM_REQUIRED/REASON_NOT_GROUNDED denials, and applied writes with
     // their before/after hashes) instead of duplicating the human log in a
     // different format.
-    let audit_file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(calm_dir.join("audit.log"))?;
+    let mut audit_opts = std::fs::OpenOptions::new();
+    audit_opts.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        audit_opts.mode(0o600);
+    }
+    let audit_file = audit_opts.open(calm_dir.join("audit.log"))?;
     let audit_layer = tracing_subscriber::fmt::layer()
         .json()
         .with_writer(audit_file)

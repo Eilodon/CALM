@@ -6653,14 +6653,13 @@ mod tests {
     }
 
     #[test]
-    fn edit_symbol_position_before_warns_when_symbol_has_leading_doc_comment() {
-        // Backlog B1 (docs/plans/2026-07-14-calm-agent-experience-audit-and-
-        // backlog.md): position="before" anchors on the symbol's own
-        // line_start, which never includes a leading doc comment -- so the
-        // insertion lands BETWEEN the comment and the symbol. Not a syntax
-        // break (so PARSE_ERROR never fires), just a silent misattribution.
-        // insertion_hunk_for now attaches a warning to the response's `note`
-        // whenever the resolved symbol has a non-empty docstring.
+fn edit_symbol_position_before_moves_anchor_above_leading_doc_comment() {
+        // Root-cause fix (2026-07-14, replaces the former backlog-B1
+        // warning-only mitigation): position="before" used to anchor on the
+        // symbol's own line_start, landing new_text BETWEEN a leading doc
+        // comment and the symbol -- silently leaving the comment describing
+        // whatever was just inserted. `leading_doc_comment_start` now scans
+        // upward for the comment block and moves the anchor above it.
         let (dir, server) = test_server("edit_symbol_before_doc_sandwich");
         std::fs::write(
             dir.join("a.rs"),
@@ -6693,10 +6692,68 @@ mod tests {
         ));
         let v = jv(out);
         assert_eq!(v["applied"], true, "response: {v}");
+        assert!(
+            v["note"].is_null(),
+            "doc comment was successfully relocated above -- no warning expected, got: {v}"
+        );
+
+        let content = std::fs::read_to_string(dir.join("a.rs")).unwrap();
+        assert_eq!(
+            content,
+            "fn other() -> i32 {\n    2\n}\n/// old doc for helper\nfn helper() -> i32 {\n    1\n}\n",
+            "new content must land ABOVE the doc comment, not sandwiched between it and helper: {content:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_symbol_position_before_warns_when_attribute_blocks_doc_comment_detection() {
+        // Residual gap the fix above doesn't cover: an attribute
+        // (`#[inline]`) sitting between the doc comment and the symbol.
+        // Verified directly against tree-sitter-rust 0.23 (this workspace's
+        // pinned grammar): `attribute_item` is its own top-level sibling
+        // node, NOT folded into `function_item`'s span, so the indexed
+        // line_start for `helper` here is the `fn` line, not the attribute's
+        // -- the live line directly above that isn't a comment, so
+        // `leading_doc_comment_start` correctly declines to guess through it
+        // and the sandwich warning still fires.
+        let (dir, server) = test_server("edit_symbol_before_doc_attr_gap");
+        std::fs::write(
+            dir.join("a.rs"),
+            "/// old doc for helper\n#[inline]\nfn helper() -> i32 {\n    1\n}\n",
+        )
+        .unwrap();
+
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.rs::helper', 'helper', 'function', 'rust', 'a.rs', 3, 5, '', 'old doc for helper', 'helper', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let out = server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
+            EditSymbolParams {
+                symbol: "helper".into(),
+                path: None,
+                line: None,
+                expected_hash: None,
+                new_text: "fn other() -> i32 {\n    2\n}".into(),
+                position: Some("before".into()),
+                confirm: false,
+                reason: None,
+                old_text: None,
+            },
+        ));
+        let v = jv(out);
+        assert_eq!(v["applied"], true, "response: {v}");
         let note = v["note"].as_str().unwrap_or("");
         assert!(
             note.contains("leading doc comment") && note.contains("helper"),
-            "expected doc-comment-sandwich warning in note, got: {v}"
+            "expected residual sandwich warning when an attribute blocks detection, got: {v}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

@@ -517,6 +517,24 @@ fn daemon_calm_dir_and_socket_have_restrictive_permissions() {
         "the daemon socket must be chmod'd 0600 before any accept()"
     );
 
+    // 2026-07-14 audit: daemon.log and audit.log used to inherit the
+    // umask-derived default (0664 observed live) instead of an explicit
+    // mode, inconsistent with memory.key's deliberate 0600 — fixed in
+    // `init_daemon_tracing` (calm-cli/src/main.rs).
+    let daemon_log_mode = std::fs::metadata(calm_dir.join("daemon.log"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(daemon_log_mode, 0o600, "daemon.log must be created at exactly 0600");
+
+    let audit_log_mode = std::fs::metadata(calm_dir.join("audit.log"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(audit_log_mode, 0o600, "audit.log must be created at exactly 0600");
+
     let pid = read_daemon_pid(project.path()).unwrap();
     unsafe {
         libc::kill(pid as i32, libc::SIGTERM);

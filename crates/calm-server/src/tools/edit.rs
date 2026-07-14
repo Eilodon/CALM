@@ -410,7 +410,7 @@ impl CalmServer {
             .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("");
-        let parse_status = match calm_core::edit::validate_syntax(&new_content, ext) {
+        let parse_status = match calm_core::edit::validate_syntax_diff(&original, &new_content, ext) {
             Some(true) => "clean",
             Some(false) => {
                 // Show the ORIGINAL boundary line(s) so a pre-existing
@@ -1073,25 +1073,38 @@ fn insertion_hunk_for(
             },
             Err(_) => (c.line_start as usize, c.line_end as usize),
         };
-    // Warn (2026-07-14, backlog B1): `Before` anchors at the symbol's own
+    // Root-cause fix (2026-07-14, replaces the former backlog-B1 warning-only
+    // mitigation): `Before` used to always anchor at the symbol's own
     // line_start, which never includes a leading doc comment (a separate
     // tree-sitter sibling node -- see walk_symbols, crates/calm-core/src/
-    // indexer/parser.rs:587) -- so inserting "before" a documented symbol
-    // lands new_text BETWEEN the comment and the symbol, silently leaving the
-    // comment describing whatever was just inserted instead of its original
-    // target. Reuses the already-extracted `docstring` (no new text-scanning
-    // heuristic, no schema change) -- cheap and language-agnostic since doc
-    // extraction is already per-language in the indexer. The real fix (moving
-    // the anchor itself) needs a `doc_start_line`-style field and a schema
-    // migration -- deliberately deferred, see docs/plans/2026-07-14-calm-
-    // agent-experience-audit-and-backlog.md B4.
+    // indexer/parser.rs:587) -- sandwiching new_text BETWEEN the comment and
+    // the symbol, silently leaving the comment describing whatever was just
+    // inserted instead of its original target. `leading_doc_comment_start`
+    // scans the already-read live file text (no schema change, no DB column
+    // -- the "doc_start_line field" previously deferred as the only real fix
+    // turns out unnecessary since this function already re-reads the file)
+    // for a contiguous doc-comment block directly above with no blank-line
+    // gap, and moves the actual insertion anchor above it. A residual
+    // warning remains only for what this can't cover: an attribute/
+    // annotation (`#[derive(...)]`, a decorator, ...) sitting between the
+    // comment and the symbol as its own preceding sibling node in a grammar
+    // that doesn't fold it into the item's span the way tree-sitter-rust
+    // does for `#[...]`.
+    let live_lines: Vec<&str> = live.lines().collect();
+    let anchor_line_start = if matches!(position, calm_core::edit::InsertPosition::Before) {
+        leading_doc_comment_start(&live_lines, &c.language, line_start)
+    } else {
+        line_start
+    };
     let sandwich_warning = if matches!(position, calm_core::edit::InsertPosition::Before)
         && !c.docstring.trim().is_empty()
+        && anchor_line_start == line_start
     {
         Some(format!(
-            "heads up — '{}' has a leading doc comment; position=\"before\" inserts between \
-             that comment and '{}', not above the comment, so the comment will end up \
-             describing the newly-inserted code instead. If you want the comment to stay with \
+            "heads up — '{}' has a leading doc comment this anchor could not locate directly \
+             above it (e.g. an attribute/annotation line sits between them) — position=\"before\" \
+             inserted between the comment and '{}', not above the comment, so the comment may \
+             now describe the newly-inserted code instead. If the comment should stay with \
              '{}', include your own comment in new_text, or use edit_lines to insert above the \
              comment's own line.",
             c.name, c.name, c.name
@@ -1099,18 +1112,72 @@ fn insertion_hunk_for(
     } else {
         None
     };
-    let hunk = calm_core::edit::insertion_hunk(&live, line_start, line_end, position, new_text)
-        .ok_or_else(|| {
-            error_detail(
-                "INVALID_RANGE",
-                &format!(
-                    "resolved range {line_start}..{line_end} is out of bounds for {} on disk",
-                    c.path
-                ),
-                true,
-            )
-        })?;
+    let hunk =
+        calm_core::edit::insertion_hunk(&live, anchor_line_start, line_end, position, new_text)
+            .ok_or_else(|| {
+                error_detail(
+                    "INVALID_RANGE",
+                    &format!(
+                        "resolved range {anchor_line_start}..{line_end} is out of bounds for {} \
+                         on disk",
+                        c.path
+                    ),
+                    true,
+                )
+            })?;
     Ok((hunk, sandwich_warning))
+}
+
+/// Scans upward from a symbol's own first line (1-indexed, as returned by a
+/// fresh parse) to find where an immediately-preceding doc-comment block
+/// begins, so `Before` insertion can anchor above the comment instead of
+/// between it and the symbol. Two forms recognized: (a) a contiguous run of
+/// single-line markers (Rust `///`/`//!`, `#` for Python/Ruby, `//` for the
+/// C-family/JS/TS/Java/C#/Go/Kotlin/Swift/Scala) with no blank line breaking
+/// the run; (b) a `/* ... */`/`/** ... */` block comment on the line(s)
+/// directly above, found by scanning upward for its opening `/*` (assumes
+/// non-nested block comments — true for every grammar this workspace
+/// indexes). Returns `symbol_start` unchanged if neither form sits
+/// immediately above — a comment separated by a blank line isn't "leading"
+/// in the sense that matters for sandwiching, and this deliberately doesn't
+/// guess through an attribute/annotation line (see `insertion_hunk_for`'s
+/// doc comment on that residual gap).
+fn leading_doc_comment_start(lines: &[&str], language: &str, symbol_start: usize) -> usize {
+    if symbol_start < 2 || lines.is_empty() {
+        return symbol_start;
+    }
+    let above_idx = symbol_start - 2;
+
+    if lines[above_idx].trim().ends_with("*/") {
+        let mut i = above_idx;
+        loop {
+            if lines[i].trim_start().contains("/*") {
+                return i + 1;
+            }
+            if i == 0 {
+                return symbol_start;
+            }
+            i -= 1;
+        }
+    }
+
+    let markers: &[&str] = match language {
+        "rust" => &["///", "//!"],
+        "python" | "ruby" => &["#"],
+        _ => &["//"],
+    };
+    let is_marker_line = |s: &str| markers.iter().any(|m| s.trim().starts_with(m));
+
+    let mut top = above_idx;
+    loop {
+        if !is_marker_line(lines[top]) {
+            return top + 2;
+        }
+        if top == 0 {
+            return 1;
+        }
+        top -= 1;
+    }
 }
 
 /// Picks the live-parse occurrence of `name` whose start is nearest the

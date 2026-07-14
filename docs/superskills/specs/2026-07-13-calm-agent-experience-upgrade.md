@@ -28,6 +28,24 @@ reasoning in conversation; see `calm-safety-by-construction-design-lens.md`
 in the assistant's memory for the underlying litmus test: "strip away
 agent memory/model/repo history — does the guarantee still hold?").
 
+**Status (verified against real code 2026-07-14, not memory/comments — see the
+VHEATM re-audit that triggered this check): items 1-3 below are IMPLEMENTED
+and tested, not proposals. Verified live:** `symbols.boundary_ambiguous`
+column exists and is written by `graph::boundary::update_boundary_ambiguous_flags`
+(called from both reindex paths in `indexer/pipeline.rs`); `fitness_report`
+surfaces `boundary_ambiguous_count` with a `max_boundary_ambiguous_count`
+threshold (`fitness.rs`); `edit_symbol`'s replace path refuses when
+`c.boundary_ambiguous` is set (`tools/edit.rs:139`, tests in `tools.rs`
+`edit_symbol_replace_refuses_a_boundary_ambiguous_symbol` +
+`edit_symbol_old_text_mode_refuses_on_boundary_ambiguous_symbol`); the
+`old_text` small-text-match mode (item 2) is live on `edit_symbol`; the
+per-(file,symbol) native-Edit re-arm (item 3) is live in
+`.claude/hooks/calm-nudge.sh`. A `fitness_report` count > 0 for
+`boundary_ambiguous_count` reflects real ambiguous symbols the mechanism
+correctly caught, not a missing feature — do not re-implement item 1 or 2
+without re-checking the code first. Items 4-8 were not re-verified in this
+pass; do not assume their status from this note.
+
 **Tier 1 — highest combined leverage:**
 1. Index-time symbol-boundary-integrity check: at parse time (`walk_symbols`),
    compare consecutive top-level symbols' start/end rows; if two symbols
