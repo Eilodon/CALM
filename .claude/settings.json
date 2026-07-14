@@ -13,11 +13,6 @@
             "type": "command",
             "command": "bash .claude/hooks/session-start-build-calm.sh",
             "timeout": 300
-          },
-          {
-            "type": "command",
-            "command": "bash .claude/hooks/sessionstart-discovery-dump.sh",
-            "timeout": 5
           }
         ]
       }

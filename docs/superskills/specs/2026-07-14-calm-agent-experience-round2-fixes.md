@@ -282,3 +282,23 @@ for "is hardening safe" from 27 down to 16 — still zero observed false
 positives in that narrowed pool, but a smaller sample than the raw count
 suggested. No hard-gate code changed as part of this pass (F3 was
 analysis-only per the audit-design gate).
+
+## F1 Results — finalized with a real captured payload
+
+The temporary `sessionstart-discovery-dump.sh` hook captured a real `SessionStart` payload for this exact conversation before any permanent logic was written, confirming both assumptions the audit flagged as unverified:
+
+```json
+{"session_id": "0727c625-8339-4ef1-b2c5-dfd873942623", "hook_event_name": "SessionStart", "source": "resume"}
+```
+
+`session_id` is present; `source` is present with exactly the values expected (`startup` for two other concurrent sessions on this repo, `resume` for this session's own reconnect). Implemented the audit's revised design exactly: `session-start-agents-md.sh` now keys a "seen" marker (`.calm/.hook-state/sessionstart-seen/<session_id>`) and only serves the short banner when `source == "resume"` **and** that marker already exists — any other `source` value (`startup`, `clear`, `compact`, or absent/unrecognized) always gets the full `AGENTS.md` injection, fail-safe toward re-injecting rather than silence.
+
+Verified live across 6 scenarios (`.claude/hooks/test-session-start-agents-md.sh`, all PASS, run twice for idempotency):
+1. `startup`, fresh `session_id` → full inject, marker created.
+2. `resume`, same `session_id` (marker exists) → short banner naming the `calm-guide` Skill.
+3. `resume`, a *different* never-seen `session_id` → full inject (dedup only applies to an already-seen id).
+4. `clear`, same `session_id` as (1) → full inject — **this is the exact bug the audit's pre-mortem caught** in the first draft (session_id-only dedup would have wrongly served the banner right after context was wiped).
+5. `compact`, same `session_id` → full inject, same reasoning as (4).
+6. `source` field missing entirely → full inject (fail-safe).
+
+The temporary discovery-dump hook and its `settings.json` entry were removed once the schema was confirmed and the permanent logic landed, per its own header comment's instruction.
