@@ -4,6 +4,7 @@ pub mod db;
 pub mod edit;
 pub mod embedding;
 pub mod fitness;
+pub mod format;
 pub mod gitignore;
 pub mod graph;
 pub mod indexer;

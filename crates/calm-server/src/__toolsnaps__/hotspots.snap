@@ -1,0 +1,305 @@
+{
+  "name": "hotspots",
+  "description": "Proactive churn × complexity analysis. USE WHEN: starting exploration of a codebase or after orientation to identify high-risk files before diving in.",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "properties": {
+      "top_n": {
+        "description": "Max files to return. Defaults to `hotspots.default_top_n` in\nconfig.json (10 out of the box).",
+        "type": [
+          "integer",
+          "null"
+        ],
+        "format": "uint",
+        "minimum": 0
+      },
+      "since": {
+        "description": "`git log --since` window for churn analysis, e.g. `\"3 months ago\"`.\nDefaults to `hotspots.default_since` in config.json (\"6 months ago\"\nout of the box).",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "min_churn": {
+        "description": "Minimum commit count for a file to qualify. Defaults to\n`hotspots.default_min_churn` in config.json (2 out of the box).\nSet to `0` to also surface high-complexity files with little or no\nrecent churn (\"stable legacy debt\") that the default threshold\nexcludes entirely.",
+        "type": [
+          "integer",
+          "null"
+        ],
+        "format": "int64"
+      },
+      "include_symbols": {
+        "description": "`true` to also list the highest-risk symbols within each hotspot\nfile, not just the file-level score. `false` (default) is cheaper.",
+        "type": "boolean",
+        "default": false
+      }
+    },
+    "type": "object"
+  },
+  "outputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$defs": {
+      "ErrorDetail": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "recoverable": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "recoverable"
+        ]
+      },
+      "HotspotEntryOutput": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "language": {
+            "type": "string"
+          },
+          "churn": {
+            "$ref": "#/$defs/HotspotChurnOutput"
+          },
+          "complexity": {
+            "$ref": "#/$defs/HotspotComplexityOutput"
+          },
+          "norm_churn": {
+            "description": "Churn share (0-1) of the score, normalized against the busiest\ncandidate file this run — 0.0 when git is unavailable.",
+            "type": "number",
+            "format": "double"
+          },
+          "norm_compl": {
+            "description": "Complexity share (0-1) of the score, normalized against the most\ncomplex candidate file this run.",
+            "type": "number",
+            "format": "double"
+          },
+          "hotspot_score": {
+            "type": "number",
+            "format": "double"
+          },
+          "risk_level": {
+            "type": "string"
+          },
+          "top_symbols": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/$defs/HotspotSymbolOutput"
+            }
+          }
+        },
+        "required": [
+          "path",
+          "language",
+          "churn",
+          "complexity",
+          "norm_churn",
+          "norm_compl",
+          "hotspot_score",
+          "risk_level"
+        ]
+      },
+      "HotspotChurnOutput": {
+        "type": "object",
+        "properties": {
+          "commit_count": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "bot_commit_count": {
+            "description": "Commits whose author looks like a bot account (dependabot[bot],\nrenovate[bot], etc.) — see `churn_source`.",
+            "type": "integer",
+            "format": "int64"
+          },
+          "churn_source": {
+            "description": "\"unknown\" (no churn data — e.g. git unavailable), \"human\" (no bot\ncommits), \"bot_dominated\" (every commit was a bot), or \"mixed\".",
+            "type": "string"
+          },
+          "authors": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "last_changed": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "commit_count",
+          "bot_commit_count",
+          "churn_source",
+          "authors"
+        ]
+      },
+      "HotspotComplexityOutput": {
+        "type": "object",
+        "properties": {
+          "symbol_count": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "hub_count": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "avg_caller_count": {
+            "type": "number",
+            "format": "double"
+          },
+          "connected_coreness_count": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "language": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "symbol_count",
+          "hub_count",
+          "avg_caller_count",
+          "connected_coreness_count",
+          "language"
+        ]
+      },
+      "HotspotSymbolOutput": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "is_hub": {
+            "type": "boolean"
+          },
+          "coreness": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "caller_count": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "line_start": {
+            "description": "Disambiguates two same-named symbols in this file (e.g. a\n`#[cfg(feature)]` real impl vs. its stub) — `symbol_info` already\ncarries these for the same reason.",
+            "type": "integer",
+            "format": "int64"
+          },
+          "line_end": {
+            "type": "integer",
+            "format": "int64"
+          }
+        },
+        "required": [
+          "name",
+          "kind",
+          "is_hub",
+          "caller_count",
+          "line_start",
+          "line_end"
+        ]
+      },
+      "SuggestedNext": {
+        "type": "object",
+        "properties": {
+          "tool": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "args": true,
+          "gate": {
+            "description": "Plan 3 §3.5(b): `Some(true)` iff skipping `tool` is actually\nhook-enforced (currently only the edit_context/edit_lines/edit_symbol\n→ diff_impact hints set this, via `suggested_gated`) — every other\nhint is left unset (`None`), meaning advisory-only. Lets an agent\ntell \"you'll be blocked if you skip this\" apart from \"you probably\nwant this next\" without re-deriving it from AGENTS.md prose each time.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "tool",
+          "reason"
+        ]
+      }
+    },
+    "properties": {
+      "error": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/ErrorDetail"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "hotspots": {
+        "type": "array",
+        "items": {
+          "$ref": "#/$defs/HotspotEntryOutput"
+        }
+      },
+      "count": {
+        "type": "integer",
+        "format": "uint",
+        "minimum": 0
+      },
+      "git_available": {
+        "type": "boolean"
+      },
+      "since": {
+        "type": "string"
+      },
+      "total_files_analyzed": {
+        "type": "integer",
+        "format": "uint",
+        "minimum": 0
+      },
+      "hotspot_method": {
+        "type": "string"
+      },
+      "note": {
+        "type": "string"
+      },
+      "suggested_next": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/SuggestedNext"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "type": "object"
+  },
+  "annotations": {
+    "readOnlyHint": true,
+    "destructiveHint": false,
+    "idempotentHint": true,
+    "openWorldHint": false
+  }
+}

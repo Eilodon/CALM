@@ -1,0 +1,117 @@
+{
+  "name": "remember",
+  "description": "Save a durable, interpretive note (architecture decision, gotcha, rationale) under a short topic key. Persists across sessions and server restarts — unlike session_context, which only tracks the current session's navigation. USE WHEN: you've learned something a future session should know that the graph/AST can't capture on its own (a WHY, not a fact derivable from code). Upserts: calling again with the same topic overwrites its content.",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "required": [
+      "topic",
+      "content"
+    ],
+    "type": "object",
+    "properties": {
+      "topic": {
+        "description": "Short stable key for this note (e.g. \"why-resolver-tiers\",\n\"auth-module-gotcha\"). Calling `remember` again with the same topic\noverwrites its content — one note per topic, not an append log.",
+        "type": "string"
+      },
+      "content": {
+        "description": "The note's full text — replaces whatever was previously stored\nunder `topic`.",
+        "type": "string"
+      }
+    }
+  },
+  "outputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$defs": {
+      "ErrorDetail": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "recoverable": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "recoverable"
+        ]
+      },
+      "SuggestedNext": {
+        "type": "object",
+        "properties": {
+          "tool": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "args": true,
+          "gate": {
+            "description": "Plan 3 §3.5(b): `Some(true)` iff skipping `tool` is actually\nhook-enforced (currently only the edit_context/edit_lines/edit_symbol\n→ diff_impact hints set this, via `suggested_gated`) — every other\nhint is left unset (`None`), meaning advisory-only. Lets an agent\ntell \"you'll be blocked if you skip this\" apart from \"you probably\nwant this next\" without re-deriving it from AGENTS.md prose each time.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "tool",
+          "reason"
+        ]
+      }
+    },
+    "properties": {
+      "error": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/ErrorDetail"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "topic": {
+        "type": "string"
+      },
+      "updated_at": {
+        "type": "string"
+      },
+      "refs_captured": {
+        "description": "Count of file-path-like references found in `content` that resolved\nto a real file and got snapshotted for later staleness checks (see\n`MemoryNote::staleness`) — 0 just means the note didn't mention any\nfile, not that anything went wrong.",
+        "type": "integer",
+        "format": "uint",
+        "minimum": 0
+      },
+      "content_warning": {
+        "description": "audit F7: detection-only, same as `recall`'s per-note warning — the\nnote is still saved either way (sanitize.rs's philosophy: flag, don't\nblock), this only tells the person writing it that the content looks\nprompt-injection-shaped before it's stored.",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "suggested_next": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/SuggestedNext"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "type": "object"
+  },
+  "annotations": {
+    "readOnlyHint": false,
+    "destructiveHint": false,
+    "idempotentHint": true,
+    "openWorldHint": false
+  }
+}

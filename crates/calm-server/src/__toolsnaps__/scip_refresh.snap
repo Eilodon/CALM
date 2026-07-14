@@ -1,0 +1,134 @@
+{
+  "name": "scip_refresh",
+  "description": "Manually run one or every SCIP provider's indexer right now (rust/go/python/javascript/java/csharp/php/c/ruby), bypassing the configured refresh policy — e.g. to force a run for an on_demand/min_interval provider without waiting. \"java\" also covers Kotlin (scip-java indexes a mixed Java+Kotlin module in one pass, same as \"javascript\" covering TypeScript). USE WHEN: you need formal-tier call edges immediately and know a source-of-truth indexer (rust-analyzer/scip-go/scip-python/scip-typescript/scip-java/scip-dotnet/scip-php/scip-clang/scip-ruby) is available. scip-ruby (Sorbet) indexes untyped Ruby on a best-effort basis — real flow-sensitive narrowing (e.g. inside a `case/when` on class), but weaker than a fully `sig`-annotated codebase. Can block for a while (up to a few minutes for a large project, longer for Java/C++'s full build-tool invocation) since it may invoke a real external indexer — not for routine use. NETWORK: for javascript/python, the underlying indexer may run via `npx`, which fetches the package from the npm registry if not already cached locally.",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "properties": {
+      "lang": {
+        "description": "Which provider to refresh: \"rust\", \"go\", \"python\", \"javascript\",\n\"java\", \"csharp\", \"php\", \"c\", \"ruby\", or \"all\" (default) for every\nprovider in the table.",
+        "type": [
+          "string",
+          "null"
+        ],
+        "default": null
+      }
+    },
+    "type": "object"
+  },
+  "outputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$defs": {
+      "ErrorDetail": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "recoverable": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "recoverable"
+        ]
+      },
+      "ScipRefreshProviderOutput": {
+        "type": "object",
+        "properties": {
+          "lang": {
+            "type": "string"
+          },
+          "upgraded": {
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0
+          },
+          "ruled_out": {
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0
+          },
+          "inserted": {
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0
+          },
+          "match_rate": {
+            "type": "number",
+            "format": "double"
+          }
+        },
+        "required": [
+          "lang",
+          "upgraded",
+          "ruled_out",
+          "inserted",
+          "match_rate"
+        ]
+      },
+      "SuggestedNext": {
+        "type": "object",
+        "properties": {
+          "tool": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "args": true,
+          "gate": {
+            "description": "Plan 3 §3.5(b): `Some(true)` iff skipping `tool` is actually\nhook-enforced (currently only the edit_context/edit_lines/edit_symbol\n→ diff_impact hints set this, via `suggested_gated`) — every other\nhint is left unset (`None`), meaning advisory-only. Lets an agent\ntell \"you'll be blocked if you skip this\" apart from \"you probably\nwant this next\" without re-deriving it from AGENTS.md prose each time.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "tool",
+          "reason"
+        ]
+      }
+    },
+    "properties": {
+      "error": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/ErrorDetail"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "providers": {
+        "type": "array",
+        "items": {
+          "$ref": "#/$defs/ScipRefreshProviderOutput"
+        }
+      },
+      "suggested_next": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/SuggestedNext"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "type": "object"
+  },
+  "annotations": {
+    "readOnlyHint": false,
+    "destructiveHint": false,
+    "idempotentHint": true,
+    "openWorldHint": true
+  }
+}

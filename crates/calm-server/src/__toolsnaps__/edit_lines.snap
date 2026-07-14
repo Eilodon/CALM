@@ -1,0 +1,266 @@
+{
+  "name": "edit_lines",
+  "description": "The only write-capable tool in ci — line-range granularity, works on ANY tracked file (source code, Cargo.toml, docs — not just parsed symbols). NOT FOR: symbol-scoped edits with auto-resolved range (use edit_symbol). Requires expected_hash from a prior call's current_hash (or edit_context's range_checksum for a whole symbol); omit it to preview a range's hash/content without writing anything. All hunks in one call apply to the same file and must be disjoint (non-overlapping).",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$defs": {
+      "EditHunkParam": {
+        "type": "object",
+        "properties": {
+          "start_line": {
+            "description": "1-indexed, inclusive.",
+            "type": "integer",
+            "format": "int64"
+          },
+          "end_line": {
+            "description": "1-indexed, inclusive.",
+            "type": "integer",
+            "format": "int64"
+          },
+          "expected_hash": {
+            "description": "Hash of this range's current content — from a prior call's\n`current_hash`, or `edit_context`'s `range_checksum` when the range\nis exactly a whole symbol. Omit to preview instead of writing: the\nresponse still reports `current_hash`/`old_text` for this range, so\na first call can learn the hash before a real edit.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "new_text": {
+            "description": "Replacement text for the range, used exactly as given (no implicit\nnewline handling) — include your own `\\n` between lines and after\nthe last one if the following line should stay on its own line.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "start_line",
+          "end_line",
+          "new_text"
+        ]
+      }
+    },
+    "type": "object",
+    "properties": {
+      "path": {
+        "description": "Repo-relative path. All hunks in one call apply to this one file.",
+        "type": "string"
+      },
+      "edits": {
+        "description": "Must be disjoint (non-overlapping) ranges; applied bottom-up so\nearlier (lower-numbered) hunks are never affected by line-count\nchanges from later (higher-numbered) ones.",
+        "type": "array",
+        "items": {
+          "$ref": "#/$defs/EditHunkParam"
+        }
+      },
+      "confirm": {
+        "description": "Required `true` to write when any touched range falls inside a\n`risk_assessment: \"high\"` symbol or one with `is_hub: true` (see\n`edit_context`). Omitted/`false` rejects such an edit with an\nexplanation instead of proceeding. Two further requirements gate on\ntop of `confirm` for a DEGREE-hub/both-hub/high-risk touch\n(docs/superskills/specs/2026-07-11-superskills-inspired-features.md\n#5 v2): `edit_context` must have been called for the touched\nsymbol(s) THIS session (`EDIT_CONTEXT_REQUIRED` otherwise — merely\nhaving called it in a prior session, or a stale review past the\nfreshness window, doesn't count), and `reason` must cite a real\ncaller name from that exact `edit_context` response\n(`REASON_NOT_GROUNDED` otherwise) — `confirm: true` alone is never\nsufficient for those. Plan 3 §3.3 (F10): a BRIDGE-only hub touch\n(structurally central via coreness, not a high-caller symbol) at\nrisk ≤ medium, where every known caller edge is `resolved`/`formal`\nconfidence (no `textual`/`ambiguous` undercounting risk), skips\nboth of those extra requirements — `confirm: true` alone is enough.\nA single low-confidence caller on that same symbol still forces the\nfull requirements regardless of `hub_kind`.",
+        "type": "boolean",
+        "default": false
+      },
+      "reason": {
+        "description": "Required (non-empty, and referencing a real caller — see `confirm`)\nwhen touching a hub/high-risk symbol. Ignored otherwise. State which\ncaller(s) you checked and why this change is safe for them — not a\nfree-form justification a generic phrase could satisfy.",
+        "type": [
+          "string",
+          "null"
+        ]
+      }
+    },
+    "required": [
+      "path",
+      "edits"
+    ]
+  },
+  "outputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$defs": {
+      "ErrorDetail": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "recoverable": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "recoverable"
+        ]
+      },
+      "EditHunkResultOutput": {
+        "type": "object",
+        "properties": {
+          "start_line": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "end_line": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "status": {
+            "description": "\"applied\" | \"preview\" | \"conflict\"",
+            "type": "string"
+          },
+          "current_hash": {
+            "description": "Hash of the range's content before this call — pass this as\n`expected_hash` on retry.",
+            "type": "string"
+          },
+          "old_text": {
+            "description": "Content of the range before this call — undo material when\n`status == \"applied\"`, or what to inspect otherwise.",
+            "type": "string"
+          },
+          "new_end_line": {
+            "description": "Only present when `status == \"applied\"`: the line the replacement\nnow ends at (`start_line` is unchanged).",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "other_matches": {
+            "description": "Present when the range's pre-edit content is byte-identical to N\nOTHER line windows of this file (a lone `}` line, say): the hash\nproves content, not position — verify the line numbers point where\nintended, or anchor structurally via edit_symbol's `position`.",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          }
+        },
+        "required": [
+          "start_line",
+          "end_line",
+          "status",
+          "current_hash",
+          "old_text"
+        ]
+      },
+      "TouchedSymbolOutput": {
+        "type": "object",
+        "properties": {
+          "qualified_name": {
+            "type": "string"
+          },
+          "caller_count": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "is_hub": {
+            "type": "boolean"
+          },
+          "hub_kind": {
+            "description": "Plan 3 §3.3 (F10): `'degree' | 'bridge' | 'both'`, or `None` when\n`is_hub` is `false` — see `graph::hub::update_is_hub_flags`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "qualified_name",
+          "caller_count",
+          "is_hub"
+        ]
+      },
+      "SuggestedNext": {
+        "type": "object",
+        "properties": {
+          "tool": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "args": true,
+          "gate": {
+            "description": "Plan 3 §3.5(b): `Some(true)` iff skipping `tool` is actually\nhook-enforced (currently only the edit_context/edit_lines/edit_symbol\n→ diff_impact hints set this, via `suggested_gated`) — every other\nhint is left unset (`None`), meaning advisory-only. Lets an agent\ntell \"you'll be blocked if you skip this\" apart from \"you probably\nwant this next\" without re-deriving it from AGENTS.md prose each time.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "tool",
+          "reason"
+        ]
+      }
+    },
+    "properties": {
+      "error": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/ErrorDetail"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "path": {
+        "type": "string"
+      },
+      "applied": {
+        "type": "boolean"
+      },
+      "hunks": {
+        "type": "array",
+        "items": {
+          "$ref": "#/$defs/EditHunkResultOutput"
+        }
+      },
+      "parse_status": {
+        "description": "\"clean\" | \"skipped_unrecognized_language\" — absent when nothing was\nwritten (preview/conflict/risk-blocked/parse error).",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "touched_symbols": {
+        "description": "Symbols overlapping the touched ranges (post-edit positions once\n`applied`) — the same callers/is_hub signal `edit_context`/\n`diff_impact` report, bundled here so a caller doesn't need a\nseparate round trip just to see what it just changed.",
+        "type": "array",
+        "items": {
+          "$ref": "#/$defs/TouchedSymbolOutput"
+        }
+      },
+      "risk_assessment": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "index_stale": {
+        "description": "`true` only when `applied` is `true` but the post-write index\nrefresh failed: the file on disk holds the new content — do NOT\nre-apply — while symbol line numbers served from the index may lag\nuntil it recovers (see `note`, and call `indexing_status`).",
+        "type": [
+          "boolean",
+          "null"
+        ]
+      },
+      "note": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "suggested_next": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/SuggestedNext"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "type": "object"
+  },
+  "annotations": {
+    "readOnlyHint": false,
+    "destructiveHint": true,
+    "idempotentHint": false,
+    "openWorldHint": false
+  }
+}

@@ -260,6 +260,169 @@ impl CalmServer {
         }))
     }
 
+    #[tool(
+        name = "format_files",
+        description = "Formats Rust source files via rustfmt — the safe replacement for shelling out to `rustfmt`/`cargo fmt` directly. Only `.rs` files are supported (rustfmt is Rust-specific); a non-Rust path is reported as skipped, not an error. Reindexes any file it actually changes, same as edit_lines/edit_symbol.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    pub(crate) fn format_files(
+        &self,
+        Parameters(p): Parameters<FormatFilesParams>,
+    ) -> Json<ToolOutcome<FormatFilesOutput>> {
+        Json(self.timed_tool("format_files", || self.format_files_impl(p.paths)))
+    }
+
+    /// Shared implementation for `format_files`. Formats each path in
+    /// isolation (a syntax error in one file never blocks the rest), writes
+    /// only the files that actually changed via the same `atomic_write` +
+    /// `reindex_paths` path `edit_lines_impl` uses, and reindexes all of
+    /// them together in one batched call rather than once per file.
+    ///
+    /// Deliberately does NOT run the hub/high-risk `CONFIRM_REQUIRED`/
+    /// `edit_context`-required gate `edit_lines_impl` enforces: that gate
+    /// exists because an arbitrary text edit can change program semantics
+    /// in ways blast-radius analysis needs to catch. `rustfmt` cannot —
+    /// by construction it only ever changes whitespace/line-breaks/
+    /// trailing commas, never identifiers, expressions, or control flow —
+    /// so gating a formatting-only write behind the same machinery
+    /// designed for semantic risk would be safety theater, not safety.
+    /// Still marks written files for the Stage 7 `diff_impact` gate below
+    /// (same as every other write path) for consistency, even though a
+    /// `diff_impact` run on a pure-formatting change will correctly report
+    /// no symbol-level changes.
+    fn format_files_impl(&self, paths: Vec<String>) -> ToolOutcome<FormatFilesOutput> {
+        let _guard = self.edit_lock.lock_ok();
+        let calm_dir = self
+            .db_path
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| self.project_root.clone());
+        let _cross_guard = match calm_core::db::edit_lock::acquire(&calm_dir) {
+            Ok(g) => g,
+            Err(e) => {
+                return ToolOutcome::error(error_detail(
+                    "EDIT_LOCK_FAILED",
+                    &format!(
+                        "could not acquire cross-process edit lock in {}: {e}",
+                        calm_dir.display()
+                    ),
+                    true,
+                ));
+            }
+        };
+
+        let mut results = Vec::with_capacity(paths.len());
+        let mut changed_paths: Vec<String> = Vec::new();
+
+        for path in &paths {
+            let full_path = match resolve_repo_path(&self.project_root, path) {
+                Ok(p) => p,
+                Err(e) => {
+                    results.push(FormatFileResult {
+                        path: path.clone(),
+                        status: "error".to_string(),
+                        detail: Some(e.message),
+                    });
+                    continue;
+                }
+            };
+            let ext = full_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            if ext != "rs" {
+                results.push(FormatFileResult {
+                    path: path.clone(),
+                    status: "skipped_unsupported_extension".to_string(),
+                    detail: Some("format_files only supports .rs files today".to_string()),
+                });
+                continue;
+            }
+            let original = match std::fs::read_to_string(&full_path) {
+                Ok(s) => s,
+                Err(e) => {
+                    results.push(FormatFileResult {
+                        path: path.clone(),
+                        status: "error".to_string(),
+                        detail: Some(format!("could not read {path}: {e}")),
+                    });
+                    continue;
+                }
+            };
+            let edition = calm_core::format::detect_rust_edition(&full_path, &self.project_root);
+            let formatted = match calm_core::format::format_rust_source(&original, &edition) {
+                Ok(f) => f,
+                Err(e) => {
+                    results.push(FormatFileResult {
+                        path: path.clone(),
+                        status: "error".to_string(),
+                        detail: Some(e),
+                    });
+                    continue;
+                }
+            };
+            if formatted == original {
+                results.push(FormatFileResult {
+                    path: path.clone(),
+                    status: "already_formatted".to_string(),
+                    detail: None,
+                });
+                continue;
+            }
+            if let Err(e) = calm_core::edit::atomic_write(&full_path, &formatted) {
+                results.push(FormatFileResult {
+                    path: path.clone(),
+                    status: "error".to_string(),
+                    detail: Some(format!("failed to write {path}: {e}")),
+                });
+                continue;
+            }
+            self.track_file(path);
+            self.mark_written(path);
+            changed_paths.push(path.clone());
+            results.push(FormatFileResult {
+                path: path.clone(),
+                status: "formatted".to_string(),
+                detail: None,
+            });
+        }
+
+        let mut index_stale: Option<String> = None;
+        if !changed_paths.is_empty() {
+            match calm_core::db::conn::open_writer(&self.db_path) {
+                Err(e) => index_stale = Some(format!("could not open DB to reindex: {e}")),
+                Ok(mut write_conn) => {
+                    if let Err(e) = calm_core::indexer::pipeline::reindex_paths(
+                        &mut write_conn,
+                        &self.project_root,
+                        &changed_paths,
+                    ) {
+                        index_stale = Some(format!("reindex failed: {e}"));
+                    }
+                }
+            }
+        }
+        drop(_cross_guard);
+        drop(_guard);
+
+        let suggested_next = if changed_paths.is_empty() {
+            None
+        } else {
+            self.filter_sn(suggested_gated(
+                "diff_impact",
+                "Formatting wrote to disk — diff_impact should report no symbol-level changes, only style",
+            ))
+        };
+
+        ToolOutcome::success(FormatFilesOutput {
+            results,
+            index_stale,
+            suggested_next,
+        })
+    }
+
     /// Shared implementation for `edit_lines`/`edit_symbol`. Flow: apply
     /// hunks in-memory (all-or-nothing, see `calm_core::edit::apply_hunks`) →
     /// pre-write syntax validation → risk gate (query-only, against
@@ -410,7 +573,8 @@ impl CalmServer {
             .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("");
-        let parse_status = match calm_core::edit::validate_syntax_diff(&original, &new_content, ext) {
+        let parse_status = match calm_core::edit::validate_syntax_diff(&original, &new_content, ext)
+        {
             Some(true) => "clean",
             Some(false) => {
                 // Show the ORIGINAL boundary line(s) so a pre-existing
@@ -1441,6 +1605,36 @@ pub(crate) struct EditLinesOutput {
     pub(crate) index_stale: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) note: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) suggested_next: Option<SuggestedNext>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub(crate) struct FormatFilesParams {
+    /// Repo-relative paths to format. Only `.rs` files are supported today
+    /// (rustfmt is Rust-specific) — a non-Rust path comes back as
+    /// `skipped_unsupported_extension` in the corresponding result, not a
+    /// tool error, so it's safe to pass a mixed-language batch.
+    pub(crate) paths: Vec<String>,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub(crate) struct FormatFileResult {
+    pub(crate) path: String,
+    /// "formatted" | "already_formatted" | "skipped_unsupported_extension" | "error".
+    pub(crate) status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) detail: Option<String>,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub(crate) struct FormatFilesOutput {
+    pub(crate) results: Vec<FormatFileResult>,
+    /// Set only if at least one file was reformatted but the post-write
+    /// index refresh failed — same meaning as `EditLinesOutput::index_stale`,
+    /// carrying the failure detail directly instead of a separate bool.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) index_stale: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) suggested_next: Option<SuggestedNext>,
 }

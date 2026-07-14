@@ -19,7 +19,7 @@
     ],
     "PreToolUse": [
       {
-        "matcher": "Read|Edit|Write|Grep|Bash|mcp__calm__edit_context|mcp__calm__diff_impact|mcp__calm__edit_lines|mcp__calm__edit_symbol|mcp__calm__search|mcp__calm__source|mcp__calm__locate|mcp__calm__file_overview|mcp__calm__understand",
+        "matcher": "Read|Edit|Write|Grep|Bash|mcp__calm__edit_context|mcp__calm__diff_impact|mcp__calm__edit_lines|mcp__calm__edit_symbol|mcp__calm__search|mcp__calm__source|mcp__calm__locate|mcp__calm__file_overview|mcp__calm__understand|mcp__calm__session_context",
         "hooks": [
           {
             "type": "command",

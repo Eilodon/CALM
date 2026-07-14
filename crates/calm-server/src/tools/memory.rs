@@ -317,7 +317,7 @@ pub(crate) struct MemoryNote {
     /// referenced file changed since this note was written), or "gone" (a
     /// referenced file was deleted) — set by `recall`, not `memory_note_row`.
     pub(crate) staleness: &'static str,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub(crate) stale_refs: Vec<StaleRefOutput>,
     /// Plan 3 §3.5(d): "ok" (`content_mac` present and verifies against
     /// this project's key), "mismatch" (present but does NOT verify — the

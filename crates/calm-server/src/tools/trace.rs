@@ -678,7 +678,7 @@ pub(crate) struct CallersOutput {
     /// fans out to every same-named symbol), so each may or may not actually
     /// call this symbol. Excluded from `direct`/`direct_count` — weigh these
     /// explicitly rather than trusting them as confirmed callers.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub(crate) ambiguous: Vec<CallerEntry>,
     pub(crate) ambiguous_count: usize,
     pub(crate) direct_count: usize,
@@ -755,7 +755,7 @@ pub(crate) struct CalleesOutput {
     pub(crate) direct: Vec<CalleeEntry>,
     /// `ambiguous`-confidence callees split out of `direct` — see
     /// `CallersOutput::ambiguous`. Excluded from `direct`/`direct_count`.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub(crate) ambiguous: Vec<CalleeEntry>,
     pub(crate) ambiguous_count: usize,
     pub(crate) direct_count: usize,
@@ -811,11 +811,11 @@ pub(crate) struct DependenciesOutput {
     /// `imported_by` — e.g. a fully-qualified `crate::foo::Bar::baz()` call
     /// with no `use`. Best-effort (can include ambiguous-receiver calls);
     /// complements the import graph, does not replace it.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub(crate) call_dependents: Vec<String>,
     /// Files that reach this file's symbols through exactly one `use other::*;`
     /// hop — see the doc comment where this is computed in `dependencies`.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub(crate) glob_reexport_dependents: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) suggested_next: Option<SuggestedNext>,

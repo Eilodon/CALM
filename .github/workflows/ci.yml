@@ -100,3 +100,41 @@ jobs:
 
       - name: Test (all languages + lsp-overlay)
         run: cargo test --workspace --features tier0-5,lang-kotlin,lang-swift,lang-scala,lang-dart,lang-lua,lang-elixir,lang-haskell,lang-ocaml,lang-zig,lang-powershell,lang-groovy,scip-overlay,lsp-overlay
+
+  # Real cross-SDK MCP interop check (2026-07-14 upgrade item, ported from
+  # modelcontextprotocol/rust-sdk's own crates/rmcp/tests/test_with_js.rs —
+  # verified against that real source before porting). Every OTHER test in
+  # this repo (the `verify`/`all-languages` jobs above, the bash hook
+  # suite) drives `calm serve` with rmcp's own client code — same SDK,
+  # same author, on both sides of the wire, so a protocol-shape bug rmcp's
+  # own client happens to tolerate would never surface. This job is the
+  # other half: the official TypeScript MCP SDK (@modelcontextprotocol/sdk,
+  # a genuinely independent implementation) drives a real `calm serve`
+  # child process over real stdio and validates `tools/list` +
+  # `tools/call` end-to-end, including strict structuredContent-vs-
+  # outputSchema validation the TS SDK enforces that rmcp's own test
+  # client does not — this is exactly what caught a real schema/impl
+  # mismatch bug (`weak_cross_reference_languages` and 13 sibling fields
+  # missing `#[serde(default)]`) the very first time this check ran.
+  js-client-interop:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Build calm binary
+        run: cargo build --bin calm
+
+      # ubuntu-latest already ships a recent Node.js + npm (same assumption
+      # release.yml's npm-publish job already makes) — no actions/setup-node
+      # needed.
+      - name: Install JS interop test dependencies
+        working-directory: tests/js_client_interop
+        run: npm ci
+
+      - name: Run cross-SDK MCP interop check
+        working-directory: tests/js_client_interop
+        run: node client.mjs "$GITHUB_WORKSPACE/target/debug/calm" "$GITHUB_WORKSPACE/crates/calm-core/tests/fixtures/rust_workspace"

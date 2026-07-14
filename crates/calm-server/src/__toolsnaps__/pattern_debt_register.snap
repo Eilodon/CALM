@@ -1,0 +1,224 @@
+{
+  "name": "pattern_debt_register",
+  "description": "Register a duplicate-code-pattern anchor for later re-checking via pattern_debt_status. Resolves `symbol` the same way edit_context does (same path/line disambiguation contract), then baselines with search(kind=\"similar\") against the resolved symbol's current location. Anchored by the symbol's qualified_name, NOT path+line — survives line-shifting edits elsewhere in the file; if the symbol itself is later renamed/removed, pattern_debt_status reports anchor_lost instead of a false \"resolved\". USE WHEN: you just found/fixed one instance of a duplicated bug pattern and want to track how many other instances remain. Re-registering the same symbol replaces its note and re-baselines. Needs the embeddings feature ready — returns EMBEDDINGS_NOT_READY otherwise, same degradation as search(kind=\"similar\")/kind=\"semantic\".",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "required": [
+      "symbol",
+      "note"
+    ],
+    "type": "object",
+    "properties": {
+      "symbol": {
+        "description": "Bare symbol name (not a `path::name` qualified name) — same\nresolution contract as `edit_context`.",
+        "type": "string"
+      },
+      "path": {
+        "description": "Narrows the search to one file when `symbol` alone is ambiguous.",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "line": {
+        "description": "Disambiguates same-named symbols in the same file.",
+        "type": [
+          "integer",
+          "null"
+        ],
+        "format": "int64"
+      },
+      "note": {
+        "description": "Free-text description of the bug/duplication pattern this anchor\ntracks — shown back on every `pattern_debt_status` check.",
+        "type": "string"
+      }
+    }
+  },
+  "outputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$defs": {
+      "ErrorDetail": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "recoverable": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "recoverable"
+        ]
+      },
+      "AmbiguousCandidate": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "line_start": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "line_end": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "class_context": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "caller_count": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "language": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "signature": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "name",
+          "path",
+          "kind",
+          "line_start",
+          "line_end"
+        ]
+      },
+      "SuggestedNext": {
+        "type": "object",
+        "properties": {
+          "tool": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "args": true,
+          "gate": {
+            "description": "Plan 3 §3.5(b): `Some(true)` iff skipping `tool` is actually\nhook-enforced (currently only the edit_context/edit_lines/edit_symbol\n→ diff_impact hints set this, via `suggested_gated`) — every other\nhint is left unset (`None`), meaning advisory-only. Lets an agent\ntell \"you'll be blocked if you skip this\" apart from \"you probably\nwant this next\" without re-deriving it from AGENTS.md prose each time.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "tool",
+          "reason"
+        ]
+      },
+      "Caveat": {
+        "description": "Structured, machine-checkable hint attached to a tool result whose\nliteral content (empty list / not-found) could otherwise be misread as\nproof of absence. `class` lets a safety gate branch without parsing\n`message`; `message` is the human-readable explanation. Design mirrors\nzzet/gortex's `ZeroEdgeCaveat` (Apache-2.0) — reimplemented against\nCALM's own resolver shape, not a line-for-line port.",
+        "type": "object",
+        "properties": {
+          "class": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "class",
+          "message"
+        ]
+      }
+    },
+    "properties": {
+      "error": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/ErrorDetail"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "ambiguous": {
+        "type": "boolean"
+      },
+      "total": {
+        "description": "Total candidates matched before the display cap of\n`MAX_AMBIGUOUS_CANDIDATES`. `truncated` is `true` when `total >\ncandidates.len()`, telling the caller there are more matches than\nshown and to narrow with `path`/`line` — the list is never silently\npresented as the complete set.",
+        "type": "integer",
+        "format": "uint",
+        "minimum": 0
+      },
+      "truncated": {
+        "type": "boolean"
+      },
+      "candidates": {
+        "type": "array",
+        "items": {
+          "$ref": "#/$defs/AmbiguousCandidate"
+        }
+      },
+      "topic": {
+        "description": "Stable id for this anchor — pass to `pattern_debt_status(topic=...)`.\nAlways equal to `anchor_qualified_name` at registration time.",
+        "type": "string"
+      },
+      "anchor_qualified_name": {
+        "type": "string"
+      },
+      "baseline_count": {
+        "description": "Similar-instance count at registration time (excludes the anchor\nitself), from `search(kind=\"similar\")`.",
+        "type": "integer",
+        "format": "int64"
+      },
+      "suggested_next": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/SuggestedNext"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "caveat": {
+        "description": "Advisory hint on an empty/not-found result. Never set alongside a\npopulated `success` unless a tool opts in via `with_caveat` (e.g.\n`callers` on zero direct callers).",
+        "anyOf": [
+          {
+            "$ref": "#/$defs/Caveat"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "type": "object"
+  },
+  "annotations": {
+    "readOnlyHint": false,
+    "destructiveHint": false,
+    "idempotentHint": true,
+    "openWorldHint": false
+  }
+}

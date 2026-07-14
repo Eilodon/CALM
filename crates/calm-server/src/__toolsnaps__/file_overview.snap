@@ -1,0 +1,159 @@
+{
+  "name": "file_overview",
+  "description": "USE WHEN: you have a file path and want to see its symbols, structure, and inferred role. vs source: file_overview shows ALL symbols in a file; source reads ONE symbol's body. vs dependencies: file_overview shows what's INSIDE the file; dependencies shows what the file IMPORTS/IS IMPORTED BY.",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "required": [
+      "path"
+    ],
+    "type": "object",
+    "properties": {
+      "path": {
+        "description": "Repo-relative path, e.g. `crates/calm-core/src/embedding.rs`.",
+        "type": "string"
+      }
+    }
+  },
+  "outputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$defs": {
+      "ErrorDetail": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "recoverable": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "recoverable"
+        ]
+      },
+      "FileOverviewSymbol": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "qualified_name": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "line_start": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "line_end": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "caller_count": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "is_hub": {
+            "type": "boolean"
+          },
+          "signature": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "qualified_name",
+          "kind",
+          "line_start",
+          "line_end",
+          "caller_count",
+          "is_hub",
+          "signature"
+        ]
+      },
+      "SuggestedNext": {
+        "type": "object",
+        "properties": {
+          "tool": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "args": true,
+          "gate": {
+            "description": "Plan 3 §3.5(b): `Some(true)` iff skipping `tool` is actually\nhook-enforced (currently only the edit_context/edit_lines/edit_symbol\n→ diff_impact hints set this, via `suggested_gated`) — every other\nhint is left unset (`None`), meaning advisory-only. Lets an agent\ntell \"you'll be blocked if you skip this\" apart from \"you probably\nwant this next\" without re-deriving it from AGENTS.md prose each time.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "tool",
+          "reason"
+        ]
+      }
+    },
+    "properties": {
+      "error": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/ErrorDetail"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "path": {
+        "type": "string"
+      },
+      "language": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "symbols": {
+        "type": "array",
+        "items": {
+          "$ref": "#/$defs/FileOverviewSymbol"
+        }
+      },
+      "symbol_count": {
+        "type": "integer",
+        "format": "uint",
+        "minimum": 0
+      },
+      "symbols_truncated": {
+        "description": "`true` when `symbols` was capped below `symbol_count` (only `locate`\ncaps; the `file_overview` tool always returns the full list).",
+        "type": "boolean"
+      },
+      "suggested_next": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/SuggestedNext"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "type": "object"
+  },
+  "annotations": {
+    "readOnlyHint": true,
+    "destructiveHint": false,
+    "idempotentHint": true,
+    "openWorldHint": false
+  }
+}

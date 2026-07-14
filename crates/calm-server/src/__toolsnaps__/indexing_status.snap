@@ -1,0 +1,250 @@
+{
+  "name": "indexing_status",
+  "description": "USE WHEN: you need file-level index stats, embedding error details, or to trigger embedding recovery. NOT a replacement for repo_overview at session start. retry_embeddings=true triggers re-download of embedding model.",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "properties": {
+      "retry_embeddings": {
+        "description": "`true` to re-attempt loading the embedding model and re-embedding,\nbut only if the current `embeddings_status` is `\"failed\"` or\n`\"offline_unavailable\"` — a no-op otherwise (already succeeded, or\nalready in progress).",
+        "type": "boolean",
+        "default": false
+      }
+    },
+    "type": "object"
+  },
+  "outputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$defs": {
+      "ErrorDetail": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "recoverable": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "recoverable"
+        ]
+      },
+      "ScipOverlayStatusOutput": {
+        "description": "Local mirror of `calm_core::scip::OverlayStatus` — that type lives in\n`calm-core`, which doesn't depend on `schemars`, so it can't derive\n`JsonSchema` itself. Only exists when this crate is built with the\n`scip-overlay` feature (the same gate `calm_core::scip` itself is behind).",
+        "type": "object",
+        "properties": {
+          "available": {
+            "description": "`rust-analyzer` binary was found (PATH/rustup/VS Code) at last check.",
+            "type": "boolean"
+          },
+          "up_to_date": {
+            "description": "`false` means Rust source has changed since the last overlay run (or\nnone has ever run) — the next non-noop incremental reindex will\nactually invoke rust-analyzer again rather than cache-skip.",
+            "type": "boolean"
+          },
+          "last_match_rate": {
+            "description": "Fraction (0.0-1.0) of SCIP-resolved call sites represented by a\n`formal` edge as of the last real overlay run — absent if it's never\nactually run. A low value alongside a healthy `.scip` file usually\nmeans indexer-subroot paths aren't rebased correctly for wherever the\nindexer ran (see `parse::parse_index`'s `rebase_prefix`). Stale the\ninstant `up_to_date` is `false`.",
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
+          "last_inserted": {
+            "description": "New `call_edges` rows the last real overlay run inserted for a call\nsite tree-sitter's own candidate selection dropped entirely (e.g. name\nfan-out past `MAX_CALLEE_CANDIDATES`) — absent if it's never actually\nrun.",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "uint",
+            "minimum": 0
+          },
+          "last_run": {
+            "description": "ISO8601 timestamp of that same last real (non-cache-skip) run,\nabsent if it's never actually run.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "available",
+          "up_to_date"
+        ]
+      },
+      "PerLanguageOverlayStatus": {
+        "description": "One `ScipOverlayStatusOutput` tagged with its `file_index.language`\nvalue — see `IndexingStatusOutput::scip_overlays`.",
+        "type": "object",
+        "properties": {
+          "lang": {
+            "type": "string"
+          },
+          "available": {
+            "description": "`rust-analyzer` binary was found (PATH/rustup/VS Code) at last check.",
+            "type": "boolean"
+          },
+          "up_to_date": {
+            "description": "`false` means Rust source has changed since the last overlay run (or\nnone has ever run) — the next non-noop incremental reindex will\nactually invoke rust-analyzer again rather than cache-skip.",
+            "type": "boolean"
+          },
+          "last_match_rate": {
+            "description": "Fraction (0.0-1.0) of SCIP-resolved call sites represented by a\n`formal` edge as of the last real overlay run — absent if it's never\nactually run. A low value alongside a healthy `.scip` file usually\nmeans indexer-subroot paths aren't rebased correctly for wherever the\nindexer ran (see `parse::parse_index`'s `rebase_prefix`). Stale the\ninstant `up_to_date` is `false`.",
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
+          "last_inserted": {
+            "description": "New `call_edges` rows the last real overlay run inserted for a call\nsite tree-sitter's own candidate selection dropped entirely (e.g. name\nfan-out past `MAX_CALLEE_CANDIDATES`) — absent if it's never actually\nrun.",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "uint",
+            "minimum": 0
+          },
+          "last_run": {
+            "description": "ISO8601 timestamp of that same last real (non-cache-skip) run,\nabsent if it's never actually run.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "lang",
+          "available",
+          "up_to_date"
+        ]
+      },
+      "SuggestedNext": {
+        "type": "object",
+        "properties": {
+          "tool": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "args": true,
+          "gate": {
+            "description": "Plan 3 §3.5(b): `Some(true)` iff skipping `tool` is actually\nhook-enforced (currently only the edit_context/edit_lines/edit_symbol\n→ diff_impact hints set this, via `suggested_gated`) — every other\nhint is left unset (`None`), meaning advisory-only. Lets an agent\ntell \"you'll be blocked if you skip this\" apart from \"you probably\nwant this next\" without re-deriving it from AGENTS.md prose each time.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "tool",
+          "reason"
+        ]
+      }
+    },
+    "properties": {
+      "error": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/ErrorDetail"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "indexing_phase": {
+        "type": "string"
+      },
+      "indexing_error": {
+        "description": "Error message from the most recent indexing failure, present only\nwhen `indexing_phase == \"failed\"` — see `IndexingPhase::Failed`.",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "files_indexed": {
+        "type": "integer",
+        "format": "int64"
+      },
+      "files_total": {
+        "description": "Tier-0 source files currently discoverable on disk (respects\n`config.ignore`) — compare against `files_indexed` to see whether the\nindex is behind what's actually in the project tree.",
+        "type": "integer",
+        "format": "int64"
+      },
+      "symbols_indexed": {
+        "type": "integer",
+        "format": "int64"
+      },
+      "edges_indexed": {
+        "type": "integer",
+        "format": "int64"
+      },
+      "embeddings_status": {
+        "type": "string"
+      },
+      "embeddings_error": {
+        "description": "Error message from the most recent embeddings failure, present only\nwhen `embeddings_status` is `\"failed\"` or `\"offline_unavailable\"` —\nsee `EmbedStatus::Failed`/`OfflineUnavailable`. `\"disabled\"` means\n`semantic_search.enabled` is `false` in config, not a failure — no\nerror accompanies it.",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "edges_ready": {
+        "type": "boolean"
+      },
+      "last_updated": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "graph_mode": {
+        "description": "Which graph-rebuild path the most recent non-noop reindex took:\n`\"full\"`, `\"incremental\"`, or `\"full_fallback:<reason>\"` (Phase B\nL6 — `GraphMode::label`). Absent until this process has served one\nnon-noop reindex (edit tool or file watcher). Lets an agent confirm\nthe incremental path is actually engaged rather than silently\nfalling back to full rebuilds.",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "scip_overlay": {
+        "description": "`None` when this build wasn't compiled with the `scip-overlay` feature,\nor `rust.scip.enabled` is explicitly `false` — nothing to report.\nOtherwise reflects whether Rust call edges are currently up to date\nwith SCIP-upgraded (`formal`) confidence — see\n`calm_core::scip::overlay_status`.",
+        "anyOf": [
+          {
+            "$ref": "#/$defs/ScipOverlayStatusOutput"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "scip_overlays": {
+        "description": "Superset of `scip_overlay` covering every SCIP provider (P2.6) —\n`rust`/`go`/`python`/`javascript`/`java`/`csharp`/`php`/`c` — instead of Rust alone. Empty when\nthis build lacks the `scip-overlay` feature. A language is omitted\n(not present with `available: false`) when its `enabled` config is\nexplicitly `false` — nothing to report, same as `scip_overlay` being\nabsent for that reason.",
+        "type": "array",
+        "items": {
+          "$ref": "#/$defs/PerLanguageOverlayStatus"
+        }
+      },
+      "suggested_next": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/SuggestedNext"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "type": "object"
+  },
+  "annotations": {
+    "readOnlyHint": true,
+    "destructiveHint": false,
+    "idempotentHint": true,
+    "openWorldHint": false
+  }
+}

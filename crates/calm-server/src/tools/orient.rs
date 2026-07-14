@@ -474,7 +474,7 @@ pub(crate) struct BoundaryViolationOutput {
     pub(crate) to_path: String,
     pub(crate) rule_from: String,
     pub(crate) rule_to: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
+    #[serde(skip_serializing_if = "String::is_empty", default)]
     pub(crate) reason: String,
 }
 
@@ -510,9 +510,9 @@ pub(crate) struct FitnessReportOutput {
     pub(crate) passed: bool,
     pub(crate) checks: Vec<FitnessCheckItemOutput>,
     pub(crate) metrics: FitnessMetricsOutput,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub(crate) boundary_violations: Vec<BoundaryViolationOutput>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub(crate) config_drift: Vec<ConfigDriftFindingOutput>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) suggested_next: Option<SuggestedNext>,
@@ -559,7 +559,7 @@ pub(crate) struct HealthSummary {
     /// edges, not zero resolution. Empty (the common case for
     /// well-supported languages, or a build without the `scip-overlay`
     /// feature) when nothing qualifies.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub(crate) weak_cross_reference_languages: Vec<super::recover::PerLanguageOverlayStatus>,
 }
 
@@ -597,7 +597,7 @@ pub(crate) struct RepoOverviewOutput {
     pub(crate) truncated: bool,
     /// Empty (and therefore omitted) whenever `compact:true` — see
     /// `RepoOverviewParams::compact`.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub(crate) entry_points: Vec<EntryPointItem>,
     pub(crate) module_map: Vec<ModuleEntry>,
     pub(crate) health_summary: HealthSummary,

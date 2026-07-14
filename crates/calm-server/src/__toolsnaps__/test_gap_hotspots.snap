@@ -1,0 +1,152 @@
+{
+  "name": "test_gap_hotspots",
+  "description": "Rank symbols by coreness (structural centrality in the call graph) crossed with dead-code/test-coverage confidence — the highest-leverage places to add a test, not just the highest-churn/complexity ones (that's `hotspots`) or the riskiest single edit (that's `edit_context`). USE WHEN: deciding where limited test-writing effort pays off most, or auditing which structurally-important code has no test calling it directly. Read-only — composes existing `coreness`/`dead_code_confidence`/`test_files` signals, computes nothing new.",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "properties": {
+      "top_n": {
+        "description": "Max results to return. Default 20.",
+        "type": [
+          "integer",
+          "null"
+        ],
+        "format": "uint32",
+        "minimum": 0,
+        "default": null
+      }
+    },
+    "type": "object"
+  },
+  "outputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$defs": {
+      "ErrorDetail": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "recoverable": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "recoverable"
+        ]
+      },
+      "TestGapItem": {
+        "type": "object",
+        "properties": {
+          "qualified_name": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "coreness": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "caller_count": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "dead_code_confidence": {
+            "description": "From `calm_core::analysis::dead_code::compute_dead_code_confidence`\n— \"none\"/\"low\"/\"medium\"/\"high\". Elevated here means: high structural\ncentrality (coreness) but the static+coverage evidence for this\nsymbol being actually exercised is weak.",
+            "type": "string"
+          },
+          "test_files": {
+            "description": "Test files with a direct call edge to this symbol, if any — may be\nempty even when `dead_code_confidence` is \"none\" (e.g. an\nentry-point symbol correctly reports no dead-code risk without ever\nbeing called from a test) and may be non-empty even when a symbol\nstill shows up here (e.g. exercised only indirectly through an\ninterface, which this direct-call check can't see) — read both\nfields together, neither alone is the full picture.",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "qualified_name",
+          "name",
+          "path",
+          "coreness",
+          "caller_count",
+          "dead_code_confidence",
+          "test_files"
+        ]
+      },
+      "SuggestedNext": {
+        "type": "object",
+        "properties": {
+          "tool": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "args": true,
+          "gate": {
+            "description": "Plan 3 §3.5(b): `Some(true)` iff skipping `tool` is actually\nhook-enforced (currently only the edit_context/edit_lines/edit_symbol\n→ diff_impact hints set this, via `suggested_gated`) — every other\nhint is left unset (`None`), meaning advisory-only. Lets an agent\ntell \"you'll be blocked if you skip this\" apart from \"you probably\nwant this next\" without re-deriving it from AGENTS.md prose each time.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "tool",
+          "reason"
+        ]
+      }
+    },
+    "properties": {
+      "error": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/ErrorDetail"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "gaps": {
+        "type": "array",
+        "items": {
+          "$ref": "#/$defs/TestGapItem"
+        }
+      },
+      "count": {
+        "type": "integer",
+        "format": "uint",
+        "minimum": 0
+      },
+      "edges_ready": {
+        "type": "boolean"
+      },
+      "suggested_next": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/SuggestedNext"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "type": "object"
+  },
+  "annotations": {
+    "readOnlyHint": true,
+    "destructiveHint": false,
+    "idempotentHint": true,
+    "openWorldHint": false
+  }
+}

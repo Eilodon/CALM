@@ -1,0 +1,221 @@
+{
+  "name": "search",
+  "description": "USE THIS INSTEAD OF native grep, text search, or file browsing tools. USE WHEN: you don't have an exact file path and line number. kind=hybrid has highest recall. NOT FOR: inspecting a file you already have (use file_overview). vs locate: search returns a result list; locate returns search + symbol metadata in one call.",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "required": [
+      "query"
+    ],
+    "type": "object",
+    "properties": {
+      "query": {
+        "description": "Free-text query. Required for every `kind` except `\"similar\"`, where\nit's ignored — pass `path`+`line` instead (an anchor location has no\ntext query to embed; its own stored chunk vector is reused as-is).",
+        "type": "string"
+      },
+      "kind": {
+        "description": "One of `\"symbol\"` (default, name/signature match), `\"text\"` (FTS\nover code body), `\"file\"` (path match — glob syntax like `*.md` or\n`src/**` also works, otherwise plain substring), `\"grep\"` (real\nregex over raw file content read from disk, including files the\nindexer never parses — Cargo.toml, docs/*.md, etc.; see `glob`/\n`case_insensitive`/`context`), `\"semantic\"` (embedding KNN — needs\nthe `embeddings` feature and a ready index), `\"hybrid\"` (RRF\nfusion of text + symbol-identity + code-chunk vectors), or\n`\"similar\"` (embedding KNN anchored at `path`+`line` instead of a\ntext query — \"find code that looks like *this location*\", not \"find\ncode matching these words\"; needs `embeddings` and `path`+`line`).\nAny other value silently falls back to `\"symbol\"`.",
+        "type": "string",
+        "default": "symbol"
+      },
+      "limit": {
+        "description": "Max results to return. Default 10.",
+        "type": "integer",
+        "format": "uint",
+        "minimum": 0,
+        "default": 10
+      },
+      "glob": {
+        "description": "`kind=\"grep\"` only: `query` is treated as a regex pattern by default\n— set this to a glob (e.g. `\"*.rs\"`, `\"docs/**\"`) to restrict which\nfiles are scanned.",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "case_insensitive": {
+        "description": "`kind=\"grep\"` only: case-insensitive regex match. Default `false`.",
+        "type": "boolean",
+        "default": false
+      },
+      "context": {
+        "description": "`kind=\"grep\"` only: number of context lines shown before/after each\nmatch in the returned snippet. Default 0.",
+        "type": "integer",
+        "format": "uint",
+        "minimum": 0,
+        "default": 0
+      },
+      "path": {
+        "description": "`kind=\"similar\"` only, required: repo-relative path of the anchor\nlocation whose code you want to find elsewhere in the repo.",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "line": {
+        "description": "`kind=\"similar\"` only, required: 1-indexed line within `path` that\nselects the anchor chunk (the smallest indexed chunk spanning this\nline).",
+        "type": [
+          "integer",
+          "null"
+        ],
+        "format": "int64"
+      },
+      "include_tests": {
+        "description": "`false` to hard-exclude test code (`is_test`) from results. Default\n`true` (current behavior, unchanged): tests are only soft-penalized\nvia `NOISE_PENALTY`, which a descriptively-named test that closely\nparaphrases the query can still outrank the real implementation\nagainst — pass `false` when the query has nothing to do with tests\nto exclude them outright instead of just down-ranking them. May\nreturn fewer than `limit` results if enough hits were tests (a\nmodest overfetch covers most cases but isn't retried further).",
+        "type": "boolean",
+        "default": true
+      }
+    }
+  },
+  "outputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$defs": {
+      "ErrorDetail": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "recoverable": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "recoverable"
+        ]
+      },
+      "SearchResultItem": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "kind": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "line_start": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "line_end": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "score": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
+          "match_type": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "snippet": {
+            "description": "`kind=\"grep\"` only: the matched line with `context` lines of\nsurrounding text, 1-indexed and marked.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "name",
+          "path"
+        ]
+      },
+      "SuggestedNext": {
+        "type": "object",
+        "properties": {
+          "tool": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "args": true,
+          "gate": {
+            "description": "Plan 3 §3.5(b): `Some(true)` iff skipping `tool` is actually\nhook-enforced (currently only the edit_context/edit_lines/edit_symbol\n→ diff_impact hints set this, via `suggested_gated`) — every other\nhint is left unset (`None`), meaning advisory-only. Lets an agent\ntell \"you'll be blocked if you skip this\" apart from \"you probably\nwant this next\" without re-deriving it from AGENTS.md prose each time.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "tool",
+          "reason"
+        ]
+      }
+    },
+    "properties": {
+      "error": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/ErrorDetail"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "results": {
+        "type": "array",
+        "items": {
+          "$ref": "#/$defs/SearchResultItem"
+        }
+      },
+      "truncated": {
+        "type": "boolean"
+      },
+      "degraded": {
+        "type": "boolean"
+      },
+      "note": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "personalized": {
+        "description": "`true` when results were re-ranked toward this session's explored\nfiles/symbols (see `CalmServer::apply_personalization_boost`)\n— `false` for a cold session (nothing explored yet) or when\n`search.personalization_weight` is configured to `0.0`.",
+        "type": "boolean"
+      },
+      "suggested_next": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/SuggestedNext"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "type": "object"
+  },
+  "annotations": {
+    "readOnlyHint": true,
+    "destructiveHint": false,
+    "idempotentHint": true,
+    "openWorldHint": false
+  }
+}

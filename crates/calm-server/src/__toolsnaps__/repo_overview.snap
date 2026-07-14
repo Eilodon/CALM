@@ -1,0 +1,337 @@
+{
+  "name": "repo_overview",
+  "description": "ALWAYS call this FIRST at the start of every session — never skip. USE WHEN: starting a new session, switching projects, or after server restart. NOT FOR: per-file details (use file_overview), searching for symbols (use search/locate).",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "properties": {
+      "compact": {
+        "description": "Plan 3 §3.5(a): trims a repeat-call response down to the parts that\nchange session to session — drops `workflow_guide` (redundant once\nAGENTS.md has been read once) and `entry_points`, and caps\n`core_symbols` to 8 / `module_map` to 10. Defaults to `false` (full\ndetail) so a session's FIRST `repo_overview` call — before AGENTS.md\nhas necessarily been internalized — stays complete by default.",
+        "type": "boolean",
+        "default": false
+      }
+    },
+    "type": "object"
+  },
+  "outputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$defs": {
+      "ErrorDetail": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "recoverable": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "recoverable"
+        ]
+      },
+      "EntryPointItem": {
+        "type": "object",
+        "properties": {
+          "qualified_name": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "qualified_name",
+          "path"
+        ]
+      },
+      "ModuleEntry": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "file_count": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "symbol_count": {
+            "type": "integer",
+            "format": "int64"
+          }
+        },
+        "required": [
+          "name",
+          "file_count",
+          "symbol_count"
+        ]
+      },
+      "HealthSummary": {
+        "type": "object",
+        "properties": {
+          "hub_count": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "hub_degree_count": {
+            "description": "Plan 3 §3.3 (F10) breakdown of `hub_count` by `hub_kind` — a\nsymbol counted in both is one that's simultaneously a degree-hub\nand a bridge-hub, so `hub_degree_count + hub_bridge_count` can\nexceed `hub_count`.",
+            "type": "integer",
+            "format": "int64"
+          },
+          "hub_bridge_count": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "edges_ready": {
+            "type": "boolean"
+          },
+          "config_override": {
+            "description": "Root-cause fix for the F10 calibration bug: surfaces a local\n`config.json`/`.calm/config.json` override that silently shadows\n`Config::default()` (previously zero visibility outside a server\nlog line). `None` when no override file exists — the common case.",
+            "anyOf": [
+              {
+                "$ref": "#/$defs/ConfigOverrideSummary"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "weak_cross_reference_languages": {
+            "description": "2026-07-14 audit finding: an agent had no way to learn \"cross-\nreference resolution for language X is much weaker than for Rust\"\nwithout a separate `indexing_status` call most sessions never make\n— `repo_overview` is the one call every session is guaranteed to\nmake (AGENTS.md Stage 1). Populated only for languages this repo\nactually has files in (`languages` above) whose SCIP overlay is\neither unavailable, or measured below `WEAK_MATCH_RATE_THRESHOLD` —\nraw data, not a verdict: a low/absent overlay leaves the\nconservative heuristic resolver still providing weaker-confidence\nedges, not zero resolution. Empty (the common case for\nwell-supported languages, or a build without the `scip-overlay`\nfeature) when nothing qualifies.",
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/PerLanguageOverlayStatus"
+            }
+          }
+        },
+        "required": [
+          "hub_count",
+          "hub_degree_count",
+          "hub_bridge_count",
+          "edges_ready"
+        ]
+      },
+      "ConfigOverrideSummary": {
+        "type": "object",
+        "properties": {
+          "source": {
+            "description": "Path of the config.json/.calm/config.json file being read.",
+            "type": "string"
+          },
+          "overridden_fields": {
+            "description": "Dot-separated field paths (e.g. `\"hub_threshold.min_callers_bridge\"`)\nthat differ from `Config::default()`. Can be empty when an override\nfile exists but happens to match every default right now — still\nworth surfacing `source`, since it will silently start overriding\nthe moment a code-level default next changes.",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "source",
+          "overridden_fields"
+        ]
+      },
+      "PerLanguageOverlayStatus": {
+        "description": "One `ScipOverlayStatusOutput` tagged with its `file_index.language`\nvalue — see `IndexingStatusOutput::scip_overlays`.",
+        "type": "object",
+        "properties": {
+          "lang": {
+            "type": "string"
+          },
+          "available": {
+            "description": "`rust-analyzer` binary was found (PATH/rustup/VS Code) at last check.",
+            "type": "boolean"
+          },
+          "up_to_date": {
+            "description": "`false` means Rust source has changed since the last overlay run (or\nnone has ever run) — the next non-noop incremental reindex will\nactually invoke rust-analyzer again rather than cache-skip.",
+            "type": "boolean"
+          },
+          "last_match_rate": {
+            "description": "Fraction (0.0-1.0) of SCIP-resolved call sites represented by a\n`formal` edge as of the last real overlay run — absent if it's never\nactually run. A low value alongside a healthy `.scip` file usually\nmeans indexer-subroot paths aren't rebased correctly for wherever the\nindexer ran (see `parse::parse_index`'s `rebase_prefix`). Stale the\ninstant `up_to_date` is `false`.",
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
+          "last_inserted": {
+            "description": "New `call_edges` rows the last real overlay run inserted for a call\nsite tree-sitter's own candidate selection dropped entirely (e.g. name\nfan-out past `MAX_CALLEE_CANDIDATES`) — absent if it's never actually\nrun.",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "uint",
+            "minimum": 0
+          },
+          "last_run": {
+            "description": "ISO8601 timestamp of that same last real (non-cache-skip) run,\nabsent if it's never actually run.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "lang",
+          "available",
+          "up_to_date"
+        ]
+      },
+      "CoreSymbolItem": {
+        "type": "object",
+        "properties": {
+          "qualified_name": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "coreness": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "caller_count": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "is_hub": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "qualified_name",
+          "name",
+          "kind",
+          "path",
+          "coreness",
+          "caller_count",
+          "is_hub"
+        ]
+      },
+      "SuggestedNext": {
+        "type": "object",
+        "properties": {
+          "tool": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "args": true,
+          "gate": {
+            "description": "Plan 3 §3.5(b): `Some(true)` iff skipping `tool` is actually\nhook-enforced (currently only the edit_context/edit_lines/edit_symbol\n→ diff_impact hints set this, via `suggested_gated`) — every other\nhint is left unset (`None`), meaning advisory-only. Lets an agent\ntell \"you'll be blocked if you skip this\" apart from \"you probably\nwant this next\" without re-deriving it from AGENTS.md prose each time.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "tool",
+          "reason"
+        ]
+      }
+    },
+    "properties": {
+      "error": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/ErrorDetail"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "languages": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "indexing_phase": {
+        "type": "string"
+      },
+      "embeddings_status": {
+        "type": "string"
+      },
+      "total_modules": {
+        "type": "integer",
+        "format": "int64"
+      },
+      "total_symbols": {
+        "type": "integer",
+        "format": "int64"
+      },
+      "total_files": {
+        "type": "integer",
+        "format": "int64"
+      },
+      "truncated": {
+        "type": "boolean"
+      },
+      "entry_points": {
+        "description": "Empty (and therefore omitted) whenever `compact:true` — see\n`RepoOverviewParams::compact`.",
+        "type": "array",
+        "items": {
+          "$ref": "#/$defs/EntryPointItem"
+        }
+      },
+      "module_map": {
+        "type": "array",
+        "items": {
+          "$ref": "#/$defs/ModuleEntry"
+        }
+      },
+      "health_summary": {
+        "$ref": "#/$defs/HealthSummary"
+      },
+      "memory_notes_count": {
+        "description": "Count only, no content — see `recall()` to actually read them.",
+        "type": "integer",
+        "format": "int64"
+      },
+      "core_symbols": {
+        "description": "Top symbols by `coreness` (k-core) — an architectural skeleton of\nthis repo, empty until `health_summary.edges_ready`. See the\n`core_symbols` query's comment above for why it's coreness-ranked,\n`is_test`-excluded, and `coreness > 0`-floored.",
+        "type": "array",
+        "items": {
+          "$ref": "#/$defs/CoreSymbolItem"
+        }
+      },
+      "workflow_guide": {
+        "description": "`None` whenever `compact:true` — the client is expected to already\nhave this (e.g. baked into `AGENTS.md`) by the time it calls\n`repo_overview` a 2nd+ time in the same repo. See\n`RepoOverviewParams::compact`.",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "suggested_next": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/SuggestedNext"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "type": "object"
+  },
+  "annotations": {
+    "readOnlyHint": true,
+    "destructiveHint": false,
+    "idempotentHint": true,
+    "openWorldHint": false
+  }
+}

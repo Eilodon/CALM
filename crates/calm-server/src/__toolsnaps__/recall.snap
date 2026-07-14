@@ -1,0 +1,167 @@
+{
+  "name": "recall",
+  "description": "Retrieve durable notes saved by remember. USE WHEN: starting work on a topic you might have left notes about, or checking for known gotchas before touching an area. Pass `topic` for one exact note, `query` for a keyword search across all notes, or neither to list everything (most recently updated first).",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "properties": {
+      "topic": {
+        "description": "Exact topic to fetch. Takes priority over `query` if both are set.",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "query": {
+        "description": "Keyword search across topic + content: FTS5 phrase match, bm25-ranked\n(audit H1 — previously documented as \"SQL LIKE, case-insensitive\",\nstale since the FTS5 migration; see `escape_fts5_query`). Input is\nalways escaped into a literal phrase before matching. Ignored if\n`topic` is set.",
+        "type": [
+          "string",
+          "null"
+        ]
+      }
+    },
+    "type": "object"
+  },
+  "outputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$defs": {
+      "ErrorDetail": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "recoverable": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "recoverable"
+        ]
+      },
+      "MemoryNote": {
+        "type": "object",
+        "properties": {
+          "topic": {
+            "type": "string"
+          },
+          "content": {
+            "type": "string"
+          },
+          "updated_at": {
+            "type": "string"
+          },
+          "staleness": {
+            "description": "\"unchecked\" (no file refs were ever captured for this note — nothing\nto compare), \"fresh\" (all captured refs still match), \"stale\" (a\nreferenced file changed since this note was written), or \"gone\" (a\nreferenced file was deleted) — set by `recall`, not `memory_note_row`.",
+            "type": "string"
+          },
+          "stale_refs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/StaleRefOutput"
+            }
+          },
+          "integrity": {
+            "description": "Plan 3 §3.5(d): \"ok\" (`content_mac` present and verifies against\nthis project's key), \"mismatch\" (present but does NOT verify — the\nrow was altered by something other than `remember`), or\n\"unverified\" (no `content_mac` stored — a note written before this\nfeature existed). Set by `recall` via `calm_core::memory::verify_integrity`.",
+            "type": "string"
+          },
+          "content_warning": {
+            "description": "audit F7: same trust-surface treatment `source()` already gives file\ncontent — a note's `content` came from a prior `remember` call (this\nsession or a past one) and is untrusted text, same as any other\nstorage-backed channel. Set by `recall` via `injection_warning`;\n`None`/omitted when the content looks clean.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "topic",
+          "content",
+          "updated_at",
+          "staleness",
+          "integrity"
+        ]
+      },
+      "StaleRefOutput": {
+        "type": "object",
+        "properties": {
+          "reference": {
+            "type": "string"
+          },
+          "status": {
+            "description": "\"changed\" (file still exists but its content hash no longer matches\nwhat `remember` captured) or \"deleted\" (file no longer exists).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "reference",
+          "status"
+        ]
+      },
+      "SuggestedNext": {
+        "type": "object",
+        "properties": {
+          "tool": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "args": true,
+          "gate": {
+            "description": "Plan 3 §3.5(b): `Some(true)` iff skipping `tool` is actually\nhook-enforced (currently only the edit_context/edit_lines/edit_symbol\n→ diff_impact hints set this, via `suggested_gated`) — every other\nhint is left unset (`None`), meaning advisory-only. Lets an agent\ntell \"you'll be blocked if you skip this\" apart from \"you probably\nwant this next\" without re-deriving it from AGENTS.md prose each time.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "tool",
+          "reason"
+        ]
+      }
+    },
+    "properties": {
+      "error": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/ErrorDetail"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "notes": {
+        "type": "array",
+        "items": {
+          "$ref": "#/$defs/MemoryNote"
+        }
+      },
+      "truncated": {
+        "type": "boolean"
+      },
+      "suggested_next": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/SuggestedNext"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "type": "object"
+  },
+  "annotations": {
+    "readOnlyHint": true,
+    "destructiveHint": false,
+    "idempotentHint": true,
+    "openWorldHint": false
+  }
+}

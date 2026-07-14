@@ -1,0 +1,154 @@
+{
+  "name": "dependencies",
+  "description": "USE WHEN: you need to understand file-level architectural connections. USE THIS for FILE-LEVEL import graph. NOT for symbol-level call sites (use callers/callees). vs callers/callees: dependencies is file-level; callers/callees is symbol-level.",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "required": [
+      "path"
+    ],
+    "type": "object",
+    "properties": {
+      "path": {
+        "description": "Repo-relative path of the file whose imports/importers to list, e.g.\n`crates/calm-core/src/embedding.rs`.",
+        "type": "string"
+      }
+    }
+  },
+  "outputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$defs": {
+      "ErrorDetail": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "recoverable": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "recoverable"
+        ]
+      },
+      "ImportEntry": {
+        "type": "object",
+        "properties": {
+          "from_path": {
+            "type": "string"
+          },
+          "to_path": {
+            "type": "string"
+          },
+          "module_name": {
+            "type": "string"
+          },
+          "symbols_used": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "from_path",
+          "to_path",
+          "module_name",
+          "symbols_used"
+        ]
+      },
+      "SuggestedNext": {
+        "type": "object",
+        "properties": {
+          "tool": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "args": true,
+          "gate": {
+            "description": "Plan 3 §3.5(b): `Some(true)` iff skipping `tool` is actually\nhook-enforced (currently only the edit_context/edit_lines/edit_symbol\n→ diff_impact hints set this, via `suggested_gated`) — every other\nhint is left unset (`None`), meaning advisory-only. Lets an agent\ntell \"you'll be blocked if you skip this\" apart from \"you probably\nwant this next\" without re-deriving it from AGENTS.md prose each time.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "tool",
+          "reason"
+        ]
+      }
+    },
+    "properties": {
+      "error": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/ErrorDetail"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "path": {
+        "type": "string"
+      },
+      "imports": {
+        "type": "array",
+        "items": {
+          "$ref": "#/$defs/ImportEntry"
+        }
+      },
+      "imports_truncated": {
+        "type": "boolean"
+      },
+      "imported_by": {
+        "type": "array",
+        "items": {
+          "$ref": "#/$defs/ImportEntry"
+        }
+      },
+      "imported_by_truncated": {
+        "type": "boolean"
+      },
+      "call_dependents": {
+        "description": "Files that reference this file via call edges but are absent from\n`imported_by` — e.g. a fully-qualified `crate::foo::Bar::baz()` call\nwith no `use`. Best-effort (can include ambiguous-receiver calls);\ncomplements the import graph, does not replace it.",
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "glob_reexport_dependents": {
+        "description": "Files that reach this file's symbols through exactly one `use other::*;`\nhop — see the doc comment where this is computed in `dependencies`.",
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "suggested_next": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/SuggestedNext"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "type": "object"
+  },
+  "annotations": {
+    "readOnlyHint": true,
+    "destructiveHint": false,
+    "idempotentHint": true,
+    "openWorldHint": false
+  }
+}

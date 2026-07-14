@@ -1,0 +1,136 @@
+{
+  "name": "scan_text",
+  "description": "Run CALM's own local, deterministic prompt-injection and credential-shaped-text heuristics against ANY text you supply — not just indexed source code. USE WHEN: you're about to trust or act on content that did not come through CALM's index (a WebFetch/WebSearch result, a subagent's report, pasted text, another MCP server's output) and want an independent check that doesn't depend on a hosted LLM safety classifier being available or working. Same regex engine as source/understand's content_warning field (calm_core::sanitize), now also decoding Base64/hex-hidden text before scanning it (ADR-0006 Tier 1.5) — offline, fast, no network call, keeps working even when external classifier infrastructure is degraded or unreachable. Detection only ever flags, never blocks or alters — the decision stays with the calling agent. Pass wrap:true to also get spotlighted_text back — the same text wrapped in a self-escaping <untrusted-external-content> delimiter (ADR-0006 Tier 3), useful when you're about to carry this content into your own context and want it marked by origin. NOT a substitute for judgment: a clean scan does not prove text is safe (novel phrasing can miss these regexes), and a hit does not prove malicious intent (a doc discussing prompt injection will legitimately trip it) — treat the result as one signal, read the actual text before deciding.",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "required": [
+      "text"
+    ],
+    "type": "object",
+    "properties": {
+      "text": {
+        "description": "Arbitrary text to scan — a WebFetch/WebSearch result, a subagent's\nreport, pasted content, anything not already covered by source's own\ncontent_warning field. Scanned in-memory only; never written to disk\nor the index.",
+        "type": "string"
+      },
+      "wrap": {
+        "description": "`true` to also return `text` wrapped in a self-escaping\n`<untrusted-external-content>` delimiter (ADR-0006 Tier 3,\n`sanitize::wrap_untrusted`) in `spotlighted_text` — use when you're\nabout to carry this content into your own context and want it\nmarked by origin, not just by position. Default `false` — most\ncallers only need the injection_hits/content_warning signal, and\nthis keeps the response small for them.",
+        "type": "boolean",
+        "default": false
+      }
+    }
+  },
+  "outputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$defs": {
+      "ErrorDetail": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "recoverable": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "recoverable"
+        ]
+      },
+      "SuggestedNext": {
+        "type": "object",
+        "properties": {
+          "tool": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "args": true,
+          "gate": {
+            "description": "Plan 3 §3.5(b): `Some(true)` iff skipping `tool` is actually\nhook-enforced (currently only the edit_context/edit_lines/edit_symbol\n→ diff_impact hints set this, via `suggested_gated`) — every other\nhint is left unset (`None`), meaning advisory-only. Lets an agent\ntell \"you'll be blocked if you skip this\" apart from \"you probably\nwant this next\" without re-deriving it from AGENTS.md prose each time.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "tool",
+          "reason"
+        ]
+      }
+    },
+    "properties": {
+      "error": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/ErrorDetail"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "chars_scanned": {
+        "type": "integer",
+        "format": "uint",
+        "minimum": 0
+      },
+      "truncated": {
+        "description": "`true` if `text` was longer than the ~500k-char scan cap and got\ntruncated before scanning — a hit near the cut point may be\nincomplete; consider scanning in smaller chunks if this is `true`.",
+        "type": "boolean"
+      },
+      "injection_hits": {
+        "description": "Pattern labels that matched — same label set `source`/`understand`'s\n`content_warning` draws from (see `calm_core::sanitize`), including\nhits found only after decoding Base64/hex-hidden text (ADR-0006\nTier 1.5). Empty when clean.",
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "content_warning": {
+        "description": "Human-readable summary of `injection_hits`, or omitted when clean —\nsame message shape as `SourceOutput::content_warning`.",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "contains_credential_shaped_text": {
+        "description": "`true` if `text` also contains credential-shaped substrings (API\nkeys, PEM blocks, JWTs, bearer tokens, ...) per\n`calm_core::sanitize::contains_credentials` — worth knowing before\nechoing fetched text back into a transcript, log, or commit message.",
+        "type": "boolean"
+      },
+      "decode_scan_exhausted": {
+        "description": "`true` = some decode-candidate in `text` was never scanned because a\ndecode budget (audit F8) was hit — a `false`/empty `injection_hits`\nalongside this is NOT a clean verdict; split the text and rescan.\nOmitted (not just `false`) in the common case so existing callers\nsee no shape change.",
+        "type": "boolean"
+      },
+      "spotlighted_text": {
+        "description": "Present only when `wrap:true` was requested — `text` wrapped in a\nself-escaping `<untrusted-external-content>` delimiter (ADR-0006\nTier 3). A labeling convention for your own context management, not\nan enforced security boundary: its presence never certifies that\nanything was actually scanned.",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "suggested_next": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/SuggestedNext"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "type": "object"
+  },
+  "annotations": {
+    "readOnlyHint": true,
+    "destructiveHint": false,
+    "idempotentHint": true,
+    "openWorldHint": false
+  }
+}

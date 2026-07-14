@@ -305,6 +305,64 @@ emit_commit_tally() {
   exit 0
 }
 
+# 2026-07-14 self-audit finding: session_context exists specifically to
+# surface "have I made real progress lately" (calls_since_progress /
+# possibly_stuck), "what's still unverified" (files_pending_diff_impact),
+# and "who else is here" (other_active_sessions) — exactly the awareness a
+# long multi-hour session needs. But nothing in this hook ever pushed
+# toward it: the only existing reference (emit_commit_tally, above) cites
+# it as a REASON to prefer CALM search over native reads, not as a
+# standalone thing to go call. Verified live on a real ~4-hour, 4-deliverable
+# session: session_context was never called once, despite comfortably
+# clearing the 10-call "possibly_stuck" threshold session_context computes
+# server-side — a well-designed signal that stayed completely invisible
+# because nothing ever prompted checking it.
+#
+# SESSION_CONTEXT_REMINDER_EVERY is deliberately higher than TALLY_EVERY
+# (6): this hook only fires on a SUBSET of real tool calls (the
+# settings.json PreToolUse matcher — Read/Edit/Write/Grep/Bash plus a
+# handful of mcp__calm__* tools; repo_overview/hotspots/callers/callees/
+# TodoWrite/Agent/etc never reach it), so the true per-session call count
+# always runs higher than what `since_session_context` observes. 25 is a
+# deliberately conservative proxy for "a genuinely long stretch", not a
+# literal call-count threshold.
+SESSION_CONTEXT_REMINDER_EVERY=25
+
+# Called once, unconditionally, at the very end of the dispatch below (after
+# `esac`) — every earlier path that had something more important to say
+# already `exit 0`'d before reaching here, so this can never suppress or
+# outrank a real deny/nudge; it only ever fires on an otherwise-silent
+# "allow" call. Resets the counter on an actual session_context call
+# (acknowledging the reminder, not just receiving it) rather than on any
+# CALM tool call, so the reminder can't be silenced by unrelated activity.
+#
+# Reads/writes the state file FRESH from disk (like `bump`, NOT via the
+# `$state` snapshot loaded once at script start) — this function always
+# runs last, after any `bump native_explore`/`bump calm_explore` earlier in
+# this same invocation already wrote their own fresh read-modify-write to
+# disk; using the stale start-of-script `$state` here would silently
+# clobber those with an outdated copy.
+maybe_nudge_session_context() {
+  local prev
+  prev=$(cat "$state_file" 2>/dev/null || echo '{}')
+  if [ "$tool_name" = "mcp__calm__session_context" ]; then
+    if [ "$(jq -r '.since_session_context // 0' <<<"$prev")" != "0" ]; then
+      jq -c '.since_session_context = 0' <<<"$prev" >"$state_file" 2>/dev/null || true
+    fi
+    return 0
+  fi
+  local n
+  n=$(jq -r '((.since_session_context // 0) + 1)' <<<"$prev")
+  jq -c --argjson n "$n" '.since_session_context = $n' <<<"$prev" >"$state_file" 2>/dev/null || true
+  if [ $((n % SESSION_CONTEXT_REMINDER_EVERY)) -eq 0 ]; then
+    decision="session_context_reminder"
+    decision_detail="since_session_context=$n"
+    jq -n --arg n "$n" --arg evt "${hook_event:-PreToolUse}" \
+      '{hookSpecificOutput: {hookEventName: $evt, additionalContext: ("This session has reached " + $n + " CALM-visible tool calls without a session_context check. It reports calls-since-progress (\"possibly_stuck\"), files still pending diff_impact, and other active sessions on this daemon — call mcp__calm__session_context() to check in.")}}'
+    exit 0
+  fi
+}
+
 # Normalize a path to repo-relative form so the edit_context gate compares
 # like with like. This is load-bearing: `mcp__calm__edit_context`'s `path`
 # arg is repo-relative (CALM's convention), but Claude Code hands native
@@ -739,6 +797,11 @@ if [ "$tool_name" = "mcp__calm__edit_context" ]; then
     edit_context_files=$(jq -c --arg p "$ec_path" '. + [$p] | unique' <<<"$edit_context_files")
   fi
   save_state "$edit_context_files" "$needs_diff_impact" "$nudge_counts"
+  # Silent state-update exit, same reasoning as the calm-read-tools branch
+  # above: this would otherwise never reach the tail's own call, and
+  # edit_context is exactly the kind of frequent, otherwise-silent call a
+  # long edit-heavy session is dominated by.
+  maybe_nudge_session_context
   exit 0
 fi
 if [ "$tool_name" = "mcp__calm__diff_impact" ]; then
@@ -755,6 +818,11 @@ if [ "$tool_name" = "mcp__calm__diff_impact" ]; then
   # satisfies this hook's gate) and why it's accepted for Plan 1's scope.
   decision_detail="state:needs_diff_impact=false"
   save_state "$edit_context_files" false "$nudge_counts"
+  # diff_impact is arguably the single best natural checkpoint for this
+  # reminder — an agent that just finished verifying blast radius is
+  # exactly at a reflection point, same spirit as emit_commit_tally firing
+  # at the commit checkpoint.
+  maybe_nudge_session_context
   exit 0
 fi
 if [ "$tool_name" = "mcp__calm__edit_lines" ] || [ "$tool_name" = "mcp__calm__edit_symbol" ]; then
@@ -764,6 +832,7 @@ if [ "$tool_name" = "mcp__calm__edit_lines" ] || [ "$tool_name" = "mcp__calm__ed
   # their own stricter per-call risk gate instead (see header comment).
   decision_detail="state:needs_diff_impact=true"
   save_state "$edit_context_files" true "$nudge_counts"
+  maybe_nudge_session_context
   exit 0
 fi
 # calm's own read/navigation tools — not gated, just counted, so the
@@ -774,6 +843,17 @@ case "$tool_name" in
     bump calm_explore
     decision="allow"
     decision_detail="calm_explore++"
+    # This branch always exits below, so it would otherwise never reach
+    # maybe_nudge_session_context's own call at the very end of this
+    # script — a real gap: these 5 tools are the single most common calls
+    # in a typical session (verified live: they dominated a real ~4-hour
+    # session that never once reached the tail as a result), so skipping
+    # this check here would leave the reminder unable to fire for exactly
+    # the sessions it matters most for. Checked here explicitly instead —
+    # still only emits if the threshold is actually hit, still a plain
+    # return (not an exit) otherwise, so the bare "allow" below is
+    # unaffected on every other call.
+    maybe_nudge_session_context
     exit 0
     ;;
 esac
@@ -927,6 +1007,25 @@ case "$tool_name" in
     elif grep -qE '\bfind\b.*-i?name\b' <<<"$command"; then
       bump native_explore
       nudge_or_tally bash_find "CI available in this repo — prefer mcp__calm__search(query, kind=\"file\") or mcp__calm__file_overview / mcp__calm__dependencies over find (AGENTS.md Stage 1-2).${TOOL_DISCOVERY_HINT}"
+    elif grep -qE '\b(rustfmt|cargo[[:space:]]+fmt)\b' <<<"$command"; then
+      # 2026-07-14 self-audit finding, not a guess: a raw `rustfmt
+      # <files...>` shell invocation on THIS exact repo silently
+      # reformatted a file that was never in the argument list —
+      # `rustfmt` resolves the owning Cargo package for any positional
+      # file arg and walks its whole `mod` tree, not just the files
+      # actually passed. mcp__calm__format_files avoids this by
+      # construction: it pipes each file through rustfmt over stdin only
+      # (no positional file arg, so no package/mod-tree resolution at
+      # all — see calm_core::format's own doc comment) and writes back
+      # through the same atomic-write path every other CALM edit uses,
+      # so it can only ever touch the exact paths it was given.
+      nudge bash_rustfmt "CI available in this repo — prefer mcp__calm__format_files(paths=[...]) over a raw rustfmt/cargo fmt invocation. A bare \`rustfmt <files>\` resolves the owning Cargo package and reformats its WHOLE mod tree, not just the files listed — confirmed live on this exact repo, not a theoretical risk. format_files pipes each file through rustfmt over stdin only, so it can never touch a file outside its own paths list.${TOOL_DISCOVERY_HINT}"
     fi
     ;;
 esac
+
+# Reaching here means nothing above this point had anything more important
+# to say for this call (every deny/nudge exits the script directly) — the
+# one safe place to add a low-priority, never-suppresses-anything session
+# awareness check. See maybe_nudge_session_context's own header comment.
+maybe_nudge_session_context

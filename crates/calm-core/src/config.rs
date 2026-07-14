@@ -708,23 +708,77 @@ impl Default for CoChangeConfig {
 /// without calm-core depending on calm-server.
 pub const VALID_PRESETS: &[&str] = &["full", "orient", "trace", "edit", "compound"];
 
+/// Toolset (module-domain) names for the composable half of the preset
+/// registry (2026-07-14 upgrade item) — mirrors calm-server's
+/// `tools::common::TOOLSET_NAMES` exactly, one name per `#[tool_router]`
+/// module. Duplicated here (not imported) for the same reason
+/// `VALID_PRESETS` is: calm-core cannot depend on calm-server. The two
+/// lists WILL silently drift if either is edited alone — calm-server's
+/// `toolset_names_match_calm_core_valid_toolset_names` test is the one
+/// thing that catches that; if this list changes, that test must too.
+pub const VALID_TOOLSET_NAMES: &[&str] = &[
+    "trace",
+    "locate",
+    "orient",
+    "memory",
+    "guardrails",
+    "recover",
+    "scip",
+    "lsp",
+    "security",
+    "testgap",
+    "inspect",
+    "edit",
+    "patterndebt",
+];
 pub fn load_config(project_root: &Path) -> anyhow::Result<Config> {
     match resolve_config_path(project_root) {
         Some(candidate) => {
             let text = std::fs::read_to_string(&candidate)?;
             let config: Config = serde_json::from_str(&text)?;
-            if !config.preset.is_empty() && !VALID_PRESETS.contains(&config.preset.as_str()) {
+            if !config.preset.is_empty() && !preset_syntax_is_plausible(&config.preset) {
                 anyhow::bail!(
-                    "Unknown preset {:?} in {}. Valid presets: {}",
+                    "Unknown preset {:?} in {}. Valid presets: {}. Valid toolsets \
+                     (comma-composable, e.g. \"trace,security\" or \"full,-edit\"): {}",
                     config.preset,
                     candidate.display(),
-                    VALID_PRESETS.join(", ")
+                    VALID_PRESETS.join(", "),
+                    VALID_TOOLSET_NAMES.join(", ")
                 );
             }
             Ok(config)
         }
         None => Ok(Config::default()),
     }
+}
+
+/// Syntactic-only check: does `preset` look like either a legacy bare
+/// name or a comma-composed toolset spec? A single unrecognized bare
+/// token (the common typo case — `"preset": "flul"`) is still rejected
+/// right here, matching the exact UX this check has always had. A
+/// composed spec's individual TOOLSET tokens are also checked against
+/// `VALID_TOOLSET_NAMES` (kept in sync with calm-server's own
+/// `common::TOOLSET_NAMES` — see that const's doc comment for the
+/// cross-check test), so a typo'd toolset name in config.json is still
+/// caught here, not just at server startup.
+///
+/// What this does NOT validate: individual bare tool names composed into
+/// a spec (e.g. a hypothetical `"trace,+scan_text"`) — calm-core has no
+/// visibility into individual registered tool names without depending on
+/// calm-server (see `VALID_PRESETS`'s doc comment on why that dependency
+/// direction is off the table). `calm_server::tools::common::resolve_preset`
+/// is the full, authoritative validator; it runs at server startup
+/// (`CalmServer::new_with_preset`) and fails loudly there for anything
+/// this lighter check let through — see that function's own doc comment.
+fn preset_syntax_is_plausible(preset: &str) -> bool {
+    let is_valid_token = |t: &str| {
+        let name = t.strip_prefix('-').unwrap_or(t);
+        name == "full" || VALID_PRESETS.contains(&name) || VALID_TOOLSET_NAMES.contains(&name)
+    };
+    if !preset.contains(',') {
+        return VALID_PRESETS.contains(&preset) || VALID_TOOLSET_NAMES.contains(&preset);
+    }
+    preset.split(',').map(str::trim).all(is_valid_token)
 }
 
 /// The `config.json`/`.calm/config.json` candidate `load_config` would
@@ -837,6 +891,70 @@ mod tests {
         assert!(
             result.is_err(),
             "unknown preset should fail to load, got: {result:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn config_load_accepts_composed_toolset_preset() {
+        let tmp =
+            std::env::temp_dir().join(format!("ci_cfg_composedpreset_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("config.json"), r#"{"preset": "trace,security"}"#).unwrap();
+
+        let config = crate::config::load_config(&tmp);
+        assert!(
+            config.is_ok(),
+            "comma-composed toolset preset should load, got: {config:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn config_load_accepts_bare_toolset_name_and_exclusion_syntax() {
+        for preset in ["security", "full,-edit"] {
+            let tmp = std::env::temp_dir().join(format!(
+                "ci_cfg_toolsetsyntax_{}_{}",
+                preset.replace([',', '-'], "_"),
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&tmp);
+            std::fs::create_dir_all(&tmp).unwrap();
+            std::fs::write(
+                tmp.join("config.json"),
+                format!(r#"{{"preset": "{preset}"}}"#),
+            )
+            .unwrap();
+
+            let config = crate::config::load_config(&tmp);
+            assert!(
+                config.is_ok(),
+                "preset {preset:?} should load, got: {config:?}"
+            );
+
+            let _ = std::fs::remove_dir_all(&tmp);
+        }
+    }
+
+    #[test]
+    fn config_load_rejects_unknown_token_in_composed_preset() {
+        let tmp =
+            std::env::temp_dir().join(format!("ci_cfg_badcomposedpreset_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(
+            tmp.join("config.json"),
+            r#"{"preset": "trace,not_a_real_toolset"}"#,
+        )
+        .unwrap();
+
+        let result = crate::config::load_config(&tmp);
+        assert!(
+            result.is_err(),
+            "unknown toolset token in a composed preset should fail to load, got: {result:?}"
         );
 
         let _ = std::fs::remove_dir_all(&tmp);

@@ -1,0 +1,364 @@
+{
+  "name": "callers",
+  "description": "USE WHEN: you need to know who calls a specific symbol — blast radius scan, refactoring impact. USE THIS for SYMBOL-LEVEL call sites. NOT for file-level imports (use dependencies). vs edit_context: callers is for exploration; edit_context is the mandatory pre-edit tool.",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "required": [
+      "symbol"
+    ],
+    "type": "object",
+    "properties": {
+      "symbol": {
+        "description": "Bare symbol name (not a `path::name` qualified name).",
+        "type": "string"
+      },
+      "path": {
+        "description": "Narrows the search to one file when `symbol` alone is ambiguous\nacross the repo. Repo-relative path.",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "line": {
+        "description": "Disambiguates same-named symbols in the same file — any line within\nthe intended candidate's range (see an earlier `ambiguous` response's\n`line_start`/`line_end`).",
+        "type": [
+          "integer",
+          "null"
+        ],
+        "format": "int64"
+      },
+      "transitive": {
+        "description": "`true` to also do a multi-hop BFS (`transitive`/`transitive_count`\nin the output) beyond direct callers. `false` (default) returns\nonly direct callers — cheaper.",
+        "type": "boolean",
+        "default": false
+      },
+      "max_depth": {
+        "description": "Max BFS depth when `transitive` is set. Clamped to\n`callers.max_depth_cap` in config.json (4 out of the box); ignored\nif `transitive` is `false`.",
+        "type": [
+          "integer",
+          "null"
+        ],
+        "format": "int64"
+      },
+      "if_none_match": {
+        "description": "`etag` from a prior `callers` call on this exact `symbol`/`path`/\n`line` (with the same `transitive`/`max_depth`) — if the caller set\nhasn't changed since, the response omits `direct`/`ambiguous` and\nsets `not_modified: true` instead of re-sending them.",
+        "type": [
+          "string",
+          "null"
+        ]
+      }
+    }
+  },
+  "outputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$defs": {
+      "ErrorDetail": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "recoverable": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "recoverable"
+        ]
+      },
+      "AmbiguousCandidate": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "line_start": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "line_end": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "class_context": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "caller_count": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "language": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "signature": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "name",
+          "path",
+          "kind",
+          "line_start",
+          "line_end"
+        ]
+      },
+      "CallerEntry": {
+        "type": "object",
+        "properties": {
+          "symbol": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "edge_confidence": {
+            "type": "string"
+          },
+          "edge_kind": {
+            "description": "`\"call\"` or `\"reference\"` (SQL view/proc reading a table via\nFROM/JOIN) — see `call_edges.edge_kind`. Lets a consumer tell a real\ninvocation apart from a mere read without misreading a JOIN as a\nfunction call.",
+            "type": "string"
+          },
+          "line": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "preview": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "symbol",
+          "path",
+          "edge_confidence",
+          "edge_kind"
+        ]
+      },
+      "TransitiveEntry": {
+        "type": "object",
+        "properties": {
+          "symbol": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "depth": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "edge_confidence": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "symbol",
+          "path",
+          "depth",
+          "edge_confidence"
+        ]
+      },
+      "SuggestedNext": {
+        "type": "object",
+        "properties": {
+          "tool": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "args": true,
+          "gate": {
+            "description": "Plan 3 §3.5(b): `Some(true)` iff skipping `tool` is actually\nhook-enforced (currently only the edit_context/edit_lines/edit_symbol\n→ diff_impact hints set this, via `suggested_gated`) — every other\nhint is left unset (`None`), meaning advisory-only. Lets an agent\ntell \"you'll be blocked if you skip this\" apart from \"you probably\nwant this next\" without re-deriving it from AGENTS.md prose each time.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "tool",
+          "reason"
+        ]
+      },
+      "Caveat": {
+        "description": "Structured, machine-checkable hint attached to a tool result whose\nliteral content (empty list / not-found) could otherwise be misread as\nproof of absence. `class` lets a safety gate branch without parsing\n`message`; `message` is the human-readable explanation. Design mirrors\nzzet/gortex's `ZeroEdgeCaveat` (Apache-2.0) — reimplemented against\nCALM's own resolver shape, not a line-for-line port.",
+        "type": "object",
+        "properties": {
+          "class": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "class",
+          "message"
+        ]
+      }
+    },
+    "properties": {
+      "error": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/ErrorDetail"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "ambiguous": {
+        "description": "`ambiguous`-confidence callers split out of `direct`: index-time\nfan-out edges (a method call whose receiver type couldn't be resolved\nfans out to every same-named symbol), so each may or may not actually\ncall this symbol. Excluded from `direct`/`direct_count` — weigh these\nexplicitly rather than trusting them as confirmed callers.",
+        "type": "array",
+        "items": {
+          "$ref": "#/$defs/CallerEntry"
+        }
+      },
+      "total": {
+        "description": "Total candidates matched before the display cap of\n`MAX_AMBIGUOUS_CANDIDATES`. `truncated` is `true` when `total >\ncandidates.len()`, telling the caller there are more matches than\nshown and to narrow with `path`/`line` — the list is never silently\npresented as the complete set.",
+        "type": "integer",
+        "format": "uint",
+        "minimum": 0
+      },
+      "truncated": {
+        "type": "boolean"
+      },
+      "candidates": {
+        "type": "array",
+        "items": {
+          "$ref": "#/$defs/AmbiguousCandidate"
+        }
+      },
+      "symbol": {
+        "type": "string"
+      },
+      "edges_ready": {
+        "type": "boolean"
+      },
+      "direct": {
+        "type": "array",
+        "items": {
+          "$ref": "#/$defs/CallerEntry"
+        }
+      },
+      "ambiguous_count": {
+        "type": "integer",
+        "format": "uint",
+        "minimum": 0
+      },
+      "direct_count": {
+        "type": "integer",
+        "format": "uint",
+        "minimum": 0
+      },
+      "direct_truncated": {
+        "description": "`true` when `direct` was cut down to `config.callers.direct_list_cap`\nentries — `direct_count` above is still the true total regardless.\nA real hub symbol can have 50-200+ direct callers; without this cap\na single `callers` call on one could cost several thousand tokens\ndumping near-duplicate entries (e.g. dozens of unit-test call sites\nin one file) with the one production caller buried at the end.",
+        "type": [
+          "boolean",
+          "null"
+        ]
+      },
+      "ambiguous_truncated": {
+        "type": [
+          "boolean",
+          "null"
+        ]
+      },
+      "transitive": {
+        "type": [
+          "array",
+          "null"
+        ],
+        "items": {
+          "$ref": "#/$defs/TransitiveEntry"
+        }
+      },
+      "transitive_count": {
+        "type": [
+          "integer",
+          "null"
+        ],
+        "format": "uint",
+        "minimum": 0
+      },
+      "transitive_capped": {
+        "type": [
+          "boolean",
+          "null"
+        ]
+      },
+      "etag": {
+        "description": "Fingerprint of this response's `direct`+`ambiguous` (see\n`hash_caller_entries`) — pass back as `if_none_match` on a later\n`callers` call for the same symbol to skip re-sending them if\nnothing changed.",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "not_modified": {
+        "description": "`true` when `if_none_match` matched this response's `etag` —\n`direct`/`ambiguous` are empty in this case, not actually zero\ncallers; re-call without `if_none_match` for the real lists.",
+        "type": [
+          "boolean",
+          "null"
+        ]
+      },
+      "suggested_next": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/SuggestedNext"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "caveat": {
+        "description": "Advisory hint on an empty/not-found result. Never set alongside a\npopulated `success` unless a tool opts in via `with_caveat` (e.g.\n`callers` on zero direct callers).",
+        "anyOf": [
+          {
+            "$ref": "#/$defs/Caveat"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "type": "object"
+  },
+  "annotations": {
+    "readOnlyHint": true,
+    "destructiveHint": false,
+    "idempotentHint": true,
+    "openWorldHint": false
+  }
+}

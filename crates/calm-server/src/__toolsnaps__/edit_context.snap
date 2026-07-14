@@ -1,0 +1,479 @@
+{
+  "name": "edit_context",
+  "description": "ALWAYS CALL THIS before any code modification — mandatory, never skip. USE WHEN: you are about to edit, refactor, or delete a symbol. NOT FOR: read-only inspection (use symbol_info + source). NOT post-edit (use diff_impact).",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "required": [
+      "symbol"
+    ],
+    "type": "object",
+    "properties": {
+      "symbol": {
+        "description": "Bare symbol name (not a `path::name` qualified name) — e.g. `load`,\nnot `crates/calm-core/src/embedding.rs::Embedder::load`.",
+        "type": "string"
+      },
+      "path": {
+        "description": "Narrows the search to one file when `symbol` alone is ambiguous\nacross the repo. Repo-relative, e.g. `crates/calm-core/src/embedding.rs`.",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "line": {
+        "description": "Disambiguates same-named symbols in the same file (e.g. a\n`#[cfg(feature)]` real impl vs. its stub) — any line within the\nintended candidate's range, as echoed in an earlier `ambiguous`\nresponse's `line_start`/`line_end`.",
+        "type": [
+          "integer",
+          "null"
+        ],
+        "format": "int64"
+      },
+      "if_none_match": {
+        "description": "`edges_etag` from a prior `edit_context` call on this exact symbol —\nif the caller/callee lists haven't changed since, the response omits\n`callers`/`callees` and sets `edges_not_modified: true`. Every other\nfield (`risk_assessment`, `dead_code_confidence`, `blast_radius`,\n`trend`, `co_changed_files`, `range_checksum`) is always recomputed\nand returned in full regardless — never gated behind this etag, since\nthis is the mandatory pre-edit safety tool and none of those may go\nsilently stale.",
+        "type": [
+          "string",
+          "null"
+        ]
+      }
+    }
+  },
+  "outputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$defs": {
+      "ErrorDetail": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "recoverable": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "recoverable"
+        ]
+      },
+      "AmbiguousCandidate": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "line_start": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "line_end": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "class_context": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "caller_count": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "language": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "signature": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "name",
+          "path",
+          "kind",
+          "line_start",
+          "line_end"
+        ]
+      },
+      "CallerEntry": {
+        "type": "object",
+        "properties": {
+          "symbol": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "edge_confidence": {
+            "type": "string"
+          },
+          "edge_kind": {
+            "description": "`\"call\"` or `\"reference\"` (SQL view/proc reading a table via\nFROM/JOIN) — see `call_edges.edge_kind`. Lets a consumer tell a real\ninvocation apart from a mere read without misreading a JOIN as a\nfunction call.",
+            "type": "string"
+          },
+          "line": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "preview": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "symbol",
+          "path",
+          "edge_confidence",
+          "edge_kind"
+        ]
+      },
+      "CalleeEntry": {
+        "type": "object",
+        "properties": {
+          "symbol": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "edge_confidence": {
+            "type": "string"
+          },
+          "edge_kind": {
+            "description": "See `CallerEntry::edge_kind`.",
+            "type": "string"
+          },
+          "line": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "preview": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "symbol",
+          "path",
+          "edge_confidence",
+          "edge_kind"
+        ]
+      },
+      "BlastRadiusInfo": {
+        "type": "object",
+        "properties": {
+          "transitive": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "files_affected": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "transitive",
+          "files_affected"
+        ]
+      },
+      "TrendOutput": {
+        "description": "How much `caller_count`/`coreness`/`is_hub` moved since the oldest snapshot\nstill at least `EDIT_CONTEXT_TREND_LOOKBACK_DAYS` old — see\n`calm_core::fitness::compute_trend`.",
+        "type": "object",
+        "properties": {
+          "compared_to": {
+            "type": "string"
+          },
+          "caller_count_delta": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "coreness_delta": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "is_hub_changed": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "compared_to",
+          "caller_count_delta",
+          "coreness_delta",
+          "is_hub_changed"
+        ]
+      },
+      "CoChangedFileOutput": {
+        "description": "A file with no import/call relationship to the symbol's file, but that\nhistorically changed alongside it in the same commit — a coupling signal\nthe static graph cannot see. See `calm_core::analysis::cochange`.",
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "co_change_count": {
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0
+          },
+          "last_co_changed": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "path",
+          "co_change_count"
+        ]
+      },
+      "RelatedNoteOutput": {
+        "type": "object",
+        "properties": {
+          "topic": {
+            "type": "string"
+          },
+          "excerpt": {
+            "description": "First 160 characters of the note's content — not the full note;\ncall `recall(topic=...)` for the whole thing.",
+            "type": "string"
+          },
+          "specificity": {
+            "description": "`\"symbol\"` when the note's text mentions the resolved symbol's bare\nname (higher trust), `\"file\"` when it only matched at file level\n(the note references this file but may be about a different symbol\nin it — calibrate trust accordingly).",
+            "type": "string"
+          },
+          "staleness": {
+            "description": "`\"fresh\"` / `\"stale\"` / `\"gone\"` (same convention as `recall`'s\nper-note staleness) / `\"unknown\"` when the staleness check itself\nfailed (fail-open: the note still surfaces, just without a\nconfident freshness read).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "topic",
+          "excerpt",
+          "specificity",
+          "staleness"
+        ]
+      },
+      "SuggestedNext": {
+        "type": "object",
+        "properties": {
+          "tool": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "args": true,
+          "gate": {
+            "description": "Plan 3 §3.5(b): `Some(true)` iff skipping `tool` is actually\nhook-enforced (currently only the edit_context/edit_lines/edit_symbol\n→ diff_impact hints set this, via `suggested_gated`) — every other\nhint is left unset (`None`), meaning advisory-only. Lets an agent\ntell \"you'll be blocked if you skip this\" apart from \"you probably\nwant this next\" without re-deriving it from AGENTS.md prose each time.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "tool",
+          "reason"
+        ]
+      },
+      "Caveat": {
+        "description": "Structured, machine-checkable hint attached to a tool result whose\nliteral content (empty list / not-found) could otherwise be misread as\nproof of absence. `class` lets a safety gate branch without parsing\n`message`; `message` is the human-readable explanation. Design mirrors\nzzet/gortex's `ZeroEdgeCaveat` (Apache-2.0) — reimplemented against\nCALM's own resolver shape, not a line-for-line port.",
+        "type": "object",
+        "properties": {
+          "class": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "class",
+          "message"
+        ]
+      }
+    },
+    "properties": {
+      "error": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/ErrorDetail"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "ambiguous": {
+        "type": "boolean"
+      },
+      "total": {
+        "description": "Total candidates matched before the display cap of\n`MAX_AMBIGUOUS_CANDIDATES`. `truncated` is `true` when `total >\ncandidates.len()`, telling the caller there are more matches than\nshown and to narrow with `path`/`line` — the list is never silently\npresented as the complete set.",
+        "type": "integer",
+        "format": "uint",
+        "minimum": 0
+      },
+      "truncated": {
+        "type": "boolean"
+      },
+      "candidates": {
+        "type": "array",
+        "items": {
+          "$ref": "#/$defs/AmbiguousCandidate"
+        }
+      },
+      "symbol": {
+        "type": "string"
+      },
+      "edges_ready": {
+        "type": "boolean"
+      },
+      "index_freshness": {
+        "type": "string"
+      },
+      "callers": {
+        "type": "array",
+        "items": {
+          "$ref": "#/$defs/CallerEntry"
+        }
+      },
+      "callees": {
+        "type": "array",
+        "items": {
+          "$ref": "#/$defs/CalleeEntry"
+        }
+      },
+      "callers_truncated": {
+        "description": "`true` when `callers` was cut down to `config.callers.direct_list_cap`\nentries (a real hub symbol can have 50-200+) — `blast_radius`'s own\ncounts are unaffected, only this raw per-entry dump is capped.",
+        "type": [
+          "boolean",
+          "null"
+        ]
+      },
+      "callees_truncated": {
+        "type": [
+          "boolean",
+          "null"
+        ]
+      },
+      "blast_radius": {
+        "$ref": "#/$defs/BlastRadiusInfo"
+      },
+      "range_checksum": {
+        "description": "Hash of the symbol's current `[line_start, line_end]` — pass this\nstraight to `edit_lines`/`edit_symbol` as `expected_hash` to skip\nthe \"learn the hash\" preview round trip. Absent if the file\ncouldn't be read from disk.",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "risk_assessment": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "dead_code_confidence": {
+        "description": "`\"none\"` (confirmed not dead — entry point, test, or has confirmed\ncallers), `\"high\"`/`\"medium\"`/`\"low\"` confidence it genuinely is dead\ncode — see `calm_core::analysis::dead_code::compute_dead_code_confidence`.\nAlso feeds `risk_assessment`: a 0-caller symbol only keeps \"low\" risk\nwhen this independently agrees (`\"high\"`/`\"medium\"`).",
+        "type": "string"
+      },
+      "dead_code_source": {
+        "description": "`\"static\"` or `\"static+coverage\"` — whether a runtime coverage file\n(see `scripts/gen-coverage.sh`) was available to inform `dead_code_confidence`.",
+        "type": "string"
+      },
+      "trend": {
+        "description": "Absent when there's no snapshot yet at least `EDIT_CONTEXT_TREND_LOOKBACK_DAYS`\nold (e.g. `calm fitness-check` hasn't run for that long) — not an error.",
+        "anyOf": [
+          {
+            "$ref": "#/$defs/TrendOutput"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "co_changed_files": {
+        "description": "Empty when git is unavailable or no file co-changed with this\nsymbol's file often enough to clear `config.cochange.min_co_changes`\n— not an error signal, most edits legitimately have none.",
+        "type": "array",
+        "items": {
+          "$ref": "#/$defs/CoChangedFileOutput"
+        }
+      },
+      "related_notes": {
+        "description": "Notes saved via `remember` that reference this symbol's file —\nsurfaced automatically so a known gotcha isn't missed just because\nnobody thought to call `recall` first. Empty is the common case, not\nan error signal. See `CalmServer::related_notes` for the specificity/\nfail-open/content-safety rules governing what qualifies.",
+        "type": "array",
+        "items": {
+          "$ref": "#/$defs/RelatedNoteOutput"
+        }
+      },
+      "edges_etag": {
+        "description": "Fingerprint of `callers`+`callees` only (see `if_none_match` on\n`EditContextParams`) — every other field above is always fresh on\nevery call, never gated behind this.",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "edges_not_modified": {
+        "type": [
+          "boolean",
+          "null"
+        ]
+      },
+      "suggested_next": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/SuggestedNext"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "caveat": {
+        "description": "Advisory hint on an empty/not-found result. Never set alongside a\npopulated `success` unless a tool opts in via `with_caveat` (e.g.\n`callers` on zero direct callers).",
+        "anyOf": [
+          {
+            "$ref": "#/$defs/Caveat"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "type": "object"
+  },
+  "annotations": {
+    "readOnlyHint": true,
+    "destructiveHint": false,
+    "idempotentHint": true,
+    "openWorldHint": false
+  }
+}

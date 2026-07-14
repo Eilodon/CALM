@@ -1,0 +1,209 @@
+{
+  "name": "session_context",
+  "description": "USE WHEN: after 10+ tool calls without convergence, or when starting a new sub-task. Tracks explored symbols, files, and tool call count.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {}
+  },
+  "outputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$defs": {
+      "ErrorDetail": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "recoverable": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "recoverable"
+        ]
+      },
+      "FrontierEntry": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "reason"
+        ]
+      },
+      "SessionSummary": {
+        "description": "In-memory session tracking — tool call count and the symbols/files\ntouched, for the `session_context` tool. Reset only when the server\nrestarts. Values are the `tool_calls` count at the most recent touch (not\na boolean \"seen\"): `apply_personalization_boost` uses that to decay a\nresult's proximity boost by how long ago (in tool-calls, not wall-clock)\nthe connecting file/symbol was last explored — a re-touch refreshes it,\nsame \"attention\" semantics as re-reading something brings it back to mind.\nOne connection's lightweight activity summary, visible to every *other*\nconnection sharing the same daemon (unlike `SessionLog` below, which\n`for_connection` deliberately gives each connection its own private\ncopy of) — backs `session_context.other_active_sessions` so an agent can\ntell \"is anyone else touching this repo right now, and where\". Always\nempty under a bare stdio `calm serve` (exactly one connection by\nconstruction — nothing else to see).",
+        "type": "object",
+        "properties": {
+          "session_id": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          },
+          "last_touched_file": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_touched_at": {
+            "type": "string"
+          },
+          "tool_calls": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          },
+          "reviewing_symbol": {
+            "description": "Qualified name of the most recent symbol this session ran\n`edit_context` on — advisory intent-visibility, not a reservation:\nno other session is blocked from touching the same symbol, and this\nis never cleared once the edit actually happens, so a stale value\nhere just means \"this session was looking at X as of\n`last_touched_at`/`tool_calls`\", the same \"as of\" caveat every other\nfield on this struct already carries. Closes part of the gap between\n`active_sessions` only ever recording *past* touches\n(`touch_active_session`) and a session's actual *current* intent —\nstill no reservation/locking semantics, same posture as the rest of\nthis struct.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "session_id",
+          "last_touched_at",
+          "tool_calls"
+        ]
+      },
+      "SuggestedNext": {
+        "type": "object",
+        "properties": {
+          "tool": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "args": true,
+          "gate": {
+            "description": "Plan 3 §3.5(b): `Some(true)` iff skipping `tool` is actually\nhook-enforced (currently only the edit_context/edit_lines/edit_symbol\n→ diff_impact hints set this, via `suggested_gated`) — every other\nhint is left unset (`None`), meaning advisory-only. Lets an agent\ntell \"you'll be blocked if you skip this\" apart from \"you probably\nwant this next\" without re-deriving it from AGENTS.md prose each time.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "tool",
+          "reason"
+        ]
+      }
+    },
+    "properties": {
+      "error": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/ErrorDetail"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "session_started_at": {
+        "type": "string"
+      },
+      "tool_calls": {
+        "type": "integer",
+        "format": "uint64",
+        "minimum": 0
+      },
+      "explored_symbols": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "explored_files": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "unique_files_explored": {
+        "description": "True total before any `config.session.max_fetched` truncation of\n`explored_symbols`/`explored_files` below.",
+        "type": "integer",
+        "format": "uint",
+        "minimum": 0
+      },
+      "truncated": {
+        "description": "True when `explored_symbols`/`explored_files` were capped at\n`config.session.max_fetched` — a long session can otherwise dump an\nunbounded list into every `session_context` call.",
+        "type": "boolean"
+      },
+      "frontier": {
+        "type": "array",
+        "items": {
+          "$ref": "#/$defs/FrontierEntry"
+        }
+      },
+      "frontier_degraded": {
+        "type": "boolean"
+      },
+      "pending_diff_impact": {
+        "description": "True when `edit_lines`/`edit_symbol` wrote a file since the last\n`diff_impact` call — a host-agnostic version of the Claude-Code-only\nPreToolUse hook's commit/push gate, visible to any MCP client.",
+        "type": "boolean"
+      },
+      "files_pending_diff_impact": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "calls_since_progress": {
+        "description": "Tool calls since `explored_files`/`explored_symbols` last gained a\ngenuinely new entry — informational only, never enforced.",
+        "type": "integer",
+        "format": "uint64",
+        "minimum": 0
+      },
+      "possibly_stuck": {
+        "description": "`calls_since_progress >= 10` — matches AGENTS.md's documented \"after\n10+ calls without convergence\" cue for calling this tool.",
+        "type": "boolean"
+      },
+      "other_active_sessions": {
+        "description": "Every *other* connection currently sharing this daemon (this\nsession's own entry excluded) — always empty under a bare stdio\n`calm serve`, where there is only ever one connection by\nconstruction. Lets an agent notice \"someone else is already editing\nfile X\" before stepping on the same area, without needing full A2A\nprotocol support — see `CalmServer::active_sessions`.",
+        "type": "array",
+        "items": {
+          "$ref": "#/$defs/SessionSummary"
+        }
+      },
+      "overlapping_files": {
+        "description": "Backlog B5 (docs/plans/2026-07-14-calm-agent-experience-audit-and-\nbacklog.md): files in `explored_files` (untruncated, before\n`max_fetched` capping) that also match some OTHER active session's\n`last_touched_file` -- a narrow, purely-derived overlap signal built\nentirely from data `other_active_sessions` already carries, not a new\nsubsystem. Informational only, like `possibly_stuck` -- never gates\nor reorders `suggested_next`; no reservation/locking semantics.",
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "suggested_next": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/SuggestedNext"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "type": "object"
+  },
+  "annotations": {
+    "readOnlyHint": true,
+    "destructiveHint": false,
+    "idempotentHint": true,
+    "openWorldHint": false
+  }
+}

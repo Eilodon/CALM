@@ -1,0 +1,226 @@
+{
+  "name": "diff_impact",
+  "description": "CALL THIS after every code change, BEFORE commit or push — never skip. USE WHEN: you have uncommitted changes and want to verify blast radius. NOT FOR: pre-edit analysis (use edit_context). vs edit_context: edit_context=pre-edit; diff_impact=post-edit. Omit all three for the unstaged working-tree diff, or provide at most one of: diff, staged=true, commits=<range>.",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "properties": {
+      "diff": {
+        "description": "A raw unified diff (`git diff` output) to analyze directly, instead\nof having this tool run git itself. At most one of `diff`, `staged`,\n`commits` may be set — omitting all three analyzes the unstaged\nworking-tree diff (plain `git diff`).",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "staged": {
+        "description": "`true` to analyze the staged diff (`git diff --cached`); `false` or\nomitted analyzes the unstaged working-tree diff. At most one of\n`diff`, `staged`, `commits` may be set.",
+        "type": [
+          "boolean",
+          "null"
+        ]
+      },
+      "commits": {
+        "description": "A commit range/rev understood by `git diff`, e.g. `HEAD~3..HEAD` or\na single commit SHA. At most one of `diff`, `staged`, `commits`\nmay be set.",
+        "type": [
+          "string",
+          "null"
+        ]
+      }
+    },
+    "type": "object"
+  },
+  "outputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$defs": {
+      "ErrorDetail": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "recoverable": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "recoverable"
+        ]
+      },
+      "AffectedSymbolOutput": {
+        "type": "object",
+        "properties": {
+          "qualified_name": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "signature_changed": {
+            "type": "boolean"
+          },
+          "symbol_is_new": {
+            "description": "True when this symbol didn't exist before the diff (new file, or a\npure-addition hunk covering its signature) — it has zero prior call\nsites by definition, so `signature_changed` is always false for it\nand risk is not escalated on \"callers may need update\" grounds.",
+            "type": "boolean"
+          },
+          "blast_radius": {
+            "$ref": "#/$defs/BlastRadiusOutput"
+          },
+          "risk_assessment": {
+            "$ref": "#/$defs/RiskAssessmentOutput"
+          }
+        },
+        "required": [
+          "qualified_name",
+          "name",
+          "path",
+          "kind",
+          "signature_changed",
+          "symbol_is_new",
+          "blast_radius",
+          "risk_assessment"
+        ]
+      },
+      "BlastRadiusOutput": {
+        "type": "object",
+        "properties": {
+          "direct_callers": {
+            "type": "integer",
+            "format": "int64"
+          }
+        },
+        "required": [
+          "direct_callers"
+        ]
+      },
+      "RiskAssessmentOutput": {
+        "type": "object",
+        "properties": {
+          "level": {
+            "type": "string"
+          },
+          "reasons": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "level",
+          "reasons"
+        ]
+      },
+      "UnindexedFileOutput": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "reason": {
+            "description": "\"pending_scan\" — a recognized source file, in a path the indexer\nactually walks, that just hasn't been scanned yet; resolves itself\nonce indexing catches up (check `indexing_status`).\n\"out_of_scope\" — will stay unindexed no matter how long you wait:\neither not a source extension the indexer parses at all (docs,\nconfig, etc.), or it sits under a dotdir/`IGNORE_DIRS` path (e.g.\n`.claude/`, `target/`) the walker categorically never descends into,\nregardless of extension.\n\"recognized_unparsed\" — a `file_index` row exists (the indexer has\nscanned it) but `language` is NULL: a recognized-but-unsupported\nextension (see `is_recognized_unparsed_extension`) tracked by path\nonly. Like \"out_of_scope\", this never resolves on its own — there is\nno symbol extraction to wait for — but unlike \"out_of_scope\" the file\ngenuinely is indexed (has a row), just never for symbols.\n\"deleted\" — the file appears in the diff but no longer exists on\ndisk (deleted or renamed away); like \"out_of_scope\" this is a\npermanent state — it will never be scanned no matter how long you\nwait — so it must never gate `aggregate_risk` on `indexing_status`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "reason"
+        ]
+      },
+      "SuggestedNext": {
+        "type": "object",
+        "properties": {
+          "tool": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "args": true,
+          "gate": {
+            "description": "Plan 3 §3.5(b): `Some(true)` iff skipping `tool` is actually\nhook-enforced (currently only the edit_context/edit_lines/edit_symbol\n→ diff_impact hints set this, via `suggested_gated`) — every other\nhint is left unset (`None`), meaning advisory-only. Lets an agent\ntell \"you'll be blocked if you skip this\" apart from \"you probably\nwant this next\" without re-deriving it from AGENTS.md prose each time.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "tool",
+          "reason"
+        ]
+      }
+    },
+    "properties": {
+      "error": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/ErrorDetail"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "files_changed": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "affected_symbols": {
+        "type": "array",
+        "items": {
+          "$ref": "#/$defs/AffectedSymbolOutput"
+        }
+      },
+      "unindexed_files": {
+        "type": "array",
+        "items": {
+          "$ref": "#/$defs/UnindexedFileOutput"
+        }
+      },
+      "aggregate_risk": {
+        "type": "string"
+      },
+      "suggested_reviewers": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "note": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "suggested_next": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/SuggestedNext"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "type": "object"
+  },
+  "annotations": {
+    "readOnlyHint": true,
+    "destructiveHint": false,
+    "idempotentHint": true,
+    "openWorldHint": false
+  }
+}

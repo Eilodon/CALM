@@ -1,0 +1,178 @@
+{
+  "name": "pattern_debt_status",
+  "description": "Re-check registered pattern-debt anchor(s): re-resolves each anchor's current location by qualified_name (never a stale line number) and re-runs search(kind=\"similar\") to report how many similar instances remain. Pass `topic` for one anchor (the value pattern_debt_register returned), or omit to check every OPEN anchor (capped — see truncated). status is one of: open (similar instances still found), resolved (none found this check — persisted), anchor_lost (the symbol was renamed/removed/split since registration — never silently reported as resolved). USE WHEN: verifying whether a duplicated bug pattern you registered earlier has actually been cleaned up elsewhere, or auditing outstanding pattern debt. Read-only towards your code; does update this anchor's own tracked status/last-checked fields.",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "properties": {
+      "topic": {
+        "description": "Check one anchor by its topic (from `pattern_debt_register`'s\noutput). Omit to check every currently-`open` anchor instead\n(capped — see the output's `truncated`).",
+        "type": [
+          "string",
+          "null"
+        ]
+      }
+    },
+    "type": "object"
+  },
+  "outputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$defs": {
+      "ErrorDetail": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "recoverable": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "recoverable"
+        ]
+      },
+      "PatternDebtEntryOutput": {
+        "type": "object",
+        "properties": {
+          "topic": {
+            "type": "string"
+          },
+          "anchor_qualified_name": {
+            "type": "string"
+          },
+          "note": {
+            "type": "string"
+          },
+          "baseline_count": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "status": {
+            "description": "One of `open` / `resolved` / `anchor_lost`, or a `\"<status>\n(check_unavailable_this_run)\"` suffix when this check couldn't run\n(e.g. embeddings not ready) — the persisted status shown is what it\nwas *before* this call, never guessed.",
+            "type": "string"
+          },
+          "current_count": {
+            "description": "Similar-instance count from this check (excludes the anchor itself).\n`None` when the anchor is lost or this check was unavailable.",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "remaining_locations": {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/PatternDebtLocationOutput"
+            }
+          },
+          "checked_at": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "topic",
+          "anchor_qualified_name",
+          "note",
+          "baseline_count",
+          "status",
+          "remaining_locations",
+          "checked_at"
+        ]
+      },
+      "PatternDebtLocationOutput": {
+        "type": "object",
+        "properties": {
+          "qualified_name": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "line_start": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "score": {
+            "type": "number",
+            "format": "double"
+          }
+        },
+        "required": [
+          "qualified_name",
+          "path",
+          "score"
+        ]
+      },
+      "SuggestedNext": {
+        "type": "object",
+        "properties": {
+          "tool": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "args": true,
+          "gate": {
+            "description": "Plan 3 §3.5(b): `Some(true)` iff skipping `tool` is actually\nhook-enforced (currently only the edit_context/edit_lines/edit_symbol\n→ diff_impact hints set this, via `suggested_gated`) — every other\nhint is left unset (`None`), meaning advisory-only. Lets an agent\ntell \"you'll be blocked if you skip this\" apart from \"you probably\nwant this next\" without re-deriving it from AGENTS.md prose each time.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "tool",
+          "reason"
+        ]
+      }
+    },
+    "properties": {
+      "error": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/ErrorDetail"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "entries": {
+        "type": "array",
+        "items": {
+          "$ref": "#/$defs/PatternDebtEntryOutput"
+        }
+      },
+      "truncated": {
+        "description": "`true` when more than `PATTERN_DEBT_STATUS_MAX` open entries exist —\nre-run with an explicit `topic` to check the rest.",
+        "type": "boolean"
+      },
+      "suggested_next": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/SuggestedNext"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "type": "object"
+  },
+  "annotations": {
+    "readOnlyHint": false,
+    "destructiveHint": false,
+    "idempotentHint": true,
+    "openWorldHint": false
+  }
+}

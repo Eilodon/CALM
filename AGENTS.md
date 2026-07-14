@@ -12,7 +12,7 @@ Full stage-by-stage guide, all 8 Mandatory Rules, the Preset table, and Tool Qui
 
 ---
 
-> 28 tools. 8 stages. Every response carries `suggested_next` — follow it.
+> 29 tools. 8 stages. Every response carries `suggested_next` — follow it.
 ---
 
 ## Core Principles
@@ -264,7 +264,7 @@ remember("auth-flow", "OAuth callback must validate state param — see incident
 | 3 Inspect | `source`, `symbol_info`, `understand` | `cat` / full file read |
 | 4 Trace | `callers`, `callees`, `path`, `dependencies` | Manual call tracing |
 | 5 Pre-Edit | `edit_context` | *(no native equivalent)* |
-| 6 Edit | `edit_symbol`, `edit_lines` (preferred), `pattern_debt_register`/`pattern_debt_status` (track a duplicated bug pattern) | native `Edit`/`Write` (fallback for new/untracked files) || 7 Verify | `diff_impact` | *(no native equivalent)* |
+| 6 Edit | `edit_symbol`, `edit_lines` (preferred), `format_files` (rustfmt via stdin, safe replacement for shelling out), `pattern_debt_register`/`pattern_debt_status` (track a duplicated bug pattern) | native `Edit`/`Write` (fallback for new/untracked files) || 7 Verify | `diff_impact` | *(no native equivalent)* |
 | 8 Recover | `session_context`, `indexing_status`, `remember`, `recall` | *(no native equivalent)* |
 
 ---
@@ -289,5 +289,14 @@ remember("auth-flow", "OAuth callback must validate state param — see incident
 | `trace` | `repo_overview`, `search`, `locate`, `symbol_info`, `source`, `callers`, `callees`, `path`, `dependencies`, `indexing_status` | Call graph traversal |
 | `edit` | `repo_overview`, `search`, `locate`, `symbol_info`, `source`, `callers`, `callees`, `edit_context`, `edit_lines`, `edit_symbol`, `diff_impact`, `indexing_status` | Code modification workflow |
 | `compound` | `repo_overview`, `locate`, `hotspots`, `fitness_report`, `source`, `understand`, `edit_context`, `diff_impact`, `session_context`, `indexing_status`, `remember`, `recall` | Full workflow, no raw graph traversal |
-| `full` | All 28 tools | Default; use when workflow spans multiple stages |
+| `full` | All 29 tools | Default; use when workflow spans multiple stages |
 `--preset` is set once at server startup and cannot change mid-session. Use `full` (default) when the workflow spans multiple stages. Use specific presets only when scope is locked to one stage.
+
+Beyond the 5 named presets above, `--preset`/`config.json`'s `preset` field also accept a **composable toolset spec**: a comma-separated list of toolset (module-domain) names — `trace`, `locate`, `orient`, `memory`, `guardrails`, `recover`, `scip`, `lsp`, `security`, `testgap`, `inspect`, `edit`, `patterndebt` — optionally prefixed with `-` to subtract that toolset instead of adding it. E.g. `--preset "trace,security"` unions two toolsets; `--preset "full,-edit"` is every tool except the edit toolset's (`edit_symbol`/`edit_lines`/`format_files`). This is a different, finer-grained axis than the 5 named presets (which are hand-curated cross-cutting workflow bundles, not toolset unions) — an unrecognized token in either syntax is a hard startup error, never a silent full-access fallback.
+
+## Troubleshooting
+
+**A CALM tool call fails with a connection/transport error (e.g. "Connection closed") with no other explanation.** This has been observed live (2026-07-14) with no reproducible root cause identified yet — treat it as transient first, not as a sign of a corrupted session:
+1. Retry the exact same call once. The daemon+forwarder architecture (ADR-0005) means a single dropped connection does not lose index state — the daemon keeps running independently of any one forwarder/client connection.
+2. If it fails again, check `.calm/daemon.log` (human-readable, INFO+) and `.calm/audit.log` (JSON, edit-decisions only) in the project root — every daemon-mode `calm serve` process logs there from startup (see `init_daemon_tracing` in `crates/calm-cli/src/main.rs`); an idle-timeout eviction, a background-indexer panic, or a stale-build mismatch (`DaemonMeta::is_current`) all leave a visible trace there even after the connection itself is long gone. A plain non-daemon `calm serve` (no `--listen`) has no log file — its output goes to stderr on whatever spawned it instead.
+3. `mcp__calm__indexing_status` confirms whether the index itself is still healthy independent of the transport question — a stale/degraded index and a dropped connection are two different failure modes that can look similar from the client side.

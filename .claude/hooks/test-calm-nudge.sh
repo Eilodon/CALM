@@ -233,4 +233,50 @@ out=$(run_hook_read_path "$(pwd)/crates/calm-server/src/tools/edit.rs")
 echo "$out" | jq -e '.hookSpecificOutput.additionalContext' >/dev/null 2>&1 \
   || fail "expected a nudge for a long indexed file Read, got: $out"
 
+# 14-17. Proactive session_context reminder (2026-07-14 self-audit finding:
+# session_context existed but nothing ever prompted calling it). Uses its
+# own isolated session id so its call count starts clean regardless of
+# what tests 1-13 already did to session_id_test's state.
+run_hook_tool() {
+  jq -nc --arg session "session-context-reminder-test" --arg tool "$1" \
+    '{session_id: $session, tool_name: $tool, tool_input: {}}' \
+    | bash .claude/hooks/calm-nudge.sh
+}
+
+# 14. First 24 mcp__calm__search calls -> SILENT (below the every-25 threshold).
+for i in $(seq 1 24); do
+  out=$(run_hook_tool "mcp__calm__search")
+  is_silent "$out" || fail "expected silence on search call #$i (below threshold), got: $out"
+done
+
+# 15. The 25th call -> REMINDER, naming session_context.
+out=$(run_hook_tool "mcp__calm__search")
+echo "$out" | jq -r '.hookSpecificOutput.additionalContext' | grep -q "session_context" \
+  || fail "expected a session_context reminder on the 25th otherwise-silent call, got: $out"
+
+# 16. Calling mcp__calm__session_context itself -> SILENT (it's the
+#     acknowledgment, not another otherwise-silent call to count), and
+#     resets the counter.
+out=$(run_hook_tool "mcp__calm__session_context")
+is_silent "$out" || fail "expected silence on the session_context call itself, got: $out"
+
+# 17. Next 24 calls after the reset -> SILENT again (proves the counter
+#     actually reset to 0, not just coincidentally still under 25 from
+#     continuing the old count).
+for i in $(seq 1 24); do
+  out=$(run_hook_tool "mcp__calm__search")
+  is_silent "$out" || fail "expected silence on post-reset search call #$i, got: $out"
+done
+
+# 18. Raw `rustfmt`/`cargo fmt` via Bash -> NUDGE toward format_files (2026-07-14
+#     self-audit: a raw rustfmt invocation silently reformatted an unrelated
+#     sibling file on this exact repo).
+out=$(run_hook_bash 'rustfmt --edition 2024 crates/calm-core/src/config.rs')
+echo "$out" | jq -r '.hookSpecificOutput.additionalContext' | grep -q "format_files" \
+  || fail "expected a format_files nudge for a raw rustfmt invocation, got: $out"
+
+out=$(run_hook_bash 'cargo fmt --all -- --check')
+echo "$out" | jq -r '.hookSpecificOutput.additionalContext' | grep -q "format_files" \
+  || fail "expected a format_files nudge for a raw cargo fmt invocation, got: $out"
+
 echo "PASS"

@@ -1,0 +1,130 @@
+{
+  "name": "lsp_refresh",
+  "description": "Manually run one or every LSP resolve-time overlay provider right now (rust-analyzer/gopls/clangd), bypassing the configured refresh policy — none of these run automatically on save by default (policy defaults to on_demand). Upgrades ambiguous/textual call edges to formal by resolving each call site interactively against a live LSP session. USE WHEN: you need formal-tier call edges for rust/go/c/cpp immediately and the relevant LSP server (rust-analyzer/gopls/clangd) is available. Can be slow — spawns a persistent LSP server and does one round-trip per unresolved call site — not for routine/automatic use. NETWORK: none of these three spawn via npx, but once running they may indirectly trigger the underlying build tool (cargo/go) to fetch dependencies if the project's own cache is incomplete — inherited from the environment, not added by CALM.",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "properties": {
+      "lang": {
+        "description": "Which provider to refresh: \"rust\" (rust-analyzer), \"go\" (gopls), \"c\"\n(clangd, covers both .c and .cpp), or \"all\" (default) for every\nprovider in the table.",
+        "type": [
+          "string",
+          "null"
+        ],
+        "default": null
+      }
+    },
+    "type": "object"
+  },
+  "outputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$defs": {
+      "ErrorDetail": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "recoverable": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "recoverable"
+        ]
+      },
+      "LspRefreshProviderOutput": {
+        "type": "object",
+        "properties": {
+          "lang": {
+            "type": "string"
+          },
+          "upgraded": {
+            "description": "Edges actually flipped to `formal`/`formal_source='lsp'` (counted\nfrom UPDATE rowcounts, so a concurrent reindex can't inflate it).",
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0
+          },
+          "attempted": {
+            "description": "Call sites queried against the live LSP session — a low\n`upgraded/attempted` ratio usually means the residual edges are ones\nthis provider itself can't resolve (macros, dynamic dispatch), since\nbatch SCIP (where one exists for this language) already claimed\neverything the same engine could prove.",
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0
+          },
+          "match_rate": {
+            "type": "number",
+            "format": "double"
+          }
+        },
+        "required": [
+          "lang",
+          "upgraded",
+          "attempted",
+          "match_rate"
+        ]
+      },
+      "SuggestedNext": {
+        "type": "object",
+        "properties": {
+          "tool": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "args": true,
+          "gate": {
+            "description": "Plan 3 §3.5(b): `Some(true)` iff skipping `tool` is actually\nhook-enforced (currently only the edit_context/edit_lines/edit_symbol\n→ diff_impact hints set this, via `suggested_gated`) — every other\nhint is left unset (`None`), meaning advisory-only. Lets an agent\ntell \"you'll be blocked if you skip this\" apart from \"you probably\nwant this next\" without re-deriving it from AGENTS.md prose each time.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "tool",
+          "reason"
+        ]
+      }
+    },
+    "properties": {
+      "error": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/ErrorDetail"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "providers": {
+        "type": "array",
+        "items": {
+          "$ref": "#/$defs/LspRefreshProviderOutput"
+        }
+      },
+      "suggested_next": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/SuggestedNext"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "type": "object"
+  },
+  "annotations": {
+    "readOnlyHint": false,
+    "destructiveHint": false,
+    "idempotentHint": true,
+    "openWorldHint": true
+  }
+}

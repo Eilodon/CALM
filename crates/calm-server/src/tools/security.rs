@@ -101,7 +101,7 @@ pub(crate) struct ScanTextOutput {
     /// alongside this is NOT a clean verdict; split the text and rescan.
     /// Omitted (not just `false`) in the common case so existing callers
     /// see no shape change.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[serde(skip_serializing_if = "std::ops::Not::not", default)]
     pub(crate) decode_scan_exhausted: bool,
     /// Present only when `wrap:true` was requested — `text` wrapped in a
     /// self-escaping `<untrusted-external-content>` delimiter (ADR-0006

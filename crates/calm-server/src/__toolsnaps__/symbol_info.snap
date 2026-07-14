@@ -1,0 +1,328 @@
+{
+  "name": "symbol_info",
+  "description": "USE WHEN: you have a symbol name and want metadata + health signals BEFORE reading source. Check is_hub + coreness before deciding whether to modify — hub symbols need edit_context. NOT FOR: reading source (use source), finding symbols (use search/locate). vs source: symbol_info is metadata-only (no code body).",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "required": [
+      "symbol"
+    ],
+    "type": "object",
+    "properties": {
+      "symbol": {
+        "description": "Bare symbol name (not a `path::name` qualified name).",
+        "type": "string"
+      },
+      "path": {
+        "description": "Narrows the search to one file when `symbol` alone is ambiguous\nacross the repo. Repo-relative path.",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "line": {
+        "description": "Disambiguates same-named symbols in the same file — any line within\nthe intended candidate's range (see an earlier `ambiguous` response's\n`line_start`/`line_end`).",
+        "type": [
+          "integer",
+          "null"
+        ],
+        "format": "int64"
+      }
+    }
+  },
+  "outputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$defs": {
+      "ErrorDetail": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "recoverable": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "recoverable"
+        ]
+      },
+      "AmbiguousCandidate": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "line_start": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "line_end": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "class_context": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "caller_count": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "language": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "signature": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "name",
+          "path",
+          "kind",
+          "line_start",
+          "line_end"
+        ]
+      },
+      "HealthOutput": {
+        "type": "object",
+        "properties": {
+          "dead_code_confidence": {
+            "type": "string"
+          },
+          "dead_code_source": {
+            "type": "string"
+          },
+          "caller_count_by_confidence": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/CallerCountByConfidence"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "test_files": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "dead_code_confidence",
+          "dead_code_source",
+          "test_files"
+        ]
+      },
+      "CallerCountByConfidence": {
+        "type": "object",
+        "properties": {
+          "formal": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "resolved": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "inferred": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "textual": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "ambiguous": {
+            "description": "Bare-name matches fanned out across >1 same-named candidate with no\ntie-breaker — most likely correct for at most one of them. See\n`EdgeConfidence::Ambiguous`.",
+            "type": "integer",
+            "format": "int64"
+          }
+        },
+        "required": [
+          "formal",
+          "resolved",
+          "inferred",
+          "textual",
+          "ambiguous"
+        ]
+      },
+      "SuggestedNext": {
+        "type": "object",
+        "properties": {
+          "tool": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "args": true,
+          "gate": {
+            "description": "Plan 3 §3.5(b): `Some(true)` iff skipping `tool` is actually\nhook-enforced (currently only the edit_context/edit_lines/edit_symbol\n→ diff_impact hints set this, via `suggested_gated`) — every other\nhint is left unset (`None`), meaning advisory-only. Lets an agent\ntell \"you'll be blocked if you skip this\" apart from \"you probably\nwant this next\" without re-deriving it from AGENTS.md prose each time.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "tool",
+          "reason"
+        ]
+      },
+      "Caveat": {
+        "description": "Structured, machine-checkable hint attached to a tool result whose\nliteral content (empty list / not-found) could otherwise be misread as\nproof of absence. `class` lets a safety gate branch without parsing\n`message`; `message` is the human-readable explanation. Design mirrors\nzzet/gortex's `ZeroEdgeCaveat` (Apache-2.0) — reimplemented against\nCALM's own resolver shape, not a line-for-line port.",
+        "type": "object",
+        "properties": {
+          "class": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "class",
+          "message"
+        ]
+      }
+    },
+    "properties": {
+      "error": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/ErrorDetail"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "ambiguous": {
+        "type": "boolean"
+      },
+      "total": {
+        "description": "Total candidates matched before the display cap of\n`MAX_AMBIGUOUS_CANDIDATES`. `truncated` is `true` when `total >\ncandidates.len()`, telling the caller there are more matches than\nshown and to narrow with `path`/`line` — the list is never silently\npresented as the complete set.",
+        "type": "integer",
+        "format": "uint",
+        "minimum": 0
+      },
+      "truncated": {
+        "type": "boolean"
+      },
+      "candidates": {
+        "type": "array",
+        "items": {
+          "$ref": "#/$defs/AmbiguousCandidate"
+        }
+      },
+      "name": {
+        "type": "string"
+      },
+      "qualified_name": {
+        "type": "string"
+      },
+      "kind": {
+        "type": "string"
+      },
+      "path": {
+        "type": "string"
+      },
+      "line_start": {
+        "type": "integer",
+        "format": "int64"
+      },
+      "line_end": {
+        "type": "integer",
+        "format": "int64"
+      },
+      "signature": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "docstring": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "caller_count": {
+        "type": "integer",
+        "format": "int64"
+      },
+      "is_hub": {
+        "type": "boolean"
+      },
+      "coreness": {
+        "type": [
+          "integer",
+          "null"
+        ],
+        "format": "int64"
+      },
+      "health": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/HealthOutput"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "suggested_next": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/SuggestedNext"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "caveat": {
+        "description": "Advisory hint on an empty/not-found result. Never set alongside a\npopulated `success` unless a tool opts in via `with_caveat` (e.g.\n`callers` on zero direct callers).",
+        "anyOf": [
+          {
+            "$ref": "#/$defs/Caveat"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "type": "object"
+  },
+  "annotations": {
+    "readOnlyHint": true,
+    "destructiveHint": false,
+    "idempotentHint": true,
+    "openWorldHint": false
+  }
+}

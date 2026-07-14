@@ -1,0 +1,226 @@
+{
+  "name": "fitness_report",
+  "description": "Repo-wide codebase health snapshot (hub concentration, dead code, complexity, edge coverage, architecture-boundary/config-drift violations) against configurable thresholds — the same checks `calm fitness-check` runs in CI, queryable mid-session instead of waiting on a pipeline. USE WHEN: you want a big-picture health pulse-check. NOT FOR: per-file/per-symbol risk (use hotspots/edit_context for that).",
+  "inputSchema": {
+    "type": "object",
+    "properties": {}
+  },
+  "outputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$defs": {
+      "ErrorDetail": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "recoverable": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "recoverable"
+        ]
+      },
+      "FitnessCheckItemOutput": {
+        "type": "object",
+        "properties": {
+          "metric": {
+            "type": "string"
+          },
+          "value": {
+            "type": "number",
+            "format": "double"
+          },
+          "threshold": {
+            "type": "number",
+            "format": "double"
+          },
+          "passed": {
+            "type": "boolean"
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "metric",
+          "value",
+          "threshold",
+          "passed",
+          "message"
+        ]
+      },
+      "FitnessMetricsOutput": {
+        "type": "object",
+        "properties": {
+          "hub_count": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "hub_pct": {
+            "type": "number",
+            "format": "double"
+          },
+          "avg_coreness": {
+            "type": "number",
+            "format": "double"
+          },
+          "dead_code_pct": {
+            "type": "number",
+            "format": "double"
+          },
+          "hotspot_risk": {
+            "type": "number",
+            "format": "double"
+          },
+          "edge_coverage_pct": {
+            "type": "number",
+            "format": "double"
+          },
+          "high_complexity_pct": {
+            "type": "number",
+            "format": "double"
+          },
+          "high_complexity_pct_note": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "hub_count",
+          "hub_pct",
+          "avg_coreness",
+          "dead_code_pct",
+          "hotspot_risk",
+          "edge_coverage_pct",
+          "high_complexity_pct"
+        ]
+      },
+      "BoundaryViolationOutput": {
+        "type": "object",
+        "properties": {
+          "from_path": {
+            "type": "string"
+          },
+          "to_path": {
+            "type": "string"
+          },
+          "rule_from": {
+            "type": "string"
+          },
+          "rule_to": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "from_path",
+          "to_path",
+          "rule_from",
+          "rule_to"
+        ]
+      },
+      "ConfigDriftFindingOutput": {
+        "type": "object",
+        "properties": {
+          "doc_path": {
+            "type": "string"
+          },
+          "reference": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "doc_path",
+          "reference"
+        ]
+      },
+      "SuggestedNext": {
+        "type": "object",
+        "properties": {
+          "tool": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "args": true,
+          "gate": {
+            "description": "Plan 3 §3.5(b): `Some(true)` iff skipping `tool` is actually\nhook-enforced (currently only the edit_context/edit_lines/edit_symbol\n→ diff_impact hints set this, via `suggested_gated`) — every other\nhint is left unset (`None`), meaning advisory-only. Lets an agent\ntell \"you'll be blocked if you skip this\" apart from \"you probably\nwant this next\" without re-deriving it from AGENTS.md prose each time.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "tool",
+          "reason"
+        ]
+      }
+    },
+    "properties": {
+      "error": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/ErrorDetail"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "passed": {
+        "type": "boolean"
+      },
+      "checks": {
+        "type": "array",
+        "items": {
+          "$ref": "#/$defs/FitnessCheckItemOutput"
+        }
+      },
+      "metrics": {
+        "$ref": "#/$defs/FitnessMetricsOutput"
+      },
+      "boundary_violations": {
+        "type": "array",
+        "items": {
+          "$ref": "#/$defs/BoundaryViolationOutput"
+        }
+      },
+      "config_drift": {
+        "type": "array",
+        "items": {
+          "$ref": "#/$defs/ConfigDriftFindingOutput"
+        }
+      },
+      "suggested_next": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/SuggestedNext"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "type": "object"
+  },
+  "annotations": {
+    "readOnlyHint": true,
+    "destructiveHint": false,
+    "idempotentHint": true,
+    "openWorldHint": false
+  }
+}

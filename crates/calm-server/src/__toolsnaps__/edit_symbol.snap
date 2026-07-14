@@ -1,0 +1,365 @@
+{
+  "name": "edit_symbol",
+  "description": "Sugar over edit_lines: resolves symbol (+ optional path/line, same disambiguation contract as edit_context). Default position=\"replace\" swaps the symbol's whole [line_start, line_end] for new_text in one hunk (needs expected_hash). position=\"before\"/\"after\"/\"append_inside\" instead INSERTS new_text relative to the symbol, anchored on a fresh parse of the file on disk — no line numbers, no expected_hash, no preview round trip, immune to stale line offsets (append_inside = end of a class/function body; after = new sibling below it, e.g. a new test after the last existing test). USE WHEN: replacing an entire function/class/method body by name, or inserting new code relative to one. NOT FOR: editing a single line inside a symbol, or anything outside a parsed symbol (an import line, Cargo.toml) — use edit_lines directly for those.",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "required": [
+      "symbol",
+      "new_text"
+    ],
+    "type": "object",
+    "properties": {
+      "symbol": {
+        "description": "Bare symbol name (not a `path::name` qualified name).",
+        "type": "string"
+      },
+      "path": {
+        "description": "Narrows the search to one file when `symbol` alone is ambiguous.",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "line": {
+        "description": "Disambiguates same-named symbols in the same file — any line within\nthe intended candidate's range, as echoed in an earlier `ambiguous`\nresponse's `line_start`/`line_end`.",
+        "type": [
+          "integer",
+          "null"
+        ],
+        "format": "int64"
+      },
+      "expected_hash": {
+        "description": "Same contract as `edit_lines`' hunk `expected_hash` — omit to\npreview the symbol's current hash/content instead of writing.\nIgnored by the insertion `position` modes, which anchor and hash\nthemselves.",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "new_text": {
+        "description": "With the default `position` (\"replace\"): full replacement text for\nthe symbol's `[line_start, line_end]`. With an insertion `position`:\nthe new code to insert — the symbol itself is left untouched.",
+        "type": "string"
+      },
+      "position": {
+        "description": "One of `\"replace\"` (default), `\"before\"`, `\"after\"`,\n`\"append_inside\"`, `\"top_of_file\"`, `\"end_of_file\"`. `\"replace\"`\nswaps the symbol's whole range for `new_text`. `\"before\"`/`\"after\"`/\n`\"append_inside\"` INSERT `new_text` relative to the symbol:\n`\"before\"` = directly above it, `\"after\"` = directly below it (a\nnew sibling — e.g. add a test after the last test in a module),\n`\"append_inside\"` = at the end of its body (above the closing\ndelimiter when one exists). Insertion modes re-resolve the symbol's\nrange from a fresh parse of the file on disk and pre-fill the\nanchor hash themselves, so no `expected_hash`, preview round trip,\nor line arithmetic is needed — they cannot land at a stale line\noffset. `\"top_of_file\"`/`\"end_of_file\"` insert relative to the\nWHOLE FILE (`path` required, `symbol` ignored) — for brand-new\nmodule-level content (a new `use`, a new top-level function) with\nno existing sibling symbol to anchor on.",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "confirm": {
+        "description": "Same gate as `edit_lines`' `confirm` — including the `edit_context`-\nthis-session and `reason`-must-cite-a-real-caller requirements on\ntop of it for a hub/high-risk touch. See `EditLinesParams::confirm`.",
+        "type": "boolean",
+        "default": false
+      },
+      "reason": {
+        "description": "See `EditLinesParams::reason`.",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "old_text": {
+        "description": "Small-text-match mode: when set, `new_text` replaces the FIRST\n(and required-to-be-only) occurrence of `old_text` found within the\nresolved symbol's current range, instead of replacing the whole\nsymbol. No line numbers, no `expected_hash` needed — the server\nreads the symbol's live content to find the match, so staleness is\nimpossible by construction. Refused with `BOUNDARY_AMBIGUOUS` if\nthe target symbol carries that flag (its own range can't be\ntrusted as a search scope — see fitness_report). Ignored when\n`position` is not `\"replace\"`.",
+        "type": [
+          "string",
+          "null"
+        ]
+      }
+    }
+  },
+  "outputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$defs": {
+      "ErrorDetail": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "recoverable": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "recoverable"
+        ]
+      },
+      "AmbiguousCandidate": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "line_start": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "line_end": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "class_context": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "caller_count": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "language": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "signature": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "name",
+          "path",
+          "kind",
+          "line_start",
+          "line_end"
+        ]
+      },
+      "EditHunkResultOutput": {
+        "type": "object",
+        "properties": {
+          "start_line": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "end_line": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "status": {
+            "description": "\"applied\" | \"preview\" | \"conflict\"",
+            "type": "string"
+          },
+          "current_hash": {
+            "description": "Hash of the range's content before this call — pass this as\n`expected_hash` on retry.",
+            "type": "string"
+          },
+          "old_text": {
+            "description": "Content of the range before this call — undo material when\n`status == \"applied\"`, or what to inspect otherwise.",
+            "type": "string"
+          },
+          "new_end_line": {
+            "description": "Only present when `status == \"applied\"`: the line the replacement\nnow ends at (`start_line` is unchanged).",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "other_matches": {
+            "description": "Present when the range's pre-edit content is byte-identical to N\nOTHER line windows of this file (a lone `}` line, say): the hash\nproves content, not position — verify the line numbers point where\nintended, or anchor structurally via edit_symbol's `position`.",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          }
+        },
+        "required": [
+          "start_line",
+          "end_line",
+          "status",
+          "current_hash",
+          "old_text"
+        ]
+      },
+      "TouchedSymbolOutput": {
+        "type": "object",
+        "properties": {
+          "qualified_name": {
+            "type": "string"
+          },
+          "caller_count": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "is_hub": {
+            "type": "boolean"
+          },
+          "hub_kind": {
+            "description": "Plan 3 §3.3 (F10): `'degree' | 'bridge' | 'both'`, or `None` when\n`is_hub` is `false` — see `graph::hub::update_is_hub_flags`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "qualified_name",
+          "caller_count",
+          "is_hub"
+        ]
+      },
+      "SuggestedNext": {
+        "type": "object",
+        "properties": {
+          "tool": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "args": true,
+          "gate": {
+            "description": "Plan 3 §3.5(b): `Some(true)` iff skipping `tool` is actually\nhook-enforced (currently only the edit_context/edit_lines/edit_symbol\n→ diff_impact hints set this, via `suggested_gated`) — every other\nhint is left unset (`None`), meaning advisory-only. Lets an agent\ntell \"you'll be blocked if you skip this\" apart from \"you probably\nwant this next\" without re-deriving it from AGENTS.md prose each time.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "tool",
+          "reason"
+        ]
+      },
+      "Caveat": {
+        "description": "Structured, machine-checkable hint attached to a tool result whose\nliteral content (empty list / not-found) could otherwise be misread as\nproof of absence. `class` lets a safety gate branch without parsing\n`message`; `message` is the human-readable explanation. Design mirrors\nzzet/gortex's `ZeroEdgeCaveat` (Apache-2.0) — reimplemented against\nCALM's own resolver shape, not a line-for-line port.",
+        "type": "object",
+        "properties": {
+          "class": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "class",
+          "message"
+        ]
+      }
+    },
+    "properties": {
+      "error": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/ErrorDetail"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "ambiguous": {
+        "type": "boolean"
+      },
+      "total": {
+        "description": "Total candidates matched before the display cap of\n`MAX_AMBIGUOUS_CANDIDATES`. `truncated` is `true` when `total >\ncandidates.len()`, telling the caller there are more matches than\nshown and to narrow with `path`/`line` — the list is never silently\npresented as the complete set.",
+        "type": "integer",
+        "format": "uint",
+        "minimum": 0
+      },
+      "truncated": {
+        "type": "boolean"
+      },
+      "candidates": {
+        "type": "array",
+        "items": {
+          "$ref": "#/$defs/AmbiguousCandidate"
+        }
+      },
+      "path": {
+        "type": "string"
+      },
+      "applied": {
+        "type": "boolean"
+      },
+      "hunks": {
+        "type": "array",
+        "items": {
+          "$ref": "#/$defs/EditHunkResultOutput"
+        }
+      },
+      "parse_status": {
+        "description": "\"clean\" | \"skipped_unrecognized_language\" — absent when nothing was\nwritten (preview/conflict/risk-blocked/parse error).",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "touched_symbols": {
+        "description": "Symbols overlapping the touched ranges (post-edit positions once\n`applied`) — the same callers/is_hub signal `edit_context`/\n`diff_impact` report, bundled here so a caller doesn't need a\nseparate round trip just to see what it just changed.",
+        "type": "array",
+        "items": {
+          "$ref": "#/$defs/TouchedSymbolOutput"
+        }
+      },
+      "risk_assessment": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "index_stale": {
+        "description": "`true` only when `applied` is `true` but the post-write index\nrefresh failed: the file on disk holds the new content — do NOT\nre-apply — while symbol line numbers served from the index may lag\nuntil it recovers (see `note`, and call `indexing_status`).",
+        "type": [
+          "boolean",
+          "null"
+        ]
+      },
+      "note": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "suggested_next": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/SuggestedNext"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "caveat": {
+        "description": "Advisory hint on an empty/not-found result. Never set alongside a\npopulated `success` unless a tool opts in via `with_caveat` (e.g.\n`callers` on zero direct callers).",
+        "anyOf": [
+          {
+            "$ref": "#/$defs/Caveat"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "type": "object"
+  },
+  "annotations": {
+    "readOnlyHint": false,
+    "destructiveHint": true,
+    "idempotentHint": false,
+    "openWorldHint": false
+  }
+}

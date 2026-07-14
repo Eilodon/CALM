@@ -1,0 +1,316 @@
+{
+  "name": "symbols_batch",
+  "description": "USE WHEN: you need source (+ optionally direct callers/callees) for several EXACT qualified_names in one round trip — e.g. following up on a locate/search result list. Requires exact qualified_name, not a bare symbol name: an id that doesn't match exactly comes back found:false instead of fuzzy-substituting the closest name (unlike understand's fuzzy search). NOT FOR: a single bare-name lookup (use source/symbol_info) or exploring an unknown name (use search/locate first to get exact qualified_names). Capped at 50 ids per call.",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "required": [
+      "qualified_names"
+    ],
+    "type": "object",
+    "properties": {
+      "qualified_names": {
+        "description": "Exact `qualified_name`s to fetch (e.g. `path/to/file.rs::Type::method`)\n— NOT bare names. Get these from a prior `search`/`locate` call. This\ntool does no fuzzy matching: an id that doesn't match exactly comes\nback `found: false` for that entry rather than silently substituting\nthe closest name. Capped at 50 entries per call (extras are dropped,\nsee `truncated`).",
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "include_callers": {
+        "description": "`true` to also include each found symbol's direct callers (same\nshape as `callers`'s `direct` field — no transitive/ambiguous split).",
+        "type": "boolean",
+        "default": false
+      },
+      "include_callees": {
+        "description": "`true` to also include each found symbol's direct callees.",
+        "type": "boolean",
+        "default": false
+      }
+    }
+  },
+  "outputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$defs": {
+      "ErrorDetail": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "recoverable": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "recoverable"
+        ]
+      },
+      "SymbolsBatchEntry": {
+        "type": "object",
+        "properties": {
+          "qualified_name": {
+            "type": "string"
+          },
+          "found": {
+            "type": "boolean"
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "kind": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "path": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "line_start": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "line_end": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "language": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "is_hub": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "source": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "token_estimate": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "content_warning": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "direct_callers": {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/CallerEntry"
+            }
+          },
+          "direct_callees": {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/CalleeEntry"
+            }
+          }
+        },
+        "required": [
+          "qualified_name",
+          "found"
+        ]
+      },
+      "CallerEntry": {
+        "type": "object",
+        "properties": {
+          "symbol": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "edge_confidence": {
+            "type": "string"
+          },
+          "edge_kind": {
+            "description": "`\"call\"` or `\"reference\"` (SQL view/proc reading a table via\nFROM/JOIN) — see `call_edges.edge_kind`. Lets a consumer tell a real\ninvocation apart from a mere read without misreading a JOIN as a\nfunction call.",
+            "type": "string"
+          },
+          "line": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "preview": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "symbol",
+          "path",
+          "edge_confidence",
+          "edge_kind"
+        ]
+      },
+      "CalleeEntry": {
+        "type": "object",
+        "properties": {
+          "symbol": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "edge_confidence": {
+            "type": "string"
+          },
+          "edge_kind": {
+            "description": "See `CallerEntry::edge_kind`.",
+            "type": "string"
+          },
+          "line": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "preview": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "symbol",
+          "path",
+          "edge_confidence",
+          "edge_kind"
+        ]
+      },
+      "Caveat": {
+        "description": "Structured, machine-checkable hint attached to a tool result whose\nliteral content (empty list / not-found) could otherwise be misread as\nproof of absence. `class` lets a safety gate branch without parsing\n`message`; `message` is the human-readable explanation. Design mirrors\nzzet/gortex's `ZeroEdgeCaveat` (Apache-2.0) — reimplemented against\nCALM's own resolver shape, not a line-for-line port.",
+        "type": "object",
+        "properties": {
+          "class": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "class",
+          "message"
+        ]
+      },
+      "SuggestedNext": {
+        "type": "object",
+        "properties": {
+          "tool": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "args": true,
+          "gate": {
+            "description": "Plan 3 §3.5(b): `Some(true)` iff skipping `tool` is actually\nhook-enforced (currently only the edit_context/edit_lines/edit_symbol\n→ diff_impact hints set this, via `suggested_gated`) — every other\nhint is left unset (`None`), meaning advisory-only. Lets an agent\ntell \"you'll be blocked if you skip this\" apart from \"you probably\nwant this next\" without re-deriving it from AGENTS.md prose each time.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "tool",
+          "reason"
+        ]
+      }
+    },
+    "properties": {
+      "error": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/ErrorDetail"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "results": {
+        "type": "array",
+        "items": {
+          "$ref": "#/$defs/SymbolsBatchEntry"
+        }
+      },
+      "found_count": {
+        "type": "integer",
+        "format": "uint",
+        "minimum": 0
+      },
+      "not_found_count": {
+        "type": "integer",
+        "format": "uint",
+        "minimum": 0
+      },
+      "truncated": {
+        "description": "`true` when more than `SYMBOLS_BATCH_MAX` distinct ids were\nrequested — only the first `SYMBOLS_BATCH_MAX` (input order, after\ndedup) were looked up.",
+        "type": "boolean"
+      },
+      "caveat": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/Caveat"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "suggested_next": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/SuggestedNext"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "type": "object"
+  },
+  "annotations": {
+    "readOnlyHint": true,
+    "destructiveHint": false,
+    "idempotentHint": true,
+    "openWorldHint": false
+  }
+}

@@ -415,7 +415,7 @@ pub(crate) struct SessionContextOutput {
     /// `diff_impact` call — a host-agnostic version of the Claude-Code-only
     /// PreToolUse hook's commit/push gate, visible to any MCP client.
     pub(crate) pending_diff_impact: bool,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub(crate) files_pending_diff_impact: Vec<String>,
     /// Tool calls since `explored_files`/`explored_symbols` last gained a
     /// genuinely new entry — informational only, never enforced.
@@ -437,7 +437,7 @@ pub(crate) struct SessionContextOutput {
     /// entirely from data `other_active_sessions` already carries, not a new
     /// subsystem. Informational only, like `possibly_stuck` -- never gates
     /// or reorders `suggested_next`; no reservation/locking semantics.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub(crate) overlapping_files: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) suggested_next: Option<SuggestedNext>,
@@ -504,7 +504,7 @@ pub(crate) struct IndexingStatusOutput {
     /// (not present with `available: false`) when its `enabled` config is
     /// explicitly `false` — nothing to report, same as `scip_overlay` being
     /// absent for that reason.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub(crate) scip_overlays: Vec<PerLanguageOverlayStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) suggested_next: Option<SuggestedNext>,

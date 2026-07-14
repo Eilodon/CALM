@@ -1,0 +1,9 @@
+{
+  "name": "calm-js-client-interop",
+  "private": true,
+  "type": "module",
+  "description": "Real-client MCP interop check: drives `calm serve` over stdio with the official TypeScript MCP SDK (an independent implementation from CALM's own rmcp-based Rust test harness) so a genuine cross-SDK handshake/tools-list/tool-call is exercised in CI, not just CALM testing itself.",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0"
+  }
+}
