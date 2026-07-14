@@ -79,7 +79,7 @@ string (verified: `get_info_advertises_tools_capability`/
 
 ## Risk Assessment (audit-design)
 <!-- audit-design: DO NOT DUPLICATE -- update this section, do not append a second one -->
-<!-- last-run: 2026-07-14 | trigger: NORMAL -->
+<!-- last-run: 2026-07-14 | trigger: NORMAL | Item B updated same day with external-research follow-up (official docs + anthropics/claude-code issues) -->
 
 **Tier:** 2 (Production) | **Date:** 2026-07-14
 
@@ -260,13 +260,13 @@ content-pinning test spanning both the prompt and the scaffold (FM3).
   duplicate the appended block — same identity-check need as L3.
 
 **Assumptions to Verify**
-- **ASSUMED, HIGH-impact if false:** multi-block `PreToolUse` array
-  evaluates all matching blocks, not first-match-only (FM1) — must be
-  verified empirically (a real Claude Code test session with two
-  independently-matching blocks, one denying, one not) before this design
-  can be trusted.
+- **ASSUMED, now RESOLVED (favorably) by external research below:** multi-block
+  `PreToolUse` array evaluates all matching blocks, not first-match-only
+  (FM1's original core question) — confirmed against official docs, not
+  just inferred. See External Research below.
 - **ASSUMED:** a minimal rewrite can match `calm-nudge.sh`'s already-fixed
-  edge cases without repeating its bug history (FM2).
+  edge cases without repeating its bug history (FM2) — unchanged, still
+  unverified.
 
 **Abductive Hypotheses**
 1. **Direct precedent, same day, same repo.** This repo's own audit-design
@@ -287,17 +287,91 @@ content-pinning test spanning both the prompt and the scaffold (FM3).
    independently rediscovered in Item B — evidence this is a structural
    coupling between A and B, not two unrelated features.
 
-**Gate Result: HOLD.** Two HIGH findings (FM1's unverified — and possibly
-silently-inert — core mechanism; FM2's regression risk from a ground-up
-rewrite) plus a direct, same-day precedent (Abductive 1) against shipping a
-new hard-deny mechanism without measured evidence. Required before
-revisiting: (a) empirically verify array-block evaluation semantics in a
-real Claude Code session before finalizing the merge strategy; (b) derive
-the minimal template *by subtraction* from `calm-nudge.sh`'s already-fixed
-logic for the 2 kept gates, rather than a rewrite, to inherit its bug
-fixes; (c) design a shadow-mode-first rollout (log what would be denied,
-don't deny) for at least one release before any real external hard-deny
-ships, mirroring this repo's own stated bar for itself; (d) fix the
-cross-item message coupling (Abductive 2) — either make deny messages
-self-contained (no bare "AGENTS.md Stage N" references) or make
-`--strict-hooks` imply `--agents-md`.
+**External Research (2026-07-14, follow-up pass — official docs +
+anthropics/claude-code GitHub issues, not just this repo's own code)**
+
+Requested explicitly to check whether external documentation resolves
+enough of Item B's HOLD to proceed. It resolves FM1's original narrow
+question, but surfaces a bigger, previously-uncounted risk in its place —
+net effect strengthens the HOLD, not weakens it.
+
+- **FM1's core question, RESOLVED:** official docs
+  (code.claude.com/docs/en/hooks, "Hook handler fields" section) state
+  plainly: *"All matching hooks run in parallel, and identical handlers
+  are deduplicated automatically."* Multiple independent `{matcher,
+  hooks}` blocks that each match a given tool call all fire — not
+  first-match-only. The corrected append-a-new-block merge strategy in
+  this spec's Design section is NOT silently inert as FM1 feared.
+- **NEW finding, more serious than FM1 as originally scoped:** what
+  happens when multiple fired hooks *disagree* is not just unverified —
+  it is a real, repeated, multi-version production bug class, evidenced
+  directly (not inferred) from `anthropics/claude-code` issues:
+  - **#4669** (Claude Code v1.0.62-69, filed Aug 2025): `permissionDecision:
+    "deny"` silently ignored, tool executes anyway. Three independent
+    reporters reproduced it (`JC1738`, `jeubank12`, `tomomonta`); the last
+    reported the *entire* PreToolUse blocking mechanism broken (`deny`,
+    `ask`, AND `"continue": false` all failed to block). **Auto-closed by
+    a housekeeping bot for 60-day inactivity — never confirmed fixed by a
+    maintainer.** Checked directly via `gh issue view 4669`, not taken
+    from a blog summary.
+  - **#39344** (v2.1.84, filed 2026-03-26, labels `bug`+`area:security`):
+    a hook returning `"ask"` silently overrode a static `permissions.deny`
+    rule entirely — command ran with no prompt. **This one WAS confirmed
+    fixed** by maintainer `ashwin-ant`, in **v2.1.101**
+    (2026-04-18): "A PreToolUse hook returning permissionDecision 'ask'
+    no longer overrides explicit `permissions.deny` rules." Checked via
+    `gh issue view 39344`, comments read directly, not summarized secondhand.
+  - **#35136:** separately confirmed (as of v2.1.77) that a hook's
+    `"allow"` does NOT override a static deny rule — this direction was
+    already safe, the bug was only ever in the `ask`-overrides-`deny`
+    direction (#39344).
+  - Both #4669 and #39344 reference further duplicates/related reports
+    (#18312, #22018, #36059, #37420) — this is a recurring problem area
+    for the vendor, not a one-off.
+- **Most load-bearing finding: Anthropic's own docs recommend AGAINST
+  using hooks for hard enforcement at all.** Fetched directly from
+  code.claude.com/docs/en/hooks, "Common fields" section: *"Because the
+  `if` filter is best-effort, use the [permission system] rather than a
+  hook to enforce a hard allow or deny."* This is the vendor's own stated
+  design guidance, and it argues directly against Item B's entire premise
+  — a hook-based hard-deny gate is explicitly not the mechanism Anthropic
+  itself recommends for that job. CALM's use case (contextual, session-
+  state-dependent: "has `edit_context` been called for *this* file *this*
+  session") can't be expressed as a static `permissions.deny` pattern
+  rule, so this doesn't invalidate the goal, but it does mean Item B is
+  reaching for a mechanism the vendor documents as not the hard-enforcement
+  tool, and the GitHub issue history above shows why: it's genuinely had
+  reliability bugs, repeatedly, across many months of versions.
+- **Constructive finding for whenever B is revisited:** a community
+  workaround (user `yurukusa`, on #39344) recommends `exit 2` (blocking
+  error, stderr fed to Claude, JSON/stdout ignored entirely — confirmed in
+  official docs' "Exit code output" section) over the JSON
+  `permissionDecision: "deny"` form, specifically because it sidesteps the
+  whole JSON-output interaction surface where #4669/#39344's bugs lived.
+  Worth noting: **`calm-nudge.sh`'s own `deny()` function
+  (`.claude/hooks/calm-nudge.sh`) currently uses the JSON
+  `permissionDecision: "deny"` form, not `exit 2`** — this repo's own
+  internal mechanism has the same theoretical exposure to this bug class
+  that Item B would inherit. Worth a separate, smaller follow-up for
+  `calm-nudge.sh` itself, independent of whether Item B ever ships.
+
+**Gate Result: HOLD — reaffirmed, on stronger grounds than the original
+pass.** FM1 (silently-inert mechanism) is resolved favorably: array-block
+evaluation is confirmed safe. But external research replaces it with
+evidence-backed findings that are harder to dismiss than an unverified
+assumption: a real multi-version bug history in exactly the deny-reliability
+property Item B depends on (one confirmed-fixed, one auto-closed without
+confirmation), and Anthropic's own documentation directly recommending
+against hooks for hard enforcement. FM2 (regression risk from a from-scratch
+rewrite) and Abductive 1/2 (same-day internal precedent; cross-item message
+coupling) stand unchanged. Required before revisiting, updated: (a) build
+on `exit 2`, not JSON `permissionDecision`, for the actual blocking signal,
+specifically to avoid the JSON-output interaction bug class #4669/#39344
+both lived in; (b) derive the minimal template *by subtraction* from
+`calm-nudge.sh`'s already-fixed logic for the 2 kept gates, rather than a
+rewrite; (c) design a shadow-mode-first rollout before any real external
+hard-deny ships; (d) fix the cross-item message coupling (Abductive 2); (e)
+new — message this to users honestly as best-effort/defense-in-depth, never
+as guaranteed-unbypassable, matching Anthropic's own framing of what hooks
+are and are not reliable for; (f) new — file the same `exit 2` finding as a
+follow-up for `calm-nudge.sh` itself, independent of Item B's own fate.
