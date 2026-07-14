@@ -177,16 +177,24 @@ bằng đường dẫn thật nơi bạn clone repo này (khác với 3 config c
 trên, path ở đây **phải là tuyệt đối** vì không có khái niệm "project root"
 cho một file config toàn cục):
 
+**QUAN TRỌNG:** Vì Windsurf dùng global config, bạn **PHẢI truyền `--project-root`**
+rõ ràng để CALM biết project nào cần index. Nếu không truyền, CALM sẽ dùng
+current working directory của Windsurf process (có thể là thư mục khác hoặc
+home directory), dẫn đến index sai scope.
+
 ```json
 {
   "mcpServers": {
     "calm": {
       "command": "bash",
-      "args": ["/absolute/path/to/CALM/scripts/mcp-launcher.sh"]
+      "args": ["/absolute/path/to/CALM/scripts/mcp-launcher.sh", "--project-root", "/absolute/path/to/CALM"]
     }
   }
 }
 ```
+
+Thay `/absolute/path/to/CALM` bằng đường dẫn thật nơi bạn clone repo này.
+Cả 2 path (launcher script và project root) phải tuyệt đối.
 
 Devin Desktop cũng có "MCP Marketplace" riêng ngay trong panel Cascade
 (icon MCPs ở góc trên, hoặc Settings → Cascade → MCP Servers), hỗ trợ cài
@@ -201,6 +209,18 @@ nộp vào marketplace đó.
 Cấu hình qua UI settings riêng của JetBrains (không phải file check-in vào
 repo) — trỏ command/args giống hệt snippet Windsurf ở trên (path tuyệt đối
 tới `scripts/mcp-launcher.sh`).
+
+**QUAN TRỌNG:** Giống Windsurf, JetBrains cũng dùng global config, nên bạn
+**PHẢI truyền `--project-root`** rõ ràng để CALM biết project nào cần index:
+
+```json
+{
+  "command": "bash",
+  "args": ["/absolute/path/to/CALM/scripts/mcp-launcher.sh", "--project-root", "/absolute/path/to/CALM"]
+}
+```
+
+Thay `/absolute/path/to/CALM` bằng đường dẫn thật nơi bạn clone repo này.
 
 ## Codex CLI (OpenAI)
 
@@ -233,11 +253,16 @@ args = ["-y", "@eilodon/calm-mcp", "serve"]
 Hoặc nếu đang dev trên chính repo CALM, trỏ vào `scripts/mcp-launcher.sh`
 (path tuyệt đối, cùng lý do như Windsurf) thay vì npx:
 
+**QUAN TRỌNG:** Nếu dùng launcher script (không phải npx), bạn **PHẢI truyền
+`--project-root`** rõ ràng để CALM biết project nào cần index:
+
 ```toml
 [mcp_servers.calm]
 command = "bash"
-args = ["/absolute/path/to/CALM/scripts/mcp-launcher.sh"]
+args = ["/absolute/path/to/CALM/scripts/mcp-launcher.sh", "--project-root", "/absolute/path/to/CALM"]
 ```
+
+Thay `/absolute/path/to/CALM` bằng đường dẫn thật nơi bạn clone repo này.
 
 Xem chi tiết: [developers.openai.com/codex/mcp](https://developers.openai.com/codex/mcp).
 
@@ -254,16 +279,21 @@ Cũng config toàn cục, dùng chung giữa Antigravity IDE và Antigravity CLI
 `~/.gemini/config/mcp_config.json` — cùng shape JSON `mcpServers` như Claude
 Code/Cursor, chỉ khác chỗ đặt file (global, không phải project-level):
 
+**QUAN TRỌNG:** Giống Windsurf, Antigravity cũng dùng global config, nên bạn
+**PHẢI truyền `--project-root`** rõ ràng để CALM biết project nào cần index:
+
 ```json
 {
   "mcpServers": {
     "calm": {
       "command": "bash",
-      "args": ["/absolute/path/to/CALM/scripts/mcp-launcher.sh"]
+      "args": ["/absolute/path/to/CALM/scripts/mcp-launcher.sh", "--project-root", "/absolute/path/to/CALM"]
     }
   }
 }
 ```
+
+Thay `/absolute/path/to/CALM` bằng đường dẫn thật nơi bạn clone repo này.
 
 Sửa xong lưu file, Antigravity tự reload — không cần restart. Trong IDE cũng
 sửa được qua "..." ở agent panel → "Manage MCP Servers" → "View raw config".
