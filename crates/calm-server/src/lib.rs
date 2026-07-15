@@ -722,6 +722,12 @@ pub fn doctor(project_root: &std::path::Path) -> Result<()> {
         println!("Git: NOT FOUND (hotspots/diff_impact will be limited)");
     }
 
+    let hooks_status = calm_core::hooks::check_hooks_status(project_root);
+    println!("{}", hooks_status.summary());
+    if hooks_status.disabled_by_env {
+        println!("  (CALM_HOOKS_DISABLE=1 is set in this shell -- unset it to re-enable)");
+    }
+
     println!("\nAll checks passed.");
     Ok(())
 }

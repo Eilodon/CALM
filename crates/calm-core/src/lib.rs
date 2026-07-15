@@ -7,6 +7,7 @@ pub mod fitness;
 pub mod format;
 pub mod gitignore;
 pub mod graph;
+pub mod hooks;
 pub mod indexer;
 #[cfg(feature = "lsp-overlay")]
 pub mod lsp;

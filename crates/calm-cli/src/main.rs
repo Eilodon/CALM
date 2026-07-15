@@ -122,6 +122,19 @@ enum Commands {
         /// always safe without `--force` — see `write_agents_md_block`).
         #[arg(long)]
         force: bool,
+        /// Scaffold a generic Claude Code hook (`.claude/hooks/calm-hooks.sh`,
+        /// wired into `.claude/settings.json`) nudging toward `edit_context`
+        /// before native `Edit`/`Write` and `diff_impact` before commit/push.
+        /// Off by default — `calm init` alone never touches hooks. Bare
+        /// `--hooks` means `nudge` (advisory only, never blocks — this is
+        /// the mechanism's own shadow-mode-equivalent trial). `--hooks=enforce`
+        /// upgrades specific gates to a hard `exit 2` deny — best-effort
+        /// defense-in-depth, NOT a security boundary (see the scaffolded
+        /// script's own header comment for the exact bypass this cannot
+        /// close). `--hooks=off` cleanly removes everything this wrote.
+        /// See `calm doctor` to check the actually-active state at any time.
+        #[arg(long, num_args = 0..=1, default_missing_value = "nudge")]
+        hooks: Option<String>,
     },
     /// Write MCP client config (.mcp.json, .cursor/mcp.json,
     /// .vscode/mcp.json) pointing at this binary, so an external project
@@ -647,6 +660,7 @@ async fn main() -> Result<()> {
             project_root,
             agents_md,
             force,
+            hooks,
         } => {
             let root = if project_root.exists() {
                 std::fs::canonicalize(&project_root)?
@@ -673,6 +687,11 @@ async fn main() -> Result<()> {
                 }
             }
 
+            if let Some(mode_str) = hooks
+                && let Err(e) = apply_hooks_flag(&root, &mode_str)
+            {
+                println!("hooks: skipped ({e})");
+            }
             println!();
             println!("Next steps:");
             println!(
@@ -916,6 +935,91 @@ fn write_agents_md_block(root: &std::path::Path, force: bool) -> Result<&'static
             "AGENTS.md has an unexpected number of calm:workflow markers (start={start_count}, end={end_count}) \u{2014} leaving it untouched, this needs a manual fix, not --force"
         ),
     }
+}
+
+/// Applies `calm init --hooks[=MODE]` end to end: validates `mode_str`,
+/// scaffolds `.claude/hooks/calm-hooks.sh` (for `nudge`/`enforce`) or
+/// removes everything this command previously wrote (for `off`), writes
+/// `.calm/hooks.mode`, merges/removes the `.claude/settings.json` block,
+/// and prints exactly what changed plus the current mode transition —
+/// satisfying the "never silent" requirement from
+/// docs/superskills/specs/2026-07-15-calm-hooks-transparent-reactivation.md
+/// at the one point a human is guaranteed to see output: the command they
+/// just ran.
+fn apply_hooks_flag(root: &std::path::Path, mode_str: &str) -> Result<()> {
+    use calm_core::hooks::{
+        self, HooksMode, CLAUDE_SETTINGS_REL_PATH, HOOKS_SCRIPT, HOOKS_SCRIPT_REL_PATH,
+    };
+
+    let mode = HooksMode::parse(mode_str).ok_or_else(|| {
+        anyhow::anyhow!(
+            "unrecognized --hooks value {mode_str:?} — expected one of: nudge, enforce, off"
+        )
+    })?;
+
+    let calm_dir = root.join(".calm");
+    let previous_mode = hooks::read_hooks_mode_file(&calm_dir);
+    let settings_path = root.join(CLAUDE_SETTINGS_REL_PATH);
+    let script_path = root.join(HOOKS_SCRIPT_REL_PATH);
+
+    if mode == HooksMode::Off {
+        let mode_removed = hooks::remove_hooks_mode_file(&calm_dir)?;
+        let block_action = hooks::remove_hooks_settings_block(&settings_path)?;
+        let script_removed = if script_path.exists() {
+            std::fs::remove_file(&script_path)?;
+            true
+        } else {
+            false
+        };
+        println!("hooks: {previous_mode} -> off");
+        println!("  .calm/hooks.mode: {}", if mode_removed { "removed" } else { "was already absent" });
+        println!("  {CLAUDE_SETTINGS_REL_PATH}: {block_action}");
+        println!(
+            "  {HOOKS_SCRIPT_REL_PATH}: {}",
+            if script_removed { "removed" } else { "was already absent" }
+        );
+        return Ok(());
+    }
+
+    if let Some(parent) = script_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&script_path, HOOKS_SCRIPT)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))?;
+    }
+
+    hooks::write_hooks_mode_file(&calm_dir, mode, calm_core::BUILD_INFO)?;
+    let block_action = hooks::write_hooks_settings_block(&settings_path)?;
+
+    println!("hooks: {previous_mode} -> {mode}");
+    println!("  wrote {HOOKS_SCRIPT_REL_PATH}");
+    println!("  {CLAUDE_SETTINGS_REL_PATH}: {block_action}");
+    println!();
+    if mode == HooksMode::Nudge {
+        println!(
+            "  Advisory only — never blocks a tool call. This is the mechanism's own \
+             shadow-mode trial: watch it fire for a while before opting into `--hooks=enforce`."
+        );
+    } else {
+        println!(
+            "  \u{26a0} best-effort defense-in-depth, NOT a security boundary. Any process with \
+             normal write access to this repo (including the agent this is meant to nudge) can \
+             disable it with one write to .calm/hooks.mode, by deleting {HOOKS_SCRIPT_REL_PATH}, \
+             or by editing {CLAUDE_SETTINGS_REL_PATH} \u{2014} true of every Claude Code hook, not \
+             specific to CALM. A downgrade is never silent: it's logged to .calm/audit.log and \
+             surfaced on the next tool call, but it cannot be prevented. Use this to catch honest \
+             mistakes, not to constrain an actively evading agent."
+        );
+    }
+    println!("  Check the actually-active state any time with `calm doctor`.");
+    println!(
+        "  Change mode with `calm init --hooks=nudge|enforce|off`; `CALM_HOOKS_DISABLE=1` \
+         disables it for one shell session with no file changes."
+    );
+    Ok(())
 }
 
 /// Manual MCP config snippet for clients that only read a global (not
