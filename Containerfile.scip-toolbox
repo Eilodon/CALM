@@ -1,0 +1,125 @@
+# SCIP toolchain sidecar — bundles the heavy, multi-toolchain external
+# indexers that give the most bootstrap friction on a bare dev machine or CI
+# runner: `scip-java` (needs a JDK + Maven/Gradle + coursier), `scip-dotnet`
+# (needs a .NET SDK), and `scip-php` (needs PHP + Composer, plus a source
+# workaround — see below). Mirrors Sourcegraph's own precedent for scip-java
+# itself, whose docs recommend a Docker image over a bare-metal install for
+# exactly this reason (`sourcegraph/scip-java`, JDK 11/17/21 preinstalled) —
+# see docs/architecture.md and the 2026-07-15 research pass that identified
+# this as one lever for closing CALM's "SCIP available: false locally" gap
+# (a code-complete provider with no binary on PATH, not a CALM-side gap).
+#
+# NOT part of the release `Containerfile` (that one ships the `calm` binary
+# itself, `scratch`-based, no toolchains at all) — this is an optional,
+# separate sidecar image a user or CI job can run `scip-java`/`scip-dotnet`/
+# `scip-php` inside, then hand the resulting `.scip` file to `calm index
+# --scip-file`, or mount a project into it and run `calm scip-run` directly
+# if the `calm` binary is copied in too (left as a follow-up — see the
+# bottom of this file for why that's not done here yet).
+#
+# `scip-php` is NOT installed via `composer require` (Packagist's only
+# release, v0.0.2 from 2023, both hits a Composer security-advisory block
+# AND a separate vendor-directory crash — see `.github/workflows/
+# scip-nightly.yml`'s `scip-php` job comment for the full writeup and
+# github.com/davidrjenni/scip-php/issues/862, filed 2026-07-15). Installed
+# from source at the same pinned post-fix commit that job uses instead —
+# one source of truth for which commit is known-good, not two.
+#
+# Verified end-to-end 2026-07-15 (not guessed, not just "--help runs"): built
+# with `docker build` on a plain `ubuntu:24.04` base (the same distro
+# `ubuntu-latest` GitHub Actions runners use); `scip-java index` produced a
+# real, non-empty `index.scip` against this repo's own
+# `tests/fixtures/multi_lang_workspace/java` fixture with real occurrence
+# data for `Main#main()`/`Helper#greet()`; `scip-dotnet index` did the same
+# against `multi_lang_workspace/csharp` (`Program#Main()`/`Helper#Greet()`);
+# `scip-php` did the same against `multi_lang_workspace/php`
+# (`Helper#greet()`). One real bug found and fixed along the way (not a
+# container issue — a fixture issue everyone hitting this fixture would
+# eventually hit too): `multi_lang_workspace/java/pom.xml` had no explicit
+# `maven.compiler.source`/`target`, so Maven 3.8's super-POM default
+# (`maven-compiler-plugin` 3.1, targeting Java 5) failed outright against
+# JDK 21 ("Source option 5 is no longer supported") — fixed by pinning
+# source/target 17 in that pom.xml. Image size is ~2.2GB (JDK + Maven +
+# Gradle + .NET SDK + PHP toolchain, none of which compress well) — expected
+# for an opt-in sidecar, not something end users installing `calm` itself
+# ever pull.
+
+FROM ubuntu:24.04
+
+# ca-certificates: coursier/dotnet both fetch over HTTPS during install below.
+# openjdk-21-jdk + maven: scip-java's own runtime + build-tool requirement
+# (matches the JDK 21 already preinstalled on `ubuntu-latest`, so a project's
+# own Maven/Gradle build behaves the same inside this image as it does in
+# `scip-nightly.yml`'s `scip-java` job).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates curl unzip git openjdk-21-jdk maven gradle \
+    && rm -rf /var/lib/apt/lists/*
+
+# Coursier: the JVM ecosystem's package manager, used here only to `cs
+# bootstrap` scip-java's Maven Central artifact into a runnable launcher —
+# the same artifact `scip-nightly.yml`'s hand-rolled Maven-classpath script
+# resolves, but coursier's `bootstrap` command does this in one line since,
+# unlike a bare GitHub Actions runner, this image is allowed to depend on
+# coursier being installed at all.
+ARG COURSIER_VERSION=v2.1.24
+RUN curl -sSfL -o /usr/local/bin/cs.gz \
+        "https://github.com/coursier/coursier/releases/download/${COURSIER_VERSION}/cs-x86_64-pc-linux-static.gz" \
+    && gunzip /usr/local/bin/cs.gz \
+    && chmod +x /usr/local/bin/cs
+
+ARG SCIP_JAVA_VERSION=0.10.4
+# `cs bootstrap` can't auto-detect a main class from this jar's manifest
+# (confirmed live: "Cannot find default main class") — `com.sourcegraph.
+# scip_java.ScipJava` is the exact class `scip-nightly.yml`'s own
+# hand-rolled classpath wrapper script already invokes, reused here.
+RUN cs bootstrap "com.sourcegraph:scip-java_2.13:${SCIP_JAVA_VERSION}" \
+        --main-class com.sourcegraph.scip_java.ScipJava \
+        -o /usr/local/bin/scip-java --force
+
+# .NET SDK — Microsoft's official install script (no `apt` feed needed,
+# works identically across Debian/Ubuntu releases). `scip-dotnet` is then a
+# plain `dotnet tool install --global`, matching `scip-nightly.yml`'s
+# `scip-csharp` job exactly.
+RUN curl -sSfL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh \
+    && bash /tmp/dotnet-install.sh --channel LTS --install-dir /usr/local/dotnet \
+    && rm /tmp/dotnet-install.sh
+ENV PATH="/usr/local/dotnet:/root/.dotnet/tools:${PATH}"
+ENV DOTNET_ROOT="/usr/local/dotnet"
+RUN dotnet tool install --global scip-dotnet
+
+# PHP + Composer, then `scip-php` from source at the same pinned commit
+# `scip-nightly.yml`'s `scip-php` job uses — see the top-of-file comment and
+# that job's own comment for why (Packagist's v0.0.2 both trips a Composer
+# advisory block and crashes with a separate, since-fixed-upstream vendor-
+# directory bug). Wrapped the same way: a thin PATH launcher, not a symlink
+# (scip-php resolves paths relative to its own real script location).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends php-cli php-mbstring php-xml unzip \
+    && rm -rf /var/lib/apt/lists/*
+RUN curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
+ARG SCIP_PHP_COMMIT=71a5b117ec4c5dd2af302e363410e604e5df309e
+RUN git clone https://github.com/davidrjenni/scip-php /opt/scip-php-src \
+    && git -C /opt/scip-php-src checkout --quiet "${SCIP_PHP_COMMIT}" \
+    && composer install --no-interaction --no-dev --working-dir=/opt/scip-php-src \
+    && printf '#!/usr/bin/env bash\nexec php /opt/scip-php-src/bin/scip-php "$@"\n' \
+        > /usr/local/bin/scip-php \
+    && chmod +x /usr/local/bin/scip-php
+
+WORKDIR /project
+ENTRYPOINT ["/bin/bash"]
+
+# Follow-ups deliberately left for a future session, not done here:
+# - Copy the `calm` binary in and set an entrypoint that runs `calm
+#   scip-run --lang java,csharp,php` directly against /project, instead of
+#   just providing the indexer binaries for a caller to invoke by hand —
+#   needs a decision on which `calm` build (musl static binary from the
+#   release `Containerfile`?) to reuse, not a new one to compile here.
+# - Add C/C++ (`scip-clang`, a plain platform binary download, no JVM/.NET
+#   toolchain needed) and Ruby (`scip-ruby`, same shape) if a single combined
+#   toolbox ever becomes worth it over calling `curl` for those two directly
+#   (they need no heavy toolchain, which is the whole reason this image
+#   exists for java/csharp/php and not for them).
+# - Bump `SCIP_PHP_COMMIT` (here and in `scip-nightly.yml`, keep them in
+#   sync) once upstream cuts a real release per issue #862, then switch both
+#   back to a normal `composer require`.
