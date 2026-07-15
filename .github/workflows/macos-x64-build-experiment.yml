@@ -30,19 +30,30 @@ name: macOS x64 build experiment (probe, not release)
 # toolchain problem — so the prior expectation here is "probably fine," but
 # untested until this runs. Run with:
 #   gh workflow run macos-x64-build-experiment.yml
-# If this goes green, promote x86_64-apple-darwin into release.yml's matrix
-# as a `cross: false` entry on the existing `macos-14` job (NOT a new
-# `macos-15-intel` job — see above) and add an
-# @eilodon/calm-mcp-darwin-x64 npm platform package (see docs/mcp-client-setup.md
-# and npm/README.md for the existing pattern the 3 shipped platforms follow).
+#
+# RESULT (2026-07-15, run #29437245454): the C-dependency cross-arch question
+# above is answered — build succeeds, the binary runs correctly under
+# Rosetta, and a real `calm serve` session fully indexes this repo (3372
+# symbols, 6390 code chunks, SCIP overlays) with no cross-arch anomalies.
+# x86_64-apple-darwin's build/run feasibility is proven; promoted into
+# release.yml's matrix on that basis (`cross: false` on the existing
+# `macos-14` job, NOT a new `macos-15-intel` job — see above) alongside an
+# @eilodon/calm-mcp-darwin-x64 npm platform package.
+#
+# OPEN, SEPARATE FINDING: the SIGTERM smoke test below did not observe the
+# process exit within 15s of SIGTERM in two consecutive runs, with no
+# "Received SIGTERM" ever appearing in its own log — i.e. graceful shutdown
+# time on this exact CI environment is unconfirmed, not merely slow. Because
+# this exercises the same `#[cfg(unix)]` SIGTERM-handling code path already
+# shipping in the aarch64-apple-darwin binary (lib.rs `bootstrap`), this is
+# either a Rosetta/cross-arch-specific signal-delivery quirk of this CI
+# runner, or a pre-existing macOS-wide gap unrelated to x64 specifically —
+# not yet disambiguated. Does not block build/run distribution above; does
+# block treating graceful-shutdown-under-SIGTERM as verified on macOS.
+# Follow-up: reproduce on real Apple hardware (native, no Rosetta) before
+# closing this out.
 on:
   workflow_dispatch:
-  # TEMPORARY, removed before merge: a brand-new workflow_dispatch workflow
-  # only becomes dispatchable once it exists on the default branch, so this
-  # branch-scoped push trigger is the only way to test it pre-merge. Revert
-  # to workflow_dispatch-only once this probe has gone green.
-  push:
-    branches: [feat/windows-macos-x64-distribution]
 
 jobs:
   probe:
