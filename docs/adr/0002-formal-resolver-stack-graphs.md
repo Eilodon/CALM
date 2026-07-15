@@ -81,3 +81,31 @@ Both resolved during implementation, closing the open questions from Update (202
 `load_javascript` (`crates/calm-core/src/resolver/formal.rs:425`, 2026-07-04) and `load_java`
 (`formal.rs:451`, 2026-07-06). See `test_resolve_file_resolves_java_builtins` and the JS/TS
 equivalents in the same test module for what specifically got verified working, not just compiling.
+
+## Update (2026-07-15): forked upstream ahead of a critical bug, not after one
+
+The Consequences section above said "if critical bugs surface, we fork" — that was written as a
+reactive contingency. Acting on it proactively instead: `github/stack-graphs` (the single monorepo
+backing all 6 crates this project depends on — `stack-graphs`, `tree-sitter-stack-graphs`, and the
+`-python`/`-typescript`/`-java`/`-javascript` language bindings, confirmed via each crate's own
+`repository` field on crates.io, not assumed) is forked to
+[`Eilodon/stack-graphs`](https://github.com/Eilodon/stack-graphs).
+
+What this does and doesn't change:
+- **Doesn't change the build.** `Cargo.lock` still resolves all 6 crates from crates.io
+  (`source = "registry+..."`), pinned at `stack-graphs 0.14.1` / `tree-sitter-stack-graphs 0.10.0` /
+  `-python 0.3.0` / `-typescript 0.4.0` / `-java 0.5.0` / `-javascript 0.3.0`. crates.io doesn't
+  delete published versions the way GitHub can delete or hide a repo, so the exact versions this
+  project ships on are not at near-term risk regardless of the fork — this isn't "vendoring because
+  the build would break tomorrow otherwise."
+- **Does close two residual risks the Consequences section flagged but didn't act on**: (a) if a
+  critical bug surfaces in the future, there is no upstream maintainer left to accept a PR against —
+  a fork under this org's control is the only path to ever actually fixing it, and now that path
+  exists before it's urgently needed instead of being improvised under pressure; (b) an archived
+  repo can still eventually be deleted or transferred by its owner (rare, but not impossible) — a
+  fork is a permanent, independently-controlled copy of the exact source these crates were built
+  from, taken while it was still reachable.
+- **No patches applied.** This is a plain fork of upstream's last state (pushed 2025-09-09, matching
+  the archive date) — insurance, not a maintenance takeover. If a real bug is ever found, that's the
+  point where this fork starts receiving actual commits (pinned via a `[patch.crates-io]` or a git
+  dependency override at that time, not now).

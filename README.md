@@ -3,7 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![CI](https://github.com/Eilodon/CALM/actions/workflows/ci.yml/badge.svg)](https://github.com/Eilodon/CALM/actions/workflows/ci.yml)
 [![npm](https://img.shields.io/npm/v/%40eilodon%2Fcalm-mcp?label=npm)](https://www.npmjs.com/package/@eilodon/calm-mcp)
-![Languages](https://img.shields.io/badge/languages-24%20parsed%20%C2%B7%206%20call--graph%20%C2%B7%2012%20formal--verified-informational)
+![Languages](https://img.shields.io/badge/languages-24%20parsed%20%C2%B7%2013%20call--graph%20by%20default%20%C2%B7%2012%20formal--verified-informational)
 
 **A live, graph-verified map of your codebase — so an AI coding agent can edit with its eyes open instead of grepping in the dark.**
 
@@ -39,7 +39,7 @@ CALM stands for **Coding Agent Liveness Map**. *Liveness*, because the map is ne
 
 ## What you get
 
-- **Your agent stops guessing who depends on what.** `callers`/`callees`/`edit_context` show every real caller before a change ships — full `tree-sitter` call graphs for 6 languages (Python, TypeScript, JavaScript, Java, Rust, Go), plus call-graph coverage for 17 more behind opt-in grammar features (24 languages parsed in total; see [multi-tier indexing](docs/architecture.md#multi-tier-indexing)).
+- **Your agent stops guessing who depends on what.** `callers`/`callees`/`edit_context` show every real caller before a change ships — full `tree-sitter` call graphs for **13 languages out of the box** (Python, TypeScript, JavaScript, Java, Rust, Go — zero-config Tier-0 — plus C, C++, C#, Ruby, PHP, Shell, and R, on by default via the `tier0-5` grammar bundle), plus call-graph coverage for 11 more (Kotlin, Swift, Scala, Dart, Lua, Elixir, Haskell, OCaml, Zig, PowerShell, Groovy) behind an opt-in `--features lang-X` flag not compiled into the shipped binary — those fall back to a regex/line-scan symbol extractor with no call graph until you build with that flag (24 languages parsed in total; see [multi-tier indexing](docs/architecture.md#multi-tier-indexing)).
 - **Edits that can't silently break things.** Every write is hash-verified against the exact line range, syntax-checked before it ever touches disk, and hub/high-fan-in symbols hard-refuse without an explicit `confirm:true` — a policy only a tool with a real dependency graph can enforce. Proven, not just claimed — in benchmark runs against several established open-source MCP servers, that gate refused an unconfirmed edit to a verified hub symbol when not every tool tested had an equivalent one. See [Measured against the tools that came before it](#measured-against-the-tools-that-came-before-it).
 - **When your compiler can double-check the graph, CALM asks it to.** SCIP overlays (`rust-analyzer`, `scip-go` — including multi-module `go.work` workspaces — `scip-python`, `scip-ruby`, and more) and live LSP overlays (`gopls`, `clangd`) upgrade "best guess" edges to formally verified ones across 12 languages, with zero behavior change on a machine that doesn't have the toolchain installed.
 - **Memory that survives a restart.** `remember`/`recall` keep architecture decisions and gotchas around across sessions instead of making the agent re-derive them from scratch every time.
@@ -56,7 +56,7 @@ CALM stands for **Coding Agent Liveness Map**. *Liveness*, because the map is ne
 
 **Hard safety gates before risky edits**, and **memory that survives a session restart**, are the two things CALM is built around as a result. Reality turned out more nuanced than "notably absent" — at least one predecessor (Serena) already had working cross-session memory, which was a genuinely useful reference point while designing CALM's own `remember`/`recall` — but the pre-edit safety-gate gap held up in CALM's own testing, and closing it is the part of CALM's design most distinctly its own (see [Measured against the tools that came before it](#measured-against-the-tools-that-came-before-it) below).
 
-The trade-off is honest, not hidden: CALM's full-call-graph tier is still 6 languages, not the 40+ some pure-LSP tools reach out of the box — but tree-sitter parsing itself now spans 24 languages, and 12 of those have a formal- or LSP-verified upgrade path wired, so that gap is narrower than it used to be. What doesn't change is the differentiation underneath: confidence-graded edges, hard pre-edit gates, durable memory, and a codebase that grades its own health — each backed by a number you can reproduce yourself, not just a claim (see [Proof, not promises](#proof-not-promises) below).
+The trade-off is honest, not hidden: CALM's full-call-graph tier out of the box is 13 languages, not the 40+ some pure-LSP tools reach — but tree-sitter parsing itself now spans 24 languages (11 more behind a build-time flag), and 12 of those have a formal- or LSP-verified upgrade path wired, so that gap is narrower than it used to be. What doesn't change is the differentiation underneath: confidence-graded edges, hard pre-edit gates, durable memory, and a codebase that grades its own health — each backed by a number you can reproduce yourself, not just a claim (see [Proof, not promises](#proof-not-promises) below).
 
 ### Is CALM the right fit?
 
