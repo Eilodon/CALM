@@ -76,6 +76,12 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      # Needed by attest-build-provenance below: `id-token` to mint the
+      # Sigstore/Fulcio OIDC signing cert (same keyless mechanism the
+      # `docker` job's cosign step already uses), `attestations` to publish
+      # the resulting attestation to this repo's attestation store.
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -85,6 +91,25 @@ jobs:
       - name: Generate checksums
         working-directory: dist
         run: sha256sum calm-*.tar.gz > SHA256SUMS
+
+      # GitHub-native build provenance for the binary tarballs — previously
+      # only SHA256-checksummed (integrity against transfer corruption, not
+      # authenticity) while the `docker` job's container image alone got a
+      # real cosign signature (identity/authenticity). This closes that gap
+      # cheaply: no key management, verifiable by any user via `gh
+      # attestation verify calm-<target>.tar.gz --owner ${{ github.repository_owner }}`.
+      # Complements rather than replaces the `docker` job's cosign signing —
+      # provenance attestation proves "built by this exact workflow run from
+      # this commit", cosign proves "signed by this identity"; 2025 guidance
+      # (github.blog/changelog, sigstore.dev) treats these as layered, not
+      # redundant. Deliberately not extended to the container image too:
+      # cosign's signature already has the widest adoption in that ecosystem
+      # (Kubernetes admission controllers, etc.) and doubling up there isn't
+      # this pass's scope.
+      - name: Attest build provenance for release binaries
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: "dist/calm-*.tar.gz"
 
       - name: Publish release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
