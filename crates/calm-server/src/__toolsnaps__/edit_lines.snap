@@ -1,6 +1,6 @@
 {
   "name": "edit_lines",
-  "description": "The only write-capable tool in ci — line-range granularity, works on ANY tracked file (source code, Cargo.toml, docs — not just parsed symbols). NOT FOR: symbol-scoped edits with auto-resolved range (use edit_symbol). Requires expected_hash from a prior call's current_hash (or edit_context's range_checksum for a whole symbol); omit it to preview a range's hash/content without writing anything. All hunks in one call apply to the same file and must be disjoint (non-overlapping).",
+  "description": "The only write-capable tool in ci — line-range granularity, works on ANY tracked file (source code, Cargo.toml, docs — not just parsed symbols). NOT FOR: symbol-scoped edits with auto-resolved range (use edit_symbol). Requires expected_hash from a prior call's current_hash (or edit_context's range_checksum for a whole symbol); omit it to preview a range's hash/content without writing anything. Alternative to expected_hash: set old_text on a hunk instead — replaces its one occurrence within [start_line, end_line] with no hash needed and no preview round trip (fixes the common 'read a wide range for context, then edit one narrow line inside it' case: keep [start_line, end_line] as the wide range you already read, old_text pins the exact spot). All hunks in one call apply to the same file and must be disjoint (non-overlapping).",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "$defs": {
@@ -18,7 +18,14 @@
             "format": "int64"
           },
           "expected_hash": {
-            "description": "Hash of this range's current content — from a prior call's\n`current_hash`, or `edit_context`'s `range_checksum` when the range\nis exactly a whole symbol. Omit to preview instead of writing: the\nresponse still reports `current_hash`/`old_text` for this range, so\na first call can learn the hash before a real edit.",
+            "description": "Hash of this range's current content — from a prior call's\n`current_hash`, or `edit_context`'s `range_checksum` when the range\nis exactly a whole symbol. Omit to preview instead of writing: the\nresponse still reports `current_hash`/`old_text` for this range, so\na first call can learn the hash before a real edit. Ignored when\n`old_text` is set.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "old_text": {
+            "description": "Small-text-match mode: when set, `new_text` replaces the FIRST (and\nrequired-to-be-only) occurrence of `old_text` found within\n`[start_line, end_line]`, instead of requiring `expected_hash` for\nthat exact sub-range. No hash needed and no preview round trip —\nthe server reads the file's live content to find the match, so\nstaleness is impossible by construction, same guarantee\n`edit_symbol`'s own `old_text` mode already provides for a resolved\nsymbol range. The intended fix for the common \"read a wide range for\ncontext, then edit one narrow line inside it\" case: `[start_line,\nend_line]` can stay exactly the wide range just read (no new hash\nneeded for it either — this mode doesn't check one), while\n`old_text` pins down the one exact spot to change. Refused with\n`MATCH_NOT_FOUND`/`AMBIGUOUS_MATCH` if the text isn't found exactly\nonce in that window.",
             "type": [
               "string",
               "null"

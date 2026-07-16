@@ -1,6 +1,6 @@
 {
   "name": "calm",
-  "description": "CALM (Coding Agent Liveness Map) MCP server — call-graph-aware locate/source/edit_symbol/diff_impact and 22 tools total, backed by a multi-tier resolver (syntactic -> Stack Graphs -> SCIP) instead of grep.",
+  "description": "CALM (Coding Agent Liveness Map) MCP server — call-graph-aware locate/source/edit_symbol/diff_impact and 29 tools total, backed by a multi-tier resolver (syntactic -> Stack Graphs -> SCIP) instead of grep. Bundles a SessionStart bootstrap (scaffolds the CALM tool-workflow hook + AGENTS.md into your project on first use, via `calm init --hooks --agents-md`) and a calm-guide Skill.",
   "version": "0.1.5",
   "author": {
     "name": "Eilodon"

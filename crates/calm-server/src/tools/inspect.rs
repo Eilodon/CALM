@@ -280,7 +280,7 @@ impl CalmServer {
         let token_estimate = estimate_tokens(&rendered);
         let sn = self.filter_sn(suggested_with_args(
             "edit_lines",
-            "Range read — edit this window directly (etag is the expected_hash)",
+            "Range read — edit this window directly (etag is the expected_hash; or set old_text on a hunk to skip the hash entirely and edit narrower than this window)",
             serde_json::json!({ "path": path }),
         ));
         ResolvedOutcome::success(SourceOutput {

@@ -613,13 +613,21 @@ impl CalmServer {
             // attempted" proves nothing about whether the diff was actually
             // analyzed.
             self.clear_written_files();
+            let note = calm_core::analysis::diff_impact::any_compile_checkable_file(&files_changed)
+                .then(|| {
+                    "aggregate_risk reflects call-graph blast radius and edit-time syntax \
+                     checks only — it does not run a build or test suite. files_changed \
+                     includes Rust/Go/TypeScript source; confirm this project's own build/tests \
+                     (e.g. cargo test, go build, tsc --noEmit) still pass before committing"
+                        .to_string()
+                });
             ToolOutcome::success(DiffImpactOutput {
                 files_changed,
                 affected_symbols,
                 unindexed_files,
                 aggregate_risk,
                 suggested_reviewers,
-                note: None,
+                note,
                 suggested_next: self.filter_sn(sn),
             })
         }))

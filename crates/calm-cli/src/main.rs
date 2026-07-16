@@ -90,6 +90,17 @@ enum Commands {
         /// Project root directory
         #[arg(long, default_value = ".")]
         project_root: PathBuf,
+        /// Self-heal a configured-but-not-active hooks install (entrypoint
+        /// missing — e.g. the project directory was moved/renamed since
+        /// `calm init --hooks` last ran, or the npm-resolved binary path
+        /// changed) by re-running the equivalent of `calm init
+        /// --hooks=<current mode>` with this binary's own current path.
+        /// Never touches an explicit `--hooks=off`, and never changes
+        /// nudge<->enforce — only repairs a stale/missing entrypoint for
+        /// whichever mode is already configured. A no-op (prints the same
+        /// report as without this flag) when nothing needs fixing.
+        #[arg(long)]
+        fix: bool,
     },
     /// Check codebase fitness against thresholds (exits 1 if any threshold exceeded)
     FitnessCheck {
@@ -180,6 +191,19 @@ enum Commands {
     ScipDump {
         /// Path to the .scip file produced by `rust-analyzer scip`
         scip_path: PathBuf,
+    },
+    /// PreToolUse/PostToolUse hook backend, invoked by `.claude/settings.json`
+    /// exec-form wiring (`calm init --hooks` scaffolds this automatically) —
+    /// not meant to be run by hand. Reads one Claude Code hook JSON payload
+    /// from stdin, decides allow/nudge/deny per `calm_core::hooks_check`,
+    /// and reports the result via exit code (0 = allow/nudge, 2 = deny) plus
+    /// an optional stderr message — see that module for the full contract,
+    /// including its fail-open guarantee on malformed stdin.
+    #[command(hide = true)]
+    HooksCheck {
+        /// Project root directory this hook call is scoped to.
+        #[arg(long, default_value = ".")]
+        project_root: PathBuf,
     },
 }
 
@@ -527,8 +551,19 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Commands::Doctor { project_root } => {
+        Commands::Doctor { project_root, fix } => {
             let root = std::fs::canonicalize(&project_root)?;
+            if fix {
+                let calm_dir = root.join(".calm");
+                let mode = calm_core::hooks::read_hooks_mode_file(&calm_dir);
+                if mode == calm_core::hooks::HooksMode::Off {
+                    println!("hooks: off — nothing to fix (run `calm init --hooks=nudge|enforce` to turn it on)\n");
+                } else if let Err(e) = apply_hooks_flag(&root, mode.as_str()) {
+                    println!("hooks: --fix failed: {e}\n");
+                } else {
+                    println!();
+                }
+            }
             calm_server::doctor(&root)?;
         }
         Commands::FitnessCheck {
@@ -755,6 +790,12 @@ async fn main() -> Result<()> {
             };
             println!("{snippet}");
         }
+        Commands::HooksCheck { project_root } => {
+            let root = std::fs::canonicalize(&project_root).unwrap_or(project_root);
+            let code =
+                calm_core::hooks_check::run(std::io::stdin(), std::io::stderr(), &root);
+            std::process::exit(code);
+        }
     }
 
     Ok(())
@@ -947,9 +988,7 @@ fn write_agents_md_block(root: &std::path::Path, force: bool) -> Result<&'static
 /// at the one point a human is guaranteed to see output: the command they
 /// just ran.
 fn apply_hooks_flag(root: &std::path::Path, mode_str: &str) -> Result<()> {
-    use calm_core::hooks::{
-        self, CLAUDE_SETTINGS_REL_PATH, HOOKS_SCRIPT, HOOKS_SCRIPT_REL_PATH, HooksMode,
-    };
+    use calm_core::hooks::{self, CLAUDE_SETTINGS_REL_PATH, HOOKS_SCRIPT_REL_PATH, HooksMode};
 
     let mode = HooksMode::parse(mode_str).ok_or_else(|| {
         anyhow::anyhow!(
@@ -960,13 +999,16 @@ fn apply_hooks_flag(root: &std::path::Path, mode_str: &str) -> Result<()> {
     let calm_dir = root.join(".calm");
     let previous_mode = hooks::read_hooks_mode_file(&calm_dir);
     let settings_path = root.join(CLAUDE_SETTINGS_REL_PATH);
-    let script_path = root.join(HOOKS_SCRIPT_REL_PATH);
+    let legacy_script_path = root.join(HOOKS_SCRIPT_REL_PATH);
 
     if mode == HooksMode::Off {
         let mode_removed = hooks::remove_hooks_mode_file(&calm_dir)?;
         let block_action = hooks::remove_hooks_settings_block(&settings_path)?;
-        let script_removed = if script_path.exists() {
-            std::fs::remove_file(&script_path)?;
+        // Cleans up a pre-2026-07-16 legacy install's script file too, if
+        // present — a fresh install never writes one (see below), so this
+        // is a no-op there.
+        let script_removed = if legacy_script_path.exists() {
+            std::fs::remove_file(&legacy_script_path)?;
             true
         } else {
             false
@@ -992,21 +1034,21 @@ fn apply_hooks_flag(root: &std::path::Path, mode_str: &str) -> Result<()> {
         return Ok(());
     }
 
-    if let Some(parent) = script_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&script_path, HOOKS_SCRIPT)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))?;
-    }
+    // Exec-form entrypoint: the exact binary running THIS `calm init
+    // --hooks` invocation is guaranteed to exist and work right now — no
+    // PATH/npx resolution ambiguity, no bash/jq/sqlite3-CLI/flock
+    // dependency (see docs/superskills/specs/2026-07-16-calm-hooks-
+    // native-cli-subcommand.md). No script file is scaffolded for a fresh
+    // install; `write_hooks_settings_block` atomically swaps away any
+    // legacy shell-form block a prior version of this command left behind.
+    let bin_path = std::env::current_exe()?;
+    let bin_str = bin_path.to_string_lossy().into_owned();
 
     hooks::write_hooks_mode_file(&calm_dir, mode, calm_core::BUILD_INFO)?;
-    let block_action = hooks::write_hooks_settings_block(&settings_path)?;
+    let block_action = hooks::write_hooks_settings_block(&settings_path, &bin_str)?;
 
     println!("hooks: {previous_mode} -> {mode}");
-    println!("  wrote {HOOKS_SCRIPT_REL_PATH}");
+    println!("  entrypoint: {bin_str} hooks-check");
     println!("  {CLAUDE_SETTINGS_REL_PATH}: {block_action}");
     println!();
     if mode == HooksMode::Nudge {
@@ -1018,11 +1060,11 @@ fn apply_hooks_flag(root: &std::path::Path, mode_str: &str) -> Result<()> {
         println!(
             "  \u{26a0} best-effort defense-in-depth, NOT a security boundary. Any process with \
              normal write access to this repo (including the agent this is meant to nudge) can \
-             disable it with one write to .calm/hooks.mode, by deleting {HOOKS_SCRIPT_REL_PATH}, \
-             or by editing {CLAUDE_SETTINGS_REL_PATH} \u{2014} true of every Claude Code hook, not \
-             specific to CALM. A downgrade is never silent: it's logged to .calm/audit.log and \
-             surfaced on the next tool call, but it cannot be prevented. Use this to catch honest \
-             mistakes, not to constrain an actively evading agent."
+             disable it with one write to .calm/hooks.mode, or by editing \
+             {CLAUDE_SETTINGS_REL_PATH} — true of every Claude Code hook, not specific to CALM. \
+             A downgrade is never silent: it's logged to .calm/audit.log and surfaced on the \
+             next tool call, but it cannot be prevented. Use this to catch honest mistakes, not \
+             to constrain an actively evading agent."
         );
     }
     println!("  Check the actually-active state any time with `calm doctor`.");

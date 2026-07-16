@@ -13,25 +13,41 @@ use anyhow::{Context, Result};
 
 /// The hook script content, embedded verbatim from the canonical source
 /// file so it stays directly shellcheck'able/testable in this repo rather
-/// than living only as a Rust string literal — see
-/// `assets/hooks/calm-hooks.sh`.
+/// than living only as a Rust string literal — see `assets/hooks/calm-
+/// hooks.sh`. Kept around for `--hooks=off` cleanup of a pre-existing
+/// legacy (shell-form) install and for anyone who still wants the bash
+/// version, but no longer written by a fresh `calm init --hooks` run —
+/// see `HOOKS_WIRE_ARGS` below.
 pub const HOOKS_SCRIPT: &str = include_str!("../assets/hooks/calm-hooks.sh");
 
-/// Exact invocation string used both to write the settings.json block and
-/// to detect/remove it later — one constant, so the installer and the
-/// detector/remover can never independently drift out of sync (the exact
-/// failure mode a hand-duplicated string in two places risks).
+/// Legacy shell-form invocation string (pre-2026-07-16) — no longer
+/// written by a fresh install, kept only to detect and clean up an
+/// existing one during migration (`block_is_calm_hook_block`) so
+/// `--hooks=enforce`/`--hooks=off` on an old install still finds and
+/// removes it by exact identity, same guarantee this constant always gave.
 pub const HOOKS_WIRE_COMMAND: &str = "bash .claude/hooks/calm-hooks.sh";
 
-/// `PreToolUse` matcher covering exactly the tool names `calm-hooks.sh`
-/// branches on — kept in sync with the script by hand (both are small and
-/// change together); a mismatch here would only widen or narrow which
-/// calls invoke an otherwise-correct script, not silently break the mode
-/// logic itself.
+/// Current (2026-07-16+) exec-form invocation: `{"command": "<path to the
+/// calm binary>", "args": HOOKS_WIRE_ARGS}` — bypasses the shell entirely,
+/// so no `jq`/`sqlite3` CLI/POSIX `flock` dependency (see
+/// `docs/superskills/specs/2026-07-16-calm-hooks-native-cli-subcommand.md`).
+/// The binary path varies per install (can't be a single constant the way
+/// the legacy command string was), so identity for idempotent-write/detect/
+/// remove purposes is keyed on `args` matching exactly instead — a
+/// binary's absolute path changing (rebuilt, moved) between runs is a
+/// legitimate self-heal case, not a "different hook" case.
+pub const HOOKS_WIRE_ARGS: &[&str] = &["hooks-check"];
+
+/// `PreToolUse` matcher covering exactly the tool names the hook branches
+/// on (both the legacy script and `hooks_check::evaluate` agree on this
+/// set) — kept in sync by hand; a mismatch here would only widen or narrow
+/// which calls invoke an otherwise-correct decision, not silently break
+/// the mode logic itself.
 pub const HOOKS_MATCHER: &str = "Edit|Write|Bash|mcp__calm__edit_context|mcp__calm__diff_impact|mcp__calm__edit_lines|mcp__calm__edit_symbol";
 
-/// Relative path to the scaffolded script inside a project, and the
-/// settings.json file it's wired into.
+/// Relative path to the legacy scaffolded script inside a project (only
+/// relevant for an old shell-form install), and the settings.json file
+/// the hook block is wired into either way.
 pub const HOOKS_SCRIPT_REL_PATH: &str = ".claude/hooks/calm-hooks.sh";
 pub const CLAUDE_SETTINGS_REL_PATH: &str = ".claude/settings.json";
 
@@ -144,15 +160,24 @@ pub fn remove_hooks_mode_file(calm_dir: &Path) -> Result<bool> {
     Ok(true)
 }
 
-/// The one-block `{matcher, hooks: [...]}` entry this module ever writes
-/// into `.claude/settings.json`'s `hooks.PreToolUse` array — same shape
-/// `write_mcp_config_entry`'s neighbors already use elsewhere in
-/// `calm-cli`, just for a different top-level key.
-fn hooks_settings_block() -> serde_json::Value {
+/// The exec-form `{matcher, hooks: [...]}` entry this module writes into
+/// `.claude/settings.json`'s `hooks.PreToolUse` array for a fresh install
+/// — `command`/`args` bypass the shell entirely (Claude Code's exec form:
+/// a command with an `args` array spawns the executable directly, no
+/// `sh -c`/Git-Bash indirection — see the sibling spec's Windows-execution
+/// research). `bin_path` is normally `std::env::current_exe()` at scaffold
+/// time (the exact binary that's running `calm init --hooks` right now is
+/// guaranteed to exist and work).
+fn hooks_settings_block(bin_path: &str) -> serde_json::Value {
     serde_json::json!({
         "matcher": HOOKS_MATCHER,
         "hooks": [
-            { "type": "command", "command": HOOKS_WIRE_COMMAND, "timeout": 5 }
+            {
+                "type": "command",
+                "command": bin_path,
+                "args": HOOKS_WIRE_ARGS,
+                "timeout": 5
+            }
         ]
     })
 }
@@ -165,18 +190,42 @@ fn block_command(block: &serde_json::Value) -> Option<&str> {
         .find_map(|h| h.get("command")?.as_str())
 }
 
+fn block_args(block: &serde_json::Value) -> Option<Vec<&str>> {
+    block
+        .get("hooks")?
+        .as_array()?
+        .iter()
+        .find_map(|h| h.get("args")?.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+}
+
+/// True for EITHER a legacy shell-form block (`command` == the old
+/// `HOOKS_WIRE_COMMAND` string) OR a current exec-form block (`args` ==
+/// `HOOKS_WIRE_ARGS`) — the one predicate write/remove/detect all share, so
+/// a stale legacy install and a stale/previous exec-form install are
+/// always recognized and cleanly swapped, never left to coexist (the
+/// sibling spec's Failure Mode 3 — dual-entrypoint transition window).
+fn block_is_calm_hook_block(block: &serde_json::Value) -> bool {
+    block_command(block) == Some(HOOKS_WIRE_COMMAND)
+        || block_args(block).as_deref() == Some(HOOKS_WIRE_ARGS)
+}
+
 /// Merges CALM's hook block into `.claude/settings.json`'s
-/// `hooks.PreToolUse` array. Never touches any other key at any level —
-/// mirrors `write_mcp_config_entry`'s own "leave everything else alone"
-/// contract, adapted for an array-of-blocks shape instead of a
-/// single-object-keyed-by-name shape (`PreToolUse`/`PostToolUse` are
-/// independent `{matcher, hooks}` blocks per Claude Code's own hooks
-/// schema — confirmed via this repo's own `.claude/settings.json` and via
-/// official docs that all matching blocks fire in parallel, not
-/// first-match-only, so appending a new block is safe regardless of what
-/// else is already there). Idempotent: a block whose `command` already
-/// equals `HOOKS_WIRE_COMMAND` means "already wired," no rewrite.
-pub fn write_hooks_settings_block(path: &Path) -> Result<&'static str> {
+/// `hooks.PreToolUse` array — atomic swap, not append: any existing calm
+/// hook block (legacy shell-form OR a previous exec-form entry with a
+/// stale binary path) is removed first, then the current exec-form block
+/// for `bin_path` is added, in the same write, so there is never a window
+/// where two calm hooks are simultaneously wired. Never touches any other
+/// key at any level — mirrors `write_mcp_config_entry`'s own "leave
+/// everything else alone" contract, adapted for an array-of-blocks shape
+/// (`PreToolUse`/`PostToolUse` are independent `{matcher, hooks}` blocks
+/// per Claude Code's own hooks schema — confirmed via this repo's own
+/// `.claude/settings.json` and via official docs that all matching blocks
+/// fire in parallel, not first-match-only, so appending a new block is
+/// safe regardless of what else is already there). Idempotent: if an
+/// existing block already has this exact `bin_path` + `HOOKS_WIRE_ARGS`,
+/// no rewrite.
+pub fn write_hooks_settings_block(path: &Path, bin_path: &str) -> Result<&'static str> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -210,23 +259,24 @@ pub fn write_hooks_settings_block(path: &Path) -> Result<&'static str> {
             )
         })?;
 
-    let already_wired = pre
-        .iter()
-        .any(|b| block_command(b) == Some(HOOKS_WIRE_COMMAND));
-    if already_wired {
+    let already_current = pre.iter().any(|b| {
+        block_command(b) == Some(bin_path) && block_args(b).as_deref() == Some(HOOKS_WIRE_ARGS)
+    });
+    if already_current {
         return Ok("up to date");
     }
 
-    pre.push(hooks_settings_block());
+    pre.retain(|b| !block_is_calm_hook_block(b));
+    pre.push(hooks_settings_block(bin_path));
     std::fs::write(path, format!("{}\n", serde_json::to_string_pretty(&root)?))?;
     Ok("wrote")
 }
 
-/// Inverse of `write_hooks_settings_block` — removes only the one block
-/// this module itself would have added (identified by the exact same
-/// `HOOKS_WIRE_COMMAND` constant), leaving every other `PreToolUse` entry
-/// and every other top-level key untouched. No-ops cleanly if the file, the
-/// `hooks`/`PreToolUse` keys, or the block itself don't exist.
+/// Inverse of `write_hooks_settings_block` — removes any calm hook block
+/// (legacy shell-form or current exec-form, via `block_is_calm_hook_block`),
+/// leaving every other `PreToolUse` entry and every other top-level key
+/// untouched. No-ops cleanly if the file, the `hooks`/`PreToolUse` keys, or
+/// the block itself don't exist.
 pub fn remove_hooks_settings_block(path: &Path) -> Result<&'static str> {
     if !path.exists() {
         return Ok("nothing to remove");
@@ -247,7 +297,7 @@ pub fn remove_hooks_settings_block(path: &Path) -> Result<&'static str> {
     };
 
     let before = pre.len();
-    pre.retain(|b| block_command(b) != Some(HOOKS_WIRE_COMMAND));
+    pre.retain(|b| !block_is_calm_hook_block(b));
     if pre.len() == before {
         return Ok("nothing to remove");
     }
@@ -258,26 +308,31 @@ pub fn remove_hooks_settings_block(path: &Path) -> Result<&'static str> {
 
 /// FM2's status cross-check: does the mode file's claim (`configured`)
 /// match what's actually wired in `.claude/settings.json`, and does the
-/// script file itself exist? Returns a `HooksStatus` with an explicit
-/// `active` flag rather than letting a caller assume "mode file present"
-/// means "actually enforced" — the specific gap the spec's audit named as
-/// worse than no feature if left unaddressed.
+/// entrypoint it points at actually exist? Returns a `HooksStatus` with an
+/// explicit `active` flag rather than letting a caller assume "mode file
+/// present" means "actually enforced" — the specific gap the spec's audit
+/// named as worse than no feature if left unaddressed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HooksStatus {
     pub configured_mode: HooksMode,
     pub settings_wired: bool,
-    pub script_present: bool,
+    /// For a current exec-form install, whether the wired block's
+    /// `command` path exists on disk right now (the binary could have
+    /// been moved/removed since scaffolding). For a legacy shell-form
+    /// install, whether `.claude/hooks/calm-hooks.sh` exists. `false` if
+    /// `settings_wired` is false (nothing to check).
+    pub entrypoint_present: bool,
     pub disabled_by_env: bool,
 }
 
 impl HooksStatus {
     /// True only when the configured mode is actually live: not `Off`,
-    /// settings.json wiring found, script file present, and the
-    /// `CALM_HOOKS_DISABLE` escape hatch isn't set in the environment.
+    /// settings.json wiring found, the entrypoint it points at present,
+    /// and the `CALM_HOOKS_DISABLE` escape hatch isn't set.
     pub fn active(&self) -> bool {
         self.configured_mode != HooksMode::Off
             && self.settings_wired
-            && self.script_present
+            && self.entrypoint_present
             && !self.disabled_by_env
     }
 
@@ -297,9 +352,9 @@ impl HooksStatus {
                 self.configured_mode, CLAUDE_SETTINGS_REL_PATH, self.configured_mode
             );
         }
-        if !self.script_present {
+        if !self.entrypoint_present {
             return format!(
-                "hooks: wiring present but {} is missing. Run `calm init --hooks={}` to reinstall.",
+                "hooks: wiring present but its entrypoint (binary, or {} for a legacy install) is missing. Run `calm init --hooks={}` to reinstall.",
                 HOOKS_SCRIPT_REL_PATH, self.configured_mode
             );
         }
@@ -314,26 +369,33 @@ pub fn check_hooks_status(project_root: &Path) -> HooksStatus {
     let calm_dir = project_root.join(".calm");
     let configured_mode = read_hooks_mode_file(&calm_dir);
     let settings_path = project_root.join(CLAUDE_SETTINGS_REL_PATH);
-    let settings_wired = std::fs::read_to_string(&settings_path)
+    let wired_block: Option<serde_json::Value> = std::fs::read_to_string(&settings_path)
         .ok()
         .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
         .and_then(|v| {
-            v.get("hooks")?.get("PreToolUse")?.as_array().map(|arr| {
-                arr.iter()
-                    .any(|b| block_command(b) == Some(HOOKS_WIRE_COMMAND))
-            })
-        })
-        .unwrap_or(false);
-    let script_present = project_root.join(HOOKS_SCRIPT_REL_PATH).is_file();
+            v.get("hooks")?
+                .get("PreToolUse")?
+                .as_array()?
+                .iter()
+                .find(|b| block_is_calm_hook_block(b))
+                .cloned()
+        });
+    let settings_wired = wired_block.is_some();
+    let entrypoint_present = match &wired_block {
+        Some(b) if block_args(b).as_deref() == Some(HOOKS_WIRE_ARGS) => block_command(b)
+            .map(|cmd| Path::new(cmd).is_file())
+            .unwrap_or(false),
+        Some(_) => project_root.join(HOOKS_SCRIPT_REL_PATH).is_file(),
+        None => false,
+    };
     let disabled_by_env = std::env::var("CALM_HOOKS_DISABLE").as_deref() == Ok("1");
     HooksStatus {
         configured_mode,
         settings_wired,
-        script_present,
+        entrypoint_present,
         disabled_by_env,
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -439,19 +501,44 @@ mod tests {
     fn settings_block_writes_new_file() {
         let dir = tmp_dir();
         let path = dir.path().join(".claude/settings.json");
-        assert_eq!(write_hooks_settings_block(&path).unwrap(), "wrote");
+        assert_eq!(
+            write_hooks_settings_block(&path, "/usr/bin/calm").unwrap(),
+            "wrote"
+        );
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains(HOOKS_WIRE_COMMAND));
+        assert!(text.contains("hooks-check"));
+        assert!(text.contains("/usr/bin/calm"));
     }
 
     #[test]
     fn settings_block_rerun_is_idempotent() {
         let dir = tmp_dir();
         let path = dir.path().join(".claude/settings.json");
-        write_hooks_settings_block(&path).unwrap();
-        assert_eq!(write_hooks_settings_block(&path).unwrap(), "up to date");
+        write_hooks_settings_block(&path, "/usr/bin/calm").unwrap();
+        assert_eq!(
+            write_hooks_settings_block(&path, "/usr/bin/calm").unwrap(),
+            "up to date"
+        );
         let text = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(text.matches(HOOKS_WIRE_COMMAND).count(), 1);
+        assert_eq!(text.matches("hooks-check").count(), 1);
+    }
+
+    #[test]
+    fn settings_block_rerun_with_a_moved_binary_self_heals_the_path() {
+        // A rebuilt/moved binary between two `calm init --hooks` runs is a
+        // legitimate self-heal case (ADR-0005's daemon.meta stale-build
+        // pattern, same shape) — not treated as "already up to date".
+        let dir = tmp_dir();
+        let path = dir.path().join(".claude/settings.json");
+        write_hooks_settings_block(&path, "/old/path/calm").unwrap();
+        assert_eq!(
+            write_hooks_settings_block(&path, "/new/path/calm").unwrap(),
+            "wrote"
+        );
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("/old/path/calm"));
+        assert!(text.contains("/new/path/calm"));
+        assert_eq!(text.matches("hooks-check").count(), 1);
     }
 
     #[test]
@@ -476,7 +563,7 @@ mod tests {
         )
         .unwrap();
 
-        write_hooks_settings_block(&path).unwrap();
+        write_hooks_settings_block(&path, "/usr/bin/calm").unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(v["permissions"]["allow"][0], "Bash(ls:*)");
@@ -500,7 +587,7 @@ mod tests {
         let path = dir.path().join(".claude/settings.json");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, "{ not valid json").unwrap();
-        assert!(write_hooks_settings_block(&path).is_err());
+        assert!(write_hooks_settings_block(&path, "/usr/bin/calm").is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ not valid json");
     }
 
@@ -518,7 +605,7 @@ mod tests {
     fn remove_settings_block_leaves_other_blocks_alone() {
         let dir = tmp_dir();
         let path = dir.path().join(".claude/settings.json");
-        write_hooks_settings_block(&path).unwrap();
+        write_hooks_settings_block(&path, "/usr/bin/calm").unwrap();
         // Add an unrelated block by hand, same array.
         let text = std::fs::read_to_string(&path).unwrap();
         let mut v: serde_json::Value = serde_json::from_str(&text).unwrap();
@@ -540,11 +627,49 @@ mod tests {
     fn remove_settings_block_twice_is_idempotent() {
         let dir = tmp_dir();
         let path = dir.path().join(".claude/settings.json");
-        write_hooks_settings_block(&path).unwrap();
+        write_hooks_settings_block(&path, "/usr/bin/calm").unwrap();
         assert_eq!(remove_hooks_settings_block(&path).unwrap(), "removed");
         assert_eq!(
             remove_hooks_settings_block(&path).unwrap(),
             "nothing to remove"
+        );
+    }
+
+    #[test]
+    fn write_settings_block_atomically_swaps_away_a_legacy_shell_form_block() {
+        // Spec FM3 (docs/superskills/specs/2026-07-16-calm-hooks-native-
+        // cli-subcommand.md): a project that scaffolded the OLD bash-
+        // script hook before this migration must never end up with BOTH
+        // the legacy shell-form block and the new exec-form block wired
+        // at once — Claude Code fires every matching PreToolUse block in
+        // parallel, so two simultaneously-wired calm hooks is a real
+        // decision-conflict risk, not just clutter.
+        let dir = tmp_dir();
+        let path = dir.path().join(".claude/settings.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "hooks": {
+                    "PreToolUse": [hooks_settings_block_legacy_for_test()]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        write_hooks_settings_block(&path, "/usr/bin/calm").unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !text.contains(HOOKS_WIRE_COMMAND),
+            "legacy block must be gone, got: {text}"
+        );
+        assert_eq!(text.matches("hooks-check").count(), 1);
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            v["hooks"]["PreToolUse"].as_array().unwrap().len(),
+            1,
+            "exactly one calm hook block after the swap, not two"
         );
     }
 
@@ -564,7 +689,7 @@ mod tests {
         let dir = tmp_dir();
         let calm_dir = dir.path().join(".calm");
         write_hooks_mode_file(&calm_dir, HooksMode::Enforce, "test").unwrap();
-        // No settings.json, no script file written.
+        // No settings.json, no entrypoint written.
         let status = check_hooks_status(dir.path());
         assert_eq!(status.configured_mode, HooksMode::Enforce);
         assert!(!status.settings_wired);
@@ -573,17 +698,52 @@ mod tests {
     }
 
     #[test]
-    fn status_active_when_mode_wiring_and_script_all_present() {
+    fn status_active_when_mode_wiring_and_binary_all_present() {
         let dir = tmp_dir();
         let calm_dir = dir.path().join(".calm");
         write_hooks_mode_file(&calm_dir, HooksMode::Enforce, "test").unwrap();
-        write_hooks_settings_block(&dir.path().join(CLAUDE_SETTINGS_REL_PATH)).unwrap();
-        let script_path = dir.path().join(HOOKS_SCRIPT_REL_PATH);
-        std::fs::create_dir_all(script_path.parent().unwrap()).unwrap();
-        std::fs::write(&script_path, HOOKS_SCRIPT).unwrap();
+        // The exec-form entrypoint check looks at whether the wired
+        // `command` path actually exists on disk — any real file works
+        // for the test, it doesn't need to be a real executable.
+        let bin_path = dir.path().join("fake-calm-binary");
+        std::fs::write(&bin_path, b"not a real binary, just needs to exist").unwrap();
+        write_hooks_settings_block(
+            &dir.path().join(CLAUDE_SETTINGS_REL_PATH),
+            bin_path.to_str().unwrap(),
+        )
+        .unwrap();
 
         let status = check_hooks_status(dir.path());
-        assert!(status.active());
+        assert!(status.active(), "status: {status:?}");
         assert_eq!(status.summary(), "hooks: enforce mode, active");
+    }
+
+    #[test]
+    fn status_not_active_when_wired_binary_path_no_longer_exists() {
+        let dir = tmp_dir();
+        let calm_dir = dir.path().join(".calm");
+        write_hooks_mode_file(&calm_dir, HooksMode::Enforce, "test").unwrap();
+        write_hooks_settings_block(
+            &dir.path().join(CLAUDE_SETTINGS_REL_PATH),
+            "/no/such/path/calm",
+        )
+        .unwrap();
+
+        let status = check_hooks_status(dir.path());
+        assert!(!status.entrypoint_present);
+        assert!(!status.active());
+    }
+
+    /// Test-only helper building a legacy shell-form block, kept separate
+    /// from `hooks_settings_block` (which only ever builds the current
+    /// exec-form shape) so the migration test above can seed a realistic
+    /// pre-2026-07-16 install without resurrecting the old code path.
+    fn hooks_settings_block_legacy_for_test() -> serde_json::Value {
+        serde_json::json!({
+            "matcher": HOOKS_MATCHER,
+            "hooks": [
+                { "type": "command", "command": HOOKS_WIRE_COMMAND, "timeout": 5 }
+            ]
+        })
     }
 }

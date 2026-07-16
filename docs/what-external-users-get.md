@@ -2,7 +2,7 @@
 
 > Tài liệu này mô tả chính xác những gì một user **cài CALM qua `npx @eilodon/calm-mcp` / npm / MCP Registry / GitHub Release** nhận được — phân biệt rõ với phần chỉ tồn tại trong môi trường dev của chính repo CALM. Mọi claim dưới đây đã được verify trực tiếp từ code (file:line), không suy từ docs/comment (những thứ này đôi khi tự thân đã lỗi thời — xem mục "Bài học phương pháp luận" ở cuối).
 >
-> **Chốt tại**: commit `f6fc973` (2026-07-15), version `0.2.0`. Có một mục ("Sắp có") mô tả tính năng đã code+test xong trong working tree phiên này nhưng **chưa commit, chưa release** — nói rõ ràng để không nhầm với những gì user hiện tại thực sự nhận được.
+> **Chốt tại**: commit `5a3d03f` (2026-07-15), version `0.3.0` — **đã tag, đã release, đã verify live** (npm, GitHub Release, MCP Registry, `npx` smoke test đều xác nhận `--hooks` hoạt động trong binary published thật). Mục 6 dưới đây mô tả tính năng này với tư cách đã ship, không còn là "sắp có".
 
 ---
 
@@ -13,7 +13,7 @@
 | Cách cài | `npx -y @eilodon/calm-mcp serve`, hoặc `calm setup --npx` tự ghi entry này vào `.mcp.json`/`.cursor/mcp.json`/`.vscode/mcp.json` |
 | Cơ chế npm | `npm/calm-mcp/package.json` chỉ là wrapper mỏng — `optionalDependencies` trỏ tới 3 package theo platform (`linux-x64`/`linux-arm64`/`darwin-arm64`), `bin/calm-mcp.js` spawn binary thật + forward SIGINT/SIGTERM/SIGHUP. Không compile từ source, giống cơ chế esbuild/swc. |
 | Binary release | `.github/workflows/release.yml:17-26` cross-compile đúng **3 target**: `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl` (qua `cross`), `aarch64-apple-darwin` (native trên `macos-14`). Chưa có Windows/Linux gnu/macOS x64 trong ma trận thật (có 1 workflow thử nghiệm riêng, chưa gắn vào release). |
-| Xác thực binary | `SHA256SUMS` **+ `actions/attest-build-provenance`** (Sigstore/Fulcio-backed, verify được bằng `gh attestation verify`) — thêm từ commit `636d003` (2026-07-15). Image container/GHCR ký riêng bằng `cosign` keyless — 2 cơ chế khác nhau, không hợp nhất (chủ đích, comment trong code giải thích). |
+| Xác thực binary | `SHA256SUMS` **+ `actions/attest-build-provenance`** (Sigstore/Fulcio-backed) — thêm từ commit `636d003` (2026-07-15). **Verify sống** trên asset `v0.3.0` (`gh` 2.96.0, CLI hệ thống 2.45.0 quá cũ để có subcommand này): `gh attestation verify calm-x86_64-unknown-linux-musl.tar.gz -R Eilodon/CALM` exit 0, digest SHA256 trong payload khớp digest file tải về. Image container/GHCR ký riêng bằng `cosign` keyless — 2 cơ chế khác nhau, không hợp nhất (chủ đích, comment trong code giải thích). |
 | MCP Registry | `server.json` (`io.github.Eilodon/calm-mcp`), publish qua `mcp-publisher` + GitHub OIDC (`.github/workflows/publish-mcp-registry.yml`) |
 | `calm init` (không cờ) | Chỉ tạo `.calm/config.json` — không đụng AGENTS.md, không đụng hooks |
 | Bootstrap lần đầu | Tự thêm `.calm/` vào `.gitignore`, spawn thread index nền, DB tại `.calm/index.db` (`crates/calm-server/src/lib.rs::bootstrap`) |
@@ -96,16 +96,16 @@ Chỉ 3: `rust-analyzer` (live-session, khác export SCIP batch), `gopls` (Go), 
 
 ---
 
-## 6. Sắp có — đã code + test xong, **CHƯA commit, CHƯA release** (tại thời điểm viết tài liệu này)
+## 6. `calm init --hooks` — đã ship trong `v0.3.0` (2026-07-15)
 
-Phiên làm việc dẫn tới tài liệu này vừa implement `calm init --hooks[=nudge|enforce|off]` — scaffold một hook Claude Code **generic** (`.claude/hooks/calm-hooks.sh`, khác hoàn toàn với `calm-nudge.sh` nội bộ) vào project của user khác, với:
+`calm init --hooks[=nudge|enforce|off]` scaffold một hook Claude Code **generic** (`.claude/hooks/calm-hooks.sh`, khác hoàn toàn với `calm-nudge.sh` nội bộ của chính repo CALM) vào project của user khác, với:
 
 - Mặc định `nudge` (chỉ nhắc, không bao giờ chặn) — phải gõ tường minh `--hooks=enforce` mới nâng lên chặn thật (`exit 2`)
 - Framing **best-effort rõ ràng**, nói thẳng cách bypass cụ thể (ghi đè `.calm/hooks.mode`, xóa script, sửa settings.json) ngay trong output cài đặt — không overclaim "unbypassable"
 - `calm doctor` báo trạng thái thật (cross-check mode file + settings.json wiring + script tồn tại — không tin 1 chiều)
 - Downgrade mode để lại dấu vết trong `.calm/audit.log` + thông báo 1 lần, không im lặng
 
-**Toàn bộ nằm trong working tree local của repo CALM, chưa push, chưa release. Bản `npx @eilodon/calm-mcp` hiện tại KHÔNG có tính năng này.** Xem `docs/superskills/specs/2026-07-15-calm-hooks-transparent-reactivation.md` để biết chi tiết thiết kế + trạng thái implementation.
+**Đã verify live**, không chỉ "code xong": commit `fc45ab7` → push → CI xanh (`ci.yml`) → tag `v0.3.0` → `release.yml` xanh cả 7 job → `npm view @eilodon/calm-mcp version` trả về `0.3.0` → `npx -y @eilodon/calm-mcp@0.3.0 init --help` in đúng flag `--hooks` trong binary published thật. Xem `docs/superskills/specs/2026-07-15-calm-hooks-transparent-reactivation.md` để biết chi tiết thiết kế + trạng thái implementation.
 
 ---
 
@@ -121,7 +121,7 @@ Verify bằng grep `include_str!`/`include_bytes!` toàn bộ `crates/` + đọc
 
 ## 8. Rough edge cần biết
 
-- **CI SCIP nightly**: root cause (Composer advisory chặn `scip-php`) đã vá, workflow đã tái cấu trúc thành job riêng từng ngôn ngữ (`.github/workflows/scip-nightly.yml`, commit `d299f03`/`636d003`) — nhưng tính đến lần kiểm tra gần nhất, **chưa có lần chạy cron nào xác nhận xanh** với cấu trúc mới. Đừng nói "đã fix và đang pass" cho tới khi thấy 1 run thật.
+- **CI SCIP nightly**: root cause (Composer advisory chặn `scip-php`) đã vá, workflow đã tái cấu trúc thành job riêng từng ngôn ngữ (`.github/workflows/scip-nightly.yml`, commit `d299f03`/`636d003`) — lần chạy cron đầu tiên với cấu trúc mới (2026-07-15 05:35 UTC) đã xanh (`gh run list --workflow=scip-nightly.yml`, `conclusion: success`), sau 5 lần fail liên tiếp trước đó. 1 lần xanh chưa chứng minh hết flaky, nhưng root cause đã được xác nhận đúng bằng bằng chứng thật, không còn là "đã vá nhưng chưa thấy chạy".
 
 ---
 

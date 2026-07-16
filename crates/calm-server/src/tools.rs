@@ -5910,6 +5910,7 @@ mod tests {
             EditLinesParams {
                 path: "a.py".into(),
                 edits: vec![EditHunkParam {
+                old_text: None,
                     start_line: 2,
                     end_line: 2,
                     expected_hash: None,
@@ -5942,6 +5943,7 @@ mod tests {
             EditLinesParams {
                 path: "a.py".into(),
                 edits: vec![EditHunkParam {
+                old_text: None,
                     start_line: 2,
                     end_line: 2,
                     expected_hash: Some("deadbeefdeadbeef".into()),
@@ -5973,6 +5975,7 @@ mod tests {
             EditLinesParams {
                 path: "a.py".into(),
                 edits: vec![EditHunkParam {
+                old_text: None,
                     start_line: 2,
                     end_line: 2,
                     expected_hash: Some(hash),
@@ -6220,6 +6223,7 @@ mod tests {
             EditLinesParams {
                 path: "a.py".into(),
                 edits: vec![EditHunkParam {
+                old_text: None,
                     start_line: 2,
                     end_line: 2,
                     expected_hash: Some(hash),
@@ -6259,6 +6263,7 @@ mod tests {
             EditLinesParams {
                 path: "a.py".into(),
                 edits: vec![EditHunkParam {
+                old_text: None,
                     start_line: 2,
                     end_line: 2,
                     expected_hash: Some(hash),
@@ -6350,6 +6355,50 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+
+    #[test]
+    fn diff_impact_notes_build_check_reminder_for_rust_file() {
+        let (dir, server) = test_server("diff_impact_build_note_rust");
+
+        let output = server.diff_impact(rmcp::handler::server::wrapper::Parameters(
+            DiffImpactParams {
+                diff: Some("diff --git a/unrelated.rs b/unrelated.rs\n".into()),
+                staged: None,
+                commits: None,
+            },
+        ));
+        let v = jv(output);
+        assert!(v.get("error").is_none(), "{v}");
+        let note = v["note"].as_str().expect("note should be present for a .rs diff");
+        assert!(
+            note.contains("build or test suite"),
+            "expected a build/test reminder, got: {note}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn diff_impact_no_build_check_note_for_docs_only_diff() {
+        let (dir, server) = test_server("diff_impact_build_note_docs");
+
+        let output = server.diff_impact(rmcp::handler::server::wrapper::Parameters(
+            DiffImpactParams {
+                diff: Some("diff --git a/README.md b/README.md\n".into()),
+                staged: None,
+                commits: None,
+            },
+        ));
+        let v = jv(output);
+        assert!(v.get("error").is_none(), "{v}");
+        assert!(
+            v.get("note").is_none(),
+            "a docs-only diff should not carry the build/test reminder: {v}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn edit_lines_rejects_syntax_error_before_writing() {
         let (dir, server) = test_server("edit_syntax_err");
@@ -6360,6 +6409,7 @@ mod tests {
             EditLinesParams {
                 path: "a.py".into(),
                 edits: vec![EditHunkParam {
+                old_text: None,
                     start_line: 2,
                     end_line: 2,
                     expected_hash: Some(hash),
@@ -6401,6 +6451,7 @@ mod tests {
             EditLinesParams {
                 path: traversal_path,
                 edits: vec![EditHunkParam {
+                old_text: None,
                     start_line: 1,
                     end_line: 1,
                     expected_hash: Some("irrelevant".into()),
@@ -6444,6 +6495,7 @@ mod tests {
             EditLinesParams {
                 path: "link.txt".into(),
                 edits: vec![EditHunkParam {
+                old_text: None,
                     start_line: 1,
                     end_line: 1,
                     expected_hash: Some("irrelevant".into()),
@@ -6488,6 +6540,7 @@ mod tests {
             EditLinesParams {
                 path: "a.py".into(),
                 edits: vec![EditHunkParam {
+                old_text: None,
                     start_line: 2,
                     end_line: 2,
                     expected_hash: Some(hash.clone()),
@@ -6519,6 +6572,7 @@ mod tests {
             EditLinesParams {
                 path: "a.py".into(),
                 edits: vec![EditHunkParam {
+                old_text: None,
                     start_line: 2,
                     end_line: 2,
                     expected_hash: Some(hash.clone()),
@@ -6539,6 +6593,7 @@ mod tests {
             EditLinesParams {
                 path: "a.py".into(),
                 edits: vec![EditHunkParam {
+                old_text: None,
                     start_line: 2,
                     end_line: 2,
                     expected_hash: Some(hash.clone()),
@@ -6556,6 +6611,7 @@ mod tests {
             EditLinesParams {
                 path: "a.py".into(),
                 edits: vec![EditHunkParam {
+                old_text: None,
                     start_line: 2,
                     end_line: 2,
                     expected_hash: Some(hash),
@@ -6608,6 +6664,7 @@ mod tests {
             EditLinesParams {
                 path: "a.py".into(),
                 edits: vec![EditHunkParam {
+                old_text: None,
                     start_line: 2,
                     end_line: 2,
                     expected_hash: Some(hash.clone()),
@@ -6627,6 +6684,7 @@ mod tests {
             EditLinesParams {
                 path: "a.py".into(),
                 edits: vec![EditHunkParam {
+                old_text: None,
                     start_line: 2,
                     end_line: 2,
                     expected_hash: Some(hash),
@@ -6681,6 +6739,7 @@ mod tests {
                 EditLinesParams {
                     path: "a.py".into(),
                     edits: vec![EditHunkParam {
+                    old_text: None,
                         start_line: 2,
                         end_line: 2,
                         expected_hash: Some(hash),
@@ -6713,12 +6772,14 @@ mod tests {
                 path: "m.py".into(),
                 edits: vec![
                     EditHunkParam {
+                    old_text: None,
                         start_line: 2,
                         end_line: 2,
                         expected_hash: Some(hash_a),
                         new_text: "    return 10\n".into(),
                     },
                     EditHunkParam {
+                    old_text: None,
                         start_line: 6,
                         end_line: 6,
                         expected_hash: Some(hash_b),
@@ -6735,6 +6796,148 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dir.join("m.py")).unwrap(),
             "def a():\n    return 10\n\n\ndef b():\n    return 20\n"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_lines_old_text_mode_replaces_unique_match_within_wide_window() {
+        // The friction this mode exists to fix: read a WIDE range for
+        // context, then edit one NARROW spot inside it with no separately
+        // fetched hash for that narrower sub-range — [start_line, end_line]
+        // here is deliberately the whole file, not the one line that
+        // actually changes.
+        let (dir, server) = test_server("edit_lines_old_text_unique");
+        std::fs::write(
+            dir.join("f.rs"),
+            "pub fn a() {\n    let x = 1;\n}\n\npub fn b() {\n    let y = 2;\n}\n",
+        )
+        .unwrap();
+
+        let out = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
+            EditLinesParams {
+                path: "f.rs".into(),
+                edits: vec![EditHunkParam {
+                    start_line: 1,
+                    end_line: 7,
+                    expected_hash: None,
+                    old_text: Some("let y = 2;".into()),
+                    new_text: "let y = 99;".into(),
+                }],
+                confirm: false,
+                reason: None,
+            },
+        ));
+        let v = jv(out);
+        assert_eq!(v["applied"], true, "response: {v}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("f.rs")).unwrap(),
+            "pub fn a() {\n    let x = 1;\n}\n\npub fn b() {\n    let y = 99;\n}\n"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_lines_old_text_mode_ambiguous_match_reports_locations_not_error() {
+        let (dir, server) = test_server("edit_lines_old_text_ambiguous");
+        std::fs::write(
+            dir.join("f.rs"),
+            "pub fn a() {\n    let x = 1;\n    let x = 2;\n}\n",
+        )
+        .unwrap();
+
+        let out = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
+            EditLinesParams {
+                path: "f.rs".into(),
+                edits: vec![EditHunkParam {
+                    start_line: 1,
+                    end_line: 4,
+                    expected_hash: None,
+                    old_text: Some("let x".into()),
+                    new_text: "let z".into(),
+                }],
+                confirm: false,
+                reason: None,
+            },
+        ));
+        let v = jv(out);
+        assert_eq!(v["error"]["code"], "AMBIGUOUS_MATCH");
+        assert_eq!(
+            v["error"]["message"]
+                .as_str()
+                .unwrap()
+                .matches("line")
+                .count(),
+            2
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("f.rs")).unwrap(),
+            "pub fn a() {\n    let x = 1;\n    let x = 2;\n}\n",
+            "no partial write on ambiguous match"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_lines_old_text_mode_not_found_reports_error() {
+        let (dir, server) = test_server("edit_lines_old_text_not_found");
+        std::fs::write(dir.join("f.rs"), "pub fn a() {\n    let x = 1;\n}\n").unwrap();
+
+        let out = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
+            EditLinesParams {
+                path: "f.rs".into(),
+                edits: vec![EditHunkParam {
+                    start_line: 1,
+                    end_line: 3,
+                    expected_hash: None,
+                    old_text: Some("nope".into()),
+                    new_text: "irrelevant".into(),
+                }],
+                confirm: false,
+                reason: None,
+            },
+        ));
+        let v = jv(out);
+        assert_eq!(v["error"]["code"], "MATCH_NOT_FOUND");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_lines_old_text_mode_scopes_search_to_the_given_window() {
+        // old_text occurs twice in the file but only once inside
+        // [start_line, end_line] — must match the in-window occurrence
+        // only, exactly like edit_symbol's own scoping guarantee.
+        let (dir, server) = test_server("edit_lines_old_text_scoped");
+        std::fs::write(
+            dir.join("f.rs"),
+            "pub fn a() {\n    let n = 1;\n}\n\npub fn b() {\n    let n = 1;\n}\n",
+        )
+        .unwrap();
+
+        let out = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
+            EditLinesParams {
+                path: "f.rs".into(),
+                edits: vec![EditHunkParam {
+                    start_line: 5,
+                    end_line: 7,
+                    expected_hash: None,
+                    old_text: Some("let n = 1;".into()),
+                    new_text: "let n = 2;".into(),
+                }],
+                confirm: false,
+                reason: None,
+            },
+        ));
+        let v = jv(out);
+        assert_eq!(v["applied"], true, "response: {v}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("f.rs")).unwrap(),
+            "pub fn a() {\n    let n = 1;\n}\n\npub fn b() {\n    let n = 2;\n}\n",
+            "only the occurrence inside the given window should change"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -7302,6 +7505,7 @@ mod tests {
             EditLinesParams {
                 path: "a.rs".into(),
                 edits: vec![EditHunkParam {
+                old_text: None,
                     start_line: 2,
                     end_line: 2,
                     expected_hash: None,
@@ -7337,6 +7541,7 @@ mod tests {
             EditLinesParams {
                 path: "a.py".into(),
                 edits: vec![EditHunkParam {
+                old_text: None,
                     start_line: 2,
                     end_line: 2,
                     expected_hash: Some(hash),
@@ -8163,6 +8368,7 @@ mod tests {
                 EditLinesParams {
                     path: "a.py".into(),
                     edits: vec![EditHunkParam {
+                    old_text: None,
                         start_line: 2,
                         end_line: 2,
                         expected_hash: Some(hash.clone()),
@@ -8184,6 +8390,7 @@ mod tests {
                 EditLinesParams {
                     path: "a.py".into(),
                     edits: vec![EditHunkParam {
+                    old_text: None,
                         start_line: 2,
                         end_line: 2,
                         expected_hash: Some(hash),

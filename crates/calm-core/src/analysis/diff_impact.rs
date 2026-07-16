@@ -366,6 +366,34 @@ pub fn compute_aggregate_risk<T: AffectedSymbolFacts>(
         .unwrap_or("low")
         .to_string()
 }
+
+
+/// Extensions with one unambiguous, near-universal "does this still build"
+/// command a CI pipeline would run (`cargo build`/`test`, `go build`/`test`,
+/// `tsc --noEmit`). Deliberately narrow — NOT the full parser language list
+/// (`lang_constants::language_for_extension`), which also covers languages
+/// like Python or Ruby with no single canonical compile-check invocation to
+/// point an agent at.
+const COMPILE_CHECKABLE_EXTENSIONS: &[&str] = &["rs", "go", "ts", "tsx", "mts", "cts"];
+
+/// True if any changed file has an extension in `COMPILE_CHECKABLE_EXTENSIONS`
+/// — used by `diff_impact` to note that `aggregate_risk` reflects call-graph
+/// blast radius and edit-time syntax checks (`parse_status`) only, neither of
+/// which runs an actual build or test suite. `edit_lines`/`edit_symbol` can
+/// report `parse_status: "clean"` on a Rust file that is syntactically valid
+/// but still fails to type-check or compile — that gap is real and this note
+/// is the closest thing to closing it without CALM itself running the
+/// project's build (out of scope: no single command works across every repo
+/// CALM might index, and running arbitrary build commands from an MCP tool
+/// is its own trust boundary this project has deliberately stayed out of).
+pub fn any_compile_checkable_file(files_changed: &[String]) -> bool {
+    files_changed.iter().any(|f| {
+        std::path::Path::new(f)
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|ext| COMPILE_CHECKABLE_EXTENSIONS.contains(&ext))
+    })
+}
 pub fn escalate_risk_if_signature_changed(
     signature_changed: bool,
     level: &str,
@@ -583,6 +611,38 @@ mod tests {
         };
         let result = compute_aggregate_risk(&[s1, s2], &[]);
         assert_eq!(result, "high");
+    }
+
+
+    #[test]
+    fn any_compile_checkable_file_true_for_rust_go_and_typescript() {
+        assert!(any_compile_checkable_file(&["crates/calm-core/src/lib.rs".to_string()]));
+        assert!(any_compile_checkable_file(&["cmd/main.go".to_string()]));
+        assert!(any_compile_checkable_file(&["src/app.tsx".to_string()]));
+        assert!(any_compile_checkable_file(&[
+            "README.md".to_string(),
+            "src/index.ts".to_string(),
+        ]));
+    }
+
+    #[test]
+    fn any_compile_checkable_file_false_for_docs_only_diff() {
+        assert!(!any_compile_checkable_file(&[
+            "README.md".to_string(),
+            "docs/guide.md".to_string(),
+            "Cargo.toml".to_string(),
+        ]));
+        assert!(!any_compile_checkable_file(&[]));
+    }
+
+    #[test]
+    fn any_compile_checkable_file_false_for_python_and_ruby() {
+        // Deliberately narrow: no single canonical build-check command for
+        // these, unlike cargo/go/tsc — see the doc comment on the function.
+        assert!(!any_compile_checkable_file(&[
+            "app.py".to_string(),
+            "lib/thing.rb".to_string(),
+        ]));
     }
 
     #[test]

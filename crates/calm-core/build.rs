@@ -32,6 +32,23 @@ fn main() {
     };
 
     println!("cargo:rustc-env=CI_BUILD_INFO={info}");
+
+    // Stamps the absolute path this crate was compiled from, so a locally
+    // built dev binary can recognize "the project I'm serving right now IS
+    // the exact checkout I was compiled from" (see
+    // `is_own_running_binary_source` in `src/lib.rs`) — used to warn a
+    // dogfooding agent that editing crates/ Rust source won't reach this
+    // session's already-running daemon until it's rebuilt and reconnected.
+    // For a downloaded release binary this is a CI runner path that won't
+    // exist on the user's machine, so the comparison fails closed (never a
+    // false positive for a normal user).
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default();
+    let source_root = std::path::Path::new(&manifest_dir)
+        .parent() // crates/
+        .and_then(std::path::Path::parent) // repo root
+        .map(|p| p.display().to_string())
+        .unwrap_or(manifest_dir);
+    println!("cargo:rustc-env=CI_BUILD_SOURCE_ROOT={source_root}");
 }
 fn run_git(args: &[&str]) -> Option<String> {
     let output = Command::new("git").args(args).output().ok()?;

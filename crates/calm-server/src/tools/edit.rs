@@ -17,7 +17,7 @@ static EMBED_BG: std::sync::Mutex<()> = std::sync::Mutex::new(());
 impl CalmServer {
     #[tool(
         name = "edit_lines",
-        description = "The only write-capable tool in ci — line-range granularity, works on ANY tracked file (source code, Cargo.toml, docs — not just parsed symbols). NOT FOR: symbol-scoped edits with auto-resolved range (use edit_symbol). Requires expected_hash from a prior call's current_hash (or edit_context's range_checksum for a whole symbol); omit it to preview a range's hash/content without writing anything. All hunks in one call apply to the same file and must be disjoint (non-overlapping).",
+        description = "The only write-capable tool in ci — line-range granularity, works on ANY tracked file (source code, Cargo.toml, docs — not just parsed symbols). NOT FOR: symbol-scoped edits with auto-resolved range (use edit_symbol). Requires expected_hash from a prior call's current_hash (or edit_context's range_checksum for a whole symbol); omit it to preview a range's hash/content without writing anything. Alternative to expected_hash: set old_text on a hunk instead — replaces its one occurrence within [start_line, end_line] with no hash needed and no preview round trip (fixes the common 'read a wide range for context, then edit one narrow line inside it' case: keep [start_line, end_line] as the wide range you already read, old_text pins the exact spot). All hunks in one call apply to the same file and must be disjoint (non-overlapping).",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -30,16 +30,82 @@ impl CalmServer {
         Parameters(p): Parameters<EditLinesParams>,
     ) -> Json<ToolOutcome<EditLinesOutput>> {
         Json(self.timed_tool("edit_lines", || {
-            let hunks: Vec<calm_core::edit::HunkRequest> = p
-                .edits
-                .into_iter()
-                .map(|h| calm_core::edit::HunkRequest {
-                    start_line: h.start_line.max(0) as usize,
-                    end_line: h.end_line.max(0) as usize,
-                    expected_hash: h.expected_hash,
-                    new_text: h.new_text,
-                })
-                .collect();
+            // old_text-mode hunks (see EditHunkParam::old_text) need one
+            // live read of the file to resolve against — done once up
+            // front, shared by every such hunk in this call, not once per
+            // hunk. Hash-mode hunks (the common case) never touch this and
+            // pay nothing extra.
+            let live: Option<String> = if p.edits.iter().any(|h| h.old_text.is_some()) {
+                let full_path = match resolve_repo_path(&self.project_root, &p.path) {
+                    Ok(fp) => fp,
+                    Err(e) => return ToolOutcome::error(e),
+                };
+                match std::fs::read_to_string(&full_path) {
+                    Ok(s) => Some(s),
+                    Err(e) => {
+                        return ToolOutcome::error(error_detail(
+                            "READ_FAILED",
+                            &format!("could not read {}: {e}", p.path),
+                            false,
+                        ));
+                    }
+                }
+            } else {
+                None
+            };
+
+            let mut hunks: Vec<calm_core::edit::HunkRequest> = Vec::with_capacity(p.edits.len());
+            for h in p.edits {
+                let start = h.start_line.max(0) as usize;
+                let end = h.end_line.max(0) as usize;
+                match h.old_text {
+                    None => hunks.push(calm_core::edit::HunkRequest {
+                        start_line: start,
+                        end_line: end,
+                        expected_hash: h.expected_hash,
+                        new_text: h.new_text,
+                    }),
+                    Some(old_text) => {
+                        // `live` is always Some here: the check above sets it
+                        // whenever any hunk in `p.edits` has `old_text` set.
+                        let live_ref = live.as_deref().expect("live read done above");
+                        match calm_core::edit::find_and_replace_hunk(
+                            live_ref, start, end, &old_text, &h.new_text,
+                        ) {
+                            Ok(hunk) => hunks.push(hunk),
+                            Err(calm_core::edit::MatchOutcome::NotFound) => {
+                                return ToolOutcome::error(error_detail(
+                                    "MATCH_NOT_FOUND",
+                                    &format!(
+                                        "old_text {old_text:?} was not found within \
+                                         {start}..{end} of '{}' on disk",
+                                        p.path
+                                    ),
+                                    true,
+                                ));
+                            }
+                            Err(calm_core::edit::MatchOutcome::Ambiguous(lines)) => {
+                                let where_str = lines
+                                    .iter()
+                                    .map(|l| format!("line {l}"))
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                return ToolOutcome::error(error_detail(
+                                    "AMBIGUOUS_MATCH",
+                                    &format!(
+                                        "old_text {old_text:?} occurs {} times within \
+                                         '{}' ({where_str}) — narrow it with more \
+                                         surrounding context so it matches exactly once",
+                                        lines.len(),
+                                        p.path
+                                    ),
+                                    true,
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
             self.edit_lines_impl(&p.path, hunks, p.confirm, p.reason.as_deref(), false, None)
         }))
     }
@@ -568,6 +634,13 @@ impl CalmServer {
             });
         }
         let new_content = outcome.new_content.expect("all_applied implies Some");
+        let dogfood_note = calm_core::is_own_running_binary_source(&self.project_root, path).then(|| {
+            "this edit touched crates/ Rust source that IS the binary currently serving this \
+             MCP session — the running daemon will not reflect it until it's rebuilt and \
+             reconnected (the file on disk is correct now, this session's live tool behavior \
+             just won't show the change yet)"
+                .to_string()
+        });
 
         let ext = std::path::Path::new(path)
             .extension()
@@ -955,6 +1028,10 @@ impl CalmServer {
                 note.push_str(". ");
                 note.push_str(a);
             }
+            if let Some(d) = &dogfood_note {
+                note.push_str(". ");
+                note.push_str(d);
+            }
             return ToolOutcome::success(EditLinesOutput {
                 path: path.to_string(),
                 applied: true,
@@ -983,7 +1060,14 @@ impl CalmServer {
                         touched_symbols: vec![],
                         risk_assessment: risk,
                         index_stale: None,
-                        note: Some("edit applied but could not re-query touched symbols".into()),
+                        note: match &dogfood_note {
+                            Some(d) => Some(format!(
+                                "edit applied but could not re-query touched symbols. {d}"
+                            )),
+                            None => Some(
+                                "edit applied but could not re-query touched symbols".into(),
+                            ),
+                        },
                         suggested_next: None,
                     });
                 }
@@ -997,6 +1081,12 @@ impl CalmServer {
             touched
         };
 
+        let note = match (&ambiguity_note, &dogfood_note) {
+            (Some(a), Some(d)) => Some(format!("{a}. {d}")),
+            (Some(a), None) => Some(a.clone()),
+            (None, Some(d)) => Some(d.clone()),
+            (None, None) => None,
+        };
         ToolOutcome::success(EditLinesOutput {
             path: path.to_string(),
             applied: true,
@@ -1005,7 +1095,7 @@ impl CalmServer {
             touched_symbols,
             risk_assessment: risk,
             index_stale: None,
-            note: ambiguity_note,
+            note,
             suggested_next: self.filter_sn(suggested_gated(
                 "diff_impact",
                 "Verify wider blast radius, especially if this touched a hub/high-risk symbol",
@@ -1420,9 +1510,26 @@ pub(crate) struct EditHunkParam {
     /// `current_hash`, or `edit_context`'s `range_checksum` when the range
     /// is exactly a whole symbol. Omit to preview instead of writing: the
     /// response still reports `current_hash`/`old_text` for this range, so
-    /// a first call can learn the hash before a real edit.
+    /// a first call can learn the hash before a real edit. Ignored when
+    /// `old_text` is set.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) expected_hash: Option<String>,
+    /// Small-text-match mode: when set, `new_text` replaces the FIRST (and
+    /// required-to-be-only) occurrence of `old_text` found within
+    /// `[start_line, end_line]`, instead of requiring `expected_hash` for
+    /// that exact sub-range. No hash needed and no preview round trip —
+    /// the server reads the file's live content to find the match, so
+    /// staleness is impossible by construction, same guarantee
+    /// `edit_symbol`'s own `old_text` mode already provides for a resolved
+    /// symbol range. The intended fix for the common "read a wide range for
+    /// context, then edit one narrow line inside it" case: `[start_line,
+    /// end_line]` can stay exactly the wide range just read (no new hash
+    /// needed for it either — this mode doesn't check one), while
+    /// `old_text` pins down the one exact spot to change. Refused with
+    /// `MATCH_NOT_FOUND`/`AMBIGUOUS_MATCH` if the text isn't found exactly
+    /// once in that window.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) old_text: Option<String>,
     /// Replacement text for the range, used exactly as given (no implicit
     /// newline handling) — include your own `\n` between lines and after
     /// the last one if the following line should stay on its own line.
