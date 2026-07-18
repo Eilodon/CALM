@@ -1,20 +1,16 @@
 name: Windows build experiment (probe, not release)
 
-# Manual-only feasibility probe for native Windows support — NOT wired into
-# release.yml's matrix yet. Every dependency that could plausibly break a
-# Windows build compiles C/C++ via the `cc` crate (rusqlite `bundled`, the
-# `onig` regex engine, ~24 tree-sitter grammar crates) — all of that is
-# `#[cfg(unix)]`-free in calm's own code (verified: only the shared-daemon
-# `calm connect`/`--listen` path is Unix-gated, and callers already skip it
-# on non-Unix — see crates/calm-server/src/daemon.rs and
-# scripts/mcp-launcher.sh), so the only real unknown is whether every C
-# dependency's build script is happy under MSVC. This workflow exists to
-# answer that empirically instead of guessing. Run with:
+# Manual-only feasibility probe for native Windows support. Every
+# dependency that could plausibly break a Windows build compiles C/C++ via
+# the `cc` crate (rusqlite `bundled`, the `onig` regex engine, ~24
+# tree-sitter grammar crates) — all of that is `#[cfg(unix)]`-free in
+# calm's own code (verified: only the shared-daemon `calm connect`/
+# `--listen` path is Unix-gated, and callers already skip it on non-Unix —
+# see crates/calm-server/src/daemon.rs and scripts/mcp-launcher.sh), so the
+# only real unknown is whether every C dependency's build script is happy
+# under MSVC. This workflow exists to answer that empirically instead of
+# guessing. Run with:
 #   gh workflow run windows-build-experiment.yml
-# If this goes green, promote x86_64-pc-windows-msvc into release.yml's
-# matrix and add an @eilodon/calm-mcp-win32-x64 npm platform package
-# (see docs/mcp-client-setup.md and npm/README.md for the existing pattern
-# the 3 shipped platforms follow).
 on:
   workflow_dispatch:
 

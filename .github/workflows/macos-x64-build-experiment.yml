@@ -1,10 +1,8 @@
 name: macOS x64 build experiment (probe, not release)
 
-# Manual-only feasibility probe for x86_64-apple-darwin (Intel Mac) support —
-# NOT wired into release.yml's matrix yet. Companion to
-# windows-build-experiment.yml: same "prove it empirically before promoting"
-# posture (see docs/superskills/specs/2026-07-13-one-command-install-any-environment.md
-# §6: "Windows — probe chưa green thì đừng hứa" applies equally here).
+# Manual-only feasibility probe for x86_64-apple-darwin (Intel Mac) support.
+# Companion to windows-build-experiment.yml: same "prove it empirically
+# before promoting" posture.
 #
 # Deliberately does NOT use a native x64 runner. GitHub retired the Intel
 # `macos-13` image (2025-12-04); the only x64 label left is `macos-15-intel`,

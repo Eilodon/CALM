@@ -17,7 +17,6 @@ cỗ máy đã dựng nhưng chưa được quay tay đủ:**
 | npm `@eilodon/calm-mcp` (3 platform pkg) | ✅ | ⚠️ đang serve **v0.1.4**, trễ **146 commit** so với main |
 | `release.yml` (tag `v*` → build 3 platform → GH release) | ✅ auto trên tag | ✅ nhưng lần cuối là v0.1.4 (2026-07-08) |
 | `publish-mcp-registry.yml` (`server.json` + `mcp-publisher` + github-oidc) | ✅ | ❌ **chưa từng publish thành công** — registry search không thấy `io.github.Eilodon/calm-mcp` |
-| `windows-build-experiment.yml` | ✅ probe | ❌ chưa promote vào release matrix |
 | `stage-release.sh` + `npm publish` | ✅ | ⚠️ **thủ công có chủ đích** (human sanity-check) → là điểm nghẽn cadence |
 | edge release (auto trên push main) | ✅ | ⚠️ chỉ `x86_64-linux-musl`, chỉ dùng nội bộ cho launcher tier 1.5 |
 | `calm setup` (ghi `.mcp.json`/`.cursor`/`.vscode`) | ✅ | ⚠️ chỉ 3 file project, dùng absolute path, không detect client, không có Codex/Windsurf/JetBrains |
@@ -153,14 +152,11 @@ chỉ cần mở rộng nó thành kênh chính thức đa nền tảng thay vì
 7. **List lên Smithery** → user có `npx @smithery/cli install @eilodon/calm-mcp --client X` cho
    ~15 client miễn phí. Piggyback discoverability + universality của bên thứ ba.
 8. **VS Code install badge + `code --add-mcp` vào README/docs**; verify lại Cursor deeplink.
-9. **Windows + Intel-mac**: promote `windows-build-experiment.yml` vào `release.yml` matrix +
-   thêm `@eilodon/calm-mcp-win32-x64`; thêm `x86_64-apple-darwin`. Đây là điều kiện để chữ
-   "mọi môi trường" **không còn là nói quá**.
 
 ### P3 — Hoàn thiện
 
-10. Mở rộng edge release ra đủ platform (hiện chỉ linux-x64) cho cold-start agent trên web.
-11. `mcpName`/registry cho cả bản binary (không chỉ npm) nếu registry hỗ trợ nhiều `registryType`.
+9. Mở rộng edge release ra đủ platform (hiện chỉ linux-x64) cho cold-start agent trên web.
+10. `mcpName`/registry cho cả bản binary (không chỉ npm) nếu registry hỗ trợ nhiều `registryType`.
 
 ---
 
@@ -190,8 +186,6 @@ Lệnh canonical duy nhất để dạy/nhớ:
   để cả hai, mặc định theo cách họ vừa cài (install.sh → absolute; không clone → npx).
 - **Phụ thuộc Smithery** — là bề mặt bên thứ ba, không nên là nền móng. Xếp P2 sau khi registry
   chính thống đã live.
-- **Windows** — probe chưa green thì đừng hứa. Chạy `gh workflow run windows-build-experiment.yml`
-  trước, xanh mới promote.
 
 ---
 
