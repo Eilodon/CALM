@@ -429,5 +429,4 @@ Không còn phụ thuộc kỹ thuật nào chặn bất kỳ nhánh nào bên d
 3. ~~Benchmark harness~~ ✅ ĐÃ XONG (2026-07-07) — xem §7 cho kết quả baseline thật trên 8 ngôn ngữ +
    1 bug crash thật tìm thấy (C, đã sửa). Phát hiện chính: `ambiguous` (fan-out), không phải
    `textual`, là trần chính Phase 2 cần lấp — xác nhận bằng số đo thật, không phải suy luận.
-4. Xác nhận `.github/workflows/scip-nightly.yml` chạy xanh thật trên GitHub Actions (push + đợi lịch hoặc `workflow_dispatch` thủ công) — chưa phiên nào verify tương đương ngoài local.
-5. P1.5's "using→namespace-to-files" nửa còn lại (namespace không map trực tiếp thư mục cho C#) — cần pre-pass kiến trúc mới, xem ghi chú trong mục P1.5.
+4. P1.5's "using→namespace-to-files" nửa còn lại (namespace không map trực tiếp thư mục cho C#) — cần pre-pass kiến trúc mới, xem ghi chú trong mục P1.5.

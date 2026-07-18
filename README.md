@@ -292,13 +292,6 @@ Three CI jobs run on every PR: `verify` (fmt/clippy/test/audit), `stack-graphs-c
 
 Full workspace run, today (2026-07-11): **826 passed**, 0 failed, 12 ignored (live-binary integration tests for external tools, e.g. `rust-analyzer`/`scip-go`/`scip-java`, not installed in every environment).
 
-<details>
-<summary>Known flaky tests (environment-sensitive, not a regression by default)</summary>
-
-`crates/calm-server/tests/watcher_integration.rs` and `crates/calm-cli/tests/daemon_integration.rs` both spin up real subprocesses/filesystem events under a hard timeout. These tests are environment-sensitive and may fail transiently in constrained containers (inotify/I/O limits, socket/process scheduling jitter) — one was observed to fail and then pass cleanly on an immediate retry with no code change in between, while writing this README. If you hit a failure, re-run the specific test binary in isolation (`cargo test -p calm-server --test watcher_integration` / `cargo test -p calm-cli --test daemon_integration`) on an unconstrained machine and treat it as a real regression only if it still fails there.
-
-</details>
-
 ## Further reading
 
 Everything below is more detail than this README needs to make its case — pointers for anyone who wants to go deeper, not required reading:
