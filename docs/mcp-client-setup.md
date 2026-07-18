@@ -1,31 +1,31 @@
-# Dùng "calm" MCP server với nhiều agent/IDE khác nhau
+# Using the "calm" MCP server with different agents/IDEs
 
-`calm` không phải MCP server chỉ dành riêng cho Claude Code — `scripts/mcp-launcher.sh`
-là entrypoint dùng chung cho **mọi** client MCP nói stdio (Claude Code, Cursor,
-VS Code, Windsurf, JetBrains, Codex CLI, Antigravity, hoặc bất kỳ tool nào có
-thể spawn một command). File này giải thích launcher hoạt động ra sao và cách
-trỏ từng client vào nó.
+`calm` isn't an MCP server built only for Claude Code — `scripts/mcp-launcher.sh`
+is a shared entrypoint for **any** stdio-speaking MCP client (Claude Code, Cursor,
+VS Code, Windsurf, JetBrains, Codex CLI, Antigravity, or any tool that can
+spawn a command). This file explains how the launcher works and how to
+point each client at it.
 
-## Không muốn clone cả repo? — cài thẳng binary `calm`
+## Don't want to clone the whole repo? — install the `calm` binary directly
 
-Phần "Launcher resolve binary theo 3 tầng" bên dưới mô tả cách self-host
-**trong chính checkout** của CALM (dùng tốt nếu bạn đang dev
-`calm`, hoặc project của bạn chính là repo này). Nếu bạn chỉ muốn dùng `calm`
-như một MCP server bình thường cho **project khác**, không cần checkout gì
-cả, có 2 cách:
+The "Launcher resolves a binary in 3 tiers" section below describes how to self-host
+**from within a CALM checkout** (useful if you're developing `calm` itself, or your
+project *is* this repo). If you just want `calm` as a regular MCP server for
+**a different project**, no checkout needed, there are 2 ways:
 
-### 1. Install script (không cần Node)
+### 1. Install script (no Node required)
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Eilodon/CALM/main/scripts/install.sh | sh
 ```
 
-Tải đúng prebuilt binary cho platform hiện tại (Linux x86_64/aarch64, macOS
-Apple Silicon — cùng matrix 3 platform mà `release.yml` build), verify
-SHA256 với `SHA256SUMS` publish kèm release, cài vào `~/.local/bin/calm`
-(đổi qua biến `CI_INSTALL_DIR`). Không có tầng build-from-source — không có
-source checkout để build; platform chưa hỗ trợ thì tự `git clone` +
-`cargo build --release --bin calm` theo README thay vì tự động fallback.
+Downloads the right prebuilt binary for your current platform (Linux x86_64/aarch64,
+macOS Apple Silicon — the same 3-platform matrix `release.yml` builds), verifies
+SHA256 against the `SHA256SUMS` published with the release, and installs to
+`~/.local/bin/calm` (override via the `CI_INSTALL_DIR` variable). There's no
+build-from-source tier here — there's no source checkout to build from; an
+unsupported platform means `git clone` + `cargo build --release --bin calm`
+by hand per the README instead of an automatic fallback.
 
 ### 2. npm (`@eilodon/calm-mcp`)
 
@@ -40,17 +40,17 @@ source checkout để build; platform chưa hỗ trợ thì tự `git clone` +
 }
 ```
 
-Package JS mỏng, tự chọn đúng binary prebuilt cho platform qua
-`optionalDependencies` (không postinstall tải mạng — binary nằm sẵn trong
-tarball npm). Xem [`../npm/README.md`](../npm/README.md) để biết cách
-publish/kiểm tra package này.
+A thin JS package that picks the right prebuilt binary for your platform via
+`optionalDependencies` (no network fetch on postinstall — the binary already
+ships inside the npm tarball). See [`../npm/README.md`](../npm/README.md) for
+how to publish/verify this package.
 
-### 3. Lệnh CLI add-server 1 dòng (client tự có sẵn, không cần sửa file tay)
+### 3. One-line CLI add-server commands (client already has one built in, no manual file editing)
 
-Không cần biết trước path file config — 3 client dưới đây tự ghi config
-đúng chỗ chỉ với 1 lệnh, đủ ngắn để chính agent (Claude/Codex/VS Code, khi
-có quyền chạy shell) tự thực thi thay người dùng nếu được yêu cầu kiểu "cài
-CALM của Eilodon cho tui":
+No need to know the config file path ahead of time — the three clients below
+write the config to the right place with a single command, short enough that
+the agent itself (Claude/Codex/VS Code, when it has shell access) can run it on
+the user's behalf if asked something like "install Eilodon's CALM for me":
 
 ```bash
 # Claude Code
@@ -59,106 +59,113 @@ claude mcp add --transport stdio calm -- npx -y @eilodon/calm-mcp serve
 # Codex CLI
 codex mcp add calm -- npx -y @eilodon/calm-mcp serve
 
-# VS Code (ghi thẳng vào user profile, không cần mở file config)
+# VS Code (writes straight to the user profile, no config file to open)
 code --add-mcp '{"name":"calm","command":"npx","args":["-y","@eilodon/calm-mcp","serve"]}'
 ```
 
-Cursor/Windsurf/Antigravity chưa có lệnh CLI tương đương — nhưng vì
-agent của các tool này (ở chế độ agent/agentic mode) đều có quyền ghi file,
-agent vẫn tự sửa được đúng file config (`.cursor/mcp.json`,
-`.vscode/mcp.json`, `~/.codeium/windsurf/mcp_config.json`,
-`~/.gemini/config/mcp_config.json`) khi được yêu cầu — chỉ là không có 1
-lệnh built-in để gõ thẳng.
+Cursor/Windsurf/Antigravity don't have an equivalent CLI command yet — but since
+those tools' agents (in agent/agentic mode) have file-write permission anyway,
+the agent can still edit the right config file itself
+(`.cursor/mcp.json`, `.vscode/mcp.json`, `~/.codeium/windsurf/mcp_config.json`,
+`~/.gemini/config/mcp_config.json`) when asked — there just isn't a single
+built-in command to type for it.
 
-### Sau khi cài xong bằng cách 1 hoặc 2 ở trên (không áp dụng cho cách 3 — `codex`/`claude mcp add` đã tự ghi config, không cần `calm setup`): `calm setup`
+### After installing via method 1 or 2 above (doesn't apply to method 3 — `codex`/`claude mcp add` already wrote the config, no `calm setup` needed): `calm setup`
 
-Từ bên trong project bạn muốn `calm` phân tích:
+From inside the project you want `calm` to analyze:
 
 ```bash
 calm setup
 ```
 
-Tự viết/merge entry `"calm"` vào `.mcp.json`, `.cursor/mcp.json`,
-`.vscode/mcp.json` trong project đó — không đụng tới các entry khác đã có
-sẵn — trỏ thẳng vào binary vừa cài. Đã có entry `"calm"` trỏ chỗ khác (ví dụ
-bạn từng dùng launcher script) thì `calm setup` mặc định để yên, dùng
-`calm setup --force` nếu thật sự muốn ghi đè. Windsurf/JetBrains vẫn phải dán
-tay (xem 2 phần riêng bên dưới) vì đó là global config, không phải
-project-level.
+Writes/merges a `"calm"` entry into `.mcp.json`, `.cursor/mcp.json`,
+`.vscode/mcp.json` in that project — without touching any other entries already
+there — pointing straight at the binary you just installed. If a `"calm"`
+entry already points somewhere else (e.g. you were previously using the
+launcher script), `calm setup` leaves it alone by default; use
+`calm setup --force` if you really want to overwrite it. Windsurf/JetBrains
+still need manual pasting (see their own sections below), since those are
+global configs, not project-level.
 
-Muốn config **portable/chia sẻ được** (commit `.mcp.json` vào repo cho cả
-team/CI, không phụ thuộc path binary trên máy bạn): `calm setup --npx` ghi
-entry dạng `npx -y @eilodon/calm-mcp serve` thay vì đường dẫn tuyệt đối — tự
-bám theo bản npm đã publish, chỉ cần Node ở nơi chạy.
+Want a **portable/shareable** config (commit `.mcp.json` to the repo for the
+whole team/CI, independent of the binary path on your machine)?
+`calm setup --npx` writes the entry as `npx -y @eilodon/calm-mcp serve`
+instead of an absolute path — it automatically tracks the published npm
+version, and only needs Node wherever it runs.
 
-## Launcher resolve binary theo 3 tầng
+## Launcher resolves a binary in 3 tiers
 
-`scripts/mcp-launcher.sh` luôn thử theo đúng thứ tự sau, dùng ngay binary đầu
-tiên tìm thấy:
+`scripts/mcp-launcher.sh` always tries these in order, and uses the first
+binary it finds:
 
-1. **Fast path** — binary đã có sẵn: `$CI_MCP_BIN` (override thủ công) →
-   `~/.cache/calm-mcp/<tag>/calm` (bản đã tải-và-verify từ lần trước) →
-   `target/release/calm` → `target/debug/calm` (build local đã có).
-2. **Verified download** — chỉ áp dụng cho Linux x86_64/aarch64, và **chỉ khi
-   `HEAD` đang đứng đúng một git tag đã release** (không bao giờ đoán mò
-   version). Tải asset đúng platform từ GitHub Release của tag đó, verify
-   SHA256 với `SHA256SUMS` đã publish kèm, rồi sanity-check `calm --version`
-   khớp với version mong đợi — xong hết mới cache lại và exec. Bất kỳ bước
-   nào thất bại (tải lỗi, sai checksum, sai version) đều rơi xuống tầng 3,
-   **không bao giờ** exec một binary chưa verify xong.
-3. **Build from source** — `cargo build -p calm-cli`, luôn hoạt động miễn có
-   Rust toolchain. Đây là đường duy nhất cho macOS/Windows, cho checkout
-   đang dev dở (không nằm đúng tag), hoặc môi trường không có mạng.
+1. **Fast path** — an already-usable binary: `$CI_MCP_BIN` (manual override) →
+   `~/.cache/calm-mcp/<tag>/calm` (downloaded-and-verified from a previous run) →
+   `target/release/calm` → `target/debug/calm` (an existing local build).
+2. **Verified download** — only applies on Linux x86_64/aarch64, and **only when
+   `HEAD` is sitting exactly on a released git tag** (never guesses at a
+   version). Downloads the right platform's asset from that tag's GitHub
+   Release, verifies SHA256 against the published `SHA256SUMS`, then
+   sanity-checks that `calm --version` matches the expected version — only
+   after all of that does it cache the binary and exec it. Any step failing
+   (download error, checksum mismatch, version mismatch) falls through to
+   tier 3 — it **never** execs a binary that hasn't finished verification.
+3. **Build from source** — `cargo build -p calm-cli`, always works as long as
+   the Rust toolchain is present. This is the only path for macOS/Windows,
+   for a checkout mid-development (not sitting on a tag), or an environment
+   with no network access.
 
-Vì sao không mặc định lấy "latest release": nếu bạn đang dev trên `main`
-giữa hai lần release, tải "latest" sẽ âm thầm cài một binary **cũ hơn**
-source đang có trên máy — sai lệch này rất khó nhận ra. Launcher mặc định
-chỉ tải khi checkout đang đúng một tag (tag khớp source thì mới an toàn để
-tin tưởng); muốn ưu tiên khởi động nhanh và chấp nhận rủi ro lệch version đó
-thì set `CI_MCP_LAUNCHER_ALLOW_LATEST=1`.
+Why it doesn't default to fetching "latest release": if you're developing on
+`main` between two releases, fetching "latest" would silently install a binary
+**older** than the source already on your machine — a mismatch that's very
+hard to notice. The launcher only downloads by default when the checkout is
+sitting exactly on a tag (a matching tag is the only case where it's safe to
+trust the download); to prioritize fast startup and accept that version-drift
+risk instead, set `CI_MCP_LAUNCHER_ALLOW_LATEST=1`.
 
-Nếu SHA256 sai (nghi ngờ download hỏng hoặc bị can thiệp), launcher **không
-exec** binary đó — log lỗi rõ ràng ra stderr rồi tự động build từ source
-thay vì dừng hẳn, để server vẫn luôn khởi động được.
+If the SHA256 doesn't match (suspected corrupted or tampered-with download),
+the launcher **does not exec** that binary — it logs a clear error to stderr
+and automatically builds from source instead of just stopping, so the server
+can still always start.
 
-## Chế độ daemon dùng chung (mặc định từ 2026-07-11)
+## Shared daemon mode (default since 2026-07-11)
 
-Dù binary nào ở trên được chọn, launcher mặc định gọi nó qua `calm connect`
-thay vì `calm serve` khi cả hai điều kiện đúng: đang chạy trên Unix (macOS/
-Linux) và không có arg nào khác được truyền vào launcher. `calm connect` kết
-nối (hoặc spawn nếu chưa có) 1 daemon dùng chung cho cả project — nhiều
-client/session cùng mở 1 project sẽ chia sẻ chung 1 indexer/watcher/embedder
-thay vì mỗi session tự chạy riêng (xem `docs/adr/0005-daemon-forwarder-
-shared-process.md`). Nhận biết: `.calm/daemon.sock`/`daemon.meta`/
-`daemon.log` xuất hiện trong thư mục project.
+Whatever binary gets selected above, the launcher by default invokes it via
+`calm connect` instead of `calm serve` when both conditions hold: running on
+Unix (macOS/Linux), and no other arg was passed to the launcher. `calm connect`
+connects to (or spawns, if none exists yet) one daemon shared across the whole
+project — multiple clients/sessions opening the same project share one
+indexer/watcher/embedder instead of each session running its own (see
+`docs/adr/0005-daemon-forwarder-shared-process.md`). You'll see
+`.calm/daemon.sock`/`daemon.meta`/`daemon.log` appear in the project directory
+as a sign this is active.
 
-Bất kỳ arg tùy chỉnh nào (ví dụ client config tự thêm `--preset`) đều làm
-launcher quay về `calm serve` như trước đây, không thay đổi. Muốn tắt hẳn
-chế độ daemon (ví dụ môi trường không muốn chia sẻ process giữa các
-session) thì set `CI_MCP_LAUNCHER_NO_DAEMON=1`.
+Any custom arg (e.g. a client config that adds its own `--preset`) makes the
+launcher fall back to `calm serve` as before, unchanged. To turn daemon mode
+off entirely (e.g. an environment that shouldn't share a process across
+sessions), set `CI_MCP_LAUNCHER_NO_DAEMON=1`.
 
-## Client đã có sẵn config trong repo
+## Clients with config already checked into this repo
 
-Ba file sau đều trỏ vào `scripts/mcp-launcher.sh`, khác nhau ở tên field
-top-level:
+The following three files all point at `scripts/mcp-launcher.sh`, differing
+only in the top-level field name:
 
-| Client | File (repo-level) | Field top-level |
+| Client | File (repo-level) | Top-level field |
 |---|---|---|
 | Claude Code | `.mcp.json` | `mcpServers` |
 | Cursor | `.cursor/mcp.json` | `mcpServers` |
-| VS Code | `.vscode/mcp.json` | `servers` (khác tên, cùng shape `command`/`args`) |
+| VS Code | `.vscode/mcp.json` | `servers` (different name, same `command`/`args` shape) |
 
-Clone repo về là dùng được ngay với cả ba — không cần cấu hình thêm gì.
+Clone the repo and all three work immediately — no further configuration needed.
 
-## Windsurf / Devin Desktop (global config, không check-in được)
+## Windsurf / Devin Desktop (global config, can't be checked in)
 
-Windsurf đổi thương hiệu thành **Devin Desktop** (Cognition, 6/2026) — vẫn
-cùng nền tảng Cascade cũ, đường dẫn config bên dưới không đổi.
+Windsurf rebranded to **Devin Desktop** (Cognition, June 2026) — still the same
+underlying Cascade platform, the config path below is unchanged.
 
-Windsurf/Devin chỉ đọc config từ `~/.codeium/windsurf/mcp_config.json` (theo
-user, không có project-level) — không thể checkout kèm repo được, phải dán
-tay. Cách đơn giản nhất, **không cần clone CALM**, dùng npx như phần Quick
-start ở README:
+Windsurf/Devin only reads config from `~/.codeium/windsurf/mcp_config.json`
+(per-user, no project-level option) — it can't be checked out with the repo,
+so it has to be pasted by hand. The simplest way, **no CALM clone needed**,
+uses npx like the Quick Start section in the README:
 
 ```json
 {
@@ -171,16 +178,17 @@ start ở README:
 }
 ```
 
-Nếu bạn đang dev trên chính repo CALM (không phải project khác), trỏ thẳng
-vào `scripts/mcp-launcher.sh` thay vì npx — thay `/absolute/path/to/CALM`
-bằng đường dẫn thật nơi bạn clone repo này (khác với 3 config check-in ở
-trên, path ở đây **phải là tuyệt đối** vì không có khái niệm "project root"
-cho một file config toàn cục):
+If you're developing on the CALM repo itself (not a different project), point
+at `scripts/mcp-launcher.sh` directly instead of npx — replace
+`/absolute/path/to/CALM` with the real path where you cloned this repo
+(unlike the 3 checked-in configs above, the path here **must be absolute**
+since there's no "project root" concept for a single global config file):
 
-**QUAN TRỌNG:** Vì Windsurf dùng global config, bạn **PHẢI truyền `--project-root`**
-rõ ràng để CALM biết project nào cần index. Nếu không truyền, CALM sẽ dùng
-current working directory của Windsurf process (có thể là thư mục khác hoặc
-home directory), dẫn đến index sai scope.
+**IMPORTANT:** Because Windsurf uses a global config, you **MUST pass
+`--project-root`** explicitly so CALM knows which project to index. Without
+it, CALM falls back to the Windsurf process's current working directory
+(which could be a different directory, or your home directory), leading to
+the wrong scope getting indexed.
 
 ```json
 {
@@ -193,25 +201,25 @@ home directory), dẫn đến index sai scope.
 }
 ```
 
-Thay `/absolute/path/to/CALM` bằng đường dẫn thật nơi bạn clone repo này.
-Cả 2 path (launcher script và project root) phải tuyệt đối.
+Replace `/absolute/path/to/CALM` with the real path where you cloned this repo.
+Both paths (the launcher script and the project root) must be absolute.
 
-Devin Desktop cũng có "MCP Marketplace" riêng ngay trong panel Cascade
-(icon MCPs ở góc trên, hoặc Settings → Cascade → MCP Servers), hỗ trợ cài
-1-click qua deeplink dạng
-`windsurf://windsurf-mcp-registry?serverName=<tên-server>` — **CALM chưa
-được liệt kê ở đó tại thời điểm viết tài liệu này**, nên deeplink kiểu đó
-chưa dùng được cho CALM; dùng 1 trong 2 cách dán tay ở trên trong lúc chờ
-nộp vào marketplace đó.
+Devin Desktop also has its own "MCP Marketplace" right inside the Cascade
+panel (the MCPs icon at the top, or Settings → Cascade → MCP Servers), which
+supports one-click install via a deeplink shaped like
+`windsurf://windsurf-mcp-registry?serverName=<server-name>` — **CALM isn't
+listed there as of this writing**, so that kind of deeplink doesn't work for
+CALM yet; use one of the two manual-paste methods above while a marketplace
+submission is pending.
 
 ## JetBrains AI Assistant
 
-Cấu hình qua UI settings riêng của JetBrains (không phải file check-in vào
-repo) — trỏ command/args giống hệt snippet Windsurf ở trên (path tuyệt đối
-tới `scripts/mcp-launcher.sh`).
+Configured through JetBrains's own UI settings (not a file checked into the
+repo) — point command/args at the exact same snippet as the Windsurf section
+above (absolute path to `scripts/mcp-launcher.sh`).
 
-**QUAN TRỌNG:** Giống Windsurf, JetBrains cũng dùng global config, nên bạn
-**PHẢI truyền `--project-root`** rõ ràng để CALM biết project nào cần index:
+**IMPORTANT:** Like Windsurf, JetBrains also uses a global config, so you
+**MUST pass `--project-root`** explicitly so CALM knows which project to index:
 
 ```json
 {
@@ -220,41 +228,42 @@ tới `scripts/mcp-launcher.sh`).
 }
 ```
 
-Thay `/absolute/path/to/CALM` bằng đường dẫn thật nơi bạn clone repo này.
+Replace `/absolute/path/to/CALM` with the real path where you cloned this repo.
 
 ## Codex CLI (OpenAI)
 
-**Cách nhanh nhất — 1 lệnh, không cần sửa file tay:**
+**Fastest way — one command, no manual file editing:**
 
 ```bash
 codex mcp add calm -- npx -y @eilodon/calm-mcp serve
 ```
 
-Lệnh này tự ghi vào config global (`~/.codex/config.toml`). Xem lại bằng
-`codex mcp list` hoặc `/mcp` trong Codex TUI.
+This writes to the global config (`~/.codex/config.toml`) automatically. Check
+it with `codex mcp list` or `/mcp` inside the Codex TUI.
 
-**CORRECTION (2026-07-12):** bản trước của mục này nói Codex "giống
-Windsurf/JetBrains — không có project-level, chỉ có config toàn cục" — sai,
-đã kiểm chứng lại với tài liệu OpenAI hiện tại. Codex **có hỗ trợ
-project-scoped config** qua `.codex/config.toml` ngay trong repo, chỉ cần
-project đó được đánh dấu "trusted" (cơ chế trust cụ thể chưa được tài liệu
-OpenAI mô tả chi tiết). Một số key nhạy cảm (`model_provider`,
-`model_providers`, `openai_base_url`, `notify`) bị khoá, không override được
-ở project-level — nhưng `mcp_servers.*` không nằm trong danh sách bị khoá,
-nên vẫn khai báo được CALM ở đây thay vì chỉ global:
+**CORRECTION (2026-07-12):** an earlier version of this section said Codex was
+"like Windsurf/JetBrains — no project-level option, global config only" — that
+was wrong, corrected after re-checking current OpenAI documentation. Codex
+**does support project-scoped config** via `.codex/config.toml` right inside
+the repo, as long as that project is marked "trusted" (the exact trust
+mechanism isn't documented in detail by OpenAI). A few sensitive keys
+(`model_provider`, `model_providers`, `openai_base_url`, `notify`) are locked
+and can't be overridden at the project level — but `mcp_servers.*` isn't on
+that locked list, so CALM can still be declared here instead of only globally:
 
 ```toml
-# .codex/config.toml (check in cùng repo, cần project được Codex "trust")
+# .codex/config.toml (checked into the repo, requires the project be "trusted" by Codex)
 [mcp_servers.calm]
 command = "npx"
 args = ["-y", "@eilodon/calm-mcp", "serve"]
 ```
 
-Hoặc nếu đang dev trên chính repo CALM, trỏ vào `scripts/mcp-launcher.sh`
-(path tuyệt đối, cùng lý do như Windsurf) thay vì npx:
+Or, if you're developing on the CALM repo itself, point at
+`scripts/mcp-launcher.sh` (absolute path, same reasoning as Windsurf) instead
+of npx:
 
-**QUAN TRỌNG:** Nếu dùng launcher script (không phải npx), bạn **PHẢI truyền
-`--project-root`** rõ ràng để CALM biết project nào cần index:
+**IMPORTANT:** If you use the launcher script (instead of npx), you **MUST
+pass `--project-root`** explicitly so CALM knows which project to index:
 
 ```toml
 [mcp_servers.calm]
@@ -262,25 +271,26 @@ command = "bash"
 args = ["/absolute/path/to/CALM/scripts/mcp-launcher.sh", "--project-root", "/absolute/path/to/CALM"]
 ```
 
-Thay `/absolute/path/to/CALM` bằng đường dẫn thật nơi bạn clone repo này.
+Replace `/absolute/path/to/CALM` with the real path where you cloned this repo.
 
-Xem chi tiết: [developers.openai.com/codex/mcp](https://developers.openai.com/codex/mcp).
+See details: [developers.openai.com/codex/mcp](https://developers.openai.com/codex/mcp).
 
-**Codex Cloud (bản hosted/async, khác ChatGPT web):** chưa xác nhận được có
-setup-script/environment-config tương đương cho việc pre-build binary hay
-không — tài liệu công khai của OpenAI không đủ chi tiết ở phần này (khác
-với ChatGPT web, xác nhận là *không* đọc config Codex local, dùng cơ chế
-plugin riêng). Nếu cần hỗ trợ Codex Cloud thật sự, phải thử nghiệm trực
-tiếp thay vì suy đoán từ tài liệu.
+**Codex Cloud (the hosted/async product, different from the ChatGPT web app):**
+not yet confirmed whether it has an equivalent setup-script/environment-config
+mechanism for pre-building a binary — OpenAI's public docs aren't detailed
+enough here (unlike the ChatGPT web app, which is confirmed to *not* read local
+Codex config, using its own separate plugin mechanism instead). Anyone who
+actually needs Codex Cloud support should test it directly rather than guess
+from the docs.
 
 ## Antigravity (Google)
 
-Cũng config toàn cục, dùng chung giữa Antigravity IDE và Antigravity CLI, tại
-`~/.gemini/config/mcp_config.json` — cùng shape JSON `mcpServers` như Claude
-Code/Cursor, chỉ khác chỗ đặt file (global, không phải project-level):
+Also a global config, shared between the Antigravity IDE and the Antigravity
+CLI, at `~/.gemini/config/mcp_config.json` — same JSON `mcpServers` shape as
+Claude Code/Cursor, just a different file location (global, not project-level):
 
-**QUAN TRỌNG:** Giống Windsurf, Antigravity cũng dùng global config, nên bạn
-**PHẢI truyền `--project-root`** rõ ràng để CALM biết project nào cần index:
+**IMPORTANT:** Like Windsurf, Antigravity also uses a global config, so you
+**MUST pass `--project-root`** explicitly so CALM knows which project to index:
 
 ```json
 {
@@ -293,18 +303,20 @@ Code/Cursor, chỉ khác chỗ đặt file (global, không phải project-level)
 }
 ```
 
-Thay `/absolute/path/to/CALM` bằng đường dẫn thật nơi bạn clone repo này.
+Replace `/absolute/path/to/CALM` with the real path where you cloned this repo.
 
-Sửa xong lưu file, Antigravity tự reload — không cần restart. Trong IDE cũng
-sửa được qua "..." ở agent panel → "Manage MCP Servers" → "View raw config".
-Path tới `mcp-launcher.sh` vẫn phải tuyệt đối, cùng lý do như Windsurf.
+After saving, Antigravity reloads automatically — no restart needed. It can
+also be edited from inside the IDE via "..." on the agent panel → "Manage MCP
+Servers" → "View raw config". The path to `mcp-launcher.sh` still must be
+absolute, for the same reason as Windsurf.
 
-## Liên quan: race điều kiện lúc cold-start trên Claude Code on the web
+## Related: a cold-start race condition on Claude Code on the web
 
-`docs/cloud-environment-setup.md` giải thích một vấn đề khác, riêng cho
-Claude Code trên web: MCP client dial server **song song** với SessionStart
-hook, không đảm bảo thứ tự — nên `.claude/hooks/session-start-build-calm.sh`
-vẫn tồn tại độc lập với launcher này. Fast path (tầng 1) của launcher chỉ
-kiểm tra "binary đã tồn tại chưa", không kiểm tra binary có bị stale hay
-không (ví dụ đang sửa dở source của chính `calm`) — đó vẫn là vai trò riêng
-của SessionStart hook đó, không bị thay thế bởi launcher này.
+`docs/cloud-environment-setup.md` covers a separate issue specific to Claude
+Code on the web: the MCP client dials the server **in parallel** with the
+SessionStart hook, with no ordering guarantee — so
+`.claude/hooks/session-start-build-calm.sh` still exists independently of this
+launcher. The launcher's fast path (tier 1) only checks "does a binary already
+exist," not whether that binary is stale (e.g. mid-edit on `calm`'s own
+source) — that's still that SessionStart hook's own job, not replaced by this
+launcher.

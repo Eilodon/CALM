@@ -13,9 +13,9 @@ Real call graphs, not vector-similarity guesses · hard safety gates before risk
 
 | | |
 |---|---|
-| **Coverage** | 24 languages parsed · 6 with full call graphs · 12 with a formal/compiler-verified upgrade path |
+| **Coverage** | 24 languages parsed · 13 with full call graphs by default (6 zero-config + 7 more via the default `tier0-5` bundle) · 12 with a formal/compiler-verified upgrade path |
 | **Safety** | The only 1 of 5 real MCP servers tested that refused an unconfirmed edit to a verified hub symbol |
-| **Self-graded** | 9.5% hub concentration · 5.5% dead code · 0 architecture-boundary violations, on CALM's own 2,689-symbol codebase |
+| **Self-graded** | 12.3% hub concentration · 5.1% dead code · 0 architecture-boundary violations, on CALM's own 3,400+-symbol codebase |
 
 Full methodology and more numbers (including a ~60% token-reduction result on repeat hub-symbol lookups) in [Proof, not promises](#proof-not-promises) below.
 
@@ -44,7 +44,7 @@ CALM stands for **Coding Agent Liveness Map**. *Liveness*, because the map is ne
 - **When your compiler can double-check the graph, CALM asks it to.** SCIP overlays (`rust-analyzer`, `scip-go` — including multi-module `go.work` workspaces — `scip-python`, `scip-ruby`, and more) and live LSP overlays (`gopls`, `clangd`) upgrade "best guess" edges to formally verified ones across 12 languages, with zero behavior change on a machine that doesn't have the toolchain installed.
 - **Memory that survives a restart.** `remember`/`recall` keep architecture decisions and gotchas around across sessions instead of making the agent re-derive them from scratch every time.
 - **A codebase that grades itself.** `fitness_report` turns hub concentration, dead code, and architecture-boundary violations into a queryable, CI-enforceable signal instead of a one-off audit.
-- **Plays well with others, and stays on your machine.** A cross-process edit lock and single-writer indexing model mean two editor sessions on the same repo don't corrupt each other's writes or double-index — under the shared daemon, sessions can even see each other coming. No code leaves your machine for indexing, search, or editing; the one narrow exception (a default embedding model download) is opt-out-able. MIT-licensed.
+- **Plays well with others, and stays on your machine.** A cross-process edit lock and single-writer indexing model mean two editor sessions on the same repo don't corrupt each other's writes or double-index — under the shared daemon, sessions can even see each other coming. No code leaves your machine for indexing, search, or editing; the default embedding model is vendored into the binary at build time (zero network at runtime), with a rare, opt-out-able fallback download only if that vendored copy is ever unusable. MIT-licensed.
 
 ## Where CALM fits
 
@@ -80,7 +80,7 @@ CALM is under continuous, active development — the language matrix, the concur
 | **Antigravity** (Google) | CLI · IDE | edit `~/.gemini/config/mcp_config.json` |
 | **JetBrains AI Assistant** | IDE | via UI settings |
 
-Full walkthrough for every client above, including exact global-config snippets for the ones that need one — [`docs/mcp-client-setup.md`](docs/mcp-client-setup.md) (Vietnamese).
+Full walkthrough for every client above, including exact global-config snippets for the ones that need one — [`docs/mcp-client-setup.md`](docs/mcp-client-setup.md).
 
 **Using CALM on your own project** — no clone, no Rust toolchain:
 
@@ -123,7 +123,7 @@ This repo ships ready-made config for Claude Code (`.mcp.json`), Cursor (`.curso
 
 ```
 agent: repo_overview()
-  → 192 files, 2,689 symbols, 175 hub symbols, indexing_phase=ready
+  → 233 files, 3,482 symbols, 275 hub symbols, indexing_phase=ready
 
 agent: "I need to change getUserByEmail"
   → locate("getUserByEmail")        # find the file + symbol metadata
@@ -138,18 +138,19 @@ agent: "I need to change getUserByEmail"
 
 ## Proof, not promises
 
-Numbers are cheap to claim and easy to fake. These are measured, today (2026-07-11), by pointing CALM's own `fitness_report`/`repo_overview` at its own codebase — not aspirational, and reproducible by running the same two tool calls yourself:
+Numbers are cheap to claim and easy to fake. These are measured, today (2026-07-19), by pointing CALM's own `fitness_report`/`repo_overview` at its own codebase — not aspirational, and reproducible by running the same two tool calls yourself:
 
 | Metric | Measured value |
 |---|---|
-| Codebase indexed | **192 files, 2,689 symbols** — 15 languages present in this repo alone |
-| Hub concentration (`hub_pct`) | 9.5% — 175 hub symbols (gate: ≤ 20%) |
-| Self dead-code rate (`dead_code_pct`, coverage-aware) | 5.5% (gate: ≤ 10%) |
-| Edge coverage (`edge_coverage_pct`) | 74.7% of symbols have at least one call edge (gate: ≥ 60%) |
-| High-complexity functions (`high_complexity_pct`) | 2.3% (gate: ≤ 15%) |
-| Architecture boundary violations | 0 (declared rules actively enforced, not aspirational) |
+| Codebase indexed | **233 files, 3,482 symbols** — 15 languages present in this repo alone |
+| Hub concentration (`hub_pct`) | 12.3% — 275 hub symbols (gate: ≤ 20%) |
+| Self dead-code rate (`dead_code_pct`, coverage-aware) | 5.1% (gate: ≤ 10%) |
+| Edge coverage (`edge_coverage_pct`) | 74.8% of symbols have at least one call edge (gate: ≥ 60%) |
+| High-complexity functions (`high_complexity_pct`) | 2.9% (gate: ≤ 15%) |
+| Architecture boundary violations (`boundary_violations`) | 0 (declared rules actively enforced, not aspirational) |
+| Ambiguous symbol boundaries (`boundary_ambiguous_count`) | **52 — currently over gate (≤ 0)**, the one metric `calm fitness-check` fails on today; a shared-line boundary refuses `edit_symbol` replace until resolved. Reported here, not hidden — see [`Fitness check`](#fitness-check--the-ci-gate) |
 | Token efficiency | ~60% fewer tokens on a repeat `callers()` call to a hub symbol (list capping + etag caching) |
-| Full test suite (default features) | **826 passed**, 0 failed (12 ignored — live-binary integration tests for external tools, e.g. `rust-analyzer`/`scip-go`/`scip-java`, not installed in every environment) — see [`Testing`](#testing) for caveats on two environment-sensitive suites |
+| Full test suite (default features) | see [`Testing`](#testing) below for the current pass/fail count and caveats on two environment-sensitive suites |
 
 For context on the SCIP overlay's actual lift: an earlier measurement found 1,619 / 2,096 Rust call edges (77.2%) upgraded to `formal` (rust-analyzer ground truth) on a smaller snapshot of this graph, up from 0% before the overlay existed — not re-measured at the current graph size, but the mechanism hasn't changed. A separate, stricter Rust-only measurement against a full `rust-analyzer` SCIP oracle (precision/recall, not just "% upgraded") found precision 0.795 / recall 0.193 for the pre-overlay syntactic resolver alone — i.e. what it claims is usually right, but it was missing most of the oracle's edges before the SCIP overlay closes that gap; that number predates the overlay and hasn't been re-run since. Reported here, unflattering parts included, because that's this project's own stated benchmark policy.
 
@@ -237,7 +238,7 @@ Distinct from the `tools` above — MCP Prompts (`prompts/list`, `prompts/get`) 
 
 ## Fitness check — the CI gate
 
-`calm fitness-check` measures 9 metrics against thresholds declared in `thresholds.toml`:
+`calm fitness-check` measures 10 metrics against thresholds declared in `thresholds.toml`:
 
 | Metric | What it measures | Default threshold |
 |---|---|---|
@@ -249,6 +250,7 @@ Distinct from the `tools` above — MCP Prompts (`prompts/list`, `prompts/get`) 
 | `edge_coverage_pct` | % of symbols with at least one call edge | ≥ 60% |
 | `high_complexity_pct` | % of functions/methods with McCabe cyclomatic complexity > 10 (AST-based; Tier-0.5 languages always report complexity 1) | ≤ 15.0% |
 | `boundary_violations` | Count of `import_edges` violating a declared `[[boundaries]]` rule | ≤ 0 |
+| `boundary_ambiguous_count` | Count of symbols with an ambiguous line boundary (shared with a neighbor) — `edit_symbol` replace on these is refused until resolved | ≤ 0 |
 | `config_drift_count` | Count of doc file-path references (declared via `[config_drift].doc_paths`) pointing at nothing real | ≤ 0 |
 
 Every `calm fitness-check` run also snapshots metrics to the DB so `edit_context` can show a trend (delta versus the previous day).
@@ -268,29 +270,28 @@ reason = "indexer (extraction) must stay upstream of analysis (dead-code, hotspo
 
 ## Deployment
 
-- `cargo build --release` → static musl binaries via `.github/workflows/release.yml`, matrix: `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl` (with `SHA256SUMS`), `aarch64-apple-darwin`. `scripts/mcp-launcher.sh` downloads and checksum-verifies the right platform's build automatically when checkout is on a matching git tag.
+- `cargo build --release` → static (musl on Linux) binaries via `.github/workflows/release.yml`, 5-target matrix with `SHA256SUMS` + build-provenance attestation for every asset: `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-pc-windows-msvc`. `scripts/mcp-launcher.sh`/`scripts/install.sh` download and checksum-verify the right platform's build automatically when checkout is on (or you're installing) a matching git tag.
 - `Containerfile`, multi-stage (`rust:alpine` → `scratch`) — a single static binary, no runtime image needed, published to `ghcr.io/eilodon/calm-mcp` (tagged by version + `latest`) on every git tag push.
 - `compose.yaml` ships a hardened example (`read_only`, `cap_drop: ALL`, `no-new-privileges`, `pids_limit: 64`, `mem_limit: 256m`).
-- The repo uses Git LFS for `crates/calm-core/assets/potion-code-16m/*.safetensors` (~61MB) — run `git lfs install && git lfs pull` to get the real weight file.
+- The default embedding model's weights are vendored into the binary via `include_bytes!` — `build.rs::ensure_embedding_weights` fetches `crates/calm-core/assets/potion-code-16m/*.safetensors` from Hugging Face Hub and checksum-verifies it once at *compile* time, so a normal `cargo build`/release binary loads it with zero network I/O at runtime. No Git LFS is involved (the repo carries zero LFS content).
 
 <details>
-<summary>What happens if you skip <code>git lfs pull</code></summary>
+<summary>What happens if the build-time fetch fails (offline build, etc.)</summary>
 
-`git clone`/`cargo build` still **compiles successfully** (`include_bytes!` just embeds raw bytes without parsing them) — but that file is a ~130-byte LFS pointer instead of the real model, so loading it **at runtime** fails ("failed to parse safetensors"), `indexing_status` reports `embeddings_status: "failed"`, and `search(kind="semantic"/"hybrid")` automatically degrades to FTS-only — no crash, just no semantic search until you run `git lfs pull` and rebuild.
+`cargo build` still **compiles successfully** — `build.rs` writes a small placeholder stub in place of the real weights instead of failing the build. Loading that stub **at runtime** fails ("failed to parse safetensors"), so `Embedder::load` automatically falls back to a one-time Hugging Face Hub download of the same model (cached locally afterward, gated by `semantic_search.allow_network_fallback`). If that fallback is disabled or also unavailable, `indexing_status` reports `embeddings_status: "failed"` and `search(kind="semantic"/"hybrid")` degrades to FTS-only — no crash, just no semantic search until the model is available and you rebuild or re-run.
 
 </details>
 
 ## Testing
 
 ```bash
-cargo test --workspace                        # unit + integration (default features)
-cargo test -p calm-core --features embeddings   # includes the semantic/vector path (brute-force cosine KNN)
+cargo test --workspace                        # unit + integration (embeddings is a default feature, included)
 cargo test --test parity_test test_formal_edges   # Stack Graphs regression corpus
 ```
 
-Three CI jobs run on every PR: `verify` (fmt/clippy/test/audit), `stack-graphs-corpus` (formal-resolver parity), `embeddings` (clippy + test with the `embeddings` feature).
+Five CI jobs run on every PR: `verify` (fmt/clippy/test/audit), `stack-graphs-corpus` (formal-resolver parity), `embeddings` (clippy + test with the `embeddings` feature), `all-languages` (fixture-repo indexing across all 24 parsed languages), `js-client-interop` (cross-checks the tool schema against a real JS MCP SDK client, not just Rust's own).
 
-Full workspace run, today (2026-07-11): **826 passed**, 0 failed, 12 ignored (live-binary integration tests for external tools, e.g. `rust-analyzer`/`scip-go`/`scip-java`, not installed in every environment).
+Full workspace run, today (2026-07-19): **1,048 passed**, 0 failed, 14 ignored (live-binary integration tests for external tools, e.g. `rust-analyzer`/`scip-go`/`scip-java`, not installed in every environment).
 
 ## Further reading
 
@@ -298,6 +299,7 @@ Everything below is more detail than this README needs to make its case — poin
 
 - [`docs/architecture.md`](docs/architecture.md) — the full technical deep-dive: multi-tier indexing, SCIP/LSP overlays, search internals, the edit safety net, concurrency, self-grading, memory, sanitization, and the design philosophy behind it all.
 - [`docs/comparison.md`](docs/comparison.md) — methodology-first positioning write-up against other tools in this category.
+- [`docs/what-external-users-get.md`](docs/what-external-users-get.md) — exactly what an `npx`/npm/MCP-Registry install gives you, as distinct from this repo's own dev checkout: install/distribution mechanics, the full tool and toolset breakdown, the edit safety layer, language coverage, and what never ships externally.
 - [`docs/`](docs/) — resolver internals, migration plans, and other design notes not covered by `docs/architecture.md` above.
 - [`docs/adr/`](docs/adr/) — individual architecture decision records (Stack Graphs scope, the formal-resolver approach, the LSP-optional confidence upgrade, the daemon+forwarder concurrency model).
 - [`docs/mcp-client-setup.md`](docs/mcp-client-setup.md) — every MCP client install path in detail, including Windsurf/Devin Desktop and Codex global config.
