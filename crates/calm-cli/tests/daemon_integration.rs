@@ -13,7 +13,7 @@
 //! modes if gotten wrong.
 #![cfg(unix)]
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -69,23 +69,35 @@ fn send_initialize_and_capture(calm_dir_project: &Path) -> std::process::Output 
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawning calm connect");
-    {
-        // Scoped so the write end drops (closes) before `wait_with_output`
-        // blocks. The sleep before that close matters: a real MCP client
-        // keeps stdin open for the whole session, but closing immediately
-        // after the write here races `relay`'s two directions against each
-        // other — `client_to_daemon` can hit EOF (this pipe closing) and
-        // trip the "client closed first = normal exit" branch *before*
-        // `daemon_to_client` has forwarded the response that's still in
-        // flight, producing empty stdout despite a real response having
-        // been sent. Hit exactly this race during manual smoke-testing
-        // (`printf | calm connect` with no delay) before M3 shipped — same
-        // fix here: give the response a real chance to arrive first.
-        let mut stdin = child.stdin.take().unwrap();
-        stdin.write_all(request).unwrap();
-        std::thread::sleep(Duration::from_millis(500));
+
+    let stdout = child.stdout.take().expect("piped stdout");
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(request).unwrap();
+
+    // Wait for the real response (echoes back "id":1) before closing stdin
+    // — see `StdoutWatcher`'s doc comment. Closing stdin immediately after
+    // the write (no wait at all) would race `relay`'s two directions
+    // against each other: `client_to_daemon` can hit EOF (this pipe
+    // closing) and trip the "client closed first = normal exit" branch
+    // *before* `daemon_to_client` has forwarded the response that's still
+    // in flight, producing empty stdout despite a real response having
+    // been sent. Hit exactly this race during manual smoke-testing
+    // (`printf | calm connect` with no delay) before M3 shipped — waiting
+    // for the actual response closes it precisely, rather than a fixed
+    // delay long enough on a lightly-loaded machine.
+    let watcher = StdoutWatcher::spawn(stdout);
+    watcher.wait_for("\"id\":1", Duration::from_secs(8));
+    drop(stdin);
+    let mut stderr_text = Vec::new();
+    if let Some(mut stderr) = child.stderr.take() {
+        let _ = stderr.read_to_end(&mut stderr_text);
     }
-    child.wait_with_output().expect("calm connect should exit")
+    let status = child.wait().expect("calm connect should exit");
+    std::process::Output {
+        status,
+        stdout: watcher.finish().into_bytes(),
+        stderr: stderr_text,
+    }
 }
 
 /// ADR-0005's own self-flagged Risk #1, highest severity: the daemon must
@@ -160,6 +172,74 @@ fn daemon_survives_forwarders_process_group_sigterm() {
     }
 }
 
+/// Reads `stdout` incrementally on a background thread and polls the
+/// accumulated bytes until they contain `needle` or `timeout` elapses —
+/// synchronizes on the daemon's actual response instead of guessing how
+/// long a cold start + round trip takes. `connect_live_and_current`
+/// (`crates/calm-server/src/daemon.rs`) itself budgets up to 5s for a
+/// freshly-spawned daemon to become reachable, so a fixed sub-second sleep
+/// here would race that budget under load rather than actually wait it out.
+/// Reads a child's stdout incrementally on a background thread so a caller
+/// can (1) know once the accumulated output contains some marker — safe to
+/// close stdin without racing `relay`'s two directions against each other
+/// (see the callers below) — and separately (2) get the *complete* output
+/// once the child has actually exited. `connect_live_and_current`
+/// (`crates/calm-server/src/daemon.rs`) itself budgets up to 5s for a
+/// freshly-spawned daemon to become reachable, so a fixed sub-second sleep
+/// before closing stdin would race that budget under load rather than
+/// actually wait it out — hence (1). Splitting (1) from (2) matters because
+/// a large response (e.g. a full tool list with schemas) can arrive from the
+/// daemon across several `read`s: a marker near the *start* of that response
+/// can already be in the buffer while the rest is still in flight, so taking
+/// a snapshot the instant the marker appears — instead of waiting for real
+/// EOF — can return truncated content under load. `finish` only reads to
+/// EOF, so call it after the child is already exiting (stdin dropped,
+/// `child.wait()` done), never on its own — otherwise it blocks forever.
+struct StdoutWatcher {
+    buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    handle: std::thread::JoinHandle<()>,
+}
+
+impl StdoutWatcher {
+    fn spawn(mut stdout: std::process::ChildStdout) -> Self {
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let reader_buf = buf.clone();
+        let handle = std::thread::spawn(move || {
+            let mut chunk = [0u8; 4096];
+            loop {
+                match stdout.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => reader_buf.lock().unwrap().extend_from_slice(&chunk[..n]),
+                }
+            }
+        });
+        Self { buf, handle }
+    }
+
+    /// Blocks until the accumulated bytes so far contain `needle` or
+    /// `timeout` elapses. Not for reading final content — see `finish`.
+    fn wait_for(&self, needle: &str, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if String::from_utf8_lossy(&self.buf.lock().unwrap()).contains(needle) {
+                return;
+            }
+            if Instant::now() >= deadline {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Joins the reader thread (blocks until the pipe hits real EOF) and
+    /// returns everything it read. Only call once the child is known to be
+    /// exiting — otherwise this can hang indefinitely.
+    fn finish(self) -> String {
+        let _ = self.handle.join();
+        String::from_utf8_lossy(&self.buf.lock().unwrap()).into_owned()
+    }
+}
+
 /// `--preset`/`--db-path` on `calm connect` must reach the daemon it spawns
 /// (crates/calm-server/src/daemon.rs::spawn_detached_daemon), not just be
 /// accepted by the CLI parser and silently dropped. Asserts on the visible
@@ -187,26 +267,39 @@ fn calm_connect_forwards_preset_to_the_daemon_it_spawns() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawning calm connect --preset orient");
-    {
-        let mut stdin = child.stdin.take().unwrap();
-        stdin.write_all(initialize).unwrap();
-        std::thread::sleep(Duration::from_millis(500));
-        stdin.write_all(list_tools).unwrap();
-        std::thread::sleep(Duration::from_millis(500));
+
+    let stdout = child.stdout.take().expect("piped stdout");
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    stdin.write_all(initialize).unwrap();
+    stdin.write_all(list_tools).unwrap();
+
+    // Wait for the real `tools/list` response (echoes back "id":2) before
+    // closing stdin — see `StdoutWatcher`'s doc comment for why a fixed
+    // sleep here is racy. Not `"tools"`: the *initialize* response already
+    // contains that substring via its own `capabilities":{"tools":{}}`, so it
+    // would match one response too early.
+    let watcher = StdoutWatcher::spawn(stdout);
+    watcher.wait_for("\"id\":2", Duration::from_secs(8));
+    drop(stdin); // EOF now that the response is in, so the forwarder can exit
+    let mut stderr_text = Vec::new();
+    if let Some(mut stderr) = child.stderr.take() {
+        let _ = stderr.read_to_end(&mut stderr_text);
     }
-    let output = child
-        .wait_with_output()
-        .expect("calm connect --preset orient should exit");
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let _ = child.wait();
+    // Only read the full response now that the child is exiting — the
+    // tools/list response is large enough to arrive across several reads,
+    // so snapshotting at the first sight of "id":2 (before EOF) risked
+    // returning it truncated.
+    let stdout_text = watcher.finish();
+    let stderr_text = String::from_utf8_lossy(&stderr_text);
 
     assert!(
-        stdout.contains("\"repo_overview\""),
-        "orient preset must include repo_overview, got stdout: {stdout}\nstderr: {}",
-        String::from_utf8_lossy(&output.stderr)
+        stdout_text.contains("\"repo_overview\""),
+        "orient preset must include repo_overview, got stdout: {stdout_text}\nstderr: {stderr_text}"
     );
     assert!(
-        !stdout.contains("\"edit_context\""),
-        "orient preset must NOT include edit_context — if it's present, --preset wasn't forwarded to the spawned daemon. stdout: {stdout}"
+        !stdout_text.contains("\"edit_context\""),
+        "orient preset must NOT include edit_context — if it's present, --preset wasn't forwarded to the spawned daemon. stdout: {stdout_text}"
     );
 }
 

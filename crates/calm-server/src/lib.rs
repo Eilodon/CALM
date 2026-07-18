@@ -400,6 +400,7 @@ pub async fn bootstrap(
                 watch_embedder,
                 watch_coverage,
                 watch_graph_mode,
+                None,
             );
         });
         // Await (rather than discard) the indexer thread's handle so a panic

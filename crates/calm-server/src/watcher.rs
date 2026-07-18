@@ -43,7 +43,16 @@ fn is_relevant_path(path: &Path) -> bool {
 }
 
 fn event_is_relevant(res: &notify::Result<notify::Event>) -> bool {
-    matches!(res, Ok(event) if event.paths.iter().any(|p| is_relevant_path(p)))
+    // `need_rescan()` is `notify`'s own signal that the OS watch backend may
+    // have dropped events (e.g. the kernel's inotify queue overflowed under
+    // heavy I/O) — path-matching against `is_relevant_path` doesn't apply to
+    // a "something changed, we don't know what" notice, so treat it as
+    // relevant unconditionally. This is what lets a missed add/delete event
+    // still get picked up: the very next tick's reindex is a full-tree walk
+    // regardless of which event triggered it (see `run_watch_loop`), so
+    // reacting to the rescan flag heals a dropped event without needing to
+    // know which file it was about.
+    matches!(res, Ok(event) if event.need_rescan() || event.paths.iter().any(|p| is_relevant_path(p)))
 }
 
 /// True when `path` is one of the fixed coverage-report locations
@@ -77,6 +86,14 @@ pub fn run_watch_loop(
     // Phase B T6.5: shared slot indexing_status reads to report which
     // rebuild path the most recent reindex took.
     graph_mode: std::sync::Arc<std::sync::RwLock<Option<String>>>,
+    // Fired once the OS-level watch is actually armed (right after
+    // `watcher.watch` returns `Ok`), so a caller that needs to know the
+    // watch is live before mutating the tree (namely this module's own
+    // integration tests) can wait on a real signal instead of guessing a
+    // sleep duration long enough to outlast this thread's own scheduling
+    // delay under load. `None` in production (`bootstrap` below) — nothing
+    // there needs to block on watch-armed.
+    ready: Option<std::sync::mpsc::Sender<()>>,
 ) {
     let (tx, rx) = mpsc::channel();
     let mut watcher = match recommended_watcher(move |res| {
@@ -95,8 +112,10 @@ pub fn run_watch_loop(
         );
         return;
     }
+    if let Some(ready) = ready {
+        let _ = ready.send(());
+    }
     tracing::info!("File watcher active on {}", project_root.display());
-
     // Checked between reindex parse batches too (not just once per loop
     // iteration here) — a single `reindex_changed` call on a large changed
     // set (e.g. a git branch switch touching thousands of files) can itself

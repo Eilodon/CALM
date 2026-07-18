@@ -521,6 +521,22 @@ async fn connect_live_and_current(
     spawn_detached_daemon(project_root, socket_path, preset, db_path)?;
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    // Re-spawn on this cadence, not just once up front: `bind_or_yield`'s
+    // split-brain protection (ADR-0005 §3 — "bind IS the natural spawn
+    // mutex") means a losing candidate is *designed* to be cheap and yield
+    // immediately, so retrying the spawn here is free of new invariants, not
+    // a workaround. Needed because a candidate can lose the bind race for a
+    // reason other than "a live current-build daemon already owns the
+    // socket": if the previous holder was mid-shutdown (stale-build
+    // SIGTERM'd by `try_connect_current` below), its socket file can still
+    // be bound at the exact moment this candidate calls `bind_or_yield`,
+    // which then sees it as "still live" and yields — permanently, since
+    // nothing else in this loop ever attempts another bind. Without a
+    // repeat spawn, that single lost race means this whole call times out
+    // at the deadline below even though the stale daemon finishes exiting
+    // (and its socket becomes free) well within the 5s budget.
+    let mut last_spawn_attempt = std::time::Instant::now();
+    const RESPAWN_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
     loop {
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         if let Some(stream) = try_connect_current(calm_dir, socket_path).await {
@@ -531,6 +547,10 @@ async fn connect_live_and_current(
                 "daemon at {} did not become reachable within 5s of spawning it",
                 socket_path.display()
             );
+        }
+        if last_spawn_attempt.elapsed() >= RESPAWN_RETRY_INTERVAL {
+            spawn_detached_daemon(project_root, socket_path, preset, db_path)?;
+            last_spawn_attempt = std::time::Instant::now();
         }
     }
 }

@@ -55,6 +55,7 @@ fn watcher_reindexes_add_and_delete() {
     assert_eq!(symbol_count(&db_path), 1, "initial index");
 
     let ct = CancellationToken::new();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     let handle = {
         let (root, db, ct) = (dir.clone(), db_path.clone(), ct.clone());
         let embedder: calm_server::EmbedderHandle =
@@ -70,12 +71,17 @@ fn watcher_reindexes_add_and_delete() {
                 embedder,
                 coverage,
                 std::sync::Arc::new(std::sync::RwLock::new(None)),
+                Some(ready_tx),
             )
         })
     };
 
-    // Let the watcher register before mutating the tree.
-    std::thread::sleep(Duration::from_millis(400));
+    // Wait for the watcher to actually arm its OS-level watch before mutating
+    // the tree — a fixed sleep here raced real thread-scheduling delay under
+    // load (see `run_watch_loop`'s `ready` doc comment).
+    ready_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("watcher should signal ready within 10s");
 
     // Add a file → watcher should incrementally index it.
     std::fs::write(dir.join("b.py"), "def b():\n    pass\n").unwrap();
@@ -131,6 +137,7 @@ fn concurrent_edit_write_and_watcher_reindex_does_not_lock_or_go_stale() {
     assert_eq!(symbol_count(&db_path), 1, "initial index");
 
     let ct = CancellationToken::new();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     let handle = {
         let (root, db, ct) = (dir.clone(), db_path.clone(), ct.clone());
         let embedder: calm_server::EmbedderHandle =
@@ -146,10 +153,13 @@ fn concurrent_edit_write_and_watcher_reindex_does_not_lock_or_go_stale() {
                 embedder,
                 coverage,
                 std::sync::Arc::new(std::sync::RwLock::new(None)),
+                Some(ready_tx),
             )
         })
     };
-    std::thread::sleep(Duration::from_millis(400));
+    ready_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("watcher should signal ready within 10s");
 
     // Simulate edit_lines_impl's own write+reindex sequence, firing right
     // after a file write the watcher is independently about to react to —
@@ -246,6 +256,7 @@ fn watcher_hot_reloads_coverage_file_change() {
     );
 
     let ct = CancellationToken::new();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     let handle = {
         let (root, db, ct, coverage) = (dir.clone(), db_path.clone(), ct.clone(), coverage.clone());
         let embedder: calm_server::EmbedderHandle =
@@ -258,12 +269,14 @@ fn watcher_hot_reloads_coverage_file_change() {
                 embedder,
                 coverage,
                 std::sync::Arc::new(std::sync::RwLock::new(None)),
+                Some(ready_tx),
             )
         })
     };
 
-    // Let the watcher register before mutating the tree.
-    std::thread::sleep(Duration::from_millis(400));
+    ready_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("watcher should signal ready within 10s");
 
     // Write a coverage report *after* the watcher is running — this is the
     // "regenerated mid-session" case the fix targets.
