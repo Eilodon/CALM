@@ -24,12 +24,24 @@ pub fn update_boundary_ambiguous_flags(conn: &Connection) -> rusqlite::Result<()
 
     let mut ambiguous_qns: Vec<String> = Vec::new();
     for window in rows.windows(2) {
-        let (qn_a, path_a, _start_a, end_a) = &window[0];
-        let (qn_b, path_b, start_b, _end_b) = &window[1];
+        let (qn_a, path_a, start_a, end_a) = &window[0];
+        let (qn_b, path_b, start_b, end_b) = &window[1];
         if path_a != path_b {
             continue;
         }
-        if end_a >= start_b {
+        // A symbol whose range fully contains the next one — a class/impl
+        // immediately followed by its own first nested method, or a Rust
+        // fn immediately followed by an item declared inside its body — is
+        // normal structural nesting, not a boundary-parsing ambiguity: the
+        // container's line_end reaching past the child's line_start is
+        // exactly what nesting looks like. Only treat a touch/overlap as
+        // ambiguous when b is NOT strictly nested inside a. `start_b >
+        // start_a` is deliberately strict (not `>=`): a child that starts
+        // on the *same* line as its container (e.g. a one-line class body)
+        // is a case a line-range replace genuinely can't disambiguate, so
+        // it must stay flagged rather than be waved through as "contained."
+        let b_nested_in_a = start_b > start_a && end_b <= end_a;
+        if end_a >= start_b && !b_nested_in_a {
             ambiguous_qns.push(qn_a.clone());
             ambiguous_qns.push(qn_b.clone());
         }
@@ -144,5 +156,77 @@ mod tests {
             )
             .unwrap();
         assert_eq!(a, 0, "flag must clear once the boundary no longer overlaps");
+    }
+
+    #[test]
+    fn does_not_flag_pure_containment() {
+        let conn = setup_db();
+        // A container (e.g. a class, or a Rust item declared inside a
+        // function body) whose range simply encloses its own first child is
+        // normal nesting, not a boundary-parsing ambiguity — replacing the
+        // child by its own line range doesn't touch anything outside it.
+        insert_symbol(&conn, "container", "f.rs", 1, 20);
+        insert_symbol(&conn, "child", "f.rs", 2, 10);
+        update_boundary_ambiguous_flags(&conn).unwrap();
+
+        let container: i64 = conn
+            .query_row(
+                "SELECT boundary_ambiguous FROM symbols WHERE qualified_name = 'container'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let child: i64 = conn
+            .query_row(
+                "SELECT boundary_ambiguous FROM symbols WHERE qualified_name = 'child'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            container, 0,
+            "container containing its own child is not ambiguous"
+        );
+        assert_eq!(
+            child, 0,
+            "child fully nested inside its container is not ambiguous"
+        );
+    }
+
+    #[test]
+    fn flags_child_starting_on_the_same_line_as_its_container() {
+        let conn = setup_db();
+        // Degenerate edge case: the child starts on the exact same line as
+        // its container (e.g. a one-line class body). A line-range replace
+        // genuinely can't disambiguate the two here, so this must stay
+        // flagged even though it's geometrically "contained" — the
+        // containment exclusion requires a STRICT start_b > start_a for
+        // exactly this reason.
+        insert_symbol(&conn, "container", "f.rs", 1, 20);
+        insert_symbol(&conn, "child", "f.rs", 1, 10);
+        update_boundary_ambiguous_flags(&conn).unwrap();
+
+        let container: i64 = conn
+            .query_row(
+                "SELECT boundary_ambiguous FROM symbols WHERE qualified_name = 'container'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let child: i64 = conn
+            .query_row(
+                "SELECT boundary_ambiguous FROM symbols WHERE qualified_name = 'child'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            container, 1,
+            "same start line as its child is a real replace hazard"
+        );
+        assert_eq!(
+            child, 1,
+            "same start line as its container is a real replace hazard"
+        );
     }
 }
