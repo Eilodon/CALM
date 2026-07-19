@@ -17,7 +17,7 @@ members = [
 # version against the downloaded release binary's real `--version` output
 # and treats any mismatch as a corrupted/wrong download, so a stale value
 # here silently defeats the verified-download fast path for everyone.
-version = "0.3.1"
+version = "0.3.2"
 edition = "2024"
 license = "MIT"
 rust-version = "1.85"
