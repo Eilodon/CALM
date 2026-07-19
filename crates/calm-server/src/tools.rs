@@ -12,7 +12,7 @@ use calm_core::embedding::Embedder;
 use calm_core::sanitize::{injection_warning, sanitize_source_output};
 use calm_core::types::{EmbedStatus, IndexingPhase};
 
-mod common;
+pub(crate) mod common;
 mod edit;
 mod guardrails;
 mod inspect;

@@ -12,6 +12,8 @@ use std::time::Duration;
 use notify::{RecursiveMode, Watcher, recommended_watcher};
 use tokio_util::sync::CancellationToken;
 
+use crate::tools::common::RwLockExt;
+
 /// Quiet period after the last event before a reindex fires.
 const DEBOUNCE: Duration = Duration::from_millis(500);
 
@@ -175,7 +177,7 @@ pub fn run_watch_loop(
         if coverage_touched {
             let reloaded = calm_core::analysis::coverage::load_coverage(&project_root);
             tracing::info!("Coverage file changed — reloaded ({})", reloaded.source);
-            *coverage.write().unwrap() = reloaded;
+            *coverage.write_ok() = reloaded;
         }
 
         match calm_core::db::conn::open_writer(&db_path) {
@@ -189,7 +191,7 @@ pub fn run_watch_loop(
                         if !s.is_noop() =>
                     {
                         let mode = s.graph_mode.label();
-                        *graph_mode.write().unwrap() = Some(mode.clone());
+                        *graph_mode.write_ok() = Some(mode.clone());
                         tracing::info!(
                             graph_mode = %mode,
                             "Incremental reindex: {} changed, {} deleted",
@@ -198,7 +200,7 @@ pub fn run_watch_loop(
                         );
                         // Embed any symbols/chunks added by this reindex (Layer 1 +
                         // Layer 2 — see indexer::chunker for the latter).
-                        if let Some(model) = embedder.read().unwrap().clone() {
+                        if let Some(model) = embedder.read_ok().clone() {
                             if let Err(e) =
                                 calm_core::embedding::embed_pending(&conn, model.as_ref())
                             {

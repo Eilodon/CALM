@@ -69,14 +69,18 @@ pub fn run_all_coalesced(root: &Path, db_path: &Path) {
 /// one language's overlay (or its own DB connection) is logged and does not
 /// affect any other language's run.
 pub fn run_all(root: &Path, db_path: &Path) {
+    // Loaded once up front, not once per language via 8 separate concurrent
+    // load_config(...).unwrap_or_default() calls -- each independently
+    // re-read and re-parsed config.json, silently discarding a malformed
+    // config 8x over. `Config`'s fields are read-only from here on, so a
+    // shared `&config.<lang>` borrow into each std::thread::scope closure
+    // is sound without cloning.
+    let config = calm_core::config::load_config_or_warn(root);
     std::thread::scope(|s| {
         s.spawn(|| {
             run_one("rust", db_path, |conn| {
-                let rust_cfg = calm_core::config::load_config(root)
-                    .map(|c| c.rust)
-                    .unwrap_or_default();
                 let dirty = calm_core::scip::rust_source_dirty_keys(conn);
-                let stats = calm_core::scip::run_overlay(conn, root, &rust_cfg, &dirty)?;
+                let stats = calm_core::scip::run_overlay(conn, root, &config.rust, &dirty)?;
                 // caller_count was computed by the reindex that ran before this
                 // overlay pass, before the overlay flipped
                 // edge_confidence/ruled_out_by_scip on (or inserted) some edges —
@@ -95,66 +99,42 @@ pub fn run_all(root: &Path, db_path: &Path) {
         });
         s.spawn(|| {
             run_one("go", db_path, |conn| {
-                let cfg = calm_core::config::load_config(root)
-                    .map(|c| c.go)
-                    .unwrap_or_default();
-                calm_core::scip::run_go_overlay_and_log(conn, root, &cfg)
+                calm_core::scip::run_go_overlay_and_log(conn, root, &config.go)
             });
         });
         s.spawn(|| {
             run_one("python", db_path, |conn| {
-                let cfg = calm_core::config::load_config(root)
-                    .map(|c| c.python)
-                    .unwrap_or_default();
-                calm_core::scip::run_python_overlay_and_log(conn, root, &cfg)
+                calm_core::scip::run_python_overlay_and_log(conn, root, &config.python)
             });
         });
         s.spawn(|| {
             run_one("js", db_path, |conn| {
-                let cfg = calm_core::config::load_config(root)
-                    .map(|c| c.js)
-                    .unwrap_or_default();
-                calm_core::scip::run_js_overlay_and_log(conn, root, &cfg)
+                calm_core::scip::run_js_overlay_and_log(conn, root, &config.js)
             });
         });
         s.spawn(|| {
             run_one("java", db_path, |conn| {
-                let cfg = calm_core::config::load_config(root)
-                    .map(|c| c.java)
-                    .unwrap_or_default();
-                calm_core::scip::run_java_overlay_and_log(conn, root, &cfg)
+                calm_core::scip::run_java_overlay_and_log(conn, root, &config.java)
             });
         });
         s.spawn(|| {
             run_one("csharp", db_path, |conn| {
-                let cfg = calm_core::config::load_config(root)
-                    .map(|c| c.csharp)
-                    .unwrap_or_default();
-                calm_core::scip::run_csharp_overlay_and_log(conn, root, &cfg)
+                calm_core::scip::run_csharp_overlay_and_log(conn, root, &config.csharp)
             });
         });
         s.spawn(|| {
             run_one("php", db_path, |conn| {
-                let cfg = calm_core::config::load_config(root)
-                    .map(|c| c.php)
-                    .unwrap_or_default();
-                calm_core::scip::run_php_overlay_and_log(conn, root, &cfg)
+                calm_core::scip::run_php_overlay_and_log(conn, root, &config.php)
             });
         });
         s.spawn(|| {
             run_one("c", db_path, |conn| {
-                let cfg = calm_core::config::load_config(root)
-                    .map(|c| c.clang)
-                    .unwrap_or_default();
-                calm_core::scip::run_clang_overlay_and_log(conn, root, &cfg)
+                calm_core::scip::run_clang_overlay_and_log(conn, root, &config.clang)
             });
         });
         s.spawn(|| {
             run_one("ruby", db_path, |conn| {
-                let cfg = calm_core::config::load_config(root)
-                    .map(|c| c.ruby)
-                    .unwrap_or_default();
-                calm_core::scip::run_ruby_overlay_and_log(conn, root, &cfg)
+                calm_core::scip::run_ruby_overlay_and_log(conn, root, &config.ruby)
             });
         });
     });

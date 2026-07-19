@@ -25,6 +25,7 @@ use anyhow::{Context, Result};
 use tokio_util::sync::CancellationToken;
 
 use crate::tools::CalmServer;
+use crate::tools::common::RwLockExt;
 use crate::{Bootstrapped, bootstrap, shutdown_and_checkpoint};
 
 /// Runs CALM as a daemon listening on `socket_path`. Returns once shut down
@@ -239,11 +240,11 @@ fn is_idle(
         return false;
     }
     let phase_stable = matches!(
-        *phase.read().unwrap(),
+        *phase.read_ok(),
         IndexingPhase::Ready | IndexingPhase::Failed
     );
     let embed_stable = !matches!(
-        *embed_status.read().unwrap(),
+        *embed_status.read_ok(),
         EmbedStatus::Downloading | EmbedStatus::Embedding
     );
     phase_stable && embed_stable

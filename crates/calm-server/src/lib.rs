@@ -16,6 +16,7 @@ use rmcp::transport::stdio;
 use tokio_util::sync::CancellationToken;
 
 use tools::CalmServer;
+use tools::common::RwLockExt;
 
 /// Shared handle to the loaded embedder, written by the indexer, read by tools.
 pub type EmbedderHandle = Arc<RwLock<Option<Arc<Embedder>>>>;
@@ -136,9 +137,7 @@ pub async fn bootstrap(
         });
     }
 
-    let semantic = calm_core::config::load_config(&project_root)
-        .map(|c| c.semantic_search)
-        .unwrap_or_default();
+    let semantic = calm_core::config::load_config_or_warn(&project_root).semantic_search;
 
     let indexer_db_path = db_path.clone();
     let indexer_root = project_root.clone();
@@ -216,7 +215,7 @@ pub async fn bootstrap(
                             .query_row("SELECT COUNT(*) FROM file_index", [], |r| r.get(0))
                             .unwrap_or(0);
                         if existing_files > 0 {
-                            *phase.write().unwrap() = calm_core::types::IndexingPhase::Ready;
+                            *phase.write_ok() = calm_core::types::IndexingPhase::Ready;
                         }
                     }
                     // The lock only gates *writes* (new index rows, new embedding
@@ -268,7 +267,7 @@ pub async fn bootstrap(
                     }
                 }
             };
-            *owns_indexer_lock.write().unwrap() = true;
+            *owns_indexer_lock.write_ok() = true;
 
             if let Ok(mut conn) = calm_core::db::conn::open_writer(&indexer_db_path) {
                 let _ = calm_core::db::schema::init_db(&conn);
@@ -289,7 +288,7 @@ pub async fn bootstrap(
                     tracing::info!(
                         "Existing index found ({existing_files} files) — incremental reindex"
                     );
-                    *phase.write().unwrap() = calm_core::types::IndexingPhase::Parsing;
+                    *phase.write_ok() = calm_core::types::IndexingPhase::Parsing;
                     match calm_core::indexer::pipeline::reindex_changed_cancellable(
                         &mut conn,
                         &indexer_root,
@@ -301,7 +300,7 @@ pub async fn bootstrap(
                                 summary.changed,
                                 summary.deleted
                             );
-                            *phase.write().unwrap() = calm_core::types::IndexingPhase::Ready;
+                            *phase.write_ok() = calm_core::types::IndexingPhase::Ready;
                             IndexOutcome::Ok
                         }
                         Ok(calm_core::indexer::pipeline::ReindexOutcome::Cancelled) => {
@@ -358,14 +357,14 @@ pub async fn bootstrap(
                 let index_ok = match &index_outcome {
                     IndexOutcome::Ok => {
                         tracing::info!("Background indexing completed");
-                        *last_index_error.write().unwrap() = None;
+                        *last_index_error.write_ok() = None;
                         true
                     }
                     IndexOutcome::Cancelled => unreachable!("handled above"),
                     IndexOutcome::Err(e) => {
                         tracing::error!("Background indexer failed: {e}");
-                        *phase.write().unwrap() = calm_core::types::IndexingPhase::Failed;
-                        *last_index_error.write().unwrap() = Some(e.clone());
+                        *phase.write_ok() = calm_core::types::IndexingPhase::Failed;
+                        *last_index_error.write_ok() = Some(e.clone());
                         false
                     }
                 };
@@ -411,8 +410,8 @@ pub async fn bootstrap(
         // continues to the transport below immediately either way.
         if let Err(join_err) = handle.await {
             tracing::error!("Background indexer thread panicked: {join_err}");
-            *outer_phase.write().unwrap() = calm_core::types::IndexingPhase::Failed;
-            *outer_last_index_error.write().unwrap() =
+            *outer_phase.write_ok() = calm_core::types::IndexingPhase::Failed;
+            *outer_last_index_error.write_ok() =
                 Some(format!("indexer thread panicked: {join_err}"));
         }
     });
@@ -516,8 +515,8 @@ fn load_embedder_model(
     status: &Arc<RwLock<EmbedStatus>>,
     last_embed_error: &Arc<RwLock<Option<String>>>,
 ) -> Option<Arc<Embedder>> {
-    *status.write().unwrap() = EmbedStatus::Downloading;
-    *last_embed_error.write().unwrap() = None;
+    *status.write_ok() = EmbedStatus::Downloading;
+    *last_embed_error.write_ok() = None;
     if embeddings_blocked_by_offline_policy(
         semantic.model == calm_core::embedding::DEFAULT_MODEL_ID,
         calm_core::embedding::default_vendored_asset_unusable(),
@@ -529,8 +528,8 @@ fn load_embedder_model(
              allow_network_fallback=true to download it instead, then retry_embeddings."
             .to_string();
         tracing::warn!("{msg}");
-        *status.write().unwrap() = EmbedStatus::OfflineUnavailable;
-        *last_embed_error.write().unwrap() = Some(msg);
+        *status.write_ok() = EmbedStatus::OfflineUnavailable;
+        *last_embed_error.write_ok() = Some(msg);
         return None;
     }
     if semantic.model == calm_core::embedding::DEFAULT_MODEL_ID {
@@ -549,12 +548,12 @@ fn load_embedder_model(
         Err(e) => {
             let msg = format!("Embedding model load failed: {e}");
             tracing::error!("{msg}");
-            *status.write().unwrap() = EmbedStatus::Failed;
-            *last_embed_error.write().unwrap() = Some(msg);
+            *status.write_ok() = EmbedStatus::Failed;
+            *last_embed_error.write_ok() = Some(msg);
             return None;
         }
     };
-    *embedder.write().unwrap() = Some(model.clone());
+    *embedder.write_ok() = Some(model.clone());
     Some(model)
 }
 
@@ -582,25 +581,25 @@ pub fn bootstrap_embeddings(
     if let Err(e) = calm_core::embedding::create_embedding_table(conn, model.dim()) {
         let msg = format!("Embedding table creation failed: {e}");
         tracing::error!("{msg}");
-        *status.write().unwrap() = EmbedStatus::Failed;
-        *last_embed_error.write().unwrap() = Some(msg);
+        *status.write_ok() = EmbedStatus::Failed;
+        *last_embed_error.write_ok() = Some(msg);
         return;
     }
     if let Err(e) = calm_core::embedding::create_chunk_embedding_table(conn, model.dim()) {
         let msg = format!("Chunk embedding table creation failed: {e}");
         tracing::error!("{msg}");
-        *status.write().unwrap() = EmbedStatus::Failed;
-        *last_embed_error.write().unwrap() = Some(msg);
+        *status.write_ok() = EmbedStatus::Failed;
+        *last_embed_error.write_ok() = Some(msg);
         return;
     }
-    *status.write().unwrap() = EmbedStatus::Embedding;
+    *status.write_ok() = EmbedStatus::Embedding;
     match calm_core::embedding::embed_pending(conn, model.as_ref()) {
         Ok(n) => tracing::info!("Embedded {n} symbols"),
         Err(e) => {
             let msg = format!("Embedding failed: {e}");
             tracing::error!("{msg}");
-            *status.write().unwrap() = EmbedStatus::Failed;
-            *last_embed_error.write().unwrap() = Some(msg);
+            *status.write_ok() = EmbedStatus::Failed;
+            *last_embed_error.write_ok() = Some(msg);
             return;
         }
     }
@@ -612,12 +611,12 @@ pub fn bootstrap_embeddings(
         Err(e) => {
             let msg = format!("Chunk embedding failed: {e}");
             tracing::error!("{msg}");
-            *status.write().unwrap() = EmbedStatus::Failed;
-            *last_embed_error.write().unwrap() = Some(msg);
+            *status.write_ok() = EmbedStatus::Failed;
+            *last_embed_error.write_ok() = Some(msg);
             return;
         }
     }
-    *status.write().unwrap() = EmbedStatus::Ready;
+    *status.write_ok() = EmbedStatus::Ready;
     tracing::info!("Embeddings ready");
 }
 
@@ -638,7 +637,7 @@ pub(crate) fn load_embedder_readonly(
     last_embed_error: &Arc<RwLock<Option<String>>>,
 ) {
     if load_embedder_model(semantic, embedder, status, last_embed_error).is_some() {
-        *status.write().unwrap() = EmbedStatus::Ready;
+        *status.write_ok() = EmbedStatus::Ready;
         tracing::info!(
             "Embedder loaded for query-time semantic search (another process owns \
              indexing/embedding writes for this project)"
