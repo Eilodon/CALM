@@ -22,7 +22,7 @@ kiểm tra blast radius trước khi sửa / locate 3-in-1), dùng symbol thật
 `reindex_changed`). `mcp_client.py` (client MCP stdio) cũng nằm ở `../lib/`, tái dùng cho các
 benchmark sau.
 
-## Kết quả mẫu (chạy lần đầu, self-repo, 42 files)
+## Kết quả mẫu (chạy lần đầu, self-repo, 42 files) — LỊCH SỬ, xem bản cập nhật bên dưới
 
 | Task | ci tool | naive tokens | ci tokens | ratio |
 |---|---|---|---|---|
@@ -33,19 +33,36 @@ benchmark sau.
 
 median 4.9x, mean 6.0x (N=4 — quá nhỏ để tính p90/p99 có ý nghĩa, xem "Giới hạn" bên dưới).
 
-## Phát hiện quan trọng: `find_callers` ratio < 1
+## Cập nhật 2026-07-19: `find_callers` ratio < 1 — đã tìm ra root cause và fix, không còn đúng nữa
 
-`collect_source_files` chỉ có 4 call site trong toàn repo → `grep -n` thô đã rất gọn (146 tokens),
-trong khi JSON của `callers` (`edge_confidence`, `preview`, `suggested_next`...) tốn nhiều hơn (373
-tokens) dù thông tin có cấu trúc hơn (đã phân loại confidence, không cần agent tự đoán). Đã verify
-bằng tay: cả 2 phía đều tìm đúng 4 call site, không phải bug.
+Con số 0.4x ở trên (và các lần đo lại tương tự trước khi fix, dao động 0.6x-0.8x tùy trạng thái
+repo) **không phải giới hạn cấu trúc của JSON, mà là 1 field thật sự thừa**: `CallerEntry.path`
+lặp lại y hệt tiền tố đã có sẵn trong `symbol` (`"{path}::{name}"`) trên MỌI entry — verify bằng
+cách quét toàn bộ 6.166 dòng `call_edges` thật trong index của chính repo này (11 ngôn ngữ), 0 case
+lệch, cộng với việc lần theo code tạo ra `path`/`symbol` (`indexer::pipeline`, `scip::ingest`) — cả
+hai luôn được gán từ cùng 1 biến. Không mất thông tin gì khi bỏ field này (path suy ra được 100%
+bằng `symbol.split("::", 1)[0]`).
 
-**Kết luận thật, không phải marketing**: token efficiency của MCP tools **tỷ lệ thuận với blast
-radius / kích thước ngữ cảnh cần đọc**. Khi 1 symbol chỉ có vài chỗ dùng trong 1 file nhỏ, JSON
-overhead có thể vượt raw text. Lợi thế lớn nhất xuất hiện ở các task cần agent tự tổng hợp thông
-tin từ nhiều file hoặc đọc nguyên 1 file lớn chỉ để lấy 1 hàm (`read_one_function`: 14x,
-`pre_edit_blast_radius`: 6x) — đúng như premise gốc "tốn nhiều token nhất khi file to / blast
-radius rộng".
+Đã fix ở commit `e6a4d7e` (bỏ `path` khỏi `CallerEntry`, xem `crates/calm-server/src/tools/common.rs`).
+Chạy lại `run_benchmark.py` trên HEAD sau fix (repo hiện đã lớn hơn nhiều so với lần đo đầu — xem
+bảng dưới):
+
+| Task | ci tool | naive tokens | ci tokens | ratio |
+|---|---|---|---|---|
+| read_one_function | `source` | 51380 | 213 | **241.2x** |
+| find_callers | `callers` | 219 | 217 | **1.0x** |
+| pre_edit_blast_radius | `edit_context` | 145386 | 755 | **192.6x** |
+| locate_and_inspect | `locate` | 130262 | 4530 | **28.8x** |
+
+median 110.7x, mean 115.9x. `find_callers` giờ ngang bằng (thực ra rẻ hơn 2 token) naive grep thay
+vì đắt hơn — không phải vì blast radius của `collect_source_files` đổi (vẫn 3 call site), mà vì
+phần overhead thừa đã bị cắt. `pre_edit_blast_radius` cũng lợi theo vì `edit_context` dùng chung
+`CallerEntry`.
+
+**Kết luận cập nhật**: premise gốc "token efficiency tỷ lệ thuận với blast radius" vẫn đúng và giờ
+thể hiện rõ hơn nhiều (`read_one_function` từ 14x lên 241.2x, đơn giản vì file đó đã phình to theo
+thời gian) — nhưng `find_callers` ratio<1 KHÔNG phải bằng chứng cho premise đó; nó là 1 bug lãng phí
+token cụ thể, đã fix, không đại diện cho giới hạn cấu trúc chung của JSON-typed tool response.
 
 ## Giới hạn của lần đo này
 

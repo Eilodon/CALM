@@ -1217,16 +1217,14 @@ mod tests {
         // with no further results beyond the page.
         let conn = setup_db_with_symbols();
         // "database" appears in both get_user's and update_user's docstring.
-        let exact =
-            search(&conn, "database", SearchKind::Text, 2, None, DEFAULT_RRF_K).unwrap();
+        let exact = search(&conn, "database", SearchKind::Text, 2, None, DEFAULT_RRF_K).unwrap();
         assert_eq!(exact.results.len(), 2);
         assert!(
             !exact.truncated,
             "exactly `limit` results with no more beyond it must not be reported as truncated"
         );
 
-        let capped =
-            search(&conn, "database", SearchKind::Text, 1, None, DEFAULT_RRF_K).unwrap();
+        let capped = search(&conn, "database", SearchKind::Text, 1, None, DEFAULT_RRF_K).unwrap();
         assert_eq!(capped.results.len(), 1);
         assert!(
             capped.truncated,
@@ -1332,21 +1330,32 @@ mod tests {
         // LIKE branch: "src/" matches all 3 indexed files.
         let exact = search(&conn, "src/", SearchKind::File, 3, None, DEFAULT_RRF_K).unwrap();
         assert_eq!(exact.results.len(), 3);
-        assert!(!exact.truncated, "LIKE branch: exact count must not be truncated");
+        assert!(
+            !exact.truncated,
+            "LIKE branch: exact count must not be truncated"
+        );
 
         let capped = search(&conn, "src/", SearchKind::File, 2, None, DEFAULT_RRF_K).unwrap();
         assert_eq!(capped.results.len(), 2);
-        assert!(capped.truncated, "LIKE branch: more matches than limit must be truncated");
+        assert!(
+            capped.truncated,
+            "LIKE branch: more matches than limit must be truncated"
+        );
 
         // Glob branch: "*.py" matches src/main.py and src/utils.py.
         let exact_glob = search(&conn, "*.py", SearchKind::File, 2, None, DEFAULT_RRF_K).unwrap();
         assert_eq!(exact_glob.results.len(), 2);
-        assert!(!exact_glob.truncated, "glob branch: exact count must not be truncated");
+        assert!(
+            !exact_glob.truncated,
+            "glob branch: exact count must not be truncated"
+        );
 
-        let capped_glob =
-            search(&conn, "*.py", SearchKind::File, 1, None, DEFAULT_RRF_K).unwrap();
+        let capped_glob = search(&conn, "*.py", SearchKind::File, 1, None, DEFAULT_RRF_K).unwrap();
         assert_eq!(capped_glob.results.len(), 1);
-        assert!(capped_glob.truncated, "glob branch: more matches than limit must be truncated");
+        assert!(
+            capped_glob.truncated,
+            "glob branch: more matches than limit must be truncated"
+        );
     }
 
     #[test]

@@ -446,10 +446,9 @@ impl CalmServer {
                     let previews = line_previews_batched(&self.project_root, &preview_items);
                     rows.into_iter()
                         .zip(previews)
-                        .map(|((symbol, path, edge_confidence, edge_kind, line), preview)| {
+                        .map(|((symbol, _path, edge_confidence, edge_kind, line), preview)| {
                             CallerEntry {
                                 symbol,
-                                path,
                                 edge_confidence,
                                 edge_kind,
                                 line,
@@ -603,12 +602,11 @@ impl CalmServer {
                     .map(|(_, _, from_path, _, _, line)| (from_path.clone(), *line))
                     .collect();
                 let previews = line_previews_batched(&self.project_root, &preview_items);
-                for ((to_symbol, from_symbol, from_path, edge_confidence, edge_kind, line), preview) in
+                for ((to_symbol, from_symbol, _from_path, edge_confidence, edge_kind, line), preview) in
                     raw.into_iter().zip(previews)
                 {
                     callers_by_symbol.entry(to_symbol).or_default().push(CallerEntry {
                         symbol: from_symbol,
-                        path: from_path,
                         edge_confidence,
                         edge_kind,
                         line,

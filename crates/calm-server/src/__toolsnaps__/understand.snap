@@ -329,9 +329,7 @@
         "type": "object",
         "properties": {
           "symbol": {
-            "type": "string"
-          },
-          "path": {
+            "description": "`path::name` (or `path::Class::name`) — the enclosing file path is\nalways the substring before the first `::`, since every producer\n(tree-sitter extraction in `indexer::pipeline`, SQL indexer, SCIP\noverlay ingestion) derives both from the same `rel`/`from_path`\nvalue at the point the symbol/edge is created. A separate `path`\nfield used to duplicate this verbatim on every entry — pure waste\non a hub symbol with many callers in the same file; split on the\nfirst `::` if you need it standalone.",
             "type": "string"
           },
           "edge_confidence": {
@@ -357,7 +355,6 @@
         },
         "required": [
           "symbol",
-          "path",
           "edge_confidence",
           "edge_kind"
         ]

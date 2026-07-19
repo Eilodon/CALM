@@ -71,9 +71,8 @@ impl CalmServer {
                 rows.into_iter()
                     .zip(previews)
                     .map(
-                        |((symbol, path, edge_confidence, edge_kind, line), preview)| CallerEntry {
+                        |((symbol, _path, edge_confidence, edge_kind, line), preview)| CallerEntry {
                             symbol,
-                            path,
                             edge_confidence,
                             edge_kind,
                             line,

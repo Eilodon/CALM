@@ -1864,8 +1864,15 @@ pub(crate) struct SymbolInfoOutput {
 
 #[derive(Serialize, JsonSchema)]
 pub(crate) struct CallerEntry {
+    /// `path::name` (or `path::Class::name`) — the enclosing file path is
+    /// always the substring before the first `::`, since every producer
+    /// (tree-sitter extraction in `indexer::pipeline`, SQL indexer, SCIP
+    /// overlay ingestion) derives both from the same `rel`/`from_path`
+    /// value at the point the symbol/edge is created. A separate `path`
+    /// field used to duplicate this verbatim on every entry — pure waste
+    /// on a hub symbol with many callers in the same file; split on the
+    /// first `::` if you need it standalone.
     pub(crate) symbol: String,
-    pub(crate) path: String,
     pub(crate) edge_confidence: String,
     /// `"call"` or `"reference"` (SQL view/proc reading a table via
     /// FROM/JOIN) — see `call_edges.edge_kind`. Lets a consumer tell a real
@@ -1883,16 +1890,17 @@ pub(crate) struct CallerEntry {
 /// etag — see `range_checksum`/`hash_content`). Includes `preview` (not just
 /// the SQL columns) so a call site whose *line content* changed — but not
 /// its confidence/path/line-number — still gets a fresh etag; two calls
-/// with the same set of `(symbol, path, edge_confidence, edge_kind, line,
+/// with the same set of `(symbol, edge_confidence, edge_kind, line,
 /// preview)` tuples in the same order are guaranteed to hash identically.
+/// No separate `path` component: `symbol` is always `path::name` (or
+/// `path::Class::name`), so any change to the path is already a change to
+/// `symbol` — hashing both would be redundant, not more discriminating.
 pub(crate) fn hash_caller_entries<'a>(
     entries: impl IntoIterator<Item = &'a CallerEntry>,
 ) -> String {
     let mut buf = String::new();
     for e in entries {
         buf.push_str(&e.symbol);
-        buf.push('\u{1}');
-        buf.push_str(&e.path);
         buf.push('\u{1}');
         buf.push_str(&e.edge_confidence);
         buf.push('\u{1}');

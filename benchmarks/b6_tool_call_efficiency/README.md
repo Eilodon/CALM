@@ -38,7 +38,9 @@ median 38%, mean 39%.
 
 2 task đầu (`read_one_function`, `find_callers`) có naive_calls=1 vì naive workflow của chúng chỉ
 cần 1 lệnh (`cat` 1 file, hoặc `grep` không cần mở thêm file) — nên reduction=0%, dù B4 vẫn cho
-thấy chênh lệch token (14.0x và 0.4x). Điều này càng củng cố việc **B4 và B6 đo hai chiều độc lập**:
+thấy chênh lệch token (xem số hiện tại trong [B4](../b4_token_efficiency/) — `find_callers`'s ratio<1
+ban đầu hóa ra là 1 field JSON thừa, đã fix 2026-07-19, không còn đúng nữa). Điều này càng củng cố
+việc **B4 và B6 đo hai chiều độc lập**:
 token efficiency không suy ra được tool-call efficiency và ngược lại. Lợi thế tool-call chỉ lộ rõ ở
 những task cần agent tổng hợp từ **nhiều file** (`pre_edit_blast_radius`, `locate_and_inspect`) —
 đúng pattern CodeGraph mô tả: gains scale với số lượng file liên quan, không phải với kích thước 1
