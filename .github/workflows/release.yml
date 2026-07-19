@@ -123,6 +123,15 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+          # Only the binary tarballs from the build matrix. Without this
+          # filter, "download all" also grabs the `*.dockerbuild` build-record
+          # artifact docker/build-push-action v6 uploads whenever the `docker`
+          # job happens to finish before this one — and downloading that
+          # artifact fails hard (5 retries, then kills the job), which is
+          # exactly how the first v0.3.2 release attempt died. `needs: build`
+          # only orders this job after the build matrix; `docker` runs in
+          # parallel, so whether it sneaks its artifact in first is a race.
+          pattern: "calm-*"
 
       - name: Generate checksums
         working-directory: dist
