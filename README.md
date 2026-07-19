@@ -163,7 +163,9 @@ Rather than take the positioning above on faith, `benchmarks/b11_extended_compet
 
 What held up: CALM matched the best result on caller-recall and blast-radius tasks, and was the only one of the five servers whose pre-edit safety gate actually refused a risky, unconfirmed edit rather than just being able to describe the risk after the fact. On durable cross-session memory, CALM and Serena were the only two of the five with any at all — a useful data point rather than a surprise, since Serena's approach to memory was part of what shaped CALM's own `remember`/`recall`.
 
-Reported honestly, including where CALM isn't the cheapest: on one token-efficiency task its compression ratio was the lowest of the five tools tested, and on another it used more tokens than a naive grep baseline. The pattern across all four tasks: CALM's correctness stayed at or near the ceiling every time, even on the tasks where its token efficiency didn't. Full methodology, every task, and the raw per-tool numbers live in the benchmark's own README.
+Reported honestly, including where CALM isn't the cheapest: on one token-efficiency task its compression ratio was the lowest of the five tools tested. The pattern across all four tasks: CALM's correctness stayed at or near the ceiling every time, even on the task where its token efficiency didn't.
+
+*Update 2026-07-19*: the other task — `find_callers` costing more tokens than a naive grep baseline — turned out not to be an inherent JSON-overhead tax at all. `CallerEntry` carried a `path` field that duplicated the file path already present as a prefix of `symbol` on every single entry, verified redundant against all 6,166 real `call_edges` rows in this repo's own index (11 languages, zero exceptions) before removing it. Fixed in `e6a4d7e`; a fresh run now puts `find_callers` at parity with naive grep instead of behind it — see [`benchmarks/b4_token_efficiency/`](benchmarks/b4_token_efficiency/) for the current numbers. Full methodology, every task, and the raw per-tool numbers live in the benchmark's own README.
 
 ### Language coverage, measured not asserted
 

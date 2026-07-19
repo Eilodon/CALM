@@ -63,6 +63,10 @@ cùng câu hỏi:
 - **`find_callers`**: cả `calm` và CodeGraph đều ratio <1x (tốn token hơn naive `grep`) — vì `grep`
   không cần mở file nào (naive.type=grep, không phải grep_then_cat_matches), nên baseline đã rẻ
   sẵn. Giống nhận xét trong B6: lợi thế chỉ lộ rõ khi naive cần mở nhiều file.
+  **Cập nhật 2026-07-19**: phần `calm` của finding này hóa ra không phải overhead cấu trúc JSON, mà
+  do `CallerEntry.path` lặp lại thừa tiền tố đã có trong `symbol` — đã fix (`e6a4d7e`), xem
+  [B4](../b4_token_efficiency/) và `README.md` cho số đo lại. Số của CodeGraph trong bảng trên không
+  bị đụng tới, không phải phạm vi của fix này.
 - **Semble** cho 2 task `unsupported` (`find_callers`, `pre_edit_blast_radius`) trả lời bằng
   embedding search — có thể trông "rẻ" (735 token, ratio 59.2x) nhưng **không xác nhận được quan
   hệ gọi hàm thật**, nên ratio cao ở đây không phải "hiệu quả hơn", mà là "trả lời một câu hỏi

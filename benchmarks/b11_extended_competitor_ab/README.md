@@ -167,6 +167,12 @@ Same warning B10 gave, sharper now that there are 5 tools instead of 3:
   (ratio < 1x) — because naive here is a single ungrepped `grep -rn`, which is already free. The
   advantage of a real call-graph tool shows up on `pre_edit_blast_radius` (naive needs to open every
   matched file), not here.
+  **Correction 2026-07-19** (see B4's own changelog and `README.md`): the `calm` side of this specific
+  finding was not an inherent JSON-overhead tax — `CallerEntry.path` duplicated a substring already
+  present in `symbol` on every entry, confirmed redundant against the full live index (6,166 real
+  `call_edges` rows, 11 languages) before removing it in `e6a4d7e`. A fresh run puts `calm`'s
+  `find_callers` at parity with naive grep, not behind it. The grepai/Serena numbers in this table are
+  untouched and not re-verified here — this correction is `calm`-specific.
 - **Semble** is marked `unsupported` on 2 of 4 tasks (embedding search, no call graph) yet still
   scores 2/2 and 4/5 recall by coincidence of a small, single-symbol corpus where the right files
   happen to rank highly semantically — this is not evidence Semble does call-graph analysis; it's
