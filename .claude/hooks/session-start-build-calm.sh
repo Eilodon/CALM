@@ -91,4 +91,22 @@ if [ -x "$debug_bin" ] && { [ ! -x "$release_bin" ] || [ "$debug_bin" -nt "$rele
   fi
 fi
 
+# Best-effort, NON-blocking install of rust-analyzer (audit-design 2026-07-20:
+# confirmed live that CALM's own Rust SCIP overlay needs nothing else to
+# start firing automatically -- RustConfig::default() is already
+# `enabled: None` (auto-detect: silently no-ops if the binary is absent,
+# turns itself on the moment it's found) + `policy: OnSave` (every reindex
+# that touches a .rs file re-runs it, no explicit scip_refresh call needed).
+# The ONLY missing ingredient in an environment where `caller_count` stays
+# textual-only for Rust is the binary itself not being on PATH yet -- this
+# closes that gap the same way the release-build self-heal above does: a
+# backgrounded, `|| true`-tolerant install that never blocks the race this
+# hook exists to win. `rustup which` (not `command -v`) matches
+# `scip::runner::resolve_binary`'s own first PATH-then-rustup probe order,
+# so this only installs when BOTH would otherwise come up empty.
+if command -v rustup >/dev/null 2>&1 && ! rustup which rust-analyzer >/dev/null 2>&1; then
+  (rustup component add rust-analyzer >/dev/null 2>&1 || true) &
+  disown 2>/dev/null || true
+fi
+
 exit 0

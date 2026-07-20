@@ -125,7 +125,7 @@ backticks in a comment. Plain quotes (`'`/`"`) are fine; backticks are not.
 # zero LFS-tracked content any more. The vendored embedding model's
 # weights are fetched from HuggingFace Hub and checksum-verified by
 # crates/calm-core/build.rs::ensure_embedding_weights as part of the
-# `cargo build` below — same || true-style non-fatal degrade (a fetch
+# cargo build below — same || true-style non-fatal degrade (a fetch
 # failure there writes a placeholder instead of failing the build;
 # Embedder::load's own runtime fallback and
 # embeddings_status: "offline_unavailable" messaging are still the
@@ -136,6 +136,16 @@ backticks in a comment. Plain quotes (`'`/`"`) are fine; backticks are not.
 # the official docs). A failed build here is non-fatal — the MCP server
 # simply won't connect, which is recoverable; a dead session is not.
 cargo build --quiet -p calm-cli 2>&1 || true
+
+# Install rust-analyzer if missing. Unrelated to the MCP connection race
+# above -- this is for CALM's own Rust SCIP overlay (audit-design
+# 2026-07-20): RustConfig::default() already auto-detects rust-analyzer
+# and auto-enables on every reindex that touches a .rs file (policy:
+# OnSave), so the only thing an environment without it is missing is the
+# binary itself. Same || true safety rule as the build above: this must
+# never be the thing that kills session startup. Idempotent (a no-op if
+# already installed), so safe to run unconditionally every time.
+rustup component add rust-analyzer 2>&1 || true
 ```
 
 **Why `|| true`:** Claude Code's cloud docs state: *"If the script exits
@@ -202,6 +212,9 @@ margin on top of it.
   is already warm), but it's what keeps the binary from going *stale*
   (e.g. after editing `calm`'s own source), and it's the only mechanism at
   all for local/non-cloud Claude Code, which has no Setup Script concept.
+  Same layering for rust-analyzer (2026-07-20): backgrounded, `|| true`,
+  only fires when `rustup which rust-analyzer` already fails (a no-op
+  once the Setup Script above or a prior session installed it).
 - `crates/calm-core/build.rs::ensure_embedding_weights` — fetches and
   checksum-verifies the vendored embedding model from HuggingFace Hub at
   compile time (2026-07-12; used to be a Git LFS asset resolved by a
