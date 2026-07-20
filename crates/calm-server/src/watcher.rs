@@ -12,7 +12,7 @@ use std::time::Duration;
 use notify::{RecursiveMode, Watcher, recommended_watcher};
 use tokio_util::sync::CancellationToken;
 
-use crate::tools::common::RwLockExt;
+use crate::sync_ext::RwLockExt;
 
 /// Quiet period after the last event before a reindex fires.
 const DEBOUNCE: Duration = Duration::from_millis(500);

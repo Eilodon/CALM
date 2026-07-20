@@ -495,7 +495,7 @@ pub fn search_grep(
 
     // Phase 1 (sequential, cheap): walk + glob/size filter to candidates.
     let mut candidates: Vec<(PathBuf, String)> = Vec::new();
-    for entry in crate::walk::build_walker(project_root, ignore_patterns) {
+    for entry in crate::walk::build_walker(project_root, ignore_patterns, true) {
         let Ok(entry) = entry else { continue };
         if !entry.file_type().is_some_and(|t| t.is_file()) {
             continue;
@@ -1569,6 +1569,37 @@ mod tests {
         let output = search_grep(&conn, &dir, "needle", None, false, 0, &ignore, 10).unwrap();
         let paths: Vec<&str> = output.results.iter().map(|r| r.path.as_str()).collect();
         assert_eq!(paths, vec!["keep.py"]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression test for the bug this fix closes: `search(kind="grep")`'s
+    /// own docstring promises to cover "files the indexer never parses",
+    /// which in practice very often means files under a dotdir
+    /// (`.github/workflows/*.yml`, `.claude/hooks/*.sh`) — but the shared
+    /// walker used to exclude every dot-prefixed directory unconditionally,
+    /// silently returning zero matches with no error, indistinguishable
+    /// from a true negative. `.git` must still stay excluded even now (VCS
+    /// internals, never useful to grep) to confirm the fix is `.git`-aware,
+    /// not just "allow everything".
+    #[test]
+    fn test_search_grep_finds_files_under_dotdirs_except_git() {
+        let dir = make_temp_project(
+            "dotdirs",
+            &[
+                (".github/workflows/release.yml", "needle: dotdir_config\n"),
+                (".claude/hooks/example.sh", "needle_in_claude_hook\n"),
+                (".git/some-internal-file", "needle_inside_git_internals\n"),
+            ],
+        );
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        let output = search_grep(&conn, &dir, "needle", None, false, 0, &[], 10).unwrap();
+        let paths: Vec<&str> = output.results.iter().map(|r| r.path.as_str()).collect();
+        assert!(paths.contains(&".github/workflows/release.yml"));
+        assert!(paths.contains(&".claude/hooks/example.sh"));
+        assert!(!paths.iter().any(|p| p.starts_with(".git/")));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

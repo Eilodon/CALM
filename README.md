@@ -138,7 +138,7 @@ Every number below is measured by pointing CALM's own `fitness_report`/`repo_ove
 | Edge coverage (`edge_coverage_pct`) | 74.9% of symbols have at least one call edge (gate: ≥ 60%) |
 | High-complexity functions (`high_complexity_pct`) | 2.9% (gate: ≤ 15%) |
 | Ambiguous symbol boundaries (`boundary_ambiguous_count`) | 0 (gate: ≤ 0) |
-| Architecture boundary violations (`boundary_violations`) | **1 — currently over gate (≤ 0)**: a recent merge introduced a `watcher → tools` import that breaks a declared layering rule, and the fitness gate caught it. The one metric `calm fitness-check` fails on today; visible here until fixed |
+| Architecture boundary violations (`boundary_violations`) | 0 (gate: ≤ 0) — the `watcher → tools` import previously flagged here was fixed by relocating the shared `RwLockExt`/`LockExt` traits it needed out of `tools/common.rs` into their own `sync_ext` module |
 | Token efficiency vs. a naive read-the-files baseline | `source` **241x** · `edit_context` **193x** · `locate` **29x** · `callers` **1.0x** — median 111x across the four benchmark tasks ([methodology](benchmarks/b4_token_efficiency/)) |
 | Full test suite (default features) | see [Testing](#testing) below |
 
@@ -223,6 +223,8 @@ Distinct from the `tools` above — MCP Prompts (`prompts/list`, `prompts/get`) 
 | `calm_workflow` | *(none)* | No-argument orientation to the full Stage 1-8 tool workflow — for a client that never auto-loads AGENTS.md, or a mid-session refresher |
 
 ## Fitness check — the CI gate
+
+Run for real in `.github/workflows/ci.yml`'s `fitness-check` job on every push/PR — `calm index` first (a fresh checkout has no `.calm/index.db` yet), then `calm fitness-check --project-root . --config thresholds.toml`. That `--config` flag is not optional: without it, `[[boundaries]]` and `[config_drift]` are silently treated as "no rules declared" rather than erroring — only the numeric thresholds have a real default.
 
 `calm fitness-check` measures 10 metrics against thresholds declared in `thresholds.toml`:
 

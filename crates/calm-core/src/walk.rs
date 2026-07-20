@@ -10,6 +10,14 @@ pub const IGNORE_DIRS: &[&str] = &[
     "__pycache__",
     "venv",
     "legacy",
+    // VCS internals and CALM's own state/index — unlike other dot-prefixed
+    // directories (`.github/`, `.claude/`, etc., which can hold
+    // human-authored config/docs a `search(kind="grep")` caller may
+    // legitimately want to reach, see `allow_dotdirs` below), these two are
+    // never useful to walk regardless of caller, so they're excluded
+    // unconditionally rather than folded into the dotdir toggle.
+    ".git",
+    ".calm",
 ];
 
 /// Return true if `name` matches any pattern in `patterns`.
@@ -25,14 +33,25 @@ pub fn matches_ignore_pattern(name: &str, patterns: &[String]) -> bool {
 }
 
 /// True if `name` (a single path *segment*, not a full path) is a directory
-/// name the walker categorically refuses to descend into — dot-prefixed, or
-/// a literal `IGNORE_DIRS` entry. Deliberately does not consult
+/// name the walker refuses to descend into: always for a literal
+/// `IGNORE_DIRS` entry, and for any other dot-prefixed name unless
+/// `allow_dotdirs` is `true`. Deliberately does not consult
 /// `ignore_patterns` (user/project config) — that's checked separately by
 /// callers that have it, same as `build_walker`'s closure below. This is
-/// just the built-in, unconditional part of the rule, factored out so
-/// `build_walker` and `path_has_ignored_dir_component` can't drift apart.
-pub fn is_ignored_dir_component(name: &str) -> bool {
-    name.starts_with('.') || IGNORE_DIRS.contains(&name)
+/// just the built-in part of the rule, factored out so `build_walker` and
+/// `path_has_ignored_dir_component` can't drift apart.
+///
+/// `allow_dotdirs`: the indexer (via `path_has_ignored_dir_component` and
+/// `build_walker`'s own indexer callers) always passes `false` — dotdirs
+/// categorically hold nothing it should ever parse as source. `search
+/// (kind="grep")` passes `true` so it can reach the human-authored
+/// config/docs (`.github/workflows/*.yml`, `.claude/hooks/*.sh`, etc.) that
+/// commonly live under a dotdir and that this search kind's own contract
+/// promises to cover ("files the indexer never parses") — `.git`/`.calm`
+/// stay excluded regardless via `IGNORE_DIRS` above, since neither is ever
+/// useful to grep either.
+pub fn is_ignored_dir_component(name: &str, allow_dotdirs: bool) -> bool {
+    (!allow_dotdirs && name.starts_with('.')) || IGNORE_DIRS.contains(&name)
 }
 
 /// True if any *directory* component of `path` is one `is_ignored_dir_component`
@@ -51,7 +70,7 @@ pub fn path_has_ignored_dir_component(path: &Path) -> bool {
         parent
             .components()
             .filter_map(|c| c.as_os_str().to_str())
-            .any(is_ignored_dir_component)
+            .any(|seg| is_ignored_dir_component(seg, false))
     })
 }
 
@@ -59,11 +78,15 @@ pub fn path_has_ignored_dir_component(path: &Path) -> bool {
 /// (`indexer::pipeline::collect_source_files`, which adds its own
 /// extension gate on top) and `search(kind="grep")` (which does not gate by
 /// extension, so it can search files the indexer never parses — Cargo.toml,
-/// docs/*.md, etc.). Honors: built-in `IGNORE_DIRS`, dot-directories, any
+/// docs/*.md, etc.). Honors: built-in `IGNORE_DIRS` (always), dot-directories
+/// (unless `allow_dotdirs` is `true` — see `is_ignored_dir_component`), any
 /// user-configured `ignore` patterns (applied to both file and directory
 /// names), and real `.gitignore` / `.git/info/exclude` rules — the indexer
 /// previously never consulted `.gitignore` at all.
-pub fn build_walker(root: &Path, ignore_patterns: &[String]) -> ignore::Walk {
+///
+/// Every caller except `search_grep` passes `allow_dotdirs: false`,
+/// preserving the walker's original dotdir-exclusion behavior exactly.
+pub fn build_walker(root: &Path, ignore_patterns: &[String], allow_dotdirs: bool) -> ignore::Walk {
     let patterns = ignore_patterns.to_vec();
     ignore::WalkBuilder::new(root)
         .hidden(false) // dot-dir skipping is replicated explicitly below; dot-files were never filtered
@@ -75,7 +98,8 @@ pub fn build_walker(root: &Path, ignore_patterns: &[String]) -> ignore::Walk {
             let is_dir = entry.file_type().is_some_and(|t| t.is_dir());
             let name = entry.file_name().to_str().unwrap_or("");
             if is_dir {
-                !(is_ignored_dir_component(name) || matches_ignore_pattern(name, &patterns))
+                !(is_ignored_dir_component(name, allow_dotdirs)
+                    || matches_ignore_pattern(name, &patterns))
             } else {
                 !matches_ignore_pattern(name, &patterns)
             }
@@ -98,12 +122,26 @@ mod tests {
 
     #[test]
     fn test_is_ignored_dir_component() {
-        assert!(is_ignored_dir_component(".claude"));
-        assert!(is_ignored_dir_component(".git"));
-        assert!(is_ignored_dir_component("target"));
-        assert!(is_ignored_dir_component("node_modules"));
-        assert!(!is_ignored_dir_component("crates"));
-        assert!(!is_ignored_dir_component("src"));
+        assert!(is_ignored_dir_component(".claude", false));
+        assert!(is_ignored_dir_component(".git", false));
+        assert!(is_ignored_dir_component("target", false));
+        assert!(is_ignored_dir_component("node_modules", false));
+        assert!(!is_ignored_dir_component("crates", false));
+        assert!(!is_ignored_dir_component("src", false));
+    }
+
+    /// `search(kind="grep")`'s contract: dotdirs open up (e.g. `.github`,
+    /// `.claude`) except the two that are never useful to grep regardless —
+    /// VCS internals and CALM's own state/index, both hard-excluded via
+    /// `IGNORE_DIRS` rather than the dotdir toggle.
+    #[test]
+    fn test_is_ignored_dir_component_allow_dotdirs_still_excludes_git_and_calm() {
+        assert!(!is_ignored_dir_component(".github", true));
+        assert!(!is_ignored_dir_component(".claude", true));
+        assert!(is_ignored_dir_component(".git", true));
+        assert!(is_ignored_dir_component(".calm", true));
+        assert!(is_ignored_dir_component("target", true));
+        assert!(!is_ignored_dir_component("crates", true));
     }
 
     #[test]

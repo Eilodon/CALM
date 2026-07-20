@@ -38,7 +38,7 @@ impl NamespaceMap {
         let Some(consts) = get_lang_constants("csharp") else {
             return Self { files_by_namespace };
         };
-        for entry in crate::walk::build_walker(project_root, &[]) {
+        for entry in crate::walk::build_walker(project_root, &[], false) {
             let Ok(entry) = entry else { continue };
             if entry.path().extension().and_then(|e| e.to_str()) != Some("cs") {
                 continue;

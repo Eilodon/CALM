@@ -1,6 +1,7 @@
 #[cfg(unix)]
 pub mod daemon;
 mod scip_overlay;
+mod sync_ext;
 pub mod telemetry;
 pub mod tools;
 pub mod watcher;
@@ -15,8 +16,8 @@ use calm_core::types::EmbedStatus;
 use rmcp::transport::stdio;
 use tokio_util::sync::CancellationToken;
 
+use sync_ext::RwLockExt;
 use tools::CalmServer;
-use tools::common::RwLockExt;
 
 /// Shared handle to the loaded embedder, written by the indexer, read by tools.
 pub type EmbedderHandle = Arc<RwLock<Option<Arc<Embedder>>>>;

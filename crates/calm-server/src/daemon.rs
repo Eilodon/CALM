@@ -24,8 +24,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use tokio_util::sync::CancellationToken;
 
+use crate::sync_ext::RwLockExt;
 use crate::tools::CalmServer;
-use crate::tools::common::RwLockExt;
 use crate::{Bootstrapped, bootstrap, shutdown_and_checkpoint};
 
 /// Runs CALM as a daemon listening on `socket_path`. Returns once shut down

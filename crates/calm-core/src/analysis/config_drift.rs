@@ -40,7 +40,7 @@ pub struct ConfigDriftFinding {
 /// agree on what "real" means.
 pub fn build_real_path_index(project_root: &Path, ignore_patterns: &[String]) -> HashSet<String> {
     let mut real_paths = HashSet::new();
-    for entry in crate::walk::build_walker(project_root, ignore_patterns) {
+    for entry in crate::walk::build_walker(project_root, ignore_patterns, false) {
         let Ok(entry) = entry else { continue };
         if !entry.file_type().is_some_and(|t| t.is_file()) {
             continue;

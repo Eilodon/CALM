@@ -78,7 +78,7 @@ impl CrateMap {
 
     fn from_toml_scan(project_root: &Path) -> Self {
         let mut roots = HashMap::new();
-        for entry in crate::walk::build_walker(project_root, &[]) {
+        for entry in crate::walk::build_walker(project_root, &[], false) {
             let Ok(entry) = entry else { continue };
             if entry.file_name() != "Cargo.toml" {
                 continue;

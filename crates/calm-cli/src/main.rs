@@ -107,7 +107,11 @@ enum Commands {
         /// Project root directory
         #[arg(long, default_value = ".")]
         project_root: PathBuf,
-        /// Path to thresholds.toml (uses defaults if not provided)
+        /// Path to thresholds.toml. Numeric thresholds (hub_count,
+        /// dead_code_pct, etc.) fall back to FitnessThresholds::default()
+        /// when omitted, but [[boundaries]] and [config_drift] have no
+        /// such default (an empty rule set) — omitting this when your repo
+        /// declares either silently checks neither, not "uses defaults".
         #[arg(long)]
         config: Option<PathBuf>,
         /// Output results as JSON

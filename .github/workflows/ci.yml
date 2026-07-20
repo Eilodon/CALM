@@ -138,3 +138,33 @@ jobs:
       - name: Run cross-SDK MCP interop check
         working-directory: tests/js_client_interop
         run: node client.mjs "$GITHUB_WORKSPACE/target/debug/calm" "$GITHUB_WORKSPACE/crates/calm-core/tests/fixtures/rust_workspace"
+
+  # Wires `calm fitness-check` (README: "CI gate, exits 1 on failure") into
+  # actual CI — previously documented as a CI gate but never invoked by any
+  # workflow, so a declared `[[boundaries]]`/threshold violation could sit
+  # "over gate" indefinitely without ever failing a build. Runs `calm index`
+  # first since fitness-check reads `import_edges`/`symbols` from this repo's
+  # own `.calm/index.db`, which a fresh checkout doesn't have yet.
+  fitness-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Build calm binary
+        run: cargo build --bin calm
+
+      - name: Index this repo
+        run: ./target/debug/calm index --project-root .
+
+      - name: Fitness check
+        # --config is NOT optional despite the CLI's "uses defaults if not
+        # provided" framing: the numeric thresholds do have real defaults,
+        # but [[boundaries]]/[config_drift] have no conceptual default
+        # (an empty rule set) — omitting --config silently skips checking
+        # this repo's own declared boundary rules entirely rather than
+        # erroring, verified locally (`no [[boundaries]] rules declared`).
+        run: ./target/debug/calm fitness-check --project-root . --config thresholds.toml

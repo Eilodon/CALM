@@ -93,7 +93,7 @@ type CallSiteRow = (
 /// `language_for_extension` recognizes. Deterministic order is imposed by
 /// the caller.
 pub fn collect_source_files(root: &Path, ignore: &[String], out: &mut Vec<PathBuf>) {
-    for result in crate::walk::build_walker(root, ignore) {
+    for result in crate::walk::build_walker(root, ignore, false) {
         let Ok(entry) = result else { continue };
         if !entry.file_type().is_some_and(|t| t.is_file()) {
             continue;
