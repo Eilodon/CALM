@@ -176,13 +176,7 @@ pub fn python_resolve_binary(override_bin: Option<&str>, _root: &Path) -> Option
 /// process). Real network/npm-cache round trip, not a cheap check, but this
 /// is exactly the "does this actually work" probe the plan calls for.
 fn npx_can_run_scip_python(npx: &Path) -> bool {
-    Command::new(npx)
-        .args(["--yes", "@sourcegraph/scip-python", "--version"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    probe_succeeds(Command::new(npx).args(["--yes", "@sourcegraph/scip-python", "--version"]))
 }
 
 /// `scip-python index --cwd <root> --project-name <name> --project-version
@@ -291,13 +285,7 @@ pub fn js_resolve_binary(override_bin: Option<&str>, _root: &Path) -> Option<Pat
 /// Whether `npx --yes @sourcegraph/scip-typescript --version` succeeds —
 /// same `--yes` auto-confirm reasoning as `npx_can_run_scip_python`.
 fn npx_can_run_scip_typescript(npx: &Path) -> bool {
-    Command::new(npx)
-        .args(["--yes", "@sourcegraph/scip-typescript", "--version"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    probe_succeeds(Command::new(npx).args(["--yes", "@sourcegraph/scip-typescript", "--version"]))
 }
 
 /// `scip-typescript index --infer-tsconfig --cwd <root> --output <out>
@@ -857,14 +845,48 @@ pub fn clang_toolchain_fingerprint(root: &Path) -> String {
         .unwrap_or_default()
 }
 
-pub(crate) fn binary_runs(path: &Path) -> bool {
-    Command::new(path)
-        .arg("--version")
+/// Wall-clock budget for a `--version`-style *availability probe* (not a real
+/// indexing run) — `binary_runs`/`npx_can_run_scip_python`/
+/// `npx_can_run_scip_typescript` all go through `probe_succeeds` below so a
+/// stalled/offline `npx` registry lookup can't block a status-only tool call
+/// (`indexing_status`/`repo_overview`) indefinitely the way an un-timed
+/// `Command::status()` call did before. 3s comfortably covers the ~1-1.5s a
+/// warm `npx --yes @sourcegraph/scip-<lang> --version` costs even over a fast
+/// network (measured directly against this repo's own environment), while
+/// still bounding the worst case instead of leaving it unbounded.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Spawns `cmd` and reports whether it exits successfully within
+/// `PROBE_TIMEOUT` — same bounded-poll shape `run_indexer` already uses for a
+/// real (much longer-running) indexer invocation, just with a much shorter
+/// budget appropriate for a cheap presence check. An overrun kills the child
+/// and counts as unavailable rather than hanging the caller.
+fn probe_succeeds(cmd: &mut Command) -> bool {
+    let Ok(mut child) = cmd
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+        .spawn()
+    else {
+        return false;
+    };
+    let deadline = std::time::Instant::now() + PROBE_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) => {}
+            Err(_) => return false,
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+pub(crate) fn binary_runs(path: &Path) -> bool {
+    probe_succeeds(Command::new(path).arg("--version"))
 }
 /// `<bin> --version` output, trimmed, or `""` if it can't be run. Used as part
 /// of the overlay cache key — any version change invalidates the cache.

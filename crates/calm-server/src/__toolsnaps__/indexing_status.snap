@@ -229,7 +229,7 @@
         ]
       },
       "scip_overlays": {
-        "description": "Superset of `scip_overlay` covering every SCIP provider (P2.6) —\n`rust`/`go`/`python`/`javascript`/`java`/`csharp`/`php`/`c` — instead of Rust alone. Empty when\nthis build lacks the `scip-overlay` feature. A language is omitted\n(not present with `available: false`) when its `enabled` config is\nexplicitly `false` — nothing to report, same as `scip_overlay` being\nabsent for that reason.",
+        "description": "Superset of `scip_overlay` covering every SCIP provider (P2.6) —\n`rust`/`go`/`python`/`javascript`/`java`/`csharp`/`php`/`c` — instead of Rust alone. Empty when\nthis build lacks the `scip-overlay` feature. A language is omitted\n(not present with `available: false`) when its `enabled` config is\nexplicitly `false`, or when the project has no files in that\nlanguage at all (see `per_language_overlay_statuses`'s doc comment —\nthis also avoids an unconditional `npx`-based probe for languages\nthe project doesn't use) — nothing to report either way, same as\n`scip_overlay` being absent for the config reason.",
         "type": "array",
         "items": {
           "$ref": "#/$defs/PerLanguageOverlayStatus"

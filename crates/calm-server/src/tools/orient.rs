@@ -153,11 +153,13 @@ impl CalmServer {
                 });
             #[cfg(feature = "scip-overlay")]
             const WEAK_MATCH_RATE_THRESHOLD: f64 = 0.5;
+            // `per_language_overlay_statuses` already restricts itself to
+            // languages present in `languages` (see its doc comment) — no
+            // separate language filter needed here anymore.
             #[cfg(feature = "scip-overlay")]
             let weak_cross_reference_languages: Vec<super::recover::PerLanguageOverlayStatus> =
-                self.per_language_overlay_statuses(&conn)
+                self.per_language_overlay_statuses(&conn, &languages)
                     .into_iter()
-                    .filter(|s| languages.contains(&s.lang))
                     .filter(|s| {
                         !s.status.available
                             || s.status

@@ -79,7 +79,19 @@ impl CalmServer {
             let scip_overlay: Option<ScipOverlayStatusOutput> = None;
 
             #[cfg(feature = "scip-overlay")]
-            let scip_overlays = self.per_language_overlay_statuses(&conn);
+            let scip_overlays = {
+                let mut stmt = match conn
+                    .prepare("SELECT DISTINCT language FROM file_index WHERE language IS NOT NULL")
+                {
+                    Ok(s) => s,
+                    Err(e) => return db_error(e),
+                };
+                let languages: Vec<String> = match stmt.query_map([], |r| r.get(0)) {
+                    Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+                    Err(e) => return db_error(e),
+                };
+                self.per_language_overlay_statuses(&conn, &languages)
+            };
             #[cfg(not(feature = "scip-overlay"))]
             let scip_overlays: Vec<PerLanguageOverlayStatus> = Vec::new();
 
@@ -103,87 +115,132 @@ impl CalmServer {
     }
     /// One `OverlayStatus` per SCIP provider (P2.6) — `scip_overlay` above
     /// stays Rust-only for backward compat with existing callers; this is
-    /// the superset covering Go/Python/JS-TS/Java/C#/PHP/C-C++ too. Skips a provider entirely
-    /// when `cfg.enabled == Some(false)` (same semantics as
-    /// `overlay_status_for` returning `None`) rather than reporting a
-    /// misleading `available: false`.
+    /// the superset covering Go/Python/JS-TS/Java/C#/PHP/C-C++ too. Skips a
+    /// provider entirely when `cfg.enabled == Some(false)` (same semantics
+    /// as `overlay_status_for` returning `None`) rather than reporting a
+    /// misleading `available: false`, and also skips a provider whose
+    /// language(s) don't appear in `languages` (`file_index`'s distinct
+    /// `language` column) at all — reporting "python: unavailable" for a
+    /// repo with zero `.py` files is not actionable information.
+    ///
+    /// This second skip is a real-latency fix, not just noise reduction:
+    /// `overlay_status_for` -> `resolve_binary` for Python/JS falls back to
+    /// spawning `npx --yes @sourcegraph/scip-<lang> --version` whenever no
+    /// standalone binary is on `PATH` (the common case) — a real npm/npx
+    /// round trip, ~1-1.5s each even cache-warm (measured directly against
+    /// this repo's own environment). Before this fix, both probes ran
+    /// unconditionally on *every* `repo_overview`/`indexing_status` call
+    /// regardless of whether the project used Python or JS at all, adding
+    /// several fixed seconds — independent of repo size — that could exceed
+    /// an MCP client's own response timeout and surface as a spurious
+    /// "Connection closed" despite the tool call completing successfully
+    /// server-side (root-caused via a 2026-07-21 cross-session investigation
+    /// reproducing it against an empty single-file project).
     #[cfg(feature = "scip-overlay")]
     pub(crate) fn per_language_overlay_statuses(
         &self,
         conn: &rusqlite::Connection,
+        languages: &[String],
     ) -> Vec<PerLanguageOverlayStatus> {
         let config = self.config();
+        let present = |tags: &[&str]| tags.iter().any(|t| languages.iter().any(|l| l == t));
         let mut out = Vec::new();
-        if let Some(s) = calm_core::scip::overlay_status_for(
-            &calm_core::scip::provider::RUST,
-            conn,
-            &self.project_root,
-            &config.rust.scip,
-        ) {
+        if present(&["rust"])
+            && let Some(s) = calm_core::scip::overlay_status_for(
+                &calm_core::scip::provider::RUST,
+                conn,
+                &self.project_root,
+                &config.rust.scip,
+            )
+        {
             out.push(PerLanguageOverlayStatus::new("rust", s));
         }
-        if let Some(s) = calm_core::scip::overlay_status_for(
-            &calm_core::scip::provider::GO,
-            conn,
-            &self.project_root,
-            &config.go.scip,
-        ) {
+        if present(&["go"])
+            && let Some(s) = calm_core::scip::overlay_status_for(
+                &calm_core::scip::provider::GO,
+                conn,
+                &self.project_root,
+                &config.go.scip,
+            )
+        {
             out.push(PerLanguageOverlayStatus::new("go", s));
         }
-        if let Some(s) = calm_core::scip::overlay_status_for(
-            &calm_core::scip::provider::PYTHON,
-            conn,
-            &self.project_root,
-            &config.python.scip,
-        ) {
+        if present(&["python"])
+            && let Some(s) = calm_core::scip::overlay_status_for(
+                &calm_core::scip::provider::PYTHON,
+                conn,
+                &self.project_root,
+                &config.python.scip,
+            )
+        {
             out.push(PerLanguageOverlayStatus::new("python", s));
         }
-        if let Some(s) = calm_core::scip::overlay_status_for(
-            &calm_core::scip::provider::TYPESCRIPT,
-            conn,
-            &self.project_root,
-            &config.js.scip,
-        ) {
+        // TYPESCRIPT is the one provider tagged differently from its
+        // `file_index.language` values — it covers both `"javascript"` and
+        // `"typescript"` sources under the single `"javascript"` tag (see
+        // `PerLanguageOverlayStatus::new` call below), so presence must
+        // check both.
+        if present(&["javascript", "typescript"])
+            && let Some(s) = calm_core::scip::overlay_status_for(
+                &calm_core::scip::provider::TYPESCRIPT,
+                conn,
+                &self.project_root,
+                &config.js.scip,
+            )
+        {
             out.push(PerLanguageOverlayStatus::new("javascript", s));
         }
-        if let Some(s) = calm_core::scip::overlay_status_for(
-            &calm_core::scip::provider::JAVA,
-            conn,
-            &self.project_root,
-            &config.java.scip,
-        ) {
+        if present(&["java"])
+            && let Some(s) = calm_core::scip::overlay_status_for(
+                &calm_core::scip::provider::JAVA,
+                conn,
+                &self.project_root,
+                &config.java.scip,
+            )
+        {
             out.push(PerLanguageOverlayStatus::new("java", s));
         }
-        if let Some(s) = calm_core::scip::overlay_status_for(
-            &calm_core::scip::provider::CSHARP,
-            conn,
-            &self.project_root,
-            &config.csharp.scip,
-        ) {
+        if present(&["csharp"])
+            && let Some(s) = calm_core::scip::overlay_status_for(
+                &calm_core::scip::provider::CSHARP,
+                conn,
+                &self.project_root,
+                &config.csharp.scip,
+            )
+        {
             out.push(PerLanguageOverlayStatus::new("csharp", s));
         }
-        if let Some(s) = calm_core::scip::overlay_status_for(
-            &calm_core::scip::provider::PHP,
-            conn,
-            &self.project_root,
-            &config.php.scip,
-        ) {
+        if present(&["php"])
+            && let Some(s) = calm_core::scip::overlay_status_for(
+                &calm_core::scip::provider::PHP,
+                conn,
+                &self.project_root,
+                &config.php.scip,
+            )
+        {
             out.push(PerLanguageOverlayStatus::new("php", s));
         }
-        if let Some(s) = calm_core::scip::overlay_status_for(
-            &calm_core::scip::provider::CLANG,
-            conn,
-            &self.project_root,
-            &config.clang.scip,
-        ) {
+        // CLANG covers both `"c"` and `"cpp"` `file_index.language` values
+        // under the single `"c"` tag — same both-tags reasoning as
+        // TYPESCRIPT above.
+        if present(&["c", "cpp"])
+            && let Some(s) = calm_core::scip::overlay_status_for(
+                &calm_core::scip::provider::CLANG,
+                conn,
+                &self.project_root,
+                &config.clang.scip,
+            )
+        {
             out.push(PerLanguageOverlayStatus::new("c", s));
         }
-        if let Some(s) = calm_core::scip::overlay_status_for(
-            &calm_core::scip::provider::RUBY,
-            conn,
-            &self.project_root,
-            &config.ruby.scip,
-        ) {
+        if present(&["ruby"])
+            && let Some(s) = calm_core::scip::overlay_status_for(
+                &calm_core::scip::provider::RUBY,
+                conn,
+                &self.project_root,
+                &config.ruby.scip,
+            )
+        {
             out.push(PerLanguageOverlayStatus::new("ruby", s));
         }
         out
@@ -502,8 +559,11 @@ pub(crate) struct IndexingStatusOutput {
     /// `rust`/`go`/`python`/`javascript`/`java`/`csharp`/`php`/`c` — instead of Rust alone. Empty when
     /// this build lacks the `scip-overlay` feature. A language is omitted
     /// (not present with `available: false`) when its `enabled` config is
-    /// explicitly `false` — nothing to report, same as `scip_overlay` being
-    /// absent for that reason.
+    /// explicitly `false`, or when the project has no files in that
+    /// language at all (see `per_language_overlay_statuses`'s doc comment —
+    /// this also avoids an unconditional `npx`-based probe for languages
+    /// the project doesn't use) — nothing to report either way, same as
+    /// `scip_overlay` being absent for the config reason.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub(crate) scip_overlays: Vec<PerLanguageOverlayStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
