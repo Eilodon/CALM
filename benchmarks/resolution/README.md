@@ -166,6 +166,55 @@ Giới hạn bên dưới.
   fan-out thật sự cao; NHƯNG con số 92.5% cũng bị thổi phồng bởi chính bug "struct reference = symbol"
   mô tả ở trên (chưa sửa) — hai nguyên nhân cộng dồn, chưa tách được tỷ lệ đóng góp của mỗi cái ở bản
   đo này.
+
+  **Cập nhật 2026-07-28 — đo thật với `scip-clang`, không phải mô phỏng:** trước khi đầu tư vào
+  qualifier-gate heuristic cho C++ (namespace map, xem audit "Tier B"), đã thử trực tiếp câu hỏi
+  "wire SCIP overlay thật vào corpus fmt này cho ra bao nhiêu". Recipe (mất ~10 phút, không cần build
+  từ nguồn):
+  ```bash
+  # 1. Tải binary — có sẵn release Linux x86_64, không cần build từ nguồn
+  curl -sL -o scip-clang \
+    https://github.com/sourcegraph/scip-clang/releases/download/v0.4.0/scip-clang-x86_64-linux
+  chmod +x scip-clang   # thêm vào PATH
+
+  # 2. Sinh compile_commands.json — fmt dùng CMake, tự động ở đúng vị trí
+  #    find_compile_commands (runner.rs) đã quét: <root>/compile_commands.json và
+  #    <root>/build/compile_commands.json — cmake -B build khớp thẳng vị trí thứ 2.
+  cmake -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DFMT_TEST=ON -DFMT_DOC=OFF \
+    -DCMAKE_BUILD_TYPE=Release corpus/cpp
+  # FMT_TEST=ON quan trọng: build không bật test chỉ sinh 3 translation unit (src/*.cc);
+  # bật test sinh 51 TU — đúng chỗ đa số hàm overload (format/print/join) thật sự được GỌI
+  # nhiều lần với kiểu khác nhau, tức đúng nơi tree-sitter fan-out cao nhất.
+
+  # 3. calm index bản release build với --features tier0-5,scip-overlay (đã tự động
+  #    chạy overlay ngay sau khi index xong — xem ADR liên quan tới one-shot index)
+  calm index --project-root corpus/cpp
+  ```
+  Kết quả thật (không mô phỏng), so với baseline tree-sitter-thuần ở trên:
+
+  | | trước (tree-sitter thuần) | sau (+ scip-clang, 51 TU) |
+  |---|---:|---:|
+  | symbols | 5,052 | 5,299 (commit fmt mới hơn) |
+  | edges | 51,399 | 79,386 |
+  | **ambiguous%** | **92.5%** | **56.6%** |
+  | **formal%** | **0.0%** | **41.2%** |
+  | resolved% | 4.8% | 1.3% |
+  | textual% | 2.5% | 0.8% |
+
+  Log thật của lần chạy: `4824 edges upgraded to formal, 40191 fan-out siblings ruled out, 27920
+  edges inserted, match_rate=0.38`. 40,191 site bị loại fan-out chỉ bằng cách wire 1 binary có sẵn —
+  **lớn hơn nhiều** so với ước tính ban đầu của qualifier-gate heuristic (mô phỏng, chưa persist
+  thành script: ~1,734 site được thu hẹp / 20.5% giảm tương đối). match_rate=0.38 không cao (nhiều
+  occurrence của scip-clang không khớp 1-1 với site tree-sitter đã ghi — 51 TU vẫn chưa phủ hết mọi
+  file fmt có, vd doc examples/godbolt snippets), nên 56.6% ambiguous còn lại chủ yếu là code NGOÀI
+  51 translation unit này, không phải giới hạn của bản thân overlay.
+
+  **Kết luận cho ưu tiên B1/B2 (C++ namespace qualifier-gate heuristic):** hạ ưu tiên xuống dưới việc
+  làm cho recipe scip-clang này dễ dùng hơn cho user CALM (vd tài liệu hoá rõ trong install_hint, hoặc
+  script tiện ích sinh compile_commands.json) — độ khó thực tế thấp hơn nhiều so với comment cũ trong
+  `provider.rs` ngụ ý ("cannot be exercised end to end here regardless"). Heuristic namespace-gate vẫn
+  còn giá trị RIÊNG cho phần code ngoài phạm vi compile_commands.json (build không đầy đủ, IDE-only
+  headers, …) — không phải 0, nhưng không còn là đòn bẩy lớn nhất cho C++ nữa.
 - **C# có `resolved%` cao nhất (40.9%)** — hợp lý: P1.5's type_map/ctor-inference mới thêm (commit
   `d7178b9`) hoạt động đúng thiết kế, và C# không nằm trong same-dir tier V1 (P1.3) nên toàn bộ đóng
   góp resolved ở đây đến từ type_map thật, không phải proxy thư mục.
