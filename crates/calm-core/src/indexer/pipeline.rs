@@ -1007,6 +1007,8 @@ fn rebuild_graph(
     psr4: &crate::indexer::psr4::Psr4Map,
     namespace_map: &crate::indexer::csharp_namespace::NamespaceMap,
     pysys: &crate::indexer::pysyspath::PySysPathMap,
+    jvm: &crate::indexer::jvm_package::JvmPackageMap,
+    go: &crate::indexer::go_module::GoModule,
 ) -> rusqlite::Result<()> {
     let ctx = build_resolution_context(tx, namespace_map)?;
 
@@ -1053,7 +1055,7 @@ fn rebuild_graph(
         [],
     )?;
     refresh_caller_counts(tx)?;
-    resolve_import_targets(tx, crate_map, psr4, namespace_map, pysys)?;
+    resolve_import_targets(tx, crate_map, psr4, namespace_map, pysys, jvm, go)?;
     crate::graph::coreness::compute_coreness(tx)?;
     crate::graph::hub::update_is_hub_flags(tx, hub_config)?;
     crate::graph::boundary::update_boundary_ambiguous_flags(tx)?;
@@ -1101,6 +1103,8 @@ pub fn incremental_graph_update(
     psr4: &crate::indexer::psr4::Psr4Map,
     namespace_map: &crate::indexer::csharp_namespace::NamespaceMap,
     pysys: &crate::indexer::pysyspath::PySysPathMap,
+    jvm: &crate::indexer::jvm_package::JvmPackageMap,
+    go: &crate::indexer::go_module::GoModule,
 ) -> rusqlite::Result<IncrementalOutcome> {
     // Step 1 (plan D1): delta_paths = delta_seed ∪ {from_path of call_sites
     // whose callee_name ∈ names_delta} — a site in an UNCHANGED file that
@@ -1144,6 +1148,8 @@ pub fn incremental_graph_update(
             psr4,
             namespace_map,
             pysys,
+            jvm,
+            go,
         )?;
         return Ok(IncrementalOutcome::FellBackToFull(reason));
     }
@@ -1222,7 +1228,7 @@ pub fn incremental_graph_update(
     // once the edge set matches, since every one is a pure function of
     // current DB state, not of how the edges got there.
     refresh_caller_counts(tx)?;
-    resolve_import_targets(tx, crate_map, psr4, namespace_map, pysys)?;
+    resolve_import_targets(tx, crate_map, psr4, namespace_map, pysys, jvm, go)?;
     crate::graph::coreness::compute_coreness(tx)?;
     crate::graph::hub::update_is_hub_flags(tx, hub_config)?;
     crate::graph::boundary::update_boundary_ambiguous_flags(tx)?;
@@ -1269,6 +1275,8 @@ fn resolve_import_targets(
     psr4: &crate::indexer::psr4::Psr4Map,
     namespace_map: &crate::indexer::csharp_namespace::NamespaceMap,
     pysys: &crate::indexer::pysyspath::PySysPathMap,
+    jvm: &crate::indexer::jvm_package::JvmPackageMap,
+    go: &crate::indexer::go_module::GoModule,
 ) -> rusqlite::Result<()> {
     let known: HashSet<String> = {
         let mut stmt = tx.prepare("SELECT path FROM file_index")?;
@@ -1301,6 +1309,8 @@ fn resolve_import_targets(
                 psr4,
                 namespace_map,
                 pysys,
+                jvm,
+                go,
             )
         })
         .collect();
@@ -1474,6 +1484,14 @@ fn resolve_candidates(
 
 /// Map a module/path string to an indexed file path, trying the conventions of
 /// all six languages (dotted, scoped, and JS-relative) plus common index files.
+// Six per-ecosystem maps plus the three inputs they resolve against. The same
+// `#[allow]` `rebuild_graph` already carries, for the same reason; this is now
+// the third function to hit the limit, which is the signal that these maps want
+// to be one `ResolutionMaps` struct rather than a growing parameter list.
+// Deliberately not done in this change: bundling them touches every call site
+// in the reindex path, which is a refactor to land on its own, not alongside a
+// resolution fix.
+#[allow(clippy::too_many_arguments)]
 fn resolve_module_to_path(
     from_path: &str,
     module: &str,
@@ -1482,6 +1500,8 @@ fn resolve_module_to_path(
     psr4: &crate::indexer::psr4::Psr4Map,
     namespace_map: &crate::indexer::csharp_namespace::NamespaceMap,
     pysys: &crate::indexer::pysyspath::PySysPathMap,
+    jvm: &crate::indexer::jvm_package::JvmPackageMap,
+    go: &crate::indexer::go_module::GoModule,
 ) -> Option<String> {
     let m = module.trim().trim_matches(|c| c == '"' || c == '\'');
     if m.is_empty() {
@@ -1524,6 +1544,61 @@ fn resolve_module_to_path(
         && known.contains(hit)
     {
         return Some(hit.to_string());
+    }
+
+    // JVM: `import a.b.C;` names package `a.b` plus type `C`. Maven/Gradle
+    // put sources under `src/main/java/<package path>`, which the generic
+    // project-root/`src/` scan below never finds, so every Java/Kotlin/Groovy
+    // import used to stay NULL. The package declaration inside each file is
+    // the layout-agnostic answer, and the only one that can separate a
+    // first-party import from a JDK one here -- Maven's own tree contains
+    // directories literally named `java`/`org`/`com`.
+    if matches!(
+        std::path::Path::new(from_path)
+            .extension()
+            .and_then(|e| e.to_str()),
+        Some("java" | "kt" | "kts" | "groovy" | "scala")
+    ) {
+        // A JVM import is always a package-qualified name; the generic scan
+        // below can only mis-bind it (`java.io.Serializable` -> some local
+        // `Serializable.java`), so this is the sole authority for these files.
+        return jvm
+            .resolve_type(m)
+            .filter(|hit| known.contains(*hit))
+            .map(str::to_string);
+    }
+
+    // Go: the standard library owns exactly the import paths whose first
+    // element has no dot; everything else is domain-qualified. Without that
+    // rule `import "errors"` binds to whatever `errors.go` the project has --
+    // measured on gin, where `errors`/`path`/`context` ALL mis-resolved to
+    // gin's own files while gin's real module-path imports resolved to
+    // nothing. Both halves are fixed here.
+    if from_path.ends_with(".go") {
+        if go.is_stdlib(m) {
+            return None;
+        }
+        if let Some(dir) = go.package_dir(m) {
+            // A Go package is a directory: any indexed `.go` file inside it
+            // identifies the package. Deterministic pick so repeated indexes
+            // agree, since `import_edges.to_path` holds a single target.
+            let prefix = if dir.is_empty() {
+                String::new()
+            } else {
+                format!("{dir}/")
+            };
+            let mut in_pkg: Vec<&str> = known
+                .iter()
+                .map(String::as_str)
+                .filter(|p| {
+                    p.ends_with(".go") && p.starts_with(&prefix) && !p[prefix.len()..].contains('/')
+                })
+                .collect();
+            in_pkg.sort_unstable();
+            return in_pkg.first().map(|p| p.to_string());
+        }
+        // Domain-qualified but outside this module: a third-party dependency.
+        return None;
     }
 
     // Build candidate base paths (without extension), forward-slash normalised.
@@ -1832,7 +1907,7 @@ pub fn run_indexing_pipeline_cancellable(
 
     *phase.write().unwrap() = IndexingPhase::BuildingEdges;
 
-    let (crate_map, psr4, namespace_map, pysys) = cached_resolution_maps(project_root);
+    let (crate_map, psr4, namespace_map, pysys, jvm, go) = cached_resolution_maps(project_root);
     rebuild_graph(
         &tx,
         project_root,
@@ -1842,6 +1917,8 @@ pub fn run_indexing_pipeline_cancellable(
         &psr4,
         &namespace_map,
         &pysys,
+        &jvm,
+        &go,
     )?;
     tx.commit()?;
 
@@ -1921,6 +1998,8 @@ struct CachedResolutionMaps {
     psr4: crate::indexer::psr4::Psr4Map,
     namespace_map: crate::indexer::csharp_namespace::NamespaceMap,
     pysys: crate::indexer::pysyspath::PySysPathMap,
+    jvm: crate::indexer::jvm_package::JvmPackageMap,
+    go: crate::indexer::go_module::GoModule,
 }
 
 static RESOLUTION_MAPS_CACHE: std::sync::OnceLock<
@@ -1955,6 +2034,8 @@ fn cached_resolution_maps(
     crate::indexer::psr4::Psr4Map,
     crate::indexer::csharp_namespace::NamespaceMap,
     crate::indexer::pysyspath::PySysPathMap,
+    crate::indexer::jvm_package::JvmPackageMap,
+    crate::indexer::go_module::GoModule,
 ) {
     let file_mtime = |name: &str| {
         std::fs::metadata(project_root.join(name))
@@ -1980,6 +2061,8 @@ fn cached_resolution_maps(
                 c.psr4.clone(),
                 c.namespace_map.clone(),
                 c.pysys.clone(),
+                c.jvm.clone(),
+                c.go.clone(),
             );
         }
     }
@@ -1988,6 +2071,8 @@ fn cached_resolution_maps(
     let psr4 = crate::indexer::psr4::Psr4Map::build(project_root);
     let namespace_map = crate::indexer::csharp_namespace::NamespaceMap::build(project_root);
     let pysys = crate::indexer::pysyspath::PySysPathMap::build(project_root);
+    let jvm = crate::indexer::jvm_package::JvmPackageMap::build(project_root);
+    let go = crate::indexer::go_module::GoModule::build(project_root);
     cache.insert(
         project_root.to_path_buf(),
         CachedResolutionMaps {
@@ -1999,9 +2084,11 @@ fn cached_resolution_maps(
             psr4: psr4.clone(),
             namespace_map: namespace_map.clone(),
             pysys: pysys.clone(),
+            jvm: jvm.clone(),
+            go: go.clone(),
         },
     );
-    (crate_map, psr4, namespace_map, pysys)
+    (crate_map, psr4, namespace_map, pysys, jvm, go)
 }
 
 /// Phase B plan T4b: the 3 manifest filenames `cached_resolution_maps`
@@ -2166,7 +2253,7 @@ pub fn reindex_changed_cancellable(
         if summary.changed_paths.iter().any(|p| is_manifest_path(p)) {
             invalidate_resolution_maps_cache(project_root);
         }
-        let (crate_map, psr4, namespace_map, pysys) = cached_resolution_maps(project_root);
+        let (crate_map, psr4, namespace_map, pysys, jvm, go) = cached_resolution_maps(project_root);
         if config.indexing.incremental_graph {
             match incremental_graph_update(
                 &tx,
@@ -2179,6 +2266,8 @@ pub fn reindex_changed_cancellable(
                 &psr4,
                 &namespace_map,
                 &pysys,
+                &jvm,
+                &go,
             )? {
                 IncrementalOutcome::Applied => summary.graph_mode = GraphMode::Incremental,
                 IncrementalOutcome::FellBackToFull(reason) => {
@@ -2195,6 +2284,8 @@ pub fn reindex_changed_cancellable(
                 &psr4,
                 &namespace_map,
                 &pysys,
+                &jvm,
+                &go,
             )?;
             summary.graph_mode = GraphMode::Full;
         }
@@ -2316,7 +2407,7 @@ pub fn reindex_paths(
         if summary.changed_paths.iter().any(|p| is_manifest_path(p)) {
             invalidate_resolution_maps_cache(project_root);
         }
-        let (crate_map, psr4, namespace_map, pysys) = cached_resolution_maps(project_root);
+        let (crate_map, psr4, namespace_map, pysys, jvm, go) = cached_resolution_maps(project_root);
         if config.indexing.incremental_graph {
             match incremental_graph_update(
                 &tx,
@@ -2329,6 +2420,8 @@ pub fn reindex_paths(
                 &psr4,
                 &namespace_map,
                 &pysys,
+                &jvm,
+                &go,
             )? {
                 IncrementalOutcome::Applied => summary.graph_mode = GraphMode::Incremental,
                 IncrementalOutcome::FellBackToFull(reason) => {
@@ -2345,6 +2438,8 @@ pub fn reindex_paths(
                 &psr4,
                 &namespace_map,
                 &pysys,
+                &jvm,
+                &go,
             )?;
             summary.graph_mode = GraphMode::Full;
         }
@@ -2628,7 +2723,7 @@ mod tests {
         .unwrap();
         std::fs::write(dir.join("src/lib.rs"), "").unwrap();
 
-        let (crate_map, _, _, _) = cached_resolution_maps(&dir);
+        let (crate_map, _, _, _, _, _) = cached_resolution_maps(&dir);
         assert_eq!(crate_map.root_of("resmaps_foo"), Some("src"));
 
         // Rewrite Cargo.toml's package name WITHOUT touching mtime granularity
@@ -2641,7 +2736,7 @@ mod tests {
         )
         .unwrap();
 
-        let (crate_map2, _, _, _) = cached_resolution_maps(&dir);
+        let (crate_map2, _, _, _, _, _) = cached_resolution_maps(&dir);
         assert_eq!(
             crate_map2.root_of("resmaps_bar"),
             Some("src"),
@@ -3139,6 +3234,135 @@ mod tests {
             imported_by, 1,
             "dependencies()'s imported_by relies on to_path being populated"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Go's own language rule: an import path whose FIRST element contains no
+    /// dot is reserved for the standard library (everything else is a domain,
+    /// `github.com/...`/`example.com/...`). Without that rule a bare `import
+    /// "errors"` binds to whatever `errors.go` the project happens to have —
+    /// measured on the real gin corpus, where `errors`/`path`/`context` all
+    /// mis-resolved to gin's own same-named files, silently feeding the
+    /// `dependencies` tool and the `[[boundaries]]` fitness gate a wrong edge.
+    #[test]
+    fn test_go_stdlib_import_does_not_bind_to_same_named_project_file() {
+        let dir = std::env::temp_dir().join(format!("ci_idx_gostd_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("helper")).unwrap();
+        std::fs::write(dir.join("go.mod"), "module example.com/proj\n\ngo 1.21\n").unwrap();
+        // A project file whose name collides with a stdlib package.
+        std::fs::write(
+            dir.join("errors.go"),
+            "package proj\n\nfunc NewError() string {\n\treturn \"boom\"\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("helper/helper.go"),
+            "package helper\n\nfunc Help() string {\n\treturn \"ok\"\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("main.go"),
+            "package proj\n\nimport (\n\t\"errors\"\n\t\"example.com/proj/helper\"\n)\n\n\
+             func run() error {\n\thelper.Help()\n\treturn errors.New(\"x\")\n}\n",
+        )
+        .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
+
+        let stdlib_target: Option<String> = conn
+            .query_row(
+                "SELECT to_path FROM import_edges \
+                 WHERE from_path = 'main.go' AND module_name = 'errors'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            stdlib_target, None,
+            "Go stdlib `errors` bound to the project's own errors.go"
+        );
+
+        // The guard must be specific to stdlib, not a blanket "Go never resolves".
+        let first_party: Option<String> = conn
+            .query_row(
+                "SELECT to_path FROM import_edges \
+                 WHERE from_path = 'main.go' AND module_name = 'example.com/proj/helper'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            first_party.as_deref(),
+            Some("helper/helper.go"),
+            "a genuine in-module Go import must still resolve"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Maven/Gradle put sources under `src/main/java/<package path>`, so the
+    /// generic project-root/`src/` guesses never find them and EVERY Java
+    /// import stayed `to_path = NULL` — measured 0 of 22 genuinely first-party
+    /// imports resolved on spring-petclinic. The package declaration inside
+    /// each file is the layout-agnostic answer (it works for Gradle custom
+    /// source sets and Bazel too, which a hardcoded `src/main/java` prefix
+    /// would not). `dependencies`' `imported_by` and the `[[boundaries]]`
+    /// fitness gate both read `to_path`.
+    #[test]
+    fn test_java_import_resolves_via_package_declaration_under_maven_layout() {
+        let dir = std::env::temp_dir().join(format!("ci_idx_jvmpkg_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let pkg_dir = dir.join("src/main/java/org/example/app/model");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(
+            pkg_dir.join("Person.java"),
+            "package org.example.app.model;\n\npublic class Person {\n\
+             \tpublic String name() { return \"x\"; }\n}\n",
+        )
+        .unwrap();
+        let svc_dir = dir.join("src/main/java/org/example/app");
+        std::fs::write(
+            svc_dir.join("Service.java"),
+            "package org.example.app;\n\n\
+             import org.example.app.model.Person;\n\
+             import java.io.Serializable;\n\n\
+             public class Service {\n\tpublic String go() { return new Person().name(); }\n}\n",
+        )
+        .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
+
+        let first_party: Option<String> = conn
+            .query_row(
+                "SELECT to_path FROM import_edges \
+                 WHERE module_name = 'org.example.app.model.Person'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            first_party.as_deref(),
+            Some("src/main/java/org/example/app/model/Person.java"),
+            "a first-party Java import must resolve through its package declaration"
+        );
+
+        // The JDK shares the `java`/`org` root segments with the source tree
+        // itself (`src/main/java/org/...`), so a directory-name heuristic would
+        // wrongly claim this one. Only a real package declaration can tell.
+        let jdk: Option<String> = conn
+            .query_row(
+                "SELECT to_path FROM import_edges WHERE module_name = 'java.io.Serializable'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(jdk, None, "a JDK import must not resolve to a project file");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

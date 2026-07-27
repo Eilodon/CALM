@@ -237,6 +237,25 @@ def read_import_resolution(db_path: Path, lang: str) -> dict:
     stems = {Path(p).stem.replace("-", "_") for p in paths}
     dirs = {seg.replace("-", "_") for p in paths for seg in Path(p).parent.parts}
 
+    # Go states first-partyness exactly, so don't guess it by name here. Its
+    # module path is declared in `go.mod`, and the standard library owns the
+    # dotless import paths. The name heuristic gets Go backwards without this:
+    # on gin it counted stdlib `errors`/`path`/`context` as first-party (they
+    # collide with gin's own file stems) while missing every real
+    # `github.com/gin-gonic/gin/...` import, whose `github` root matches no
+    # directory -- so it reported 0% for a corpus where all 31 in-module
+    # imports resolve correctly.
+    go_module = None
+    if db_lang == "go":
+        try:
+            gomod = (db_path.parent.parent / "go.mod").read_text()
+            for line in gomod.splitlines():
+                if line.strip().startswith("module "):
+                    go_module = line.strip()[len("module ") :].split("//")[0].strip()
+                    break
+        except OSError:
+            pass
+
     def segments(spec: str) -> list[str]:
         flat = spec.replace("::", "/").replace(".", "/").replace("\\", "/")
         return [s for s in flat.split("/") if s]
@@ -245,6 +264,12 @@ def read_import_resolution(db_path: Path, lang: str) -> dict:
     for module, to_path in rows:
         spec = (module or "").strip().strip("\"'")
         if not spec:
+            continue
+        if go_module is not None:
+            # Exact rule, no heuristic: inside the module path or nothing.
+            if spec == go_module or spec.startswith(go_module + "/"):
+                first_party += 1
+                resolved += 1 if to_path else 0
             continue
         segs = segments(spec)
         root = segs[0].replace("-", "_") if segs else ""
