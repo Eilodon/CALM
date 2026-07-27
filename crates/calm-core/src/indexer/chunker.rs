@@ -171,6 +171,7 @@ mod tests {
             is_test: false,
             class_context: None,
             complexity: 1,
+            arity: None,
         }
     }
 

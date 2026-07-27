@@ -85,6 +85,7 @@ type CallSiteRow = (
     bool,
     Option<String>,
     String,
+    Option<i64>,
 );
 
 /// Collect tier-0 source files under `root` via the shared `crate::walk`
@@ -269,6 +270,10 @@ struct CallSiteData {
     /// (a view/proc reading a table is not invoking it) — see
     /// `call_edges.edge_kind`'s migration comment in `db::schema`.
     edge_kind: String,
+    /// See `parser::RawCall::arg_count` / `count_arguments_node` — `None`
+    /// for `indexer::sql`'s references (no call-argument concept) and for
+    /// any language whose grammar's arg-count extraction isn't verified.
+    arg_count: Option<i64>,
 }
 
 /// Everything extracted from a single file's source, before any DB I/O.
@@ -335,6 +340,7 @@ fn extract_file_data(
                 looks_option_or_result_chained: false,
                 module_hint: None,
                 edge_kind: r.edge_kind.to_string(),
+                arg_count: None,
             })
             .collect();
         return ExtractedFile {
@@ -580,6 +586,7 @@ fn extract_file_data(
                 looks_option_or_result_chained: c.looks_option_or_result_chained,
                 module_hint: c.module_hint.clone(),
                 edge_kind: "call".to_string(),
+                arg_count: c.arg_count,
             });
         }
     }
@@ -619,8 +626,8 @@ fn persist_file(
     insert_symbols_batch(tx, &extracted.symbols)?;
     insert_import_edges_batch(tx, &extracted.import_edges)?;
     let mut stmt = tx.prepare(
-        "INSERT INTO call_sites (from_path, enclosing_qn, callee_name, call_line, confidence, receiver, target_class, looks_option_or_result_chained, module_hint, edge_kind) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        "INSERT INTO call_sites (from_path, enclosing_qn, callee_name, call_line, confidence, receiver, target_class, looks_option_or_result_chained, module_hint, edge_kind, arg_count) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
     )?;
     for c in &extracted.call_sites {
         stmt.execute(rusqlite::params![
@@ -634,6 +641,7 @@ fn persist_file(
             c.looks_option_or_result_chained as i64,
             c.module_hint,
             c.edge_kind,
+            c.arg_count,
         ])?;
     }
     insert_code_chunks_batch(tx, rel, file_hash, &extracted.chunks)?;
@@ -662,6 +670,10 @@ struct ResolutionCtx<'a> {
     path_lang: HashMap<String, String>,
     caller_usings: HashMap<String, HashSet<String>>,
     namespace_map: &'a crate::indexer::csharp_namespace::NamespaceMap,
+    /// qualified_name → declared arity (see `ParsedSymbol::arity`), for the
+    /// Elixir arity gate below (B3, Tier B audit) — only ever populated for
+    /// Elixir symbols so far, `None`/absent elsewhere.
+    arity_by_qn: HashMap<String, i64>,
 }
 
 /// Build the candidate-lookup tables `resolve_sites_to_edges` narrows
@@ -693,9 +705,12 @@ fn build_resolution_context<'a>(
     // own symbols, so it's always populated for any path that could ever be
     // a call site's `from_path` below).
     let mut path_lang: HashMap<String, String> = HashMap::new();
+    // qualified_name → declared arity, Elixir-only for now — feeds the
+    // arity gate below (B3, Tier B audit).
+    let mut arity_by_qn: HashMap<String, i64> = HashMap::new();
     {
         let mut stmt = tx.prepare(
-            "SELECT name, qualified_name, path, class_context, signature, language FROM symbols",
+            "SELECT name, qualified_name, path, class_context, signature, language, arity FROM symbols",
         )?;
         let rows = stmt
             .query_map([], |r| {
@@ -706,10 +721,11 @@ fn build_resolution_context<'a>(
                     r.get::<_, Option<String>>(3)?,
                     r.get::<_, String>(4)?,
                     r.get::<_, String>(5)?,
+                    r.get::<_, Option<i64>>(6)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        for (name, qn, path, cls, sig, language) in rows {
+        for (name, qn, path, cls, sig, language, arity) in rows {
             path_lang
                 .entry(path.clone())
                 .or_insert_with(|| language.clone());
@@ -723,6 +739,9 @@ fn build_resolution_context<'a>(
                     .entry((name, c))
                     .or_default()
                     .push((qn.clone(), path, language));
+            }
+            if let Some(a) = arity {
+                arity_by_qn.insert(qn.clone(), a);
             }
             sig_by_qn.insert(qn, sig);
         }
@@ -758,6 +777,7 @@ fn build_resolution_context<'a>(
         path_lang,
         caller_usings,
         namespace_map,
+        arity_by_qn,
     })
 }
 
@@ -815,6 +835,7 @@ fn resolve_sites_to_edges(ctx: &ResolutionCtx, sites: &[CallSiteRow]) -> Vec<Cal
                 looks_option_or_result_chained,
                 module_hint,
                 _,
+                arg_count,
             )| {
                 let targets = match target_class {
                     Some(cls) => ctx.by_name_class.get(&(callee.clone(), cls.clone())),
@@ -867,6 +888,41 @@ fn resolve_sites_to_edges(ctx: &ResolutionCtx, sites: &[CallSiteRow]) -> Vec<Cal
                 if t.is_empty() {
                     return (Vec::new(), false);
                 }
+                // B3 arity gate (Tier B audit), Elixir-only: `greet/1` and
+                // `greet/2` are different clauses, not overloads of one
+                // symbol — a bare-name candidate list can hold both at once
+                // (same_file's own match below would otherwise still
+                // conflate them when both live in the caller's file), so
+                // this narrows by each candidate's OWN declared arity
+                // (`ctx.arity_by_qn`, from a real def/defp, not a guess)
+                // before same_file/same_dir/same_namespace even run. Exactly
+                // 1 survivor is real declaration-verified evidence — same
+                // standing as same_namespace's C#-only confirmation below —
+                // so it short-circuits straight to `resolved`. Fail-open
+                // (keep `t` unchanged) when arity is unknown at either end,
+                // or narrowing would leave nothing: absence of a match is
+                // never proof the true candidate isn't in `t` (e.g. a
+                // multi-clause function this pass doesn't fully model).
+                let arity_narrowed: Vec<(String, String)>;
+                let t: &Vec<(String, String)> = if caller_lang.map(String::as_str) == Some("elixir")
+                    && let Some(n) = arg_count
+                {
+                    let narrowed: Vec<(String, String)> = t
+                        .iter()
+                        .filter(|(qn, _)| ctx.arity_by_qn.get(qn) == Some(n))
+                        .cloned()
+                        .collect();
+                    if narrowed.len() == 1 {
+                        return (narrowed, true);
+                    } else if narrowed.is_empty() {
+                        t
+                    } else {
+                        arity_narrowed = narrowed;
+                        &arity_narrowed
+                    }
+                } else {
+                    t
+                };
                 // Module-qualifier preference: `crate::telemetry::timed_tool()`
                 // carries an explicit, unambiguous module segment in the source
                 // text (see `parser::module_hint_of`) — stronger evidence than
@@ -962,7 +1018,7 @@ fn resolve_sites_to_edges(ctx: &ResolutionCtx, sites: &[CallSiteRow]) -> Vec<Cal
     let mut edges: Vec<CallEdge> = Vec::new();
     let mut seen_pairs: HashSet<(String, String, Option<i64>)> = HashSet::new();
     for (
-        (from_path, enc_qn, _callee, line, confidence, _target_class, _, _, edge_kind),
+        (from_path, enc_qn, _callee, line, confidence, _target_class, _, _, edge_kind, _),
         (targets, namespace_confirmed),
     ) in sites.iter().zip(candidates.iter())
     {
@@ -1018,7 +1074,7 @@ fn rebuild_graph(
     let sites: Vec<CallSiteRow> = {
         let mut stmt = tx.prepare(
             "SELECT from_path, enclosing_qn, callee_name, call_line, confidence, target_class, \
-                    looks_option_or_result_chained, module_hint, edge_kind \
+                    looks_option_or_result_chained, module_hint, edge_kind, arg_count \
              FROM call_sites ORDER BY id",
         )?;
         stmt.query_map([], |r| {
@@ -1032,6 +1088,7 @@ fn rebuild_graph(
                 r.get::<_, i64>(6)? != 0,
                 r.get::<_, Option<String>>(7)?,
                 r.get::<_, String>(8)?,
+                r.get::<_, Option<i64>>(9)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?
@@ -1189,7 +1246,7 @@ pub fn incremental_graph_update(
     let sites: Vec<CallSiteRow> = {
         let sql = format!(
             "SELECT from_path, enclosing_qn, callee_name, call_line, confidence, target_class, \
-                    looks_option_or_result_chained, module_hint, edge_kind \
+                    looks_option_or_result_chained, module_hint, edge_kind, arg_count \
              FROM call_sites WHERE from_path IN ({placeholders}) ORDER BY id"
         );
         let mut stmt = tx.prepare(&sql)?;
@@ -1204,6 +1261,7 @@ pub fn incremental_graph_update(
                 r.get::<_, i64>(6)? != 0,
                 r.get::<_, Option<String>>(7)?,
                 r.get::<_, String>(8)?,
+                r.get::<_, Option<i64>>(9)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?
@@ -3742,6 +3800,76 @@ impl StructB {
             ),
             0,
             "Main.callHelper()'s Helper.greet() must NOT fan out to pkgb's unrelated Helper"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    // B3 (Tier B audit): `greet/1` and `greet/2` are different clauses, not
+    // overloads of one symbol — before the arity gate in
+    // resolve_sites_to_edges, both landed in the same `by_name["greet"]`
+    // bucket and same_file's own bare-name match couldn't tell them apart
+    // (both live in the same file here), so a 1-arg call site fanned out to
+    // BOTH and got marked ambiguous instead of resolving to the one real
+    // target. Single-file fixture on purpose: it's the harder case (unlike
+    // Java's package/dir split above) since same_file itself is what used
+    // to conflate them.
+    fn test_elixir_arity_disambiguates_same_name_different_arity_clauses() {
+        let dir = std::env::temp_dir().join(format!("ci_idx_elixir_arity_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("greeter.ex"),
+            "defmodule Greeter do\n  def greet(name) do\n    \"Hi \" <> name\n  end\n\n  def greet(name, greeting) do\n    greeting <> name\n  end\n\n  def call_with_one_arg do\n    greet(\"world\")\n  end\n\n  def call_with_two_args do\n    greet(\"world\", \"Hello\")\n  end\nend\n",
+        )
+        .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
+
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM call_edges \
+                 WHERE from_symbol = (SELECT qualified_name FROM symbols WHERE name = 'call_with_one_arg') \
+                 AND to_symbol = (SELECT qualified_name FROM symbols WHERE name = 'greet' AND arity = 1) \
+                 AND edge_confidence = 'resolved'",
+            ),
+            1,
+            "greet(\"world\") (1 arg) must resolve to the arity-1 clause, confidently"
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM call_edges \
+                 WHERE from_symbol = (SELECT qualified_name FROM symbols WHERE name = 'call_with_one_arg') \
+                 AND to_symbol = (SELECT qualified_name FROM symbols WHERE name = 'greet' AND arity = 2)",
+            ),
+            0,
+            "greet(\"world\") (1 arg) must NOT fan out to the arity-2 clause"
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM call_edges \
+                 WHERE from_symbol = (SELECT qualified_name FROM symbols WHERE name = 'call_with_two_args') \
+                 AND to_symbol = (SELECT qualified_name FROM symbols WHERE name = 'greet' AND arity = 2) \
+                 AND edge_confidence = 'resolved'",
+            ),
+            1,
+            "greet(\"world\", \"Hello\") (2 args) must resolve to the arity-2 clause, confidently"
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM call_edges \
+                 WHERE from_symbol = (SELECT qualified_name FROM symbols WHERE name = 'call_with_two_args') \
+                 AND to_symbol = (SELECT qualified_name FROM symbols WHERE name = 'greet' AND arity = 1)",
+            ),
+            0,
+            "greet(\"world\", \"Hello\") (2 args) must NOT fan out to the arity-1 clause"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

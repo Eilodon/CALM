@@ -24,6 +24,14 @@ pub struct ParsedSymbol {
     /// McCabe cyclomatic complexity (1 = no branches). Always 1 for
     /// languages without a real parse tree — see `branch_node_kinds`.
     pub complexity: i64,
+    /// Declared arity (arg count), verified per-language before being
+    /// populated — `None` everywhere except Elixir so far (see
+    /// `elixir_def_arity`). Elixir functions of the same name but different
+    /// arity (`greet/1`, `greet/2`) are different clauses, not overloads of
+    /// one symbol — B3 (Tier B audit) arity gate in
+    /// `pipeline::resolve_sites_to_edges` narrows a bare-name candidate
+    /// list by matching this against the call site's own `RawCall::arg_count`.
+    pub arity: Option<i64>,
 }
 
 use crate::graph::tokenize::tokenize_identifier;
@@ -472,6 +480,49 @@ fn resolve_name_node<'a>(
     }
 }
 
+/// Count real arguments in a node with a direct "arguments"-kind child —
+/// the convention this codebase has confirmed so far for Elixir's `call`
+/// node (both a definition's own name+params wrapper and an ordinary call
+/// site use it). `named_child_count` already excludes anonymous punctuation
+/// (commas, parens), so this needs no separator-counting of its own.
+/// Returns `None` when no such child exists (a different grammar's
+/// convention not yet verified against its own real AST, or a bare
+/// identifier with no argument list at all) — never guesses `Some(0)` for
+/// an unrecognized shape. Feeds `RawCall::arg_count` (call sites) and
+/// `elixir_def_arity` (declarations) — see both doc comments.
+fn count_arguments_node(container: tree_sitter::Node) -> Option<i64> {
+    let mut cursor = container.walk();
+    container
+        .children(&mut cursor)
+        .find(|c| c.kind() == "arguments")
+        .map(|args| args.named_child_count() as i64)
+}
+
+/// Elixir def/defp's own declared arity. Mirrors `resolve_name_node`'s
+/// `"call" if is_definition_macro_call(...)` arm one level deeper: that arm
+/// stops at the defined name (the nested call's `target`); this continues
+/// into the SAME nested call's own "arguments" to count the parameter list
+/// instead. `def_call_node` must be the same outer `call` node (target:
+/// def/defp) passed to that function. Same real-AST shape verified there:
+/// a nested `call` (`greet(name)`, even zero-arg `greet()`) when parens are
+/// present, or a bare `identifier` (`def foo do ... end`) when they're
+/// omitted entirely — arity 0 either way for the latter. Elixir has 0%
+/// default-argument clauses (B3, Tier B audit), so an exact arity match is
+/// sound here in a way it would not be for e.g. Kotlin/Swift/C++.
+fn elixir_def_arity(def_call_node: tree_sitter::Node) -> Option<i64> {
+    let mut cursor = def_call_node.walk();
+    let arguments = def_call_node
+        .children(&mut cursor)
+        .find(|c| c.kind() == "arguments")?;
+    let mut arg_cursor = arguments.walk();
+    let first_arg = arguments.children(&mut arg_cursor).next()?;
+    match first_arg.kind() {
+        "call" => Some(count_arguments_node(first_arg).unwrap_or(0)),
+        "identifier" => Some(0),
+        _ => None,
+    }
+}
+
 /// Walks backward through contiguous same-kind comment siblings immediately
 /// preceding `node` — no blank-line gap between any two, nor between the
 /// last one and `node` itself — and joins them in source order. Line-
@@ -552,6 +603,15 @@ fn walk_symbols(
         } else {
             enclosing_class.clone()
         };
+        // B3 (Tier B audit): Elixir's def/defp arity, verified only for this
+        // language so far — see `elixir_def_arity`'s doc comment for why an
+        // exact-arity gate is sound here (0% default-argument clauses) but
+        // not assumed for any other language yet.
+        let arity = if language == "elixir" && node.kind() == "call" {
+            elixir_def_arity(node)
+        } else {
+            None
+        };
 
         let kind = node_kind_to_symbol_kind(node.kind(), enclosing_class.is_some());
         // `detect_entry_point`'s heuristics (trait-dispatch names like
@@ -593,6 +653,7 @@ fn walk_symbols(
             is_test,
             complexity,
             class_context,
+            arity,
         });
     }
 
@@ -1146,6 +1207,14 @@ pub struct RawCall {
     /// unqualified name.
     pub module_hint: Option<String>,
     pub line: usize,
+    /// Argument count at this call site, when the grammar exposes an
+    /// "arguments"-kind child directly on the call node (see
+    /// `count_arguments_node`) -- `None` when it doesn't (every language
+    /// this isn't wired for yet), never a guessed `Some(0)`. Feeds the
+    /// Elixir arity gate (B3, Tier B audit): `greet/1` and `greet/2` are
+    /// different clauses, not overloads of one symbol, so a bare-name
+    /// candidate list must be narrowed by arity, not just by name.
+    pub arg_count: Option<i64>,
 }
 
 /// Keep the leading identifier of a segment (drop generics/parens/whitespace).
@@ -1467,6 +1536,7 @@ fn walk_calls(
             module_hint: module_hint_of(&source[fn_node.byte_range()]),
             looks_option_or_result_chained: looks_option_or_result_chained(node, source),
             line: node.start_position().row + 1,
+            arg_count: count_arguments_node(node),
         });
     }
 
@@ -2506,6 +2576,7 @@ pub fn extract_symbols_shallow(source: &str, language: &str, path: &str) -> Vec<
             is_test: false,
             class_context: None,
             complexity: 1,
+            arity: None,
         });
     }
     out
@@ -2587,6 +2658,7 @@ pub fn extract_markdown_symbols(source: &str, path: &str) -> Vec<ParsedSymbol> {
             is_test: false,
             class_context: None,
             complexity: 1,
+            arity: None,
         });
     }
     out
@@ -4541,19 +4613,37 @@ class Foo {
             .find(|s| s.name == "greet")
             .expect("greet should be found");
         assert_eq!(greet.kind, SymbolKind::Function);
+        // B3 (Tier B audit): declared arity, verified against the real
+        // grammar's def/defp shape (nested `call(target: greet, arguments:
+        // [name])`) — `greet(name)`/`format_greeting(name)` both take 1 arg.
+        assert_eq!(
+            greet.arity,
+            Some(1),
+            "greet(name) should have declared arity 1"
+        );
+        let format_greeting = symbols
+            .iter()
+            .find(|s| s.name == "format_greeting")
+            .expect("format_greeting should be found");
+        assert_eq!(
+            format_greeting.arity,
+            Some(1),
+            "format_greeting(name) should have declared arity 1"
+        );
 
         let calls = extract_calls(code, "elixir", "a.ex").unwrap();
         assert!(
             calls.iter().any(|c| c.enclosing_name == "greet"
                 && c.callee == "puts"
-                && c.receiver.as_deref() == Some("IO")),
-            "qualified call (IO.puts) should produce a call edge with receiver: {calls:?}"
+                && c.receiver.as_deref() == Some("IO")
+                && c.arg_count == Some(1)),
+            "qualified call (IO.puts) should produce a call edge with receiver and arg_count 1: {calls:?}"
         );
         assert!(
-            calls
-                .iter()
-                .any(|c| c.enclosing_name == "greet" && c.callee == "format_greeting"),
-            "bare call should produce a call edge: {calls:?}"
+            calls.iter().any(|c| c.enclosing_name == "greet"
+                && c.callee == "format_greeting"
+                && c.arg_count == Some(1)),
+            "bare call should produce a call edge with arg_count 1: {calls:?}"
         );
         assert!(
             !calls

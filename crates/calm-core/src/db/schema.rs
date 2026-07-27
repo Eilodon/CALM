@@ -90,7 +90,8 @@ CREATE TABLE IF NOT EXISTS call_sites (
     target_class TEXT,
     looks_option_or_result_chained INTEGER NOT NULL DEFAULT 0,
     module_hint  TEXT,
-    edge_kind    TEXT NOT NULL DEFAULT 'call'
+    edge_kind    TEXT NOT NULL DEFAULT 'call',
+    arg_count    INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_call_sites_from   ON call_sites(from_path);
 CREATE INDEX IF NOT EXISTS idx_call_sites_callee ON call_sites(callee_name);
@@ -263,6 +264,11 @@ fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
     // lowercase-qualified `::`-call (`crate::telemetry::timed_tool`), used to
     // disambiguate same-named candidates by file when there's no `use`.
     migrate_add_column(conn, "call_sites", "module_hint", "TEXT")?;
+    // B3-Elixir arity gate (Tier B audit): argument count at the call site,
+    // when the grammar exposes an "arguments"-kind child directly on the
+    // call node (see `parser::count_arguments_node`) -- NULL when it
+    // doesn't (every language this isn't wired for yet), never a guessed 0.
+    migrate_add_column(conn, "call_sites", "arg_count", "INTEGER")?;
     conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_call_edges_to ON call_edges(to_symbol);")?;
     // Set by the SCIP overlay (`calm_core::scip::ingest`) when a reference at a
     // given call site is proven — via real type-checked evidence — to NOT be
@@ -345,6 +351,11 @@ fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
     // window"); search must never treat the two the same or an entire repo
     // would silently de-rank the moment git becomes unavailable.
     migrate_add_column(conn, "symbols", "churn_score", "REAL")?;
+    // B3-Elixir arity gate (Tier B audit): a def/defp's own declared arity
+    // (arg count -- arity is part of a function's identity in Elixir, e.g.
+    // greet/1 vs greet/2 are different clauses), NULL for every other
+    // language until their own arity extraction is verified per-grammar.
+    migrate_add_column(conn, "symbols", "arity", "INTEGER")?;
     migrate_fts_add_signature(conn)?;
     migrate_add_project_memory_fts(conn)?;
     Ok(())
@@ -493,6 +504,44 @@ mod tests {
             )
             .unwrap();
         assert_eq!(val, 0, "new rows default to not-ambiguous");
+    }
+
+    #[test]
+    fn migration_adds_arity_and_arg_count_columns_defaulting_to_null() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO symbols (qualified_name, name, kind, path, language, line_start, line_end, signature) \
+             VALUES ('x', 'x', 'function', 'a.ex', 'elixir', 1, 2, 'def x()')",
+            [],
+        )
+        .unwrap();
+        let arity: Option<i64> = conn
+            .query_row(
+                "SELECT arity FROM symbols WHERE qualified_name = 'x'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(arity, None, "arity defaults to NULL, not a guessed 0");
+
+        conn.execute(
+            "INSERT INTO call_sites (from_path, enclosing_qn, callee_name, call_line) \
+             VALUES ('a.ex', 'a.ex::x', 'y', 1)",
+            [],
+        )
+        .unwrap();
+        let arg_count: Option<i64> = conn
+            .query_row(
+                "SELECT arg_count FROM call_sites WHERE callee_name = 'y'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            arg_count, None,
+            "arg_count defaults to NULL, not a guessed 0"
+        );
     }
 
     #[test]

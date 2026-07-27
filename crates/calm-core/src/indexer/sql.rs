@@ -115,6 +115,7 @@ pub fn extract_sql_file(rel: &str, source: &str) -> SqlFile {
             is_test: false,
             class_context: None,
             complexity: 1,
+            arity: None,
         });
         references.extend(scan_references(&stmt_text, &qn, start_line));
     }
