@@ -40,6 +40,19 @@ jobs:
         run: |
           cargo test -p calm-core --features scip-overlay -- --ignored \
             overlay_upgrades_a_real_edge_on_the_fixture
+      # `calm-cli/tests/scip_overlay_cli.rs` mirrors the test above but drives
+      # the real `calm` binary as a subprocess (`calm index --project-root`),
+      # so it also exercises the CLI's own overlay wiring instead of calling
+      # `run_overlay` directly. Needs the same rust-analyzer install as the
+      # job above, so it piggybacks this job rather than getting its own —
+      # never previously wired into this workflow despite existing in source
+      # (audited 2026-07-28: `.github/workflows/scip-nightly.yml` only ran
+      # `-p calm-core`, so this CLI-level regression guard had zero real CI
+      # runs behind it).
+      - name: Run real-indexer integration test (calm-cli, rust-analyzer scip)
+        run: |
+          cargo test -p calm-cli --features scip-overlay -- --ignored \
+            calm_index_cli_upgrades_a_real_edge_on_the_fixture
 
   scip-go:
     runs-on: ubuntu-latest
