@@ -13,7 +13,12 @@ use rusqlite::Connection;
 pub fn compute_coreness(conn: &Connection) -> rusqlite::Result<HashMap<String, i64>> {
     let mut adj: HashMap<String, HashSet<String>> = HashMap::new();
 
-    let mut stmt = conn.prepare("SELECT from_symbol, to_symbol FROM call_edges")?;
+    // `ruled_out_by_scip = 0`: an edge SCIP proved does not exist must not
+    // inflate degeneracy — coreness feeds `is_hub`, and `is_hub` is what gates
+    // the `confirm:true` requirement on edits, so a disproven edge could
+    // otherwise promote a symbol into that gate (or mask a real hub).
+    let mut stmt =
+        conn.prepare("SELECT from_symbol, to_symbol FROM call_edges WHERE ruled_out_by_scip = 0")?;
     let rows = stmt.query_map([], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
     })?;
@@ -125,6 +130,44 @@ mod tests {
             rusqlite::params![from, to],
         )
         .unwrap();
+    }
+
+    fn insert_ruled_out_edge(conn: &Connection, from: &str, to: &str) {
+        conn.execute(
+            "INSERT INTO call_edges (from_symbol, to_symbol, edge_confidence, \
+             ruled_out_by_scip) VALUES (?, ?, 'resolved', 1)",
+            rusqlite::params![from, to],
+        )
+        .unwrap();
+    }
+
+    /// `ruled_out_by_scip` marks an edge SCIP has *proven* does not exist. Letting
+    /// it into the degeneracy graph inflates coreness, which feeds `is_hub` — and
+    /// `is_hub` is what gates the `confirm:true` requirement on edits. A disproven
+    /// edge must not be able to promote a symbol into that gate.
+    #[test]
+    fn scip_ruled_out_edges_do_not_inflate_coreness() {
+        let conn = setup_db();
+        for s in ["a", "b", "c"] {
+            insert_symbol(&conn, s);
+        }
+        // A real path a-b only; the triangle is closed solely by disproven edges.
+        insert_edge(&conn, "a", "b");
+        insert_ruled_out_edge(&conn, "b", "c");
+        insert_ruled_out_edge(&conn, "c", "a");
+
+        let result = compute_coreness(&conn).unwrap();
+        assert_eq!(
+            result.get("a"),
+            Some(&1),
+            "disproven edges closed a phantom triangle: {result:?}"
+        );
+        assert_eq!(result.get("b"), Some(&1), "{result:?}");
+        assert_eq!(
+            result.get("c"),
+            None,
+            "symbol reachable only via disproven edges must not enter the graph: {result:?}"
+        );
     }
 
     #[test]
