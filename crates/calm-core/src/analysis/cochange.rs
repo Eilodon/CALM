@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use super::git_log::commits_with_files;
+use crate::git::commits_with_files_cached;
 
 /// A file that historically changed alongside the symbol/file under
 /// inspection, in the same commit — a "coupling" signal a static call/import
@@ -38,7 +38,7 @@ pub fn compute_co_changes(
     min_co_changes: usize,
     top_n: usize,
 ) -> CoChangeResult {
-    let (commits, git_available) = commits_with_files(project_root, since);
+    let (commits, git_available) = commits_with_files_cached(project_root, since);
     if !git_available {
         return CoChangeResult {
             entries: Vec::new(),
@@ -51,7 +51,7 @@ pub fn compute_co_changes(
     let mut last_seen: HashMap<String, String> = HashMap::new();
     let mut commits_with_target = 0usize;
 
-    for commit in &commits {
+    for commit in commits.iter() {
         if !commit.files.iter().any(|f| f == target_path) {
             continue;
         }

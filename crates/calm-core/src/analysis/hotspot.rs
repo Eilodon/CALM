@@ -4,6 +4,7 @@ use std::path::Path;
 use rusqlite::Connection;
 
 use crate::config::HotspotsConfig;
+use crate::git;
 
 #[derive(Debug, Clone)]
 pub struct ChurnInfo {
@@ -304,33 +305,42 @@ fn collect_git_churn(project_root: &Path, since: &str) -> (HashMap<String, Churn
     // forward slashes — this must match `symbols.path`'s format exactly (see
     // `pipeline::rel_path`), or the churn/complexity merge below silently drops
     // every candidate.
-    let (commits, git_available) = super::git_log::commits_with_files(project_root, since);
+    //
+    // Routed through `crate::git::commits_with_files_cached` (Phase 0,
+    // 2026-07-27 martin/entropy/churn plan) rather than its own `git log`
+    // pass: `cochange::compute_co_changes` and `ownership_entropy` fold
+    // over the exact same commit set, so all three can never disagree
+    // about a file's churn/authorship within one TTL window.
+    let (commits, git_available) = git::commits_with_files_cached(project_root, since);
     if !git_available {
         return (HashMap::new(), false);
     }
 
-    let mut churn_map: HashMap<String, ChurnInfo> = HashMap::new();
-    // `commits` is newest-first (git log's default order): `or_insert_with`
-    // only fires on a file's first occurrence, so `last_changed` naturally
-    // ends up as the date of the most recent commit that touched it.
-    for commit in &commits {
-        for path in &commit.files {
-            let entry = churn_map.entry(path.clone()).or_insert_with(|| ChurnInfo {
-                commit_count: 0,
-                bot_commit_count: 0,
-                authors: HashSet::new(),
-                // H-1 fix: last_changed is Option<String>, None instead of ""
-                last_changed: commit.date.clone(),
-            });
-            entry.commit_count += 1;
-            if let Some(ref author) = commit.author {
-                entry.authors.insert(author.clone());
-                if is_bot_author(author) {
-                    entry.bot_commit_count += 1;
-                }
-            }
-        }
-    }
+    // One shared derivation (`file_signals`) feeds `ChurnInfo` here and
+    // `ownership_entropy` in `edit_context` — same reasoning as above,
+    // applied to the per-file fold instead of just the raw commit list.
+    let signals = git::file_signals(&commits);
+    let churn_map: HashMap<String, ChurnInfo> = signals
+        .into_iter()
+        .map(|(path, sig)| {
+            let bot_commit_count: i64 = sig
+                .author_commits
+                .iter()
+                .filter(|(author, _)| is_bot_author(author))
+                .map(|(_, count)| *count as i64)
+                .sum();
+            let authors: HashSet<String> = sig.author_commits.into_keys().collect();
+            (
+                path,
+                ChurnInfo {
+                    commit_count: sig.commit_count as i64,
+                    bot_commit_count,
+                    authors,
+                    last_changed: sig.last_changed,
+                },
+            )
+        })
+        .collect();
     (churn_map, true)
 }
 

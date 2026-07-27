@@ -337,6 +337,14 @@ fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
     // has no MAC to check, and `memory::verify_integrity` reports that case
     // as `"unverified"`, distinct from `"ok"`/`"mismatch"`.
     migrate_add_column(conn, "project_memory", "content_mac", "TEXT")?;
+    // #3 (2026-07-27 martin/entropy/churn plan): normalized [0,1] churn
+    // score, written by `graph::churn::update_churn_scores` from the
+    // indexer pipeline (rebuild_graph/incremental_graph_update), read by
+    // `search`'s ranking multiplier. NULL means "git unavailable, unknown"
+    // -- distinct from `0.0` ("measured, this file had zero commits in the
+    // window"); search must never treat the two the same or an entire repo
+    // would silently de-rank the moment git becomes unavailable.
+    migrate_add_column(conn, "symbols", "churn_score", "REAL")?;
     migrate_fts_add_signature(conn)?;
     migrate_add_project_memory_fts(conn)?;
     Ok(())

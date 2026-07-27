@@ -2403,7 +2403,7 @@ mod tests {
             "the full caller list must still surface every ambiguous entry"
         );
         assert_eq!(
-            v["risk_assessment"], "low",
+            v["risk_assessment"]["level"], "low",
             "12 ambiguous-confidence callers (name-collision noise) must not \
              read as high risk when zero of them are confirmed — got: {v}"
         );
@@ -2451,7 +2451,7 @@ mod tests {
         );
 
         assert_eq!(
-            v["risk_assessment"], "high",
+            v["risk_assessment"]["level"], "high",
             "risk must reflect all 30 confirmed callers (>10 threshold), not just the capped 25 shown: {v}"
         );
         assert_eq!(
@@ -2460,6 +2460,277 @@ mod tests {
             "callers list itself must still be capped: {v}"
         );
         assert_eq!(v["callers_truncated"], true, "{v}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_context_escalates_low_risk_to_medium_for_single_author_file() {
+        // #2 (2026-07-27 martin/entropy/churn plan): a file with exactly one
+        // distinct commit author gets `ownership_entropy == Some(0.0)`, which
+        // must escalate an otherwise-"low" risk to "medium" with a reason
+        // naming the low-bus-factor signal.
+        let dir =
+            std::env::temp_dir().join(format!("ci_editctx_entropy_solo_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "solo@example.com"]);
+        git(&["config", "user.name", "Solo"]);
+        std::fs::write(dir.join("owned.py"), "1").unwrap();
+        git(&["add", "owned.py"]);
+        git(&["commit", "-q", "-m", "first"]);
+        std::fs::write(dir.join("owned.py"), "2").unwrap();
+        git(&["add", "owned.py"]);
+        git(&["commit", "-q", "-m", "second"]);
+
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('owned.py::helper', 'helper', 'function', 'python', 'owned.py', 1, 1, '', '', 'helper', 2, 0, 0)",
+                [],
+            )
+            .unwrap();
+            // 2 confirmed callers -> risk_level_from_caller_count == "low"
+            // (<=3) and confirmed_caller_count != 0, so the pre-existing
+            // dead-code-uncertainty escalation above never fires here --
+            // isolates this test to the entropy escalation specifically.
+            for i in 0..2 {
+                conn.execute(
+                    "INSERT INTO call_edges (from_symbol, to_symbol, from_path, to_path, edge_confidence)
+                     VALUES (?1, 'owned.py::helper', ?2, 'owned.py', 'formal')",
+                    rusqlite::params![format!("caller{i}.py::c{i}"), format!("caller{i}.py")],
+                )
+                .unwrap();
+            }
+        }
+
+        let v = jv(
+            server.edit_context(rmcp::handler::server::wrapper::Parameters(
+                EditContextParams {
+                    symbol: "helper".into(),
+                    path: None,
+                    line: None,
+                    if_none_match: None,
+                },
+            )),
+        );
+
+        assert_eq!(
+            v["risk_assessment"]["level"], "medium",
+            "single-author file must escalate low -> medium: {v}"
+        );
+        assert!(
+            v["risk_assessment"]["reasons"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r.as_str().unwrap().contains("single-author")),
+            "expected a single-author reason string: {v}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_context_does_not_escalate_risk_for_multi_author_file() {
+        // Same shape as the single-author test, but two distinct authors ->
+        // ownership_entropy is > 0.0, not exactly 0.0, so the strict ==0.0
+        // gate must NOT fire.
+        let dir =
+            std::env::temp_dir().join(format!("ci_editctx_entropy_multi_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(dir.join("shared.py"), "1").unwrap();
+        git(&["config", "user.email", "alice@example.com"]);
+        git(&["config", "user.name", "Alice"]);
+        git(&["add", "shared.py"]);
+        git(&["commit", "-q", "-m", "first"]);
+        std::fs::write(dir.join("shared.py"), "2").unwrap();
+        git(&["config", "user.email", "bob@example.com"]);
+        git(&["config", "user.name", "Bob"]);
+        git(&["add", "shared.py"]);
+        git(&["commit", "-q", "-m", "second"]);
+
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('shared.py::helper', 'helper', 'function', 'python', 'shared.py', 1, 1, '', '', 'helper', 2, 0, 0)",
+                [],
+            )
+            .unwrap();
+            for i in 0..2 {
+                conn.execute(
+                    "INSERT INTO call_edges (from_symbol, to_symbol, from_path, to_path, edge_confidence)
+                     VALUES (?1, 'shared.py::helper', ?2, 'shared.py', 'formal')",
+                    rusqlite::params![format!("caller{i}.py::c{i}"), format!("caller{i}.py")],
+                )
+                .unwrap();
+            }
+        }
+
+        let v = jv(
+            server.edit_context(rmcp::handler::server::wrapper::Parameters(
+                EditContextParams {
+                    symbol: "helper".into(),
+                    path: None,
+                    line: None,
+                    if_none_match: None,
+                },
+            )),
+        );
+
+        assert_eq!(
+            v["risk_assessment"]["level"], "low",
+            "two distinct authors must not trip the single-author escalation: {v}"
+        );
+        assert_eq!(
+            v["risk_assessment"]["reasons"].as_array().unwrap().len(),
+            0,
+            "no reason should be recorded when nothing escalated: {v}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_context_ownership_entropy_is_none_when_git_unavailable() {
+        // No .git directory at all -> commits_with_files_cached reports
+        // git_available:false -> ownership_entropy_for returns None -> the
+        // entropy escalation block must be a no-op, same as every other
+        // git-unavailable degrade path in this codebase.
+        let (dir, server) = test_server("editctx_entropy_no_git");
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('orphan.py::helper', 'helper', 'function', 'python', 'orphan.py', 1, 1, '', '', 'helper', 2, 0, 0)",
+                [],
+            )
+            .unwrap();
+            for i in 0..2 {
+                conn.execute(
+                    "INSERT INTO call_edges (from_symbol, to_symbol, from_path, to_path, edge_confidence)
+                     VALUES (?1, 'orphan.py::helper', ?2, 'orphan.py', 'formal')",
+                    rusqlite::params![format!("caller{i}.py::c{i}"), format!("caller{i}.py")],
+                )
+                .unwrap();
+            }
+        }
+
+        let v = jv(
+            server.edit_context(rmcp::handler::server::wrapper::Parameters(
+                EditContextParams {
+                    symbol: "helper".into(),
+                    path: None,
+                    line: None,
+                    if_none_match: None,
+                },
+            )),
+        );
+
+        assert_eq!(
+            v["risk_assessment"]["level"], "low",
+            "no git repo at all must degrade like every other git-unavailable path, not panic or escalate: {v}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_context_never_deescalates_high_risk_via_entropy() {
+        // A hub symbol with >10 confirmed callers is already "high" before
+        // the entropy check runs. Even with a single-author history, the
+        // entropy block must be structurally unreachable here (gated on
+        // `risk == "low"`) -- proving entropy can only ever escalate low
+        // risk, never touch/override an already-elevated level.
+        let dir = std::env::temp_dir().join(format!(
+            "ci_editctx_entropy_highrisk_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "solo@example.com"]);
+        git(&["config", "user.name", "Solo"]);
+        std::fs::write(dir.join("hub.rs"), "1").unwrap();
+        git(&["add", "hub.rs"]);
+        git(&["commit", "-q", "-m", "first"]);
+        std::fs::write(dir.join("hub.rs"), "2").unwrap();
+        git(&["add", "hub.rs"]);
+        git(&["commit", "-q", "-m", "second"]);
+
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('hub.rs::hub', 'hub', 'function', 'rust', 'hub.rs', 1, 1, 'fn hub()', '', 'hub', 11, 1, 0)",
+                [],
+            )
+            .unwrap();
+            for i in 0..11 {
+                conn.execute(
+                    "INSERT INTO call_edges (from_symbol, to_symbol, from_path, to_path, edge_confidence)
+                     VALUES (?1, 'hub.rs::hub', 'caller.rs', 'hub.rs', 'formal')",
+                    rusqlite::params![format!("mod.caller_{i}")],
+                )
+                .unwrap();
+            }
+        }
+
+        let v = jv(
+            server.edit_context(rmcp::handler::server::wrapper::Parameters(
+                EditContextParams {
+                    symbol: "hub".into(),
+                    path: None,
+                    line: None,
+                    if_none_match: None,
+                },
+            )),
+        );
+
+        assert_eq!(
+            v["risk_assessment"]["level"], "high",
+            "11 confirmed callers must stay high regardless of single-author history: {v}"
+        );
+        assert!(
+            !v["risk_assessment"]["reasons"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r.as_str().unwrap().contains("single-author")),
+            "entropy escalation must never even run once risk is already above low: {v}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

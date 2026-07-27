@@ -202,6 +202,24 @@
           "files_affected"
         ]
       },
+      "RiskAssessmentOutput": {
+        "type": "object",
+        "properties": {
+          "level": {
+            "type": "string"
+          },
+          "reasons": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "level",
+          "reasons"
+        ]
+      },
       "TrendOutput": {
         "description": "How much `caller_count`/`coreness`/`is_hub` moved since the oldest snapshot\nstill at least `EDIT_CONTEXT_TREND_LOOKBACK_DAYS` old — see\n`calm_core::fitness::compute_trend`.",
         "type": "object",
@@ -392,9 +410,13 @@
         ]
       },
       "risk_assessment": {
-        "type": [
-          "string",
-          "null"
+        "anyOf": [
+          {
+            "$ref": "#/$defs/RiskAssessmentOutput"
+          },
+          {
+            "type": "null"
+          }
         ]
       },
       "dead_code_confidence": {

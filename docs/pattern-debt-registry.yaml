@@ -245,3 +245,31 @@ items:
       không tạo nợ mới (L3 finding).
     remaining: []
     owner_hint: hooks
+
+  DEBT-011-martin-avg-distance-unfailable-threshold:
+    status: open
+    urgency: low
+    opened_at: "2026-07-27"
+    description: >
+      `FitnessThresholds::max_avg_distance` (crates/calm-core/src/fitness.rs)
+      ships with default 1.0. `D = |A + I - 1|` theo dinh nghia Martin/OOD
+      luon nam trong [0, 1], nen threshold 1.0 KHONG THE fail ve mat cau truc
+      - day la quyet dinh co chu dich (audit-design 2026-07-27,
+      docs/superskills/specs/2026-07-27-martin-metrics-ownership-entropy-
+      churn-ranking.md, Abductive Hypothesis 1), khong phai so suat: chua co
+      baseline cross-repo de chon mot nguong that ma khong false-fail nhung
+      repo co main sequence hoi lech ly tuong. Rui ro da duoc audit xac dinh
+      truoc: mot threshold chua tung do khong phan biet duoc voi threshold
+      dang hoat dong dung - co the tro thanh vinh vien chi vi khong ai quay
+      lai siet no.
+    current_control: >
+      `avg_distance`/`avg_instability`/`martin_files_measured`/
+      `martin_files_total` da hien thi day du trong `fitness_report` (gia tri
+      that, khong che giau) - chi rieng nguong pass/fail la vo hieu. Entry
+      registry nay chinh la co che theo doi duoc audit yeu cau, ghi trong
+      cung commit voi threshold (khong phai "revisit later" mo ho).
+    remaining:
+      - "Baseline avg_distance tren >= 3 repo Rust/Java/TypeScript/C# that (khong phai fixture nho) de biet main-sequence thuc te lech bao nhieu so voi D=0 ly tuong"
+      - "Sau baseline, dat max_avg_distance theo percentile quan sat duoc (vd. p90 cua cac repo baseline), khong phai mot con so doan truoc"
+      - "Kiem tra lai avg_distance co on dinh qua thoi gian tren cung 1 repo hay dao dong nhieu theo ngon ngu/kich thuoc file thay doi - neu dao dong lon, nguong cung co the khong phai cach dung de gate"
+    owner_hint: calm-core/fitness

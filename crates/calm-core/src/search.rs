@@ -48,6 +48,13 @@ pub struct SearchResult {
     /// they test, so there's no separate test-directory path to flag.
     /// `false` for non-symbol results (file/gap-chunk hits).
     pub is_test: bool,
+    /// From `symbols.churn_score` (see `graph::churn::update_churn_scores`)
+    /// — `None` when the result has no backing `symbols` row to join
+    /// (file-path hits, raw grep matches, gap chunks with no `symbol_qn`)
+    /// or the underlying churn pass itself found git unavailable. `rank_multiplier`
+    /// treats absence the same as a neutral `0.0` multiplier contribution,
+    /// never a penalty.
+    pub churn_score: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -116,12 +123,25 @@ fn is_noisy_path(path: &str) -> bool {
 
 /// Score multiplier for a result — see `NOISE_PENALTY`, `is_noisy_path`, and
 /// `SearchResult::is_test`.
-fn noise_multiplier(path: &str, is_test: bool) -> f64 {
+/// Score multiplier combining the existing noise penalty (unchanged, and
+/// checked FIRST — a test/noisy-path result is capped at `NOISE_PENALTY`
+/// regardless of churn, so a heavily-churned test file can never outrank
+/// the real implementation it tests; see the S3 regression case in
+/// docs/test/calmrootcauseandfixes20260709.md and the same exclusion
+/// `hotspot.rs`/`orient.rs` already apply for identical reasons) with a
+/// small churn-based boost (2026-07-27 martin/entropy/churn plan, #3).
+/// `CHURN_WEIGHT` is deliberately small relative to `NOISE_PENALTY` (0.6)
+/// so churn can only reorder near-ties, never overturn a clear relevance
+/// win — containing the rank-inflation feedback loop the plan's audit
+/// flagged (rank ↑ → edits ↑ → churn ↑ → rank ↑ still exists, but stays
+/// bounded to a narrow range where relevance dominates).
+const CHURN_WEIGHT: f64 = 0.15;
+
+fn rank_multiplier(path: &str, is_test: bool, churn_score: Option<f64>) -> f64 {
     if is_test || is_noisy_path(path) {
-        NOISE_PENALTY
-    } else {
-        1.0
+        return NOISE_PENALTY;
     }
+    1.0 + CHURN_WEIGHT * churn_score.unwrap_or(0.0)
 }
 
 fn escape_fts5_query(query: &str) -> String {
@@ -152,7 +172,7 @@ fn search_symbol(conn: &Connection, query: &str, limit: usize) -> rusqlite::Resu
 
     let mut stmt_exact = conn.prepare(
         "SELECT s.qualified_name, s.name, s.path, s.line_start, s.line_end, s.kind,
-                -bm25(fts_exact) AS score, s.is_test
+                -bm25(fts_exact) AS score, s.is_test, s.churn_score
          FROM fts_exact
          JOIN symbols s ON s.id = fts_exact.rowid
          WHERE fts_exact MATCH ?1
@@ -169,6 +189,7 @@ fn search_symbol(conn: &Connection, query: &str, limit: usize) -> rusqlite::Resu
             kind: row.get(5)?,
             score: row.get(6)?,
             is_test: row.get(7)?,
+            churn_score: row.get(8)?,
         })
     })?;
 
@@ -181,7 +202,7 @@ fn search_symbol(conn: &Connection, query: &str, limit: usize) -> rusqlite::Resu
 
     let mut stmt_tokens = conn.prepare(
         "SELECT s.qualified_name, s.name, s.path, s.line_start, s.line_end, s.kind,
-                -bm25(fts_tokens) AS score, s.is_test
+                -bm25(fts_tokens) AS score, s.is_test, s.churn_score
          FROM fts_tokens
          JOIN symbols s ON s.id = fts_tokens.rowid
          WHERE fts_tokens MATCH ?1
@@ -198,6 +219,7 @@ fn search_symbol(conn: &Connection, query: &str, limit: usize) -> rusqlite::Resu
             kind: row.get(5)?,
             score: row.get(6)?,
             is_test: row.get(7)?,
+            churn_score: row.get(8)?,
         })
     })?;
 
@@ -210,7 +232,7 @@ fn search_symbol(conn: &Connection, query: &str, limit: usize) -> rusqlite::Resu
 
     for (qname, r) in data.iter() {
         if let Some(s) = scores.get_mut(qname) {
-            *s *= noise_multiplier(&r.path, r.is_test);
+            *s *= rank_multiplier(&r.path, r.is_test, r.churn_score);
         }
     }
 
@@ -257,7 +279,7 @@ fn search_text(conn: &Connection, query: &str, limit: usize) -> rusqlite::Result
 
     let mut stmt = conn.prepare(
         "SELECT s.qualified_name, s.name, s.path, s.line_start, s.line_end, s.kind,
-                -bm25(fts_exact) AS score, s.is_test
+                -bm25(fts_exact) AS score, s.is_test, s.churn_score
          FROM fts_exact
          JOIN symbols s ON s.id = fts_exact.rowid
          WHERE fts_exact MATCH ?1
@@ -275,6 +297,7 @@ fn search_text(conn: &Connection, query: &str, limit: usize) -> rusqlite::Result
             kind: row.get(5)?,
             score: row.get(6)?,
             is_test: row.get(7)?,
+            churn_score: row.get(8)?,
         })
     })?;
 
@@ -371,6 +394,7 @@ fn search_file(conn: &Connection, query: &str, limit: usize) -> rusqlite::Result
             match_type: "file".to_string(),
             snippet: None,
             is_test: false,
+            churn_score: None,
         })
         .collect();
 
@@ -586,6 +610,7 @@ pub fn search_grep(
                 match_type: "grep".to_string(),
                 snippet: Some(m.snippet),
                 is_test: false,
+                churn_score: None,
             });
         }
     }
@@ -611,7 +636,7 @@ fn symbol_semantic_results(
     // off-by-one search_text/search_file had — see their fix comments).
     let hits = crate::embedding::knn(conn, qvec, limit + 1)?;
     let mut stmt = conn.prepare(
-        "SELECT qualified_name, name, path, line_start, line_end, kind, is_test FROM symbols WHERE id = ?1",
+        "SELECT qualified_name, name, path, line_start, line_end, kind, is_test, churn_score FROM symbols WHERE id = ?1",
     )?;
     let mut results = Vec::with_capacity(hits.len());
     for (id, dist) in &hits {
@@ -627,6 +652,7 @@ fn symbol_semantic_results(
                 match_type: "semantic".to_string(),
                 snippet: None,
                 is_test: row.get(6)?,
+                churn_score: row.get(7)?,
             })
         }) {
             // cosine distance → similarity in [0, 1] for a friendlier score.
@@ -683,20 +709,24 @@ fn chunk_hit_to_result(conn: &Connection, chunk_id: i64) -> rusqlite::Result<Opt
         return Ok(None);
     };
 
-    let (qualified_name, name, kind, is_test) = match &symbol_qn {
+    let (qualified_name, name, kind, is_test, churn_score) = match &symbol_qn {
         Some(qn) => {
-            let mut sym_stmt =
-                conn.prepare("SELECT name, kind, is_test FROM symbols WHERE qualified_name = ?1")?;
+            let mut sym_stmt = conn.prepare(
+                "SELECT name, kind, is_test, churn_score FROM symbols WHERE qualified_name = ?1",
+            )?;
             let sym = sym_stmt.query_row(rusqlite::params![qn], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, Option<String>>(1)?,
                     r.get::<_, bool>(2)?,
+                    r.get::<_, Option<f64>>(3)?,
                 ))
             });
             match sym {
-                Ok((name, kind, is_test)) => (qn.clone(), name, kind, is_test),
-                Err(_) => (qn.clone(), qn.clone(), None, false),
+                Ok((name, kind, is_test, churn_score)) => {
+                    (qn.clone(), name, kind, is_test, churn_score)
+                }
+                Err(_) => (qn.clone(), qn.clone(), None, false, None),
             }
         }
         None => {
@@ -706,6 +736,7 @@ fn chunk_hit_to_result(conn: &Connection, chunk_id: i64) -> rusqlite::Result<Opt
                 fname,
                 None,
                 false,
+                None,
             )
         }
     };
@@ -721,6 +752,7 @@ fn chunk_hit_to_result(conn: &Connection, chunk_id: i64) -> rusqlite::Result<Opt
         match_type: "semantic_chunk".to_string(),
         snippet: None,
         is_test,
+        churn_score,
     }))
 }
 
@@ -983,7 +1015,7 @@ fn rrf_merge_n(
 
     for (qname, r) in data.iter() {
         if let Some(s) = scores.get_mut(qname) {
-            *s *= noise_multiplier(&r.path, r.is_test);
+            *s *= rank_multiplier(&r.path, r.is_test, r.churn_score);
         }
     }
 
@@ -1014,6 +1046,7 @@ struct RawRow {
     kind: Option<String>,
     score: f64,
     is_test: bool,
+    churn_score: Option<f64>,
 }
 
 impl RawRow {
@@ -1029,6 +1062,7 @@ impl RawRow {
             match_type: match_type.to_string(),
             snippet: None,
             is_test: self.is_test,
+            churn_score: self.churn_score,
         }
     }
 }
@@ -1634,6 +1668,7 @@ mod tests {
                 match_type: "exact".into(),
                 snippet: None,
                 is_test: false,
+                churn_score: None,
             },
             SearchResult {
                 name: "b".into(),
@@ -1646,6 +1681,7 @@ mod tests {
                 match_type: "exact".into(),
                 snippet: None,
                 is_test: false,
+                churn_score: None,
             },
         ];
         let semantic = vec![SearchResult {
@@ -1659,6 +1695,7 @@ mod tests {
             match_type: "semantic".into(),
             snippet: None,
             is_test: false,
+            churn_score: None,
         }];
 
         let merged = rrf_merge_n(
@@ -1684,6 +1721,7 @@ mod tests {
             match_type: match_type.into(),
             snippet: None,
             is_test: false,
+            churn_score: None,
         }
     }
 
@@ -2036,13 +2074,31 @@ mod tests {
     }
 
     #[test]
-    fn test_noise_multiplier_values() {
-        assert_eq!(noise_multiplier("tests/test_foo.py", false), NOISE_PENALTY);
-        assert_eq!(noise_multiplier("src/foo.py", false), 1.0);
+    fn test_rank_multiplier_values() {
         assert_eq!(
-            noise_multiplier("src/foo.py", true),
+            rank_multiplier("tests/test_foo.py", false, None),
+            NOISE_PENALTY
+        );
+        assert_eq!(rank_multiplier("src/foo.py", false, None), 1.0);
+        assert_eq!(
+            rank_multiplier("src/foo.py", true, None),
             NOISE_PENALTY,
             "is_test=true must penalize even a clean-looking path"
+        );
+        assert_eq!(
+            rank_multiplier("src/foo.py", true, Some(1.0)),
+            NOISE_PENALTY,
+            "is_test must still win over the maximum possible churn boost -- never overturned"
+        );
+        assert_eq!(
+            rank_multiplier("src/foo.py", false, Some(1.0)),
+            1.0 + CHURN_WEIGHT,
+            "max churn (1.0) on a clean path adds exactly CHURN_WEIGHT"
+        );
+        assert_eq!(
+            rank_multiplier("src/foo.py", false, Some(0.0)),
+            1.0,
+            "zero churn (measured, never changed) must not move the multiplier at all"
         );
     }
 
@@ -2058,6 +2114,7 @@ mod tests {
             match_type: "exact".into(),
             snippet: None,
             is_test: false,
+            churn_score: None,
         }
     }
 
@@ -2138,6 +2195,139 @@ mod tests {
                 .iter()
                 .map(|r| &r.qualified_name)
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_search_symbol_high_churn_test_file_never_outranks_real_implementation() {
+        // The S3 regression case (docs/test/calmrootcauseandfixes20260709.md):
+        // a test file whose name closely paraphrases the query previously
+        // outranked the real implementation. This is that scenario with the
+        // 2026-07-27 churn boost added on TOP of the test file -- if churn
+        // were applied before the is_test/noisy-path check instead of after,
+        // a heavily-churned test file could claw back the rank the noise
+        // penalty just took away. rank_multiplier's is_test branch must
+        // return before ever reading churn_score.
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO symbols (name, qualified_name, kind, path, language, line_start, line_end, docstring, name_tokens, is_test, churn_score)
+             VALUES ('widget', 'real::widget', 'function', 'src/widget.py', 'python', 1, 5, '', 'widget', 0, 0.0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO symbols (name, qualified_name, kind, path, language, line_start, line_end, docstring, name_tokens, is_test, churn_score)
+             VALUES ('widget', 'test::widget', 'function', 'tests/test_widget.py', 'python', 1, 5, '', 'widget', 1, 1.0)",
+            [],
+        )
+        .unwrap();
+
+        let output = search(&conn, "widget", SearchKind::Symbol, 10, None, DEFAULT_RRF_K).unwrap();
+        assert_eq!(output.results.len(), 2);
+        assert_eq!(
+            output.results[0].qualified_name,
+            "real::widget",
+            "max churn_score (1.0) on the test file must not overturn the noise penalty, got: {:?}",
+            output
+                .results
+                .iter()
+                .map(|r| &r.qualified_name)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_search_symbol_higher_churn_ranks_first_among_equally_relevant_non_test_files() {
+        // Positive case: with the noise penalty out of the way (neither
+        // file is a test/noisy path), a higher churn_score DOES move a
+        // result up on an otherwise-tied relevance score -- proving the
+        // boost actually does something, not just that it's safely
+        // contained.
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO symbols (name, qualified_name, kind, path, language, line_start, line_end, docstring, name_tokens, is_test, churn_score)
+             VALUES ('widget', 'quiet::widget', 'function', 'src/quiet.py', 'python', 1, 5, '', 'widget', 0, 0.0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO symbols (name, qualified_name, kind, path, language, line_start, line_end, docstring, name_tokens, is_test, churn_score)
+             VALUES ('widget', 'busy::widget', 'function', 'src/busy.py', 'python', 1, 5, '', 'widget', 0, 1.0)",
+            [],
+        )
+        .unwrap();
+
+        let output = search(&conn, "widget", SearchKind::Symbol, 10, None, DEFAULT_RRF_K).unwrap();
+        assert_eq!(output.results.len(), 2);
+        assert_eq!(
+            output.results[0].qualified_name,
+            "busy::widget",
+            "equal relevance, higher churn_score must rank first: {:?}",
+            output
+                .results
+                .iter()
+                .map(|r| &r.qualified_name)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_search_symbol_null_churn_matches_pre_churn_baseline_ranking() {
+        // NULL churn_score (the default for every row until a reindex
+        // populates it, or whenever git is unavailable) must rank
+        // identically to how search behaved before this column existed --
+        // a pure relevance-only ordering, no fabricated boost from an
+        // absent signal.
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        for (qn, path) in [("a::widget", "src/a.py"), ("b::widget", "src/b.py")] {
+            conn.execute(
+                "INSERT INTO symbols (name, qualified_name, kind, path, language, line_start, line_end, docstring, name_tokens)
+                 VALUES ('widget', ?1, 'function', ?2, 'python', 1, 5, '', 'widget')",
+                rusqlite::params![qn, path],
+            )
+            .unwrap();
+        }
+
+        let output = search(&conn, "widget", SearchKind::Symbol, 10, None, DEFAULT_RRF_K).unwrap();
+        assert_eq!(output.results.len(), 2);
+        // Tied relevance, both churn_score NULL -> BTreeMap alphabetical
+        // tie-break by qualified_name, same as every other tie test in this
+        // file.
+        assert_eq!(output.results[0].qualified_name, "a::widget");
+        assert_eq!(output.results[1].qualified_name, "b::widget");
+    }
+
+    #[test]
+    fn test_rrf_merge_n_ties_break_deterministically_with_equal_churn_scores() {
+        // Determinism guard: two results with IDENTICAL relevance AND
+        // IDENTICAL churn_score must still break the tie alphabetically by
+        // qualified_name (BTreeMap), not depend on insertion/iteration
+        // order -- churn must never introduce the nondeterminism the
+        // existing qualified_name tie-break was built to eliminate.
+        // Each as the sole entry of its own source list (same trick
+        // test_rrf_merge_n_demotes_noisy_path_on_tie uses) so both get
+        // rank=0 and a genuinely tied RRF score -- putting them at
+        // different positions in ONE list would give them different ranks
+        // by construction, which isn't the tie this test needs.
+        let mut z = stub_result("zzz_symbol", "semantic");
+        z.churn_score = Some(0.5);
+        let mut a = stub_result("aaa_symbol", "semantic");
+        a.churn_score = Some(0.5);
+        let fts = [z, a];
+
+        let merged = rrf_merge_n(
+            &[(&fts[..1], 1.0), (&fts[1..], 1.0)],
+            10,
+            DEFAULT_RRF_K,
+            "hybrid",
+        );
+        assert_eq!(merged.len(), 2);
+        assert_eq!(
+            merged[0].qualified_name, "aaa_symbol",
+            "equal churn on both sides must still break ties alphabetically: {merged:?}"
         );
     }
 

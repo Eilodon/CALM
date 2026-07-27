@@ -221,6 +221,37 @@ impl CalmServer {
         result
     }
 
+    /// Ownership-entropy for `path` (Phase 0/#2, 2026-07-27 martin/entropy/
+    /// churn plan): thin wrapper composing `calm_core::git::commits_with_files_cached`,
+    /// `file_signals`, and `ownership_entropy`. Deliberately NOT a second
+    /// server-layer cache on top of `commits_with_files_cached`'s own
+    /// process-wide cache, since that inner cache is what actually bounds
+    /// cost: a cache hit is ~microseconds, and `file_signals`'s per-call
+    /// fold over the cached commit list costs only single-digit
+    /// milliseconds even against a large repo (measured against a
+    /// 60k-commit synthetic history in the same plan's Abductive
+    /// Hypothesis 2 gate). Adding a second cache here would only guard
+    /// against that already-cheap fold, at the cost of a second staleness
+    /// surface to reason about.
+    ///
+    /// `None` when git is unavailable/timed out, or the file has fewer than
+    /// `hotspots.default_min_churn` commits in the window -- same "not
+    /// enough signal yet" semantics `ownership_entropy` documents, not an
+    /// error.
+    pub(crate) fn ownership_entropy_for(&self, path: &str) -> Option<f64> {
+        let config = self.config();
+        let (commits, git_available) = calm_core::git::commits_with_files_cached(
+            &self.project_root,
+            &config.hotspots.default_since,
+        );
+        if !git_available {
+            return None;
+        }
+        let signals = calm_core::git::file_signals(&commits);
+        let file_signals = signals.get(path)?;
+        calm_core::git::ownership_entropy(file_signals, config.hotspots.default_min_churn as u32)
+    }
+
     /// Test-only write connection for seeding fixture data.
     /// Production tool handlers must use `make_read_conn()` instead.
     #[cfg(test)]
@@ -2438,6 +2469,7 @@ mod personalization_tests {
             match_type: "symbol".to_string(),
             snippet: None,
             is_test: false,
+            churn_score: None,
         }
     }
 

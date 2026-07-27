@@ -64,6 +64,17 @@ pub struct FitnessThresholds {
     /// Default 0, same reasoning as `max_boundary_violations`: this is a
     /// landmine, not a tolerable-in-small-doses metric.
     pub max_boundary_ambiguous_count: i64,
+    /// Martin/OOD distance-from-main-sequence: `D = |A + I - 1| ∈ [0, 1]`
+    /// by construction, so `1.0` is un-failable *by definition* — this is
+    /// deliberate, not an oversight. `D` requires abstractness (`A`),
+    /// which is only computable for a handful of languages (see
+    /// `analysis::martin::ABSTRACTNESS_SUPPORTED_LANGUAGES`) and needs a
+    /// real cross-repo baseline before a meaningful cap can be chosen
+    /// without false-failing every repo whose main sequence happens to
+    /// sit slightly off the ideal. See PATTERN-DEBT entry for the
+    /// tightening trigger — this default must not silently become
+    /// permanent by omission.
+    pub max_avg_distance: f64,
 }
 
 /// Per-symbol cyclomatic complexity above this is "high" for
@@ -91,6 +102,7 @@ impl Default for FitnessThresholds {
             max_boundary_violations: 0,
             max_config_drift_count: 0,
             max_boundary_ambiguous_count: 0,
+            max_avg_distance: 1.0,
         }
     }
 }
@@ -185,6 +197,23 @@ pub struct FitnessMetrics {
     /// Count of symbols flagged `boundary_ambiguous` — see
     /// `graph::boundary::update_boundary_ambiguous_flags`.
     pub boundary_ambiguous_count: i64,
+    /// Martin/OOD instability, averaged over `martin_files_measured` (files
+    /// with `Ca + Ce > 0`) — see `analysis::martin::compute_martin_metrics`.
+    pub avg_instability: f64,
+    /// Martin/OOD distance from the main sequence, averaged only over
+    /// files where abstractness (`A`) was computable. `None` when no file
+    /// in the measured population is in a language
+    /// `analysis::martin::ABSTRACTNESS_SUPPORTED_LANGUAGES` covers.
+    pub avg_distance: Option<f64>,
+    /// Files with `Ca + Ce > 0` — the denominator `avg_instability` is
+    /// averaged over. Report alongside `martin_files_total` so a caller
+    /// never reads a Martin aggregate without seeing how much of the
+    /// codebase it actually covers.
+    pub martin_files_measured: i64,
+    /// Total indexed source files (excludes markdown) considered for
+    /// Martin measurement, regardless of whether they cleared the
+    /// `Ca + Ce > 0` gate.
+    pub martin_files_total: i64,
 }
 /// Row shape needed to re-run `compute_dead_code_confidence` per symbol:
 /// (path, line_start, line_end, caller_count, is_entry_point, is_test, language, name, signature, kind).
@@ -338,6 +367,8 @@ pub fn collect_metrics(
         &HotspotsConfig::default().default_since,
     );
 
+    let martin = crate::analysis::martin::compute_martin_metrics(conn)?;
+
     // Same category error as dead_code_pct/edge_coverage_pct: a struct/class
     // symbol can be constructed and referenced constantly without that ever
     // showing up as call fan-in, so it can (in principle) never earn `is_hub`
@@ -409,6 +440,10 @@ pub fn collect_metrics(
         high_complexity_pct,
         high_complexity_pct_note,
         boundary_ambiguous_count,
+        avg_instability: martin.avg_instability,
+        avg_distance: martin.avg_distance,
+        martin_files_measured: martin.files_measured,
+        martin_files_total: martin.files_total,
     })
 }
 
@@ -543,6 +578,31 @@ pub fn run_fitness_check(
             HIGH_COMPLEXITY_THRESHOLD
         ),
     });
+
+    // Only pushed when at least one measured file's abstractness resolved
+    // (see analysis::martin::ABSTRACTNESS_SUPPORTED_LANGUAGES) -- unlike
+    // boundary_violations/config_drift below (real zeros an opted-out
+    // project legitimately has), a `None` here means the metric literally
+    // isn't computable for this codebase's language mix, not that it
+    // measured a clean 0.0. Pushing a fabricated check item would silently
+    // guarantee a permanent pass instead of just omitting a check that has
+    // nothing to report.
+    if let Some(avg_distance) = metrics.avg_distance {
+        checks.push(FitnessCheckItem {
+            metric: "avg_distance".into(),
+            value: avg_distance,
+            threshold: thresholds.max_avg_distance,
+            passed: avg_distance <= thresholds.max_avg_distance,
+            message: format!(
+                "Martin/OOD avg distance from main sequence {:.3} (max {:.3}) -- {} of {} \
+                 indexed files measured (Ca+Ce>0, abstractness resolved)",
+                avg_distance,
+                thresholds.max_avg_distance,
+                metrics.martin_files_measured,
+                metrics.martin_files_total
+            ),
+        });
+    }
 
     checks.push(FitnessCheckItem {
         metric: "boundary_violations".into(),

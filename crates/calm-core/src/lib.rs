@@ -5,6 +5,7 @@ pub mod edit;
 pub mod embedding;
 pub mod fitness;
 pub mod format;
+pub mod git;
 pub mod gitignore;
 pub mod graph;
 pub mod hooks;

@@ -239,13 +239,47 @@ impl CalmServer {
                     &self.coverage.read_ok(),
                     &c.kind,
                 );
+            let mut risk_reasons: Vec<String> = Vec::new();
             if confirmed_caller_count == 0
                 && risk == "low"
                 && zero_caller_count_is_uncertain(dead_code_confidence)
             {
                 risk = "medium".to_string();
+                risk_reasons.push(format!(
+                    "zero confirmed callers, but dead-code confidence ({dead_code_confidence}) disagrees this is safe to remove"
+                ));
             }
-            let risk = Some(risk);
+
+            // Ownership-entropy escalation (#2, 2026-07-27 martin/entropy/
+            // churn plan): a single-author file is a low-bus-factor risk no
+            // caller-count-based signal above can see -- confirmed_caller_count
+            // and dead_code_confidence both describe how USED a symbol is,
+            // not how much independent review its history has had. Gated
+            // strictly on entropy == 0.0 (exactly one distinct commit
+            // author, not merely "low" by some arbitrary threshold) so this
+            // never fires on a fuzzy cutoff -- ownership_entropy's own doc
+            // comment guarantees 0.0 is returned only for the single-author
+            // case, never as a rounding artifact of a skewed-but-multi-
+            // author split. Deliberately confined to this local `risk`
+            // string, NOT `risk_level_from_caller_count` itself: that shared
+            // function also feeds `compute_touch_risk`'s write-blocking gate
+            // (edit_lines/edit_symbol), and entropy is an advisory reviewer-
+            // coverage signal that must never acquire the power to refuse an
+            // edit outright.
+            if risk == "low"
+                && let Some(entropy) = self.ownership_entropy_for(&c.path)
+                && entropy == 0.0
+            {
+                risk = "medium".to_string();
+                risk_reasons.push(
+                    "single-author file (low bus factor) — no second reviewer has context here"
+                        .to_string(),
+                );
+            }
+            let risk = Some(RiskAssessmentOutput {
+                level: risk,
+                reasons: risk_reasons,
+            });
 
             // Structural half of edit_symbol/edit_lines' confirm gate (docs/
             // superskills/specs/2026-07-11-superskills-inspired-features.md
@@ -257,7 +291,7 @@ impl CalmServer {
             self.record_edit_context_review(
                 &c.qualified_name,
                 &callers.iter().map(|e| e.symbol.clone()).collect::<Vec<_>>(),
-                risk.as_deref().unwrap_or("unknown"),
+                risk.as_ref().map(|r| r.level.as_str()).unwrap_or("unknown"),
             );
             self.note_reviewing(&c.qualified_name);
             let trend = calm_core::fitness::compute_trend(
@@ -734,7 +768,7 @@ pub(crate) struct EditContextOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) range_checksum: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) risk_assessment: Option<String>,
+    pub(crate) risk_assessment: Option<RiskAssessmentOutput>,
     /// `"none"` (confirmed not dead — entry point, test, or has confirmed
     /// callers), `"high"`/`"medium"`/`"low"` confidence it genuinely is dead
     /// code — see `calm_core::analysis::dead_code::compute_dead_code_confidence`.

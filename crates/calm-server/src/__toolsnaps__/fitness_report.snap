@@ -92,6 +92,25 @@
               "string",
               "null"
             ]
+          },
+          "avg_instability": {
+            "type": "number",
+            "format": "double"
+          },
+          "avg_distance": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
+          "martin_files_measured": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "martin_files_total": {
+            "type": "integer",
+            "format": "int64"
           }
         },
         "required": [
@@ -101,7 +120,10 @@
           "dead_code_pct",
           "hotspot_risk",
           "edge_coverage_pct",
-          "high_complexity_pct"
+          "high_complexity_pct",
+          "avg_instability",
+          "martin_files_measured",
+          "martin_files_total"
         ]
       },
       "BoundaryViolationOutput": {

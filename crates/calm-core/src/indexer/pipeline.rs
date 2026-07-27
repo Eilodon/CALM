@@ -997,8 +997,11 @@ fn resolve_sites_to_edges(ctx: &ResolutionCtx, sites: &[CallSiteRow]) -> Vec<Cal
     edges
 }
 
+#[allow(clippy::too_many_arguments)]
 fn rebuild_graph(
     tx: &rusqlite::Transaction,
+    project_root: &std::path::Path,
+    churn_since: &str,
     hub_config: &crate::config::HubThresholdConfig,
     crate_map: &crate::indexer::crate_map::CrateMap,
     psr4: &crate::indexer::psr4::Psr4Map,
@@ -1054,6 +1057,7 @@ fn rebuild_graph(
     crate::graph::coreness::compute_coreness(tx)?;
     crate::graph::hub::update_is_hub_flags(tx, hub_config)?;
     crate::graph::boundary::update_boundary_ambiguous_flags(tx)?;
+    crate::graph::churn::update_churn_scores(tx, project_root, churn_since)?;
     Ok(())
 }
 
@@ -1088,6 +1092,8 @@ pub enum IncrementalOutcome {
 #[allow(clippy::too_many_arguments)]
 pub fn incremental_graph_update(
     tx: &rusqlite::Transaction,
+    project_root: &std::path::Path,
+    churn_since: &str,
     delta_seed: &[String],
     names_delta: &HashSet<String>,
     hub_config: &crate::config::HubThresholdConfig,
@@ -1129,7 +1135,16 @@ pub fn incremental_graph_update(
             "delta_paths.len()={} > {MAX_INCREMENTAL_DELTA_PATHS}",
             delta_paths.len()
         );
-        rebuild_graph(tx, hub_config, crate_map, psr4, namespace_map, pysys)?;
+        rebuild_graph(
+            tx,
+            project_root,
+            churn_since,
+            hub_config,
+            crate_map,
+            psr4,
+            namespace_map,
+            pysys,
+        )?;
         return Ok(IncrementalOutcome::FellBackToFull(reason));
     }
 
@@ -1211,6 +1226,7 @@ pub fn incremental_graph_update(
     crate::graph::coreness::compute_coreness(tx)?;
     crate::graph::hub::update_is_hub_flags(tx, hub_config)?;
     crate::graph::boundary::update_boundary_ambiguous_flags(tx)?;
+    crate::graph::churn::update_churn_scores(tx, project_root, churn_since)?;
 
     Ok(IncrementalOutcome::Applied)
 }
@@ -1819,6 +1835,8 @@ pub fn run_indexing_pipeline_cancellable(
     let (crate_map, psr4, namespace_map, pysys) = cached_resolution_maps(project_root);
     rebuild_graph(
         &tx,
+        project_root,
+        &config.hotspots.default_since,
         &config.hub_threshold,
         &crate_map,
         &psr4,
@@ -2152,6 +2170,8 @@ pub fn reindex_changed_cancellable(
         if config.indexing.incremental_graph {
             match incremental_graph_update(
                 &tx,
+                project_root,
+                &config.hotspots.default_since,
                 &summary.changed_paths,
                 &summary.names_delta,
                 &config.hub_threshold,
@@ -2168,6 +2188,8 @@ pub fn reindex_changed_cancellable(
         } else {
             rebuild_graph(
                 &tx,
+                project_root,
+                &config.hotspots.default_since,
                 &config.hub_threshold,
                 &crate_map,
                 &psr4,
@@ -2298,6 +2320,8 @@ pub fn reindex_paths(
         if config.indexing.incremental_graph {
             match incremental_graph_update(
                 &tx,
+                project_root,
+                &config.hotspots.default_since,
                 &summary.changed_paths,
                 &summary.names_delta,
                 &config.hub_threshold,
@@ -2314,6 +2338,8 @@ pub fn reindex_paths(
         } else {
             rebuild_graph(
                 &tx,
+                project_root,
+                &config.hotspots.default_since,
                 &config.hub_threshold,
                 &crate_map,
                 &psr4,

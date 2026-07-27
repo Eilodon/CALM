@@ -453,6 +453,11 @@ pub(crate) struct FitnessMetricsOutput {
     pub(crate) high_complexity_pct: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) high_complexity_pct_note: Option<String>,
+    pub(crate) avg_instability: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) avg_distance: Option<f64>,
+    pub(crate) martin_files_measured: i64,
+    pub(crate) martin_files_total: i64,
 }
 
 impl From<calm_core::fitness::FitnessMetrics> for FitnessMetricsOutput {
@@ -466,6 +471,10 @@ impl From<calm_core::fitness::FitnessMetrics> for FitnessMetricsOutput {
             edge_coverage_pct: m.edge_coverage_pct,
             high_complexity_pct: m.high_complexity_pct,
             high_complexity_pct_note: m.high_complexity_pct_note,
+            avg_instability: m.avg_instability,
+            avg_distance: m.avg_distance,
+            martin_files_measured: m.martin_files_measured,
+            martin_files_total: m.martin_files_total,
         }
     }
 }

@@ -867,6 +867,7 @@ mod tests {
             match_type: "symbol".into(),
             snippet: None,
             is_test,
+            churn_score: None,
         }
     }
 
