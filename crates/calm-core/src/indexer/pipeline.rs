@@ -1003,6 +1003,7 @@ fn rebuild_graph(
     crate_map: &crate::indexer::crate_map::CrateMap,
     psr4: &crate::indexer::psr4::Psr4Map,
     namespace_map: &crate::indexer::csharp_namespace::NamespaceMap,
+    pysys: &crate::indexer::pysyspath::PySysPathMap,
 ) -> rusqlite::Result<()> {
     let ctx = build_resolution_context(tx, namespace_map)?;
 
@@ -1049,7 +1050,7 @@ fn rebuild_graph(
         [],
     )?;
     refresh_caller_counts(tx)?;
-    resolve_import_targets(tx, crate_map, psr4, namespace_map)?;
+    resolve_import_targets(tx, crate_map, psr4, namespace_map, pysys)?;
     crate::graph::coreness::compute_coreness(tx)?;
     crate::graph::hub::update_is_hub_flags(tx, hub_config)?;
     crate::graph::boundary::update_boundary_ambiguous_flags(tx)?;
@@ -1079,6 +1080,12 @@ pub enum IncrementalOutcome {
 /// loaded and (b) how much of `call_edges` gets deleted first; see plan
 /// §3.1 for the proof that `delta_paths` below is sufficient to catch every
 /// input `resolve_sites_to_edges` depends on.
+// 8 params: the four resolution maps (`crate_map`/`psr4`/`namespace_map`/
+// `pysys`) are built once per reindex by `cached_resolution_maps` and always
+// travel together, so they would collapse to a single `&ResolutionMaps`
+// bundle — a worthwhile tidy-up, but one that would rewrite the signature of
+// every function on this path for a lint rather than a behaviour fix.
+#[allow(clippy::too_many_arguments)]
 pub fn incremental_graph_update(
     tx: &rusqlite::Transaction,
     delta_seed: &[String],
@@ -1087,6 +1094,7 @@ pub fn incremental_graph_update(
     crate_map: &crate::indexer::crate_map::CrateMap,
     psr4: &crate::indexer::psr4::Psr4Map,
     namespace_map: &crate::indexer::csharp_namespace::NamespaceMap,
+    pysys: &crate::indexer::pysyspath::PySysPathMap,
 ) -> rusqlite::Result<IncrementalOutcome> {
     // Step 1 (plan D1): delta_paths = delta_seed ∪ {from_path of call_sites
     // whose callee_name ∈ names_delta} — a site in an UNCHANGED file that
@@ -1121,7 +1129,7 @@ pub fn incremental_graph_update(
             "delta_paths.len()={} > {MAX_INCREMENTAL_DELTA_PATHS}",
             delta_paths.len()
         );
-        rebuild_graph(tx, hub_config, crate_map, psr4, namespace_map)?;
+        rebuild_graph(tx, hub_config, crate_map, psr4, namespace_map, pysys)?;
         return Ok(IncrementalOutcome::FellBackToFull(reason));
     }
 
@@ -1199,7 +1207,7 @@ pub fn incremental_graph_update(
     // once the edge set matches, since every one is a pure function of
     // current DB state, not of how the edges got there.
     refresh_caller_counts(tx)?;
-    resolve_import_targets(tx, crate_map, psr4, namespace_map)?;
+    resolve_import_targets(tx, crate_map, psr4, namespace_map, pysys)?;
     crate::graph::coreness::compute_coreness(tx)?;
     crate::graph::hub::update_is_hub_flags(tx, hub_config)?;
     crate::graph::boundary::update_boundary_ambiguous_flags(tx)?;
@@ -1244,6 +1252,7 @@ fn resolve_import_targets(
     crate_map: &crate::indexer::crate_map::CrateMap,
     psr4: &crate::indexer::psr4::Psr4Map,
     namespace_map: &crate::indexer::csharp_namespace::NamespaceMap,
+    pysys: &crate::indexer::pysyspath::PySysPathMap,
 ) -> rusqlite::Result<()> {
     let known: HashSet<String> = {
         let mut stmt = tx.prepare("SELECT path FROM file_index")?;
@@ -1268,7 +1277,15 @@ fn resolve_import_targets(
     let targets: Vec<Option<String>> = rows
         .par_iter()
         .map(|(_, from_path, module)| {
-            resolve_module_to_path(from_path, module, &known, crate_map, psr4, namespace_map)
+            resolve_module_to_path(
+                from_path,
+                module,
+                &known,
+                crate_map,
+                psr4,
+                namespace_map,
+                pysys,
+            )
         })
         .collect();
 
@@ -1330,10 +1347,27 @@ fn resolve_rust_module(
                 dir = parent_of(&dir);
                 i += 1;
             }
-            if i == 1
-                && let Some(hit) = resolve_candidates(&from_dir, &segs[1..], false, known)
-            {
-                return Some(hit);
+            if i == 1 {
+                // `super::x` at the top level of this file: one module up is
+                // the file's own directory.
+                if let Some(hit) = resolve_candidates(&from_dir, &segs[1..], false, known) {
+                    return Some(hit);
+                }
+                // The same `use super::x;` written *inside* an inline `mod`
+                // block (overwhelmingly `#[cfg(test)] mod tests`) means one
+                // level up from **that block** — i.e. this file's own module,
+                // whose directory is `foo/` for `foo.rs`. The branch above
+                // never looks there (it only ever sees `foo.rs`'s parent), so
+                // every `use super::sibling;` inside a test module used to
+                // resolve to nothing. `mod.rs`/`lib.rs`/`main.rs` already own
+                // their directory and are covered above, so `own_module_dir`
+                // returns `None` for them. Tried second so a genuine
+                // top-level `super::x` still wins when both could match.
+                if let Some(own) = own_module_dir(from_path)
+                    && let Some(hit) = resolve_candidates(&own, &segs[1..], false, known)
+                {
+                    return Some(hit);
+                }
             }
             (dir, &segs[i..], false)
         }
@@ -1346,6 +1380,18 @@ fn resolve_rust_module(
             match crate_map.root_of(&other.replace('-', "_")) {
                 Some(root) => (root.to_string(), &segs[1..], true),
                 None => {
+                    // ...and "in scope" includes a module declared in *this
+                    // same file* — the `pub mod overlay; pub use overlay::X;`
+                    // re-export façade. That module's files live under the
+                    // importing file's own module directory, which the crate-
+                    // root fallback below never looks at (it only matches a
+                    // module sitting directly at the crate root). Tried first
+                    // because uniform paths give an in-scope module priority
+                    // over a same-named item at the root.
+                    let own = own_module_dir(from_path).unwrap_or_else(|| from_dir.clone());
+                    if let Some(hit) = resolve_candidates(&own, &segs, false, known) {
+                        return Some(hit);
+                    }
                     let (_, root) = crate_map.crate_of_file(from_path)?;
                     (root.to_string(), segs.as_slice(), false)
                 }
@@ -1419,6 +1465,7 @@ fn resolve_module_to_path(
     crate_map: &crate::indexer::crate_map::CrateMap,
     psr4: &crate::indexer::psr4::Psr4Map,
     namespace_map: &crate::indexer::csharp_namespace::NamespaceMap,
+    pysys: &crate::indexer::pysyspath::PySysPathMap,
 ) -> Option<String> {
     let m = module.trim().trim_matches(|c| c == '"' || c == '\'');
     if m.is_empty() {
@@ -1506,6 +1553,21 @@ fn resolve_module_to_path(
             .trim_start_matches("self/")
             .trim_start_matches("super/")
             .to_string();
+        // Python: an absolute `import a.b` / `from a.b import x` resolves
+        // against the `sys.path` entries in effect for the *importing* file,
+        // not against the project root. The nearest such entry is the file's
+        // own package root; after that, any `__file__`-anchored
+        // `sys.path.insert(...)` the file performs itself. Both are tried
+        // ahead of the project-root/`src/` guesses below, which only ever
+        // happen to be right for a module sitting at the repo root — without
+        // them an ordinary intra-package import (`from pkg.helper import x`)
+        // never resolved at all.
+        if from_path.ends_with(".py") {
+            bases.push(join_rel(&python_package_root(from_path, known), &norm));
+            for root in pysys.roots_for(from_path) {
+                bases.push(join_rel(root, &norm));
+            }
+        }
         // The full path, and — for item imports like `use a::b::Item` — its parent.
         // Also try a conventional `src/` source root.
         bases.push(norm.clone());
@@ -1553,6 +1615,41 @@ fn strip_js_emit_extension(m: &str) -> Option<&str> {
         }
     }
     None
+}
+
+/// The directory a Rust file's own module owns — where its submodule files
+/// live: `a/b/foo.rs` → `a/b/foo`. `None` for the three file names that already
+/// *are* their containing directory's module (`mod.rs`/`lib.rs`/`main.rs`), for
+/// which the caller's plain parent-directory candidate is already correct.
+fn own_module_dir(from_path: &str) -> Option<String> {
+    let path = std::path::Path::new(from_path);
+    let stem = path.file_stem()?.to_str()?;
+    if matches!(stem, "mod" | "lib" | "main") {
+        return None;
+    }
+    let dir = path
+        .parent()
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_default();
+    Some(join_rel(&dir, stem))
+}
+
+/// The `sys.path` entry a Python file's own package hangs off: walk out of the
+/// `__init__.py` chain the file sits in (`pkg/sub/mod.py`, with both
+/// `pkg/__init__.py` and `pkg/sub/__init__.py` present, → the directory holding
+/// `pkg`). A file in no package is its own root — exactly what `python foo.py`
+/// puts on `sys.path[0]`. PEP 420 namespace packages (no `__init__.py`) stop
+/// the walk early, which is the conservative direction: a shorter root only
+/// ever yields fewer candidates, never a wrong one.
+fn python_package_root(from_path: &str, known: &HashSet<String>) -> String {
+    let mut dir = std::path::Path::new(from_path)
+        .parent()
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_default();
+    while !dir.is_empty() && known.contains(&format!("{dir}/__init__.py")) {
+        dir = parent_of(&dir);
+    }
+    dir
 }
 
 fn parent_of(dir: &str) -> String {
@@ -1719,13 +1816,14 @@ pub fn run_indexing_pipeline_cancellable(
 
     *phase.write().unwrap() = IndexingPhase::BuildingEdges;
 
-    let (crate_map, psr4, namespace_map) = cached_resolution_maps(project_root);
+    let (crate_map, psr4, namespace_map, pysys) = cached_resolution_maps(project_root);
     rebuild_graph(
         &tx,
         &config.hub_threshold,
         &crate_map,
         &psr4,
         &namespace_map,
+        &pysys,
     )?;
     tx.commit()?;
 
@@ -1804,6 +1902,7 @@ struct CachedResolutionMaps {
     crate_map: crate::indexer::crate_map::CrateMap,
     psr4: crate::indexer::psr4::Psr4Map,
     namespace_map: crate::indexer::csharp_namespace::NamespaceMap,
+    pysys: crate::indexer::pysyspath::PySysPathMap,
 }
 
 static RESOLUTION_MAPS_CACHE: std::sync::OnceLock<
@@ -1811,12 +1910,12 @@ static RESOLUTION_MAPS_CACHE: std::sync::OnceLock<
 > = std::sync::OnceLock::new();
 
 /// Fallback for the part `CrateMap`/`Psr4Map` genuinely can't cover by
-/// mtime alone: `NamespaceMap::build` isn't manifest-driven at all — it
-/// walks every `.cs` file in the repo and reads each one's content (see its
-/// own doc comment) — so there is no single file whose mtime tracks "did
-/// the namespace map change". A pure TTL is the honest answer here, not a
-/// gap: any edit to a `.cs` file is already at most this old before the
-/// next reindex sees a corrected map.
+/// mtime alone: neither `NamespaceMap::build` nor `PySysPathMap::build` is
+/// manifest-driven at all — they walk every `.cs` / `.py` file in the repo
+/// and read each one's content (see their own doc comments) — so there is no
+/// single file whose mtime tracks "did those maps change". A pure TTL is the
+/// honest answer here, not a gap: any edit to a `.cs`/`.py` file is already
+/// at most this old before the next reindex sees a corrected map.
 const RESOLUTION_MAPS_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Plan 3 §3.1 Phase D: `CrateMap`/`Psr4Map`/`NamespaceMap` were each
@@ -1837,6 +1936,7 @@ fn cached_resolution_maps(
     crate::indexer::crate_map::CrateMap,
     crate::indexer::psr4::Psr4Map,
     crate::indexer::csharp_namespace::NamespaceMap,
+    crate::indexer::pysyspath::PySysPathMap,
 ) {
     let file_mtime = |name: &str| {
         std::fs::metadata(project_root.join(name))
@@ -1857,13 +1957,19 @@ fn cached_resolution_maps(
             && c.cargo_lock_mtime == cargo_lock_mtime
             && c.composer_json_mtime == composer_json_mtime;
         if fresh_enough && manifests_unchanged {
-            return (c.crate_map.clone(), c.psr4.clone(), c.namespace_map.clone());
+            return (
+                c.crate_map.clone(),
+                c.psr4.clone(),
+                c.namespace_map.clone(),
+                c.pysys.clone(),
+            );
         }
     }
 
     let crate_map = crate::indexer::crate_map::CrateMap::build(project_root);
     let psr4 = crate::indexer::psr4::Psr4Map::build(project_root);
     let namespace_map = crate::indexer::csharp_namespace::NamespaceMap::build(project_root);
+    let pysys = crate::indexer::pysyspath::PySysPathMap::build(project_root);
     cache.insert(
         project_root.to_path_buf(),
         CachedResolutionMaps {
@@ -1874,9 +1980,10 @@ fn cached_resolution_maps(
             crate_map: crate_map.clone(),
             psr4: psr4.clone(),
             namespace_map: namespace_map.clone(),
+            pysys: pysys.clone(),
         },
     );
-    (crate_map, psr4, namespace_map)
+    (crate_map, psr4, namespace_map, pysys)
 }
 
 /// Phase B plan T4b: the 3 manifest filenames `cached_resolution_maps`
@@ -2041,7 +2148,7 @@ pub fn reindex_changed_cancellable(
         if summary.changed_paths.iter().any(|p| is_manifest_path(p)) {
             invalidate_resolution_maps_cache(project_root);
         }
-        let (crate_map, psr4, namespace_map) = cached_resolution_maps(project_root);
+        let (crate_map, psr4, namespace_map, pysys) = cached_resolution_maps(project_root);
         if config.indexing.incremental_graph {
             match incremental_graph_update(
                 &tx,
@@ -2051,6 +2158,7 @@ pub fn reindex_changed_cancellable(
                 &crate_map,
                 &psr4,
                 &namespace_map,
+                &pysys,
             )? {
                 IncrementalOutcome::Applied => summary.graph_mode = GraphMode::Incremental,
                 IncrementalOutcome::FellBackToFull(reason) => {
@@ -2064,6 +2172,7 @@ pub fn reindex_changed_cancellable(
                 &crate_map,
                 &psr4,
                 &namespace_map,
+                &pysys,
             )?;
             summary.graph_mode = GraphMode::Full;
         }
@@ -2185,7 +2294,7 @@ pub fn reindex_paths(
         if summary.changed_paths.iter().any(|p| is_manifest_path(p)) {
             invalidate_resolution_maps_cache(project_root);
         }
-        let (crate_map, psr4, namespace_map) = cached_resolution_maps(project_root);
+        let (crate_map, psr4, namespace_map, pysys) = cached_resolution_maps(project_root);
         if config.indexing.incremental_graph {
             match incremental_graph_update(
                 &tx,
@@ -2195,6 +2304,7 @@ pub fn reindex_paths(
                 &crate_map,
                 &psr4,
                 &namespace_map,
+                &pysys,
             )? {
                 IncrementalOutcome::Applied => summary.graph_mode = GraphMode::Incremental,
                 IncrementalOutcome::FellBackToFull(reason) => {
@@ -2208,6 +2318,7 @@ pub fn reindex_paths(
                 &crate_map,
                 &psr4,
                 &namespace_map,
+                &pysys,
             )?;
             summary.graph_mode = GraphMode::Full;
         }
@@ -2491,7 +2602,7 @@ mod tests {
         .unwrap();
         std::fs::write(dir.join("src/lib.rs"), "").unwrap();
 
-        let (crate_map, _, _) = cached_resolution_maps(&dir);
+        let (crate_map, _, _, _) = cached_resolution_maps(&dir);
         assert_eq!(crate_map.root_of("resmaps_foo"), Some("src"));
 
         // Rewrite Cargo.toml's package name WITHOUT touching mtime granularity
@@ -2504,7 +2615,7 @@ mod tests {
         )
         .unwrap();
 
-        let (crate_map2, _, _) = cached_resolution_maps(&dir);
+        let (crate_map2, _, _, _) = cached_resolution_maps(&dir);
         assert_eq!(
             crate_map2.root_of("resmaps_bar"),
             Some("src"),
@@ -2763,6 +2874,136 @@ mod tests {
             confidence, "resolved",
             "imported call should be resolved, not textual"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `use super::common::*;` written inside an inline `#[cfg(test)] mod
+    /// tests` means one module up from *that block* — i.e. `tools` itself,
+    /// whose files live in `src/tools/`. Resolving `super::` purely from the
+    /// importing file's parent directory (`src/`) finds nothing, which is
+    /// what used to happen for every such import.
+    #[test]
+    fn test_rust_super_import_inside_inline_mod_resolves_to_own_module_dir() {
+        let dir = std::env::temp_dir().join(format!("ci_idx_supermod_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src/tools")).unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"supermod\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "pub mod tools;\n").unwrap();
+        std::fs::write(
+            dir.join("src/tools.rs"),
+            "pub mod common;\n\n#[cfg(test)]\nmod tests {\n    use super::common::*;\n}\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("src/tools/common.rs"), "pub fn helper() {}\n").unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
+
+        let to_path: String = conn
+            .query_row(
+                "SELECT COALESCE(to_path,'') FROM import_edges \
+                 WHERE from_path = 'src/tools.rs' AND module_name = 'super::common'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            to_path, "src/tools/common.rs",
+            "`super::` inside an inline mod resolves against the file's own module dir"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An ordinary intra-package `from pkg.helper import helper` resolves
+    /// against the importing file's own package root — here `app/`, since
+    /// `app/main.py` is in no package itself — not against the project root.
+    #[test]
+    fn test_python_dotted_import_resolves_against_package_root() {
+        let dir = std::env::temp_dir().join(format!("ci_idx_pypkg_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("app/pkg")).unwrap();
+        std::fs::write(dir.join("app/main.py"), "from pkg.helper import helper\n").unwrap();
+        std::fs::write(dir.join("app/pkg/__init__.py"), "").unwrap();
+        std::fs::write(dir.join("app/pkg/helper.py"), "def helper():\n    pass\n").unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
+
+        let to_path: String = conn
+            .query_row(
+                "SELECT COALESCE(to_path,'') FROM import_edges \
+                 WHERE from_path = 'app/main.py' AND module_name = 'pkg.helper'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            to_path, "app/pkg/helper.py",
+            "dotted Python import resolves under the importing file's package root"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A script that prepends a sibling directory to `sys.path` before
+    /// importing from it — the shape every runner under `benchmarks/` in this
+    /// very repo uses. Without reading that insertion there is no path from
+    /// `mcp_client` to `bench/lib/mcp_client.py` at all.
+    #[test]
+    fn test_python_import_resolves_through_sys_path_insert() {
+        let dir = std::env::temp_dir().join(format!("ci_idx_pysys_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("bench/runner")).unwrap();
+        std::fs::create_dir_all(dir.join("bench/lib")).unwrap();
+        std::fs::write(
+            dir.join("bench/runner/run.py"),
+            "import sys\nfrom pathlib import Path\n\
+             sys.path.insert(0, str(Path(__file__).resolve().parents[1] / \"lib\"))\n\
+             from mcp_client import Client\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("bench/lib/mcp_client.py"),
+            "class Client:\n    pass\n",
+        )
+        .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
+
+        let to_path: String = conn
+            .query_row(
+                "SELECT COALESCE(to_path,'') FROM import_edges \
+                 WHERE from_path = 'bench/runner/run.py' AND module_name = 'mcp_client'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            to_path, "bench/lib/mcp_client.py",
+            "import resolves through the file's own sys.path.insert"
+        );
+
+        // The stdlib import in the same file must stay unresolved — the new
+        // roots must not invent an in-project target for `sys`.
+        let sys_to: String = conn
+            .query_row(
+                "SELECT COALESCE(to_path,'') FROM import_edges \
+                 WHERE from_path = 'bench/runner/run.py' AND module_name = 'sys'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(sys_to, "", "stdlib import must remain unresolved");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
