@@ -7,4 +7,5 @@ pub mod lang_constants;
 pub mod parser;
 pub mod pipeline;
 pub mod psr4;
+pub mod pysyspath;
 pub mod sql;
