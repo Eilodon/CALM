@@ -2140,10 +2140,12 @@ pub(crate) fn transitive_bfs(
 ) -> (Vec<TransitiveEntry>, bool) {
     let sql = match direction {
         EdgeDirection::Callers => {
-            "SELECT from_symbol, from_path, edge_confidence FROM call_edges WHERE to_symbol = ?1"
+            "SELECT from_symbol, from_path, edge_confidence FROM call_edges \
+             WHERE to_symbol = ?1 AND ruled_out_by_scip = 0"
         }
         EdgeDirection::Callees => {
-            "SELECT to_symbol, to_path, edge_confidence FROM call_edges WHERE from_symbol = ?1"
+            "SELECT to_symbol, to_path, edge_confidence FROM call_edges \
+             WHERE from_symbol = ?1 AND ruled_out_by_scip = 0"
         }
     };
     let mut stmt = match conn.prepare(sql) {
@@ -2179,13 +2181,25 @@ pub(crate) fn transitive_bfs(
             let Ok(rows) = rows else { continue };
             for (sym_name, sym_path, edge_confidence) in rows.filter_map(|r| r.ok()) {
                 if visited.insert(sym_name.clone()) {
+                    // An `ambiguous` edge is index-time fan-out (one call site,
+                    // one edge per same-named symbol). Reported, because the
+                    // caller still wants to see it — but never expanded: each
+                    // such hop would multiply the frontier by the fan-out width,
+                    // and confidence is not transitive, so anything found behind
+                    // one inherits its uncertainty while presenting its own
+                    // edge's confidence. Measured on real corpora before this
+                    // guard: a depth-3 query returned up to 47% of a whole repo.
+                    let expandable =
+                        edge_confidence != calm_core::types::EdgeConfidence::Ambiguous.as_str();
                     results.push(TransitiveEntry {
                         symbol: sym_name.clone(),
                         path: sym_path,
                         depth: depth as i64,
                         edge_confidence,
                     });
-                    next_frontier.push(sym_name);
+                    if expandable {
+                        next_frontier.push(sym_name);
+                    }
                 }
             }
         }
@@ -2598,5 +2612,87 @@ mod personalization_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod transitive_bfs_tests {
+    use super::*;
+
+    fn test_conn() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        calm_core::db::schema::init_db(&conn).unwrap();
+        conn
+    }
+
+    fn edge(conn: &rusqlite::Connection, from: &str, to: &str, confidence: &str, ruled_out: i64) {
+        conn.execute(
+            "INSERT INTO call_edges (from_symbol, to_symbol, from_path, to_path, \
+             edge_confidence, ruled_out_by_scip, edge_kind) \
+             VALUES (?1, ?2, ?1, ?2, ?3, ?4, 'call')",
+            rusqlite::params![from, to, confidence, ruled_out],
+        )
+        .unwrap();
+    }
+
+    /// `callers`' own direct query (tools/trace.rs) filters `ruled_out_by_scip = 0`
+    /// — an edge SCIP has *proven* wrong must not reappear just because the
+    /// caller asked for the transitive view.
+    #[test]
+    fn skips_scip_ruled_out_edges() {
+        let conn = test_conn();
+        edge(&conn, "caller_ok", "target", "resolved", 0);
+        edge(&conn, "caller_disproven", "target", "resolved", 1);
+
+        let (entries, _) = transitive_bfs(&conn, "target", EdgeDirection::Callers, 3, 5_000);
+        let names: Vec<&str> = entries.iter().map(|e| e.symbol.as_str()).collect();
+
+        assert!(names.contains(&"caller_ok"));
+        assert!(
+            !names.contains(&"caller_disproven"),
+            "ruled_out_by_scip edge was traversed: {names:?}"
+        );
+    }
+
+    /// An `ambiguous` edge is index-time fan-out: one call site emitting an edge
+    /// to EVERY same-named symbol. Reporting it as a reachable node is fine (the
+    /// direct path does too, in its own bucket), but *expanding* it multiplies
+    /// the frontier by the fan-out width at every hop — measured on real corpora
+    /// as up to 47% of an entire repo returned from one depth-3 query. So an
+    /// ambiguous node is a leaf: reported, never expanded.
+    #[test]
+    fn reports_but_does_not_expand_ambiguous_edges() {
+        let conn = test_conn();
+        edge(&conn, "fanout", "target", "ambiguous", 0);
+        edge(&conn, "behind_fanout", "fanout", "resolved", 0);
+
+        let (entries, _) = transitive_bfs(&conn, "target", EdgeDirection::Callers, 3, 5_000);
+        let names: Vec<&str> = entries.iter().map(|e| e.symbol.as_str()).collect();
+
+        assert!(
+            names.contains(&"fanout"),
+            "ambiguous neighbour should still be reported: {names:?}"
+        );
+        assert!(
+            !names.contains(&"behind_fanout"),
+            "BFS compounded THROUGH an ambiguous edge: {names:?}"
+        );
+    }
+
+    /// The stop must be specific to ambiguity, not a blanket depth-1 cap.
+    #[test]
+    fn still_expands_normally_through_confident_edges() {
+        let conn = test_conn();
+        edge(&conn, "mid", "target", "resolved", 0);
+        edge(&conn, "deep", "mid", "formal", 0);
+
+        let (entries, _) = transitive_bfs(&conn, "target", EdgeDirection::Callers, 3, 5_000);
+        let names: Vec<&str> = entries.iter().map(|e| e.symbol.as_str()).collect();
+
+        assert!(names.contains(&"mid"));
+        assert!(
+            names.contains(&"deep"),
+            "confident chain was cut short: {names:?}"
+        );
     }
 }

@@ -205,12 +205,23 @@ def read_import_resolution(db_path: Path, lang: str) -> dict:
     in-project target.
 
     "Plausibly first-party" is deliberately over-inclusive: a relative
-    specifier, or one whose leading/trailing segment matches an indexed file's
-    stem or a directory in the tree. A third-party module that happens to
-    share a name with a local file is counted in the denominator and, if
-    unresolved, drags the reported rate down. That bias is the safe one for a
-    metric used to decide where to invest effort -- it can understate
-    resolution quality, never overstate it.
+    specifier, or one whose root segment AND its tail both match something in
+    the tree. A third-party module that happens to share a name with a local
+    file is counted in the denominator and, if unresolved, drags the reported
+    rate down. That bias is the safe one for a metric used to decide where to
+    invest effort -- it can understate resolution quality, never overstate it.
+
+    Matching the ROOT ALONE (the rule until 2026-07-27) is not enough, and was
+    badly wrong for the JVM: Maven/Gradle lay sources out under
+    `src/main/java/org/...`, so the tree literally contains directories named
+    `java`, `org` and `com` -- the exact root segments of `java.io.*`,
+    `org.springframework.*` and every other vendor package. Every JDK and
+    Spring import therefore landed in the denominator. On spring-petclinic
+    that reported 386 first-party imports where only 22 exist, understating
+    the true rate by ~17x. Requiring the tail to match as well (the imported
+    leaf is an indexed file's stem, or its parent segment is a real directory)
+    keeps the over-inclusive direction while dropping that whole class of
+    phantom denominator entries.
     """
     db_lang = db_language(lang)
     conn = sqlite3.connect(db_path)
@@ -226,6 +237,25 @@ def read_import_resolution(db_path: Path, lang: str) -> dict:
     stems = {Path(p).stem.replace("-", "_") for p in paths}
     dirs = {seg.replace("-", "_") for p in paths for seg in Path(p).parent.parts}
 
+    # Go states first-partyness exactly, so don't guess it by name here. Its
+    # module path is declared in `go.mod`, and the standard library owns the
+    # dotless import paths. The name heuristic gets Go backwards without this:
+    # on gin it counted stdlib `errors`/`path`/`context` as first-party (they
+    # collide with gin's own file stems) while missing every real
+    # `github.com/gin-gonic/gin/...` import, whose `github` root matches no
+    # directory -- so it reported 0% for a corpus where all 31 in-module
+    # imports resolve correctly.
+    go_module = None
+    if db_lang == "go":
+        try:
+            gomod = (db_path.parent.parent / "go.mod").read_text()
+            for line in gomod.splitlines():
+                if line.strip().startswith("module "):
+                    go_module = line.strip()[len("module ") :].split("//")[0].strip()
+                    break
+        except OSError:
+            pass
+
     def segments(spec: str) -> list[str]:
         flat = spec.replace("::", "/").replace(".", "/").replace("\\", "/")
         return [s for s in flat.split("/") if s]
@@ -235,15 +265,30 @@ def read_import_resolution(db_path: Path, lang: str) -> dict:
         spec = (module or "").strip().strip("\"'")
         if not spec:
             continue
+        if go_module is not None:
+            # Exact rule, no heuristic: inside the module path or nothing.
+            if spec == go_module or spec.startswith(go_module + "/"):
+                first_party += 1
+                resolved += 1 if to_path else 0
+            continue
         segs = segments(spec)
         root = segs[0].replace("-", "_") if segs else ""
-        # Only the *root* segment is matched, never a trailing one: `std::path`
-        # ends in a segment that collides with plenty of repos' own `path`
-        # file, and counting it would have shown 52 phantom misses on CALM's
-        # own tree. INTERNAL_ROOTS are in-project by language definition
-        # rather than by name lookup, which a stem/dir match cannot see (a
-        # bare `use super::*;` has no name to look up at all).
-        plausible = spec.startswith(".") or root in INTERNAL_ROOTS or root in stems or root in dirs
+        # The tail is never matched on its OWN: `std::path` ends in a segment
+        # that collides with plenty of repos' own `path` file, and counting
+        # that would have shown 52 phantom misses on CALM's own tree. But the
+        # root on its own is equally unsound in the other direction (see the
+        # JVM case in the docstring), so both ends must agree. INTERNAL_ROOTS
+        # are in-project by language definition rather than by name lookup,
+        # which a stem/dir match cannot see (a bare `use super::*;` has no
+        # name to look up at all).
+        leaf = segs[-1].replace("-", "_") if segs else ""
+        parent = segs[-2].replace("-", "_") if len(segs) >= 2 else ""
+        root_ok = root in INTERNAL_ROOTS or root in stems or root in dirs
+        # A single-segment specifier (`import express`) has no tail to check
+        # independently -- root and leaf are the same token, so requiring both
+        # would be the same test twice, not a stronger one.
+        tail_ok = root_ok if len(segs) == 1 else (leaf in stems or (parent != "" and parent in dirs))
+        plausible = spec.startswith(".") or (root_ok and tail_ok)
         if plausible:
             first_party += 1
             resolved += 1 if to_path else 0
