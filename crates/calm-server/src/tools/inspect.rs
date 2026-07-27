@@ -420,8 +420,10 @@ impl CalmServer {
             let callers = match symbol_info.as_ref() {
                 Some((info, _)) => {
                     let mut stmt = match conn.prepare(
+                        // PATTERN-DEBT call-edges-missing-ruled-out-filter:
+                        // a SCIP-disproven caller isn't a real caller.
                         "SELECT from_symbol, from_path, edge_confidence, call_site_line, edge_kind
-                         FROM call_edges WHERE to_symbol = ?1",
+                         FROM call_edges WHERE to_symbol = ?1 AND ruled_out_by_scip = 0",
                     ) {
                         Ok(s) => s,
                         Err(e) => return db_error(e),
@@ -829,9 +831,11 @@ pub(crate) fn build_health(
         let mut inferred = 0i64;
         let mut textual = 0i64;
         let mut ambiguous = 0i64;
+        // PATTERN-DEBT call-edges-missing-ruled-out-filter: a SCIP-disproven
+        // edge is a phantom relationship, not real tier evidence.
         if let Ok(mut stmt) = conn.prepare(
             "SELECT edge_confidence, COUNT(*) FROM call_edges \
-             WHERE to_symbol = ?1 GROUP BY edge_confidence",
+             WHERE to_symbol = ?1 AND ruled_out_by_scip = 0 GROUP BY edge_confidence",
         ) {
             let _ = stmt
                 .query_map([&c.qualified_name], |row| {
@@ -873,10 +877,12 @@ pub(crate) fn build_health(
     };
 
     let mut test_files = Vec::new();
+    // PATTERN-DEBT call-edges-missing-ruled-out-filter: a disproven caller
+    // must not count as test-coverage evidence for this symbol.
     if let Ok(mut stmt) = conn.prepare(
         "SELECT DISTINCT ce.from_path, s.is_test FROM call_edges ce \
          LEFT JOIN symbols s ON s.qualified_name = ce.from_symbol \
-         WHERE ce.to_symbol = ?1",
+         WHERE ce.to_symbol = ?1 AND ce.ruled_out_by_scip = 0",
     ) {
         let _ = stmt
             .query_map([&c.qualified_name], |row| {

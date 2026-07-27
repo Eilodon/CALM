@@ -277,9 +277,12 @@ pub fn collect_metrics(
         .unwrap_or(0);
 
     let edge_coverage_pct = if callable_symbols > 0 {
+        // PATTERN-DEBT call-edges-missing-ruled-out-filter: a symbol whose
+        // only outgoing edge was later disproven by SCIP must not count as
+        // "covered" — that edge isn't real.
         let covered: i64 = conn
             .query_row(
-                "SELECT COUNT(DISTINCT from_symbol) FROM call_edges",
+                "SELECT COUNT(DISTINCT from_symbol) FROM call_edges WHERE ruled_out_by_scip = 0",
                 [],
                 |r| r.get(0),
             )

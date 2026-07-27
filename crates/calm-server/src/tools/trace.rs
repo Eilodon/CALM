@@ -460,9 +460,12 @@ impl CalmServer {
             let call_dependents: Vec<String> = {
                 let already: std::collections::HashSet<&str> =
                     imported_by.iter().map(|e| e.from_path.as_str()).collect();
+                // PATTERN-DEBT call-edges-missing-ruled-out-filter: a
+                // SCIP-disproven caller isn't a real dependent.
                 let stmt = conn.prepare(
                     "SELECT DISTINCT from_path FROM call_edges \
                      WHERE to_path = ?1 AND from_path IS NOT NULL AND from_path != ?1 \
+                     AND ruled_out_by_scip = 0 \
                      ORDER BY from_path LIMIT ?2",
                 );
                 let mut stmt = match stmt {

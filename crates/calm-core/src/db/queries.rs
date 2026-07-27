@@ -10,9 +10,13 @@ pub fn batch_callees(
         return Ok(HashMap::new());
     }
     let placeholders = vec!["?"; nodes.len()].join(",");
+    // PATTERN-DEBT call-edges-missing-ruled-out-filter: feeds
+    // bidirectional_bfs_path (the `path` tool) — a disproven edge must
+    // never be a hop in a reported path, same reasoning as the
+    // transitive_bfs/compute_coreness fix (commit 8634111).
     let sql = format!(
         "SELECT from_symbol, to_symbol, edge_confidence \
-         FROM call_edges WHERE from_symbol IN ({placeholders})"
+         FROM call_edges WHERE from_symbol IN ({placeholders}) AND ruled_out_by_scip = 0"
     );
     let mut stmt = conn.prepare(&sql)?;
     let params: Vec<&dyn rusqlite::types::ToSql> = nodes
@@ -44,9 +48,11 @@ pub fn batch_callers(
         return Ok(HashMap::new());
     }
     let placeholders = vec!["?"; nodes.len()].join(",");
+    // PATTERN-DEBT call-edges-missing-ruled-out-filter: same rationale as
+    // batch_callees above — feeds bidirectional_bfs_path (the `path` tool).
     let sql = format!(
         "SELECT to_symbol, from_symbol, edge_confidence \
-         FROM call_edges WHERE to_symbol IN ({placeholders})"
+         FROM call_edges WHERE to_symbol IN ({placeholders}) AND ruled_out_by_scip = 0"
     );
     let mut stmt = conn.prepare(&sql)?;
     let params: Vec<&dyn rusqlite::types::ToSql> = nodes

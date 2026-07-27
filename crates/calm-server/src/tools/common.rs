@@ -1918,11 +1918,15 @@ fn compute_proximity_boosts(
     if !explored_symbols.is_empty() {
         let anchors: Vec<String> = explored_symbols.keys().cloned().collect();
 
-        // Files containing a caller of an explored symbol.
+        // Files containing a caller of an explored symbol. PATTERN-DEBT
+        // call-edges-missing-ruled-out-filter: a SCIP-disproven caller must
+        // not boost an unrelated file's ranking — condition ordered before
+        // `to_symbol IN` since query_symbol_path_pairs_chunked appends the
+        // `(?1, ?2, ...)` placeholder list right after this prefix string.
         let mut callers = Vec::new();
         query_symbol_path_pairs_chunked(
             conn,
-            "SELECT to_symbol, from_path FROM call_edges WHERE to_symbol IN",
+            "SELECT to_symbol, from_path FROM call_edges WHERE ruled_out_by_scip = 0 AND to_symbol IN",
             &anchors,
             &mut callers,
         );

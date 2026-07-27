@@ -7674,6 +7674,80 @@ mod tests {
     }
 
     #[test]
+    // PATTERN-DEBT call-edges-missing-ruled-out-filter (edit.rs:1764):
+    // all_caller_edges_confident used to count a SCIP-disproven fan-out
+    // sibling toward `total` without it ever counting toward `confident`
+    // (its own edge_confidence was never resolved/formal) — a symbol whose
+    // only REAL caller edges are confident could still be forced through
+    // the full 3-layer gate because of a phantom disproven row. Same
+    // fixture as the sibling test above, plus one ruled_out_by_scip=1 row
+    // that must be excluded from the count entirely, not just discounted.
+    fn edit_lines_bridge_only_hub_ignores_scip_ruled_out_edges_when_checking_confidence() {
+        let (dir, server) = test_server("edit_bridge_gate_ruled_out");
+        std::fs::write(dir.join("a.py"), "def helper():\n    return 1\n").unwrap();
+        let hash = calm_core::edit::range_checksum("def helper():\n    return 1\n", 2, 2).unwrap();
+
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, hub_kind, is_entry_point)
+                 VALUES ('a.py::helper', 'helper', 'function', 'python', 'a.py', 1, 2, '', '', 'helper', 3, 1, 'bridge', 0)",
+                [],
+            )
+            .unwrap();
+            // Two real callers, both high-confidence.
+            conn.execute(
+                "INSERT INTO call_edges (from_symbol, to_symbol, edge_confidence) VALUES ('mod.a', 'a.py::helper', 'resolved')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO call_edges (from_symbol, to_symbol, edge_confidence) VALUES ('mod.b', 'a.py::helper', 'formal')",
+                [],
+            )
+            .unwrap();
+            // A disproven fan-out sibling: never a real caller, must not
+            // count toward `total` (nor toward `confident` — its own
+            // confidence is 'ambiguous', proving this isn't just "discount
+            // it from the numerator too").
+            conn.execute(
+                "INSERT INTO call_edges (from_symbol, to_symbol, edge_confidence, ruled_out_by_scip) VALUES ('mod.c', 'a.py::helper', 'ambiguous', 1)",
+                [],
+            )
+            .unwrap();
+        }
+
+        // confirm:true, NO edit_context call this session, NO reason — must
+        // still reach the lighter bridge-only tier despite the ruled-out
+        // row sitting in call_edges, same as the sibling test's assertion.
+        let with_confirm_only = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
+            EditLinesParams {
+                path: "a.py".into(),
+                edits: vec![EditHunkParam {
+                    old_text: None,
+                    start_line: 2,
+                    end_line: 2,
+                    expected_hash: Some(hash),
+                    new_text: "    return 2\n".into(),
+                }],
+                confirm: true,
+                reason: None,
+            },
+        ));
+        let v = jv(with_confirm_only);
+        assert_eq!(
+            v["applied"], true,
+            "ruled-out fan-out sibling must not force the full gate: {v}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.py")).unwrap(),
+            "def helper():\n    return 2\n"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn edit_lines_bridge_hub_with_a_low_confidence_caller_still_needs_the_full_gate() {
         let (dir, server) = test_server("edit_bridge_gate_low_confidence");
         std::fs::write(dir.join("a.py"), "def helper():\n    return 1\n").unwrap();

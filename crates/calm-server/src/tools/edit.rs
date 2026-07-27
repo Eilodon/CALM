@@ -1759,9 +1759,21 @@ fn all_caller_edges_confident(conn: &rusqlite::Connection, qualified_names: &[St
         .map(|_| "?")
         .collect::<Vec<_>>()
         .join(",");
+    // PATTERN-DEBT call-edges-missing-ruled-out-filter: without
+    // `ruled_out_by_scip = 0`, `total` counted edges SCIP has already
+    // disproven — they're never real callers, but they inflated the
+    // denominator without ever counting toward `confident` (their own
+    // edge_confidence was never 'resolved'/'formal' to begin with, since
+    // ruled_out_by_scip only ever fires on the fan-out SIBLINGS of a
+    // confirmed candidate). Net effect was a false-negative direction (this
+    // function under-reports confidence, forcing the heavier 3-layer gate
+    // even when every REAL caller edge is confident) rather than an unsafe
+    // permissive one, but it's still wrong: a symbol whose only caller
+    // edges were N confident ones plus M since-disproven ones reported
+    // `false` here instead of `true`.
     let sql = format!(
         "SELECT COUNT(*), SUM(CASE WHEN edge_confidence IN ('resolved','formal') THEN 1 ELSE 0 END) \
-         FROM call_edges WHERE to_symbol IN ({placeholders})"
+         FROM call_edges WHERE to_symbol IN ({placeholders}) AND ruled_out_by_scip = 0"
     );
     let mut stmt = match conn.prepare(&sql) {
         Ok(s) => s,

@@ -29,6 +29,14 @@ impl CalmServer {
             let symbols: i64 = conn
                 .query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0))
                 .unwrap_or(0);
+            // PATTERN-DEBT call-edges-missing-ruled-out-filter: deliberately
+            // NOT filtered by `ruled_out_by_scip` — `edges_indexed` is a raw
+            // table-size stat, sibling of `files_indexed`/`symbols_indexed`
+            // above (both plain row counts too), not a "confident edges"
+            // metric. A disproven-but-still-present row is real DB storage
+            // an agent reindexing/debugging cares about; filtering it here
+            // would make this number disagree with `SELECT COUNT(*) FROM
+            // call_edges` run by hand for no benefit.
             let edges: i64 = conn
                 .query_row("SELECT COUNT(*) FROM call_edges", [], |r| r.get(0))
                 .unwrap_or(0);
@@ -399,12 +407,16 @@ pub(crate) fn compute_frontier_entries(
         );
     }
 
-    // Set B: files containing callers of explored symbols
+    // Set B: files containing callers of explored symbols. PATTERN-DEBT
+    // call-edges-missing-ruled-out-filter: a SCIP-disproven caller must not
+    // suggest an unrelated file as a frontier to explore next — condition
+    // ordered before `to_symbol IN` since query_paths_chunked appends the
+    // `(?1, ...) AND from_path IS NOT NULL` tail right after this prefix.
     let mut set_b: HashSet<String> = HashSet::new();
     if !explored_symbols.is_empty() {
         query_paths_chunked(
             conn,
-            "SELECT DISTINCT from_path FROM call_edges WHERE to_symbol IN",
+            "SELECT DISTINCT from_path FROM call_edges WHERE ruled_out_by_scip = 0 AND to_symbol IN",
             explored_symbols,
             &mut set_b,
         );
