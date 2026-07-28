@@ -211,6 +211,16 @@ opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.31", default-features = false, features = ["http-proto", "reqwest-client"] }
 tracing-opentelemetry = { version = "0.32" }
 
+# Phase 3 (same plan): optional Streamable-HTTP transport, behind the
+# `http` feature (crates/calm-server/Cargo.toml: rmcp/transport-streamable-
+# http-server). axum is NOT an rmcp dependency -- StreamableHttpService only
+# implements tower_service::Service, the caller brings its own HTTP server
+# -- and wasn't already in this workspace's tree (checked Cargo.lock:
+# absent before this). Live-verified 2026-07-28 in a scratch probe: axum
+# 0.8 + rmcp 2.2.0 (transport-streamable-http-server) resolve and build
+# clean together (both on http 1.x / tower-service 0.3.x).
+axum = "0.8"
+
 # Internal
 calm-core = { path = "crates/calm-core" }
 calm-server = { path = "crates/calm-server" }

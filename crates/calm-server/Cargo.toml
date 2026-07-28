@@ -16,6 +16,7 @@ anyhow = { workspace = true }
 rmcp = { workspace = true }
 schemars = { workspace = true }
 libc = "0.2"
+axum = { workspace = true, optional = true }
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }
@@ -47,3 +48,8 @@ scip-overlay = ["calm-core/scip-overlay"]
 # See calm-core's `lsp-overlay` feature comment and `LspConfig`'s doc comment
 # (config.rs) for why its default policy is `on_demand`, never `on_save`.
 lsp-overlay  = ["calm-core/lsp-overlay"]
+# Opt-in remote/HTTP transport (Phase 3, docs/superskills/plans/2026-07-28-
+# otel-http-dynamic-toolsets.md). Loopback-only by default even when built
+# with this feature -- see crates/calm-cli's --http/--allow-remote flags
+# and http.rs's fail-closed launch policy (Task 3.4a).
+http = ["rmcp/transport-streamable-http-server", "dep:axum"]
