@@ -395,6 +395,43 @@ impl CalmServer {
             .expect("valid preset in test")
             .list_all()
     }
+
+    /// Mutates the per-session runtime toolset narrowing. Returns `true` iff
+    /// the new value differs from the old one — the MCP-facing `set_toolset`
+    /// tool (orient.rs) uses this to skip `notify_tool_list_changed` on a
+    /// no-op call (Abductive-2: repeated identical calls must not flood the
+    /// client with list-changed notifications).
+    fn apply_toolset_inner(&self, narrowing: Option<std::collections::BTreeSet<String>>) -> bool {
+        use common::RwLockExt;
+        let mut guard = self.enabled_toolsets.write_ok();
+        if *guard == narrowing {
+            return false;
+        }
+        *guard = narrowing;
+        true
+    }
+
+    /// Test-only entry point for `apply_toolset_inner` — production code
+    /// only reaches it through the `set_toolset` MCP tool, which also
+    /// validates names against `TOOLSET_NAMES` and notifies the client.
+    #[cfg(test)]
+    pub(crate) fn apply_toolset_for_test(&self, sets: Option<Vec<String>>) {
+        self.apply_toolset_inner(sets.map(|v| v.into_iter().collect()));
+    }
+
+    /// The tool-name set THIS session currently exposes: the static preset
+    /// ceiling narrowed (if any) by `enabled_toolsets`, via
+    /// `common::effective_tool_names`. Read by `list_tools`/`call_tool`
+    /// (the runtime toolset gate) and by `set_toolset`'s own response.
+    pub(crate) fn current_visible_tool_names(&self) -> std::collections::BTreeSet<String> {
+        let ceiling = common::resolve_preset(&self.preset)
+            .ok()
+            .flatten()
+            .unwrap_or_else(common::calm_all_tool_names);
+        use common::RwLockExt;
+        let narrowing = self.enabled_toolsets.read_ok().clone();
+        common::effective_tool_names(&ceiling, narrowing.as_ref())
+    }
 }
 
 /// MCP Prompts — canned, parameterized instruction messages a client can
@@ -6069,6 +6106,19 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
         (dir, server)
+    }
+
+    #[test]
+    fn set_toolset_narrows_then_widens_and_never_drops_floor() {
+        let (_dir, server) = test_server("set_toolset_narrows");
+        // Narrow to trace only.
+        server.apply_toolset_for_test(Some(vec!["trace".to_string()]));
+        let visible = server.current_visible_tool_names();
+        assert!(visible.contains("edit_context"), "floor dropped on narrow");
+        assert!(!visible.contains("scan_text"), "security tool leaked past narrow");
+        // Widen back to full.
+        server.apply_toolset_for_test(None);
+        assert!(server.current_visible_tool_names().contains("scan_text"));
     }
 
     /// Test-only: unwrap a migrated tool's `Json<T>` return into a plain

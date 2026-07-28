@@ -434,6 +434,79 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
             })
         }))
     }
+
+    #[tool(
+        name = "set_toolset",
+        description = "Narrow (or reset) which tools THIS session exposes, at runtime, without restarting the server. Names are toolset names (see repo_overview / TOOLSET_NAMES); the safety floor (orient+guardrails+recover+edit) is always kept, and the static preset is never exceeded. Pass an empty list / omit toolsets to reset to the full preset. Emits notifications/tools/list_changed so the client refetches.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    pub(crate) async fn set_toolset(
+        &self,
+        Parameters(p): Parameters<SetToolsetParams>,
+        ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Json<ToolOutcome<SetToolsetOutput>> {
+        let requested = p.toolsets.unwrap_or_default();
+        // Validate every requested name against TOOLSET_NAMES (reject unknowns
+        // loudly, mirroring resolve_preset's hard-error posture).
+        for name in &requested {
+            if !TOOLSET_NAMES.contains(&name.as_str()) {
+                return Json(ToolOutcome::error(error_detail(
+                    "UNKNOWN_TOOLSET",
+                    &format!(
+                        "unknown toolset {name:?}; valid: {}",
+                        TOOLSET_NAMES.join(", ")
+                    ),
+                    true,
+                )));
+            }
+        }
+        let narrowing = if requested.is_empty() {
+            None
+        } else {
+            Some(
+                requested
+                    .iter()
+                    .cloned()
+                    .collect::<std::collections::BTreeSet<_>>(),
+            )
+        };
+        let changed = self.apply_toolset_inner(narrowing);
+        // Audit trail — one of the two new runtime behaviors (L6 finding).
+        tracing::info!(
+            target: crate::telemetry::AUDIT_TARGET,
+            session_id = self.session_id,
+            decision = "toolset_changed",
+            toolsets = ?requested,
+        );
+        // Debounced (Abductive-2): only notify when the set actually changed,
+        // so repeated identical calls don't flood the client.
+        if changed {
+            let _ = ctx.peer.notify_tool_list_changed().await;
+        }
+        let visible = self.current_visible_tool_names();
+        Json(ToolOutcome::success(SetToolsetOutput {
+            narrowed_to: requested,
+            visible_tools: visible.into_iter().collect(),
+        }))
+    }
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub(crate) struct SetToolsetParams {
+    /// Toolset names to expose (union). Empty/omitted resets to the full preset.
+    #[serde(default)]
+    pub(crate) toolsets: Option<Vec<String>>,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub(crate) struct SetToolsetOutput {
+    pub(crate) narrowed_to: Vec<String>,
+    pub(crate) visible_tools: Vec<String>,
 }
 
 #[derive(Serialize, JsonSchema)]

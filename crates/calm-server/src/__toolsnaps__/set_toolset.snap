@@ -1,0 +1,76 @@
+{
+  "name": "set_toolset",
+  "description": "Narrow (or reset) which tools THIS session exposes, at runtime, without restarting the server. Names are toolset names (see repo_overview / TOOLSET_NAMES); the safety floor (orient+guardrails+recover+edit) is always kept, and the static preset is never exceeded. Pass an empty list / omit toolsets to reset to the full preset. Emits notifications/tools/list_changed so the client refetches.",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "properties": {
+      "toolsets": {
+        "description": "Toolset names to expose (union). Empty/omitted resets to the full preset.",
+        "type": [
+          "array",
+          "null"
+        ],
+        "items": {
+          "type": "string"
+        },
+        "default": null
+      }
+    },
+    "type": "object"
+  },
+  "outputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$defs": {
+      "ErrorDetail": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "recoverable": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "recoverable"
+        ]
+      }
+    },
+    "properties": {
+      "error": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/ErrorDetail"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "narrowed_to": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "visible_tools": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      }
+    },
+    "type": "object"
+  },
+  "annotations": {
+    "readOnlyHint": false,
+    "destructiveHint": false,
+    "idempotentHint": true,
+    "openWorldHint": false
+  }
+}

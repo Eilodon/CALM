@@ -876,6 +876,26 @@ pub(crate) const TOOLSET_NAMES: &[&str] = &[
     "patterndebt",
 ];
 
+/// Toolsets that runtime narrowing (`set_toolset`) can NEVER disable — the
+/// non-negotiable floor. Verified against the real `#[tool_router]` grouping
+/// (not assumed from tool names): `orient` backs the `oriented` gate and
+/// carries `set_toolset` itself (so a session can always widen back out);
+/// `guardrails` — NOT `edit` — is where `edit_context`/`diff_impact` are
+/// actually registered (`guardrails_tool_router`, guardrails.rs), the
+/// mandatory pre-edit/pre-commit gates; `recover` — also NOT `orient` — is
+/// where `indexing_status`/`session_context` actually live
+/// (`recover_tool_router`, recover.rs), the stuck-session escape hatch;
+/// `edit` itself must stay so a session that clears `edit_context` can still
+/// perform the edit (edit_lines/edit_symbol). Dropping any one of these four
+/// would either make a safety gate unreachable (bypass) or make edits
+/// deadlock (gate reachable but never satisfiable). Caught by
+/// `safety_floor_toolsets_are_all_real_and_cover_the_gates` — the original
+/// two-toolset guess (`["orient", "edit"]`) failed that test because
+/// `edit_context`/`diff_impact`/`indexing_status`/`session_context` are not
+/// where their names suggest. See Task 1.5 in the plan for the
+/// enforcement-path argument.
+pub(crate) const SAFETY_FLOOR_TOOLSETS: &[&str] = &["orient", "edit", "guardrails", "recover"];
+
 /// Tool names belonging to one toolset, read directly off that module's
 /// own `#[tool_router]`-generated router — the same accessor
 /// `full_tool_router()` itself merges, so this can never name a tool the
@@ -906,12 +926,37 @@ fn toolset_tools(name: &str) -> Option<Vec<String>> {
     )
 }
 
-fn calm_all_tool_names() -> std::collections::BTreeSet<String> {
+pub(crate) fn calm_all_tool_names() -> std::collections::BTreeSet<String> {
     CalmServer::full_tool_router()
         .list_all()
         .into_iter()
         .map(|t| t.name.to_string())
         .collect()
+}
+
+/// The concrete tool-name set a session should see, given the preset ceiling
+/// and an optional runtime narrowing. `None` narrowing = return the ceiling
+/// unchanged. `Some(sets)` = (union of those toolsets' tools ∪ floor) ∩ ceiling.
+/// The floor is unconditional; the ceiling is never exceeded.
+pub(crate) fn effective_tool_names(
+    preset_ceiling: &std::collections::BTreeSet<String>,
+    narrowing: Option<&std::collections::BTreeSet<String>>,
+) -> std::collections::BTreeSet<String> {
+    let Some(sets) = narrowing else {
+        return preset_ceiling.clone();
+    };
+    // Owned Vec first (not `.chain(...map(|s| &s.to_string()))`) — borrowing
+    // a `&String` from a temporary created inside `.map` would not outlive
+    // the chained iterator.
+    let mut names: Vec<String> = sets.iter().cloned().collect();
+    names.extend(SAFETY_FLOOR_TOOLSETS.iter().map(|s| s.to_string()));
+    let mut visible: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for name in &names {
+        if let Some(tools) = toolset_tools(name) {
+            visible.extend(tools);
+        }
+    }
+    visible.intersection(preset_ceiling).cloned().collect()
 }
 
 /// Resolves a `preset` spec to the concrete tool-name allow-list it
@@ -1095,6 +1140,51 @@ mod preset_registry_tests {
         let expected: std::collections::BTreeSet<String> =
             toolset_tools("security").unwrap().into_iter().collect();
         assert_eq!(resolved, expected);
+    }
+
+    #[test]
+    fn safety_floor_toolsets_are_all_real_and_cover_the_gates() {
+        // Every floor toolset must be a real toolset name…
+        for name in SAFETY_FLOOR_TOOLSETS {
+            assert!(
+                TOOLSET_NAMES.contains(name),
+                "floor toolset {name:?} not in TOOLSET_NAMES"
+            );
+        }
+        // …and the union of floor tools must include the mandatory gate tools.
+        let floor: std::collections::BTreeSet<String> = SAFETY_FLOOR_TOOLSETS
+            .iter()
+            .flat_map(|n| toolset_tools(n).unwrap())
+            .collect();
+        for required in [
+            "repo_overview",
+            "indexing_status",
+            "session_context",
+            "edit_context",
+            "diff_impact",
+            "set_toolset",
+        ] {
+            assert!(
+                floor.contains(required),
+                "safety floor missing gate tool {required:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn effective_tool_names_intersects_preset_and_floors_safety() {
+        let preset_full = calm_all_tool_names();
+        // Narrow to just "trace": result = trace tools + floor tools, all ⊆ preset.
+        let narrowed = Some(std::collections::BTreeSet::from(["trace".to_string()]));
+        let got = effective_tool_names(&preset_full, narrowed.as_ref());
+        assert!(got.contains("edit_context"), "floor tool dropped");
+        assert!(
+            got.contains("callers") || got.contains("path"),
+            "requested toolset tools missing"
+        );
+        assert!(got.is_subset(&preset_full), "escaped the preset ceiling");
+        // None = unchanged passthrough of the preset.
+        assert_eq!(effective_tool_names(&preset_full, None), preset_full);
     }
 }
 
