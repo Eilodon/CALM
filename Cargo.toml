@@ -200,7 +200,7 @@ rand = "0.9"
 # `cargo tree -p opentelemetry` (expect exactly one resolved line) before
 # ever bumping these.
 opentelemetry = { version = "0.31" }
-opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
 # default-features = false + http-proto avoids opening a grpc-tonic
 # transport at RUNTIME (this exporter POSTs spans over reqwest/HTTP) -- but
 # tonic/tonic-prost still compile in as transitive deps of
