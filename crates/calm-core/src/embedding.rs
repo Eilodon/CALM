@@ -237,10 +237,28 @@ mod imp {
     /// marshaling, not the dot-product arithmetic, so `knn`/`knn_chunks`
     /// decode once per (re)index cycle and reuse the result across queries
     /// instead of re-fetching on every call. In-memory `:memory:`
-    /// connections (`Connection::path()` returns `None` — every test in
-    /// this crate uses one) bypass the cache entirely: always fetch fresh,
-    /// so tests can never leak state into each other through it.
+    /// connections bypass the cache entirely: always fetch fresh, so tests
+    /// can never leak state into each other through it -- see
+    /// `stable_db_path` below for why this requires an explicit empty-string
+    /// check, not just a bare `conn.path()` match.
     type PathCache = std::sync::Mutex<std::collections::HashMap<String, Vec<(i64, Vec<f32>)>>>;
+
+    /// `conn.path()`, folding SQLite's empty-string answer for `:memory:`/
+    /// anonymous connections back to `None`. `sqlite3_db_filename` (what
+    /// `Connection::path()` wraps) returns a valid pointer to an EMPTY
+    /// string for an in-memory main database, not a NULL pointer -- so a
+    /// bare `conn.path()` match yields `Some("")` for every `:memory:`
+    /// connection in the process, not `None`. Confirmed by reproduction:
+    /// every in-memory-DB test in this crate was colliding on cache key
+    /// `""`, so `cargo test`'s parallel test threads could read back another
+    /// test's cached vectors through `knn`/`knn_chunks` (search.rs's
+    /// `search_similar_truncated_flag_is_accurate` flaked ~7% of runs from
+    /// exactly this). An anonymous database has no stable identity, so
+    /// caching by its path is unsound regardless -- this makes that
+    /// explicit instead of relying on `path()` happening to return `None`.
+    fn stable_db_path(conn: &Connection) -> Option<&str> {
+        conn.path().filter(|p| !p.is_empty())
+    }
 
     fn symbol_cache() -> &'static PathCache {
         static CACHE: std::sync::OnceLock<PathCache> = std::sync::OnceLock::new();
@@ -253,7 +271,7 @@ mod imp {
     }
 
     fn invalidate(cache: &PathCache, conn: &Connection) {
-        if let Some(path) = conn.path() {
+        if let Some(path) = stable_db_path(conn) {
             cache.lock().unwrap().remove(path);
         }
     }
@@ -348,7 +366,7 @@ mod imp {
     /// are L2-normalised (`Embedder::load`), so cosine distance reduces to
     /// `1.0 - dot_product`.
     pub fn knn(conn: &Connection, query: &[f32], k: usize) -> rusqlite::Result<Vec<(i64, f64)>> {
-        match conn.path() {
+        match stable_db_path(conn) {
             Some(path) => {
                 let mut guard = symbol_cache().lock().unwrap();
                 if !guard.contains_key(path) {
@@ -423,7 +441,7 @@ mod imp {
         query: &[f32],
         k: usize,
     ) -> rusqlite::Result<Vec<(i64, f64)>> {
-        match conn.path() {
+        match stable_db_path(conn) {
             Some(path) => {
                 let mut guard = chunk_cache().lock().unwrap();
                 if !guard.contains_key(path) {
@@ -772,6 +790,52 @@ mod tests {
         let hits = knn_chunks(&conn, &[0.0, 0.0, 0.9], 2).unwrap();
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].0, 30, "nearest should be chunk id 30");
+    }
+
+    #[test]
+    fn knn_chunks_does_not_leak_across_distinct_in_memory_connections() {
+        // Regression test for a real parallel-test flake: `conn.path()`
+        // returns `Some("")` (not `None`) for a `:memory:` connection, so
+        // before `stable_db_path` existed, every in-memory-DB test in this
+        // crate collided on cache key `""` in `chunk_cache()`. Whichever
+        // connection's `knn_chunks` call ran first "won" the shared slot,
+        // and every other in-memory connection silently read back its
+        // vectors instead of its own. This reproduces that scenario
+        // deterministically (no thread races needed): two distinct
+        // in-memory connections, each with its own chunk data, queried
+        // back-to-back in the same process -- the second must never see
+        // the first's vectors.
+        use rusqlite::Connection;
+
+        let conn_a = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn_a).unwrap();
+        create_chunk_embedding_table(&conn_a, 3).unwrap();
+        store_chunk_embedding(&conn_a, 1, &[1.0, 0.0, 0.0]).unwrap();
+
+        // Prime conn_a's slot in the (process-wide) cache first.
+        let hits_a = knn_chunks(&conn_a, &[1.0, 0.0, 0.0], 1).unwrap();
+        assert_eq!(hits_a.len(), 1);
+        assert_eq!(hits_a[0].0, 1);
+
+        let conn_b = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn_b).unwrap();
+        create_chunk_embedding_table(&conn_b, 3).unwrap();
+        store_chunk_embedding(&conn_b, 99, &[0.0, 1.0, 0.0]).unwrap();
+
+        // Before the fix: `conn_b.path()` also reads `Some("")`, so this
+        // would hit conn_a's already-populated `""` cache slot and return
+        // chunk id 1 (wrong data, wrong distance) instead of conn_b's own
+        // chunk id 99.
+        let hits_b = knn_chunks(&conn_b, &[0.0, 1.0, 0.0], 1).unwrap();
+        assert_eq!(
+            hits_b.len(),
+            1,
+            "conn_b has exactly one chunk of its own to return"
+        );
+        assert_eq!(
+            hits_b[0].0, 99,
+            "must see conn_b's own chunk, not conn_a's cached vectors"
+        );
     }
 
     #[cfg(feature = "embeddings")]
