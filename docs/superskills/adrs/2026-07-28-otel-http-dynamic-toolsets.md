@@ -1,5 +1,12 @@
 # ADR: Dynamic toolsets, opt-in OTel span export, opt-in remote/HTTP transport
 
+> **[G.CDOC verified 2026-07-28]** Section 3 and Section 7 claims spot-checked
+> directly against the committed code after writing this ADR (not just recalled
+> from memory of writing it): `SAFETY_FLOOR_TOOLSETS` constant text, the
+> `TOOL_NOT_IN_ACTIVE_TOOLSET` denial in `call_tool`, `otel_layer`'s env-var
+> early-return, and `resolve_http_launch`'s full body -- all match this ADR's
+> claims exactly. No CONTRADICTED claims found.
+
 ## 1. Title
 Ship runtime-narrowable toolsets, opt-in OpenTelemetry span export, and an opt-in
 Streamable-HTTP transport, without weakening CALM's safety gates or local-first posture.
