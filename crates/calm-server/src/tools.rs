@@ -616,6 +616,7 @@ impl rmcp::ServerHandler for CalmServer {
         rmcp::model::ServerInfo::new(
             rmcp::model::ServerCapabilities::builder()
                 .enable_tools()
+                .enable_tool_list_changed()
                 .enable_prompts()
                 .build(),
         )
@@ -637,9 +638,15 @@ impl rmcp::ServerHandler for CalmServer {
         _request: Option<rmcp::model::PaginatedRequestParams>,
         _context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<rmcp::model::ListToolsResult, rmcp::model::ErrorData> {
+        let visible = self.current_visible_tool_names();
         Ok(rmcp::model::ListToolsResult {
             next_cursor: None,
-            tools: self.tool_router.list_all(),
+            tools: self
+                .tool_router
+                .list_all()
+                .into_iter()
+                .filter(|t| visible.contains(t.name.as_ref()))
+                .collect(),
             meta: None,
         })
     }
@@ -699,6 +706,29 @@ impl rmcp::ServerHandler for CalmServer {
             );
             return Ok(rmcp::model::CallToolResult::error(vec![
                 rmcp::model::ContentBlock::text(self.orientation_required_message()),
+            ]));
+        }
+
+        // Runtime toolset gate (Phase 1). Enforced here, not just in
+        // list_tools, so a hidden tool cannot be dispatched by name (audit
+        // FM1). The floor (SAFETY_FLOOR_TOOLSETS) guarantees
+        // set_toolset/edit_context/diff_impact/orientation/recovery tools
+        // are always in `visible`, so this can never make a safety gate
+        // unreachable or deadlock an edit.
+        let visible = self.current_visible_tool_names();
+        if !visible.contains(tool_name.as_str()) {
+            tracing::info!(
+                target: crate::telemetry::AUDIT_TARGET,
+                session_id = self.session_id,
+                decision = "denied",
+                reason_code = "TOOL_NOT_IN_ACTIVE_TOOLSET",
+                tool = %tool_name,
+            );
+            return Ok(rmcp::model::CallToolResult::error(vec![
+                rmcp::model::ContentBlock::text(format!(
+                    "tool {tool_name:?} is not in this session's active toolset; \
+                     call set_toolset to widen it"
+                )),
             ]));
         }
 

@@ -303,6 +303,107 @@ fn calm_connect_forwards_preset_to_the_daemon_it_spawns() {
     );
 }
 
+/// [Task 1.5 / audit FM1] Runtime toolset narrowing must be enforced at
+/// BOTH dispatch points, not just `tools/list` — a hidden tool must be
+/// refused by `call_tool` when called by name, and the safety-floor tools
+/// (guardrails/recover/orient/edit) must stay callable no matter how narrow
+/// the session's toolset gets. Only a real daemon+socket round trip can
+/// prove the `call_tool` half: rmcp 2.2.0 keeps `Peer::new` (and therefore
+/// `RequestContext::new`) crate-private, so `list_tools`/`call_tool` can't
+/// be invoked in-process with a hand-built context — this is the
+/// integration-level test the plan's own risk table calls for.
+#[test]
+fn narrowed_session_hides_tool_from_list_and_refuses_to_dispatch_it() {
+    let project = fresh_project();
+
+    let initialize = br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"it","version":"0"}}}
+"#;
+    let narrow = br#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"set_toolset","arguments":{"toolsets":["trace"]}}}
+"#;
+    let list_tools = br#"{"jsonrpc":"2.0","id":3,"method":"tools/list","params":{}}
+"#;
+    let hidden_call = br#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"scan_text","arguments":{"text":"x"}}}
+"#;
+    let floor_call = br#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"session_context","arguments":{}}}
+"#;
+
+    let mut child = Command::new(calm_bin())
+        .arg("connect")
+        .arg("--project-root")
+        .arg(project.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawning calm connect");
+
+    let stdout = child.stdout.take().expect("piped stdout");
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    let watcher = StdoutWatcher::spawn(stdout);
+    // rmcp dispatches tools/call concurrently (see edit_lock's own doc
+    // comment) — requests are NOT guaranteed to take effect in the order
+    // they're written to stdin. set_toolset's narrowing must be confirmed
+    // applied (its own response observed) before the next request is sent,
+    // or a later request can race ahead of the narrowing and get dispatched
+    // against the still-wide toolset. Wait for each response in turn.
+    stdin.write_all(initialize).unwrap();
+    watcher.wait_for("\"id\":1", Duration::from_secs(8));
+    stdin.write_all(narrow).unwrap();
+    watcher.wait_for("\"id\":2", Duration::from_secs(8));
+    stdin.write_all(list_tools).unwrap();
+    watcher.wait_for("\"id\":3", Duration::from_secs(8));
+    stdin.write_all(hidden_call).unwrap();
+    watcher.wait_for("\"id\":4", Duration::from_secs(8));
+    stdin.write_all(floor_call).unwrap();
+    watcher.wait_for("\"id\":5", Duration::from_secs(8));
+
+    drop(stdin); // EOF now that every response is in, so the forwarder can exit
+    let mut stderr_text = Vec::new();
+    if let Some(mut stderr) = child.stderr.take() {
+        let _ = stderr.read_to_end(&mut stderr_text);
+    }
+    let _ = child.wait();
+    let stdout_text = watcher.finish();
+    let stderr_text = String::from_utf8_lossy(&stderr_text);
+
+    // Each JSON-RPC response arrives as one line; `notifications/tools/list_changed`
+    // (no `id`) may also appear on its own line(s) — harmless for this lookup.
+    let line_for_id = |id: &str| -> &str {
+        stdout_text
+            .lines()
+            .find(|l| l.contains(&format!("\"id\":{id}")))
+            .unwrap_or_else(|| {
+                panic!("no response for id {id} in stdout: {stdout_text}\nstderr: {stderr_text}")
+            })
+    };
+
+    let list_line = line_for_id("3");
+    assert!(
+        !list_line.contains("\"scan_text\""),
+        "narrowed tools/list must hide scan_text: {list_line}"
+    );
+    assert!(
+        list_line.contains("\"edit_context\""),
+        "narrowed tools/list must keep the guardrails floor tool edit_context: {list_line}"
+    );
+
+    let hidden_line = line_for_id("4");
+    assert!(
+        hidden_line.contains("\"isError\":true"),
+        "call_tool must refuse a hidden tool by name, not just hide it from list_tools: {hidden_line}"
+    );
+    assert!(
+        hidden_line.contains("active toolset"),
+        "refusal message should explain why: {hidden_line}"
+    );
+
+    let floor_line = line_for_id("5");
+    assert!(
+        !floor_line.contains("\"isError\":true"),
+        "floor tool session_context must still dispatch after narrowing: {floor_line}"
+    );
+}
+
 /// Real, live, two-connection version of the `active_sessions`/
 /// `other_active_sessions` unit tests in `calm-server`'s own `tools.rs` —
 /// those prove the logic in-process; this proves the actual
