@@ -3720,6 +3720,7 @@ impl StructB {
     }
 
     #[test]
+    #[cfg(feature = "lang-elixir")]
     // B3 (Tier B audit): `greet/1` and `greet/2` are different clauses, not
     // overloads of one symbol — before the arity gate in
     // resolve_sites_to_edges, both landed in the same `by_name["greet"]`
