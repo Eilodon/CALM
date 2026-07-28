@@ -71,7 +71,36 @@ Running CALM from more than one editor session on the same repo used to mean N i
 ## Safe by default
 - **Output sanitization** — `source`/`understand` redact credential-shaped text (PEM keys, GitHub/AWS/Slack tokens, JWTs, password assignments) before it's ever returned, and flag a `content_warning` when code contains prompt-injection-shaped text — flagged, never silently altered, since a false positive there would corrupt real code. The heuristic (`calm_core::sanitize`, 19 labeled patterns) covers plain-English phrasing (`"ignore previous instructions"`), chat-template role-marker spoofing (ChatML `<|im_start|>`, `[INST]`/`[SYS]` brackets, fake `system:`/Markdown-heading role markers), fake tool/turn-boundary tags (`</tool_result>`, `<system>`), jailbreak/persona-override phrasing, exfiltration phrasing (prompt/secret-reveal requests), zero-width Unicode obfuscation, and a first pass at Vietnamese-language equivalents — deliberately excludes anything with real false-positive risk (e.g. generic tag-density scoring, homoglyph detection) rather than guess.
 - **`scan_text` — the same detection, on demand, for anything that didn't come through the index.** `source`/`understand`'s `content_warning` only covers indexed source; every tool's own output is separately scanned (advisory-logged, not surfaced) at one central choke point (`timed_tool`). Neither covers content an agent fetches itself — a WebFetch/WebSearch result, a subagent's report. `scan_text` closes that gap: point it at any text and get the same labeled hits back, entirely local and regex-based — no dependency on a hosted LLM safety classifier being available, so it keeps working even when that classifier isn't.
-- **Local-only** — no outbound calls for the code/data path. The one narrow exception is the semantic-search default model download, which is a single public, static file fetch, opt-out-able, and unrelated to your repo's contents ever leaving the machine.
+- **Local-only** — no outbound calls for the code/data path. The two narrow exceptions are the semantic-search default model download (a single public, static file fetch, opt-out-able, unrelated to your repo's contents) and opt-in OpenTelemetry span export (below) — both off by default.
+
+## Observability (optional)
+
+`calm` can export the spans it already emits (`mcp_tool_call`, tool-execution
+timing) to an OpenTelemetry collector, entirely opt-in and off by default —
+see `crates/calm-cli/src/otel.rs`.
+
+- **Built only with `--features otel`**, and even then the pipeline is
+  never constructed unless `OTEL_EXPORTER_OTLP_ENDPOINT` is also set at
+  runtime — no exporter, no tracer provider, no background export task,
+  and no network I/O when the env var is absent, verified by
+  `crates/calm-cli/tests/otel_gate.rs` (`otel_layer` returns `None`).
+- **HTTP transport, not gRPC** — pinned to `opentelemetry-otlp`'s
+  `http-proto` feature (POSTs over `reqwest`), not `grpc-tonic`, so no gRPC
+  channel is ever opened at runtime. (`tonic`/`tonic-prost` still compile
+  in as transitive build dependencies of `opentelemetry-proto` regardless
+  of this feature choice — that crate doesn't gate them out of the
+  dependency graph, only out of `opentelemetry-otlp`'s own default feature
+  set — so this narrows runtime behavior, not full compile-time weight.)
+- **What leaves the machine when enabled**: span attributes — file paths,
+  symbol names, tool names, timing — sent to the collector at
+  `OTEL_EXPORTER_OTLP_ENDPOINT`. Never source code bodies. See the
+  README's egress note for the exact qualification of the "local-only"
+  claim above.
+- **Manual smoke test** (not run in CI — needs a live collector): run a
+  local `otel-collector`; build with `cargo build --features otel`; then
+  `export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318` and run that
+  binary's `calm serve` for one session, make a few tool calls, and confirm
+  `mcp_tool_call` spans arrive at the collector.
 
 ---
 
