@@ -4,6 +4,6 @@
 //! (`src/main.rs`) owns all real CLI/serve logic; nothing here is meant to
 //! be a public API for other crates.
 
-pub mod otel;
 #[cfg(feature = "http")]
 pub mod http;
+pub mod otel;

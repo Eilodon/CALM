@@ -316,8 +316,7 @@ async fn main() -> Result<()> {
                     // loopback bind mounts no auth layer at all.
                     let bearer_token = allow_remote.then_some(token).flatten();
                     let result =
-                        calm_server::http::serve_http(server, launch.addr, ct, bearer_token)
-                            .await;
+                        calm_server::http::serve_http(server, launch.addr, ct, bearer_token).await;
                     calm_cli::otel::shutdown();
                     return result;
                 }

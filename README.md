@@ -69,7 +69,7 @@ The trade-off is stated plainly: CALM's full-call-graph tier out of the box is 1
 | **Antigravity** (Google) | CLI · IDE | edit `~/.gemini/config/mcp_config.json` |
 | **JetBrains AI Assistant** | IDE | via UI settings |
 
-Full walkthrough for every client above, including exact global-config snippets for the ones that need one — [`docs/mcp-client-setup.md`](docs/mcp-client-setup.md).
+Full walkthrough for every client above, including exact global-config snippets for the ones that need one — [`docs/mcp-client-setup.md`](docs/mcp-client-setup.md). Running inside a devcontainer/Codespace where stdio forwarding doesn't reach? See [`docs/http-transport.md`](docs/http-transport.md) (advanced, remote-dev only, opt-in, loopback by default).
 
 **Using CALM on your own project** — no clone, no Rust toolchain:
 
@@ -289,6 +289,7 @@ The full workspace suite — 1,000+ tests — passes clean, with a handful of `#
 - [`docs/`](docs/) — resolver internals, migration plans, and other design notes not covered by `docs/architecture.md` above.
 - [`docs/adr/`](docs/adr/) — individual architecture decision records (Stack Graphs scope, the formal-resolver approach, the LSP-optional confidence upgrade, the daemon+forwarder concurrency model).
 - [`docs/mcp-client-setup.md`](docs/mcp-client-setup.md) — every MCP client install path in detail, including Windsurf/Devin Desktop and Codex global config.
+- [`docs/http-transport.md`](docs/http-transport.md) — the opt-in remote/HTTP transport (`calm serve --http`): loopback-by-default, the fail-closed `--allow-remote` + token requirement, why remote exposure forces a read-only preset, and the TLS/reverse-proxy expectation.
 - [`AGENTS.md`](AGENTS.md) — the full tool-by-tool workflow guide this project's own agents follow.
 - [`benchmarks/`](benchmarks/) — the measurement suite behind every number in this README: `b2_call_graph_quality/` (precision/recall vs. a SCIP oracle), `b4_token_efficiency/` (token cost vs. a naive baseline, per task), `b11_extended_competitor_ab/` (real calls against 4 other live MCP servers, not self-reported numbers), `resolution/` (tier-distribution baseline across 19 real OSS repos, one per language). Unflattering results are published alongside good ones on purpose — `benchmarks/README.md` states that policy.
 
