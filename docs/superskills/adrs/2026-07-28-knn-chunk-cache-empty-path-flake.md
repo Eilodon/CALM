@@ -1,5 +1,11 @@
 # ADR: Fix a parallel-test flake caused by empty-string DB paths colliding in the embedding cache
 
+> **[G.CDOC verified 2026-07-28]** Section 3's "3 call sites" claim confirmed by grepping the
+> committed tree for `stable_db_path(conn)` — exactly `invalidate` (embedding.rs:274), `knn`
+> (embedding.rs:369), `knn_chunks` (embedding.rs:444). Section 7's repro numbers (4/60 pre-fix,
+> 0/60 post-fix) and `cargo test --workspace`/`cargo fmt --check` results were captured live
+> this session, not recalled. No CONTRADICTED claims found.
+
 ## 1. Title
 Stop `knn`/`knn_chunks`' process-wide embedding cache from treating every `:memory:`
 connection as the same database, which was silently contaminating parallel test runs.
