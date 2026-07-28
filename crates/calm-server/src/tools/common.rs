@@ -1252,7 +1252,12 @@ impl Caveat {
             message: format!(
                 "no symbol named '{symbol}' is in the index — likely a typo, wrong \
                  case, or the file lives in an excluded path (target/, node_modules/, \
-                 dist/, build/, __pycache__/, venv/, legacy/, dotdirs). Run \
+                 dist/, build/, __pycache__/, venv/, legacy/, dotdirs). CALM also \
+                 does not index standard-library, language-builtin, or third-party \
+                 dependency symbols (Rust's println!, Python's len, etc.) — if \
+                 '{symbol}' is one of those, its absence here is expected, not a \
+                 search failure, and search(kind=\"hybrid\") will only surface your \
+                 own code that USES it, never its definition. Otherwise run \
                  search(kind=\"hybrid\") to find the exact name before concluding it \
                  doesn't exist — a not-found result here is not proof the symbol is \
                  unused or absent from the codebase."

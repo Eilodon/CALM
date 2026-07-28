@@ -153,6 +153,14 @@ impl CalmServer {
                 });
             #[cfg(feature = "scip-overlay")]
             const WEAK_MATCH_RATE_THRESHOLD: f64 = 0.5;
+            // F5: below this many indexed files a language's match rate is
+            // statistically meaningless (e.g. a handful of incidental Python
+            // scripts in a Rust repo), so a low rate there must NOT be flagged
+            // as a weak cross-reference signal. A missing provider
+            // (`!available`) is still always reported — that's an actionable
+            // install state, not a rate artifact.
+            #[cfg(feature = "scip-overlay")]
+            const WEAK_MIN_SAMPLE_FILES: i64 = 10;
             // `per_language_overlay_statuses` already restricts itself to
             // languages present in `languages` (see its doc comment) — no
             // separate language filter needed here anymore.
@@ -161,10 +169,17 @@ impl CalmServer {
                 self.per_language_overlay_statuses(&conn, &languages)
                     .into_iter()
                     .filter(|s| {
-                        !s.status.available
-                            || s.status
-                                .last_match_rate
-                                .is_some_and(|r| r < WEAK_MATCH_RATE_THRESHOLD)
+                        if !s.status.available {
+                            return true;
+                        }
+                        let low_rate = s
+                            .status
+                            .last_match_rate
+                            .is_some_and(|r| r < WEAK_MATCH_RATE_THRESHOLD);
+                        let enough_sample = s
+                            .indexed_file_count
+                            .is_none_or(|n| n >= WEAK_MIN_SAMPLE_FILES);
+                        low_rate && enough_sample
                     })
                     .collect();
             #[cfg(not(feature = "scip-overlay"))]

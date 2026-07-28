@@ -136,6 +136,23 @@ fn is_noisy_path(path: &str) -> bool {
 /// flagged (rank ↑ → edits ↑ → churn ↑ → rank ↑ still exists, but stays
 /// bounded to a narrow range where relevance dominates).
 const CHURN_WEIGHT: f64 = 0.15;
+/// Rank multiplier weight per unit of `coreness` (0..~9), applied only in
+/// `search_symbol`. Small like `CHURN_WEIGHT` so structural centrality
+/// reorders near-ties rather than overturning a clear textual win — except
+/// combined with `EXACT_NAME_BONUS`, where it's meant to be decisive
+/// (self-audit C5: a bare-name query for a central hub like `path`/`Config`
+/// must surface the exact-named symbol, not an incidental token match).
+const CORENESS_WEIGHT: f64 = 0.06;
+/// Decisive multiplier when a symbol's `name` equals the query verbatim
+/// (case-insensitive). A short exact name (`path`) otherwise loses the raw
+/// BM25 race to longer names that merely contain the query as a camelCase
+/// token (`PathMatcher`) or mention it in a docstring; ties among several
+/// exact-name matches break on `coreness`.
+const EXACT_NAME_BONUS: f64 = 4.0;
+/// Score floor for an exact-whole-name candidate fetched directly from
+/// `symbols` (idx_symbols_name), so the symbol literally named like the query
+/// is always a candidate even when it falls outside the FTS fetch window.
+const EXACT_NAME_SEED: f64 = 1.0;
 
 fn rank_multiplier(path: &str, is_test: bool, churn_score: Option<f64>) -> f64 {
     if is_test || is_noisy_path(path) {
@@ -169,10 +186,14 @@ fn search_symbol(conn: &Connection, query: &str, limit: usize) -> rusqlite::Resu
     // per-process-random iteration order.
     let mut scores: BTreeMap<String, f64> = BTreeMap::new();
     let mut data: BTreeMap<String, SearchResult> = BTreeMap::new();
+    // coreness feeds `search_symbol`'s rank boost but isn't carried on
+    // `SearchResult` (kept out of the output schema), so track it here keyed
+    // by qualified_name, from whichever source first sees the row.
+    let mut coreness_of: BTreeMap<String, Option<i64>> = BTreeMap::new();
 
     let mut stmt_exact = conn.prepare(
         "SELECT s.qualified_name, s.name, s.path, s.line_start, s.line_end, s.kind,
-                -bm25(fts_exact) AS score, s.is_test, s.churn_score
+                -bm25(fts_exact) AS score, s.is_test, s.churn_score, s.coreness
          FROM fts_exact
          JOIN symbols s ON s.id = fts_exact.rowid
          WHERE fts_exact MATCH ?1
@@ -190,19 +211,23 @@ fn search_symbol(conn: &Connection, query: &str, limit: usize) -> rusqlite::Resu
             score: row.get(6)?,
             is_test: row.get(7)?,
             churn_score: row.get(8)?,
+            coreness: row.get(9)?,
         })
     })?;
 
     for row in rows_exact {
         let row = row?;
         *scores.entry(row.qualified_name.clone()).or_default() += row.score * BM25_EXACT_WEIGHT;
+        coreness_of
+            .entry(row.qualified_name.clone())
+            .or_insert(row.coreness);
         data.entry(row.qualified_name.clone())
             .or_insert_with(|| row.into_result("exact"));
     }
 
     let mut stmt_tokens = conn.prepare(
         "SELECT s.qualified_name, s.name, s.path, s.line_start, s.line_end, s.kind,
-                -bm25(fts_tokens) AS score, s.is_test, s.churn_score
+                -bm25(fts_tokens) AS score, s.is_test, s.churn_score, s.coreness
          FROM fts_tokens
          JOIN symbols s ON s.id = fts_tokens.rowid
          WHERE fts_tokens MATCH ?1
@@ -220,19 +245,88 @@ fn search_symbol(conn: &Connection, query: &str, limit: usize) -> rusqlite::Resu
             score: row.get(6)?,
             is_test: row.get(7)?,
             churn_score: row.get(8)?,
+            coreness: row.get(9)?,
         })
     })?;
 
     for row in rows_tokens {
         let row = row?;
         *scores.entry(row.qualified_name.clone()).or_default() += row.score * BM25_TOKENS_WEIGHT;
+        coreness_of
+            .entry(row.qualified_name.clone())
+            .or_insert(row.coreness);
         data.entry(row.qualified_name.clone())
             .or_insert_with(|| row.into_result("tokens"));
     }
 
+    // Exact whole-name matches (case-insensitive), fetched straight from
+    // `symbols` via idx_symbols_name. FTS ranks a short exact name (`path`)
+    // below longer names that merely contain the query as a camelCase token
+    // (`PathMatcher`) and can even drop it out of the fetch window entirely —
+    // so guarantee its candidacy here and seed a score floor. The boost loop
+    // below then applies `EXACT_NAME_BONUS`, ordering ties by coreness.
+    // Self-audit C5.
+    let mut stmt_named = conn.prepare(
+        "SELECT s.qualified_name, s.name, s.path, s.line_start, s.line_end, s.kind,
+                s.is_test, s.churn_score, s.coreness
+         FROM symbols s
+         WHERE s.name = ?1 COLLATE NOCASE
+         ORDER BY COALESCE(s.coreness, 0) DESC
+         LIMIT ?2",
+    )?;
+
+    let rows_named = stmt_named.query_map(rusqlite::params![query.trim(), fetch_limit], |row| {
+        Ok(RawRow {
+            qualified_name: row.get(0)?,
+            name: row.get(1)?,
+            path: row.get(2)?,
+            line_start: row.get(3)?,
+            line_end: row.get(4)?,
+            kind: row.get(5)?,
+            score: EXACT_NAME_SEED,
+            is_test: row.get(6)?,
+            churn_score: row.get(7)?,
+            coreness: row.get(8)?,
+        })
+    })?;
+
+    for row in rows_named {
+        let row = row?;
+        // Floor (don't add): if the symbol also matched FTS, keep its stronger
+        // FTS score; otherwise seed it so it's a viable candidate at all.
+        let entry = scores.entry(row.qualified_name.clone()).or_insert(0.0);
+        if *entry < EXACT_NAME_SEED {
+            *entry = EXACT_NAME_SEED;
+        }
+        coreness_of
+            .entry(row.qualified_name.clone())
+            .or_insert(row.coreness);
+        data.entry(row.qualified_name.clone())
+            .or_insert_with(|| row.into_result("exact"));
+    }
+
+    let trimmed_query = query.trim();
     for (qname, r) in data.iter() {
         if let Some(s) = scores.get_mut(qname) {
             *s *= rank_multiplier(&r.path, r.is_test, r.churn_score);
+            // C5 precision boost (symbol search only, not hybrid RRF): a
+            // structurally-central symbol and — decisively — an exact
+            // whole-name match should outrank an incidental camelCase-token or
+            // docstring hit. Gated on the same noise check rank_multiplier
+            // uses, so a test/noisy result already floored to NOISE_PENALTY is
+            // never resurrected by the boost.
+            if !r.is_test && !is_noisy_path(&r.path) {
+                let coreness = coreness_of
+                    .get(qname)
+                    .copied()
+                    .flatten()
+                    .unwrap_or(0)
+                    .max(0);
+                *s *= 1.0 + CORENESS_WEIGHT * coreness as f64;
+                if r.name.eq_ignore_ascii_case(trimmed_query) {
+                    *s *= EXACT_NAME_BONUS;
+                }
+            }
         }
     }
 
@@ -298,6 +392,7 @@ fn search_text(conn: &Connection, query: &str, limit: usize) -> rusqlite::Result
             score: row.get(6)?,
             is_test: row.get(7)?,
             churn_score: row.get(8)?,
+            coreness: None,
         })
     })?;
 
@@ -1047,6 +1142,10 @@ struct RawRow {
     score: f64,
     is_test: bool,
     churn_score: Option<f64>,
+    /// From `symbols.coreness` — carried only to feed `search_symbol`'s
+    /// coreness rank boost; `None` for sources without a coreness join
+    /// (search_text). Not surfaced on `SearchResult`.
+    coreness: Option<i64>,
 }
 
 impl RawRow {
@@ -2099,6 +2198,76 @@ mod tests {
             rank_multiplier("src/foo.py", false, Some(0.0)),
             1.0,
             "zero churn (measured, never changed) must not move the multiplier at all"
+        );
+    }
+
+    #[test]
+    fn search_symbol_surfaces_exact_whole_name_hub_above_token_matches() {
+        // Self-audit C5 regression: `search("path")` must return the symbol
+        // literally named `path` (a central hub) on top, not lose it to
+        // camelCase token matches like `PathMatcher`/`PathCache` — and must
+        // never omit it entirely (the pre-fix bug: it fell outside the FTS
+        // fetch window and never became a candidate).
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        let insert = |name: &str, qn: &str, path: &str, tokens: &str, coreness: i64| {
+            conn.execute(
+                "INSERT INTO symbols (name, qualified_name, kind, path, language, line_start, line_end, docstring, name_tokens, coreness)
+                 VALUES (?1, ?2, 'function', ?3, 'rust', 1, 2, '', ?4, ?5)",
+                rusqlite::params![name, qn, path, tokens, coreness],
+            )
+            .unwrap();
+        };
+
+        // The exact-name central hub, plus token/substring decoys that would
+        // otherwise dominate raw BM25 ranking.
+        insert(
+            "path",
+            "src/tools/trace.rs::CalmServer::path",
+            "src/tools/trace.rs",
+            "path",
+            8,
+        );
+        insert(
+            "PathMatcher",
+            "src/analysis/boundaries.rs::PathMatcher",
+            "src/analysis/boundaries.rs",
+            "path matcher",
+            2,
+        );
+        insert(
+            "PathCache",
+            "src/embedding.rs::PathCache",
+            "src/embedding.rs",
+            "path cache",
+            1,
+        );
+        insert(
+            "normalize_path",
+            "src/coverage.rs::normalize_path",
+            "src/coverage.rs",
+            "normalize path",
+            0,
+        );
+        insert(
+            "resolve_path",
+            "src/coverage.rs::resolve_path",
+            "src/coverage.rs",
+            "resolve path",
+            0,
+        );
+
+        let out = search_symbol(&conn, "path", 10).unwrap();
+        let names: Vec<&str> = out.results.iter().map(|r| r.name.as_str()).collect();
+
+        assert!(
+            names.contains(&"path"),
+            "exact-name hub must be present, not omitted; got {names:?}"
+        );
+        assert_eq!(
+            out.results[0].name, "path",
+            "exact whole-name central hub must rank #1; got {names:?}"
         );
     }
 

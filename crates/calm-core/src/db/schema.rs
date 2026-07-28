@@ -358,6 +358,72 @@ fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
     migrate_add_column(conn, "symbols", "arity", "INTEGER")?;
     migrate_fts_add_signature(conn)?;
     migrate_add_project_memory_fts(conn)?;
+    dedup_edges_and_add_unique_indexes(conn)?;
+    Ok(())
+}
+
+/// One-off cleanup + hardening for the two derived-edge tables (`call_edges`,
+/// `import_edges`), added 2026-07-28 after a self-audit found ~62% of
+/// `call_edges` rows on a long-lived index were byte-duplicate copies.
+///
+/// Root cause: the SCIP overlay (`scip::ingest::insert_missing_edges`) is a
+/// separate background pass with no pre-clear, and its within-run dedup set —
+/// keyed on the target's `symbols.line_start` — never matched the *next* run's
+/// reload, keyed on the SCIP def-occurrence line, so every overlay run
+/// re-inserted the same `formal` edge. `import_edges` had an independent
+/// instance of the same class (the per-file extractor can emit byte-identical
+/// rows). Neither table had a UNIQUE constraint to catch it.
+///
+/// Fix is defense-in-depth: a UNIQUE index makes *every* insert path
+/// idempotent regardless of per-path delete discipline (all three production
+/// inserts now use `INSERT OR IGNORE`). This first collapses any pre-existing
+/// duplicates — keeping the lowest `id` per logical edge; the copies are
+/// byte-identical so which survivor is kept is immaterial — then creates the
+/// indexes. Guarded on the (last-created) import index's existence so the
+/// whole-table cleanup scan runs exactly once, on the first open after
+/// upgrade; every later open short-circuits. Re-running is safe either way
+/// (both DELETEs and both `CREATE ... IF NOT EXISTS` are idempotent).
+///
+/// `call_site_line` / `to_path` / `symbols_used` are wrapped in `COALESCE`
+/// because SQLite treats NULLs as *distinct* in a UNIQUE index, which would
+/// otherwise let NULL-keyed duplicates slip past the constraint. The key
+/// deliberately excludes `edge_confidence`/`formal_source`/`ruled_out_by_scip`:
+/// those are attributes the overlay mutates in place on the *same* logical
+/// edge (`from_symbol`,`to_symbol`,`call_site_line`,`edge_kind`), never a
+/// second row.
+fn dedup_edges_and_add_unique_indexes(conn: &Connection) -> rusqlite::Result<()> {
+    let already_hardened: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master \
+         WHERE type = 'index' AND name = 'idx_import_edges_unique'",
+        [],
+        |r| r.get(0),
+    )?;
+    if already_hardened > 0 {
+        return Ok(());
+    }
+
+    // Collapse pre-constraint duplicates, keeping one row per logical edge.
+    conn.execute(
+        "DELETE FROM call_edges WHERE id NOT IN ( \
+            SELECT MIN(id) FROM call_edges \
+            GROUP BY from_symbol, to_symbol, COALESCE(call_site_line, -1), edge_kind)",
+        [],
+    )?;
+    conn.execute(
+        "DELETE FROM import_edges WHERE id NOT IN ( \
+            SELECT MIN(id) FROM import_edges \
+            GROUP BY from_path, COALESCE(to_path, ''), module_name, COALESCE(symbols_used, '[]'))",
+        [],
+    )?;
+
+    // call_edges index first, import index last: the guard above keys on the
+    // import index, so a crash between the two CREATEs re-runs both cleanly.
+    conn.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_call_edges_unique \
+             ON call_edges(from_symbol, to_symbol, COALESCE(call_site_line, -1), edge_kind); \
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_import_edges_unique \
+             ON import_edges(from_path, COALESCE(to_path, ''), module_name, COALESCE(symbols_used, '[]'));",
+    )?;
     Ok(())
 }
 
@@ -484,6 +550,96 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn dedup_migration_collapses_duplicate_edge_rows_and_blocks_new_dups() {
+        // Simulate a pre-hardening DB: base tables exist (SCHEMA_SQL) but the
+        // unique edge indexes / dedup migration have not run yet. This is the
+        // 2026-07-28 self-audit repro (`boundaries.rs::PathMatcher` had 113
+        // duplicate caller rows) reduced to its data-layer essence.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA_SQL).unwrap();
+
+        // Three byte-identical call edges for one logical edge, plus a
+        // genuinely-distinct edge (different to_symbol) that must survive.
+        for _ in 0..3 {
+            conn.execute(
+                "INSERT INTO call_edges (from_symbol, to_symbol, call_site_line, edge_confidence, edge_kind) \
+                 VALUES ('a::f', 'b::g', 10, 'formal', 'call')",
+                [],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO call_edges (from_symbol, to_symbol, call_site_line, edge_confidence, edge_kind) \
+             VALUES ('a::f', 'c::h', 10, 'formal', 'call')",
+            [],
+        )
+        .unwrap();
+        // Two byte-identical imports + one distinct (different symbols_used).
+        for _ in 0..2 {
+            conn.execute(
+                "INSERT INTO import_edges (from_path, to_path, module_name, symbols_used) \
+                 VALUES ('x.rs', 'y.rs', 'y', '[\"A\"]')",
+                [],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO import_edges (from_path, to_path, module_name, symbols_used) \
+             VALUES ('x.rs', 'y.rs', 'y', '[\"B\"]')",
+            [],
+        )
+        .unwrap();
+
+        dedup_edges_and_add_unique_indexes(&conn).unwrap();
+
+        let call_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM call_edges", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(call_rows, 2, "3 identical + 1 distinct call edge -> 2");
+        let import_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM import_edges", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(import_rows, 2, "2 identical + 1 distinct import edge -> 2");
+
+        // The constraint now makes further duplicate inserts idempotent, even
+        // at a different confidence (the key excludes edge_confidence).
+        let changed = conn
+            .execute(
+                "INSERT OR IGNORE INTO call_edges (from_symbol, to_symbol, call_site_line, edge_confidence, edge_kind) \
+                 VALUES ('a::f', 'b::g', 10, 'textual', 'call')",
+                [],
+            )
+            .unwrap();
+        assert_eq!(changed, 0, "duplicate (from,to,line,kind) is ignored");
+
+        // NULL call_site_line duplicates are caught too (COALESCE in the key).
+        conn.execute(
+            "INSERT OR IGNORE INTO call_edges (from_symbol, to_symbol, edge_confidence, edge_kind) \
+             VALUES ('a::f', 'd::k', 'textual', 'call')",
+            [],
+        )
+        .unwrap();
+        let null_dup = conn
+            .execute(
+                "INSERT OR IGNORE INTO call_edges (from_symbol, to_symbol, edge_confidence, edge_kind) \
+                 VALUES ('a::f', 'd::k', 'textual', 'call')",
+                [],
+            )
+            .unwrap();
+        assert_eq!(null_dup, 0, "NULL-line duplicate ignored via COALESCE key");
+
+        // Idempotent: re-running the migration is a cheap no-op.
+        dedup_edges_and_add_unique_indexes(&conn).unwrap();
+        let call_rows_final: i64 = conn
+            .query_row("SELECT COUNT(*) FROM call_edges", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            call_rows_final, 3,
+            "2 survivors + 1 new distinct null-line edge"
+        );
     }
 
     #[test]

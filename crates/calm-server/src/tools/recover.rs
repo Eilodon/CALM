@@ -152,6 +152,21 @@ impl CalmServer {
     ) -> Vec<PerLanguageOverlayStatus> {
         let config = self.config();
         let present = |tags: &[&str]| tags.iter().any(|t| languages.iter().any(|l| l == t));
+        // Indexed-file count behind each provider's `last_match_rate` (F5) —
+        // the denominator a reader needs to tell a real weak signal from a
+        // small-sample artifact. One provider can cover several
+        // `file_index.language` tags (javascript = js + ts, c = c + cpp).
+        let file_count_for = |tags: &[&str]| -> Option<i64> {
+            let placeholders = std::iter::repeat_n("?", tags.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            conn.query_row(
+                &format!("SELECT COUNT(*) FROM file_index WHERE language IN ({placeholders})"),
+                rusqlite::params_from_iter(tags.iter().copied()),
+                |r| r.get(0),
+            )
+            .ok()
+        };
         let mut out = Vec::new();
         if present(&["rust"])
             && let Some(s) = calm_core::scip::overlay_status_for(
@@ -161,7 +176,11 @@ impl CalmServer {
                 &config.rust.scip,
             )
         {
-            out.push(PerLanguageOverlayStatus::new("rust", s));
+            out.push(PerLanguageOverlayStatus::new(
+                "rust",
+                s,
+                file_count_for(&["rust"]),
+            ));
         }
         if present(&["go"])
             && let Some(s) = calm_core::scip::overlay_status_for(
@@ -171,7 +190,11 @@ impl CalmServer {
                 &config.go.scip,
             )
         {
-            out.push(PerLanguageOverlayStatus::new("go", s));
+            out.push(PerLanguageOverlayStatus::new(
+                "go",
+                s,
+                file_count_for(&["go"]),
+            ));
         }
         if present(&["python"])
             && let Some(s) = calm_core::scip::overlay_status_for(
@@ -181,7 +204,11 @@ impl CalmServer {
                 &config.python.scip,
             )
         {
-            out.push(PerLanguageOverlayStatus::new("python", s));
+            out.push(PerLanguageOverlayStatus::new(
+                "python",
+                s,
+                file_count_for(&["python"]),
+            ));
         }
         // TYPESCRIPT is the one provider tagged differently from its
         // `file_index.language` values — it covers both `"javascript"` and
@@ -196,7 +223,11 @@ impl CalmServer {
                 &config.js.scip,
             )
         {
-            out.push(PerLanguageOverlayStatus::new("javascript", s));
+            out.push(PerLanguageOverlayStatus::new(
+                "javascript",
+                s,
+                file_count_for(&["javascript", "typescript"]),
+            ));
         }
         if present(&["java"])
             && let Some(s) = calm_core::scip::overlay_status_for(
@@ -206,7 +237,11 @@ impl CalmServer {
                 &config.java.scip,
             )
         {
-            out.push(PerLanguageOverlayStatus::new("java", s));
+            out.push(PerLanguageOverlayStatus::new(
+                "java",
+                s,
+                file_count_for(&["java"]),
+            ));
         }
         if present(&["csharp"])
             && let Some(s) = calm_core::scip::overlay_status_for(
@@ -216,7 +251,11 @@ impl CalmServer {
                 &config.csharp.scip,
             )
         {
-            out.push(PerLanguageOverlayStatus::new("csharp", s));
+            out.push(PerLanguageOverlayStatus::new(
+                "csharp",
+                s,
+                file_count_for(&["csharp"]),
+            ));
         }
         if present(&["php"])
             && let Some(s) = calm_core::scip::overlay_status_for(
@@ -226,7 +265,11 @@ impl CalmServer {
                 &config.php.scip,
             )
         {
-            out.push(PerLanguageOverlayStatus::new("php", s));
+            out.push(PerLanguageOverlayStatus::new(
+                "php",
+                s,
+                file_count_for(&["php"]),
+            ));
         }
         // CLANG covers both `"c"` and `"cpp"` `file_index.language` values
         // under the single `"c"` tag — same both-tags reasoning as
@@ -239,7 +282,11 @@ impl CalmServer {
                 &config.clang.scip,
             )
         {
-            out.push(PerLanguageOverlayStatus::new("c", s));
+            out.push(PerLanguageOverlayStatus::new(
+                "c",
+                s,
+                file_count_for(&["c", "cpp"]),
+            ));
         }
         if present(&["ruby"])
             && let Some(s) = calm_core::scip::overlay_status_for(
@@ -249,7 +296,11 @@ impl CalmServer {
                 &config.ruby.scip,
             )
         {
-            out.push(PerLanguageOverlayStatus::new("ruby", s));
+            out.push(PerLanguageOverlayStatus::new(
+                "ruby",
+                s,
+                file_count_for(&["ruby"]),
+            ));
         }
         out
     }
@@ -664,11 +715,23 @@ pub(crate) struct PerLanguageOverlayStatus {
     /// `scip_install_hint`'s own doc comment for the "no entry yet" case.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) install_hint: Option<String>,
+    /// Number of indexed source files in this language — the denominator behind
+    /// `last_match_rate`, so a near-zero rate over a handful of files reads as
+    /// the statistical artifact it is rather than a real cross-reference
+    /// quality problem (self-audit F5). Summed across every `file_index.
+    /// language` this provider covers (javascript = js + ts, c = c + cpp).
+    /// `None` only if the count query itself failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) indexed_file_count: Option<i64>,
 }
 
 #[cfg(feature = "scip-overlay")]
 impl PerLanguageOverlayStatus {
-    fn new(lang: &str, status: calm_core::scip::OverlayStatus) -> Self {
+    fn new(
+        lang: &str,
+        status: calm_core::scip::OverlayStatus,
+        indexed_file_count: Option<i64>,
+    ) -> Self {
         let install_hint = if status.available {
             None
         } else {
@@ -678,6 +741,7 @@ impl PerLanguageOverlayStatus {
             lang: lang.to_string(),
             status: ScipOverlayStatusOutput::from(status),
             install_hint,
+            indexed_file_count,
         }
     }
 }
@@ -723,7 +787,15 @@ fn scip_install_hint(lang: &str) -> Option<String> {
         "c" => {
             "download the platform binary from \
              https://github.com/sourcegraph/scip-clang/releases/latest — also needs a \
-             compile_commands.json at the project root"
+             compile_commands.json at the project root that COVERS the translation \
+             units you care about: scip-clang only resolves files that appear in it, \
+             so a partial build (tests/examples excluded) leaves those files at \
+             tree-sitter's ambiguous fan-out and barely moves the match rate. \
+             Generate it with all relevant targets enabled (CMake: \
+             -DCMAKE_EXPORT_COMPILE_COMMANDS=ON plus your test/example options, e.g. \
+             -DFMT_TEST=ON for fmtlib) — build coverage, not just tool presence, is \
+             what determines how much of the graph gets a formal edge (see \
+             benchmarks/resolution/README.md)."
         }
         _ => return None,
     };
@@ -743,7 +815,7 @@ mod scip_install_hint_tests {
             last_inserted: None,
             last_run_unix: None,
         };
-        let out = PerLanguageOverlayStatus::new("go", status);
+        let out = PerLanguageOverlayStatus::new("go", status, None);
         assert_eq!(
             out.install_hint, None,
             "an available provider has nothing to suggest installing"
@@ -770,7 +842,7 @@ mod scip_install_hint_tests {
             "ruby",
             "c",
         ] {
-            let out = PerLanguageOverlayStatus::new(lang, status.clone());
+            let out = PerLanguageOverlayStatus::new(lang, status.clone(), None);
             assert!(
                 out.install_hint.is_some(),
                 "expected an install hint for {lang}, got None"
@@ -788,7 +860,7 @@ mod scip_install_hint_tests {
             last_run_unix: None,
         };
         assert_eq!(scip_install_hint("cobol"), None);
-        let out = PerLanguageOverlayStatus::new("cobol", status);
+        let out = PerLanguageOverlayStatus::new("cobol", status, None);
         assert_eq!(out.install_hint, None);
     }
 }

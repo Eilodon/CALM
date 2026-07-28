@@ -267,7 +267,9 @@ mod tests {
 
     fn insert_import(conn: &Connection, from_path: &str, to_path: &str) {
         conn.execute(
-            "INSERT INTO import_edges (from_path, to_path, module_name) VALUES (?1, ?2, 'x')",
+            // OR IGNORE mirrors production (indexer::edges): the UNIQUE index
+            // on import_edges makes a duplicate insert a silent no-op.
+            "INSERT OR IGNORE INTO import_edges (from_path, to_path, module_name) VALUES (?1, ?2, 'x')",
             rusqlite::params![from_path, to_path],
         )
         .unwrap();
@@ -334,11 +336,14 @@ mod tests {
         insert_symbol(&conn, "a.rs", "function", "rust", "f");
         insert_symbol(&conn, "b.rs", "function", "rust", "g");
         insert_import(&conn, "a.rs", "b.rs");
-        insert_import(&conn, "a.rs", "b.rs"); // duplicate, as seen in this repo's own table
+        insert_import(&conn, "a.rs", "b.rs"); // duplicate attempt — dropped by the UNIQUE index
 
         let summary = compute_martin_metrics(&conn).unwrap();
         let a = summary.files.iter().find(|f| f.path == "a.rs").unwrap();
-        assert_eq!(a.ce, 1, "DISTINCT must collapse the duplicate edge");
+        // The UNIQUE index on import_edges (2026-07-28) prevents the duplicate
+        // from ever landing; compute_martin_metrics' own COUNT(DISTINCT) is
+        // retained as defense-in-depth. Either way, coupling stays at 1.
+        assert_eq!(a.ce, 1, "duplicate import edge must not inflate coupling");
     }
 
     #[test]

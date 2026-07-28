@@ -327,8 +327,16 @@ fn insert_missing_edges(
     }
 
     let mut inserted = 0usize;
+    // OR IGNORE + the UNIQUE index on call_edges (db::schema
+    // dedup_edges_and_add_unique_indexes) are what actually keep this pass
+    // idempotent across overlay runs. `already_represented` is keyed on the
+    // target's `symbols.line_start` (from the JOIN in `ingest_occurrences`),
+    // but the re-resolved SCIP def-occurrence line often differs from it, so
+    // the in-memory check below can fail to recognize an edge inserted on a
+    // prior run. The constraint backstops that miss: a re-insert becomes a
+    // no-op instead of the duplicate that once inflated caller counts ~19x.
     let mut insert_stmt = conn.prepare(
-        "INSERT INTO call_edges \
+        "INSERT OR IGNORE INTO call_edges \
             (from_symbol, to_symbol, call_site_line, edge_confidence, from_path, to_path, \
              formal_source, ruled_out_by_scip) \
          VALUES (?1, ?2, ?3, 'formal', ?4, ?5, 'scip', 0)",
@@ -345,7 +353,9 @@ fn insert_missing_edges(
             let Some(to_qn) = resolve_unique_symbol_at(conn, def_path, def_line as i64)? else {
                 continue;
             };
-            insert_stmt.execute(rusqlite::params![
+            // Count only rows the constraint actually accepted — an IGNOREd
+            // duplicate returns 0, keeping `inserted`/telemetry honest.
+            let n = insert_stmt.execute(rusqlite::params![
                 enc_qn,
                 to_qn,
                 call_line as i64,
@@ -354,7 +364,7 @@ fn insert_missing_edges(
             ])?;
             already_represented.insert((from_path, call_line, def_path, def_line as i64));
             satisfied_sites.insert((from_path.to_string(), call_line));
-            inserted += 1;
+            inserted += n;
         }
     }
     Ok(inserted)

@@ -162,12 +162,25 @@ impl CalmServer {
                     config.callers.max_depth_cap,
                     config.callers.transitive_timeout_ms,
                 );
-                let mut files_affected: Vec<String> =
-                    entries.iter().map(|e| e.path.clone()).collect();
+                // F3: confidence-filter to match `risk_assessment` below — an
+                // `ambiguous` edge is index-time name-collision fan-out, not a
+                // confirmed caller of *this* symbol, so it must not pad the
+                // blast radius any more than it pads `confirmed_caller_count`.
+                // transitive_bfs already refuses to EXPAND through ambiguous
+                // edges (ADR-0009), so only depth-1 ambiguous neighbors can
+                // leak in here — dropping them keeps blast_radius and
+                // risk_assessment telling the same story.
+                let confirmed_paths: Vec<String> = entries
+                    .iter()
+                    .filter(|e| e.edge_confidence != "ambiguous")
+                    .map(|e| e.path.clone())
+                    .collect();
+                let transitive = confirmed_paths.len() as i64;
+                let mut files_affected = confirmed_paths;
                 files_affected.sort();
                 files_affected.dedup();
                 BlastRadiusInfo {
-                    transitive: entries.len() as i64,
+                    transitive,
                     files_affected,
                 }
             };

@@ -2350,6 +2350,208 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn edit_context_blast_radius_excludes_ambiguous_edges() {
+        // F3 regression: an `ambiguous` caller edge is index-time name-collision
+        // fan-out, not a confirmed caller — it must not pad blast_radius, the
+        // same way it's already excluded from risk_assessment's
+        // confirmed_caller_count.
+        let dir = std::env::temp_dir().join(format!("ci_editctx_blast_amb_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        {
+            let conn = server.db();
+            for (qn, name, path) in [
+                ("mod.a", "a", "src/a.rs"),
+                ("mod.b", "b", "src/b.rs"),
+                ("mod.c", "c", "src/c.rs"),
+            ] {
+                conn.execute(
+                    "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                     VALUES (?1, ?2, 'function', 'rust', ?3, 1, 1, '', '', ?2, 0, 0, 0)",
+                    rusqlite::params![qn, name, path],
+                )
+                .unwrap();
+            }
+            // One confirmed (resolved) caller and one ambiguous fan-out caller
+            // of `a`. Only the resolved one may count toward blast radius.
+            conn.execute(
+                "INSERT INTO call_edges (from_symbol, to_symbol, from_path, to_path, edge_confidence)
+                 VALUES ('mod.b', 'mod.a', 'src/b.rs', 'src/a.rs', 'resolved')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO call_edges (from_symbol, to_symbol, from_path, to_path, edge_confidence)
+                 VALUES ('mod.c', 'mod.a', 'src/c.rs', 'src/a.rs', 'ambiguous')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let output = server.edit_context(rmcp::handler::server::wrapper::Parameters(
+            EditContextParams {
+                symbol: "a".into(),
+                path: None,
+                line: None,
+                if_none_match: None,
+            },
+        ));
+        let v = jv(output);
+
+        assert_eq!(
+            v["blast_radius"]["transitive"], 1,
+            "ambiguous caller must not count toward blast radius"
+        );
+        assert_eq!(
+            v["blast_radius"]["files_affected"],
+            serde_json::json!(["src/b.rs"]),
+            "src/c.rs (ambiguous-only) must be excluded"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- F7: direct coverage of the CalmServer::search MCP handler ---
+    // The core algorithm (calm_core::search) is thoroughly tested; this
+    // server-layer glue (kind-string dispatch, the suggested_next fallback
+    // DAG, the include_tests hard-filter) was not. These live here with the
+    // other handler tests (the jv/CalmServer::new harness) though the handler
+    // itself is in tools/locate.rs.
+    fn search_params(query: &str, kind: &str) -> crate::tools::locate::SearchParams {
+        crate::tools::locate::SearchParams {
+            query: query.into(),
+            kind: kind.into(),
+            limit: 10,
+            glob: None,
+            case_insensitive: false,
+            context: 0,
+            path: None,
+            line: None,
+            include_tests: true,
+        }
+    }
+
+    fn insert_search_symbol(server: &CalmServer, qn: &str, name: &str, path: &str, is_test: bool) {
+        let conn = server.db();
+        conn.execute(
+            "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point, is_test)
+             VALUES (?1, ?2, 'function', 'rust', ?3, 1, 2, '', '', ?2, 0, 0, 0, ?4)",
+            rusqlite::params![qn, name, path, is_test as i32],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn search_handler_symbol_kind_dispatches_and_suggests_locate() {
+        let dir = std::env::temp_dir().join(format!("ci_search_sym_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+        insert_search_symbol(&server, "src/a.rs::widget", "widget", "src/a.rs", false);
+
+        let v = jv(
+            server.search(rmcp::handler::server::wrapper::Parameters(search_params(
+                "widget", "symbol",
+            ))),
+        );
+        assert!(
+            !v["results"].as_array().unwrap().is_empty(),
+            "symbol search must find 'widget'"
+        );
+        assert_eq!(v["results"][0]["name"], "widget");
+        assert_eq!(
+            v["suggested_next"]["tool"], "locate",
+            "a non-empty symbol search points at locate for full context"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn search_handler_unknown_kind_falls_back_to_symbol_search() {
+        // "Any other value silently falls back to symbol" — a bogus kind must
+        // still return the symbol hit, not error or come back empty.
+        let dir = std::env::temp_dir().join(format!("ci_search_bogus_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+        insert_search_symbol(&server, "src/a.rs::gizmo", "gizmo", "src/a.rs", false);
+
+        let v = jv(
+            server.search(rmcp::handler::server::wrapper::Parameters(search_params(
+                "gizmo",
+                "totally-bogus-kind",
+            ))),
+        );
+        assert!(
+            !v["results"].as_array().unwrap().is_empty(),
+            "unknown kind must fall back to symbol search and still find 'gizmo'"
+        );
+        assert_eq!(v["results"][0]["name"], "gizmo");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn search_handler_empty_symbol_result_suggests_hybrid() {
+        let dir = std::env::temp_dir().join(format!("ci_search_empty_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+        // Nothing matching inserted.
+
+        let v = jv(
+            server.search(rmcp::handler::server::wrapper::Parameters(search_params(
+                "no_such_symbol_zzz",
+                "symbol",
+            ))),
+        );
+        assert!(
+            v["results"].as_array().unwrap().is_empty(),
+            "no symbol should match"
+        );
+        assert_eq!(v["suggested_next"]["tool"], "search");
+        assert_eq!(
+            v["suggested_next"]["args"]["kind"], "hybrid",
+            "an empty symbol search points at hybrid for broader recall"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn search_handler_include_tests_false_hard_excludes_test_symbols() {
+        let dir = std::env::temp_dir().join(format!("ci_search_notest_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+        insert_search_symbol(
+            &server,
+            "src/impl.rs::helper",
+            "helper",
+            "src/impl.rs",
+            false,
+        );
+        insert_search_symbol(
+            &server,
+            "src/probe.rs::helper",
+            "helper",
+            "src/probe.rs",
+            true,
+        );
+
+        let mut p = search_params("helper", "symbol");
+        p.include_tests = false;
+        let v = jv(server.search(rmcp::handler::server::wrapper::Parameters(p)));
+        let arr = v["results"].as_array().unwrap();
+        assert_eq!(arr.len(), 1, "the is_test symbol must be hard-excluded");
+        assert_eq!(
+            arr[0]["path"], "src/impl.rs",
+            "only the non-test implementation survives"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Regression for a real production finding from a live QA pass on
     /// KARMA: a common short method name (e.g. `has`) picks up a dozen-plus
     /// `ambiguous` fan-out edges from unrelated same-named methods elsewhere

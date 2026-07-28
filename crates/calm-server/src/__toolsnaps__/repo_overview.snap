@@ -180,6 +180,14 @@
               "string",
               "null"
             ]
+          },
+          "indexed_file_count": {
+            "description": "Number of indexed source files in this language — the denominator behind\n`last_match_rate`, so a near-zero rate over a handful of files reads as\nthe statistical artifact it is rather than a real cross-reference\nquality problem (self-audit F5). Summed across every `file_index.\nlanguage` this provider covers (javascript = js + ts, c = c + cpp).\n`None` only if the count query itself failed.",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
           }
         },
         "required": [

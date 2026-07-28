@@ -51,8 +51,12 @@ pub fn insert_symbols_batch(tx: &Transaction, symbols: &[ParsedSymbol]) -> rusql
 }
 
 pub fn insert_call_edges_batch(tx: &Transaction, edges: &[CallEdge]) -> rusqlite::Result<()> {
+    // OR IGNORE: the UNIQUE index on call_edges (see db::schema
+    // dedup_edges_and_add_unique_indexes) makes every insert path idempotent,
+    // so a redundant re-insert (e.g. the same edge extracted twice in one
+    // pass) collapses to a no-op instead of a duplicate row.
     let mut stmt = tx.prepare(
-        "INSERT INTO call_edges (from_symbol, to_symbol, call_site_line, edge_confidence, from_path, to_path, edge_kind)
+        "INSERT OR IGNORE INTO call_edges (from_symbol, to_symbol, call_site_line, edge_confidence, from_path, to_path, edge_kind)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
     )?;
     for e in edges {
@@ -70,8 +74,10 @@ pub fn insert_call_edges_batch(tx: &Transaction, edges: &[CallEdge]) -> rusqlite
 }
 
 pub fn insert_import_edges_batch(tx: &Transaction, edges: &[ImportEdge]) -> rusqlite::Result<()> {
+    // OR IGNORE: byte-identical import rows collapse via the UNIQUE index
+    // (see db::schema dedup_edges_and_add_unique_indexes).
     let mut stmt = tx.prepare(
-        "INSERT INTO import_edges (from_path, to_path, module_name, symbols_used)
+        "INSERT OR IGNORE INTO import_edges (from_path, to_path, module_name, symbols_used)
          VALUES (?1, ?2, ?3, ?4)",
     )?;
     for e in edges {
