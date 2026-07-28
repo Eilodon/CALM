@@ -144,6 +144,35 @@ launcher fall back to `calm serve` as before, unchanged. To turn daemon mode
 off entirely (e.g. an environment that shouldn't share a process across
 sessions), set `CI_MCP_LAUNCHER_NO_DAEMON=1`.
 
+## Dynamic toolsets (runtime narrowing, no restart needed)
+
+Beyond the static `--preset`/`config.json` ceiling, a connected client can
+call the `set_toolset` tool to narrow (or reset) which tools **this one
+session** sees, at runtime:
+
+```json
+{"name": "set_toolset", "arguments": {"toolsets": ["trace", "security"]}}
+```
+
+- Pass toolset names from `TOOLSET_NAMES` (visible in `repo_overview`'s
+  response, or via `search`). The union of the requested toolsets' tools
+  becomes this session's visible set, still capped by the static preset —
+  `set_toolset` can never *widen* past what `--preset`/`config.json` already
+  allows, only narrow within it.
+- A hard safety floor (`orient` + `guardrails` + `recover` + `edit`) is
+  never disableable, no matter what's requested — the tools backing the
+  mandatory `edit_context`/`diff_impact` gates, the `session_context`/
+  `indexing_status` recovery tools, and `set_toolset` itself always stay
+  reachable, so a session can always call `set_toolset` again to widen back
+  out.
+- Enforcement happens at both `tools/list` (hides the tool) and `tools/call`
+  (refuses to dispatch it by name even if a client tries anyway) — the
+  server also advertises `tools.listChanged` and sends
+  `notifications/tools/list_changed` after a real narrowing change, so a
+  spec-compliant client knows to refetch its tool list.
+- Pass an empty list, or omit `toolsets` entirely, to reset back to the
+  full preset.
+
 ## Clients with config already checked into this repo
 
 The following three files all point at `scripts/mcp-launcher.sh`, differing

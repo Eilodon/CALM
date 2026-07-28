@@ -6145,7 +6145,10 @@ mod tests {
         server.apply_toolset_for_test(Some(vec!["trace".to_string()]));
         let visible = server.current_visible_tool_names();
         assert!(visible.contains("edit_context"), "floor dropped on narrow");
-        assert!(!visible.contains("scan_text"), "security tool leaked past narrow");
+        assert!(
+            !visible.contains("scan_text"),
+            "security tool leaked past narrow"
+        );
         // Widen back to full.
         server.apply_toolset_for_test(None);
         assert!(server.current_visible_tool_names().contains("scan_text"));
