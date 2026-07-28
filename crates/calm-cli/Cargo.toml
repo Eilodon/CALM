@@ -3,6 +3,15 @@ name = "calm-cli"
 version.workspace = true
 edition.workspace = true
 
+# Small lib target added alongside the `calm` bin (Phase 2, docs/superskills/
+# plans/2026-07-28-otel-http-dynamic-toolsets.md Task 2.3) so `otel::otel_layer`
+# is reachable from `tests/otel_gate.rs` as an integration test -- calm-cli
+# was bin-only before this; the bin still owns all CLI/serve logic, this lib
+# only exists to expose testable modules (otel.rs) beyond main.rs itself.
+[lib]
+name = "calm_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "calm"
 path = "src/main.rs"

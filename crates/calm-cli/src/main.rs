@@ -233,13 +233,21 @@ async fn main() -> Result<()> {
     match &daemon_project_root {
         Some(root) => init_daemon_tracing(root)?,
         None => {
-            tracing_subscriber::fmt()
-                .with_env_filter(
+            use tracing_subscriber::prelude::*;
+            let fmt_layer = tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_filter(
                     tracing_subscriber::EnvFilter::from_default_env()
                         .add_directive(tracing::Level::INFO.into()),
-                )
-                .with_writer(std::io::stderr)
-                .init();
+                );
+            let registry = tracing_subscriber::registry().with(fmt_layer);
+            // Optional OTel span-export layer (Phase 2) -- absent entirely
+            // from the registry composition unless built with the `otel`
+            // feature, and even then a no-op unless
+            // OTEL_EXPORTER_OTLP_ENDPOINT is set (see otel.rs).
+            #[cfg(feature = "otel")]
+            let registry = registry.with(calm_cli::otel::otel_layer()?);
+            registry.init();
         }
     }
 
@@ -269,13 +277,20 @@ async fn main() -> Result<()> {
                         effective_preset,
                         socket_path.display()
                     );
-                    return calm_server::daemon::serve_unix_daemon(
+                    let result = calm_server::daemon::serve_unix_daemon(
                         root,
                         db,
                         effective_preset,
                         socket_path,
                     )
                     .await;
+                    // Flush any batched-but-unsent OTel spans before the
+                    // daemon process actually exits -- covers the SIGTERM
+                    // path too, since `serve_unix_daemon`'s accept loop
+                    // returns (rather than aborting the process) once its
+                    // cancellation token fires.
+                    calm_cli::otel::shutdown();
+                    return result;
                 }
                 #[cfg(not(unix))]
                 {
@@ -290,6 +305,7 @@ async fn main() -> Result<()> {
                 effective_preset
             );
             calm_server::serve_stdio_with_preset(root, db, effective_preset).await?;
+            calm_cli::otel::shutdown();
         }
         #[cfg(unix)]
         Commands::Connect {
@@ -1185,10 +1201,14 @@ fn init_daemon_tracing(project_root: &std::path::Path) -> Result<()> {
             meta.target() == calm_server::telemetry::AUDIT_TARGET
         }));
 
-    tracing_subscriber::registry()
+    let registry = tracing_subscriber::registry()
         .with(human_layer)
-        .with(audit_layer)
-        .init();
+        .with(audit_layer);
+    // Optional OTel span-export layer (Phase 2) -- see the non-daemon init
+    // arm above (main()) for the same wiring and its doc comment.
+    #[cfg(feature = "otel")]
+    let registry = registry.with(calm_cli::otel::otel_layer()?);
+    registry.init();
     Ok(())
 }
 
