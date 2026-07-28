@@ -329,6 +329,15 @@ pub struct CalmServer {
     /// connection via `..self.clone()`, so only the FIRST client to ever
     /// connect to a shared daemon would see the gate at all.
     oriented: Arc<std::sync::atomic::AtomicBool>,
+    /// Per-session runtime toolset narrowing (Phase 1 dynamic toolsets).
+    /// `None` = no runtime narrowing, expose whatever `preset`/`tool_router`
+    /// already allows (the default; identical to pre-Phase-1 behavior).
+    /// `Some(set)` = expose only tools whose toolset is in `set`, intersected
+    /// with the preset ceiling and unioned with the non-disableable floor
+    /// (see `SAFETY_FLOOR_TOOLSETS`). MUST be reset to a fresh `Arc` in
+    /// `for_connection` (like `session_log`/`oriented`) so one session's
+    /// narrowing never leaks onto another on a shared daemon.
+    enabled_toolsets: Arc<RwLock<Option<std::collections::BTreeSet<String>>>>,
 }
 impl CalmServer {
     /// Merges every module's `#[tool_router]`-generated router into one —

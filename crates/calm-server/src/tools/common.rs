@@ -63,6 +63,7 @@ impl CalmServer {
             active_sessions: Arc::new(Mutex::new(std::collections::HashMap::new())),
             edit_lock: Arc::new(Mutex::new(())),
             oriented: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            enabled_toolsets: Arc::new(RwLock::new(None)),
             preset,
             tool_router,
         })
@@ -114,6 +115,8 @@ impl CalmServer {
             // this out would silently share one gate flag across every
             // connection on a shared daemon.
             oriented: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            // Fresh per connection — see field doc. NOT inherited via `..self.clone()`.
+            enabled_toolsets: Arc::new(RwLock::new(None)),
             ..self.clone()
         }
     }
