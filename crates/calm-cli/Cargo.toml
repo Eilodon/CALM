@@ -17,6 +17,10 @@ anyhow = { workspace = true }
 clap = { workspace = true }
 rusqlite = { workspace = true }
 serde_json = { workspace = true }
+opentelemetry = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true }
+opentelemetry-otlp = { workspace = true, optional = true }
+tracing-opentelemetry = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = "3"
@@ -45,6 +49,10 @@ lang-shell  = ["calm-core/lang-shell",  "calm-server/lang-shell"]
 lang-r      = ["calm-core/lang-r",      "calm-server/lang-r"]
 tier0-5     = ["calm-core/tier0-5",     "calm-server/tier0-5"]
 scip-overlay = ["calm-core/scip-overlay", "calm-server/scip-overlay"]
+# Opt-in OpenTelemetry span export (Phase 2, docs/superskills/plans/2026-07-28-otel-http-dynamic-toolsets.md).
+# Even when built with this feature, the pipeline stays inert unless
+# OTEL_EXPORTER_OTLP_ENDPOINT is also set at runtime (crates/calm-cli/src/otel.rs).
+otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
 # Opt-in, not in `default` yet — see calm-core's `lsp-overlay` feature comment.
 # Without this passthrough the feature is unreachable from the shipped `calm`
 # binary entirely (caught in the 2026-07-10 review).
