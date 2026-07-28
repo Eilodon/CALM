@@ -139,6 +139,63 @@ jobs:
         working-directory: tests/js_client_interop
         run: node client.mjs "$GITHUB_WORKSPACE/target/debug/calm" "$GITHUB_WORKSPACE/crates/calm-core/tests/fixtures/rust_workspace"
 
+  # Feature-matrix coverage for the 2026-07-28 OTel/HTTP upgrade
+  # (docs/superskills/plans/2026-07-28-otel-http-dynamic-toolsets.md) --
+  # `verify`'s plain `cargo build/test --workspace` above never compiles a
+  # single line of otel.rs/http.rs, same gap `all-languages` closes for the
+  # opt-in language features.
+  #
+  # The single-otel-version guard below locks in the audit's A2 finding
+  # (opentelemetry Rust crates version-skew: a bare `cargo add` to latest
+  # resolves opentelemetry to two coexisting core versions, silently
+  # broken) so a future dependency bump can't reintroduce it unnoticed.
+  # Uses `cargo metadata | jq` on the exact package name, NOT a `cargo
+  # tree | grep` substring match: a bare `grep -c 'opentelemetry v0.3[^1]'`
+  # (no tree-connector anchor) false-positive-matches the *substring*
+  # inside `tracing-opentelemetry v0.32.1` -- verified live 2026-07-28,
+  # that naive pattern reports count=1 even in the correctly-pinned,
+  # healthy state, which would make this job permanently red. `jq`
+  # filtering on `.name == "opentelemetry"` operates on cargo's own
+  # structured package list, so it can't confuse a real second core with
+  # an unrelated crate whose name happens to contain the same substring.
+  otel-http-features:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Clippy (otel)
+        run: cargo clippy -p calm-cli --features otel -- -D warnings
+
+      - name: Test (otel)
+        run: cargo test -p calm-cli --features otel
+
+      - name: Guard against opentelemetry core version skew (locks in audit A2 finding)
+        run: |
+          VERSIONS=$(cargo metadata --format-version 1 --features otel \
+            | jq -r '.packages[] | select(.name == "opentelemetry") | .version' | sort -u)
+          COUNT=$(printf '%s\n' "$VERSIONS" | grep -c .)
+          echo "Resolved opentelemetry core version(s): $VERSIONS"
+          if [ "$COUNT" -ne 1 ]; then
+            echo "::error::Expected exactly ONE resolved 'opentelemetry' core version, found $COUNT: $VERSIONS"
+            exit 1
+          fi
+          if ! printf '%s\n' "$VERSIONS" | grep -q '^0\.31\.'; then
+            echo "::error::Resolved opentelemetry core is $VERSIONS, expected the pinned 0.31.x line -- update crates/calm-cli/src/otel.rs's version-note comment and Cargo.toml's pin comment together if this is an intentional bump"
+            exit 1
+          fi
+
+      - name: Clippy (http)
+        run: cargo clippy -p calm-server -p calm-cli --features http -- -D warnings
+
+      - name: Test (http)
+        run: cargo test -p calm-server -p calm-cli --features http
+
   # Wires `calm fitness-check` (README: "CI gate, exits 1 on failure") into
   # actual CI — previously documented as a CI gate but never invoked by any
   # workflow, so a declared `[[boundaries]]`/threshold violation could sit
