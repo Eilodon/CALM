@@ -35,6 +35,22 @@ enum Commands {
         /// Unix-only (errors at runtime on other platforms).
         #[arg(long)]
         listen: Option<String>,
+        /// Serve over Streamable-HTTP instead of stdio/unix-socket (needs
+        /// the `http` cargo feature -- errors at runtime if not compiled
+        /// in). Loopback-only unless --allow-remote is also passed.
+        #[arg(long)]
+        http: bool,
+        /// HTTP bind address, only used with --http. Fixed default port
+        /// (not an ephemeral :0) so a client config pointing at it stays
+        /// valid across restarts.
+        #[arg(long, default_value = "127.0.0.1:8787")]
+        addr: String,
+        /// Permit a non-loopback --addr bind. Requires CALM_HTTP_TOKEN to
+        /// be set (fail-closed) and forces a read-only preset ("full,-edit")
+        /// regardless of --preset -- see docs/http-transport.md's threat
+        /// model for why.
+        #[arg(long)]
+        allow_remote: bool,
     },
     /// Thin forwarder: connect to (or spawn, if none is live or the live
     /// one is a stale build) the shared daemon for `project_root`, then
@@ -257,6 +273,9 @@ async fn main() -> Result<()> {
             db_path,
             preset,
             listen,
+            http,
+            addr,
+            allow_remote,
         } => {
             let root = std::fs::canonicalize(&project_root)?;
             let db = db_path.unwrap_or_else(|| calm_server::default_db_path(&root));
@@ -266,6 +285,50 @@ async fn main() -> Result<()> {
             // rather than silently degrade to defaults.
             let config = calm_core::config::load_config(&root)?;
             let effective_preset = preset.unwrap_or_else(|| config.preset.clone());
+
+            if http {
+                #[cfg(feature = "http")]
+                {
+                    // Fail-closed policy resolved BEFORE anything else touches
+                    // the filesystem/DB -- a rejected launch must be a pure,
+                    // side-effect-free refusal (Task 3.4a).
+                    let token = std::env::var("CALM_HTTP_TOKEN").ok();
+                    let launch = calm_cli::http::resolve_http_launch(
+                        &addr,
+                        allow_remote,
+                        token.clone(),
+                        &effective_preset,
+                    )?;
+                    tracing::info!(
+                        "Starting MCP server for {} over HTTP (preset={}, addr={})",
+                        root.display(),
+                        launch.effective_preset,
+                        launch.addr
+                    );
+                    // Same bootstrap sequence as the stdio/unix-daemon paths
+                    // (background indexer/embedder/watcher + SIGINT/SIGTERM
+                    // handlers on `ct`) -- NOT a bare CalmServer::new_with_preset,
+                    // or the index would never build.
+                    let calm_server::Bootstrapped { server, ct } =
+                        calm_server::bootstrap(root, db, launch.effective_preset).await?;
+                    // Only ever Some when allow_remote is true (resolve_http_launch
+                    // already required a non-empty token in that case) -- a
+                    // loopback bind mounts no auth layer at all.
+                    let bearer_token = allow_remote.then_some(token).flatten();
+                    let result =
+                        calm_server::http::serve_http(server, launch.addr, ct, bearer_token)
+                            .await;
+                    calm_cli::otel::shutdown();
+                    return result;
+                }
+                #[cfg(not(feature = "http"))]
+                {
+                    let _ = (addr, allow_remote, db);
+                    anyhow::bail!(
+                        "--http requires building with --features http (this binary wasn't)"
+                    );
+                }
+            }
 
             if let Some(listen) = listen {
                 #[cfg(unix)]

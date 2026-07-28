@@ -1,5 +1,7 @@
 #[cfg(unix)]
 pub mod daemon;
+#[cfg(feature = "http")]
+pub mod http;
 mod scip_overlay;
 mod sync_ext;
 pub mod telemetry;

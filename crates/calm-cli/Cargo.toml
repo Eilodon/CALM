@@ -62,6 +62,10 @@ scip-overlay = ["calm-core/scip-overlay", "calm-server/scip-overlay"]
 # Even when built with this feature, the pipeline stays inert unless
 # OTEL_EXPORTER_OTLP_ENDPOINT is also set at runtime (crates/calm-cli/src/otel.rs).
 otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
+# Opt-in remote/HTTP transport passthrough (Phase 3, same plan) -- without
+# this the feature is unreachable from the shipped `calm` binary, same
+# reasoning as the lsp-overlay passthrough below.
+http = ["calm-server/http"]
 # Opt-in, not in `default` yet — see calm-core's `lsp-overlay` feature comment.
 # Without this passthrough the feature is unreachable from the shipped `calm`
 # binary entirely (caught in the 2026-07-10 review).
