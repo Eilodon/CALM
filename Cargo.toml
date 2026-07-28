@@ -190,26 +190,30 @@ rand = "0.9"
 # `optional = true` in crates/calm-cli/Cargo.toml's [dependencies], NOT
 # here -- cargo rejects `optional` on a [workspace.dependencies] entry:
 # "workspace dependencies cannot be optional", confirmed live 2026-07-28).
-# Pinned to the aligned 0.31 line for opentelemetry/_sdk/-otlp +
-# tracing-opentelemetry 0.32 -- live re-verified 2026-07-28 (cargo tree in a
-# scratch probe, NOT just trusted from the design doc) to resolve to a
-# SINGLE opentelemetry core. A bare `cargo add` to "latest" resolves the
-# direct `opentelemetry` dep to 0.32.x while tracing-opentelemetry's own
-# latest (0.32.1 as of this check) still requires `opentelemetry ^0.31`
-# internally -- two coexisting cores, silently broken. Re-verify with
+# Pinned to the aligned 0.32 line for opentelemetry/_sdk/-otlp +
+# tracing-opentelemetry 0.33 -- re-verified 2026-07-28 against crates.io's
+# sparse index dependency manifests (NOT just trusted from the design doc)
+# to resolve to a SINGLE opentelemetry core. tracing-opentelemetry's own
+# versioning is offset by one from the core: its 0.32.x line still requires
+# `opentelemetry ^0.31` internally, while 0.33.0 is the first release that
+# requires `opentelemetry ^0.32` / `opentelemetry-otlp ^0.32` /
+# `opentelemetry_sdk ^0.32` -- pairing core-0.32 with tracing-opentelemetry-
+# 0.32 (instead of 0.33) silently reintroduces two coexisting cores. This
+# was the root cause of a Dependabot PR (#46) that bumped only
+# `opentelemetry_sdk` to 0.32.1 and broke the build. Re-verify with
 # `cargo tree -p opentelemetry` (expect exactly one resolved line) before
 # ever bumping these.
-opentelemetry = { version = "0.31" }
-opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
+opentelemetry = { version = "0.32" }
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
 # default-features = false + http-proto avoids opening a grpc-tonic
 # transport at RUNTIME (this exporter POSTs spans over reqwest/HTTP) -- but
 # tonic/tonic-prost still compile in as transitive deps of
-# opentelemetry-proto regardless of this feature selection (its 0.31.0
+# opentelemetry-proto regardless of this feature selection (its 0.32.0
 # Cargo.toml doesn't gate them out of the dependency graph, only out of
 # opentelemetry-otlp's own default feature set). This trims runtime
 # behavior and enabled-by-default features, not full compile-time weight.
-opentelemetry-otlp = { version = "0.31", default-features = false, features = ["http-proto", "reqwest-client"] }
-tracing-opentelemetry = { version = "0.32" }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["http-proto", "reqwest-client"] }
+tracing-opentelemetry = { version = "0.33" }
 
 # Phase 3 (same plan): optional Streamable-HTTP transport, behind the
 # `http` feature (crates/calm-server/Cargo.toml: rmcp/transport-streamable-

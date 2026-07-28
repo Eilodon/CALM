@@ -185,8 +185,8 @@ jobs:
             echo "::error::Expected exactly ONE resolved 'opentelemetry' core version, found $COUNT: $VERSIONS"
             exit 1
           fi
-          if ! printf '%s\n' "$VERSIONS" | grep -q '^0\.31\.'; then
-            echo "::error::Resolved opentelemetry core is $VERSIONS, expected the pinned 0.31.x line -- update crates/calm-cli/src/otel.rs's version-note comment and Cargo.toml's pin comment together if this is an intentional bump"
+          if ! printf '%s\n' "$VERSIONS" | grep -q '^0\.32\.'; then
+            echo "::error::Resolved opentelemetry core is $VERSIONS, expected the pinned 0.32.x line -- update crates/calm-cli/src/otel.rs's version-note comment and Cargo.toml's pin comment together if this is an intentional bump"
             exit 1
           fi
 
