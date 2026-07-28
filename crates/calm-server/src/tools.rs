@@ -13,6 +13,7 @@ use calm_core::sanitize::{injection_warning, sanitize_source_output};
 use calm_core::types::{EmbedStatus, IndexingPhase};
 
 pub(crate) mod common;
+mod detail;
 mod edit;
 mod guardrails;
 mod inspect;
@@ -20,11 +21,13 @@ mod locate;
 mod lsp;
 mod memory;
 mod orient;
+mod outcome;
 mod patterndebt;
 mod recover;
 mod scip;
 mod security;
 mod testgap;
+mod toolset;
 mod trace;
 
 // ---------------------------------------------------------------------------
