@@ -4,10 +4,11 @@
 //! background exporter task spawns and no network I/O happens (audit A3).
 //!
 //! Version note (re-verify before bumping): pinned to opentelemetry/
-//! opentelemetry_sdk/opentelemetry-otlp 0.31 + tracing-opentelemetry 0.32,
+//! opentelemetry_sdk/opentelemetry-otlp 0.32 + tracing-opentelemetry 0.33,
 //! the only combination that resolves to a single `opentelemetry` core as
 //! of 2026-07-28 (see root Cargo.toml's comment on these deps for the
-//! live-verified failure mode a bare `cargo add` to latest hits instead).
+//! failure mode a naive per-crate bump hits instead -- this is what broke
+//! Dependabot PR #46, which bumped only `opentelemetry_sdk`).
 //! Check with `cargo tree -p opentelemetry` (expect exactly one line).
 
 #[cfg(feature = "otel")]
