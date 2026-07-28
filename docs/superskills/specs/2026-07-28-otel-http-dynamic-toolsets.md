@@ -194,20 +194,42 @@ AUDIT_TARGET_TIER: 2
 - **L7 Cross-cutting:** `set_toolset` is idempotent by construction (sets absolute state).
   No rate limits needed for local transports; see Abductive 2 for `list_changed`.
 
-### Assumptions to Verify
-- **ASSUMED:** rmcp's `Handler` dispatch (`list_tools`/`call_tool`, already overridden for
-  the orientation gate) can overlay a per-session enabled-set filter without forking rmcp.
-  Verify the override point is reachable before committing to the "single frozen router +
-  per-session filter" design.
-- **ASSUMED:** `tracing-opentelemetry` + `opentelemetry-otlp` are version-compatible with
-  the pinned `tracing-subscriber = 0.3` and the tokio runtime. Verify no conflict / MSRV
-  regression.
-- **ASSUMED (stated as fact):** "absent env var = zero exporter, zero network, identical
-  behavior." Verify the layer construction spawns NO background task when the endpoint is
-  unset — a batch processor started unconditionally would violate this.
-- **ASSUMED:** rmcp's streamable-http server exposes a per-connection hook equivalent to the
-  Unix accept loop so `for_connection()` can be reused. Verify before designing HTTP around
-  reuse; if not, the stateful session model needs a different seam.
+### Assumptions to Verify — RESOLVED 2026-07-28 (verified against real rmcp 2.2.0 source + cargo resolver)
+- **VERIFIED — Assumption 1 (dynamic toolsets seam):** CALM already overrides both
+  `list_tools` (tools.rs:589, returns `self.tool_router.list_all()`) and `call_tool`
+  (tools.rs:601), and `call_tool` already has a per-request dispatch chokepoint (the
+  orientation gate, tools.rs:642-661) BEFORE `self.tool_router.call(...)`. A per-session
+  enabled-set filter drops in at exactly these two points — **no rmcp fork**. The
+  `list_changed` emission is also supported: rmcp exposes `peer.notify_tool_list_changed()`
+  (service/server.rs:491) reachable via `RequestContext.peer` (service.rs:865), plus
+  `ServerCapabilities::enable_tool_list_changed()` to advertise it.
+- **VERIFIED WITH A FINDING — Assumption 2 (OTel version compat):** the naive "latest"
+  set is BROKEN — `tracing-opentelemetry` version-skips relative to `opentelemetry-otlp`:
+  `tracing-opentelemetry 0.33 → opentelemetry 0.33`, but the latest published
+  `opentelemetry-otlp` is `0.32 → opentelemetry 0.32` (no otlp 0.33 exists), and
+  `tracing-opentelemetry 0.32.1 → opentelemetry 0.31`. A `cargo add` of the two latest
+  produces **two coexisting opentelemetry core versions** (spans built with one, exported
+  by the other — silently non-functional). **The one fully-aligned, currently-published
+  set is the opentelemetry 0.31 line**, verified to resolve to a single core version via
+  `cargo tree`: `opentelemetry 0.31` + `opentelemetry_sdk 0.31` + `opentelemetry-otlp 0.31.1`
+  + `tracing-opentelemetry 0.32.1`. Plan MUST pin this co-tested set, never bare-`cargo add`
+  latest. Secondary finding: `opentelemetry-otlp 0.31` defaults to the **grpc-tonic**
+  exporter (pulls tonic/prost/hyper) — for a *minimal* footprint use the `http-proto`
+  transport feature instead, avoiding the gRPC stack.
+- **VERIFIED (by design) — Assumption 3 (no background task when unset):** holds as long as
+  CALM builds the `TracerProvider`/OTLP pipeline ONLY when `OTEL_EXPORTER_OTLP_ENDPOINT` is
+  set. The batch span processor spawns its background task at *provider-build* time, which
+  CALM gates; absent the env var, the provider is never built → zero task, zero network.
+  This is an actionable construction rule for the plan, not an external unknown.
+- **VERIFIED — Assumption 4 (HTTP per-connection reuse):** rmcp
+  `StreamableHttpService::new(service_factory: impl Fn() -> Result<S, io::Error>, ...)`
+  (transport/streamable_http_server/tower.rs:631) calls the factory per session via
+  `get_service()` and spawns each `S` in its own `serve_server` worker — so passing
+  `|| Ok(daemon.for_connection())` gives every HTTP session a fresh per-connection
+  `CalmServer` (session_id/oriented/session_log preserved). BONUS FINDING: rmcp 2.2.0's
+  streamable-http server is **session-based** (`SessionManager` w/ `Mcp-Session-Id`) — the
+  stateless MCP-2026-07-28-RC shape is NOT in the pinned rmcp yet, so the spec's "keep the
+  stateful model in v1" is what rmcp actually implements, not merely a preference.
 
 ### Abductive Hypotheses
 - **Abductive 1 (interaction of correct components):** OTel `traceparent` propagation + the
