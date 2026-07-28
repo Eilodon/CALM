@@ -1053,20 +1053,14 @@ fn resolve_sites_to_edges(ctx: &ResolutionCtx, sites: &[CallSiteRow]) -> Vec<Cal
     edges
 }
 
-#[allow(clippy::too_many_arguments)]
 fn rebuild_graph(
     tx: &rusqlite::Transaction,
     project_root: &std::path::Path,
     churn_since: &str,
     hub_config: &crate::config::HubThresholdConfig,
-    crate_map: &crate::indexer::crate_map::CrateMap,
-    psr4: &crate::indexer::psr4::Psr4Map,
-    namespace_map: &crate::indexer::csharp_namespace::NamespaceMap,
-    pysys: &crate::indexer::pysyspath::PySysPathMap,
-    jvm: &crate::indexer::jvm_package::JvmPackageMap,
-    go: &crate::indexer::go_module::GoModule,
+    maps: &ResolutionMaps,
 ) -> rusqlite::Result<()> {
-    let ctx = build_resolution_context(tx, namespace_map)?;
+    let ctx = build_resolution_context(tx, &maps.namespace_map)?;
 
     // Stable, explicit order (Phase B plan T2/A-3) so full and future
     // incremental resolution attribute `seen_pairs` dedup identically in
@@ -1112,7 +1106,7 @@ fn rebuild_graph(
         [],
     )?;
     refresh_caller_counts(tx)?;
-    resolve_import_targets(tx, crate_map, psr4, namespace_map, pysys, jvm, go)?;
+    resolve_import_targets(tx, maps)?;
     crate::graph::coreness::compute_coreness(tx)?;
     crate::graph::hub::update_is_hub_flags(tx, hub_config)?;
     crate::graph::boundary::update_boundary_ambiguous_flags(tx)?;
@@ -1143,12 +1137,6 @@ pub enum IncrementalOutcome {
 /// loaded and (b) how much of `call_edges` gets deleted first; see plan
 /// §3.1 for the proof that `delta_paths` below is sufficient to catch every
 /// input `resolve_sites_to_edges` depends on.
-// 8 params: the four resolution maps (`crate_map`/`psr4`/`namespace_map`/
-// `pysys`) are built once per reindex by `cached_resolution_maps` and always
-// travel together, so they would collapse to a single `&ResolutionMaps`
-// bundle — a worthwhile tidy-up, but one that would rewrite the signature of
-// every function on this path for a lint rather than a behaviour fix.
-#[allow(clippy::too_many_arguments)]
 pub fn incremental_graph_update(
     tx: &rusqlite::Transaction,
     project_root: &std::path::Path,
@@ -1156,12 +1144,7 @@ pub fn incremental_graph_update(
     delta_seed: &[String],
     names_delta: &HashSet<String>,
     hub_config: &crate::config::HubThresholdConfig,
-    crate_map: &crate::indexer::crate_map::CrateMap,
-    psr4: &crate::indexer::psr4::Psr4Map,
-    namespace_map: &crate::indexer::csharp_namespace::NamespaceMap,
-    pysys: &crate::indexer::pysyspath::PySysPathMap,
-    jvm: &crate::indexer::jvm_package::JvmPackageMap,
-    go: &crate::indexer::go_module::GoModule,
+    maps: &ResolutionMaps,
 ) -> rusqlite::Result<IncrementalOutcome> {
     // Step 1 (plan D1): delta_paths = delta_seed ∪ {from_path of call_sites
     // whose callee_name ∈ names_delta} — a site in an UNCHANGED file that
@@ -1196,18 +1179,7 @@ pub fn incremental_graph_update(
             "delta_paths.len()={} > {MAX_INCREMENTAL_DELTA_PATHS}",
             delta_paths.len()
         );
-        rebuild_graph(
-            tx,
-            project_root,
-            churn_since,
-            hub_config,
-            crate_map,
-            psr4,
-            namespace_map,
-            pysys,
-            jvm,
-            go,
-        )?;
+        rebuild_graph(tx, project_root, churn_since, hub_config, maps)?;
         return Ok(IncrementalOutcome::FellBackToFull(reason));
     }
 
@@ -1238,7 +1210,7 @@ pub fn incremental_graph_update(
     // Step 5 (plan D4): same shared resolver full rebuild uses — still one
     // global SELECT over symbols (accepted cost, see build_resolution_context's
     // own doc comment; scoping this too is Phase B+ backlog).
-    let ctx = build_resolution_context(tx, namespace_map)?;
+    let ctx = build_resolution_context(tx, &maps.namespace_map)?;
 
     // Step 6: re-resolve exactly delta_paths' sites. `ORDER BY id` matches
     // rebuild_graph's own load (plan A-3/T2) so "first site wins" seen_pairs
@@ -1286,7 +1258,7 @@ pub fn incremental_graph_update(
     // once the edge set matches, since every one is a pure function of
     // current DB state, not of how the edges got there.
     refresh_caller_counts(tx)?;
-    resolve_import_targets(tx, crate_map, psr4, namespace_map, pysys, jvm, go)?;
+    resolve_import_targets(tx, maps)?;
     crate::graph::coreness::compute_coreness(tx)?;
     crate::graph::hub::update_is_hub_flags(tx, hub_config)?;
     crate::graph::boundary::update_boundary_ambiguous_flags(tx)?;
@@ -1329,12 +1301,7 @@ pub fn refresh_caller_counts(conn: &rusqlite::Connection) -> rusqlite::Result<()
 /// External modules (no matching file) keep `to_path = NULL`.
 fn resolve_import_targets(
     tx: &rusqlite::Transaction,
-    crate_map: &crate::indexer::crate_map::CrateMap,
-    psr4: &crate::indexer::psr4::Psr4Map,
-    namespace_map: &crate::indexer::csharp_namespace::NamespaceMap,
-    pysys: &crate::indexer::pysyspath::PySysPathMap,
-    jvm: &crate::indexer::jvm_package::JvmPackageMap,
-    go: &crate::indexer::go_module::GoModule,
+    maps: &ResolutionMaps,
 ) -> rusqlite::Result<()> {
     let known: HashSet<String> = {
         let mut stmt = tx.prepare("SELECT path FROM file_index")?;
@@ -1358,19 +1325,7 @@ fn resolve_import_targets(
     // `known` set, so it runs in parallel; the UPDATE loop stays sequential.
     let targets: Vec<Option<String>> = rows
         .par_iter()
-        .map(|(_, from_path, module)| {
-            resolve_module_to_path(
-                from_path,
-                module,
-                &known,
-                crate_map,
-                psr4,
-                namespace_map,
-                pysys,
-                jvm,
-                go,
-            )
-        })
+        .map(|(_, from_path, module)| resolve_module_to_path(from_path, module, &known, maps))
         .collect();
 
     let mut ustmt = tx.prepare("UPDATE import_edges SET to_path = ?1 WHERE id = ?2")?;
@@ -1542,24 +1497,11 @@ fn resolve_candidates(
 
 /// Map a module/path string to an indexed file path, trying the conventions of
 /// all six languages (dotted, scoped, and JS-relative) plus common index files.
-// Six per-ecosystem maps plus the three inputs they resolve against. The same
-// `#[allow]` `rebuild_graph` already carries, for the same reason; this is now
-// the third function to hit the limit, which is the signal that these maps want
-// to be one `ResolutionMaps` struct rather than a growing parameter list.
-// Deliberately not done in this change: bundling them touches every call site
-// in the reindex path, which is a refactor to land on its own, not alongside a
-// resolution fix.
-#[allow(clippy::too_many_arguments)]
 fn resolve_module_to_path(
     from_path: &str,
     module: &str,
     known: &HashSet<String>,
-    crate_map: &crate::indexer::crate_map::CrateMap,
-    psr4: &crate::indexer::psr4::Psr4Map,
-    namespace_map: &crate::indexer::csharp_namespace::NamespaceMap,
-    pysys: &crate::indexer::pysyspath::PySysPathMap,
-    jvm: &crate::indexer::jvm_package::JvmPackageMap,
-    go: &crate::indexer::go_module::GoModule,
+    maps: &ResolutionMaps,
 ) -> Option<String> {
     let m = module.trim().trim_matches(|c| c == '"' || c == '\'');
     if m.is_empty() {
@@ -1569,7 +1511,7 @@ fn resolve_module_to_path(
     // convention scan only if it finds nothing (keeps single-crate repos working
     // even when the crate map is empty).
     if from_path.ends_with(".rs")
-        && let Some(hit) = resolve_rust_module(from_path, m, crate_map, known)
+        && let Some(hit) = resolve_rust_module(from_path, m, &maps.crate_map, known)
     {
         return Some(hit);
     }
@@ -1584,7 +1526,7 @@ fn resolve_module_to_path(
     // match anything.
     if from_path.ends_with(".php")
         && m.contains('\\')
-        && let Some(hit) = psr4.resolve(m)
+        && let Some(hit) = maps.psr4.resolve(m)
         && known.contains(&hit)
     {
         return Some(hit);
@@ -1598,7 +1540,7 @@ fn resolve_module_to_path(
     // see `NamespaceMap::resolve`'s doc comment), so it's left `None` rather
     // than guessing one of them.
     if from_path.ends_with(".cs")
-        && let Some(hit) = namespace_map.resolve(m)
+        && let Some(hit) = maps.namespace_map.resolve(m)
         && known.contains(hit)
     {
         return Some(hit.to_string());
@@ -1620,7 +1562,8 @@ fn resolve_module_to_path(
         // A JVM import is always a package-qualified name; the generic scan
         // below can only mis-bind it (`java.io.Serializable` -> some local
         // `Serializable.java`), so this is the sole authority for these files.
-        return jvm
+        return maps
+            .jvm
             .resolve_type(m)
             .filter(|hit| known.contains(*hit))
             .map(str::to_string);
@@ -1633,10 +1576,10 @@ fn resolve_module_to_path(
     // gin's own files while gin's real module-path imports resolved to
     // nothing. Both halves are fixed here.
     if from_path.ends_with(".go") {
-        if go.is_stdlib(m) {
+        if maps.go.is_stdlib(m) {
             return None;
         }
-        if let Some(dir) = go.package_dir(m) {
+        if let Some(dir) = maps.go.package_dir(m) {
             // A Go package is a directory: any indexed `.go` file inside it
             // identifies the package. Deterministic pick so repeated indexes
             // agree, since `import_edges.to_path` holds a single target.
@@ -1713,7 +1656,7 @@ fn resolve_module_to_path(
         // never resolved at all.
         if from_path.ends_with(".py") {
             bases.push(join_rel(&python_package_root(from_path, known), &norm));
-            for root in pysys.roots_for(from_path) {
+            for root in maps.pysys.roots_for(from_path) {
                 bases.push(join_rel(root, &norm));
             }
         }
@@ -1965,18 +1908,13 @@ pub fn run_indexing_pipeline_cancellable(
 
     *phase.write().unwrap() = IndexingPhase::BuildingEdges;
 
-    let (crate_map, psr4, namespace_map, pysys, jvm, go) = cached_resolution_maps(project_root);
+    let maps = cached_resolution_maps(project_root);
     rebuild_graph(
         &tx,
         project_root,
         &config.hotspots.default_since,
         &config.hub_threshold,
-        &crate_map,
-        &psr4,
-        &namespace_map,
-        &pysys,
-        &jvm,
-        &go,
+        &maps,
     )?;
     tx.commit()?;
 
@@ -2043,6 +1981,26 @@ fn cached_formal_resolver() -> &'static crate::resolver::formal::FormalResolver 
     })
 }
 
+/// Bundle of the 6 per-project-root, ecosystem-specific import/module
+/// resolvers that `resolve_module_to_path` (and everything upstream of it —
+/// `resolve_import_targets`, `rebuild_graph`, `incremental_graph_update`)
+/// needs but never inspects independently of the others: they are always
+/// built together (`cached_resolution_maps`) and always travel together.
+/// Introduced (C2, Tier A resolver audit follow-up) once `resolve_module_to_path`
+/// became the 3rd function on this path to hit clippy's `too_many_arguments`
+/// threshold — see this file's `git blame`/history for the growing-parameter-list
+/// comment that flagged this refactor and deliberately deferred it to its own
+/// change. Cheap to `Clone` (each field already was).
+#[derive(Clone)]
+pub struct ResolutionMaps {
+    crate_map: crate::indexer::crate_map::CrateMap,
+    psr4: crate::indexer::psr4::Psr4Map,
+    namespace_map: crate::indexer::csharp_namespace::NamespaceMap,
+    pysys: crate::indexer::pysyspath::PySysPathMap,
+    jvm: crate::indexer::jvm_package::JvmPackageMap,
+    go: crate::indexer::go_module::GoModule,
+}
+
 /// Cache entry for `cached_resolution_maps` — one per `project_root` (a
 /// single-slot cache would return the wrong project's maps whenever more
 /// than one `project_root` is used within the same process, which the test
@@ -2052,12 +2010,7 @@ struct CachedResolutionMaps {
     cargo_toml_mtime: Option<std::time::SystemTime>,
     cargo_lock_mtime: Option<std::time::SystemTime>,
     composer_json_mtime: Option<std::time::SystemTime>,
-    crate_map: crate::indexer::crate_map::CrateMap,
-    psr4: crate::indexer::psr4::Psr4Map,
-    namespace_map: crate::indexer::csharp_namespace::NamespaceMap,
-    pysys: crate::indexer::pysyspath::PySysPathMap,
-    jvm: crate::indexer::jvm_package::JvmPackageMap,
-    go: crate::indexer::go_module::GoModule,
+    maps: ResolutionMaps,
 }
 
 static RESOLUTION_MAPS_CACHE: std::sync::OnceLock<
@@ -2085,16 +2038,7 @@ const RESOLUTION_MAPS_TTL: std::time::Duration = std::time::Duration::from_secs(
 /// `NamespaceMap`, see its doc comment above). All three maps are cheap to
 /// `Clone` (small `HashMap`/`Vec` of strings) — cloned out of the lock
 /// rather than holding it for the caller's `rebuild_graph` pass.
-fn cached_resolution_maps(
-    project_root: &Path,
-) -> (
-    crate::indexer::crate_map::CrateMap,
-    crate::indexer::psr4::Psr4Map,
-    crate::indexer::csharp_namespace::NamespaceMap,
-    crate::indexer::pysyspath::PySysPathMap,
-    crate::indexer::jvm_package::JvmPackageMap,
-    crate::indexer::go_module::GoModule,
-) {
+fn cached_resolution_maps(project_root: &Path) -> ResolutionMaps {
     let file_mtime = |name: &str| {
         std::fs::metadata(project_root.join(name))
             .and_then(|m| m.modified())
@@ -2114,23 +2058,18 @@ fn cached_resolution_maps(
             && c.cargo_lock_mtime == cargo_lock_mtime
             && c.composer_json_mtime == composer_json_mtime;
         if fresh_enough && manifests_unchanged {
-            return (
-                c.crate_map.clone(),
-                c.psr4.clone(),
-                c.namespace_map.clone(),
-                c.pysys.clone(),
-                c.jvm.clone(),
-                c.go.clone(),
-            );
+            return c.maps.clone();
         }
     }
 
-    let crate_map = crate::indexer::crate_map::CrateMap::build(project_root);
-    let psr4 = crate::indexer::psr4::Psr4Map::build(project_root);
-    let namespace_map = crate::indexer::csharp_namespace::NamespaceMap::build(project_root);
-    let pysys = crate::indexer::pysyspath::PySysPathMap::build(project_root);
-    let jvm = crate::indexer::jvm_package::JvmPackageMap::build(project_root);
-    let go = crate::indexer::go_module::GoModule::build(project_root);
+    let maps = ResolutionMaps {
+        crate_map: crate::indexer::crate_map::CrateMap::build(project_root),
+        psr4: crate::indexer::psr4::Psr4Map::build(project_root),
+        namespace_map: crate::indexer::csharp_namespace::NamespaceMap::build(project_root),
+        pysys: crate::indexer::pysyspath::PySysPathMap::build(project_root),
+        jvm: crate::indexer::jvm_package::JvmPackageMap::build(project_root),
+        go: crate::indexer::go_module::GoModule::build(project_root),
+    };
     cache.insert(
         project_root.to_path_buf(),
         CachedResolutionMaps {
@@ -2138,15 +2077,10 @@ fn cached_resolution_maps(
             cargo_toml_mtime,
             cargo_lock_mtime,
             composer_json_mtime,
-            crate_map: crate_map.clone(),
-            psr4: psr4.clone(),
-            namespace_map: namespace_map.clone(),
-            pysys: pysys.clone(),
-            jvm: jvm.clone(),
-            go: go.clone(),
+            maps: maps.clone(),
         },
     );
-    (crate_map, psr4, namespace_map, pysys, jvm, go)
+    maps
 }
 
 /// Phase B plan T4b: the 3 manifest filenames `cached_resolution_maps`
@@ -2311,7 +2245,7 @@ pub fn reindex_changed_cancellable(
         if summary.changed_paths.iter().any(|p| is_manifest_path(p)) {
             invalidate_resolution_maps_cache(project_root);
         }
-        let (crate_map, psr4, namespace_map, pysys, jvm, go) = cached_resolution_maps(project_root);
+        let maps = cached_resolution_maps(project_root);
         if config.indexing.incremental_graph {
             match incremental_graph_update(
                 &tx,
@@ -2320,12 +2254,7 @@ pub fn reindex_changed_cancellable(
                 &summary.changed_paths,
                 &summary.names_delta,
                 &config.hub_threshold,
-                &crate_map,
-                &psr4,
-                &namespace_map,
-                &pysys,
-                &jvm,
-                &go,
+                &maps,
             )? {
                 IncrementalOutcome::Applied => summary.graph_mode = GraphMode::Incremental,
                 IncrementalOutcome::FellBackToFull(reason) => {
@@ -2338,12 +2267,7 @@ pub fn reindex_changed_cancellable(
                 project_root,
                 &config.hotspots.default_since,
                 &config.hub_threshold,
-                &crate_map,
-                &psr4,
-                &namespace_map,
-                &pysys,
-                &jvm,
-                &go,
+                &maps,
             )?;
             summary.graph_mode = GraphMode::Full;
         }
@@ -2465,7 +2389,7 @@ pub fn reindex_paths(
         if summary.changed_paths.iter().any(|p| is_manifest_path(p)) {
             invalidate_resolution_maps_cache(project_root);
         }
-        let (crate_map, psr4, namespace_map, pysys, jvm, go) = cached_resolution_maps(project_root);
+        let maps = cached_resolution_maps(project_root);
         if config.indexing.incremental_graph {
             match incremental_graph_update(
                 &tx,
@@ -2474,12 +2398,7 @@ pub fn reindex_paths(
                 &summary.changed_paths,
                 &summary.names_delta,
                 &config.hub_threshold,
-                &crate_map,
-                &psr4,
-                &namespace_map,
-                &pysys,
-                &jvm,
-                &go,
+                &maps,
             )? {
                 IncrementalOutcome::Applied => summary.graph_mode = GraphMode::Incremental,
                 IncrementalOutcome::FellBackToFull(reason) => {
@@ -2492,12 +2411,7 @@ pub fn reindex_paths(
                 project_root,
                 &config.hotspots.default_since,
                 &config.hub_threshold,
-                &crate_map,
-                &psr4,
-                &namespace_map,
-                &pysys,
-                &jvm,
-                &go,
+                &maps,
             )?;
             summary.graph_mode = GraphMode::Full;
         }
@@ -2781,8 +2695,8 @@ mod tests {
         .unwrap();
         std::fs::write(dir.join("src/lib.rs"), "").unwrap();
 
-        let (crate_map, _, _, _, _, _) = cached_resolution_maps(&dir);
-        assert_eq!(crate_map.root_of("resmaps_foo"), Some("src"));
+        let maps = cached_resolution_maps(&dir);
+        assert_eq!(maps.crate_map.root_of("resmaps_foo"), Some("src"));
 
         // Rewrite Cargo.toml's package name WITHOUT touching mtime granularity
         // — sleep past a coarse (1s) filesystem mtime resolution so this is a
@@ -2794,14 +2708,14 @@ mod tests {
         )
         .unwrap();
 
-        let (crate_map2, _, _, _, _, _) = cached_resolution_maps(&dir);
+        let maps2 = cached_resolution_maps(&dir);
         assert_eq!(
-            crate_map2.root_of("resmaps_bar"),
+            maps2.crate_map.root_of("resmaps_bar"),
             Some("src"),
             "Cargo.toml mtime changed — cache must rebuild, not serve the stale mapping"
         );
         assert_eq!(
-            crate_map2.root_of("resmaps_foo"),
+            maps2.crate_map.root_of("resmaps_foo"),
             None,
             "old crate name must be gone after rebuild"
         );
