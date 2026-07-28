@@ -1047,10 +1047,20 @@ pub static LANGUAGES: &[LanguageSpec] = &[
     // guessed:
     // - No dedicated call-expression node kind at all (calls are a generic
     //   member_access/selector/argument_part postfix chain shared with
-    //   plain field access) — call-graph extraction is a DELIBERATE,
-    //   documented scope cut for this first pass (`call_node_types` is
-    //   empty), not an oversight. See `test_dart_real_grammar_symbols_are_
-    //   accurate` in parser.rs, which locks this gap in place.
+    //   plain field access) — `call_node_types` stays EMPTY on purpose
+    //   (C3, Tier B audit: call extraction is handled by a dedicated
+    //   `language == "dart"` branch in `walk_calls`/`dart_call_from_
+    //   member_access` instead, since the generic `call_node_types`/
+    //   `call_function_field` mechanism can't express "a member_access is
+    //   only a call when its LAST selector wraps an argument_part" — see
+    //   that function's doc comment). Recognized: bare `foo(x)`,
+    //   `this.foo(x)`, `recv.foo(x)`, chained `a.b.c(x)`. Deliberately NOT
+    //   covered (bails rather than guessing): a call through an
+    //   `index_selector` in the chain (`list[0].foo()`), and the narrower
+    //   `constructor_invocation` shape (`List<int>.filled(...)`, an
+    //   explicit-type-argument named-constructor call) — both real but
+    //   comparatively rare shapes left for a follow-up pass. See
+    //   `test_dart_real_grammar_symbols_and_calls_are_accurate` in parser.rs.
     // - A method/constructor's name sits 2 levels deep with no field path
     //   all the way down (`class_member_definition` wraps `method_signature`
     //   or `declaration`, which in turn wraps an unnamed `function_signature`/

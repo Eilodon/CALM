@@ -523,6 +523,92 @@ fn elixir_def_arity(def_call_node: tree_sitter::Node) -> Option<i64> {
     }
 }
 
+/// Dart (C3, Tier B audit): tree-sitter-dart has no dedicated call-expression
+/// node kind — a call like `a.b.c(x)` and a call-less field access `a.b.c`
+/// parse as the SAME flat `member_access` node shape: `[primary, selector,
+/// selector, ...]`, where each `selector` wraps either a dotted-name
+/// (`unconditional_assignable_selector`/`conditional_assignable_selector`,
+/// i.e. `.foo`/`?.foo`) or an `argument_part` (the call parens). Recognizing
+/// a call is therefore structural — "does the LAST selector wrap an
+/// `argument_part`?" — not expressible via the generic `call_node_types`/
+/// `call_function_field` field-lookup `walk_calls` uses for every other
+/// language, so it's handled as its own language-gated branch there instead
+/// (same precedent as `go_receiver_type`/`elixir_def_arity` for other
+/// grammar shapes the generic path can't cover). Verified against a real
+/// parse of tree-sitter-dart 0.0.4 (bare `print(x)`, `this.foo(x)`,
+/// `g.greet()`, `Greeter("world")`, chained `a.b.c()`, and the no-call
+/// `a.b.c` field access — see `test_dart_real_grammar_symbols_and_calls_are_
+/// accurate`), not guessed.
+///
+/// Returns `(receiver, callee, arg_count)` when `node` (a `member_access`)
+/// is really a call site; `None` when it's a call-less field/index-access
+/// chain, or a shape this first pass doesn't cover (a call on a
+/// parenthesized/function-literal primary, or an `index_selector` — e.g.
+/// `list[0]` — in the middle of the chain) — deliberately bails rather than
+/// guessing wrong, same risk tolerance `split_receiver_callee` already
+/// applies for every other language.
+fn dart_call_from_member_access(
+    node: tree_sitter::Node,
+    source: &str,
+) -> Option<(Option<String>, String, Option<i64>)> {
+    let mut cursor = node.walk();
+    let named: Vec<tree_sitter::Node> = node.named_children(&mut cursor).collect();
+    if named.len() < 2 {
+        return None;
+    }
+    let last = named[named.len() - 1];
+    if last.kind() != "selector" {
+        return None;
+    }
+    let argument_part = last.named_child(0)?;
+    if argument_part.kind() != "argument_part" {
+        return None; // last selector isn't a call — plain field/index access chain
+    }
+    let arg_count = count_arguments_node(argument_part);
+
+    // Dotted-name selector (`.foo`/`?.foo`) -> the identifier's own text, or
+    // `None` for an `index_selector` (`[i]`) — a shape this pass skips.
+    fn dotted_name(sel: tree_sitter::Node, source: &str) -> Option<String> {
+        let inner = sel.named_child(0)?;
+        match inner.kind() {
+            "unconditional_assignable_selector" | "conditional_assignable_selector" => {
+                let ident = inner.named_child(0)?;
+                (ident.kind() == "identifier").then(|| source[ident.byte_range()].to_string())
+            }
+            _ => None,
+        }
+    }
+
+    // Everything before the call selector: primary + zero or more dotted
+    // selectors. The callee is the last dotted segment (or the primary
+    // itself for a bare call); the receiver, if any, is the segment right
+    // before that — the same "receiver = last segment" convention
+    // `split_receiver_callee` already uses for every other language's
+    // chained access (e.g. `a.b.c()` gets receiver "b", not the full "a.b").
+    let pre = &named[..named.len() - 1];
+    if pre.len() == 1 {
+        let prim = pre[0];
+        if !matches!(prim.kind(), "identifier" | "this" | "super") {
+            return None;
+        }
+        return Some((None, source[prim.byte_range()].to_string(), arg_count));
+    }
+
+    let callee_sel = pre[pre.len() - 1];
+    if callee_sel.kind() != "selector" {
+        return None;
+    }
+    let callee = dotted_name(callee_sel, source)?;
+
+    let receiver_node = pre[pre.len() - 2];
+    let receiver = if receiver_node.kind() == "selector" {
+        dotted_name(receiver_node, source)
+    } else {
+        Some(source[receiver_node.byte_range()].to_string())
+    };
+    Some((receiver, callee, arg_count))
+}
+
 /// Walks backward through contiguous same-kind comment siblings immediately
 /// preceding `node` — no blank-line gap between any two, nor between the
 /// last one and `node` itself — and joins them in source order. Line-
@@ -1416,6 +1502,7 @@ fn walk_calls(
     node: tree_sitter::Node,
     source: &str,
     consts: &crate::indexer::lang_constants::LangConstants,
+    language: &str,
     enclosing: Option<(String, usize)>,
     enclosing_class: Option<String>,
     out: &mut Vec<RawCall>,
@@ -1444,7 +1531,33 @@ fn walk_calls(
         enclosing_class.clone()
     };
 
-    if consts.call_node_types.contains(&node.kind())
+    // Dart (C3, Tier B audit): no dedicated call-expression node kind exists
+    // in this grammar at all (see `dart_call_from_member_access`'s doc
+    // comment) — handled as its own language-gated branch rather than
+    // through `call_node_types`/`call_function_field` below, which assumes a
+    // call node names its callee via one fixed field or first-child
+    // position. `call_node_types` stays empty for Dart in `lang_constants.rs`
+    // on purpose, so the generic branch below can never also fire for a
+    // `member_access` node — the two paths are mutually exclusive by
+    // construction, not just by this `else`.
+    if language == "dart"
+        && node.kind() == "member_access"
+        && let Some((enc_name, enc_line)) = &current
+        && let Some((receiver, callee, arg_count)) = dart_call_from_member_access(node, source)
+    {
+        out.push(RawCall {
+            enclosing_name: enc_name.clone(),
+            enclosing_line: *enc_line,
+            enclosing_class: child_class.clone(),
+            callee,
+            receiver_is_type_path: receiver.as_deref().is_some_and(is_type_like),
+            receiver,
+            module_hint: None,
+            looks_option_or_result_chained: looks_option_or_result_chained(node, source),
+            line: node.start_position().row + 1,
+            arg_count,
+        });
+    } else if consts.call_node_types.contains(&node.kind())
         && !is_definition_macro_call(node, source, consts)
         && let Some((enc_name, enc_line)) = &current
         && let field_name = consts
@@ -1562,6 +1675,7 @@ fn walk_calls(
             child,
             source,
             consts,
+            language,
             current.clone(),
             child_class.clone(),
             out,
@@ -1599,7 +1713,15 @@ pub fn extract_calls_from_tree(
         return Vec::new();
     };
     let mut out = Vec::new();
-    walk_calls(tree.root_node(), source, &consts, None, None, &mut out);
+    walk_calls(
+        tree.root_node(),
+        source,
+        &consts,
+        language,
+        None,
+        None,
+        &mut out,
+    );
     out
 }
 
@@ -4448,16 +4570,16 @@ class Foo {
 
     #[test]
     #[cfg(feature = "lang-dart")]
-    fn test_dart_real_grammar_symbols_are_accurate() {
+    fn test_dart_real_grammar_symbols_and_calls_are_accurate() {
         // tree-sitter-dart 0.0.4 (an older, hand-written grammar — see
         // lang_constants.rs's Dart entry) has no dedicated call-expression
-        // node kind at all (calls are a generic member_access/selector/
-        // argument_part postfix chain shared with plain field access) —
-        // call-graph extraction is a documented scope cut, not an oversight.
-        // This test locks that gap in place (asserts calls stay empty) so a
-        // future accidental `call_node_types` entry that doesn't actually
-        // work correctly gets caught instead of silently shipping partial
-        // call edges.
+        // node kind at all — a call and a call-less field access share the
+        // same `member_access`/`selector`/`argument_part` postfix-chain
+        // shape. Call extraction (C3, Tier B audit) is handled by a
+        // dedicated `dart_call_from_member_access` branch in `walk_calls`,
+        // not the generic `call_node_types` mechanism — see that function's
+        // doc comment for why, and its own scratch-verified real-grammar
+        // shapes.
         let code = "class Greeter {\n  String name;\n\n  Greeter(this.name);\n\n  String greet() {\n    print(\"hello\");\n    return this.formatGreeting(name);\n  }\n\n  String formatGreeting(String n) {\n    return \"Hello, \" + n;\n  }\n}\n\nabstract class Named {\n  String getName();\n}\n\nvoid main() {\n  var g = Greeter(\"world\");\n  g.greet();\n}\n";
         let symbols = extract_symbols(code, "dart", "a.dart").unwrap();
         let names = shallow_names(&symbols);
@@ -4503,12 +4625,49 @@ class Foo {
         );
 
         let calls = extract_calls(code, "dart", "a.dart").unwrap();
-        assert!(
-            calls.is_empty(),
-            "Dart call-graph extraction is a documented scope cut (no clean \
-             call-expression node in this grammar) — see this test's doc comment; \
-             calls: {calls:?}"
+        assert_eq!(
+            calls.len(),
+            4,
+            "expected print(\"hello\"), this.formatGreeting(name), Greeter(\"world\"), \
+             g.greet() — the constructor DECLARATION `Greeter(this.name);` must NOT \
+             itself count as a 5th call; calls: {calls:?}"
         );
+
+        let print_call = calls
+            .iter()
+            .find(|c| c.callee == "print")
+            .expect("bare print(\"hello\") call should be found");
+        assert_eq!(print_call.enclosing_name, "greet");
+        assert_eq!(print_call.receiver, None);
+        assert_eq!(print_call.arg_count, Some(1));
+
+        let format_greeting_call = calls
+            .iter()
+            .find(|c| c.callee == "formatGreeting")
+            .expect("this.formatGreeting(name) call should be found");
+        assert_eq!(format_greeting_call.enclosing_name, "greet");
+        assert_eq!(
+            format_greeting_call.receiver.as_deref(),
+            Some("this"),
+            "receiver should be \"this\""
+        );
+        assert_eq!(format_greeting_call.arg_count, Some(1));
+
+        let greeter_call = calls
+            .iter()
+            .find(|c| c.callee == "Greeter")
+            .expect("Greeter(\"world\") constructor call should be found");
+        assert_eq!(greeter_call.enclosing_name, "main");
+        assert_eq!(greeter_call.receiver, None);
+        assert_eq!(greeter_call.arg_count, Some(1));
+
+        let greet_call = calls
+            .iter()
+            .find(|c| c.callee == "greet")
+            .expect("g.greet() call should be found");
+        assert_eq!(greet_call.enclosing_name, "main");
+        assert_eq!(greet_call.receiver.as_deref(), Some("g"));
+        assert_eq!(greet_call.arg_count, Some(0));
     }
 
     #[test]

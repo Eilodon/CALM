@@ -128,10 +128,41 @@ trong `CORPORA`, ghi đè `results.json` với bộ đầy đủ):
 | powershell | 142 | 156 | 52.6% | 0.0% | 46.2% | 1.3% | 5.6 | bbc5ac3 |
 | groovy | 59 | 19 | 84.2% | 0.0% | 5.3% | 10.5% | 13.2 | 3f97e22 |
 
-**`dart` = 0 edges, đúng là 0 thật, không phải lỗi đo** — tài liệu hoá từ Phase C
-([[calm-25-language-expansion-research]]): grammar Dart không có node kind cho call-expression, nên
-`walk_calls` không có gì để trích xuất — 178 symbols (class/method) vẫn được index đầy đủ, chỉ riêng
-call-graph là khoảng trống đã biết trước, có chủ đích (deliberate scope cut, không phải bug).
+**`dart` = 0 edges lúc đo lần này (2026-07-11), đúng là 0 thật, không phải lỗi đo** — tài liệu hoá
+từ Phase C ([[calm-25-language-expansion-research]]): grammar Dart không có node kind cho
+call-expression, nên `walk_calls` không có gì để trích xuất — 178 symbols (class/method) vẫn được
+index đầy đủ, chỉ riêng call-graph là khoảng trống đã biết trước, có chủ đích (deliberate scope cut,
+không phải bug). **SUPERSEDED 2026-07-28 — xem cập nhật ngay bên dưới: đã cài đặt Dart call-edge
+extraction (C3, Tier B audit); số 0 edges này không còn đúng ở build hiện tại.**
+
+**Cập nhật 2026-07-28 — Dart call-edge extraction (C3), đo thật lại trên cùng corpus:**
+tree-sitter-dart thật ra không thiếu node kind cho call — nó dùng chung `member_access`/`selector`/
+`argument_part` cho CẢ call lẫn field access thuần (`a.b.c()` và `a.b.c` parse ra cùng shape,
+khác nhau ở việc selector cuối có bọc `argument_part` hay không) — không phải "không có node
+cho call" như ghi chú Phase C phía trên (giả định ban đầu đó sai, đã sửa). Cài một nhánh trích
+xuất riêng cho Dart trong `walk_calls` (`dart_call_from_member_access`, `parser.rs`) thay vì cơ
+chế `call_node_types`/`call_function_field` chung (không biểu đạt được luật "selector cuối có
+phải call hay không"). Đo lại trên cùng corpus `dart-lang/args` (build release, cùng lệnh ở trên):
+
+| | trước (0 edges) | sau (C3) |
+|---|---:|---:|
+| symbols | 178 | 178 (không đổi — extraction symbol vẫn luôn đúng) |
+| edges | 0 | **2,166** |
+| resolved% | — | 7.8% |
+| textual% | — | 11.2% |
+| **ambiguous%** | — | **80.9%** |
+
+Không có `formal`/`inferred` (0% cả hai — Dart chưa có SCIP provider, và Tier-2 type_map chỉ có cho
+5 ngôn ngữ Tier-0 gốc). `ambiguous%` cao (80.9%) cùng nguyên nhân gốc đã thấy ở Kotlin/OCaml/C++:
+corpus args là 1 lib CLI-parser nhỏ với nhiều method tên phổ biến (`parse`, `format`, …) trùng lặp,
+fan-out `MAX_CALLEE_CANDIDATES` cao — không phải lỗi của lần cài đặt này, mà là giới hạn chung của
+mọi ngôn ngữ Tier-0.5 chưa có SCIP provider thật, giống mọi dòng khác trong bảng Phase B/C ở trên.
+
+**Nợ ghi nhận, chưa cài trong lượt này:** `constructor_invocation` (dạng `List<int>.filled(...)`,
+có type argument tường minh trước dot-named-constructor) — hình dạng node RIÊNG, hiếm hơn
+`member_access`, cố ý bỏ qua cho lượt đầu này (xem doc comment của `dart_call_from_member_access`).
+Cũng bỏ qua có chủ đích: 1 call đi qua `index_selector` giữa chuỗi (vd `list[0].foo()`) — bail
+thay vì đoán sai, không silently miscount.
 
 **`inferred%` = 0.0% cho toàn bộ 11 ngôn ngữ mới** — hợp lý, không phải lỗi: Tier-2 (`type_map`
 receiver inference) hiện chỉ implement cho các ngôn ngữ Tier-0 gốc (Python/JS/TS/Java/C#) — 11 ngôn
