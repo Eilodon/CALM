@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Questions & discussion
+    url: https://github.com/Eilodon/CALM/discussions
+    about: Ask usage questions or discuss an idea before filing a formal issue.
+  - name: Security vulnerability
+    url: https://github.com/Eilodon/CALM/security/policy
+    about: Report security issues privately per SECURITY.md — not as a public issue.

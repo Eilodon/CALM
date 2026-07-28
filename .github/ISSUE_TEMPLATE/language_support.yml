@@ -1,0 +1,41 @@
+name: Language / resolver gap
+description: A call-graph edge, import resolution, or symbol extraction is wrong or missing for a specific language.
+title: "[Resolver]: "
+labels: ["resolver", "language-support"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This is the template CONTRIBUTING.md points to for "try CALM on a Tier-0.5 language and report gaps" — exactly this kind of report directly shapes what gets prioritized next.
+  - type: input
+    id: language
+    attributes:
+      label: Language
+    validations:
+      required: true
+  - type: textarea
+    id: what-wrong
+    attributes:
+      label: What's wrong or missing?
+      description: e.g. "call edge between A and B not detected", "import resolved to the wrong file", "symbol not extracted at all".
+    validations:
+      required: true
+  - type: textarea
+    id: sample
+    attributes:
+      label: Minimal code sample
+      description: The smallest snippet that reproduces the gap. A link to a public repo + file + line also works.
+    validations:
+      required: true
+  - type: dropdown
+    id: tier
+    attributes:
+      label: Confidence tier observed (see docs/architecture.md)
+      options:
+        - "textual"
+        - "inferred"
+        - "resolved"
+        - "formal"
+        - "not sure / edge missing entirely"
+    validations:
+      required: false

@@ -1,0 +1,29 @@
+name: Feature request
+description: Propose a new tool, capability, or improvement.
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Check the roadmap section of `CONTRIBUTING.md` first — your idea may already be a tracked priority. For anything bigger than a small fix, please open the issue before starting a PR so effort doesn't collide with work already in progress.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: What's the situation today, and where does it fall short?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed approach
+      description: How would this work, at a high level? Which tool(s)/module(s) would it touch?
+    validations:
+      required: false
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+    validations:
+      required: false

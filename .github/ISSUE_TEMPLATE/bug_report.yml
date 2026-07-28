@@ -1,0 +1,58 @@
+name: Bug report
+description: Something in CALM's indexer, resolver, or MCP tools isn't behaving as documented.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing this. Quick check first: `benchmarks/resolution/` tracks known resolver gaps (e.g. Dart parsing symbols but producing zero call edges is a tree-sitter grammar limitation, not a bug) — worth a skim before reporting a resolver miss.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you expect, and what did CALM actually do or return?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: A minimal repo/file plus the exact tool call (e.g. `search(query=..., kind=...)`, `edit_symbol(...)`) that shows the issue.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: CALM version
+      description: Output of `calm --version`, or the npm package / Docker tag in use.
+    validations:
+      required: true
+  - type: dropdown
+    id: language
+    attributes:
+      label: Language(s) involved
+      multiple: true
+      options:
+        - Python
+        - TypeScript / JavaScript
+        - Java
+        - Rust
+        - Go
+        - C / C++
+        - C#
+        - Ruby
+        - PHP
+        - Shell
+        - R
+        - Other Tier-0.5 (Kotlin/Swift/Scala/Dart/Lua/Elixir/Haskell/OCaml/Zig/PowerShell/Groovy)
+        - Not language-specific
+    validations:
+      required: false
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      description: OS, MCP client (Claude Code / Cursor / VS Code / Windsurf / JetBrains / etc.), install method (npm / prebuilt binary / Docker / source build).
+    validations:
+      required: true
