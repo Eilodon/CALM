@@ -868,6 +868,7 @@ mod tests {
             snippet: None,
             is_test,
             churn_score: None,
+            coreness: None,
         }
     }
 

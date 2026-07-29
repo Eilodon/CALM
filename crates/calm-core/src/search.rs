@@ -55,6 +55,16 @@ pub struct SearchResult {
     /// treats absence the same as a neutral `0.0` multiplier contribution,
     /// never a penalty.
     pub churn_score: Option<f64>,
+    /// From `symbols.coreness` (k-core graph metric) — `None` for results
+    /// with no backing `symbols` row (file/grep hits), same absence-is-
+    /// neutral contract as `churn_score`. Self-audit C5 originally fed this
+    /// into `search_symbol`'s own ranking only, via a side `coreness_of` map
+    /// kept off this struct; carrying it here instead (2026-07-29 "C" pass)
+    /// lets `rrf_merge_n` apply the identical structurally-central-symbol
+    /// boost to hybrid/semantic results too, not just the FTS leg's own
+    /// pre-sorted order — matching how `rank_multiplier` already applies
+    /// uniformly in both places (see its own doc comment above).
+    pub coreness: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -161,6 +171,23 @@ fn rank_multiplier(path: &str, is_test: bool, churn_score: Option<f64>) -> f64 {
     1.0 + CHURN_WEIGHT * churn_score.unwrap_or(0.0)
 }
 
+/// Coreness boost — self-audit C5 (search_symbol only), extended by the
+/// 2026-07-29 "C" pass to also cover `rrf_merge_n`'s fused score, so a
+/// structurally-central symbol found only via a semantic/chunk RRF leg (never
+/// surfaced by FTS at all) benefits the same way a `search_symbol`-only hit
+/// already did. Applied uniformly in both places, same pattern as
+/// `rank_multiplier` above (see its own doc comment). Gated behind the same
+/// noise check `rank_multiplier` uses so a test/noisy-path result already
+/// floored to `NOISE_PENALTY` is never resurrected by a high coreness value
+/// (50 * `CORENESS_WEIGHT` alone would multiply a score by 4.0x — comfortably
+/// enough to override `NOISE_PENALTY`'s 0.6x demotion if left ungated).
+fn coreness_boost(path: &str, is_test: bool, coreness: Option<i64>) -> f64 {
+    if is_test || is_noisy_path(path) {
+        return 1.0;
+    }
+    1.0 + CORENESS_WEIGHT * coreness.unwrap_or(0).max(0) as f64
+}
+
 fn escape_fts5_query(query: &str) -> String {
     let mut escaped = String::with_capacity(query.len() + 2);
     escaped.push('"');
@@ -186,10 +213,6 @@ fn search_symbol(conn: &Connection, query: &str, limit: usize) -> rusqlite::Resu
     // per-process-random iteration order.
     let mut scores: BTreeMap<String, f64> = BTreeMap::new();
     let mut data: BTreeMap<String, SearchResult> = BTreeMap::new();
-    // coreness feeds `search_symbol`'s rank boost but isn't carried on
-    // `SearchResult` (kept out of the output schema), so track it here keyed
-    // by qualified_name, from whichever source first sees the row.
-    let mut coreness_of: BTreeMap<String, Option<i64>> = BTreeMap::new();
 
     let mut stmt_exact = conn.prepare(
         "SELECT s.qualified_name, s.name, s.path, s.line_start, s.line_end, s.kind,
@@ -218,9 +241,6 @@ fn search_symbol(conn: &Connection, query: &str, limit: usize) -> rusqlite::Resu
     for row in rows_exact {
         let row = row?;
         *scores.entry(row.qualified_name.clone()).or_default() += row.score * BM25_EXACT_WEIGHT;
-        coreness_of
-            .entry(row.qualified_name.clone())
-            .or_insert(row.coreness);
         data.entry(row.qualified_name.clone())
             .or_insert_with(|| row.into_result("exact"));
     }
@@ -252,9 +272,6 @@ fn search_symbol(conn: &Connection, query: &str, limit: usize) -> rusqlite::Resu
     for row in rows_tokens {
         let row = row?;
         *scores.entry(row.qualified_name.clone()).or_default() += row.score * BM25_TOKENS_WEIGHT;
-        coreness_of
-            .entry(row.qualified_name.clone())
-            .or_insert(row.coreness);
         data.entry(row.qualified_name.clone())
             .or_insert_with(|| row.into_result("tokens"));
     }
@@ -298,9 +315,6 @@ fn search_symbol(conn: &Connection, query: &str, limit: usize) -> rusqlite::Resu
         if *entry < EXACT_NAME_SEED {
             *entry = EXACT_NAME_SEED;
         }
-        coreness_of
-            .entry(row.qualified_name.clone())
-            .or_insert(row.coreness);
         data.entry(row.qualified_name.clone())
             .or_insert_with(|| row.into_result("exact"));
     }
@@ -309,23 +323,16 @@ fn search_symbol(conn: &Connection, query: &str, limit: usize) -> rusqlite::Resu
     for (qname, r) in data.iter() {
         if let Some(s) = scores.get_mut(qname) {
             *s *= rank_multiplier(&r.path, r.is_test, r.churn_score);
-            // C5 precision boost (symbol search only, not hybrid RRF): a
-            // structurally-central symbol and — decisively — an exact
-            // whole-name match should outrank an incidental camelCase-token or
-            // docstring hit. Gated on the same noise check rank_multiplier
-            // uses, so a test/noisy result already floored to NOISE_PENALTY is
-            // never resurrected by the boost.
-            if !r.is_test && !is_noisy_path(&r.path) {
-                let coreness = coreness_of
-                    .get(qname)
-                    .copied()
-                    .flatten()
-                    .unwrap_or(0)
-                    .max(0);
-                *s *= 1.0 + CORENESS_WEIGHT * coreness as f64;
-                if r.name.eq_ignore_ascii_case(trimmed_query) {
-                    *s *= EXACT_NAME_BONUS;
-                }
+            // C5 precision boost (symbol search only, not hybrid RRF — that
+            // side is covered separately by rrf_merge_n's own coreness_boost
+            // call): a structurally-central symbol and — decisively — an
+            // exact whole-name match should outrank an incidental
+            // camelCase-token or docstring hit. `coreness_boost` applies the
+            // same noise gate as `rank_multiplier`, so a test/noisy result
+            // already floored to NOISE_PENALTY is never resurrected by it.
+            *s *= coreness_boost(&r.path, r.is_test, r.coreness);
+            if !r.is_test && !is_noisy_path(&r.path) && r.name.eq_ignore_ascii_case(trimmed_query) {
+                *s *= EXACT_NAME_BONUS;
             }
         }
     }
@@ -490,6 +497,7 @@ fn search_file(conn: &Connection, query: &str, limit: usize) -> rusqlite::Result
             snippet: None,
             is_test: false,
             churn_score: None,
+            coreness: None,
         })
         .collect();
 
@@ -706,6 +714,7 @@ pub fn search_grep(
                 snippet: Some(m.snippet),
                 is_test: false,
                 churn_score: None,
+                coreness: None,
             });
         }
     }
@@ -731,7 +740,7 @@ fn symbol_semantic_results(
     // off-by-one search_text/search_file had — see their fix comments).
     let hits = crate::embedding::knn(conn, qvec, limit + 1)?;
     let mut stmt = conn.prepare(
-        "SELECT qualified_name, name, path, line_start, line_end, kind, is_test, churn_score FROM symbols WHERE id = ?1",
+        "SELECT qualified_name, name, path, line_start, line_end, kind, is_test, churn_score, coreness FROM symbols WHERE id = ?1",
     )?;
     let mut results = Vec::with_capacity(hits.len());
     for (id, dist) in &hits {
@@ -748,6 +757,7 @@ fn symbol_semantic_results(
                 snippet: None,
                 is_test: row.get(6)?,
                 churn_score: row.get(7)?,
+                coreness: row.get(8)?,
             })
         }) {
             // cosine distance → similarity in [0, 1] for a friendlier score.
@@ -804,10 +814,10 @@ fn chunk_hit_to_result(conn: &Connection, chunk_id: i64) -> rusqlite::Result<Opt
         return Ok(None);
     };
 
-    let (qualified_name, name, kind, is_test, churn_score) = match &symbol_qn {
+    let (qualified_name, name, kind, is_test, churn_score, coreness) = match &symbol_qn {
         Some(qn) => {
             let mut sym_stmt = conn.prepare(
-                "SELECT name, kind, is_test, churn_score FROM symbols WHERE qualified_name = ?1",
+                "SELECT name, kind, is_test, churn_score, coreness FROM symbols WHERE qualified_name = ?1",
             )?;
             let sym = sym_stmt.query_row(rusqlite::params![qn], |r| {
                 Ok((
@@ -815,13 +825,14 @@ fn chunk_hit_to_result(conn: &Connection, chunk_id: i64) -> rusqlite::Result<Opt
                     r.get::<_, Option<String>>(1)?,
                     r.get::<_, bool>(2)?,
                     r.get::<_, Option<f64>>(3)?,
+                    r.get::<_, Option<i64>>(4)?,
                 ))
             });
             match sym {
-                Ok((name, kind, is_test, churn_score)) => {
-                    (qn.clone(), name, kind, is_test, churn_score)
+                Ok((name, kind, is_test, churn_score, coreness)) => {
+                    (qn.clone(), name, kind, is_test, churn_score, coreness)
                 }
-                Err(_) => (qn.clone(), qn.clone(), None, false, None),
+                Err(_) => (qn.clone(), qn.clone(), None, false, None, None),
             }
         }
         None => {
@@ -831,6 +842,7 @@ fn chunk_hit_to_result(conn: &Connection, chunk_id: i64) -> rusqlite::Result<Opt
                 fname,
                 None,
                 false,
+                None,
                 None,
             )
         }
@@ -848,6 +860,7 @@ fn chunk_hit_to_result(conn: &Connection, chunk_id: i64) -> rusqlite::Result<Opt
         snippet: None,
         is_test,
         churn_score,
+        coreness,
     }))
 }
 
@@ -1111,6 +1124,7 @@ fn rrf_merge_n(
     for (qname, r) in data.iter() {
         if let Some(s) = scores.get_mut(qname) {
             *s *= rank_multiplier(&r.path, r.is_test, r.churn_score);
+            *s *= coreness_boost(&r.path, r.is_test, r.coreness);
         }
     }
 
@@ -1162,6 +1176,7 @@ impl RawRow {
             snippet: None,
             is_test: self.is_test,
             churn_score: self.churn_score,
+            coreness: self.coreness,
         }
     }
 }
@@ -1768,6 +1783,7 @@ mod tests {
                 snippet: None,
                 is_test: false,
                 churn_score: None,
+                coreness: None,
             },
             SearchResult {
                 name: "b".into(),
@@ -1781,6 +1797,7 @@ mod tests {
                 snippet: None,
                 is_test: false,
                 churn_score: None,
+                coreness: None,
             },
         ];
         let semantic = vec![SearchResult {
@@ -1795,6 +1812,7 @@ mod tests {
             snippet: None,
             is_test: false,
             churn_score: None,
+            coreness: None,
         }];
 
         let merged = rrf_merge_n(
@@ -1821,6 +1839,7 @@ mod tests {
             snippet: None,
             is_test: false,
             churn_score: None,
+            coreness: None,
         }
     }
 
@@ -2284,6 +2303,7 @@ mod tests {
             snippet: None,
             is_test: false,
             churn_score: None,
+            coreness: None,
         }
     }
 
@@ -2497,6 +2517,65 @@ mod tests {
         assert_eq!(
             merged[0].qualified_name, "aaa_symbol",
             "equal churn on both sides must still break ties alphabetically: {merged:?}"
+        );
+    }
+
+    /// Self-audit "C" pass (2026-07-29): the coreness+exact-name boost
+    /// self-audit C5 added only reordered `search_symbol`'s own local
+    /// ranking before it became one of `rrf_merge_n`'s 3 fusion inputs — a
+    /// structurally-central symbol found ONLY via a semantic/chunk leg
+    /// (never surfaced by FTS at all) never benefited from it. This is the
+    /// regression test for `rrf_merge_n` applying the same coreness boost
+    /// directly to the fused score, mirroring how `rank_multiplier` already
+    /// does (see its own doc comment). "zzz_hub_symbol" is deliberately
+    /// alphabetically AFTER "aaa_leaf_symbol" so the BTreeMap tie-break
+    /// (which would otherwise pick "aaa_leaf_symbol" first) can't
+    /// accidentally satisfy this assertion — only a real coreness-driven
+    /// score change can.
+    #[test]
+    fn test_rrf_merge_n_coreness_breaks_tie_when_only_semantic_leg_finds_it() {
+        let mut hub = stub_result("zzz_hub_symbol", "semantic");
+        hub.coreness = Some(20);
+        let leaf = stub_result("aaa_leaf_symbol", "semantic");
+        let merged = rrf_merge_n(
+            &[(&[hub][..], 1.0), (&[leaf][..], 1.0)],
+            10,
+            DEFAULT_RRF_K,
+            "hybrid",
+        );
+        assert_eq!(merged.len(), 2);
+        assert_eq!(
+            merged[0].qualified_name, "zzz_hub_symbol",
+            "a structurally-central symbol found only via a semantic RRF leg must still \
+             outrank an equally-ranked, non-central one once coreness feeds the fused score, \
+             got: {merged:?}"
+        );
+    }
+
+    /// Guard for the same fix: a hub-coreness symbol living in a test/
+    /// generated path must not be "resurrected" past `NOISE_PENALTY`'s
+    /// demotion by a strong enough coreness value — mirrors the identical
+    /// guard `search_symbol`'s own boost already has (`!r.is_test &&
+    /// !is_noisy_path`). Without this gate, 50 * CORENESS_WEIGHT (0.06)
+    /// would multiply the fused score by 4.0x -- comfortably enough to
+    /// override NOISE_PENALTY's 0.6x demotion (net ~2.4x) and let a test-file
+    /// hit win anyway.
+    #[test]
+    fn test_rrf_merge_n_coreness_does_not_resurrect_noisy_path() {
+        let mut hub_in_test = stub_result_at("hub_in_tests", "tests/test_thing.py");
+        hub_in_test.coreness = Some(50);
+        let real_impl = stub_result_at("real_impl", "src/thing.py");
+        let merged = rrf_merge_n(
+            &[(&[hub_in_test][..], 1.0), (&[real_impl][..], 1.0)],
+            10,
+            DEFAULT_RRF_K,
+            "hybrid",
+        );
+        assert_eq!(merged.len(), 2);
+        assert_eq!(
+            merged[0].qualified_name, "real_impl",
+            "a hub-coreness symbol in a test/generated path must not be resurrected past the \
+             noise penalty by the coreness boost, got: {merged:?}"
         );
     }
 
