@@ -386,7 +386,7 @@ pub fn signature_range_has_removal(fd: &FileDiff, signature_range: (i64, i64)) -
     fd.hunks
         .iter()
         .zip(&fd.removed_line_text)
-        .any(|(&(hs, he), removed)| !(he < start || hs > end) && !removed.is_empty())
+        .any(|(&(hs, he), removed)| !(he < start || hs > end || removed.is_empty()))
 }
 
 /// Read-only accessor for the 3 fields `compute_aggregate_risk` and
