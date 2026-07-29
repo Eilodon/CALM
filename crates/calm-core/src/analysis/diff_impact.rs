@@ -321,11 +321,45 @@ pub fn signature_text_before_after(fd: &FileDiff, signature_range: (i64, i64)) -
 /// as a `+` addition either way. A diff built from real disk content
 /// (`staged=true`/`commits=`/no-args) never produces that ambiguity for an
 /// unchanged symbol, but a hand-authored `diff` string can.
+/// True when `signature_range` falls entirely within territory that didn't
+/// exist before this diff: either the whole file is new (`file_is_new`), or
+/// every line in the range is an actual `+` addition (`added_lines` — see
+/// `FileDiff`; deliberately *not* a hunk-level check, since real diffs carry
+/// unchanged context lines around an insertion, so "hunk touches this range"
+/// is not the same as "this range is new text"). Distinguishes "this symbol
+/// was just created" from "this pre-existing symbol's signature line was
+/// edited" — the two `diff_impact` previously conflated under a single
+/// `signature_changed` flag, escalating every brand-new function to "high
+/// risk — all call sites may need update" even though a symbol with zero
+/// prior existence has zero prior call sites.
+///
+/// `caller_count` (the same value already looked up alongside this symbol's
+/// row for `blast_radius`) overrides the line-coverage check: a symbol with
+/// confirmed callers already indexed against its exact qualified name cannot
+/// be new — those edges could only exist if the symbol was already there
+/// when they were indexed.
+///
+/// `signature_hunk_had_removal` (see [`signature_range_has_removal`]) closes
+/// the remaining gap for a **zero-caller** symbol: unified-diff markers
+/// alone can't distinguish "freshly inserted code" from "an existing
+/// symbol's entire body rewritten as one remove-old/add-new hunk" — every
+/// line reads as a `+` addition either way, and a comment-only edit on a
+/// zero-caller function is exactly this shape (append `// note` to a line →
+/// that line is removed and re-added). When `true`, the range is never
+/// reported as new, regardless of line coverage.
+///
+/// Edge case: a hunk that removes an old region and inserts a genuinely new,
+/// unrelated symbol in its place now reports `false` here too (a safe
+/// false-negative) — it falls through to the caller's `signature_changed`
+/// path instead, which still needs the *text* to actually differ. Preferable
+/// to a false-positive "new" on every comment-only edit of a zero-caller
+/// symbol.
 pub fn is_new_symbol(
     signature_range: (i64, i64),
     file_is_new: bool,
     added_lines: &std::collections::HashSet<i64>,
     caller_count: i64,
+    signature_hunk_had_removal: bool,
 ) -> bool {
     if file_is_new {
         return true;
@@ -333,8 +367,26 @@ pub fn is_new_symbol(
     if caller_count > 0 {
         return false;
     }
+    if signature_hunk_had_removal {
+        return false;
+    }
     let (start, end) = signature_range;
     start <= end && (start..=end).all(|line| added_lines.contains(&line))
+}
+
+/// True iff some hunk in `fd` whose new-side numeric range overlaps
+/// `signature_range` removed at least one line (`FileDiff::removed_line_text`
+/// is index-aligned with `FileDiff::hunks`). Scoped per-hunk, not
+/// per-file: a removal elsewhere in the same file, in a hunk that doesn't
+/// overlap this signature, must not count — otherwise editing one function
+/// would spuriously mark an unrelated brand-new function (in a separate,
+/// pure-insertion hunk of the same diff) as "not new".
+pub fn signature_range_has_removal(fd: &FileDiff, signature_range: (i64, i64)) -> bool {
+    let (start, end) = signature_range;
+    fd.hunks
+        .iter()
+        .zip(&fd.removed_line_text)
+        .any(|(&(hs, he), removed)| !(he < start || hs > end) && !removed.is_empty())
 }
 
 /// Read-only accessor for the 3 fields `compute_aggregate_risk` and
@@ -713,14 +765,15 @@ mod tests {
             (5, 7),
             true,
             &std::collections::HashSet::new(),
-            0
+            0,
+            false
         ));
     }
 
     #[test]
     fn test_is_new_symbol_all_lines_added() {
         let added: std::collections::HashSet<i64> = (5..=7).collect();
-        assert!(is_new_symbol((5, 7), false, &added, 0));
+        assert!(is_new_symbol((5, 7), false, &added, 0, false));
     }
 
     #[test]
@@ -729,7 +782,7 @@ mod tests {
         // the signature range is not fully new text, even though its other
         // two lines are.
         let added: std::collections::HashSet<i64> = [5, 7].into_iter().collect();
-        assert!(!is_new_symbol((5, 7), false, &added, 0));
+        assert!(!is_new_symbol((5, 7), false, &added, 0, false));
     }
 
     #[test]
@@ -738,7 +791,8 @@ mod tests {
             (5, 7),
             false,
             &std::collections::HashSet::new(),
-            0
+            0,
+            false
         ));
     }
 
@@ -752,7 +806,60 @@ mod tests {
         // was already indexed — and therefore already existed — before this
         // diff, regardless of how the diff text itself is shaped.
         let added: std::collections::HashSet<i64> = (5..=7).collect();
-        assert!(!is_new_symbol((5, 7), false, &added, 38));
+        assert!(!is_new_symbol((5, 7), false, &added, 38, false));
+    }
+
+    #[test]
+    fn test_is_new_symbol_false_when_signature_hunk_had_removal_even_with_zero_callers_and_all_lines_added() {
+        // The bug this closes: a comment-only edit on a ZERO-caller function
+        // (`caller_count == 0`, so the caller_count guard above doesn't save
+        // it) renders as remove-old+add-new for its signature line — every
+        // line in the range reads as a `+` addition, identical in shape to a
+        // genuine insertion. `signature_hunk_had_removal: true` is the signal
+        // that disambiguates: this range was NOT pure new text.
+        let added: std::collections::HashSet<i64> = (5..=7).collect();
+        assert!(!is_new_symbol((5, 7), false, &added, 0, true));
+    }
+
+    #[test]
+    fn test_is_new_symbol_true_pure_insertion_zero_callers_no_removal() {
+        // Sanity check: a genuinely new zero-caller function (no removal
+        // anywhere near its signature) must still report `true` — the new
+        // parameter must not blanket-suppress the original insertion case.
+        let added: std::collections::HashSet<i64> = (5..=7).collect();
+        assert!(is_new_symbol((5, 7), false, &added, 0, false));
+    }
+
+    #[test]
+    fn test_signature_range_has_removal_scoped_per_hunk_not_per_file() {
+        // Two hunks in one file: hunk 1 (lines 1-3) is a pure insertion of a
+        // brand-new function; hunk 2 (lines 20-22) rewrites an existing line
+        // via remove+add. A removal in hunk 2 must not contaminate the
+        // pure-insertion signature in hunk 1 — per-hunk scoping, not
+        // per-file "the diff has a removal somewhere".
+        let diff = [
+            "diff --git a/src/foo.rs b/src/foo.rs",
+            "--- a/src/foo.rs",
+            "+++ b/src/foo.rs",
+            "@@ -0,0 +1,3 @@",
+            "+fn brand_new() {",
+            "+    1",
+            "+}",
+            "@@ -19,1 +20,1 @@ fn existing() {",
+            "-    old_body()",
+            "+    new_body() // comment",
+        ]
+        .join("\n");
+        let files = parse_unified_diff(&diff);
+        let fd = &files[0];
+        assert!(
+            !signature_range_has_removal(fd, (1, 3)),
+            "hunk 1 is a pure insertion — no removal overlaps this range"
+        );
+        assert!(
+            signature_range_has_removal(fd, (20, 20)),
+            "hunk 2 removed a line overlapping this exact range"
+        );
     }
 
     /// Regression: a realistic git diff for inserting a new function after an

@@ -883,32 +883,17 @@ impl CalmServer {
         // protocol-level, client-agnostic alternative to a Claude-Code-only
         // hook.
         let force_gate_always = self.config().edit.always_require_edit_context;
-        if hub_hit
-            || risk.as_deref() == Some("high")
-            || uncertain_zero_caller.is_some()
-            || force_gate_always
-        {
-            let why = if hub_hit {
-                "a hub symbol (is_hub=true)".to_string()
-            } else if let Some(reason) = uncertain_zero_caller {
-                match reason {
-                    UncertainZeroCallerReason::EntryPoint => {
-                        "a zero-confirmed-caller entry point (e.g. an rmcp #[tool(name = \"...\")] MCP handler, main, a trait-dispatch protocol method, a bodyless trait method declaration, or similar framework/macro/language dispatch -- the real invocation isn't visible to the static call graph, so a low caller_count can't be trusted as low blast radius)".to_string()
-                    }
-                    UncertainZeroCallerReason::TestOnly => {
-                        "a zero-confirmed-caller test-only symbol (only the test harness discovers and runs it by convention/reflection, not a literal call site -- editing it risks silently breaking test coverage the static call graph can't see)".to_string()
-                    }
-                    UncertainZeroCallerReason::LowConfidence => {
-                        "a zero-confirmed-caller symbol the dead-code heuristic isn't confident is safe to treat as unused (e.g. runtime coverage shows it executing despite no static callers) -- treat the zero caller_count as inconclusive, not proof of low blast radius".to_string()
-                    }
-                }
-            } else if risk.as_deref() == Some("high") {
-                "a high-risk symbol (>10 callers)".to_string()
-            } else {
-                "this project's `edit.always_require_edit_context` config (every edit requires edit_context first, regardless of risk)".to_string()
-            };
+        let gate_classification = classify_gate(
+            hub_hit,
+            risk.as_deref(),
+            uncertain_zero_caller,
+            bridge_downgrade_eligible,
+            force_gate_always,
+        );
+        if gate_classification.will_block_without_confirm {
+            let why = gate_classification.why.unwrap_or_default();
 
-            if bridge_downgrade_eligible {
+            if matches!(gate_classification.requirement, GateRequirement::ConfirmOnly) {
                 // Lighter tier: bridge-only hub, risk ≤ medium, every caller
                 // edge resolved/formal confidence — skip EDIT_CONTEXT_REQUIRED
                 // and REASON_NOT_GROUNDED entirely, confirm:true is enough.
@@ -1659,7 +1644,7 @@ fn hub_kind_strength(kind: &str) -> u8 {
 /// applicable", not a "confirmed safe" signal, so counting it here would
 /// force the full write gate on nearly every struct/enum edit in this
 /// codebase for no real reason.
-fn compute_touch_risk(
+pub(crate) fn compute_touch_risk(
     conn: &rusqlite::Connection,
     path: &str,
     ranges: &[(i64, i64)],
@@ -1739,6 +1724,101 @@ fn compute_touch_risk(
     )
 }
 
+/// Which tier of the `edit_lines`/`edit_symbol` write gate a touched range
+/// needs, and why — the single source of truth shared by the gate itself
+/// (`edit_lines_impl_gated`) and `edit_context`'s `gate_prediction` field, so
+/// the two can never drift (UPGRADE_PLAN.md FIX2/F2b). Deliberately excludes
+/// session-state (whether `edit_context` already ran this session for the
+/// touched symbols, whether a `reason` string cites a real caller) — those
+/// two checks stay runtime-only, decided in `edit_lines_impl_gated` itself;
+/// this only decides WHICH structural tier would apply.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum GateRequirement {
+    /// No gate — the touch is low-risk enough to write freely.
+    None,
+    /// Bridge-only hub, risk ≤ medium, every known caller edge
+    /// resolved/formal confidence (see `all_caller_edges_confident`):
+    /// `confirm: true` alone is enough, no `edit_context`/grounded `reason`.
+    ConfirmOnly,
+    /// The full 3-layer gate: `edit_context` must have run THIS session for
+    /// every touched symbol, `confirm: true`, and `reason` must cite a real
+    /// caller name from that review.
+    EditContextConfirmGroundedReason,
+}
+
+impl GateRequirement {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            GateRequirement::None => "none",
+            GateRequirement::ConfirmOnly => "confirm",
+            GateRequirement::EditContextConfirmGroundedReason => {
+                "edit_context+confirm+grounded_reason"
+            }
+        }
+    }
+}
+
+pub(crate) struct GateClassification {
+    /// `true` iff a write with `confirm: false` would be rejected — i.e.
+    /// `requirement != GateRequirement::None`. Independent of whether the
+    /// runtime session-state checks (`edit_context` freshness, grounded
+    /// `reason`) would additionally block a `confirm: true` attempt.
+    pub(crate) will_block_without_confirm: bool,
+    pub(crate) requirement: GateRequirement,
+    /// Human-readable cause (`"a hub symbol (is_hub=true)"`, etc.) — `None`
+    /// only when `requirement == GateRequirement::None`.
+    pub(crate) why: Option<String>,
+}
+
+/// Pure classification — see [`GateRequirement`]'s doc comment. Mirrors
+/// `edit_lines_impl_gated`'s gate condition exactly; any change to that
+/// gate's structural logic (not its session-state checks) must be made here
+/// so both call sites stay in sync.
+pub(crate) fn classify_gate(
+    hub_hit: bool,
+    risk: Option<&str>,
+    uncertain_zero_caller: Option<UncertainZeroCallerReason>,
+    bridge_downgrade_eligible: bool,
+    force_gate_always: bool,
+) -> GateClassification {
+    if !(hub_hit || risk == Some("high") || uncertain_zero_caller.is_some() || force_gate_always) {
+        return GateClassification {
+            will_block_without_confirm: false,
+            requirement: GateRequirement::None,
+            why: None,
+        };
+    }
+    let why = if hub_hit {
+        "a hub symbol (is_hub=true)".to_string()
+    } else if let Some(reason) = uncertain_zero_caller {
+        match reason {
+            UncertainZeroCallerReason::EntryPoint => {
+                "a zero-confirmed-caller entry point (e.g. an rmcp #[tool(name = \"...\")] MCP handler, main, a trait-dispatch protocol method, a bodyless trait method declaration, or similar framework/macro/language dispatch -- the real invocation isn't visible to the static call graph, so a low caller_count can't be trusted as low blast radius)".to_string()
+            }
+            UncertainZeroCallerReason::TestOnly => {
+                "a zero-confirmed-caller test-only symbol (only the test harness discovers and runs it by convention/reflection, not a literal call site -- editing it risks silently breaking test coverage the static call graph can't see)".to_string()
+            }
+            UncertainZeroCallerReason::LowConfidence => {
+                "a zero-confirmed-caller symbol the dead-code heuristic isn't confident is safe to treat as unused (e.g. runtime coverage shows it executing despite no static callers) -- treat the zero caller_count as inconclusive, not proof of low blast radius".to_string()
+            }
+        }
+    } else if risk == Some("high") {
+        "a high-risk symbol (>10 callers)".to_string()
+    } else {
+        "this project's `edit.always_require_edit_context` config (every edit requires edit_context first, regardless of risk)".to_string()
+    };
+    let requirement = if bridge_downgrade_eligible {
+        GateRequirement::ConfirmOnly
+    } else {
+        GateRequirement::EditContextConfirmGroundedReason
+    };
+    GateClassification {
+        will_block_without_confirm: true,
+        requirement,
+        why: Some(why),
+    }
+}
+
 /// Plan 3 §3.3 (F10): true iff every caller edge (`call_edges.to_symbol`)
 /// pointing at any of `qualified_names` has `edge_confidence` in
 /// `{'resolved', 'formal'}` — gates whether a bridge-only hub touch may use
@@ -1750,7 +1830,10 @@ fn compute_touch_risk(
 /// `hub_kind`. A symbol with zero caller edges is treated as NOT confident
 /// (conservative — falls through to the full gate) rather than vacuously
 /// true; `qualified_names` empty also returns `false` for the same reason.
-fn all_caller_edges_confident(conn: &rusqlite::Connection, qualified_names: &[String]) -> bool {
+pub(crate) fn all_caller_edges_confident(
+    conn: &rusqlite::Connection,
+    qualified_names: &[String],
+) -> bool {
     if qualified_names.is_empty() {
         return false;
     }

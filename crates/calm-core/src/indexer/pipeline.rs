@@ -10,7 +10,7 @@ use crate::indexer::edges::{
 };
 use crate::indexer::lang_constants::{is_recognized_unparsed_extension, language_for_extension};
 use crate::indexer::parser::{
-    ParsedSymbol, extract_calls_from_tree, extract_file_aliases_from_tree,
+    MODULE_ENCLOSING, ParsedSymbol, extract_calls_from_tree, extract_file_aliases_from_tree,
     extract_symbols_from_tree, extract_symbols_shallow, extract_type_map_from_tree, parse_tree,
 };
 use crate::types::EdgeConfidence;
@@ -505,7 +505,24 @@ fn extract_file_data(
     let calls = extract_calls_from_tree(&tree, source, lang);
     let mut call_sites = Vec::with_capacity(calls.len());
     for c in &calls {
-        if let Some(enc_qn) = qn_by_loc.get(&(c.enclosing_name.clone(), c.enclosing_line)) {
+        // UPGRADE_PLAN.md FIX1: a call whose enclosing_name/enclosing_line
+        // doesn't map to any indexed symbol is normally dropped (top-level
+        // calls have no caller symbol -- see extract_calls' docstring) --
+        // EXCEPT when enclosing_name is the MODULE_ENCLOSING sentinel
+        // (parser.rs), in which case synthesize a per-file pseudo
+        // qualified_name directly rather than doing a qn_by_loc lookup that
+        // could never hit (line 0 is never a real symbol's line_start).
+        // This string is used ONLY as a call_edges.from_symbol value below --
+        // never inserted into `symbols`, so symbol counts/search/hotspots/
+        // hub/coreness are all unaffected.
+        let enc_qn = qn_by_loc
+            .get(&(c.enclosing_name.clone(), c.enclosing_line))
+            .cloned()
+            .or_else(|| {
+                (c.enclosing_name == MODULE_ENCLOSING)
+                    .then(|| format!("{rel}::{MODULE_ENCLOSING}"))
+            });
+        if let Some(enc_qn) = enc_qn {
             let mut confidence;
             let mut target_class: Option<String> = None;
 
@@ -2435,6 +2452,38 @@ mod tests {
         assert_eq!(
             GraphMode::FullFallback("delta_paths.len()=51 > 50".to_string()).label(),
             "full_fallback:delta_paths.len()=51 > 50"
+        );
+    }
+
+    #[test]
+    // UPGRADE_PLAN.md FIX1, Gate B: even with Gate A's sentinel seeded by
+    // parser.rs, extract_file_data's own qn_by_loc lookup previously had no
+    // entry for (MODULE_ENCLOSING, 0) and dropped the call anyway. This
+    // exercises the full extract_file_data path (not just extract_calls) to
+    // confirm the synthesized "{rel}::<module>" qualified_name actually
+    // reaches call_sites.
+    fn extract_file_data_js_module_level_call_gets_synthesized_module_qn() {
+        let source = "describe('x', function(){ helper() });\nfunction helper(){}\n";
+        let formal = crate::resolver::formal::FormalResolver::new();
+        let data = extract_file_data("test.js", "javascript", source, &[], &formal);
+        let call_summary: Vec<(&str, &str)> = data
+            .call_sites
+            .iter()
+            .map(|cs| (cs.enclosing_qn.as_str(), cs.callee.as_str()))
+            .collect();
+        assert!(
+            data.call_sites
+                .iter()
+                .any(|cs| cs.enclosing_qn == "test.js::<module>" && cs.callee == "helper"),
+            "helper() should attribute to the synthesized module-level qualified name, \
+             not be dropped: {call_summary:?}"
+        );
+        // The synthesized qn must NOT leak into `symbols` -- symbol_count
+        // must equal exactly the 1 real named function (`helper`), not 2.
+        let symbol_names: Vec<&str> = data.symbols.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            data.symbol_count, 1,
+            "the <module> pseudo-caller must never become a real indexed symbol: {symbol_names:?}"
         );
     }
     fn count(conn: &Connection, sql: &str) -> i64 {

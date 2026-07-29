@@ -7510,6 +7510,129 @@ mod tests {
     }
 
     #[test]
+    // Parity test (FIX2/F2b, UPGRADE_PLAN.md): edit_context's gate_prediction
+    // must never drift from what edit_lines' real write gate actually does —
+    // both now share classify_gate as their single source of truth. Hub
+    // symbol case: predicted will_block/requires must match a real blocked
+    // confirm:false write.
+    fn edit_context_gate_prediction_matches_real_gate_for_hub_symbol() {
+        let (dir, server) = test_server("gate_prediction_hub");
+        std::fs::write(dir.join("a.py"), "def helper():\n    return 1\n").unwrap();
+
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.py::helper', 'helper', 'function', 'python', 'a.py', 1, 2, '', '', 'helper', 0, 1, 0)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let ctx = server.edit_context(rmcp::handler::server::wrapper::Parameters(
+            EditContextParams {
+                symbol: "helper".into(),
+                path: None,
+                line: None,
+                if_none_match: None,
+            },
+        ));
+        let ctx_v = jv(ctx);
+        assert_eq!(
+            ctx_v["gate_prediction"]["will_block"], true,
+            "response: {ctx_v}"
+        );
+        assert_eq!(
+            ctx_v["gate_prediction"]["is_hub"], true,
+            "response: {ctx_v}"
+        );
+        assert_eq!(
+            ctx_v["gate_prediction"]["requires"], "edit_context+confirm+grounded_reason",
+            "response: {ctx_v}"
+        );
+
+        // The real gate must agree: confirm:false on the exact same range is blocked.
+        let hash = calm_core::edit::range_checksum("def helper():\n    return 1\n", 2, 2).unwrap();
+        let no_confirm = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
+            EditLinesParams {
+                path: "a.py".into(),
+                edits: vec![EditHunkParam {
+                    old_text: None,
+                    start_line: 2,
+                    end_line: 2,
+                    expected_hash: Some(hash),
+                    new_text: "    return 2\n".into(),
+                }],
+                confirm: false,
+                reason: None,
+            },
+        ));
+        let v = jv(no_confirm);
+        assert_eq!(v["error"]["code"], "CONFIRM_REQUIRED", "response: {v}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    // Parity test (FIX2/F2b, UPGRADE_PLAN.md), non-hub low-risk case:
+    // gate_prediction must predict a FREE write, and the real gate must
+    // agree (confirm:false still applies, no gate fires at all).
+    fn edit_context_gate_prediction_false_for_low_risk_non_hub_symbol() {
+        let (dir, server) = test_server("gate_prediction_low_risk");
+        std::fs::write(dir.join("a.py"), "def helper():\n    return 1\n").unwrap();
+
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.py::helper', 'helper', 'function', 'python', 'a.py', 1, 2, '', '', 'helper', 1, 0, 0)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let ctx = server.edit_context(rmcp::handler::server::wrapper::Parameters(
+            EditContextParams {
+                symbol: "helper".into(),
+                path: None,
+                line: None,
+                if_none_match: None,
+            },
+        ));
+        let ctx_v = jv(ctx);
+        assert_eq!(
+            ctx_v["gate_prediction"]["will_block"], false,
+            "response: {ctx_v}"
+        );
+        assert_eq!(
+            ctx_v["gate_prediction"]["is_hub"], false,
+            "response: {ctx_v}"
+        );
+        assert_eq!(ctx_v["gate_prediction"]["requires"], "none", "response: {ctx_v}");
+
+        // The real gate must agree: confirm:false on the exact same range still applies.
+        let hash = calm_core::edit::range_checksum("def helper():\n    return 1\n", 2, 2).unwrap();
+        let no_confirm = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
+            EditLinesParams {
+                path: "a.py".into(),
+                edits: vec![EditHunkParam {
+                    old_text: None,
+                    start_line: 2,
+                    end_line: 2,
+                    expected_hash: Some(hash),
+                    new_text: "    return 2\n".into(),
+                }],
+                confirm: false,
+                reason: None,
+            },
+        ));
+        let v = jv(no_confirm);
+        assert_eq!(v["applied"], true, "response: {v}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn edit_lines_requires_confirm_for_zero_caller_entry_point() {
         // Mirrors `edit_lines_requires_confirm_for_hub_symbol`, but the
         // trigger is `is_entry_point` with zero confirmed callers (e.g. an

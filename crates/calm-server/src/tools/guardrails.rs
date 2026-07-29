@@ -294,6 +294,65 @@ impl CalmServer {
                 reasons: risk_reasons,
             });
 
+            // Plan 3 gate_prediction (FIX2/F2b, UPGRADE_PLAN.md): reuses the
+            // exact same compute_touch_risk + classify_gate the real
+            // edit_lines/edit_symbol write gate uses (edit.rs), over the SAME
+            // range [c.line_start, c.line_end] -- symbols_overlapping_ranges
+            // scans the whole line range, so `gate_touched` naturally
+            // includes an enclosing class when this symbol sits inside one
+            // (closes F2b, not just F2). Single source of truth with the
+            // real gate -- see classify_gate's doc comment.
+            let gate_prediction = {
+                let (
+                    gate_risk,
+                    gate_hub_hit,
+                    gate_hub_kind,
+                    gate_uncertain_zero_caller,
+                    gate_touched,
+                ) = edit::compute_touch_risk(
+                    &conn,
+                    &c.path,
+                    &[(c.line_start, c.line_end)],
+                    &self.coverage.read_ok(),
+                );
+                // Mirrors edit_lines_impl_gated's own bridge-downgrade
+                // eligibility check exactly (edit.rs) -- computed here too,
+                // separately from compute_touch_risk, so `requires` doesn't
+                // overstate the tier for a bridge-only hub (audit-design
+                // finding, UPGRADE_PLAN.md Risk Assessment §2).
+                let bridge_downgrade_eligible = gate_hub_kind.as_deref() == Some("bridge")
+                    && gate_risk.as_deref() != Some("high")
+                    && gate_uncertain_zero_caller.is_none()
+                    && edit::all_caller_edges_confident(
+                        &conn,
+                        &gate_touched
+                            .iter()
+                            .filter(|t| t.hub_kind.is_some())
+                            .map(|t| t.qualified_name.clone())
+                            .collect::<Vec<_>>(),
+                    );
+                let classification = edit::classify_gate(
+                    gate_hub_hit,
+                    gate_risk.as_deref(),
+                    gate_uncertain_zero_caller,
+                    bridge_downgrade_eligible,
+                    config.edit.always_require_edit_context,
+                );
+                let blocking_symbols: Vec<String> = gate_touched
+                    .iter()
+                    .filter(|t| t.is_hub)
+                    .map(|t| t.qualified_name.clone())
+                    .collect();
+                GatePredictionOutput {
+                    will_block: classification.will_block_without_confirm,
+                    is_hub: c.is_hub,
+                    hub_kind: gate_hub_kind,
+                    blocking_symbols,
+                    requires: classification.requirement.as_str().to_string(),
+                    reason: classification.why,
+                }
+            };
+
             // Structural half of edit_symbol/edit_lines' confirm gate (docs/
             // superskills/specs/2026-07-11-superskills-inspired-features.md
             // #5 v2): record that edit_context ran for this symbol, plus the
@@ -354,6 +413,7 @@ impl CalmServer {
                 blast_radius,
                 range_checksum,
                 risk_assessment: risk,
+                gate_prediction,
                 dead_code_confidence: dead_code_confidence.to_string(),
                 dead_code_source: dead_code_source.to_string(),
                 trend,
@@ -549,6 +609,10 @@ impl CalmServer {
                             fd.is_new_file,
                             &fd.added_lines,
                             caller_count,
+                            calm_core::analysis::diff_impact::signature_range_has_removal(
+                                fd,
+                                (line_start, sig_end),
+                            ),
                         );
                         // A symbol that didn't exist before this diff cannot have had
                         // its signature "changed" — there is no prior signature to
@@ -782,6 +846,11 @@ pub(crate) struct EditContextOutput {
     pub(crate) range_checksum: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) risk_assessment: Option<RiskAssessmentOutput>,
+    /// Exactly what the `edit_lines`/`edit_symbol` write gate will do for
+    /// this range (FIX2/F2b) — unlike `risk_assessment` above (advisory),
+    /// this is what actually determines a write block. See
+    /// `GatePredictionOutput`'s own doc comment.
+    pub(crate) gate_prediction: GatePredictionOutput,
     /// `"none"` (confirmed not dead — entry point, test, or has confirmed
     /// callers), `"high"`/`"medium"`/`"low"` confidence it genuinely is dead
     /// code — see `calm_core::analysis::dead_code::compute_dead_code_confidence`.
@@ -849,6 +918,38 @@ pub(crate) struct BlastRadiusOutput {
 pub(crate) struct RiskAssessmentOutput {
     pub(crate) level: String,
     pub(crate) reasons: Vec<String>,
+}
+
+/// Predicts exactly what the `edit_lines`/`edit_symbol` write gate will do
+/// for this touched range — UPGRADE_PLAN.md FIX2/F2b. Built from the same
+/// `compute_touch_risk` + `classify_gate` the real gate uses
+/// (`edit_lines_impl_gated`), over the same `[c.line_start, c.line_end]`
+/// range, so it can never drift from the gate's actual behavior. Distinct
+/// from `risk_assessment` above: that field is an advisory review-risk
+/// signal (entropy, dead-code confidence); THIS is what determines a write
+/// block.
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub(crate) struct GatePredictionOutput {
+    /// `true` iff a write to this range with `confirm: false` would be
+    /// rejected. Independent of the two runtime session-state checks
+    /// (`edit_context` freshness, a grounded `reason`) a `confirm: true`
+    /// attempt would still have to clear when `requires` is
+    /// `"edit_context+confirm+grounded_reason"`.
+    pub(crate) will_block: bool,
+    /// This exact symbol's own `is_hub` — distinct from `will_block`, which
+    /// also accounts for the wider touched range (e.g. an enclosing hub
+    /// class this symbol sits inside — see `blocking_symbols`).
+    pub(crate) is_hub: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) hub_kind: Option<String>,
+    /// Touched symbols (qualified names) that are themselves a hub — names
+    /// the enclosing class here when THAT, not this symbol, is what the
+    /// gate would actually block on.
+    pub(crate) blocking_symbols: Vec<String>,
+    /// `"none"` | `"confirm"` | `"edit_context+confirm+grounded_reason"`.
+    pub(crate) requires: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) reason: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]

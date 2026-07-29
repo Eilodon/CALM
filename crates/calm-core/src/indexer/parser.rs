@@ -1729,6 +1729,25 @@ pub fn extract_calls(source: &str, language: &str, _path: &str) -> Result<Vec<Ra
     Ok(extract_calls_from_tree(&tree, source, language))
 }
 
+/// Sentinel `enclosing_name` for a call made outside any named function body
+/// (a module-level statement, or inside an anonymous callback whose nearest
+/// *named* ancestor doesn't exist) — angle brackets so it can never collide
+/// with a real identifier in any supported language. UPGRADE_PLAN.md FIX1:
+/// `walk_calls` previously only emitted a call when `current.is_some()`, so
+/// `describe('x', () => { helper() })`'s `helper()` call (nearest enclosing
+/// *named* function: none) was silently dropped — a major unattributed
+/// contributor to JS/TS call-graph recall gaps. Seeding the walk with this
+/// sentinel (see `extract_calls_from_tree`) instead of `None` lets that call
+/// survive as `(<module>, 0) -> helper` instead of vanishing; inside any
+/// named function the existing logic in `walk_calls` still overwrites
+/// `current`, so the sentinel only survives for calls whose nearest function
+/// ancestor really is anonymous/module-level -- exactly the dropped set.
+/// `extract_file_data` (pipeline.rs) synthesizes a pseudo qualified_name
+/// (`"{file}::<module>"`) for this sentinel WITHOUT inserting a new row into
+/// `symbols` -- it's only ever used as a `call_edges.from_symbol` string, so
+/// symbol counts/search/hotspots/hub/coreness are all unaffected.
+pub(crate) const MODULE_ENCLOSING: &str = "<module>";
+
 /// Same as [`extract_calls`] but against an already-parsed tree (see
 /// [`extract_symbols_from_tree`]).
 pub fn extract_calls_from_tree(
@@ -1740,12 +1759,19 @@ pub fn extract_calls_from_tree(
         return Vec::new();
     };
     let mut out = Vec::new();
+    // Gated to JS/TS in this first cut (UPGRADE_PLAN.md FIX1) -- jsx/mjs/cjs
+    // share the "javascript" language string and tsx shares "typescript"
+    // (lang_constants.rs), so both are covered without a separate check.
+    // Every other language keeps its prior `None` (unattributed top-level
+    // calls stay dropped, unchanged behavior) until validated separately.
+    let initial_enclosing = matches!(language, "javascript" | "typescript")
+        .then(|| (MODULE_ENCLOSING.to_string(), 0));
     walk_calls(
         tree.root_node(),
         source,
         &consts,
         language,
-        None,
+        initial_enclosing,
         None,
         &mut out,
     );
@@ -3313,6 +3339,81 @@ app.set = function(name, value) {
                 && c.callee == "store"
                 && c.receiver.as_deref() == Some("cache")),
             "receiver-qualified call inside should also attribute to enclosing 'set': {calls:?}"
+        );
+    }
+
+    #[test]
+    // UPGRADE_PLAN.md FIX1: a call made outside any named function body
+    // (module-level, or nested only inside anonymous callbacks) must no
+    // longer be silently dropped for JS -- it attributes to the MODULE_ENCLOSING
+    // sentinel instead. `helper()` here sits inside an anonymous
+    // `function(){...}` passed to `describe`, so its nearest NAMED function
+    // ancestor is none.
+    fn test_javascript_module_level_call_inside_anonymous_callback_attributes_to_module_sentinel() {
+        let code = r#"
+describe('x', function(){ helper() });
+function helper(){}
+"#;
+        let calls = extract_calls(code, "javascript", "test.js").unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.enclosing_name == MODULE_ENCLOSING && c.callee == "helper"),
+            "helper() inside an anonymous callback with no named ancestor should attribute to \
+             the module sentinel: {calls:?}"
+        );
+        // The describe(...) call itself is also module-level.
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.enclosing_name == MODULE_ENCLOSING && c.callee == "describe"),
+            "describe(...) itself is a top-level module call: {calls:?}"
+        );
+    }
+
+    #[test]
+    // UPGRADE_PLAN.md FIX1, TypeScript: mixes a bare top-level call with a
+    // call nested inside an arrow-function callback (mocha/jest `it(...)`
+    // idiom) -- both must attribute to the module sentinel, not vanish.
+    fn test_typescript_top_level_and_arrow_callback_calls_attribute_to_module_sentinel() {
+        let code = r#"
+foo();
+it('y', () => { bar(); });
+"#;
+        let calls = extract_calls(code, "typescript", "test.ts").unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.enclosing_name == MODULE_ENCLOSING && c.callee == "foo"),
+            "bare top-level foo() should attribute to the module sentinel: {calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.enclosing_name == MODULE_ENCLOSING && c.callee == "bar"),
+            "bar() inside it(() => {{...}}) with no named ancestor should attribute to the \
+             module sentinel: {calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.enclosing_name == MODULE_ENCLOSING && c.callee == "it"),
+            "it(...) itself is a top-level module call: {calls:?}"
+        );
+    }
+
+    #[test]
+    // UPGRADE_PLAN.md FIX1: the sentinel is gated to JS/TS only in this
+    // first cut -- every other language's prior (unchanged) behavior must
+    // still drop a module-level call rather than attribute it, so Python's
+    // own resolution numbers don't move as a side effect of this change.
+    fn test_python_module_level_call_still_dropped_not_gated_to_sentinel() {
+        let code = "helper()\ndef helper():\n    pass\n";
+        let calls = extract_calls(code, "python", "test.py").unwrap();
+        assert!(
+            calls.is_empty(),
+            "python is not in the FIX1 gate -- a module-level call must still be dropped, \
+             not attributed to the sentinel: {calls:?}"
         );
     }
 

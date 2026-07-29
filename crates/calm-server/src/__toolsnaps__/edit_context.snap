@@ -220,6 +220,49 @@
           "reasons"
         ]
       },
+      "GatePredictionOutput": {
+        "description": "Predicts exactly what the `edit_lines`/`edit_symbol` write gate will do\nfor this touched range — UPGRADE_PLAN.md FIX2/F2b. Built from the same\n`compute_touch_risk` + `classify_gate` the real gate uses\n(`edit_lines_impl_gated`), over the same `[c.line_start, c.line_end]`\nrange, so it can never drift from the gate's actual behavior. Distinct\nfrom `risk_assessment` above: that field is an advisory review-risk\nsignal (entropy, dead-code confidence); THIS is what determines a write\nblock.",
+        "type": "object",
+        "properties": {
+          "will_block": {
+            "description": "`true` iff a write to this range with `confirm: false` would be\nrejected. Independent of the two runtime session-state checks\n(`edit_context` freshness, a grounded `reason`) a `confirm: true`\nattempt would still have to clear when `requires` is\n`\"edit_context+confirm+grounded_reason\"`.",
+            "type": "boolean"
+          },
+          "is_hub": {
+            "description": "This exact symbol's own `is_hub` — distinct from `will_block`, which\nalso accounts for the wider touched range (e.g. an enclosing hub\nclass this symbol sits inside — see `blocking_symbols`).",
+            "type": "boolean"
+          },
+          "hub_kind": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "blocking_symbols": {
+            "description": "Touched symbols (qualified names) that are themselves a hub — names\nthe enclosing class here when THAT, not this symbol, is what the\ngate would actually block on.",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "requires": {
+            "description": "`\"none\"` | `\"confirm\"` | `\"edit_context+confirm+grounded_reason\"`.",
+            "type": "string"
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "will_block",
+          "is_hub",
+          "blocking_symbols",
+          "requires"
+        ]
+      },
       "TrendOutput": {
         "description": "How much `caller_count`/`coreness`/`is_hub` moved since the oldest snapshot\nstill at least `EDIT_CONTEXT_TREND_LOOKBACK_DAYS` old — see\n`calm_core::fitness::compute_trend`.",
         "type": "object",
@@ -418,6 +461,10 @@
             "type": "null"
           }
         ]
+      },
+      "gate_prediction": {
+        "description": "Exactly what the `edit_lines`/`edit_symbol` write gate will do for\nthis range (FIX2/F2b) — unlike `risk_assessment` above (advisory),\nthis is what actually determines a write block. See\n`GatePredictionOutput`'s own doc comment.",
+        "$ref": "#/$defs/GatePredictionOutput"
       },
       "dead_code_confidence": {
         "description": "`\"none\"` (confirmed not dead — entry point, test, or has confirmed\ncallers), `\"high\"`/`\"medium\"`/`\"low\"` confidence it genuinely is dead\ncode — see `calm_core::analysis::dead_code::compute_dead_code_confidence`.\nAlso feeds `risk_assessment`: a 0-caller symbol only keeps \"low\" risk\nwhen this independently agrees (`\"high\"`/`\"medium\"`).",

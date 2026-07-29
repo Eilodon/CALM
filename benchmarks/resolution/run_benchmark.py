@@ -155,11 +155,23 @@ TIERS = ["formal", "resolved", "inferred", "textual", "ambiguous", "unresolved"]
 def read_tier_histogram(db_path: Path, lang: str) -> dict:
     db_lang = db_language(lang)
     conn = sqlite3.connect(db_path)
+    # UPGRADE_PLAN.md FIX1 (2026-07-29): was `JOIN symbols s ON
+    # s.qualified_name = ce.from_symbol` -- an INNER join against `symbols`
+    # silently drops every edge whose `from_symbol` is the `<module>`
+    # pseudo-caller FIX1 introduces (deliberately never inserted into
+    # `symbols` -- see parser.rs::MODULE_ENCLOSING's doc comment), which
+    # made this benchmark structurally blind to exactly the recall gain
+    # FIX1 exists to measure (verified: express's real DB has 2637
+    # call_edges from a `<module>` from_symbol, all silently excluded by the
+    # old query). `file_index` has one row per indexed file regardless of
+    # whether it has any real symbols, keyed by `path` -- joining on
+    # `ce.from_path` instead attributes every edge to its caller FILE's
+    # language, real-symbol-sourced or `<module>`-sourced alike.
     rows = conn.execute(
         "SELECT ce.edge_confidence, COUNT(*) "
         "FROM call_edges ce "
-        "JOIN symbols s ON s.qualified_name = ce.from_symbol "
-        "WHERE s.language = ? "
+        "JOIN file_index fi ON fi.path = ce.from_path "
+        "WHERE fi.language = ? "
         "GROUP BY ce.edge_confidence",
         (db_lang,),
     ).fetchall()
