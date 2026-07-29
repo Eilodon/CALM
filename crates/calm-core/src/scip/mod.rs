@@ -142,8 +142,6 @@ pub fn run_overlay_for(
     Ok(stats)
 }
 
-
-
 /// Whether an *automatic* caller (not an explicit `force`d manual refresh)
 /// may run this provider's indexer right now, per `cfg.policy`. `OnSave`
 /// (the default) always allows it — the pre-P2.6 behavior, gated only by
@@ -642,7 +640,10 @@ pub fn overlay_status(conn: &Connection, root: &Path, rust: &RustConfig) -> Opti
 /// from whatever the last real run actually observed. Absent (never run) —
 /// `(None, None)`, not an error; this is a diagnostic nicety, not
 /// load-bearing.
-fn read_last_stats(conn: &Connection, provider: &provider::ScipProvider) -> (Option<f64>, Option<usize>) {
+fn read_last_stats(
+    conn: &Connection,
+    provider: &provider::ScipProvider,
+) -> (Option<f64>, Option<usize>) {
     state::read_state(conn, provider.lang)
         .map(|s| (Some(s.match_rate), Some(s.inserted)))
         .unwrap_or((None, None))

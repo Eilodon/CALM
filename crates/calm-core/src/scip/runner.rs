@@ -72,9 +72,7 @@ pub fn run_indexer(
     // 2026-07-28 benchmark root-cause (B3): before this, a `scip-java
     // "Multiple build tools detected"` (or any other provider's) real error
     // reason was discarded entirely, leaving only a bare exit-status bail.
-    let stderr_tmp = tempfile::Builder::new()
-        .suffix(".scip-stderr")
-        .tempfile()?;
+    let stderr_tmp = tempfile::Builder::new().suffix(".scip-stderr").tempfile()?;
     let mut cmd = (provider.build_command)(bin, root, out);
     cmd.stderr(std::fs::File::create(stderr_tmp.path())?);
     let mut child = cmd.spawn()?;
@@ -1125,7 +1123,8 @@ mod tests {
     // overlay fail at 0% formal tier, silently, before this fix (B3,
     // 2026-07-28 benchmark root-cause).
     fn detect_java_build_tool_breaks_tie_toward_maven_when_both_present() {
-        let dir = std::env::temp_dir().join(format!("ci_java_dual_buildtool_{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("ci_java_dual_buildtool_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("pom.xml"), "").unwrap();
@@ -1169,13 +1168,17 @@ mod tests {
         let path = std::env::temp_dir().join(format!("ci_stderr_tail_{}.txt", std::process::id()));
         std::fs::write(&path, "line1\nline2\nMultiple build tools detected\n").unwrap();
         let tail = stderr_tail(&path);
-        assert!(tail.contains("Multiple build tools detected"), "got: {tail}");
+        assert!(
+            tail.contains("Multiple build tools detected"),
+            "got: {tail}"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn stderr_tail_empty_for_missing_file() {
-        let path = std::env::temp_dir().join(format!("ci_stderr_tail_missing_{}.txt", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("ci_stderr_tail_missing_{}.txt", std::process::id()));
         let _ = std::fs::remove_file(&path);
         assert_eq!(stderr_tail(&path), "");
     }

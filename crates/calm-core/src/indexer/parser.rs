@@ -3275,12 +3275,18 @@ a.b = c;
 "#;
         let symbols = extract_symbols(code, "javascript", "test.js").unwrap();
         let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
-        assert!(!names.contains(&"x"), "x = 5 must not become a symbol: {names:?}");
+        assert!(
+            !names.contains(&"x"),
+            "x = 5 must not become a symbol: {names:?}"
+        );
         assert!(
             !names.contains(&"name"),
             "app.name = \"my-app\" must not become a symbol: {names:?}"
         );
-        assert!(!names.contains(&"b"), "a.b = c must not become a symbol: {names:?}");
+        assert!(
+            !names.contains(&"b"),
+            "a.b = c must not become a symbol: {names:?}"
+        );
     }
 
     #[test]
