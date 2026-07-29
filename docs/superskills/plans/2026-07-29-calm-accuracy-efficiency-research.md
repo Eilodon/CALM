@@ -6,6 +6,13 @@
 > chiếu SOTA — paper học thuật + tool hàng đầu cùng category. Mọi claim nội bộ đều grounded
 > theo `file:line`; mọi claim ngoài đều có nguồn ở cuối.
 
+> **⚠️ ĐÍNH CHÍNH (Round 2, 2026-07-29 — self-audit qua super-skills + query thẳng `.calm/index.db`):**
+> Đề xuất **A (arity-gate)** ở bản gốc **SAI TIỀN ĐỀ** — arity gate **đã tồn tại** (`pipeline.rs:949-983`),
+> `symbols.arity` + `call_sites.arg_count` đã persist; nó chỉ đang **Elixir-only có chủ đích**. Việc thật
+> là *tổng quát hoá*, không phải *xây mới*. Con số ambiguous 54-92% chỉ đúng cho **case không có SCIP
+> overlay** (repo này, Tier-0 Rust có overlay: chỉ 12.9%). Xem **§6 — Round 2** ở cuối để biết đầy đủ
+> cái đúng/sai. Đọc §6 TRƯỚC khi hành động theo bảng dưới.
+
 ---
 
 ## 0. TL;DR — đòn bẩy lớn nhất, xếp theo leverage/effort
@@ -213,3 +220,102 @@ Kỹ thuật / benchmark:
 - [f] [Hybrid Search: BM25, Vector & Reranking Reference 2026](https://www.digitalapplied.com/blog/hybrid-search-bm25-vector-reranking-reference-2026)
 - [g] [CodeXEmbed: Generalist Embedding Model Family for Code Retrieval](https://arxiv.org/pdf/2411.12644)
 - [h] [Granite Embedding R2 Models](https://arxiv.org/pdf/2508.21085)
+
+---
+
+# §6 — Round 2: Self-audit chính bản báo cáo này (2026-07-29)
+
+Áp `super-skills` (evidence-before-claims + verification-before-completion) và **bài học meta của chính
+CALM** ("đừng tin tool output *về chính nó* — query thẳng `.calm/index.db`", `docs/plans/2026-07-28-calm-read-tools-self-audit.md` §Meta-lesson). Mỗi claim gốc bị adversarial re-check. Kết quả: **1 sai
+nghiêm trọng, 2 imprecise, 3 xác nhận đúng.**
+
+## E1 — [SAI NGHIÊM TRỌNG] Đề xuất A sai tiền đề: arity-gate KHÔNG thiếu — nó đã tồn tại, đang Elixir-only
+
+Bản gốc (§2, §4.A) khẳng định *"không có bước lọc theo arity ở bất kỳ đâu trong cascade"* và coi
+"thêm arity-gate" là đòn bẩy #1 novel. **Cả hai vế đều sai — verify trực tiếp trên code + DB:**
+
+- **Arity đã được capture cả hai vế:** `RawCall.arg_count` (`parser.rs:1330`, qua `count_arguments_node`),
+  cột `symbols.arity` (schema, `edges.rs:27`), cột `call_sites.arg_count` (`pipeline.rs:687`), map
+  `ctx.arity_by_qn` (`pipeline.rs:768`).
+- **Arity-gate đã được cài đặt đầy đủ** (`pipeline.rs:949-983`), chạy **trước** cả module_hint/same_file/
+  same_dir/same_namespace, với *đúng semantics tôi "đề xuất"*: narrow theo declared arity → **đúng 1
+  survivor thì short-circuit thẳng `resolved`** (ngang chuẩn bằng chứng với same-namespace C#), fail-open
+  khi arity unknown ở một trong hai vế, giữ ambiguous-narrowed khi >1.
+- **Nó là Elixir-only CÓ CHỦ ĐÍCH**, không phải bỏ sót: trong Elixir `greet/1` và `greet/2` là hai hàm
+  *khác nhau về danh tính* → arity là bằng chứng **sound**, không heuristic. Ở ngôn ngữ có overload/
+  default-arg/vararg/currying, arity chỉ là tín hiệu **soft** — đúng cạm bẫy tôi tự nêu. Đội ngũ đã bắt
+  đầu từ nơi arity soundest.
+
+**Việc thật (đề xuất A đã sửa):** *tổng quát hoá* gate Elixir-only sang ngôn ngữ khác, KHÔNG phải xây mới.
+Hạ tầng dữ liệu (arg_count/arity/arity_by_qn) đã có → rẻ hơn tôi tưởng ở phần data; nhưng công thật nằm ở
+(a) populate `symbols.arity` khi extract cho nhiều ngôn ngữ hơn, (b) wire `count_arguments_node` cho nhiều
+grammar hơn, (c) **xử lý soundness per-language** (giữ soft/fail-open cho overload/default/vararg, tắt hẳn
+cho ngôn ngữ curry-based) rồi mới nới guard `== Some("elixir")`. InferCG [2] vì vậy **xác nhận một hướng
+CALM ĐÃ áp dụng**, không phải "tính năng còn thiếu".
+
+**Root-cause lỗi của tôi:** chỉ đọc `pipeline.rs:1000-1075` rồi kết luận "không có arity ở đâu cả" —
+**vi phạm đúng meta-lesson tôi trích dẫn** (không grep `arity`/`arg_count`, không query DB trước khi khẳng
+định một sự vắng mặt). Đây là lỗi Pattern-Globalization (không kiểm phạm vi) + "absence proof" từ một lần
+đọc cục bộ.
+
+## E2 — [IMPRECISE] "ambiguous 54-92% là trần accuracy" — over-generalized; chỉ đúng khi KHÔNG có SCIP overlay
+
+Đo tươi trên `.calm/index.db` của chính repo này (Rust Tier-0, **có** rust-analyzer overlay):
+
+| tier | edges | % |
+|---|---:|---:|
+| formal | 8410 | **76.3%** |
+| ambiguous | 1421 | **12.9%** |
+| textual | 763 | 6.9% |
+| resolved | 385 | 3.5% |
+| inferred | 48 | 0.4% |
+
+→ Con số 54-92% ở §2 là baseline **no-overlay** (benchmark corpus ngoài, đa số chưa wire SCIP). Khi overlay
+có mặt, ambiguous sụp xuống ~13%. **Hệ quả cho ưu tiên:** tổng quát-hoá arity-gate chủ yếu giúp (a) 9-13
+ngôn ngữ Tier-0.5 *không có* SCIP provider, và (b) repo Tier-0 mà user *chưa* cài toolchain SCIP — **không**
+giúp mấy cho repo đã cấu hình tốt. Điều này **hạ arity-gate khỏi vị trí "#1 tuyệt đối"**: các thắng lợi rẻ
+& phổ quát (C: coreness/reranker cho hybrid — giúp *mọi* user *mọi* query) có ROI cao ngang hoặc hơn cho
+đa số người dùng.
+
+## E3 — [IMPRECISE] "coreness boost chỉ ở search_symbol, chưa vào hybrid" — coreness CÓ chảy vào 1/3 leg
+
+`search_hybrid` (`search.rs:1019`) gọi `search_symbol` cho leg FTS → boost C5 (coreness + exact-name) **có**
+định hình input FTS đưa vào RRF. Nó *chưa* áp cho 2 leg semantic (`symbol_semantic_results`/
+`chunk_semantic_results`) và *chưa* có post-fusion re-rank. Vậy phát biểu "coreness vắng mặt khỏi hybrid"
+là **quá mạnh** — chính xác phải là: coreness hiện diện ở 1/3 nguồn, chưa áp đồng nhất across-legs. Đề xuất
+C (áp như re-rank sau fusion, hoặc boost cả nguồn semantic) vẫn đứng vững, chỉ là mức lợi nhỏ hơn tôi ngụ ý.
+
+## Đã xác nhận ĐÚNG (re-verify, không đổi)
+
+- **C1-C4 (dedup) đã fix thật** — không chỉ theo commit message: `.calm/index.db` có `idx_call_edges_unique`
+  UNIQUE trên `(from_symbol,to_symbol,COALESCE(call_site_line,-1),edge_kind)` **và** `idx_import_edges_unique`;
+  đo trực tiếp: **0 dup tuple** ở call_edges. → mục E gốc (liệt A "C1-C5 dường như đã fix") giờ là **đã
+  verify**, bỏ chữ "dường như".
+- **C5 (search ranking) đã fix** — `EXACT_NAME_SEED`/`CORENESS_WEIGHT`/`EXACT_NAME_BONUS` có thật trong
+  `search_symbol` (`search.rs:262-331`), đọc trực tiếp.
+- **Thiếu reranker sau RRF** — đúng: `rrf_merge_n` là bước cuối của `search_hybrid`, không có cross-encoder/
+  post-fusion stage. Đề xuất C-nâng-cao và [f] vẫn đúng.
+
+## Chưa verify độc lập (ghi nhận trung thực, rủi ro thấp)
+
+- `potion-code-16M = static/model2vec`: lấy từ `docs/architecture.md`, chưa đọc `embedding.rs`/`build.rs`
+  để xác nhận trực tiếp. Không đổi đề xuất D nhưng nên tự đọc trước khi trích ra ngoài.
+- Con số ambiguous no-overlay (54-92%) lấy từ `benchmarks/resolution/README.md`; một số dòng README tự
+  đánh dấu superseded/noisy (C/C++ struct-ref noise, Dart trước C3). Nếu cần số chuẩn, chạy lại benchmark.
+
+## Ưu tiên đã cập nhật (thay bảng §5 gốc)
+
+1. **C-rẻ** (coreness/exact-name cho cả hybrid RRF, không chỉ FTS-leg) + **E** (F3/F4/F5). Phổ quát, rủi ro ~0.
+2. **A′ — tổng quát-hoá arity-gate** (không phải xây mới): mở rộng `symbols.arity` extraction + nới guard
+   Elixir, per-language soundness. Ưu tiên ngôn ngữ arity-sound trước (function-clause languages), soft cho
+   phần còn lại. Đo lại `benchmarks/resolution` trước/sau **chỉ trên ngôn ngữ no-overlay** (nơi nó thực sự có ích).
+3. **F/B7** để đo tác động bằng task-correctness.
+4. **D** (embedding backend tuỳ chọn) + reranker.
+5. **B** (mở rộng stack-graphs formal tier) — dài hạn.
+
+## Meta-lesson lặp lại (cho lần sau)
+
+Tôi trích đúng bài học "query DB, đừng tin tool output về chính nó" rồi **vẫn** vi phạm nó ở claim trung tâm —
+khẳng định một sự *vắng mặt* (arity-gate) chỉ từ một lần đọc code cục bộ, không grep, không query DB. Quy tắc
+cứng rút ra: **mọi claim dạng "X không tồn tại / thiếu Y" phải đi kèm một `grep` toàn repo + (nếu là data)
+một truy vấn DB, trước khi viết xuống.**
