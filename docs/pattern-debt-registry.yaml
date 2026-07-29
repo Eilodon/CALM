@@ -273,3 +273,42 @@ items:
       - "Sau baseline, dat max_avg_distance theo percentile quan sat duoc (vd. p90 cua cac repo baseline), khong phai mot con so doan truoc"
       - "Kiem tra lai avg_distance co on dinh qua thoi gian tren cung 1 repo hay dao dong nhieu theo ngon ngu/kich thuoc file thay doi - neu dao dong lon, nguong cung co the khong phai cach dung de gate"
     owner_hint: calm-core/fitness
+
+  DEBT-012-formal-resolver-deterministic-cap-honest-limit:
+    status: open
+    urgency: medium
+    opened_at: "2026-07-30"
+    description: >
+      ADR docs/superskills/adrs/2026-07-29-b12-upgrade-plan-three-fixes.md
+      (§8b/§9, appended 2026-07-30) closed the silent-failure half of the
+      formal-resolver nondeterminism bug (ADR-A1: a cancelled resolve_file
+      is no longer indistinguishable from "resolved, found nothing") and
+      added a deterministic total-check-count ceiling
+      (BoundedCancellation/TsgBoundedCancellation, crates/calm-core/src/
+      resolver/formal.rs) intended to also make formal/textual
+      classification independent of machine speed (ADR-A2). Calibration
+      testing against real/synthetic files disproved the full-determinism
+      claim for one specific shape: deep self-reference chains (the
+      existing _pydecimal.py-style pathological regression fixture) cost
+      far more wall-clock per check() than ordinary independent-method
+      code, so a ceiling calibrated safely above legitimate-file needs
+      (measured: 400 methods / 1703 lines needs ~656K checks) does not
+      trip before the wall-clock deadline for that shape -- RESOLVE_TIMEOUT
+      remains the operative, still machine-load-sensitive bound there,
+      unchanged from before ADR-A2.
+    current_control: >
+      Honest limit is documented in the ADR itself (not silently
+      overclaimed) plus in BoundedCancellation's own doc comment in
+      formal.rs. Tests reflect reality:
+      test_resolve_file_pathological_class_still_bounded_by_wall_clock_after_adr_a2
+      (asserts the pre-existing wall-clock bound holds, does NOT claim fast
+      deterministic truncation) and
+      test_resolve_file_legitimate_large_file_not_falsely_truncated (proves
+      no regression for ordinary code). indexing_status.formal_resolution_timeouts
+      (ADR-A1) still gives visibility into how often RESOLVE_TIMEOUT fires
+      in practice, regardless of shape.
+    remaining:
+      - "A cost-weighted budget (bound total PartialPath length/complexity processed, not raw check() call count) would be needed to catch deep-chain shapes deterministically without a false-truncation risk for legitimate wide/shallow code"
+      - "Alternative: content-hash memoization of resolve_file results keyed on (file_hash, lang) -- doesn't fix determinism for a FIRST resolution of a given file content, but guarantees every subsequent reindex of unchanged content reuses the same (Complete-only) result rather than re-rolling the wall-clock race"
+      - "No evidence yet on whether the real golden_equivalence_incremental_vs_fresh_on_real_calm_repo flake (a TypeScript zod pair, not a Python deep-chain shape) is check-count-bound or per-check-cost-bound -- unresolved whether ADR-A2 as shipped actually helps that specific real-world case"
+    owner_hint: calm-core/resolver
