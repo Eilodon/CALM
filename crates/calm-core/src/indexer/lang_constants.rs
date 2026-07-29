@@ -316,6 +316,18 @@ const JS_TS_CONSTANTS: LangConstants = LangConstants {
         "class_declaration",
         "method_definition",
         "lexical_declaration",
+        // B1 (2026-07-28 benchmark root-cause): `app.set = function(){}`,
+        // `exports.foo = () => {}`, `Foo.prototype.bar = function(){}` —
+        // classic CommonJS/prototype-style code defines its entire public
+        // API via property assignment, not `function foo(){}`/`const`.
+        // Without this, a repo written that way (measured live: express —
+        // 141 .js files, only 123 symbols extracted, ALL kind=function)
+        // was almost entirely invisible to the indexer. See
+        // `resolve_name_node`'s "assignment_expression" arm for the RHS
+        // guard (only a function-literal RHS becomes a symbol; `x = 5`
+        // does not) and name extraction (member property, or a bare
+        // module-level identifier).
+        "assignment_expression",
         // TypeScript-only (never appear in the JS grammar, so no-op
         // there): interface/type-alias/enum declarations are otherwise
         // invisible to the extractor entirely — a TS/DTO-only file would

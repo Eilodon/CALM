@@ -341,6 +341,22 @@ fn insert_missing_edges(
              formal_source, ruled_out_by_scip) \
          VALUES (?1, ?2, ?3, 'formal', ?4, ?5, 'scip', 0)",
     )?;
+    // A pre-existing non-formal edge at this exact call site, pointing to a
+    // DIFFERENT target than the formal edge we just inserted, is a proven
+    // tree-sitter mistake: SCIP had an opinion about this site (it's the
+    // reason we're inserting at all) and picked a different definition.
+    // `mark_ruled_out_siblings` above only declutters fan-out GROUPS
+    // (`members.len() >= 2` at the time it runs, before any insert here) —
+    // a site where the stale edge was the sole occupant slips through it
+    // and would otherwise stay `ruled_out_by_scip = 0` (still served by
+    // every caller/callee/edit_context query) forever. Ruling it out here,
+    // gated on a real insert actually happening, closes that gap without
+    // ever leaving a call site edge-less.
+    let mut rule_out_stale_stmt = conn.prepare(
+        "UPDATE call_edges SET ruled_out_by_scip = 1 \
+         WHERE from_path = ?1 AND call_site_line = ?2 \
+           AND edge_confidence != 'formal' AND ruled_out_by_scip = 0 AND to_path != ?3",
+    )?;
     for (&(from_path, call_line), targets) in ref_targets {
         for &(def_path, def_line) in targets {
             if already_represented.contains(&(from_path, call_line, def_path, def_line as i64)) {
@@ -364,6 +380,9 @@ fn insert_missing_edges(
             ])?;
             already_represented.insert((from_path, call_line, def_path, def_line as i64));
             satisfied_sites.insert((from_path.to_string(), call_line));
+            if n > 0 {
+                rule_out_stale_stmt.execute(rusqlite::params![from_path, call_line as i64, def_path])?;
+            }
             inserted += n;
         }
     }
@@ -756,6 +775,80 @@ mod tests {
         assert_eq!(to_symbol, "core/src/engine.rs::Engine::start");
         assert_eq!(confidence, "formal");
         assert_eq!(formal_source.as_deref(), Some("scip"));
+    }
+
+    #[test]
+    // B2 (2026-07-28 benchmark root-cause): a stale non-formal edge at a call
+    // site is a LONE occupant there (only one call_edges row) at the time
+    // `mark_ruled_out_siblings` runs, since that pass runs BEFORE this
+    // function — `lone_edge_is_never_ruled_out_even_when_scip_disagrees`
+    // above locks in that a lone edge is deliberately left alone by that
+    // earlier pass. If SCIP then resolves the site to a genuinely different,
+    // previously-unrepresented target, this function inserts the correct
+    // formal edge but — before this fix — left the stale wrong edge at
+    // `ruled_out_by_scip = 0`, still served by every caller/callee/
+    // edit_context query. Measured live on 4 real OSS repos: 15-437 such
+    // edges per repo, 100% pointing to a target other than their formal
+    // sibling.
+    fn insert_replaces_stale_wrong_sibling_edge_that_rule_out_missed() {
+        let conn = db_with_call_site("app/src/main.rs", "app/src/main.rs::main", 5, "start");
+        conn.execute_batch(
+            "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end) \
+             VALUES ('core/src/engine.rs::Engine::start', 'start', 'method', 'rust', 'core/src/engine.rs', 6, 8); \
+             INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end) \
+             VALUES ('other/src/wrong.rs::Wrong::start', 'start', 'method', 'rust', 'other/src/wrong.rs', 3, 5); \
+             INSERT INTO call_edges (from_symbol, to_symbol, call_site_line, edge_confidence, from_path, to_path) \
+             VALUES ('app/src/main.rs::main', 'other/src/wrong.rs::Wrong::start', 5, 'ambiguous', 'app/src/main.rs', 'other/src/wrong.rs');",
+        )
+        .unwrap();
+
+        // SCIP resolves the call site to the CORRECT target — a def with no
+        // pre-existing edge representing it at all, exactly the shape
+        // `insert_missing_edges` handles.
+        let occ = vec![
+            ScipOccurrence {
+                file: "core/src/engine.rs".into(),
+                line: 6,
+                symbol: "M".into(),
+                is_def: true,
+                is_local: false,
+            },
+            ScipOccurrence {
+                file: "app/src/main.rs".into(),
+                line: 5,
+                symbol: "M".into(),
+                is_def: false,
+                is_local: false,
+            },
+        ];
+        let stats = ingest_occurrences(&conn, &occ, true).unwrap();
+        assert_eq!(stats.inserted, 1, "correct target should get a new formal edge");
+
+        let (confidence, ruled_out): (String, i64) = conn
+            .query_row(
+                "SELECT edge_confidence, ruled_out_by_scip FROM call_edges \
+                 WHERE to_symbol = 'other/src/wrong.rs::Wrong::start'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(confidence, "ambiguous", "edge_confidence itself is left untouched");
+        assert_eq!(
+            ruled_out, 1,
+            "stale wrong edge must be ruled out now that a formal replacement exists at the same site"
+        );
+
+        let (to_symbol, new_confidence, new_ruled_out): (String, String, i64) = conn
+            .query_row(
+                "SELECT to_symbol, edge_confidence, ruled_out_by_scip FROM call_edges \
+                 WHERE to_symbol = 'core/src/engine.rs::Engine::start'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(to_symbol, "core/src/engine.rs::Engine::start");
+        assert_eq!(new_confidence, "formal");
+        assert_eq!(new_ruled_out, 0);
     }
 
     /// `insert_missing: false` (the config off-switch) skips the insert gate

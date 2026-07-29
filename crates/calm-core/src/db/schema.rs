@@ -358,6 +358,7 @@ fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
     migrate_add_column(conn, "symbols", "arity", "INTEGER")?;
     migrate_fts_add_signature(conn)?;
     migrate_add_project_memory_fts(conn)?;
+    migrate_add_scip_overlay_state(conn)?;
     dedup_edges_and_add_unique_indexes(conn)?;
     Ok(())
 }
@@ -512,6 +513,35 @@ fn migrate_add_project_memory_fts(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(PROJECT_MEMORY_TRIGGERS_SQL)?;
     conn.execute_batch("INSERT INTO project_memory_fts(project_memory_fts) VALUES ('rebuild');")?;
     tracing::info!("Migration: created project_memory_fts and backfilled existing notes");
+    Ok(())
+}
+
+/// B4 (2026-07-28 benchmark root-cause): replaces the old
+/// `.calm/<provider>.cache` + `.calm/<provider>-stats.json` sidecar files
+/// with a DB-resident table, so wiping/rebuilding `index.db` can never
+/// leave a stale skip-signal behind for a SCIP overlay pass to trust — see
+/// `scip::state`'s module doc comment for the full incident.
+fn migrate_add_scip_overlay_state(conn: &Connection) -> rusqlite::Result<()> {
+    let already_migrated: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'scip_overlay_state'",
+        [],
+        |r| r.get(0),
+    )?;
+    if already_migrated > 0 {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "CREATE TABLE scip_overlay_state ( \
+            provider TEXT PRIMARY KEY, \
+            cache_key TEXT, \
+            upgraded INTEGER NOT NULL DEFAULT 0, \
+            ruled_out INTEGER NOT NULL DEFAULT 0, \
+            inserted INTEGER NOT NULL DEFAULT 0, \
+            match_rate REAL NOT NULL DEFAULT 0.0, \
+            last_run_unix INTEGER \
+        );",
+    )?;
+    tracing::info!("Migration: created scip_overlay_state");
     Ok(())
 }
 

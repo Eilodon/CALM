@@ -3,6 +3,7 @@ pub mod ingest;
 pub mod parse;
 pub mod provider;
 pub mod runner;
+pub mod state;
 
 use std::path::Path;
 
@@ -63,7 +64,7 @@ pub fn run_overlay_for(
     if !provider_has_any_files(conn, provider) {
         return Ok(ingest::IngestStats::default());
     }
-    if !force && !policy_allows_automatic_run(cfg.policy, root, provider) {
+    if !force && !policy_allows_automatic_run(cfg.policy, conn, provider) {
         tracing::info!(
             "SCIP overlay ({}): refresh policy ({}) skips this automatic run — \
              use `calm scip run --lang {}` or the `scip_refresh` MCP tool to force it",
@@ -83,9 +84,12 @@ pub fn run_overlay_for(
         return Ok(ingest::IngestStats::default());
     };
 
-    let cache_path = root.join(".calm").join(provider.cache_file_name);
+    // DB-resident, not a `.calm/*.cache` sidecar file (B4, 2026-07-28
+    // benchmark root-cause) — see `state`'s module doc comment for why: a
+    // sidecar file outlives the database it describes, so wiping/rebuilding
+    // `index.db` used to leave a stale skip-signal behind forever.
     let key = (provider.cache_key)(&bin, root, dirty);
-    if std::fs::read_to_string(&cache_path).is_ok_and(|prev| prev.trim() == key) {
+    if state::read_cache_key(conn, provider.lang).as_deref() == Some(key.as_str()) {
         tracing::info!(
             "SCIP overlay ({}): cache key unchanged, skipping indexer run",
             provider.lang
@@ -119,72 +123,44 @@ pub fn run_overlay_for(
         stats.inserted,
         stats.match_rate
     );
-    // Best-effort: a failed cache write just means the next run pays the cost
-    // of re-running this provider's indexer again, never a correctness issue.
-    let _ = std::fs::write(&cache_path, &key);
-    // Best-effort sidecar so `indexing_status`/`overlay_status` can surface
-    // this run's `inserted`/`match_rate`/`last_run` without re-running the
-    // overlay — none of those are derivable from `call_edges` alone the way
-    // `available`/`up_to_date` are (there's no column recording "how many
-    // SCIP-resolved sites exist" once the pass is done, or when it ran).
-    // Stands until the next real (non-cache-skip) run overwrites it; reading
-    // code should treat it as "as of the last real run", not "live". One
-    // file per provider (P2.6) — was a single shared `scip-stats.json` for
-    // every provider through P2.1/P2.4, a known bug (each provider's run
-    // clobbered the others' stats) fixed here alongside adding `last_run`,
-    // which `policy_allows_automatic_run`'s `MinInterval` case also needs
-    // per-provider, not shared.
-    let stats_path = root.join(".calm").join(stats_file_name(provider));
-    let now_unix = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let _ = std::fs::write(
-        &stats_path,
-        serde_json::json!({
-            "upgraded": stats.upgraded,
-            "ruled_out": stats.ruled_out,
-            "inserted": stats.inserted,
-            "match_rate": stats.match_rate,
-            "last_run_unix": now_unix,
-        })
-        .to_string(),
+    // Best-effort — same posture as the old sidecar writes: a failed write
+    // here just means the next run pays the cost of re-running this
+    // provider's indexer again, never a correctness issue. One row per
+    // provider (upserted, see `state::write_state`) — was a single shared
+    // `scip-stats.json` file for every provider through P2.1/P2.4, a known
+    // bug (each provider's run clobbered the others' stats), fixed via
+    // one-file-per-provider (P2.6), then moved off files entirely here.
+    state::write_state(
+        conn,
+        provider.lang,
+        &key,
+        stats.upgraded,
+        stats.ruled_out,
+        stats.inserted,
+        stats.match_rate,
     );
     Ok(stats)
 }
 
-/// `<provider.cache_file_name minus ".cache">-stats.json` — e.g. Rust's
-/// `scip.cache` -> `scip-stats.json` (same name the old shared sidecar
-/// used, so an existing checkout's Rust stats aren't orphaned by this
-/// rename), Go's `scip-go.cache` -> `scip-go-stats.json`. Derived from the
-/// cache filename (already unique per provider) rather than adding yet
-/// another `ScipProvider` field for the same purpose.
-fn stats_file_name(provider: &provider::ScipProvider) -> String {
-    format!(
-        "{}-stats.json",
-        provider
-            .cache_file_name
-            .strip_suffix(".cache")
-            .unwrap_or(provider.cache_file_name)
-    )
-}
+
 
 /// Whether an *automatic* caller (not an explicit `force`d manual refresh)
 /// may run this provider's indexer right now, per `cfg.policy`. `OnSave`
 /// (the default) always allows it — the pre-P2.6 behavior, gated only by
 /// the cache-key check just above this function's call site.
-/// `MinInterval` reads the provider's own last-run timestamp from its stats
-/// sidecar (`None` — never run for real — always allows a first run).
+/// `MinInterval` reads the provider's own last-run timestamp from the
+/// `scip_overlay_state` DB table (`None` — never run for real — always
+/// allows a first run).
 fn policy_allows_automatic_run(
     policy: crate::config::RefreshPolicy,
-    root: &Path,
+    conn: &Connection,
     provider: &provider::ScipProvider,
 ) -> bool {
     use crate::config::RefreshPolicy;
     match policy {
         RefreshPolicy::OnSave => true,
         RefreshPolicy::OnDemand => false,
-        RefreshPolicy::MinInterval(secs) => match read_last_run_unix(root, provider) {
+        RefreshPolicy::MinInterval(secs) => match read_last_run_unix(conn, provider) {
             None => true,
             Some(last) => {
                 let now = std::time::SystemTime::now()
@@ -197,11 +173,8 @@ fn policy_allows_automatic_run(
     }
 }
 
-fn read_last_run_unix(root: &Path, provider: &provider::ScipProvider) -> Option<u64> {
-    let path = root.join(".calm").join(stats_file_name(provider));
-    let text = std::fs::read_to_string(path).ok()?;
-    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
-    v.get("last_run_unix").and_then(|x| x.as_u64())
+fn read_last_run_unix(conn: &Connection, provider: &provider::ScipProvider) -> Option<u64> {
+    state::read_state(conn, provider.lang).and_then(|s| s.last_run_unix)
 }
 
 /// Run the full SCIP overlay for Rust — thin wrapper around
@@ -343,7 +316,7 @@ fn run_go_workspace_overlay(
         return Ok(ingest::IngestStats::default());
     }
     let dirty = source_dirty_keys(conn, provider.dirty_langs);
-    if !force && !policy_allows_automatic_run(cfg.policy, root, provider) {
+    if !force && !policy_allows_automatic_run(cfg.policy, conn, provider) {
         tracing::info!(
             "SCIP overlay (go, {} workspace modules): refresh policy ({}) skips this automatic run — \
              use `calm scip run --lang go` or the `scip_refresh` MCP tool to force it",
@@ -359,9 +332,10 @@ fn run_go_workspace_overlay(
         return Ok(ingest::IngestStats::default());
     };
 
-    let cache_path = root.join(".calm").join(provider.cache_file_name);
+    // DB-resident, not a sidecar file — see `run_overlay_for`'s equivalent
+    // check and `state`'s module doc comment (B4).
     let key = (provider.cache_key)(&bin, root, &dirty);
-    if std::fs::read_to_string(&cache_path).is_ok_and(|prev| prev.trim() == key) {
+    if state::read_cache_key(conn, provider.lang).as_deref() == Some(key.as_str()) {
         tracing::info!("SCIP overlay (go, workspace): cache key unchanged, skipping indexer run");
         return Ok(ingest::IngestStats::default());
     }
@@ -430,25 +404,16 @@ fn run_go_workspace_overlay(
         crate::indexer::pipeline::refresh_caller_counts(conn)?;
     }
 
-    // Best-effort, same posture as `run_overlay_for`'s equivalent writes —
-    // a failed write here just costs the next run a redundant re-index.
-    let _ = std::fs::write(&cache_path, &key);
-    let stats_path = root.join(".calm").join(stats_file_name(provider));
-    let now_unix = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let _ = std::fs::write(
-        &stats_path,
-        serde_json::json!({
-            "upgraded": total.upgraded,
-            "ruled_out": total.ruled_out,
-            "inserted": total.inserted,
-            "match_rate": total.match_rate,
-            "last_run_unix": now_unix,
-            "workspace_modules": modules.len(),
-        })
-        .to_string(),
+    // DB-resident, not a sidecar file — same posture and mechanism as
+    // `run_overlay_for`'s equivalent write (B4).
+    state::write_state(
+        conn,
+        provider.lang,
+        &key,
+        total.upgraded,
+        total.ruled_out,
+        total.inserted,
+        total.match_rate,
     );
 
     Ok(total)
@@ -649,13 +614,12 @@ pub fn overlay_status_for(
         Some(bin) => {
             let dirty = source_dirty_keys(conn, provider.dirty_langs);
             let key = (provider.cache_key)(bin, root, &dirty);
-            let cache_path = root.join(".calm").join(provider.cache_file_name);
-            std::fs::read_to_string(&cache_path).is_ok_and(|prev| prev.trim() == key)
+            state::read_cache_key(conn, provider.lang).as_deref() == Some(key.as_str())
         }
         None => false,
     };
-    let (last_match_rate, last_inserted) = read_last_stats(root, provider);
-    let last_run_unix = read_last_run_unix(root, provider);
+    let (last_match_rate, last_inserted) = read_last_stats(conn, provider);
+    let last_run_unix = read_last_run_unix(conn, provider);
     Some(OverlayStatus {
         available,
         up_to_date,
@@ -672,26 +636,16 @@ pub fn overlay_status(conn: &Connection, root: &Path, rust: &RustConfig) -> Opti
     overlay_status_for(&provider::RUST, conn, root, &rust.scip)
 }
 
-/// Best-effort read of the sidecar `run_overlay_for` writes after a real
-/// (non-cache-skip) run — `inserted`/`match_rate` aren't derivable from
-/// `call_edges` alone at read time the way `available`/`up_to_date` are, so
-/// they have to come from whatever the last real run actually observed.
-/// Absent (never run) or corrupt — both `(None, None)`, not an error; this is
-/// a diagnostic nicety, not load-bearing.
-fn read_last_stats(root: &Path, provider: &provider::ScipProvider) -> (Option<f64>, Option<usize>) {
-    let path = root.join(".calm").join(stats_file_name(provider));
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return (None, None);
-    };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
-        return (None, None);
-    };
-    (
-        v.get("match_rate").and_then(|x| x.as_f64()),
-        v.get("inserted")
-            .and_then(|x| x.as_u64())
-            .map(|n| n as usize),
-    )
+/// Best-effort read of `scip_overlay_state` after a real (non-cache-skip)
+/// run — `inserted`/`match_rate` aren't derivable from `call_edges` alone
+/// at read time the way `available`/`up_to_date` are, so they have to come
+/// from whatever the last real run actually observed. Absent (never run) —
+/// `(None, None)`, not an error; this is a diagnostic nicety, not
+/// load-bearing.
+fn read_last_stats(conn: &Connection, provider: &provider::ScipProvider) -> (Option<f64>, Option<usize>) {
+    state::read_state(conn, provider.lang)
+        .map(|s| (Some(s.match_rate), Some(s.inserted)))
+        .unwrap_or((None, None))
 }
 
 #[derive(Debug, Clone, PartialEq)]

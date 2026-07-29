@@ -274,6 +274,33 @@ fn resolve_name_node<'a>(
                 }
             })
         }
+        // JS/TS `app.set = function(){}` / `exports.foo = () => {}` /
+        // `Foo.prototype.bar = function(){}` (B1, 2026-07-28 benchmark
+        // root-cause) — CommonJS/prototype-style code defines its whole
+        // public API this way, with no `function`/`const` in sight. Same
+        // RHS guard as `lexical_declaration` above (only a function-literal
+        // RHS becomes a symbol — `x = 5`/`a.b = c` correctly return `None`
+        // and emit nothing). The extracted name is the property being
+        // assigned (`set`/`foo`/`bar`) — this matches `walk_calls`'
+        // `split_receiver_callee`, which already splits `app.set(...)` into
+        // receiver `app` + bare callee `set` on the reference side, so a
+        // definition named `set` here is exactly what a call to it already
+        // resolves against; a bare-identifier LHS (`foo = function(){}`,
+        // valid JS without `var`/`let`/`const`) is handled the same way.
+        "assignment_expression" => {
+            let right = node.child_by_field_name("right")?;
+            if !matches!(
+                right.kind(),
+                "arrow_function" | "function_expression" | "function"
+            ) {
+                return None;
+            }
+            match node.child_by_field_name("left") {
+                Some(l) if l.kind() == "member_expression" => l.child_by_field_name("property"),
+                Some(l) if l.kind() == "identifier" => Some(l),
+                _ => None,
+            }
+        }
         // C and C++ function_definition: the function name is not in a direct
         // "name" field but nested inside a declarator chain:
         //   function_definition
@@ -3201,6 +3228,100 @@ function standalone() {}
         assert_eq!(find(&symbols, "hello").kind, SymbolKind::Method);
         assert_eq!(find(&symbols, "arrow").kind, SymbolKind::Variable);
         assert_eq!(find(&symbols, "standalone").kind, SymbolKind::Function);
+    }
+
+    #[test]
+    // B1 (2026-07-28 benchmark root-cause): CommonJS/prototype-style code
+    // defines its whole public API via property assignment, not
+    // `function foo(){}`/`const`. Measured live on express (real OSS repo):
+    // 141 .js files, only 123 symbols extracted, ALL kind=function — this
+    // exact pattern (`app.set = function(){}`, `res.render = function(){}`,
+    // etc.) was entirely invisible before this fix.
+    fn test_javascript_property_assigned_functions_are_extracted() {
+        let code = r#"
+app.set = function() {};
+exports.foo = () => {};
+Foo.prototype.bar = function() {};
+freestanding = function() {};
+"#;
+        let symbols = extract_symbols(code, "javascript", "test.js").unwrap();
+        let set = find(&symbols, "set");
+        assert_eq!(set.kind, SymbolKind::Function);
+        let foo = find(&symbols, "foo");
+        assert_eq!(foo.kind, SymbolKind::Function);
+        // Foo.prototype.bar — the assigned property itself (`bar`) is what's
+        // extracted, matching how walk_calls' split_receiver_callee already
+        // resolves a call to `Foo.prototype.bar()` down to bare callee
+        // `bar` (receiver = last segment, "prototype") — same convention,
+        // not a new inconsistency.
+        let bar = find(&symbols, "bar");
+        assert_eq!(bar.kind, SymbolKind::Function);
+        // Bare identifier LHS with no var/let/const — valid JS (an implicit
+        // global assignment), must also be recognized.
+        let freestanding = find(&symbols, "freestanding");
+        assert_eq!(freestanding.kind, SymbolKind::Function);
+    }
+
+    #[test]
+    // Guard: a non-function-literal RHS must never manufacture a symbol —
+    // same discipline `lexical_declaration`'s existing RHS check already
+    // enforces for `const`/`let`.
+    fn test_javascript_non_function_assignment_is_not_extracted() {
+        let code = r#"
+let x;
+x = 5;
+app.name = "my-app";
+a.b = c;
+"#;
+        let symbols = extract_symbols(code, "javascript", "test.js").unwrap();
+        let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(!names.contains(&"x"), "x = 5 must not become a symbol: {names:?}");
+        assert!(
+            !names.contains(&"name"),
+            "app.name = \"my-app\" must not become a symbol: {names:?}"
+        );
+        assert!(!names.contains(&"b"), "a.b = c must not become a symbol: {names:?}");
+    }
+
+    #[test]
+    // A call made *inside* a property-assigned function must attribute to
+    // the newly-recognized enclosing symbol — same consistency
+    // `walk_calls`' doc comment already promises for the `lexical_declaration`
+    // arrow-function case, now extended to this shape too.
+    fn test_javascript_property_assigned_function_calls_attribute_correctly() {
+        let code = r#"
+app.set = function(name, value) {
+    validate(name);
+    this.cache.store(name, value);
+};
+"#;
+        let calls = extract_calls(code, "javascript", "test.js").unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.enclosing_name == "set" && c.callee == "validate"),
+            "bare call inside app.set = function(){{}} should attribute to enclosing 'set': {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c.enclosing_name == "set"
+                && c.callee == "store"
+                && c.receiver.as_deref() == Some("cache")),
+            "receiver-qualified call inside should also attribute to enclosing 'set': {calls:?}"
+        );
+    }
+
+    #[test]
+    // Same shape must work for TypeScript too — JS_TS_CONSTANTS is shared
+    // between the two languages, but this locks in that sharing rather than
+    // assuming it.
+    fn test_typescript_property_assigned_functions_are_extracted() {
+        let code = r#"
+export const app: any = {};
+app.set = function(key: string): void {};
+"#;
+        let symbols = extract_symbols(code, "typescript", "test.ts").unwrap();
+        let set = find(&symbols, "set");
+        assert_eq!(set.kind, SymbolKind::Function);
     }
 
     #[test]

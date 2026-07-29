@@ -61,7 +61,23 @@ pub fn run_indexer(
     root: &Path,
     out: &Path,
 ) -> anyhow::Result<()> {
-    let mut child = (provider.build_command)(bin, root, out).spawn()?;
+    // File-backed, not `Stdio::piped()`: this function only reads the
+    // capture back ONCE, after the child has already exited, so there is no
+    // pipe buffer for a chatty/failing indexer to block writing into while
+    // nobody drains it (a real deadlock risk `Stdio::piped()` would
+    // introduce here). Overrides whichever `.stderr(Stdio::null())` each
+    // provider's own `build_command` already set — `Command`'s builder
+    // methods are last-call-wins, so this applies uniformly to all 9
+    // providers without editing any of them. Closes the silent half of the
+    // 2026-07-28 benchmark root-cause (B3): before this, a `scip-java
+    // "Multiple build tools detected"` (or any other provider's) real error
+    // reason was discarded entirely, leaving only a bare exit-status bail.
+    let stderr_tmp = tempfile::Builder::new()
+        .suffix(".scip-stderr")
+        .tempfile()?;
+    let mut cmd = (provider.build_command)(bin, root, out);
+    cmd.stderr(std::fs::File::create(stderr_tmp.path())?);
+    let mut child = cmd.spawn()?;
     // Poll with a deadline; kill on overrun (Command has no built-in timeout —
     // same pattern as analysis/diff_impact.rs's bounded wait).
     let deadline = std::time::Instant::now() + provider.timeout;
@@ -70,18 +86,41 @@ pub fn run_indexer(
             if status.success() {
                 return Ok(());
             }
-            anyhow::bail!("{} indexer exited with {status}", provider.lang);
+            anyhow::bail!(
+                "{} indexer exited with {status}{}",
+                provider.lang,
+                stderr_tail(stderr_tmp.path())
+            );
         }
         if std::time::Instant::now() >= deadline {
             let _ = child.kill();
             anyhow::bail!(
-                "{} indexer exceeded {}s budget",
+                "{} indexer exceeded {}s budget{}",
                 provider.lang,
-                provider.timeout.as_secs()
+                provider.timeout.as_secs(),
+                stderr_tail(stderr_tmp.path())
             );
         }
         std::thread::sleep(Duration::from_millis(200));
     }
+}
+
+/// Best-effort tail (last 5 non-empty lines) of a provider's captured
+/// stderr, formatted as `": <line> | <line> | ..."` for direct inclusion in
+/// `run_indexer`'s `bail!` messages — empty string (not an error) when the
+/// file is missing, unreadable, or empty, since a failed capture must never
+/// mask the real exit-status failure it's trying to explain.
+fn stderr_tail(path: &Path) -> String {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return String::new();
+    };
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let mut tail: Vec<&str> = trimmed.lines().rev().take(5).collect();
+    tail.reverse();
+    format!(": {}", tail.join(" | "))
 }
 
 /// Total wall-clock budget for one `scip-go index` pass. Go's compiler-driven
@@ -389,12 +428,42 @@ pub fn java_resolve_binary(override_bin: Option<&str>, _root: &Path) -> Option<P
 /// so `current_dir(root)` is the only way to scope it, mirroring
 /// `go_build_command`'s same use of `current_dir` as a belt-and-braces
 /// measure alongside its own `--module-root` flag.
+/// Maven vs Gradle detection for `scip-java index --build-tool=`. `scip-java`
+/// refuses to guess and exits non-zero when BOTH a Maven and a Gradle
+/// project are present — confirmed live on spring-petclinic, which ships
+/// `pom.xml`+`mvnw` AND `build.gradle`+`gradlew` as a deliberate
+/// "buildable with either" demo repo. Before this, `java_build_command`
+/// never passed `--build-tool` at all (2026-07-28 benchmark root-cause: B3),
+/// so every dual-build-tool repo's Java overlay failed at 0% formal tier —
+/// and silently, since `run_indexer` used to null out stderr entirely (see
+/// its own doc comment for the fix to that half of the bug).
+///
+/// A wrapper script is a stronger signal than a bare project file (whoever
+/// set the repo up chose it deliberately), so it's checked first. When BOTH
+/// tools are genuinely present with no wrapper to break the tie, Maven
+/// wins — an arbitrary but documented choice, same shape as
+/// `find_csharp_project`'s sln-over-csproj preference above. A wrong guess
+/// here now fails loudly (real stderr in the bail! message) instead of
+/// silently, so it's a one-time visible fix rather than a permanent trap.
+pub fn detect_java_build_tool(root: &Path) -> Option<&'static str> {
+    let has = |name: &str| root.join(name).is_file();
+    let maven = has("mvnw") || has("pom.xml");
+    let gradle = has("gradlew") || has("build.gradle") || has("build.gradle.kts");
+    match (maven, gradle) {
+        (true, false) => Some("Maven"),
+        (false, true) => Some("Gradle"),
+        (true, true) => Some("Maven"),
+        (false, false) => None,
+    }
+}
+
 pub fn java_build_command(bin: &Path, root: &Path, out: &Path) -> Command {
     let mut cmd = Command::new(bin);
-    cmd.arg("index")
-        .arg("--output")
-        .arg(out)
-        .current_dir(root)
+    cmd.arg("index").arg("--output").arg(out);
+    if let Some(tool) = detect_java_build_tool(root) {
+        cmd.arg("--build-tool").arg(tool);
+    }
+    cmd.current_dir(root)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     cmd
@@ -1027,6 +1096,88 @@ mod tests {
         assert!(!binary_runs(Path::new(
             "definitely-not-a-real-scip-java-binary-xyz"
         )));
+    }
+
+    #[test]
+    fn detect_java_build_tool_prefers_maven_when_only_maven_present() {
+        let dir = std::env::temp_dir().join(format!("ci_java_maven_only_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("pom.xml"), "").unwrap();
+        assert_eq!(detect_java_build_tool(&dir), Some("Maven"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn detect_java_build_tool_prefers_gradle_when_only_gradle_present() {
+        let dir = std::env::temp_dir().join(format!("ci_java_gradle_only_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("build.gradle"), "").unwrap();
+        assert_eq!(detect_java_build_tool(&dir), Some("Gradle"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    // Real repro: spring-petclinic ships pom.xml+mvnw AND build.gradle+gradlew
+    // as a deliberate "buildable with either" demo — the exact shape that
+    // made `scip-java index` (with no --build-tool) exit 1 and CALM's Java
+    // overlay fail at 0% formal tier, silently, before this fix (B3,
+    // 2026-07-28 benchmark root-cause).
+    fn detect_java_build_tool_breaks_tie_toward_maven_when_both_present() {
+        let dir = std::env::temp_dir().join(format!("ci_java_dual_buildtool_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("pom.xml"), "").unwrap();
+        std::fs::write(dir.join("mvnw"), "").unwrap();
+        std::fs::write(dir.join("build.gradle"), "").unwrap();
+        std::fs::write(dir.join("gradlew"), "").unwrap();
+        assert_eq!(detect_java_build_tool(&dir), Some("Maven"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn detect_java_build_tool_none_when_neither_present() {
+        let dir = std::env::temp_dir().join(format!("ci_java_no_buildtool_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(detect_java_build_tool(&dir), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn java_build_command_passes_detected_build_tool_flag() {
+        let dir = std::env::temp_dir().join(format!("ci_java_build_cmd_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("pom.xml"), "").unwrap();
+        let cmd = java_build_command(Path::new("scip-java"), &dir, Path::new("out.scip"));
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let flag_pos = args.iter().position(|a| a == "--build-tool");
+        assert!(flag_pos.is_some(), "expected --build-tool in {args:?}");
+        assert_eq!(args[flag_pos.unwrap() + 1], "Maven");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    // Regression for run_indexer's stderr capture (B3): a failing indexer's
+    // real stderr must end up in the bail! message, not be discarded.
+    fn stderr_tail_includes_captured_content() {
+        let path = std::env::temp_dir().join(format!("ci_stderr_tail_{}.txt", std::process::id()));
+        std::fs::write(&path, "line1\nline2\nMultiple build tools detected\n").unwrap();
+        let tail = stderr_tail(&path);
+        assert!(tail.contains("Multiple build tools detected"), "got: {tail}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn stderr_tail_empty_for_missing_file() {
+        let path = std::env::temp_dir().join(format!("ci_stderr_tail_missing_{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(stderr_tail(&path), "");
     }
 
     /// Same invariant, for the C# provider added in P2.3.
