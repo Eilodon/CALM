@@ -810,7 +810,8 @@ mod tests {
     }
 
     #[test]
-    fn test_is_new_symbol_false_when_signature_hunk_had_removal_even_with_zero_callers_and_all_lines_added() {
+    fn test_is_new_symbol_false_when_signature_hunk_had_removal_even_with_zero_callers_and_all_lines_added()
+     {
         // The bug this closes: a comment-only edit on a ZERO-caller function
         // (`caller_count == 0`, so the caller_count guard above doesn't save
         // it) renders as remove-old+add-new for its signature line — every

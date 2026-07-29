@@ -561,8 +561,7 @@ fn extract_file_data(
             .get(&(c.enclosing_name.clone(), c.enclosing_line))
             .cloned()
             .or_else(|| {
-                (c.enclosing_name == MODULE_ENCLOSING)
-                    .then(|| format!("{rel}::{MODULE_ENCLOSING}"))
+                (c.enclosing_name == MODULE_ENCLOSING).then(|| format!("{rel}::{MODULE_ENCLOSING}"))
             });
         if let Some(enc_qn) = enc_qn {
             let mut confidence;

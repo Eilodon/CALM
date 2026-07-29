@@ -1764,8 +1764,8 @@ pub fn extract_calls_from_tree(
     // (lang_constants.rs), so both are covered without a separate check.
     // Every other language keeps its prior `None` (unattributed top-level
     // calls stay dropped, unchanged behavior) until validated separately.
-    let initial_enclosing = matches!(language, "javascript" | "typescript")
-        .then(|| (MODULE_ENCLOSING.to_string(), 0));
+    let initial_enclosing =
+        matches!(language, "javascript" | "typescript").then(|| (MODULE_ENCLOSING.to_string(), 0));
     walk_calls(
         tree.root_node(),
         source,
