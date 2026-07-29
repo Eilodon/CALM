@@ -381,7 +381,11 @@ fn insert_missing_edges(
             already_represented.insert((from_path, call_line, def_path, def_line as i64));
             satisfied_sites.insert((from_path.to_string(), call_line));
             if n > 0 {
-                rule_out_stale_stmt.execute(rusqlite::params![from_path, call_line as i64, def_path])?;
+                rule_out_stale_stmt.execute(rusqlite::params![
+                    from_path,
+                    call_line as i64,
+                    def_path
+                ])?;
             }
             inserted += n;
         }
@@ -822,7 +826,10 @@ mod tests {
             },
         ];
         let stats = ingest_occurrences(&conn, &occ, true).unwrap();
-        assert_eq!(stats.inserted, 1, "correct target should get a new formal edge");
+        assert_eq!(
+            stats.inserted, 1,
+            "correct target should get a new formal edge"
+        );
 
         let (confidence, ruled_out): (String, i64) = conn
             .query_row(
@@ -832,7 +839,10 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert_eq!(confidence, "ambiguous", "edge_confidence itself is left untouched");
+        assert_eq!(
+            confidence, "ambiguous",
+            "edge_confidence itself is left untouched"
+        );
         assert_eq!(
             ruled_out, 1,
             "stale wrong edge must be ruled out now that a formal replacement exists at the same site"

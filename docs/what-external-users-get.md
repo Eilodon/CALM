@@ -20,7 +20,7 @@ This page describes exactly what you get from **installing CALM via `npx @eilodo
 
 ---
 
-## 2. 29 MCP tools across an 8-stage workflow
+## 2. 30 MCP tools across an 8-stage workflow
 
 **Navigation**: `search`, `locate`, `file_overview`, `symbol_info`, `source`, `understand`, `symbols_batch`
 **Repo health**: `repo_overview`, `hotspots`, `fitness_report`
@@ -32,11 +32,12 @@ This page describes exactly what you get from **installing CALM via `npx @eilodo
 **Memory**: `remember`, `recall`
 **Recovery**: `indexing_status`, `session_context`
 **Overlay refresh**: `scip_refresh`, `lsp_refresh`
+**Session control**: `set_toolset` (narrow/reset this session's exposed tools at runtime)
 
 ### Toolsets and presets — two layers, not one flat list
 
 - **13 fine-grained toolsets** (module-domain): `trace`, `locate`, `orient`, `memory`, `guardrails`, `recover`, `scip`, `lsp`, `security`, `testgap`, `inspect`, `edit`, `patterndebt`
-- **5 cross-cutting presets**: `full` (default, all 29 tools), `orient`, `trace`, `edit`, `compound`
+- **5 cross-cutting presets**: `full` (default, all 30 tools), `orient`, `trace`, `edit`, `compound`
 - Composable syntax: `--preset "trace,security"` unions toolsets, `--preset "full,-edit"` subtracts one — an unrecognized token is a hard error, never a silent grant of full access
 
 ---

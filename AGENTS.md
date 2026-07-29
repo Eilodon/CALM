@@ -12,7 +12,7 @@ Full stage-by-stage guide, all 8 Mandatory Rules, the Preset table, and Tool Qui
 
 ---
 
-> 29 tools. 8 stages. Every response carries `suggested_next` — follow it.
+> 30 tools. 8 stages. Every response carries `suggested_next` — follow it.
 ---
 
 ## Core Principles
@@ -23,7 +23,7 @@ Full stage-by-stage guide, all 8 Mandatory Rules, the Preset table, and Tool Qui
 
 **`edit_context` is PRE-edit. `diff_impact` is POST-edit.** Never swap them.
 
-**MCP Prompts for recurring workflows.** `review_symbol(symbol)`, `debug_symbol(symbol)`, `onboard_area(path)` package a whole multi-stage sequence (e.g. Stage 2→3→5 for `review_symbol`) into one message, surfaced by clients as slash-commands. A prompt returns instructions only — it does not call tools itself; you still execute each step. Use one when a user's ask matches its shape instead of re-deriving the stage sequence from scratch.
+**MCP Prompts for recurring workflows.** `review_symbol(symbol)`, `debug_symbol(symbol)`, `onboard_area(path)`, and `review_pr(range)` each package a whole multi-stage sequence (e.g. Stage 2→3→5 for `review_symbol`) into one message, surfaced by clients as slash-commands; `calm_workflow()` (no argument) instead returns this same condensed 8-stage guide rather than a task-scoped sequence — useful cold, or as a mid-session refresher. A prompt returns instructions only — it does not call tools itself; you still execute each step. Use one when a user's ask matches its shape instead of re-deriving the stage sequence from scratch.
 
 ---
 
@@ -259,13 +259,15 @@ remember("auth-flow", "OAuth callback must validate state param — see incident
 
 | Stage | Primary Tools | Replaces Native |
 |-------|--------------|-----------------|
-| 1 Orient | `repo_overview`, `hotspots`, `fitness_report` | Directory scanning, README reading |
+| 1 Orient | `repo_overview`, `hotspots`, `fitness_report`, `test_gap_hotspots` (coreness × test-coverage-gap ranking) | Directory scanning, README reading |
 | 2 Locate | `locate`, `search`, `file_overview` | `grep`, file search |
-| 3 Inspect | `source`, `symbol_info`, `understand` | `cat` / full file read |
+| 3 Inspect | `source`, `symbol_info`, `understand`, `symbols_batch` (batch source+callers/callees for several exact `qualified_name`s) | `cat` / full file read |
 | 4 Trace | `callers`, `callees`, `path`, `dependencies` | Manual call tracing |
 | 5 Pre-Edit | `edit_context` | *(no native equivalent)* |
-| 6 Edit | `edit_symbol`, `edit_lines` (preferred), `format_files` (rustfmt via stdin, safe replacement for shelling out), `pattern_debt_register`/`pattern_debt_status` (track a duplicated bug pattern) | native `Edit`/`Write` (fallback for new/untracked files) || 7 Verify | `diff_impact` | *(no native equivalent)* |
+| 6 Edit | `edit_symbol`, `edit_lines` (preferred), `format_files` (rustfmt via stdin, safe replacement for shelling out), `pattern_debt_register`/`pattern_debt_status` (track a duplicated bug pattern) | native `Edit`/`Write` (fallback for new/untracked files) |
+| 7 Verify | `diff_impact` | *(no native equivalent)* |
 | 8 Recover | `session_context`, `indexing_status`, `remember`, `recall` | *(no native equivalent)* |
+| Cross-cutting | `scip_refresh`/`lsp_refresh` (force one or every SCIP/LSP provider now, bypassing refresh policy), `scan_text` (prompt-injection/credential heuristics on any text, even outside the index), `set_toolset` (narrow/reset this session's exposed tools at runtime) | *(no native equivalent)* |
 
 ---
 
@@ -289,7 +291,7 @@ remember("auth-flow", "OAuth callback must validate state param — see incident
 | `trace` | `repo_overview`, `search`, `locate`, `symbol_info`, `source`, `callers`, `callees`, `path`, `dependencies`, `indexing_status` | Call graph traversal |
 | `edit` | `repo_overview`, `search`, `locate`, `symbol_info`, `source`, `callers`, `callees`, `edit_context`, `edit_lines`, `edit_symbol`, `diff_impact`, `indexing_status` | Code modification workflow |
 | `compound` | `repo_overview`, `locate`, `hotspots`, `fitness_report`, `source`, `understand`, `edit_context`, `diff_impact`, `session_context`, `indexing_status`, `remember`, `recall` | Full workflow, no raw graph traversal |
-| `full` | All 29 tools | Default; use when workflow spans multiple stages |
+| `full` | All 30 tools | Default; use when workflow spans multiple stages |
 `--preset` is set once at server startup and cannot change mid-session. Use `full` (default) when the workflow spans multiple stages. Use specific presets only when scope is locked to one stage.
 
 Beyond the 5 named presets above, `--preset`/`config.json`'s `preset` field also accept a **composable toolset spec**: a comma-separated list of toolset (module-domain) names — `trace`, `locate`, `orient`, `memory`, `guardrails`, `recover`, `scip`, `lsp`, `security`, `testgap`, `inspect`, `edit`, `patterndebt` — optionally prefixed with `-` to subtract that toolset instead of adding it. E.g. `--preset "trace,security"` unions two toolsets; `--preset "full,-edit"` is every tool except the edit toolset's (`edit_symbol`/`edit_lines`/`format_files`). This is a different, finer-grained axis than the 5 named presets (which are hand-curated cross-cutting workflow bundles, not toolset unions) — an unrecognized token in either syntax is a hard startup error, never a silent full-access fallback.
