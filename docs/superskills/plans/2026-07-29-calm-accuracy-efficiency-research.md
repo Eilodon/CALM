@@ -319,3 +319,41 @@ Tôi trích đúng bài học "query DB, đừng tin tool output về chính nó
 khẳng định một sự *vắng mặt* (arity-gate) chỉ từ một lần đọc code cục bộ, không grep, không query DB. Quy tắc
 cứng rút ra: **mọi claim dạng "X không tồn tại / thiếu Y" phải đi kèm một `grep` toàn repo + (nếu là data)
 một truy vấn DB, trước khi viết xuống.**
+
+---
+
+# §7 — Verification pass hoàn tất (2026-07-29): đóng mọi điểm còn nghi ngờ trước khi thực thi
+
+Yêu cầu: không thực thi gì khi còn mơ hồ. Mọi điểm "chưa verify" ở §6 + mọi giả định gián tiếp đã được đóng
+bằng ground truth (đọc code / query `.calm/index.db`). Không còn điểm mở nào chưa kiểm.
+
+| # | Điểm nghi ngờ | Kết luận | Bằng chứng |
+|---|---|---|---|
+| V1 | `potion-code-16M` = static/model2vec? | ✅ **ĐÚNG** | `model2vec-rs 0.2.1` (Cargo:36), `StaticModel` (`embedding.rs:54`), 256-dim, weights `include_bytes!` (`embedding.rs:93-95`), distilled từ `nomic-ai/CodeRankEmbed` (`embedding.rs:88`) |
+| V2 | Scope arity **định nghĩa** (`symbols.arity`) | ✅ **Elixir-only** | `parser.rs:723` `if language == "elixir"`; DB: `arity_non_null=0` cho MỌI ngôn ngữ repo này (Rust 2665/0) |
+| V3 | Scope arity **call-site** (`arg_count`) | ✅ **Rộng, đã có** | `count_arguments_node` chung (`parser.rs:520/1679`); DB: `call_sites.arg_count` populate 23521/24717 (95%) trên repo Rust |
+| V4 | SCIP provider coverage | ✅ **9 provider** | `provider.rs`: rust/go/python/js-ts/java/csharp/php/ruby/c-cpp. Không provider ⇒ Kotlin(một phần)/Swift/Scala/Dart/Lua/Elixir/Haskell/OCaml/Zig/PowerShell/Groovy |
+| V5 | F3 (`blast_radius` lọc ambiguous?) | ✅ **ĐÃ FIX** | `guardrails.rs:175` `.filter(\|e\| e.edge_confidence != "ambiguous")` |
+| V6 | F4 (caveat NOT_FOUND phân biệt stdlib?) | ✅ **ĐÃ FIX** | `outcome.rs:222-233` nêu rõ "does not index standard-library/builtin/third-party... hybrid only surfaces code that USES it, never its definition" |
+| V7 | F5 (weak_cross_ref có mẫu-số?) | ✅ **ĐÃ FIX** | `repo_overview.weak_cross_reference_languages[].indexed_file_count` đã có |
+| V8 | C1-C4 (dedup) | ✅ **ĐÃ FIX (đo DB)** | `idx_call_edges_unique` + `idx_import_edges_unique`; **0 dup tuple** đo trực tiếp |
+| V9 | C5 (search ranking) | ✅ **ĐÃ FIX** | `search.rs:262-331` EXACT_NAME_SEED/CORENESS_WEIGHT/EXACT_NAME_BONUS |
+| V10 | Thiếu reranker sau RRF | ✅ **Đúng, còn mở** | `search_hybrid` kết ở `rrf_merge_n`, không post-fusion stage |
+| V11 | coreness vào hybrid | ✅ **Chỉ qua leg FTS** | `search.rs:1019` gọi `search_symbol`; 2 leg semantic chưa boost |
+| V12 | B7/B8 benchmark | ✅ **Vẫn Planned** | `benchmarks/README.md:16-17`; `b12` là tool-surface correctness (khác task-correctness) |
+
+## Đòn bẩy còn thật sự MỞ sau verify (chỉ những cái này đáng thực thi)
+
+1. **A′ — tổng quát-hoá arity-gate** *(scope đã chốt chính xác)*: nửa call-site (`arg_count`) đã có sẵn cho
+   nhiều ngôn ngữ. Việc thật = (a) compute `ParsedSymbol.arity` (đếm param định nghĩa) ngoài Elixir tại
+   `parser.rs:723`, per-grammar; (b) nới guard `pipeline.rs:965` khỏi `== "elixir"`, **giữ soundness**:
+   soft/fail-open cho overload/default/vararg, **tắt cho ngôn ngữ curry** (OCaml/Haskell). Lợi ích: chỉ
+   ngôn ngữ **không có SCIP provider** (V4). Đo trước/sau bằng `benchmarks/resolution` trên đúng nhóm đó.
+2. **C — coreness/reranker across-legs** (V10/V11): áp boost cho cả nguồn semantic và/hoặc re-rank sau RRF.
+   Phổ quát mọi user/mọi query, rủi ro thấp.
+3. **D — embedding backend tuỳ chọn** (V1): giữ potion mặc định, opt-in model mạnh hơn cho user cần recall.
+4. **F — B7/B8** (V12): task-correctness + model-tier leveling — bằng chứng chiến lược.
+5. **B — mở rộng stack-graphs formal tier** — dài hạn.
+
+## Đã đóng, KHÔNG cần làm (đừng lãng phí effort)
+Rec **E gốc** (F3/F4/F5) — **tất cả đã fix** (V5/V6/V7). C1-C5 đã fix (V8/V9). Không đụng vào các mục này nữa.
