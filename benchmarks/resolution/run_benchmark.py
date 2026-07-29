@@ -37,8 +37,11 @@ Methodology:
      and embeddings add real wall-clock (~30s+ per medium repo) for a signal
      nobody reads here.
   3. Run `calm index --project-root <corpus>`, timing wall-clock.
-  4. Read `.calm/index.db`: join `call_edges.from_symbol` to
-     `symbols.qualified_name` to get `symbols.language`, filter to the
+  4. Read `.calm/index.db`: join `call_edges.from_path` to
+     `file_index.path` to get `file_index.language` (NOT a `symbols` join on
+     `from_symbol` -- UPGRADE_PLAN.md FIX1's `<module>` pseudo-caller edges
+     are deliberately never inserted into `symbols`, so that join would
+     silently exclude them; see `read_tier_histogram`), filter to the
      corpus's own designated language (foreign-language noise inside a repo,
      e.g. a JS build script in a Go repo, is dropped from that language's own
      row -- it would show up under its own language if that language were

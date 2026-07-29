@@ -117,6 +117,7 @@ impl CalmServer {
                 graph_mode: self.last_graph_mode.read_ok().clone(),
                 scip_overlay,
                 scip_overlays,
+                formal_resolution_timeouts: calm_core::indexer::pipeline::formal_resolution_timeout_count(),
                 suggested_next: self.filter_sn(sn),
             })
         }))
@@ -629,6 +630,16 @@ pub(crate) struct IndexingStatusOutput {
     /// `scip_overlay` being absent for the config reason.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub(crate) scip_overlays: Vec<PerLanguageOverlayStatus>,
+    /// ADR-A1: count of formal-resolution (StackGraph tier-3) cancellations
+    /// since this process started -- see `calm_core::indexer::pipeline::
+    /// formal_resolution_timeout_count`. A cancelled resolution (hit
+    /// `RESOLVE_TIMEOUT` under load) used to be silently indistinguishable
+    /// from "resolved, found nothing", so a file's call edges could flip
+    /// between `formal` and `textual` confidence across reindexes with no
+    /// visible signal. A nonzero, growing value here means that is
+    /// happening on this repo right now -- worth investigating which
+    /// files/languages before trusting `formal` counts as fully stable.
+    pub(crate) formal_resolution_timeouts: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) suggested_next: Option<SuggestedNext>,
 }

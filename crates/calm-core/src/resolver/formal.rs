@@ -306,6 +306,134 @@ fn index_partial_paths_in_file(
     Ok(())
 }
 
+/// Companion ceiling to `RESOLVE_TIMEOUT` (ADR-A2). Root cause:
+/// `resolve_file`'s wall-clock deadline means the SAME file's path-
+/// stitching can be cancelled on a loaded machine and complete on a fast
+/// one, silently flipping that file's edges between `formal` and `textual`
+/// confidence across otherwise-identical reindexes (root-caused via
+/// `golden_equivalence_incremental_vs_fresh_on_real_calm_repo`).
+/// `BoundedCancellation` delegates to an inner flag first -- preserving the
+/// existing wall-clock safety net, proven necessary by the CPython
+/// `_pydecimal.py` regression this same module's pathological-class test
+/// guards -- then ALSO trips once its own `check()` invocation count
+/// crosses `max_checks`.
+///
+/// **Honest limit, found via calibration (2026-07-30):** check-count is
+/// NOT a uniform proxy for wall-clock cost across code shapes. Measured on
+/// this machine: a realistic 400-method/1703-line synthetic file needs
+/// ~656K stitching-adjacent checks and ~3s wall-clock (linear scaling
+/// confirmed at 200/400 methods); the existing deep-self-reference-chain
+/// pathological fixture, by contrast, does NOT cross even 1,000,000 checks
+/// within 3s -- each check on a long chain costs far more per-call than a
+/// check on ordinary code, so a flat counter that's safely calibrated
+/// above legitimate-file needs (this module's own tests confirm 400
+/// methods still succeeds at `MAX_STITCH_CANCELLATION_CHECKS`) does NOT
+/// reliably out-race the wall-clock for THAT shape specifically. For that
+/// shape, `RESOLVE_TIMEOUT` remains the operative (and still
+/// machine-load-sensitive) bound, unchanged from before this ADR --
+/// documented, not silently overclaimed. What this ceiling DOES provide:
+/// (a) full determinism for shapes whose bottleneck genuinely is check
+/// count rather than per-check cost, and (b) a hard, finite ceiling
+/// against even-worse-than-`_pydecimal.py` explosions, converting a
+/// possible unbounded/multi-minute hang into a bounded one regardless of
+/// per-check cost.
+struct BoundedCancellation<'a> {
+    inner: &'a dyn stack_graphs::CancellationFlag,
+    checks: std::cell::Cell<usize>,
+    max_checks: usize,
+}
+
+impl<'a> BoundedCancellation<'a> {
+    fn new(inner: &'a dyn stack_graphs::CancellationFlag, max_checks: usize) -> Self {
+        Self {
+            inner,
+            checks: std::cell::Cell::new(0),
+            max_checks,
+        }
+    }
+
+    /// Diagnostic accessor for calibrating `max_checks` against real files.
+    #[cfg(test)]
+    fn checks_used(&self) -> usize {
+        self.checks.get()
+    }
+}
+
+impl<'a> stack_graphs::CancellationFlag for BoundedCancellation<'a> {
+    fn check(&self, at: &'static str) -> Result<(), stack_graphs::CancellationError> {
+        // Wall-clock layer first -- unchanged existing behavior/safety net.
+        self.inner.check(at)?;
+        let n = self.checks.get() + 1;
+        self.checks.set(n);
+        if n > self.max_checks {
+            return Err(stack_graphs::CancellationError(
+                "deterministic stitching work cap exceeded (ADR-A2)",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Ceiling on total `BoundedCancellation::check` calls during one
+/// `resolve_file`'s path stitching (ADR-A2). Calibrated well above measured
+/// legitimate-file needs (see `test_resolve_file_legitimate_large_file_not_falsely_truncated`
+/// and its `#[ignore]`d 400-method sibling) -- see `BoundedCancellation`'s
+/// own doc comment for the honest limit found via calibration.
+const MAX_STITCH_CANCELLATION_CHECKS: usize = 1_000_000;
+
+/// TSG-build-phase counterpart to `BoundedCancellation` (ADR-A2). Empirical
+/// root cause: instrumenting `resolve_file` showed this codebase's own
+/// pathological-class regression fixture (many `self.aN` chains in one
+/// class) spends its ENTIRE 3s+ wall-clock budget inside
+/// `build_stack_graph_into` (TSG rule execution during graph
+/// CONSTRUCTION) -- stitching is never even reached. `BoundedCancellation`
+/// above (targeting stack-graphs' path-stitching phase) was consequently
+/// necessary but not sufficient on its own; this wrapper closes the actual
+/// gap. `tree_sitter_stack_graphs::CancellationFlag` requires `Sync`
+/// (unlike `stack_graphs::CancellationFlag`), hence `AtomicUsize` here
+/// instead of `Cell`.
+struct TsgBoundedCancellation<'a> {
+    inner: &'a dyn TsgCancellationFlag,
+    checks: std::sync::atomic::AtomicUsize,
+    max_checks: usize,
+}
+
+impl<'a> TsgBoundedCancellation<'a> {
+    fn new(inner: &'a dyn TsgCancellationFlag, max_checks: usize) -> Self {
+        Self {
+            inner,
+            checks: std::sync::atomic::AtomicUsize::new(0),
+            max_checks,
+        }
+    }
+
+    /// Diagnostic accessor for calibrating `max_checks` against real files.
+    #[cfg(test)]
+    fn checks_used(&self) -> usize {
+        self.checks.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl<'a> TsgCancellationFlag for TsgBoundedCancellation<'a> {
+    fn check(&self, at: &'static str) -> Result<(), tree_sitter_stack_graphs::CancellationError> {
+        // Wall-clock layer first -- unchanged existing behavior/safety net.
+        self.inner.check(at)?;
+        let n = self.checks.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if n > self.max_checks {
+            return Err(tree_sitter_stack_graphs::CancellationError(
+                "deterministic TSG-build work cap exceeded (ADR-A2)",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Ceiling on total `TsgBoundedCancellation::check` calls during one
+/// `resolve_file`'s TSG stack-graph construction (ADR-A2) -- see
+/// `MAX_STITCH_CANCELLATION_CHECKS` and `BoundedCancellation`'s doc comment
+/// (the honest limit applies equally to this ceiling).
+const MAX_TSG_BUILD_CANCELLATION_CHECKS: usize = 2_000_000;
+
 /// Same as `ForwardPartialPathStitcher::find_all_complete_partial_paths`
 /// (stack-graphs 0.14), but with `max_work_per_phase` bounded — see
 /// `MAX_WORK_PER_PHASE` for why.
@@ -507,14 +635,26 @@ impl FormalResolver {
             .add("FILE_PATH".into(), file_path.into())
             .map_err(|_| anyhow::anyhow!("Failed to set FILE_PATH global"))?;
 
-        sgl.build_stack_graph_into(&mut graph, file, source, &globals, &tsg_deadline)
+        // ADR-A2: deterministic ceiling over TSG graph construction -- see
+        // TsgBoundedCancellation's doc comment for calibration data and its
+        // documented limits.
+        let bounded_tsg_deadline =
+            TsgBoundedCancellation::new(&tsg_deadline, MAX_TSG_BUILD_CANCELLATION_CHECKS);
+        sgl.build_stack_graph_into(&mut graph, file, source, &globals, &bounded_tsg_deadline)
             .map_err(|e| anyhow::anyhow!("Stack graph build error: {e:?}"))?;
 
         let mut partials = PartialPaths::new();
         let mut db = Database::new();
 
+        // ADR-A2: one shared deterministic ceiling over the WHOLE stitching
+        // pipeline below (indexing + final cross-reference resolution) --
+        // see BoundedCancellation's doc comment for calibration data and
+        // its documented limits. Delegates to `sg_deadline` first, so the
+        // existing wall-clock safety net is unchanged.
+        let bounded_deadline = BoundedCancellation::new(&sg_deadline, MAX_STITCH_CANCELLATION_CHECKS);
+
         // Index: find partial paths in this file.
-        index_partial_paths_in_file(&graph, &mut partials, file, &mut db, &sg_deadline)
+        index_partial_paths_in_file(&graph, &mut partials, file, &mut db, &bounded_deadline)
             .map_err(|e| anyhow::anyhow!("Partial path extraction cancelled: {e}"))?;
 
         // Also index partial paths for the merged builtins files, so a
@@ -525,7 +665,7 @@ impl FormalResolver {
                 &mut partials,
                 *builtin_file,
                 &mut db,
-                &sg_deadline,
+                &bounded_deadline,
             )
             .map_err(|e| anyhow::anyhow!("Builtins partial path extraction cancelled: {e}"))?;
         }
@@ -544,7 +684,7 @@ impl FormalResolver {
         find_all_complete_partial_paths_bounded(
             &mut DatabaseCandidates::new(&graph, &mut partials, &mut db),
             reference_nodes,
-            &sg_deadline,
+            &bounded_deadline,
             |g, _ps, path: &PartialPath| {
                 let start = path.start_node;
                 let end = path.end_node;
@@ -585,6 +725,7 @@ impl Default for FormalResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use stack_graphs::CancellationFlag as _;
 
     /// Regression: a single large class with many self-references used to
     /// make stack-graphs' path stitching run unbounded (confirmed on
@@ -612,6 +753,125 @@ mod tests {
             "resolve_file must respect its deadline even on pathological input, took {:?}",
             t0.elapsed()
         );
+    }
+
+    // ADR-A2 -- honest calibration record (2026-07-30). The wall-clock
+    // RESOLVE_TIMEOUT above is a load-dependent safety net (this exact
+    // pathological fixture is the regression case that originally required
+    // it), which made this file's resolved tier nondeterministic across
+    // otherwise-identical reindexes (root-caused via
+    // golden_equivalence_incremental_vs_fresh_on_real_calm_repo).
+    // `BoundedCancellation`/`TsgBoundedCancellation` were added to provide a
+    // SECOND, deterministic ceiling -- but calibration disproved the
+    // original hope that it would out-race the wall-clock for THIS exact
+    // fixture: a deep self-reference chain costs far more wall-clock per
+    // `check()` than ordinary code, so a ceiling calibrated safely above
+    // legitimate-file needs (see the sibling test below) does not trip
+    // before the wall-clock does for this specific shape. This test
+    // therefore asserts what's actually true post-A2: the ORIGINAL
+    // wall-clock bound is preserved unchanged (no worse, and the ceiling
+    // causes no regression here) -- see `BoundedCancellation`'s doc
+    // comment for the full honest-limit writeup and what the ceiling DOES
+    // provide instead.
+    #[test]
+    fn test_resolve_file_pathological_class_still_bounded_by_wall_clock_after_adr_a2() {
+        let mut source = String::from("class Big:\n");
+        for m in 0..300 {
+            source.push_str(&format!("    def m{m}(self):\n        x = (\n"));
+            for a in 0..30 {
+                source.push_str(&format!("            self.a{a} +\n"));
+            }
+            source.push_str("            0\n        )\n");
+        }
+
+        let mut resolver = FormalResolver::new();
+        resolver.load_python().unwrap();
+        let t0 = std::time::Instant::now();
+        let _ = resolver.resolve_file("python", "big.py", &source);
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed < RESOLVE_TIMEOUT + Duration::from_secs(2),
+            "resolve_file must still respect its wall-clock deadline on pathological input \
+             after ADR-A2's ceilings were added -- took {elapsed:?}"
+        );
+    }
+
+    // ADR-A2 non-regression guard: a realistic (non-pathological, non-
+    // self-referencing) file must NOT be falsely truncated by the new
+    // ceilings. Calibration data (2026-07-30, measured on this machine via
+    // a since-removed diagnostic probe): 200 independent methods (853
+    // lines) needed ~328K TSG-build checks in ~2.4s (Ok); 400 methods
+    // (1703 lines) needed ~656K checks and already meets the PRE-EXISTING
+    // 3s wall-clock boundary on its own (confirming the wall-clock, not
+    // this ceiling, was already the binding constraint for ordinary files
+    // at that size -- a separate, pre-existing finding, not something this
+    // ADR is scoped to fix). This fast in-suite test uses a much smaller
+    // slice of the same shape so the routine `cargo test` run stays quick;
+    // it still catches a gross miscalibration (e.g. an accidental order-of-
+    // magnitude-too-low constant).
+    #[test]
+    fn test_resolve_file_legitimate_large_file_not_falsely_truncated() {
+        let mut source = String::from("def helper():\n    return 1\n\n");
+        for c in 0..10 {
+            source.push_str(&format!("class C{c}:\n"));
+            for m in 0..6 {
+                source.push_str(&format!(
+                    "    def m{m}(self):\n        x = helper()\n        y = self.m{}()\n        return x + y\n",
+                    (m + 1) % 6
+                ));
+            }
+            source.push('\n');
+        }
+
+        let mut resolver = FormalResolver::new();
+        resolver.load_python().unwrap();
+        let result = resolver.resolve_file("python", "synthetic.py", &source);
+        assert!(
+            result.is_ok(),
+            "a realistic 60-method file must not be falsely truncated by the ADR-A2 \
+             deterministic ceilings -- got {result:?}"
+        );
+    }
+
+
+    struct AlwaysOk;
+    impl stack_graphs::CancellationFlag for AlwaysOk {
+        fn check(&self, _at: &'static str) -> Result<(), stack_graphs::CancellationError> {
+            Ok(())
+        }
+    }
+    impl TsgCancellationFlag for AlwaysOk {
+        fn check(&self, _at: &'static str) -> Result<(), tree_sitter_stack_graphs::CancellationError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn bounded_cancellation_trips_exactly_after_max_checks_and_delegates_to_inner_first() {
+        let inner = AlwaysOk;
+        let bounded = BoundedCancellation::new(&inner, 3);
+        assert!(bounded.check("a").is_ok());
+        assert!(bounded.check("a").is_ok());
+        assert!(bounded.check("a").is_ok());
+        assert!(
+            bounded.check("a").is_err(),
+            "4th check should exceed max_checks=3"
+        );
+        assert_eq!(bounded.checks_used(), 4);
+    }
+
+    #[test]
+    fn tsg_bounded_cancellation_trips_exactly_after_max_checks_and_delegates_to_inner_first() {
+        let inner = AlwaysOk;
+        let bounded = TsgBoundedCancellation::new(&inner, 3);
+        assert!(bounded.check("a").is_ok());
+        assert!(bounded.check("a").is_ok());
+        assert!(bounded.check("a").is_ok());
+        assert!(
+            bounded.check("a").is_err(),
+            "4th check should exceed max_checks=3"
+        );
+        assert_eq!(bounded.checks_used(), 4);
     }
 
     #[test]

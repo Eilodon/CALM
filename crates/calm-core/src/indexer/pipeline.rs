@@ -306,6 +306,53 @@ type ExtractedBatchRow = (
     Option<ExtractedFile>,
 );
 
+/// Process-global counter of formal-resolution cancellations/timeouts
+/// (ADR-A1) -- surfaced via `indexing_status` so a silently-cancelled
+/// `resolve_file` call is no longer invisible. A cancelled resolution must
+/// never be treated as equivalent to "resolved, found nothing": both used
+/// to collapse to the same empty `HashSet`, so a file's call-graph edges
+/// could silently flip between `formal` and `textual` confidence across
+/// reindexes purely due to machine load, with zero signal to explain why.
+static FORMAL_RESOLUTION_TIMEOUTS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Count of formal-resolution cancellations since this process started --
+/// see `FORMAL_RESOLUTION_TIMEOUTS` and `IndexingStatusOutput::
+/// formal_resolution_timeouts`. A nonzero, growing count on a real repo
+/// means `RESOLVE_TIMEOUT` (formal.rs) is tripping under load, silently
+/// denying some files their `formal` confidence upgrade this pass -- see
+/// ADR-A2 for the deterministic (machine-load-independent) follow-up.
+pub fn formal_resolution_timeout_count() -> u64 {
+    FORMAL_RESOLUTION_TIMEOUTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Distinguishes `resolve_file` completing with no formal edges
+/// (`Ok(vec![])`) from being cancelled/timed out (`Err`) -- previously both
+/// collapsed to an identical empty `HashSet` via `.unwrap_or_default()`, so
+/// a file's call sites could silently flip from `formal` to `textual`
+/// confidence across reindexes purely from timing jitter, with no signal to
+/// tell the two cases apart (ADR-A1). `Err` still degrades to an empty set
+/// here (unchanged behavior for the `formally_resolved.contains(...)` check
+/// below -- tier-1/tier-2 confidence is untouched either way), but now
+/// increments a counter and logs a warning instead of failing silently.
+fn formally_resolved_names(
+    result: anyhow::Result<Vec<crate::resolver::formal::FormalEdge>>,
+    lang: &str,
+    rel: &str,
+) -> HashSet<String> {
+    match result {
+        Ok(edges) => edges.into_iter().map(|e| e.reference_symbol).collect(),
+        Err(e) => {
+            FORMAL_RESOLUTION_TIMEOUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::warn!(
+                "formal resolution cancelled for {rel} ({lang}): {e} -- calls in this file \
+                 cannot be upgraded to `formal` confidence this pass"
+            );
+            HashSet::new()
+        }
+    }
+}
+
 /// Parse and resolve one file's symbols, imports, and call sites. No DB access —
 /// safe to run concurrently across files (see [`run_indexing_pipeline`]).
 ///
@@ -487,12 +534,7 @@ fn extract_file_data(
     // "formal" — a higher-confidence tier than heuristic type inference.
     // Falls back to empty on unsupported languages or parse errors (non-fatal).
     let formally_resolved: HashSet<String> = if formal.has_language(lang) {
-        formal
-            .resolve_file(lang, rel, source)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|e| e.reference_symbol)
-            .collect()
+        formally_resolved_names(formal.resolve_file(lang, rel, source), lang, rel)
     } else {
         HashSet::new()
     };
@@ -2484,6 +2526,50 @@ mod tests {
         assert_eq!(
             data.symbol_count, 1,
             "the <module> pseudo-caller must never become a real indexed symbol: {symbol_names:?}"
+        );
+    }
+
+    // ADR-A1: formal resolution can be cancelled (RESOLVE_TIMEOUT / a
+    // deterministic work cap, see ADR-A2) -- `formally_resolved_names` must
+    // distinguish that from "resolved and genuinely found nothing" instead
+    // of silently treating both as an identical empty set with zero signal.
+    #[test]
+    fn formally_resolved_names_ok_returns_edge_names_unaffected() {
+        // No before/after counter assertion here: `FORMAL_RESOLUTION_TIMEOUTS`
+        // is a single process-global static shared by every test binary
+        // thread, so a concurrently-running test that legitimately hits the
+        // `Err` branch (e.g. the sibling test below) can bump it in the
+        // middle of this test's window -- that's cargo's normal parallel
+        // execution, not a bug. The "Ok path never increments" guarantee is
+        // structural (the `Ok` match arm has no reference to the counter at
+        // all -- see `formally_resolved_names`) and is exercised the other
+        // direction by the sibling `_err_` test asserting a real increase.
+        let edges = vec![crate::resolver::formal::FormalEdge {
+            reference_symbol: "foo".to_string(),
+            definition_symbol: "bar".to_string(),
+        }];
+        let result = formally_resolved_names(Ok(edges), "python", "mod.py");
+        assert_eq!(result, HashSet::from(["foo".to_string()]));
+    }
+
+    #[test]
+    fn formally_resolved_names_err_returns_empty_and_increments_counter() {
+        let before = formal_resolution_timeout_count();
+        let result = formally_resolved_names(
+            Err(anyhow::anyhow!(
+                "Path stitching cancelled: Cancelled at \"finding complete partial paths\""
+            )),
+            "python",
+            "mod.py",
+        );
+        assert!(
+            result.is_empty(),
+            "Err path must degrade to an empty set -- same call-site behavior as before this fix"
+        );
+        assert!(
+            formal_resolution_timeout_count() > before,
+            "Err path must increment the observability counter -- a cancelled resolution must \
+             never be silently indistinguishable from 'resolved, found nothing'"
         );
     }
     fn count(conn: &Connection, sql: &str) -> i64 {

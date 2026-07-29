@@ -5416,6 +5416,37 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    // ADR-A1: `formal_resolution_timeouts` surfaces
+    // `calm_core::indexer::pipeline::formal_resolution_timeout_count()` so a
+    // cancelled formal resolution is no longer invisible. On a fresh process
+    // with no formal resolution attempted yet, it must be present and 0 --
+    // not absent (that would make a real agent think the field doesn't
+    // exist rather than reading "nothing cancelled so far").
+    fn indexing_status_includes_formal_resolution_timeouts_field() {
+        let dir = std::env::temp_dir().join(format!("ci_idxstatus_frt_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        let v = jv(
+            server.indexing_status(rmcp::handler::server::wrapper::Parameters(
+                IndexingStatusParams {
+                    retry_embeddings: false,
+                },
+            )),
+        );
+
+        assert!(
+            v.get("formal_resolution_timeouts").is_some(),
+            "field must always be present, not skip_serializing_if-omitted, so its absence \
+             never reads as an implicit zero: {v:?}"
+        );
+        assert!(v["formal_resolution_timeouts"].is_u64());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Regression test: `retry_embeddings` used to be a no-op (logged "not yet
     /// implemented" and did nothing). It must now reclaim a `Failed` status and
     /// re-run `bootstrap_embeddings` in the background, while leaving any other

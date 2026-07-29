@@ -243,6 +243,12 @@
           "$ref": "#/$defs/PerLanguageOverlayStatus"
         }
       },
+      "formal_resolution_timeouts": {
+        "description": "ADR-A1: count of formal-resolution (StackGraph tier-3) cancellations\nsince this process started -- see `calm_core::indexer::pipeline::\nformal_resolution_timeout_count`. A cancelled resolution (hit\n`RESOLVE_TIMEOUT` under load) used to be silently indistinguishable\nfrom \"resolved, found nothing\", so a file's call edges could flip\nbetween `formal` and `textual` confidence across reindexes with no\nvisible signal. A nonzero, growing value here means that is\nhappening on this repo right now -- worth investigating which\nfiles/languages before trusting `formal` counts as fully stable.",
+        "type": "integer",
+        "format": "uint64",
+        "minimum": 0
+      },
       "suggested_next": {
         "anyOf": [
           {

@@ -77,8 +77,15 @@ recommended order (F4, F2, F1):
   `format!("{rel}::<module>")` when the lookup misses **and**
   `enclosing_name == MODULE_ENCLOSING`, instead of dropping the call. This
   string is used only as a `call_edges.from_symbol` value — never inserted
-  into `symbols`, so symbol counts/search/hotspots/hub/coreness are
-  unaffected.
+  into `symbols`, so symbol counts/search are unaffected. **Correction
+  (2026-07-30, Finding E of the follow-up VHEATM review): `caller_count`/
+  hub/coreness are NOT unaffected** — `refresh_caller_counts` computes
+  `caller_count` via `COUNT(DISTINCT from_symbol) ... AND edge_confidence
+  != 'ambiguous'` with no join to `symbols`, so a non-ambiguous `<module>`
+  edge DOES raise its target's `caller_count` (and therefore hub/coreness).
+  This is a real, previously-understated positive of FIX1: a JS/TS function
+  called only at module level no longer falsely reads as "0 usages /
+  possibly dead code".
 
 ## 4. Status
 
@@ -204,14 +211,59 @@ Claude Sonnet 5 (agent session), on behalf of the repo owner (gokuderafight@gmai
 
 No existing `docs/superskills/pattern-debt.md` entries are affected by this
 change (checked: none of the 3 fixes touch a registered DEBT-NNN area from
-`docs/pattern-debt-registry.yaml`). New debt introduced by this cycle, not
-yet registered:
-  - `golden-repo-formal-resolver-nondeterminism`: pre-existing, newly
-    root-caused (not newly introduced) `FORMAL_RESOLVER` `OnceLock` reuse
-    causing `formal`/`textual` tier nondeterminism across two `index_fresh()`
-    calls in one process — affects only the `#[ignore]`d heavy
-    `golden_equivalence_incremental_vs_fresh_on_real_calm_repo` test, not
-    product code. Not fixed in this cycle (out of the 3-fix scope).
+`docs/pattern-debt-registry.yaml`).
+
+**`golden-repo-formal-resolver-nondeterminism` — PARTIALLY CLOSED 2026-07-30 (ADR-A1 fully; ADR-A2 partially, honest limit found via calibration).**
+The original diagnosis above (`FORMAL_RESOLVER` `OnceLock` reuse across two
+`index_fresh()` calls) was **wrong on mechanism**: `FormalResolver::resolve_file`
+takes `&self` and builds a fresh local `StackGraph`/`PartialPaths`/`Database`
+per call — reusing the cached resolver cannot itself cause divergence between
+two calls on identical input. The real root cause, found by a follow-up
+VHEATM review and fixed same-day: `resolve_file`'s `RESOLVE_TIMEOUT` (3s
+wall-clock) can trip under machine load/rayon contention; the cancelled
+`Err` was silently swallowed by `.unwrap_or_default()` (pipeline.rs),
+indistinguishable from "resolved, genuinely found nothing" — so a file's
+edges could flip `formal`↔`textual` across otherwise-identical reindexes.
+Fixed via:
+  - **ADR-A1 (fully closes the silent-failure half)**: `formally_resolved_names()`
+    helper distinguishes `Ok`/`Err`, increments a `FORMAL_RESOLUTION_TIMEOUTS`
+    counter + logs on `Err`, surfaced as `indexing_status.formal_resolution_timeouts`.
+    A cancelled resolution is no longer invisible or indistinguishable from a
+    genuine empty result.
+  - **ADR-A2 (partial — see honest limit below)**: `BoundedCancellation`/
+    `TsgBoundedCancellation` wrap both the TSG-build and stitching-phase
+    deadlines with a deterministic total-check-count ceiling (delegating to
+    the existing wall-clock deadline first, preserving the `_pydecimal.py`
+    hang-prevention guarantee). Empirically, for this codebase's own
+    pathological-class fixture, the actual unbounded work was in TSG graph
+    *construction* (`build_stack_graph_into`), not path stitching as
+    originally assumed — both phases are now bounded.
+  - **Honest limit, found via calibration against real/synthetic large files
+    (2026-07-30):** check-count is NOT a uniform proxy for wall-clock cost
+    across code shapes. A safely-calibrated ceiling (high enough that a
+    legitimate 400-method/1703-line file — needing ~656K checks — is not
+    falsely truncated) does **not** trip before the wall-clock does for the
+    existing deep-self-reference-chain pathological fixture specifically:
+    each check on a long chain costs far more wall-clock than a check on
+    ordinary code, so that shape's checks never reach even 1,000,000 within
+    3 seconds. For THAT shape, `RESOLVE_TIMEOUT` remains the operative (and
+    still machine-load-sensitive) bound, unchanged from before this ADR.
+    What ADR-A2 DOES provide: full determinism for shapes whose bottleneck
+    genuinely is check count (not per-check cost), and a hard finite
+    ceiling against even-worse-than-`_pydecimal.py` explosions regardless
+    of per-check cost (bounded, not literally unbounded). Full determinism
+    for the deep-chain shape remains open — would need a cost-weighted
+    budget (e.g. bounding total `PartialPath` length/complexity processed,
+    not just `check()` call count) or a different approach entirely (e.g.
+    content-hash memoization, keeping wall-clock as-is but caching
+    known-`Complete` results so re-hitting the SAME nondeterministic file
+    twice isn't possible — first resolution wins and is reused).
+  - Evidence: `test_resolve_file_pathological_class_still_bounded_by_wall_clock_after_adr_a2`
+    + `test_resolve_file_legitimate_large_file_not_falsely_truncated` +
+    `bounded_cancellation_trips_exactly_after_max_checks_and_delegates_to_inner_first`
+    + `tsg_bounded_cancellation_trips_exactly_after_max_checks_and_delegates_to_inner_first`
+    (all formal.rs). Full `calm-core`+`calm-server`+`parity_test` suites
+    green (859+275+6 passed, 0 failed, 12 ignored).
 
 ## 9. Next Cycle Trigger
 
@@ -219,10 +271,18 @@ When `benchmarks/resolution/run_benchmark.py --lang js` (or a future `--lang typ
 addition to that corpus map) is re-run and the `formal+resolved` share for a
 corpus's core library directory (not its examples/test directories) drops
 below 50%, OR when the deferred universal-sentinel/callback-symbol follow-up
-from UPGRADE_PLAN.md is picked up, OR when
-`golden_equivalence_incremental_vs_fresh_on_real_calm_repo` is run 3
-consecutive times with 0 failures (informal signal the `FORMAL_RESOLVER`
-nondeterminism was independently fixed and this ADR's §8b debt can close).
+from UPGRADE_PLAN.md is picked up (extending `MODULE_ENCLOSING` to Python
+first, per the follow-up review's REQUIRED-tier ranking), OR when
+`indexing_status.formal_resolution_timeouts` (ADR-A1) is observed nonzero
+and growing on a real repo — worth investigating which files/languages
+before trusting `formal` counts as fully stable, and a signal that
+`MAX_TSG_BUILD_CANCELLATION_CHECKS`/`MAX_STITCH_CANCELLATION_CHECKS`
+(ADR-A2) may need recalibrating for that repo's actual file sizes — OR
+when the ADR-A2 "honest limit" debt (deep-reference-chain shapes remain
+wall-clock-bound, not check-count-bound) is picked up, requiring either a
+cost-weighted budget (bound `PartialPath` length/complexity, not raw
+`check()` count) or content-hash memoization of `resolve_file` results
+keyed on `(file_hash, lang)`.
 
 ## 10. Cycle Retrospective
 
