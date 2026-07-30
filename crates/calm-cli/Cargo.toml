@@ -38,6 +38,13 @@ libc = "0.2"
 [features]
 default = ["embeddings", "tier0-5", "scip-overlay"]
 embeddings = ["calm-core/embeddings", "calm-server/embeddings"]
+# D, docs/superskills/plans/2026-07-30-calm-dfb-levers-design.md §3 -- opt-in,
+# NOT in `default`. No calm-server passthrough needed: calm-server only ever
+# calls calm-core's Embedder::load(model_id, dim) generically and has no
+# onnx-specific code of its own -- Cargo's feature unification means any
+# calm-core instance built into this binary already has onnx-embeddings on
+# once this crate requests it, regardless of which crate's Cargo.toml asked.
+onnx-embeddings = ["calm-core/onnx-embeddings"]
 lang-c      = ["calm-core/lang-c",      "calm-server/lang-c"]
 lang-cpp    = ["calm-core/lang-cpp",    "calm-server/lang-cpp"]
 lang-ruby   = ["calm-core/lang-ruby",   "calm-server/lang-ruby"]

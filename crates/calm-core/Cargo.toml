@@ -34,6 +34,44 @@ tree-sitter-stack-graphs-typescript = { workspace = true }
 tree-sitter-stack-graphs-java = { workspace = true }
 tree-sitter-stack-graphs-javascript = { workspace = true }
 model2vec-rs = { version = "0.2.1", optional = true }
+# Optional high-accuracy embedding backend (D, docs/superskills/plans/2026-07-30-
+# calm-dfb-levers-design.md §3): pure-Rust ONNX inference (tract) + a pure-Rust
+# tokenizer, chosen specifically to preserve the same musl/no-C-extension
+# guarantee model2vec-rs already gives the default backend (see the `embeddings`
+# feature comment below) -- `ort`/ONNX Runtime was ruled out because its own
+# build is tied to glibc. Verified live this session: a real BERT-family
+# transformer ONNX export (attention/layernorm/GELU/embeddings -- the same op
+# family as code-embedding models like CodeRankEmbed) loads, optimizes, and
+# runs a real forward pass identically under x86_64-unknown-linux-musl and
+# native glibc via a standalone spike -- this is what makes tract safe to add
+# here, not just its general "runs on musl" reputation.
+tract-onnx = { version = "0.23.4", optional = true }
+# default-features disabled deliberately: `tokenizers`'s own defaults pull in
+# `onig` (C bindings to Oniguruma) and `esaxx_fast` (`esaxx-rs/cpp`) -- found
+# live this session trying to cross-compile the confirmation spike to
+# x86_64-unknown-linux-musl, which failed looking for `x86_64-linux-musl-g++`
+# (this is exactly the class of problem `sqlite-vec` caused before, which is
+# why this crate exists in the first place). `fancy-regex` (pure Rust) is the
+# in-tree substitute for whatever `onig` was providing; re-verified after
+# switching that the musl build succeeds AND produces bit-identical output to
+# the native build (same confirmation spike, tokenize+pool+normalize+
+# semantic-signal all re-checked, not just "it compiles").
+#
+# Real musl build precondition found (documented, not eliminated -- this is
+# NOT zero-setup like the rest of CALM's musl story): `esaxx-rs` (still a
+# required, non-optional dep of `tokenizers` regardless of `esaxx_fast`) runs
+# an UNCONDITIONAL C++ compiler-family probe in its build.rs even with `cpp`
+# off, and hard-fails looking for a binary literally named
+# `x86_64-linux-musl-g++`. `musl-tools` (provides `musl-gcc`, which `cc-rs`
+# finds automatically by convention) is NOT enough by itself -- confirmed
+# live: building calm-cli for musl with this feature additionally needs
+# `CXX_x86_64_unknown_linux_musl` set to ANY C++ compiler (a native g++ is
+# fine; the actual C++ code path is never invoked since `cpp` is off, so it
+# only has to satisfy the probe, not genuinely cross-compile). Verified this
+# produces a real static-pie musl binary (`ldd` reports "statically linked",
+# `--version` runs correctly) -- see the real calm-cli build log, not just
+# the isolated spike.
+tokenizers = { version = "0.23.1", optional = true, default-features = false, features = ["fancy-regex"] }
 tree-sitter-c       = { workspace = true, optional = true }
 tree-sitter-cpp     = { workspace = true, optional = true }
 tree-sitter-ruby    = { workspace = true, optional = true }
@@ -79,6 +117,12 @@ proptest = "1"
 # `hf-hub` fallback (local path or HuggingFace Hub download).
 default = ["embeddings", "tier0-5", "scip-overlay"]
 embeddings = ["dep:model2vec-rs"]
+# Opt-in, off by default (D). Requires `embeddings` -- it's an additional
+# backend inside the same Embedder abstraction, not a replacement; the
+# default model2vec-rs path and its local-only guarantee are unchanged
+# unless a caller explicitly selects an `onnx:<dir>` model_id. See
+# embedding.rs::Embedder::load and the Cargo.toml comment on the deps above.
+onnx-embeddings = ["embeddings", "dep:tract-onnx", "dep:tokenizers"]
 # Tier-0.5 upgrade: optional per-language tree-sitter grammars for accurate
 # AST-based extraction (replaces regex fallback when compiled in).
 # Individual flags let users include only the languages they need.

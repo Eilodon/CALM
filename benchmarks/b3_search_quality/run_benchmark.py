@@ -86,6 +86,13 @@ def main() -> int:
 
             symbol_ndcg, _ = ci_search_ndcg(client, q["query"], "symbol", relevance)
             hybrid_ndcg, hybrid_degraded = ci_search_ndcg(client, q["query"], "hybrid", relevance)
+            # kind="semantic" isolates the embedding backend's own NDCG,
+            # pre-RRF-fusion -- added for D (docs/superskills/plans/2026-07-30-
+            # calm-dfb-levers-design.md §3, audit-design Finding A2): a
+            # hybrid-only score dilutes a new backend's contribution with the
+            # FTS leg, so a before/after embedding-backend comparison needs
+            # this number specifically, not just ndcg_hybrid.
+            semantic_ndcg, semantic_degraded = ci_search_ndcg(client, q["query"], "semantic", relevance)
             grep_ndcg = naive_grep_ndcg(repo_root, q["grep_pattern"], file_relevance)
 
             rows.append({
@@ -94,6 +101,8 @@ def main() -> int:
                 "ndcg_symbol": symbol_ndcg,
                 "ndcg_hybrid": hybrid_ndcg,
                 "hybrid_degraded": hybrid_degraded,
+                "ndcg_semantic": semantic_ndcg,
+                "semantic_degraded": semantic_degraded,
                 "ndcg_naive_grep": grep_ndcg,
             })
     finally:
@@ -101,8 +110,17 @@ def main() -> int:
 
     symbol_scores = [r["ndcg_symbol"] for r in rows]
     hybrid_scores = [r["ndcg_hybrid"] for r in rows]
+    semantic_scores = [r["ndcg_semantic"] for r in rows]
     grep_scores = [r["ndcg_naive_grep"] for r in rows]
     any_hybrid_active = any(not r["hybrid_degraded"] for r in rows)
+    # Finding A2's actual requirement: not "at least one query" but "every
+    # query" -- a run with even one degraded query already measured nothing
+    # for that query, and averaging it in silently understates a real
+    # embedding-backend delta. This is the number a D before/after comparison
+    # must check before trusting mean_ndcg_semantic/mean_ndcg_hybrid at all.
+    all_queries_active = all(
+        not r["hybrid_degraded"] and not r["semantic_degraded"] for r in rows
+    )
 
     summary = {
         "corpus": "self (CALM)",
@@ -111,8 +129,10 @@ def main() -> int:
         "aggregate": {
             "mean_ndcg_symbol": statistics.mean(symbol_scores),
             "mean_ndcg_hybrid": statistics.mean(hybrid_scores),
+            "mean_ndcg_semantic": statistics.mean(semantic_scores),
             "mean_ndcg_naive_grep": statistics.mean(grep_scores),
             "hybrid_active_for_any_query": any_hybrid_active,
+            "all_queries_active": all_queries_active,
             "note": (
                 "hybrid was NOT degraded for at least one query — semantic layer contributed."
                 if any_hybrid_active
@@ -122,6 +142,17 @@ def main() -> int:
                      "hybrid search quality. Re-run with --features embeddings + a downloaded "
                      "model to get a real hybrid measurement."
             ),
+            "backend_comparison_note": (
+                "SAFE to use for a before/after embedding-backend comparison "
+                "(mean_ndcg_semantic and mean_ndcg_hybrid reflect a real embedding "
+                "backend for every query)."
+                if all_queries_active
+                else "NOT SAFE for a before/after embedding-backend comparison -- at least "
+                     "one query was degraded (FTS-only fallback), so mean_ndcg_semantic/"
+                     "mean_ndcg_hybrid partially reflect 'no backend ran' rather than the "
+                     "backend under test. Fix the environment (embeddings feature compiled "
+                     "in + model available) and re-run before trusting any delta."
+            ),
         },
     }
 
@@ -129,20 +160,29 @@ def main() -> int:
     out_path.write_text(json.dumps(summary, indent=2))
 
     print()
-    print("| Query | ci (symbol) | ci (hybrid) | naive grep | hybrid degraded? |")
-    print("|---|---|---|---|---|")
+    print("| Query | ci (symbol) | ci (hybrid) | ci (semantic) | naive grep | degraded? |")
+    print("|---|---|---|---|---|---|")
     for r in rows:
+        degraded = r["hybrid_degraded"] or r["semantic_degraded"]
         print(
             f"| {r['id']} | {r['ndcg_symbol']:.3f} | {r['ndcg_hybrid']:.3f} | "
-            f"{r['ndcg_naive_grep']:.3f} | {'yes' if r['hybrid_degraded'] else 'no'} |"
+            f"{r['ndcg_semantic']:.3f} | {r['ndcg_naive_grep']:.3f} | {'yes' if degraded else 'no'} |"
         )
     print()
     agg = summary["aggregate"]
     print(
         f"mean NDCG@{NDCG_K} — ci(symbol): {agg['mean_ndcg_symbol']:.3f}, "
-        f"ci(hybrid): {agg['mean_ndcg_hybrid']:.3f}, naive grep: {agg['mean_ndcg_naive_grep']:.3f}"
+        f"ci(hybrid): {agg['mean_ndcg_hybrid']:.3f}, ci(semantic): {agg['mean_ndcg_semantic']:.3f}, "
+        f"naive grep: {agg['mean_ndcg_naive_grep']:.3f}"
     )
     print(agg["note"])
+    print(agg["backend_comparison_note"])
+    if not all_queries_active:
+        print(
+            "\n*** WARNING: this run is NOT trustworthy for a D (embedding backend) "
+            "before/after comparison -- see backend_comparison_note above. ***",
+            file=sys.stderr,
+        )
     print(f"\nfull results written to {out_path}")
     return 0
 

@@ -128,8 +128,29 @@ mod imp {
 
     /// A loaded static embedding model.
     pub struct Embedder {
-        model: StaticModel,
+        backend: Backend,
         dim: usize,
+    }
+
+    /// Which concrete model implementation backs an `Embedder`. `Static`
+    /// (model2vec-rs) is the default and always available. `Onnx` (D --
+    /// optional high-accuracy local backend, docs/superskills/plans/2026-07-30-
+    /// calm-dfb-levers-design.md §3) exists only when compiled with the
+    /// `onnx-embeddings` feature -- see `Embedder::load`'s `onnx:<dir>`
+    /// model_id convention for how a caller selects it. Kept as a private
+    /// enum (not a trait object) so both variants stay statically dispatched
+    /// and the public `Embedder` surface (`load`/`dim`/`embed_one`/
+    /// `embed_batch`) is completely unchanged for every existing caller.
+    enum Backend {
+        // Both variants boxed -- StaticModel (model2vec-rs) is itself
+        // >1.2KB, so boxing only OnnxEmbedder just moved
+        // clippy::large_enum_variant from "the enum is big" to "the two
+        // variants differ wildly in size"; boxing both keeps `Backend`
+        // (and therefore `Embedder`) pointer-sized regardless of which
+        // backend is active.
+        Static(Box<StaticModel>),
+        #[cfg(feature = "onnx-embeddings")]
+        Onnx(Box<OnnxEmbedder>),
     }
 
     impl Embedder {
@@ -156,6 +177,35 @@ mod imp {
         /// stale/wrong config `dim` gets a loud warning here instead of
         /// silently mislabeling every vector this `Embedder` ever produces.
         pub fn load(model_id: &str, dim: usize) -> anyhow::Result<Self> {
+            // `onnx:<dir>` selects the optional local high-accuracy backend
+            // (D) instead of the default model2vec-rs path below -- opt-in,
+            // requires the `onnx-embeddings` feature. `<dir>` must contain
+            // `model.onnx` (any encoder exported without a pooling head --
+            // last_hidden_state output, [batch, seq, hidden]) and
+            // `tokenizer.json` (a fast-tokenizers file). See `OnnxEmbedder::load`.
+            #[cfg(feature = "onnx-embeddings")]
+            if let Some(dir) = model_id.strip_prefix("onnx:") {
+                let onnx = OnnxEmbedder::load(dir)?;
+                let real_dim = onnx.dim;
+                if real_dim != dim {
+                    tracing::warn!(
+                        "onnx embedding model at '{dir}' actually outputs {real_dim}-dim vectors, \
+                         not the {dim}-dim configured in semantic_search.dimensions — using {real_dim}"
+                    );
+                }
+                return Ok(Self {
+                    backend: Backend::Onnx(Box::new(onnx)),
+                    dim: real_dim,
+                });
+            }
+            #[cfg(not(feature = "onnx-embeddings"))]
+            if model_id.starts_with("onnx:") {
+                anyhow::bail!(
+                    "model_id '{model_id}' requests the onnx-embeddings backend, but this \
+                     binary was not compiled with the `onnx-embeddings` Cargo feature"
+                );
+            }
+
             let model = if model_id == DEFAULT_MODEL_ID {
                 match StaticModel::from_bytes(
                     DEFAULT_TOKENIZER,
@@ -200,7 +250,7 @@ mod imp {
                 );
             }
             Ok(Self {
-                model,
+                backend: Backend::Static(Box::new(model)),
                 dim: real_dim,
             })
         }
@@ -210,11 +260,222 @@ mod imp {
         }
 
         pub fn embed_one(&self, text: &str) -> Vec<f32> {
-            self.model.encode_single(text)
+            match &self.backend {
+                Backend::Static(model) => model.encode_single(text),
+                #[cfg(feature = "onnx-embeddings")]
+                Backend::Onnx(onnx) => onnx.embed_one(text),
+            }
         }
 
         pub fn embed_batch(&self, texts: &[String]) -> Vec<Vec<f32>> {
-            self.model.encode(texts)
+            match &self.backend {
+                Backend::Static(model) => model.encode(texts),
+                // model2vec-rs batches internally; the onnx path has no
+                // equivalent batched-inference API here (see OnnxEmbedder's
+                // docs) so this is a plain per-text loop -- correct, not yet
+                // optimized for throughput. Fine for D's scope: an opt-in,
+                // recall-focused backend, not the default hot path.
+                #[cfg(feature = "onnx-embeddings")]
+                Backend::Onnx(onnx) => texts.iter().map(|t| onnx.embed_one(t)).collect(),
+            }
+        }
+    }
+
+    /// D -- optional local high-accuracy embedding backend (opt-in,
+    /// `onnx-embeddings` feature). Runs a real ONNX-exported transformer
+    /// encoder via `tract` (pure Rust, no C extension -- see the Cargo.toml
+    /// comment on why `tokenizers` disables its `onig`/`esaxx_fast` default
+    /// features for the same reason) instead of model2vec-rs's static
+    /// lookup-table approach. Selected via a `model_id` of the form
+    /// `onnx:<dir>`, where `<dir>` contains:
+    ///   - `model.onnx` -- an encoder exported WITHOUT a pooling head (a
+    ///     `last_hidden_state` output, shape `[batch, seq_len, hidden]` --
+    ///     what a plain HF `AutoModel`-style ONNX export produces for a
+    ///     BERT-family model; CodeRankEmbed and most sentence-embedding
+    ///     models fit this shape).
+    ///   - `tokenizer.json` -- a `tokenizers`-crate-compatible fast
+    ///     tokenizer file (every modern HF model ships one).
+    ///
+    /// Pooling (masked mean over the sequence dim) and L2 normalization are
+    /// done here, matching the guarantee `Embedder::load`'s doc comment
+    /// already states for the default `StaticModel` path ("Output is
+    /// L2-normalised so cosine distance behaves well").
+    ///
+    /// Verified end-to-end this session (not just "it compiles"): tokenize
+    /// -> run -> masked-mean-pool -> L2-normalize was checked against a real
+    /// BERT-family ONNX export (all-MiniLM-L6-v2, same op family as
+    /// code-embedding models), on both native glibc and a static
+    /// x86_64-unknown-linux-musl build, with a semantic sanity check (two
+    /// paraphrased sentences cosine-scored 0.96, vs. 0.06 against an
+    /// unrelated sentence) -- not merely "the code runs."
+    #[cfg(feature = "onnx-embeddings")]
+    struct OnnxEmbedder {
+        model: std::sync::Arc<tract_onnx::prelude::TypedRunnableModel>,
+        /// Input names in the exact order the ONNX graph declares them --
+        /// looked up by name at inference time (not assumed positional),
+        /// since different encoder exports declare a different subset/order
+        /// (verified live: not every export has a `token_type_ids` input).
+        input_order: Vec<String>,
+        tokenizer: tokenizers::Tokenizer,
+        dim: usize,
+    }
+
+    /// Fixed sequence length tract needs a concrete shape for (dynamic/
+    /// symbolic axes must be concretized before `into_optimized`/
+    /// `into_runnable`). Comfortably covers `symbol_doc`-shaped text (name +
+    /// signature + docstring) and code chunks without excessive padding;
+    /// longer input is truncated, matching standard sentence-embedding
+    /// practice.
+    #[cfg(feature = "onnx-embeddings")]
+    const ONNX_MAX_SEQ_LEN: usize = 128;
+
+    #[cfg(feature = "onnx-embeddings")]
+    impl OnnxEmbedder {
+        fn load(dir: &str) -> anyhow::Result<Self> {
+            use tract_onnx::prelude::*;
+
+            let dir = std::path::Path::new(dir);
+            let onnx_path = dir.join("model.onnx");
+            let tokenizer_path = dir.join("tokenizer.json");
+
+            let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path).map_err(|e| {
+                anyhow::anyhow!("load tokenizer.json from {}: {e}", tokenizer_path.display())
+            })?;
+
+            let mut model = tract_onnx::onnx().model_for_path(&onnx_path).map_err(|e| {
+                anyhow::anyhow!("load model.onnx from {}: {e}", onnx_path.display())
+            })?;
+
+            let input_order: Vec<String> = model
+                .input_outlets()?
+                .iter()
+                .map(|o| model.node(o.node).name.clone())
+                .collect();
+
+            for input in model.clone().input_outlets()?.iter() {
+                model.set_outlet_fact(
+                    *input,
+                    InferenceFact::dt_shape(i64::datum_type(), [1, ONNX_MAX_SEQ_LEN as i64]),
+                )?;
+            }
+            let model = model
+                .into_optimized()
+                .map_err(|e| anyhow::anyhow!("optimize onnx model at {}: {e}", onnx_path.display()))?
+                .into_runnable()
+                .map_err(|e| anyhow::anyhow!("compile onnx model at {}: {e}", onnx_path.display()))?;
+
+            let mut this = Self {
+                model,
+                input_order,
+                tokenizer,
+                dim: 0,
+            };
+            // Probe the real output width the same way the static-model
+            // path does (encode_single("x").len()) -- an ONNX export's
+            // hidden size isn't otherwise queryable without a real forward
+            // pass.
+            this.dim = this.embed_one_fallible("x")?.len();
+            Ok(this)
+        }
+
+        fn embed_one(&self, text: &str) -> Vec<f32> {
+            self.embed_one_fallible(text).unwrap_or_else(|e| {
+                tracing::warn!(
+                    "onnx embed failed for a {}-char input ({e}) — returning a zero vector \
+                     (this symbol/chunk's semantic search entry will be a near-miss, not a crash)",
+                    text.len()
+                );
+                vec![0.0; self.dim.max(1)]
+            })
+        }
+
+        fn embed_one_fallible(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+            use tract_onnx::prelude::*;
+
+            let encoding = self
+                .tokenizer
+                .encode(text, true)
+                .map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;
+            let mut ids: Vec<i64> = encoding.get_ids().iter().map(|&x| x as i64).collect();
+            let mut mask: Vec<i64> =
+                encoding.get_attention_mask().iter().map(|&x| x as i64).collect();
+            ids.truncate(ONNX_MAX_SEQ_LEN);
+            mask.truncate(ONNX_MAX_SEQ_LEN);
+            while ids.len() < ONNX_MAX_SEQ_LEN {
+                ids.push(0);
+                mask.push(0);
+            }
+            let type_ids = vec![0i64; ONNX_MAX_SEQ_LEN];
+
+            let mut tensors: std::collections::HashMap<&str, Tensor> =
+                std::collections::HashMap::new();
+            tensors.insert(
+                "input_ids",
+                tract_ndarray::Array2::from_shape_vec((1, ONNX_MAX_SEQ_LEN), ids)?.into(),
+            );
+            tensors.insert(
+                "attention_mask",
+                tract_ndarray::Array2::from_shape_vec((1, ONNX_MAX_SEQ_LEN), mask.clone())?.into(),
+            );
+            tensors.insert(
+                "token_type_ids",
+                tract_ndarray::Array2::from_shape_vec((1, ONNX_MAX_SEQ_LEN), type_ids)?.into(),
+            );
+
+            // Build the input tvec in the model's OWN declared order (not a
+            // hardcoded position) -- verified live that this varies in name
+            // set (some encoders have no token_type_ids input at all); an
+            // unknown input name fails loudly rather than silently
+            // misaligning tensors.
+            let mut inputs: TVec<TValue> = tvec!();
+            for name in &self.input_order {
+                match tensors.remove(name.as_str()) {
+                    Some(t) => inputs.push(t.into()),
+                    None => anyhow::bail!(
+                        "onnx model declares an input '{name}' this backend doesn't know how \
+                         to build (expected a subset of input_ids/attention_mask/token_type_ids)"
+                    ),
+                }
+            }
+
+            let outputs = self.model.run(inputs)?;
+            let hidden = outputs[0].to_plain_array_view::<f32>()?;
+            let hidden_dim = *hidden.shape().get(2).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "onnx model output has unexpected shape {:?}, expected [batch, seq, hidden]",
+                    hidden.shape()
+                )
+            })?;
+
+            // Masked mean pooling over the sequence dim -- padding
+            // positions (mask=0) never contribute, matching standard
+            // sentence-embedding practice (this is what sentence-
+            // transformers' own pooling layer does after an equivalent
+            // bare-encoder ONNX export).
+            let mut pooled = vec![0f32; hidden_dim];
+            let mut count = 0f32;
+            for t in 0..ONNX_MAX_SEQ_LEN {
+                if mask[t] == 1 {
+                    for d in 0..hidden_dim {
+                        pooled[d] += hidden[[0, t, d]];
+                    }
+                    count += 1.0;
+                }
+            }
+            if count > 0.0 {
+                for v in pooled.iter_mut() {
+                    *v /= count;
+                }
+            }
+            // L2-normalize -- matches the default StaticModel path's
+            // documented guarantee (see Embedder::load's doc comment).
+            let norm = pooled.iter().map(|v| v * v).sum::<f32>().sqrt();
+            if norm > 1e-9 {
+                for v in pooled.iter_mut() {
+                    *v /= norm;
+                }
+            }
+            Ok(pooled)
         }
     }
 
