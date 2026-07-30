@@ -36,8 +36,13 @@ tempfile = "3"
 libc = "0.2"
 
 [features]
-default = ["embeddings", "tier0-5", "scip-overlay"]
+default = ["embeddings", "tier0-5", "scip-overlay", "stack-graphs-formal"]
 embeddings = ["calm-core/embeddings", "calm-server/embeddings"]
+# Passthrough -- without this the feature can't be turned off from the
+# shipped `calm` binary's --features flag at all (same reasoning as
+# lsp-overlay/http below). See docs/superskills/specs/2026-07-30-
+# stack-graphs-demotion-lever.md (D1).
+stack-graphs-formal = ["calm-core/stack-graphs-formal", "calm-server/stack-graphs-formal"]
 # D, docs/superskills/plans/2026-07-30-calm-dfb-levers-design.md §3 -- opt-in,
 # NOT in `default`. No calm-server passthrough needed: calm-server only ever
 # calls calm-core's Embedder::load(model_id, dim) generically and has no

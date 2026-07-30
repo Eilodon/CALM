@@ -258,6 +258,15 @@
         "format": "uint64",
         "minimum": 0
       },
+      "orphaned_stack_graphs_edges": {
+        "description": "D1 (2026-07-30 stack-graphs-demotion-lever, FM2): count of\n`call_edges` rows still carrying `formal_source = 'stack_graphs'`\neven though THIS build was compiled without the `stack-graphs-formal`\nfeature -- i.e. verdicts from a resolver that no longer exists in\nthis binary, which incremental reindex (only touches dirty files)\ncan never re-verify or refresh. `None` when this build HAS the\nfeature (nothing orphaned by definition). A nonzero value here is a\nreal, permanent trust gap on those specific edges until a full\nreindex on a build with the feature restored touches them again.",
+        "type": [
+          "integer",
+          "null"
+        ],
+        "format": "uint64",
+        "minimum": 0
+      },
       "suggested_next": {
         "anyOf": [
           {

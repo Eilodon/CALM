@@ -68,6 +68,46 @@ jobs:
       - name: Test (embeddings)
         run: cargo test -p calm-core --features embeddings
 
+  no-stack-graphs-formal:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      # D1 (2026-07-30 stack-graphs-demotion-lever): the ONLY dependency
+      # chain in the whole workspace that pins core `tree-sitter` to "^0.24"
+      # (verified via `cargo tree -i -p tree-sitter@0.24.7` -- real precedent
+      # for why this matters: Perl was dropped from the 25-language list
+      # (2026-07-10) for exactly this reason, see
+      # docs/superskills/plans/2026-07-10-25-language-expansion.md §1.4).
+      # `resolver::formal` compiles to a same-API stub without this feature
+      # (crates/calm-core/src/resolver/mod.rs) -- this job is the only CI
+      # coverage of that stub actually compiling and behaving correctly
+      # (`cargo check` alone can silently bit-rot a cfg branch nothing else
+      # ever builds). Keeps every OTHER default feature on
+      # (embeddings/tier0-5/scip-overlay) so this isolates JUST the
+      # stack-graphs-formal absence, not a combination of several features
+      # being off at once.
+      - name: Clippy (no stack-graphs-formal)
+        run: cargo clippy -p calm-core --all-targets --no-default-features --features embeddings,tier0-5,scip-overlay -- -D warnings
+
+      - name: Test (no stack-graphs-formal)
+        run: cargo test -p calm-core --no-default-features --features embeddings,tier0-5,scip-overlay
+
+      - name: Verify tree-sitter core is actually unpinned (not just a feature flag on paper)
+        run: |
+          set -e
+          LEAKED=$(cargo tree -p calm-core --no-default-features --features embeddings,tier0-5,scip-overlay 2>&1 | grep -ic "stack-graph" || true)
+          if [ "$LEAKED" -ne 0 ]; then
+            echo "::error::stack-graphs family still present in the dependency tree without stack-graphs-formal -- the feature gate is not actually cutting the dependency"
+            exit 1
+          fi
+
   all-languages:
     runs-on: ubuntu-latest
     steps:

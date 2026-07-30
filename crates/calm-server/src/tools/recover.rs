@@ -124,6 +124,17 @@ impl CalmServer {
                 ),
                 #[cfg(not(feature = "scip-overlay"))]
                 scip_stack_graphs_overrides: None,
+                #[cfg(not(feature = "stack-graphs-formal"))]
+                orphaned_stack_graphs_edges: conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM call_edges WHERE formal_source = 'stack_graphs'",
+                        [],
+                        |r| r.get::<_, i64>(0),
+                    )
+                    .ok()
+                    .map(|n| n as u64),
+                #[cfg(feature = "stack-graphs-formal")]
+                orphaned_stack_graphs_edges: None,
                 suggested_next: self.filter_sn(sn),
             })
         }))
@@ -654,6 +665,17 @@ pub(crate) struct IndexingStatusOutput {
     /// trên các ngôn ngữ chưa có SCIP overlay (hiện: Java).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) scip_stack_graphs_overrides: Option<u64>,
+    /// D1 (2026-07-30 stack-graphs-demotion-lever, FM2): count of
+    /// `call_edges` rows still carrying `formal_source = 'stack_graphs'`
+    /// even though THIS build was compiled without the `stack-graphs-formal`
+    /// feature -- i.e. verdicts from a resolver that no longer exists in
+    /// this binary, which incremental reindex (only touches dirty files)
+    /// can never re-verify or refresh. `None` when this build HAS the
+    /// feature (nothing orphaned by definition). A nonzero value here is a
+    /// real, permanent trust gap on those specific edges until a full
+    /// reindex on a build with the feature restored touches them again.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) orphaned_stack_graphs_edges: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) suggested_next: Option<SuggestedNext>,
 }

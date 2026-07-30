@@ -5601,6 +5601,37 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    // D1 FM2 (2026-07-30 stack-graphs-demotion-lever): orphaned_stack_graphs_
+    // edges must be absent (skip_serializing_if) when this build HAS the
+    // stack-graphs-formal feature -- there's nothing orphaned by definition
+    // when the resolver that produced those verdicts is still compiled in.
+    // The `not(feature)` branch (a real count, not None) can only be
+    // exercised by actually building without the feature -- verified
+    // separately via `cargo test -p calm-core --no-default-features
+    // --features embeddings,tier0-5,scip-overlay`, not from this test binary.
+    fn indexing_status_omits_orphaned_stack_graphs_edges_when_feature_enabled() {
+        let dir = std::env::temp_dir().join(format!("ci_idxstatus_orphan_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        let v = jv(
+            server.indexing_status(rmcp::handler::server::wrapper::Parameters(
+                IndexingStatusParams {
+                    retry_embeddings: false,
+                },
+            )),
+        );
+
+        assert!(
+            v.get("orphaned_stack_graphs_edges").is_none(),
+            "must be omitted when this build has stack-graphs-formal -- nothing is orphaned: {v:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Regression test: `retry_embeddings` used to be a no-op (logged "not yet
     /// implemented" and did nothing). It must now reclaim a `Failed` status and
     /// re-run `bootstrap_embeddings` in the background, while leaving any other

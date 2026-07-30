@@ -27,12 +27,12 @@ tree-sitter-javascript = { workspace = true }
 tree-sitter-java = { workspace = true }
 tree-sitter-rust = { workspace = true }
 tree-sitter-go = { workspace = true }
-stack-graphs = { workspace = true }
-tree-sitter-stack-graphs = { workspace = true }
-tree-sitter-stack-graphs-python = { workspace = true }
-tree-sitter-stack-graphs-typescript = { workspace = true }
-tree-sitter-stack-graphs-java = { workspace = true }
-tree-sitter-stack-graphs-javascript = { workspace = true }
+stack-graphs = { workspace = true, optional = true }
+tree-sitter-stack-graphs = { workspace = true, optional = true }
+tree-sitter-stack-graphs-python = { workspace = true, optional = true }
+tree-sitter-stack-graphs-typescript = { workspace = true, optional = true }
+tree-sitter-stack-graphs-java = { workspace = true, optional = true }
+tree-sitter-stack-graphs-javascript = { workspace = true, optional = true }
 model2vec-rs = { version = "0.2.1", optional = true }
 # Optional high-accuracy embedding backend (D, docs/superskills/plans/2026-07-30-
 # calm-dfb-levers-design.md §3): pure-Rust ONNX inference (tract) + a pure-Rust
@@ -115,8 +115,28 @@ proptest = "1"
 # docs/superskills/specs/2026-07-12-edge-release-binary-distribution.md). A
 # custom `semantic_search.model` still resolves through model2vec-rs's
 # `hf-hub` fallback (local path or HuggingFace Hub download).
-default = ["embeddings", "tier0-5", "scip-overlay"]
+default = ["embeddings", "tier0-5", "scip-overlay", "stack-graphs-formal"]
 embeddings = ["dep:model2vec-rs"]
+# Formal name-binding resolution (Tier-3) for Python/TypeScript/JavaScript/
+# Java via github/stack-graphs (fork: Eilodon/stack-graphs -- upstream
+# archived 2025-09-09, ADR-0002 Update 2026-07-15). Default-on, preserving
+# today's behavior exactly. This is the ONLY dependency chain in the whole
+# workspace that pins core `tree-sitter` to "^0.24" (verified live via
+# `cargo tree -i -p tree-sitter@0.24.7`: every other path to it goes through
+# `tree-sitter-language`, an ABI-only shim unaffected by the core version) --
+# build WITHOUT this feature to unlock a newer core `tree-sitter` when a
+# future grammar needs it. Real precedent, not hypothetical: Perl was
+# dropped from the 25-language list (2026-07-10) for exactly this reason --
+# see docs/superskills/plans/2026-07-10-25-language-expansion.md §1.4 and
+# docs/superskills/specs/2026-07-30-stack-graphs-demotion-lever.md (D1).
+stack-graphs-formal = [
+    "dep:stack-graphs",
+    "dep:tree-sitter-stack-graphs",
+    "dep:tree-sitter-stack-graphs-python",
+    "dep:tree-sitter-stack-graphs-typescript",
+    "dep:tree-sitter-stack-graphs-java",
+    "dep:tree-sitter-stack-graphs-javascript",
+]
 # Opt-in, off by default (D). Requires `embeddings` -- it's an additional
 # backend inside the same Embedder abstraction, not a replacement; the
 # default model2vec-rs path and its local-only guarantee are unchanged

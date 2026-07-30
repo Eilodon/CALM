@@ -22,8 +22,17 @@ axum = { workspace = true, optional = true }
 tracing-subscriber = { workspace = true }
 
 [features]
-default = ["embeddings", "tier0-5", "scip-overlay"]
+default = ["embeddings", "tier0-5", "scip-overlay", "stack-graphs-formal"]
 embeddings = ["calm-core/embeddings"]
+# Passthrough only -- calm-server's own code (indexing_status's
+# orphaned_stack_graphs_edges, recover.rs) directly references
+# `cfg(feature = "stack-graphs-formal")`, so this crate must declare the
+# feature itself (Rust's check-cfg validates cfg(feature=...) against the
+# declaring crate's OWN [features] table, not a dependency's) -- without
+# this, that cfg check is silently always-false regardless of calm-core's
+# real state. See docs/superskills/specs/2026-07-30-stack-graphs-demotion-
+# lever.md (D1).
+stack-graphs-formal = ["calm-core/stack-graphs-formal"]
 lang-c      = ["calm-core/lang-c"]
 lang-cpp    = ["calm-core/lang-cpp"]
 lang-ruby   = ["calm-core/lang-ruby"]
