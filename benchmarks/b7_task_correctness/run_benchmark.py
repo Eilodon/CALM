@@ -70,7 +70,7 @@ TASKS_PATH = LIB_DIR / "refactor_tasks.yaml"
 # needed to worry about for its own read-only use case.
 WORK_ROOT = repo_root_from_here().parent / "calm-b7-work"
 
-SRC_EXTS = {"rust": (".rs",), "python": (".py",), "javascript": (".js",), "typescript": (".ts",)}
+SRC_EXTS = {"rust": (".rs",), "python": (".py",), "javascript": (".js",), "typescript": (".ts",), "go": (".go",)}
 
 
 def fresh_clone(lang: str, arm: str) -> Path:

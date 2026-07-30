@@ -64,12 +64,37 @@ tasks:
     # removed upstream).
     test_cmd: ["uv", "run", "pytest", "-q"]
 
-  # --- Phase 2 (2026-07-30): Go was skipped this round -- `go` is not
-  # installed in this environment and passwordless sudo is unavailable to
-  # install it (verified live: `apt-cache policy golang-go` shows a
-  # candidate but `sudo -n true` fails) -- a real, honestly-reported
-  # environment precondition gap, not a benchmark bug. gin/Go is the
-  # documented next addition once a Go toolchain is available.
+  # --- Phase 2 continued: Go toolchain installed later the same day (user
+  # provided sudo access specifically to unblock this) -- gin/Go added below.
+
+  - id: rename_gin_clean_path
+    lang: go
+    corpus: go  # key into b12_tier1_tier2_tool_correctness.corpora.get_corpus()
+    symbol: cleanPath
+    def_path: path.go
+    def_line: 23
+    new_name: normalizeUrlPath
+    # verified live 2026-07-30 against gin @ 34dac209ffb6ef85cc78c5d217bbb7ad001d68fd.
+    # Same package (no cross-package qualification needed -- Go doesn't have
+    # JS's require()-property-access call shape, so this cleanly isolates
+    # the rename question from the property-access-call finding seen in
+    # express/setCharset). Real production usage (gin.go, 2 sites) + heavy
+    # test coverage (path_test.go, 6 sites) + 1 doc-comment mention
+    # (path.go:10, included deliberately -- a thorough rename should update
+    # doc comments too, even though the build doesn't strictly require it).
+    oracle_callsites:
+      - [gin.go, 704]
+      - [gin.go, 812]
+      - [path.go, 10]
+      - [path_test.go, 74]
+      - [path_test.go, 75]
+      - [path_test.go, 89]
+      - [path_test.go, 99]
+      - [path_test.go, 130]
+      - [path_test.go, 131]
+      - [path_test.go, 142]
+    build_cmd: ["go", "build", "./..."]
+    test_cmd: ["go", "test", "./..."]
 
   - id: rename_express_set_charset
     lang: javascript

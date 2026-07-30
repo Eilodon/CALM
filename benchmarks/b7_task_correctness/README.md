@@ -1,4 +1,4 @@
-# B7 — Task-Correctness benchmark (Phase 1: fd/Rust, flask/Python; Phase 2: express/JS, zod/TS)
+# B7 — Task-Correctness benchmark (Phase 1: fd/Rust, flask/Python; Phase 2: express/JS, zod/TS, gin/Go)
 
 Measures whether the CALM-scripted refactor workflow (`edit_context` →
 rename at each real reference → `diff_impact`) completes a real rename task
@@ -27,16 +27,18 @@ directly:
 | python | flask (pallets/flask) | `uv sync --frozen` | `uv run pytest -q` |
 | javascript | express (expressjs/express) | `npm install` | `npm test` |
 | typescript | zod (colinhacks/zod) | `pnpm install` | `pnpm test` |
+| go | gin (gin-gonic/gin) | `go build ./...` | `go test ./...` |
 
-**Go/gin was skipped this round** — `go` is not installed in this environment
-and passwordless `sudo` is unavailable to install it (verified live:
-`apt-cache policy golang-go` shows a candidate package, but `sudo -n true`
-fails). A real, honestly-reported environment gap, not a benchmark bug —
-gin is the documented next addition once a Go toolchain is available.
+**Go/gin was initially skipped** in this session's first Phase-2 pass — `go`
+wasn't installed and passwordless `sudo` was unavailable (verified live:
+`apt-cache policy golang-go` showed a candidate package, but `sudo -n true`
+failed). The user then provided sudo access specifically to unblock this
+(one-time, not persisted anywhere), Go 1.22.2 was installed via
+`apt-get install golang-go`, and gin was added the same day.
 
 **Verified live, not assumed — every build/test command below was confirmed
-correct by actually running it, not by reading a package.json/pyproject.toml
-and guessing:**
+correct by actually running it, not by reading a package.json/pyproject.toml/
+go.mod and guessing:**
 - flask needs `uv sync --frozen` + `uv run pytest`, **not** bare
   `pip install pytest` — a first attempt with bare pip grabbed the latest
   pytest, whose internal `_pytest.monkeypatch.notset` API (removed upstream)
@@ -47,6 +49,10 @@ and guessing:**
 - express has no committed lockfile — plain `npm install` is correct.
 - zod uses `pnpm` (`pnpm-lock.yaml` present, not `package-lock.json`) — a
   bare `npm install` would not respect its lockfile.
+- gin's `go.mod` requires Go 1.25.0, newer than the installed 1.22.2 —
+  `GOTOOLCHAIN=auto` (Go's default since 1.21) transparently downloaded
+  1.25.0 on first `go build`, no manual intervention needed. Verified by
+  actually running the build, not assumed from the version mismatch alone.
 
 ## Isolation
 
@@ -88,24 +94,29 @@ building this, in two separate iterations:
    by widening the pattern to match the bare identifier regardless of what
    follows it.
 
-## Results (all 4 tasks, current methodology)
+## Results (all 5 tasks, current methodology)
 
 | task | baseline | naive build_pass | naive recall | naive tool_calls | calm build_pass | calm recall | calm tool_calls |
 |---|---|---|---|---|---|---|---|
 | rename_fd_pattern_matches_leading_dot | green | True | 1.0 | 3 | True | 1.0 | 4 |
 | rename_flask_from_prefixed_env | green | True | 1.0 | 4 | True | 1.0 | 5 |
+| rename_gin_clean_path | green | True | 1.0 | 3 | True | 1.0 | 4 |
 | rename_express_set_charset | green | True | 1.0 | 4 | **False** | **0.667** | 4 |
 | rename_zod_prettify_error | green | True | 1.0 | 5 | **False** | **0.5** | 4 |
 
-### Phase 1 (fd, flask): an honest tie
+### Phase 1 + gin (fd, flask, gin): an honest tie
 
-Both arms hit perfect recall + a passing build on both tasks, and naive even
-uses fewer tool calls. Reported as measured, not hidden (project policy — cf.
-B6's `find_callers`=0% precedent): both Phase-1 symbols are distinctive
-enough (unique corpus-wide, picked via B12's `sample_distinctive` filter)
-that a repo-wide `git grep` already finds every reference. This doesn't mean
-CALM has no advantage here — it means these two symbols don't exercise the
-case where an advantage would show up.
+All three arms hit perfect recall + a passing build, and naive uses fewer or
+equal tool calls. Reported as measured, not hidden (project policy — cf.
+B6's `find_callers`=0% precedent): all three symbols are distinctive enough
+(unique corpus-wide, picked via B12's `sample_distinctive` filter) that a
+repo-wide `git grep` already finds every reference. gin's case additionally
+confirms *why*: Go has no equivalent of JS's `require('./mod').fn(...)`
+property-access call shape for same-package calls (Go's intra-package calls
+are always bare identifiers), so there's no structural opportunity for the
+property-access gap seen in JS to appear here at all. This doesn't mean CALM
+has no advantage on these three — it means these symbols don't exercise the
+case where an advantage (or the JS/TS gap) would show up.
 
 ### Phase 2 (express, zod): a real, reproducible finding — `edit_context`'s
 `callers()` alone is not sufficient for a complete rename
@@ -204,10 +215,10 @@ benchmarks/.venv/bin/python benchmarks/b7_task_correctness/run_benchmark.py --ta
 ```
 
 Preconditions: network access (fresh `git clone --local` of the pinned
-sources, plus `cargo`'s crates.io fetch, `uv sync`'s and `npm`/`pnpm
-install`'s package resolution on first run); `uv` on PATH for the flask task,
-`pnpm` on PATH for the zod task. Go/gin is not runnable until a Go toolchain
-is installed (see Corpora above).
+sources, plus `cargo`'s crates.io fetch, `uv sync`'s, `npm`/`pnpm install`'s,
+and `go build`'s module resolution on first run); `uv` on PATH for the flask
+task, `pnpm` on PATH for the zod task, a Go toolchain (`GOTOOLCHAIN=auto`
+handles a version mismatch against `go.mod`) for the gin task.
 
 `benchmarks/b7_task_correctness/.work` (B12's own convention) is **not** used
 here — see Isolation above; work copies land in `../calm-b7-work/` instead,
@@ -215,10 +226,9 @@ which is not committed and safe to delete between runs.
 
 ## Next steps
 
-1. **gin/Go** once a Go toolchain is available (Phase 2 completion).
-2. **spring-petclinic/Java** (Phase 3 — Maven+JVM, expected to be the
+1. **spring-petclinic/Java** (Phase 3 — Maven+JVM, expected to be the
    heaviest/flakiest setup of the five, per the design spec).
-3. Investigate the express `setCharset` call-graph gap directly in
+2. Investigate the express `setCharset` call-graph gap directly in
    `parser.rs`'s JS/TS call-site extraction (property-access call through a
    required module's bare identifier vs. a destructured bare-name call to
    the same export) — a candidate root-cause worth its own session, not
