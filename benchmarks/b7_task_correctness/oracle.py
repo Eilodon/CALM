@@ -6,12 +6,53 @@ calm-dfb-levers-design.md (§1.2/§1.4) and its audit-design Risk Assessment
 
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "b12_tier1_tier2_tool_correctness"))
 import ground_truth as gt  # noqa: E402
+
+
+def real_references(
+    root: Path, name: str, def_path: str, def_line: int, lang: str, src_exts: tuple[str, ...],
+) -> list[tuple[str, int]]:
+    """Ground truth for "which files need touching for a COMPLETE rename" --
+    deliberately broader than real_call_sites below. Found live while
+    building B7 Phase 2 (zod's `prettifyError`): a call-shaped oracle
+    (NAME\\() misses bare re-export statements like `export { prettifyError }`
+    in packages/zod/src/v4/classic/external.ts -- no trailing paren, so
+    git_grep_call_sites never sees it, and a "rename" that only touches
+    call-shaped occurrences leaves a real reference unrenamed, breaking the
+    build. A rename task's completeness oracle needs every bare-identifier
+    reference (calls, re-exports, imports, type positions), not just calls
+    -- a genuinely different question from "who calls this," which is what
+    B12's oracle (and CALM's own call-graph-based `callers()`) is built to
+    answer. Word-bounded on BOTH sides with no constraint on what follows
+    (must be a superset of call-shaped occurrences, not exclude them) --
+    excludes the definition line itself."""
+    pattern = rf"(^|[^A-Za-z0-9_]){re.escape(name)}($|[^A-Za-z0-9_])"
+    proc = subprocess.run(
+        ["git", "grep", "-n", "-E", "--", pattern],
+        cwd=root, capture_output=True, text=True, check=False,
+    )
+    sites: list[tuple[str, int]] = []
+    for line in proc.stdout.splitlines():
+        parts = line.split(":", 2)
+        if len(parts) < 3:
+            continue
+        path, lineno_s, _text = parts[0], parts[1], parts[2]
+        if not path.endswith(src_exts):
+            continue
+        try:
+            lineno = int(lineno_s)
+        except ValueError:
+            continue
+        if path == def_path and lineno == def_line:
+            continue
+        sites.append((path, lineno))
+    return sites
 
 
 def real_call_sites(

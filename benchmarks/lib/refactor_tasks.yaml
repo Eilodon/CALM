@@ -63,3 +63,68 @@ tasks:
     # `from _pytest.monkeypatch import notset` import, an internal API
     # removed upstream).
     test_cmd: ["uv", "run", "pytest", "-q"]
+
+  # --- Phase 2 (2026-07-30): Go was skipped this round -- `go` is not
+  # installed in this environment and passwordless sudo is unavailable to
+  # install it (verified live: `apt-cache policy golang-go` shows a
+  # candidate but `sudo -n true` fails) -- a real, honestly-reported
+  # environment precondition gap, not a benchmark bug. gin/Go is the
+  # documented next addition once a Go toolchain is available.
+
+  - id: rename_express_set_charset
+    lang: javascript
+    corpus: javascript  # key into b12_tier1_tier2_tool_correctness.corpora.get_corpus()
+    symbol: setCharset
+    def_path: lib/utils.js
+    def_line: 225
+    new_name: applyCharset
+    # verified live 2026-07-30 against express @ a3714473feb3d2908add734d340e7755fd85e0a3
+    # (lib/response.js is real production usage; test/utils.js is direct test
+    # coverage -- a missed rename here fails BOTH the build-gate AND recall)
+    oracle_callsites:
+      - [lib/response.js, 141]
+      - [test/utils.js, 48]
+      - [test/utils.js, 50]
+      - [test/utils.js, 54]
+      - [test/utils.js, 58]
+      - [test/utils.js, 62]
+      - [test/utils.js, 66]
+    build_cmd: ["npm", "install"]
+    test_cmd: ["npm", "test"]
+
+  # REJECTED candidate (kept as an audit trail, matching this project's own
+  # convention -- e.g. the B10->B11 supersession note): `slugify`
+  # (packages/zod/src/v4/core/util.ts:347). It passed B12's
+  # unique_definitions filter (which only scans free function/class/
+  # interface/type regex patterns) but is actually a 3-way name collision:
+  # util.ts's free function -> called by api.ts's `_slugify` -> re-exported
+  # as `_slugify as slugify` in checks.ts -> and ALSO an unrelated
+  # `_ZodString.slugify()` fluent builder method in schemas.ts that calls
+  # `checks.slugify()`, not util.ts's function at all. Plain-text word-bounded
+  # substitution (this benchmark's mutation mechanism for both arms) cannot
+  # tell these apart, so neither arm's result on this symbol would measure
+  # anything real -- both a genuine methodological finding (B12's
+  # unique_definitions doesn't see object-literal/class-method definitions,
+  # only top-level declarations) and a real reminder that CALM's own
+  # `ambiguous`-tier problem (the parent D/F/B research doc's arity-gate
+  # work) is exactly this shape of collision. Replaced with a cleaner,
+  # single-symbol pick below.
+  - id: rename_zod_prettify_error
+    lang: typescript
+    corpus: typescript  # key into b12_tier1_tier2_tool_correctness.corpora.get_corpus()
+    symbol: prettifyError
+    def_path: packages/zod/src/v4/core/errors.ts
+    def_line: 442
+    new_name: formatErrorForDisplay
+    # verified live 2026-07-30 against zod @ 912f0f51b0ced654d0069741e7160834dca742ee.
+    # Single definition, plain re-exports only (classic/external.ts,
+    # mini/external.ts -- no renaming alias like slugify's), called via the
+    # public `z.prettifyError(...)` -- same qualified-call shape as the
+    # rejected slugify pick and express's setCharset finding, but WITHOUT
+    # the name-collision confound, so this cleanly isolates just the
+    # qualified-call-resolution question.
+    oracle_callsites:
+      - [packages/zod/src/v4/classic/tests/error-utils.test.ts, 451]
+      - [packages/zod/src/v4/classic/tests/error-utils.test.ts, 544]
+    build_cmd: ["pnpm", "install"]
+    test_cmd: ["pnpm", "test"]

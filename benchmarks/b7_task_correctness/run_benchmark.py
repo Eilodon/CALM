@@ -23,10 +23,13 @@ not just described:
   - Baseline green check runs BEFORE either arm -- a pre-existing
     flaky/failing corpus test is reported as `skipped`, never misattributed
     to an arm (closes the L6 finding).
-  - Oracle callsites are extension-filtered (oracle.py::real_call_sites) --
-    B12's raw git-grep oracle would otherwise count doc-prose `.rst`
-    mentions as Python "call sites" (found live while picking flask's first
-    candidate, `init_db`).
+  - Oracle references are extension-filtered AND bare-identifier, not
+    call-shaped (oracle.py::real_references) -- B12's raw git-grep oracle
+    would otherwise count doc-prose `.rst` mentions as Python "call sites"
+    (found live while picking flask's first candidate, `init_db`), and a
+    call-shaped-only pattern misses bare re-export references entirely
+    (found live on zod's `prettifyError`: `export { prettifyError }` has no
+    trailing paren).
 
 SAFETY: every corpus is a FRESH throwaway clone per (task, arm) -- git clone
 --local from B12's read-only pinned source, never the pinned source itself.
@@ -53,7 +56,7 @@ sys.path.insert(0, str(B12_DIR))
 
 from mcp_client import MCPClient, repo_root_from_here  # noqa: E402
 import corpora as b12_corpora  # noqa: E402
-from oracle import real_call_sites, build_test_gate, baseline_green  # noqa: E402
+from oracle import real_references, build_test_gate, baseline_green  # noqa: E402
 
 TASKS_PATH = LIB_DIR / "refactor_tasks.yaml"
 # Deliberately OUTSIDE the CALM repo tree, unlike B12's own `.work/` (which is
@@ -67,7 +70,7 @@ TASKS_PATH = LIB_DIR / "refactor_tasks.yaml"
 # needed to worry about for its own read-only use case.
 WORK_ROOT = repo_root_from_here().parent / "calm-b7-work"
 
-SRC_EXTS = {"rust": (".rs",), "python": (".py",)}
+SRC_EXTS = {"rust": (".rs",), "python": (".py",), "javascript": (".js",), "typescript": (".ts",)}
 
 
 def fresh_clone(lang: str, arm: str) -> Path:
@@ -103,21 +106,23 @@ def apply_rename_at(corpus: Path, path: str, old_name: str, new_name: str) -> bo
 
 
 def run_naive_arm(corpus: Path, task: dict) -> dict:
-    """No call graph: grep for the symbol, rename every hit in every matched
-    file within the corpus's own source extension -- simulates an agent with
-    no structural knowledge of the codebase (same spirit as
-    naive_workflow.py's grep_then_cat_matches, extended here to a real
-    mutation instead of just a read)."""
+    """No call graph: grep for the BARE identifier (not just call-shaped
+    occurrences -- see oracle.real_references' docstring for why a rename
+    needs every reference, not just calls) and rename every hit in every
+    matched file within the corpus's own source extension. Simulates a
+    thorough naive agent doing a textual rename with no structural knowledge
+    of the codebase (same spirit as naive_workflow.py's
+    grep_then_cat_matches, extended here to a real mutation instead of just
+    a read).
+
+    NOTE: an earlier draft used a call-shaped `NAME\\(` pattern with a
+    double-escaped backslash bug (`\\\\(` inside an `rf"..."` raw string --
+    an unbalanced/invalid ERE that made `git grep` exit non-zero and print
+    nothing, silently zeroing this arm's results). Both the call-shape
+    restriction and the escaping bug are fixed here."""
     exts = SRC_EXTS[task["lang"]]
-    # Single backslash before the paren (matches B12's own proven-working
-    # ground_truth.git_grep_call_sites pattern exactly) -- an earlier draft
-    # here had `\\(` inside an `rf"..."` raw string, i.e. TWO literal
-    # backslashes then `(`, an unbalanced/invalid ERE that made `git grep`
-    # exit non-zero and print nothing to stdout. Reproduced live: naive arm
-    # silently "touched" 0 files and therefore trivially passed build/test
-    # with recall=0.0 -- caught by actually running this, not just reading it.
     proc = subprocess.run(
-        ["git", "grep", "-l", "-E", rf"(^|[^A-Za-z0-9_]){re.escape(task['symbol'])}\("],
+        ["git", "grep", "-l", "-E", rf"(^|[^A-Za-z0-9_]){re.escape(task['symbol'])}($|[^A-Za-z0-9_])"],
         cwd=corpus, capture_output=True, text=True,
     )
     files = [f for f in proc.stdout.splitlines() if f.endswith(exts)]
@@ -185,7 +190,11 @@ def main() -> int:
         exts = SRC_EXTS[lang]
         pinned_source = b12_corpora.get_corpus(task["corpus"]).source
 
-        oracle_pairs = real_call_sites(
+        # real_references (bare-identifier, not call-shaped) is the correct
+        # oracle for "does this rename fully compile" -- see its docstring
+        # for the real failure this fixed (a bare re-export statement with
+        # no trailing paren, missed by an earlier call-shaped pattern).
+        oracle_pairs = real_references(
             pinned_source, task["symbol"], task["def_path"], task["def_line"], lang, exts,
         )
         oracle_files = {p for p, _ in oracle_pairs} | {task["def_path"]}

@@ -1,16 +1,16 @@
-# B7 — Task-Correctness benchmark (Phase 1: fd/Rust, flask/Python)
+# B7 — Task-Correctness benchmark (Phase 1: fd/Rust, flask/Python; Phase 2: express/JS, zod/TS)
 
 Measures whether the CALM-scripted refactor workflow (`edit_context` →
-rename at each real call site → `diff_impact`) completes a real rename task
+rename at each real reference → `diff_impact`) completes a real rename task
 more correctly than a naive grep-and-edit workflow. **Deterministic oracle
-only — no LLM judge**: (1) the corpus's own real `cargo test`/`pytest` build+
-test gate, and (2) an independent callsite-recall check against ground truth
-computed once, outside either arm.
+only — no LLM judge**: (1) the corpus's own real build/test gate, and (2) an
+independent reference-recall check against ground truth computed once,
+outside either arm.
 
 Differs from B11/B12 (**tool-surface** correctness: given a fixed query, is
 the *answer* right?) — B7 measures **task** correctness: given a refactor,
 does the whole edit loop complete it without breaking the corpus's own tests
-or missing a real call site. This is the Serena-style claim ("8–12 manual
+or missing a real reference. This is the Serena-style claim ("8–12 manual
 steps → 1 call, fewer errors") `benchmarks/README.md` names as B7's origin.
 
 Full design rationale: `docs/superskills/specs/2026-07-30-calm-dfb-levers-design.md`
@@ -19,20 +19,34 @@ Full design rationale: `docs/superskills/specs/2026-07-30-calm-dfb-levers-design
 ## Corpora
 
 Reuses B12's pinned registry (`benchmarks/b12_tier1_tier2_tool_correctness/corpora.py`)
-directly — Phase 1 picked the 2 lowest-friction languages:
+directly:
 
 | lang | corpus | build_cmd | test_cmd |
 |---|---|---|---|
 | rust | fd (sharkdp/fd) | *(none — `cargo test` builds+tests in one step)* | `cargo test --quiet` |
 | python | flask (pallets/flask) | `uv sync --frozen` | `uv run pytest -q` |
+| javascript | express (expressjs/express) | `npm install` | `npm test` |
+| typescript | zod (colinhacks/zod) | `pnpm install` | `pnpm test` |
 
-**Verified live, not assumed:** flask's correct test setup is `uv sync --frozen`
-+ `uv run pytest`, NOT a bare `pip install pytest` — a first attempt with bare
-pip grabbed the latest pytest, whose internal `_pytest.monkeypatch.notset` API
-(removed upstream) broke flask's own `tests/test_cli.py` at collection time.
-flask pins its test dependencies via `uv.lock` (`[tool.uv] default-groups`
-includes `"tests"`) and sets `filterwarnings = ["error"]`, so a
-version-mismatched pytest can fail outright, not just warn.
+**Go/gin was skipped this round** — `go` is not installed in this environment
+and passwordless `sudo` is unavailable to install it (verified live:
+`apt-cache policy golang-go` shows a candidate package, but `sudo -n true`
+fails). A real, honestly-reported environment gap, not a benchmark bug —
+gin is the documented next addition once a Go toolchain is available.
+
+**Verified live, not assumed — every build/test command below was confirmed
+correct by actually running it, not by reading a package.json/pyproject.toml
+and guessing:**
+- flask needs `uv sync --frozen` + `uv run pytest`, **not** bare
+  `pip install pytest` — a first attempt with bare pip grabbed the latest
+  pytest, whose internal `_pytest.monkeypatch.notset` API (removed upstream)
+  broke flask's own `tests/test_cli.py` at collection time. flask pins test
+  dependencies via `uv.lock` (`[tool.uv] default-groups` includes `"tests"`)
+  and sets `filterwarnings = ["error"]`, so a version-mismatched pytest fails
+  outright, not just warns.
+- express has no committed lockfile — plain `npm install` is correct.
+- zod uses `pnpm` (`pnpm-lock.yaml` present, not `package-lock.json`) — a
+  bare `npm install` would not respect its lockfile.
 
 ## Isolation
 
@@ -54,70 +68,131 @@ covered.
 
 ## Oracle
 
-Ground truth for "which files have a real call site" is B12's own
-`ground_truth.git_grep_call_sites` (word-bounded, redefinition-filtered),
-wrapped by `oracle.py::real_call_sites` with **one fix**: an extension filter.
-**Found live, not in B12's own test suite:** B12's raw oracle has no
-file-extension restriction — sampling flask's `init_db` for a Phase-1
-candidate returned 9 "call sites" via plain `git grep`, 5 of which were
-`.rst` documentation prose mentioning the function by name (`docs/appcontext.rst`,
-`docs/patterns/sqlalchemy.rst`, etc.), not real Python call expressions. B12
-itself doesn't need this fix (its own docstring says it "only needs to flag
-gross zero-recall failures," not compute a precise recall fraction), but B7
-does, so `real_call_sites` restricts results to the corpus's own source
-extension before scoring.
+Ground truth for "which files need touching for a **complete rename**" is
+`oracle.py::real_references` — a **bare-identifier**, word-bounded, extension-
+filtered `git grep`, built on top of (but broader than) B12's
+`ground_truth.git_grep_call_sites`. Two real gaps were found and fixed while
+building this, in two separate iterations:
 
-## Results (Phase 1, both tasks)
+1. **No file-extension filter** (found on flask's `init_db`): B12's raw
+   oracle counted 5 `.rst` documentation-prose mentions as Python "call
+   sites" alongside 3 real `.py` files. Fixed by restricting results to the
+   corpus's own source extension.
+2. **Call-shaped-only pattern misses non-call references** (found on zod's
+   `prettifyError`): a first version matched only `NAME\(` (calls), which
+   misses a bare re-export statement like `export { prettifyError }` (no
+   trailing paren). A **rename** needs every bare-identifier reference —
+   calls, re-exports, imports, type positions — not just calls, which is a
+   genuinely different question from "who calls this" (what B12's oracle,
+   and CALM's own call-graph-based `callers()`, are built to answer). Fixed
+   by widening the pattern to match the bare identifier regardless of what
+   follows it.
+
+## Results (all 4 tasks, current methodology)
 
 | task | baseline | naive build_pass | naive recall | naive tool_calls | calm build_pass | calm recall | calm tool_calls |
 |---|---|---|---|---|---|---|---|
 | rename_fd_pattern_matches_leading_dot | green | True | 1.0 | 3 | True | 1.0 | 4 |
 | rename_flask_from_prefixed_env | green | True | 1.0 | 4 | True | 1.0 | 5 |
+| rename_express_set_charset | green | True | 1.0 | 4 | **False** | **0.667** | 4 |
+| rename_zod_prettify_error | green | True | 1.0 | 5 | **False** | **0.5** | 4 |
 
-**Honest finding, reported as measured (project policy — see main README's
-"don't hide an unflattering number," precedent: B6's `find_callers`=0%):**
-both arms tie at perfect recall on both Phase-1 tasks, and naive even uses
-*fewer* tool calls. This is a real, non-manufactured result for these two
-specific tasks — both target symbols are distinctive (unique corpus-wide
-name, picked via B12's own `sample_distinctive` filter) and every real call
-site literally spells the symbol's name, so a repo-wide `git grep -l`
-(unrestricted by directory) finds exactly the same file set CALM's call graph
-does. **This does not mean CALM has no advantage** — it means Phase 1's two
-symbols don't exercise the case where the advantage should show up.
+### Phase 1 (fd, flask): an honest tie
 
-**Where CALM should actually differentiate (not yet tested — a concrete
-recommendation for Phase 1b, not a vague TODO):** a symbol name that collides
-with an unrelated same-named definition in a different scope/class (the
-`ambiguous`-tier problem the parent research doc's arity-gate work targets),
-or a call reached via dispatch that isn't a literal textual match of the
-target's name (trait/interface method dispatch, a re-exported alias). A naive
-`grep -l NAME(` either over-collects (edits an unrelated same-named function
-elsewhere) or under-collects (misses a call that doesn't textually spell
-`NAME`); CALM's structural resolution should get this right where grep
-can't. Picking such a symbol is the natural next Phase-1b task, not a new
-phase.
+Both arms hit perfect recall + a passing build on both tasks, and naive even
+uses fewer tool calls. Reported as measured, not hidden (project policy — cf.
+B6's `find_callers`=0% precedent): both Phase-1 symbols are distinctive
+enough (unique corpus-wide, picked via B12's `sample_distinctive` filter)
+that a repo-wide `git grep` already finds every reference. This doesn't mean
+CALM has no advantage here — it means these two symbols don't exercise the
+case where an advantage would show up.
+
+### Phase 2 (express, zod): a real, reproducible finding — `edit_context`'s
+`callers()` alone is not sufficient for a complete rename
+
+Naive (bare-identifier grep) hits 100% recall + a passing build on **both**
+Phase-2 tasks. The CALM arm, which relies purely on `edit_context`'s
+`callers` list, **fails the build on both** — but for two structurally
+different reasons, precisely distinguished by checking what was actually
+missed:
+
+**express/`setCharset` — a genuine call-graph gap.** `lib/response.js` binds
+the import with a destructured bare name
+(`var setCharset = require('./utils').setCharset;`) and calls it as
+`setCharset(type, 'utf-8')` — CALM finds this fine (`edge_confidence:
+"resolved"`). `test/utils.js` instead does `var utils = require('../lib/utils')`
+and calls it as `utils.setCharset(...)` — a **property-access call through the
+module namespace object**. This is a real invocation (5 real test assertions
+depend on it), yet it's **completely absent** from `edit_context`'s response —
+not in `callers`, not even in `blast_radius.files_affected` (29 files listed,
+this isn't one of them). Verified directly against the raw `edit_context`
+JSON, not inferred from the benchmark's summary. Renaming only what
+`callers()` reports leaves `test/utils.js` calling a function that no longer
+exists → `TypeError: utils.setCharset is not a function` (5 failing tests).
+
+**zod/`prettifyError` — a task-oracle scope issue, not (clearly) a CALM bug.**
+CALM's `callers()` *did* find the one real call
+(`z.prettifyError(...)` in `error-utils.test.ts`) — so qualified/property-
+access calls **can** resolve correctly in this codebase (an important
+counter-example to reading the express finding as "property access never
+resolves"). What it didn't report were `packages/zod/src/v4/classic/external.ts`
+and `mini/external.ts`'s **bare re-export statements**
+(`export { prettifyError }`) — which aren't calls at all, so a call-graph
+tool correctly has no reason to surface them via `callers()`. A complete
+rename needs the import/re-export graph too, which is a different CALM tool
+(`dependencies()`) or a plain text search (`search(kind="grep")`) — exactly
+what `AGENTS.md`'s own documented workflow already treats as a *separate*
+stage from `callers()`, not something `edit_context` claims to cover on its
+own.
+
+**What this means for a real CALM-based rename workflow:** don't rely on
+`edit_context`/`callers()` alone for a rename — it models the *call* graph,
+not the full reference/import graph. A safe rename workflow should follow it
+with a `search(kind="grep")` sweep for the bare identifier (or check
+`dependencies()`) before considering the blast radius complete. This is
+existing, documented CALM workflow guidance being *validated* by a concrete
+failure case, not a new gap to file — except for the express finding, which
+*is* a genuine, reproducible call-graph resolution gap worth investigating
+in `parser.rs`'s JS/TS call-site extraction (property-access calls on a
+required module's bare identifier vs. a destructured bare-name call to the
+same export).
+
+### A rejected candidate, kept for the audit trail
+
+`slugify` (`packages/zod/src/v4/core/util.ts:347`) was tried first and
+discarded: it passed B12's `unique_definitions` filter (which only scans
+free `function`/`class`/`interface`/`type` regex patterns) but is actually a
+**3-way name collision** — `util.ts`'s free function is called by
+`api.ts::_slugify`, re-exported as `_slugify as slugify` in `checks.ts`, and
+there's *also* an unrelated `_ZodString.slugify()` fluent builder method
+(`schemas.ts`) that calls `checks.slugify()`, never touching `util.ts`'s
+function at all. Plain-text rename can't tell these apart, so neither arm's
+result on this symbol would have measured anything real. This is itself a
+genuine finding: B12's `unique_definitions` doesn't see object-literal/
+class-method definitions, only top-level declarations — worth knowing before
+reusing it as a candidate-picker for an *edit* task (as opposed to its
+original read-only tool-correctness use in B12).
 
 ## Bugs found and fixed while building this (report, not hide)
 
-1. **WORK_ROOT nested-workspace gotcha** (see Isolation above) — `cargo test`
-   failed with "current package believes it's in a workspace when it's not"
-   until work copies moved outside the CALM repo tree.
+1. **WORK_ROOT nested-workspace gotcha** — `cargo test` failed with "current
+   package believes it's in a workspace when it's not" until work copies
+   moved outside the CALM repo tree (see Isolation above).
 2. **Double-escaped regex in the naive arm** — an early draft's grep pattern
    was built inside an `rf"..."` raw string as `\\(` (two literal backslashes
-   + `(`, an unbalanced/invalid ERE), not the single `\(` B12's own proven
-   pattern uses. `git grep` exited non-zero on the bad regex and printed
-   nothing to stdout, and the code didn't check the exit code — so the naive
-   arm silently "renamed" 0 files, trivially passed build/test (nothing was
-   touched to break), and scored recall=0.0. Caught by actually running the
-   harness end-to-end, not by reading the code.
-3. **Oracle extension-filter gap** (see Oracle above) — found while picking
-   candidates, before it could contaminate a task definition.
-4. **`edit_context`'s `CallerEntry` has no `path` field** — verified against
+   + `(`, an unbalanced/invalid ERE). `git grep` exited non-zero and printed
+   nothing, so the naive arm silently "renamed" 0 files, trivially passed
+   build/test, and scored recall=0.0. Caught by actually running the harness
+   end-to-end, not by reading the code.
+3. **Oracle extension-filter gap** (flask's `init_db`) and **4. call-shaped-
+   only oracle gap** (zod's `prettifyError`) — see Oracle above.
+5. **`edit_context`'s `CallerEntry` has no `path` field** — verified against
    the real `edit_context.snap` schema before writing `run_calm_arm`: the file
-   path is the substring of `symbol` before the first `::` (the field was
-   removed as a duplicate — see the doc comment in
+   path is the substring of `symbol` before the first `::` (removed as a
+   duplicate field — see the doc comment in
    `crates/calm-server/src/tools/guardrails.rs`). A naive `c.get("path")`
    would have silently returned `None` for every caller.
+6. **`slugify` name-collision task pick** — see "A rejected candidate" above.
 
 ## Running it
 
@@ -129,9 +204,22 @@ benchmarks/.venv/bin/python benchmarks/b7_task_correctness/run_benchmark.py --ta
 ```
 
 Preconditions: network access (fresh `git clone --local` of the pinned
-sources, plus `cargo`'s crates.io fetch and `uv sync`'s package resolution on
-first run); `uv` on PATH for the flask task.
+sources, plus `cargo`'s crates.io fetch, `uv sync`'s and `npm`/`pnpm
+install`'s package resolution on first run); `uv` on PATH for the flask task,
+`pnpm` on PATH for the zod task. Go/gin is not runnable until a Go toolchain
+is installed (see Corpora above).
 
 `benchmarks/b7_task_correctness/.work` (B12's own convention) is **not** used
 here — see Isolation above; work copies land in `../calm-b7-work/` instead,
 which is not committed and safe to delete between runs.
+
+## Next steps
+
+1. **gin/Go** once a Go toolchain is available (Phase 2 completion).
+2. **spring-petclinic/Java** (Phase 3 — Maven+JVM, expected to be the
+   heaviest/flakiest setup of the five, per the design spec).
+3. Investigate the express `setCharset` call-graph gap directly in
+   `parser.rs`'s JS/TS call-site extraction (property-access call through a
+   required module's bare identifier vs. a destructured bare-name call to
+   the same export) — a candidate root-cause worth its own session, not
+   folded into this benchmark's scope.
