@@ -5447,6 +5447,36 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    // D3 (2026-07-30 stack-graphs-demotion-lever): scip_stack_graphs_overrides
+    // surfaces calm_core::scip::ingest::scip_stack_graphs_override_count().
+    // Default features include scip-overlay, so on a fresh process the field
+    // must be present and Some(0) -- not absent (skip_serializing_if only
+    // applies to the whole Option being None, which it isn't once the
+    // feature is compiled in).
+    fn indexing_status_includes_scip_stack_graphs_overrides_field_when_scip_overlay_enabled() {
+        let dir = std::env::temp_dir().join(format!("ci_idxstatus_sgso_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        let v = jv(
+            server.indexing_status(rmcp::handler::server::wrapper::Parameters(
+                IndexingStatusParams {
+                    retry_embeddings: false,
+                },
+            )),
+        );
+
+        assert!(
+            v.get("scip_stack_graphs_overrides").is_some(),
+            "field must be present (Some(0)) when built with scip-overlay, not omitted: {v:?}"
+        );
+        assert!(v["scip_stack_graphs_overrides"].is_u64());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Regression test: `retry_embeddings` used to be a no-op (logged "not yet
     /// implemented" and did nothing). It must now reclaim a `Failed` status and
     /// re-run `bootstrap_embeddings` in the background, while leaving any other

@@ -118,6 +118,12 @@ impl CalmServer {
                 scip_overlay,
                 scip_overlays,
                 formal_resolution_timeouts: calm_core::indexer::pipeline::formal_resolution_timeout_count(),
+                #[cfg(feature = "scip-overlay")]
+                scip_stack_graphs_overrides: Some(
+                    calm_core::scip::ingest::scip_stack_graphs_override_count(),
+                ),
+                #[cfg(not(feature = "scip-overlay"))]
+                scip_stack_graphs_overrides: None,
                 suggested_next: self.filter_sn(sn),
             })
         }))
@@ -640,6 +646,14 @@ pub(crate) struct IndexingStatusOutput {
     /// happening on this repo right now -- worth investigating which
     /// files/languages before trusting `formal` counts as fully stable.
     pub(crate) formal_resolution_timeouts: u64,
+    /// Số edge SCIP đã ghi đè 1 verdict stack-graphs kể từ khi process khởi
+    /// động -- xem `calm_core::scip::ingest::scip_stack_graphs_override_count`.
+    /// `None` khi build thiếu feature `scip-overlay` (không có gì để báo
+    /// cáo). Một con số dương, tăng dần trên 1 repo thật là tín hiệu đáng
+    /// điều tra thêm trước khi tin tuyệt đối `formal_source = 'stack_graphs'`
+    /// trên các ngôn ngữ chưa có SCIP overlay (hiện: Java).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) scip_stack_graphs_overrides: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) suggested_next: Option<SuggestedNext>,
 }

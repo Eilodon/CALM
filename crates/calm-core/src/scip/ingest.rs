@@ -12,6 +12,7 @@
 //! there via a prior SCIP match of its own.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use rusqlite::Connection;
 
@@ -46,6 +47,50 @@ pub struct IngestStats {
     /// wherever this indexer actually ran (see `parse::parse_index`'s
     /// `rebase_prefix`).
     pub match_rate: f64,
+}
+
+/// D3 (2026-07-30 stack-graphs-demotion-lever): count of edges where SCIP
+/// overrode a `formal_source = 'stack_graphs'` (or unattributed
+/// pre-migration) verdict since this process started -- incremented from
+/// `ingest_occurrences`'s upgrade loop and from `mark_ruled_out_siblings`.
+/// Deliberately does NOT count a fresh upgrade from `textual`/`inferred` --
+/// stack-graphs never had an opinion on that edge, so overriding it isn't a
+/// disagreement between the two formal-tier sources. See ADR-0002 +
+/// docs/superskills/specs/2026-07-30-stack-graphs-demotion-lever.md.
+static SCIP_STACK_GRAPHS_OVERRIDES: AtomicU64 = AtomicU64::new(0);
+
+/// Count of edges where SCIP overrode a `formal_source = 'stack_graphs'`
+/// verdict since this process started -- see `SCIP_STACK_GRAPHS_OVERRIDES`.
+/// A nonzero, growing count on a real repo means the two formal-tier sources
+/// disagree often enough to be worth looking into -- see
+/// `IndexingStatusOutput::scip_stack_graphs_overrides`.
+pub fn scip_stack_graphs_override_count() -> u64 {
+    SCIP_STACK_GRAPHS_OVERRIDES.load(Ordering::Relaxed)
+}
+
+/// Records one SCIP-vs-stack_graphs disagreement: bumps the process-wide
+/// counter and logs the call site + target so it can be traced back to a
+/// specific edge without re-querying the DB. `ruled_out` distinguishes the
+/// two call sites this fires from: `false` = `ingest_occurrences`'s upgrade
+/// loop (a `stack_graphs` edge got reconfirmed to `formal_source = 'scip'`),
+/// `true` = `mark_ruled_out_siblings` (a `stack_graphs`-sourced sibling lost
+/// to a SCIP-backed one in an ambiguous fan-out group).
+fn record_scip_stack_graphs_override(
+    from_path: &str,
+    call_line: i64,
+    def_path: &str,
+    def_line: i64,
+    ruled_out: bool,
+) {
+    SCIP_STACK_GRAPHS_OVERRIDES.fetch_add(1, Ordering::Relaxed);
+    tracing::debug!(
+        from_path,
+        call_line,
+        def_path,
+        def_line,
+        ruled_out,
+        "SCIP overrode a stack_graphs formal verdict"
+    );
 }
 
 /// One existing `call_edges` row with a known call site, joined to its
@@ -146,6 +191,20 @@ pub fn ingest_occurrences(
             continue; // already the strongest possible evidence — never re-litigated
         }
         if scip_agrees {
+            if row.confidence == "formal"
+                && matches!(row.formal_source.as_deref(), None | Some("stack_graphs"))
+            {
+                // D3: about to reconfirm/override a stack_graphs (or
+                // unattributed) formal verdict with SCIP's exact evidence --
+                // a real disagreement between the two formal-tier sources.
+                record_scip_stack_graphs_override(
+                    &row.from_path,
+                    row.call_line,
+                    &row.def_path,
+                    row.def_line,
+                    false,
+                );
+            }
             to_upgrade.push(row.id);
             if row.confidence != "formal" {
                 newly_upgraded_count += 1;
@@ -217,7 +276,12 @@ pub fn ingest_occurrences(
 /// the group and this one can be ruled out instead (P0.3: SCIP overriding a
 /// `stack_graphs`-sourced formal edge).
 /// One fan-out group member: `(id, def_path, def_line, is_formal, already_ruled_out)`.
-type GroupMember<'a> = (i64, &'a str, i64, bool, bool);
+/// `was_stack_graphs_formal` (D3, appended last) is `true` when this row's
+/// ORIGINAL `edge_confidence == "formal"` AND `formal_source` was
+/// `None`/`"stack_graphs"` -- a genuine stack-graphs (or unattributed)
+/// formal verdict this pass might rule out, distinct from an ordinary
+/// non-formal sibling losing a fan-out.
+type GroupMember<'a> = (i64, &'a str, i64, bool, bool, bool);
 
 fn mark_ruled_out_siblings(
     conn: &Connection,
@@ -243,6 +307,8 @@ fn mark_ruled_out_siblings(
         } else {
             false
         };
+        let was_stack_graphs_formal = row.confidence == "formal"
+            && matches!(row.formal_source.as_deref(), None | Some("stack_graphs"));
         groups
             .entry((row.from_path.as_str(), row.call_line))
             .or_default()
@@ -252,6 +318,7 @@ fn mark_ruled_out_siblings(
                 row.def_line,
                 is_formal,
                 row.ruled_out,
+                was_stack_graphs_formal,
             ));
     }
 
@@ -260,7 +327,7 @@ fn mark_ruled_out_siblings(
         if members.len() < 2 {
             continue; // not a fan-out group — nothing to declutter
         }
-        let has_formal_member = members.iter().any(|(.., is_formal, _)| *is_formal);
+        let has_formal_member = members.iter().any(|(_, _, _, is_formal, _, _)| *is_formal);
         let key = (*from_path, *call_line as usize);
         let scip_points_outside_group = ref_targets.get(&key).is_some_and(|targets| {
             targets.iter().all(|(f, l)| {
@@ -272,9 +339,19 @@ fn mark_ruled_out_siblings(
         if !has_formal_member && !scip_points_outside_group {
             continue; // no decisive evidence for this group yet
         }
-        for (id, _, _, is_formal, already_ruled_out) in members {
+        for (id, def_path, def_line, is_formal, already_ruled_out, was_stack_graphs_formal) in
+            members
+        {
             if !*is_formal && !*already_ruled_out {
                 to_rule_out.push(*id);
+                if *was_stack_graphs_formal {
+                    // D3: this sibling held a stack_graphs (or unattributed)
+                    // formal verdict and SCIP just proved it wrong -- a real
+                    // disagreement, not an ordinary fan-out loser.
+                    record_scip_stack_graphs_override(
+                        from_path, *call_line, def_path, *def_line, true,
+                    );
+                }
             }
         }
     }
@@ -1046,6 +1123,162 @@ mod tests {
                     1
                 ),
             ]
+        );
+    }
+
+    /// D3 positive case (upgrade-loop path): a `formal`/`'stack_graphs'`
+    /// edge that SCIP reconfirms/overrides to `'scip'` MUST increment the
+    /// counter -- this is a real disagreement between the two formal-tier
+    /// sources.
+    #[test]
+    fn scip_stack_graphs_override_counter_increments_on_real_override() {
+        let conn = db_with_one_textual_edge();
+        conn.execute(
+            "UPDATE call_edges SET edge_confidence = 'formal', formal_source = 'stack_graphs'",
+            [],
+        )
+        .unwrap();
+        let occ = vec![
+            ScipOccurrence {
+                file: "core/src/engine.rs".into(),
+                line: 6,
+                symbol: "M".into(),
+                is_def: true,
+                is_local: false,
+            },
+            ScipOccurrence {
+                file: "app/src/main.rs".into(),
+                line: 5,
+                symbol: "M".into(),
+                is_def: false,
+                is_local: false,
+            },
+        ];
+        let before = scip_stack_graphs_override_count();
+        ingest_occurrences(&conn, &occ, true).unwrap();
+        assert_eq!(
+            scip_stack_graphs_override_count(),
+            before + 1,
+            "SCIP overriding a stack_graphs verdict must count as exactly 1 disagreement"
+        );
+        let formal_source: Option<String> = conn
+            .query_row("SELECT formal_source FROM call_edges", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(formal_source.as_deref(), Some("scip"));
+    }
+
+    /// D3 negative case (upgrade-loop path, catches the exact bug audit-design
+    /// found in the original spec draft): a fresh upgrade from `textual` --
+    /// stack-graphs never had an opinion on this edge -- must NOT increment
+    /// the counter. Without this test, an implementation that increments on
+    /// every `to_upgrade` push (not filtered by prior `formal_source`) would
+    /// still pass every other test while overcounting in production.
+    #[test]
+    fn scip_stack_graphs_override_counter_unchanged_on_fresh_upgrade() {
+        let conn = db_with_one_textual_edge();
+        let occ = vec![
+            ScipOccurrence {
+                file: "core/src/engine.rs".into(),
+                line: 6,
+                symbol: "M".into(),
+                is_def: true,
+                is_local: false,
+            },
+            ScipOccurrence {
+                file: "app/src/main.rs".into(),
+                line: 5,
+                symbol: "M".into(),
+                is_def: false,
+                is_local: false,
+            },
+        ];
+        let before = scip_stack_graphs_override_count();
+        let stats = ingest_occurrences(&conn, &occ, true).unwrap();
+        assert_eq!(stats.upgraded, 1, "sanity: the edge really did upgrade");
+        assert_eq!(
+            scip_stack_graphs_override_count(),
+            before,
+            "a textual -> formal/scip upgrade has nothing to do with stack-graphs and must not count"
+        );
+    }
+
+    /// D3 positive case (ruled-out-siblings path): a `formal`/`'stack_graphs'`
+    /// sibling losing a fan-out to SCIP's exact evidence MUST increment the
+    /// counter -- same fixture as `scip_overrides_stack_graphs_target` above.
+    #[test]
+    fn scip_stack_graphs_override_counter_increments_on_ruled_out_sibling() {
+        let conn = db_with_ambiguous_fan_out(&[
+            ("a.rs::A::as_str", "a.rs", 1),
+            ("b.rs::B::as_str", "b.rs", 1),
+        ]);
+        conn.execute(
+            "UPDATE call_edges SET edge_confidence = 'formal', formal_source = 'stack_graphs' \
+             WHERE to_symbol = 'b.rs::B::as_str'",
+            [],
+        )
+        .unwrap();
+        let occ = vec![
+            ScipOccurrence {
+                file: "a.rs".into(),
+                line: 1,
+                symbol: "M".into(),
+                is_def: true,
+                is_local: false,
+            },
+            ScipOccurrence {
+                file: "app/src/main.rs".into(),
+                line: 5,
+                symbol: "M".into(),
+                is_def: false,
+                is_local: false,
+            },
+        ];
+        let before = scip_stack_graphs_override_count();
+        let stats = ingest_occurrences(&conn, &occ, true).unwrap();
+        assert_eq!(stats.ruled_out, 1, "sanity: the stale stack_graphs pick really was ruled out");
+        assert_eq!(
+            scip_stack_graphs_override_count(),
+            before + 1,
+            "ruling out a stack_graphs-sourced sibling is a real disagreement"
+        );
+    }
+
+    /// D3 negative case (ruled-out-siblings path): a fan-out group where the
+    /// losing sibling was plain `ambiguous` (never `stack_graphs`-formal) must
+    /// NOT increment the counter -- losing a fan-out to a stronger candidate
+    /// is unrelated to stack-graphs when stack-graphs never had a verdict on
+    /// that sibling in the first place.
+    #[test]
+    fn scip_stack_graphs_override_counter_unchanged_when_ruled_out_sibling_was_never_stack_graphs(
+    ) {
+        let conn = db_with_ambiguous_fan_out(&[
+            ("a.rs::A::as_str", "a.rs", 1),
+            ("b.rs::B::as_str", "b.rs", 1),
+        ]);
+        // Both siblings start plain `ambiguous` -- neither was ever formal.
+        let occ = vec![
+            ScipOccurrence {
+                file: "a.rs".into(),
+                line: 1,
+                symbol: "M".into(),
+                is_def: true,
+                is_local: false,
+            },
+            ScipOccurrence {
+                file: "app/src/main.rs".into(),
+                line: 5,
+                symbol: "M".into(),
+                is_def: false,
+                is_local: false,
+            },
+        ];
+        let before = scip_stack_graphs_override_count();
+        let stats = ingest_occurrences(&conn, &occ, true).unwrap();
+        assert_eq!(stats.ruled_out, 1, "sanity: b.rs::B::as_str still loses the fan-out");
+        assert_eq!(
+            scip_stack_graphs_override_count(),
+            before,
+            "the ruled-out sibling was never stack_graphs-formal, so this isn't a disagreement"
         );
     }
 }

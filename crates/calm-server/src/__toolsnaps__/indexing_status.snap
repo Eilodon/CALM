@@ -249,6 +249,15 @@
         "format": "uint64",
         "minimum": 0
       },
+      "scip_stack_graphs_overrides": {
+        "description": "Số edge SCIP đã ghi đè 1 verdict stack-graphs kể từ khi process khởi\nđộng -- xem `calm_core::scip::ingest::scip_stack_graphs_override_count`.\n`None` khi build thiếu feature `scip-overlay` (không có gì để báo\ncáo). Một con số dương, tăng dần trên 1 repo thật là tín hiệu đáng\nđiều tra thêm trước khi tin tuyệt đối `formal_source = 'stack_graphs'`\ntrên các ngôn ngữ chưa có SCIP overlay (hiện: Java).",
+        "type": [
+          "integer",
+          "null"
+        ],
+        "format": "uint64",
+        "minimum": 0
+      },
       "suggested_next": {
         "anyOf": [
           {
