@@ -356,6 +356,19 @@ fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
     // greet/1 vs greet/2 are different clauses), NULL for every other
     // language until their own arity extraction is verified per-grammar.
     migrate_add_column(conn, "symbols", "arity", "INTEGER")?;
+    // A' pass (2026-07-29 self-audit): Go's arity gate generalization needs a
+    // second column alongside `arity` -- for Go, `arity` holds the MINIMUM
+    // arg count (not an exact count like Elixir's), and this flag says
+    // whether the function's last parameter is variadic (`...T`), meaning it
+    // accepts `arity` or MORE arguments, never fewer. `0`/`false` default so
+    // every pre-existing Elixir row (where this concept doesn't apply) reads
+    // as non-variadic, matching its exact-match gate semantics unchanged.
+    migrate_add_column(
+        conn,
+        "symbols",
+        "arity_variadic",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
     migrate_fts_add_signature(conn)?;
     migrate_add_project_memory_fts(conn)?;
     migrate_add_scip_overlay_state(conn)?;

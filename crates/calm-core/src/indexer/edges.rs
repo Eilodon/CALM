@@ -24,8 +24,8 @@ pub struct ImportEdge {
 
 pub fn insert_symbols_batch(tx: &Transaction, symbols: &[ParsedSymbol]) -> rusqlite::Result<()> {
     let mut stmt = tx.prepare(
-        "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, is_entry_point, class_context, is_test, cyclomatic_complexity, arity)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)"
+        "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, is_entry_point, class_context, is_test, cyclomatic_complexity, arity, arity_variadic)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)"
     )?;
 
     for sym in symbols {
@@ -44,7 +44,8 @@ pub fn insert_symbols_batch(tx: &Transaction, symbols: &[ParsedSymbol]) -> rusql
             sym.class_context,
             sym.is_test as i32,
             sym.complexity,
-            sym.arity
+            sym.arity,
+            sym.arity_variadic as i32
         ])?;
     }
     Ok(())
@@ -146,6 +147,7 @@ mod tests {
             class_context: None,
             complexity: 1,
             arity: None,
+            arity_variadic: false,
         }];
         insert_symbols_batch(&tx, &symbols).unwrap();
         tx.commit().unwrap();
