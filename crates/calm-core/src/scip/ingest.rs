@@ -1058,8 +1058,23 @@ mod tests {
     /// the real target: that sibling gets upgraded to `formal`/`'scip'`, and
     /// the stale `stack_graphs` pick gets `ruled_out_by_scip` (its
     /// `edge_confidence` itself is never downgraded — ADR-0004 §3).
+    /// Serializes every test that asserts an exact before/after delta on the
+    /// process-global `SCIP_STACK_GRAPHS_OVERRIDES` counter (D3, 2026-07-30
+    /// stack-graphs-demotion-lever) -- cargo test's default parallel
+    /// execution would otherwise let this test and the 4 counter-specific
+    /// ones below interleave, since ALL of them exercise
+    /// `mark_ruled_out_siblings`/`ingest_occurrences`'s upgrade loop against
+    /// the SAME real static. A `>= before + 1` assertion would dodge this
+    /// but weaken the exact-count guarantee those tests exist to enforce
+    /// (catching double-counting, the bug audit-design found in the
+    /// original spec draft) -- serializing is the correct fix, not a looser
+    /// assertion. `unwrap_or_else` recovers from lock poisoning so one
+    /// failing test in the group doesn't cascade-fail the rest.
+    static COUNTER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn scip_overrides_stack_graphs_target() {
+        let _guard = COUNTER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let conn = db_with_ambiguous_fan_out(&[
             ("a.rs::A::as_str", "a.rs", 1),
             ("b.rs::B::as_str", "b.rs", 1),
@@ -1132,6 +1147,7 @@ mod tests {
     /// sources.
     #[test]
     fn scip_stack_graphs_override_counter_increments_on_real_override() {
+        let _guard = COUNTER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let conn = db_with_one_textual_edge();
         conn.execute(
             "UPDATE call_edges SET edge_confidence = 'formal', formal_source = 'stack_graphs'",
@@ -1175,6 +1191,7 @@ mod tests {
     /// still pass every other test while overcounting in production.
     #[test]
     fn scip_stack_graphs_override_counter_unchanged_on_fresh_upgrade() {
+        let _guard = COUNTER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let conn = db_with_one_textual_edge();
         let occ = vec![
             ScipOccurrence {
@@ -1207,6 +1224,7 @@ mod tests {
     /// counter -- same fixture as `scip_overrides_stack_graphs_target` above.
     #[test]
     fn scip_stack_graphs_override_counter_increments_on_ruled_out_sibling() {
+        let _guard = COUNTER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let conn = db_with_ambiguous_fan_out(&[
             ("a.rs::A::as_str", "a.rs", 1),
             ("b.rs::B::as_str", "b.rs", 1),
@@ -1235,7 +1253,10 @@ mod tests {
         ];
         let before = scip_stack_graphs_override_count();
         let stats = ingest_occurrences(&conn, &occ, true).unwrap();
-        assert_eq!(stats.ruled_out, 1, "sanity: the stale stack_graphs pick really was ruled out");
+        assert_eq!(
+            stats.ruled_out, 1,
+            "sanity: the stale stack_graphs pick really was ruled out"
+        );
         assert_eq!(
             scip_stack_graphs_override_count(),
             before + 1,
@@ -1249,8 +1270,9 @@ mod tests {
     /// is unrelated to stack-graphs when stack-graphs never had a verdict on
     /// that sibling in the first place.
     #[test]
-    fn scip_stack_graphs_override_counter_unchanged_when_ruled_out_sibling_was_never_stack_graphs(
-    ) {
+    fn scip_stack_graphs_override_counter_unchanged_when_ruled_out_sibling_was_never_stack_graphs()
+    {
+        let _guard = COUNTER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let conn = db_with_ambiguous_fan_out(&[
             ("a.rs::A::as_str", "a.rs", 1),
             ("b.rs::B::as_str", "b.rs", 1),
@@ -1274,7 +1296,10 @@ mod tests {
         ];
         let before = scip_stack_graphs_override_count();
         let stats = ingest_occurrences(&conn, &occ, true).unwrap();
-        assert_eq!(stats.ruled_out, 1, "sanity: b.rs::B::as_str still loses the fan-out");
+        assert_eq!(
+            stats.ruled_out, 1,
+            "sanity: b.rs::B::as_str still loses the fan-out"
+        );
         assert_eq!(
             scip_stack_graphs_override_count(),
             before,
