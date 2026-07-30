@@ -893,7 +893,10 @@ impl CalmServer {
         if gate_classification.will_block_without_confirm {
             let why = gate_classification.why.unwrap_or_default();
 
-            if matches!(gate_classification.requirement, GateRequirement::ConfirmOnly) {
+            if matches!(
+                gate_classification.requirement,
+                GateRequirement::ConfirmOnly
+            ) {
                 // Lighter tier: bridge-only hub, risk ≤ medium, every caller
                 // edge resolved/formal confidence — skip EDIT_CONTEXT_REQUIRED
                 // and REASON_NOT_GROUNDED entirely, confirm:true is enough.

@@ -172,6 +172,7 @@ mod tests {
             class_context: None,
             complexity: 1,
             arity: None,
+            arity_variadic: false,
         }
     }
 

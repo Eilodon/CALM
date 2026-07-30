@@ -24,14 +24,23 @@ pub struct ParsedSymbol {
     /// McCabe cyclomatic complexity (1 = no branches). Always 1 for
     /// languages without a real parse tree — see `branch_node_kinds`.
     pub complexity: i64,
-    /// Declared arity (arg count), verified per-language before being
-    /// populated — `None` everywhere except Elixir so far (see
-    /// `elixir_def_arity`). Elixir functions of the same name but different
-    /// arity (`greet/1`, `greet/2`) are different clauses, not overloads of
-    /// one symbol — B3 (Tier B audit) arity gate in
-    /// `pipeline::resolve_sites_to_edges` narrows a bare-name candidate
-    /// list by matching this against the call site's own `RawCall::arg_count`.
+    /// Declared arity, verified per-language before being populated —
+    /// `None` except Elixir (see `elixir_def_arity`) and Go (see
+    /// `go_def_arity`). For Elixir this is an EXACT count (`greet/1`,
+    /// `greet/2` are different clauses, not overloads of one symbol). For Go
+    /// (extended 2026-07-29, self-audit "A'" pass) this is instead the
+    /// MINIMUM arg count a call must supply — see `arity_variadic` for why a
+    /// single integer alone isn't a sound match for Go. B3/A' arity gate in
+    /// `pipeline::resolve_sites_to_edges` narrows a bare-name candidate list
+    /// by comparing this against the call site's own `RawCall::arg_count`.
     pub arity: Option<i64>,
+    /// `true` iff this Go function/method's last parameter is variadic
+    /// (`...T`) — it can be called with `arity` (the minimum) or MORE
+    /// arguments, never fewer, so the gate must do `arg_count >= arity`
+    /// instead of Elixir's exact `arg_count == arity`. Always `false` for
+    /// every other language (Elixir has no variadic-arg concept in the
+    /// `def`/`defp` shape this indexer covers).
+    pub arity_variadic: bool,
 }
 
 use crate::graph::tokenize::tokenize_identifier;
@@ -507,21 +516,28 @@ fn resolve_name_node<'a>(
     }
 }
 
-/// Count real arguments in a node with a direct "arguments"-kind child —
-/// the convention this codebase has confirmed so far for Elixir's `call`
-/// node (both a definition's own name+params wrapper and an ordinary call
-/// site use it). `named_child_count` already excludes anonymous punctuation
-/// (commas, parens), so this needs no separator-counting of its own.
-/// Returns `None` when no such child exists (a different grammar's
-/// convention not yet verified against its own real AST, or a bare
-/// identifier with no argument list at all) — never guesses `Some(0)` for
-/// an unrecognized shape. Feeds `RawCall::arg_count` (call sites) and
-/// `elixir_def_arity` (declarations) — see both doc comments.
+/// Count real arguments in a node with a direct "arguments"- or
+/// "argument_list"-kind child. "arguments" is the convention this codebase
+/// originally confirmed for Elixir's `call` node (both a definition's own
+/// name+params wrapper and an ordinary call site use it); "argument_list" is
+/// Go's real tree-sitter node kind for the same shape (its call_expression
+/// names the FIELD "arguments" but the actual NODE KIND is "argument_list" —
+/// verified via a real tree-sitter-go 0.23.4 parse, 2026-07-29 self-audit "A'"
+/// pass, not guessed: this codebase's own index had 0/9 Go call_sites.arg_count
+/// populated before this widening, since the old kind()=="arguments" check
+/// silently matched nothing for Go). `named_child_count` already excludes
+/// anonymous punctuation (commas, parens), so this needs no separator-counting
+/// of its own for either kind. Returns `None` when no such child exists (a
+/// different grammar's convention not yet verified against its own real AST,
+/// or a bare identifier with no argument list at all) — never guesses `Some(0)`
+/// for an unrecognized shape. Feeds `RawCall::arg_count` (call sites) and
+/// `elixir_def_arity`/`go_def_arity` (declarations) — see all three doc
+/// comments.
 fn count_arguments_node(container: tree_sitter::Node) -> Option<i64> {
     let mut cursor = container.walk();
     container
         .children(&mut cursor)
-        .find(|c| c.kind() == "arguments")
+        .find(|c| c.kind() == "arguments" || c.kind() == "argument_list")
         .map(|args| args.named_child_count() as i64)
 }
 
@@ -548,6 +564,64 @@ fn elixir_def_arity(def_call_node: tree_sitter::Node) -> Option<i64> {
         "identifier" => Some(0),
         _ => None,
     }
+}
+
+/// Go's own declared arity for a `function_declaration`/`method_declaration`
+/// (A' pass, 2026-07-29 self-audit, extending the B3-Elixir arity gate to a
+/// second language) -- returns `(min_arity, is_variadic)`. Real Go
+/// tree-sitter grammar facts below verified via a live parse
+/// (tree-sitter-go 0.23.4) this session, not guessed:
+///
+/// - `function_declaration`/`method_declaration` name their real argument
+///   list via FIELD "parameters" (a `parameter_list` node). `method_declaration`
+///   ALSO has a separate FIELD "receiver" -- itself ALSO a `parameter_list`
+///   node of the identical KIND -- so this must read the "parameters" field
+///   specifically, never blindly walk every child of that kind, or a
+///   receiver like `(s *Server)` would be miscounted as part of the call
+///   arity `s.Handle(...)` never actually supplies as an explicit argument.
+/// - Go's multi-name-one-type grouping (`func Add(a, b int)`) emits ONE
+///   `parameter_declaration` node containing TWO `identifier` children
+///   sharing one `type_identifier` -- counting `parameter_declaration` nodes
+///   alone would undercount; must count the `identifier` children within
+///   each one instead (mirrors `binding_names_and_type`'s existing Go arm,
+///   which handles the identical shape for a different purpose).
+/// - An unnamed parameter (`func Unnamed(int, string)`, legal Go) is its own
+///   `parameter_declaration` with ZERO `identifier` children -- still
+///   exactly one parameter slot, so the per-declaration contribution is
+///   `max(1, identifier_count)`, never a bare identifier count (which would
+///   silently drop unnamed params to 0 width).
+/// - `variadic_parameter_declaration` (`nums ...int`) is Go's real, distinct
+///   node kind for a trailing variadic param -- always last, so at most one
+///   per declaration list. It contributes 0 to `min_arity` (a variadic-only
+///   function can be called with zero trailing args) and sets `is_variadic`
+///   for the whole function; the gate this feeds must therefore compare
+///   `call_arg_count >= min_arity` for a variadic function, never `==`
+///   (Elixir's exact-match model does not carry over to Go's arity gate).
+fn go_def_arity(decl_node: tree_sitter::Node) -> Option<(i64, bool)> {
+    let params = decl_node.child_by_field_name("parameters")?;
+    if params.kind() != "parameter_list" {
+        return None;
+    }
+    let mut min_arity: i64 = 0;
+    let mut is_variadic = false;
+    let mut cursor = params.walk();
+    for param in params.named_children(&mut cursor) {
+        match param.kind() {
+            "parameter_declaration" => {
+                let mut name_cursor = param.walk();
+                let name_count = param
+                    .children(&mut name_cursor)
+                    .filter(|c| c.kind() == "identifier")
+                    .count() as i64;
+                min_arity += name_count.max(1);
+            }
+            "variadic_parameter_declaration" => {
+                is_variadic = true;
+            }
+            _ => {}
+        }
+    }
+    Some((min_arity, is_variadic))
 }
 
 /// Dart (C3, Tier B audit): tree-sitter-dart has no dedicated call-expression
@@ -716,14 +790,26 @@ fn walk_symbols(
         } else {
             enclosing_class.clone()
         };
-        // B3 (Tier B audit): Elixir's def/defp arity, verified only for this
-        // language so far — see `elixir_def_arity`'s doc comment for why an
-        // exact-arity gate is sound here (0% default-argument clauses) but
-        // not assumed for any other language yet.
-        let arity = if language == "elixir" && node.kind() == "call" {
-            elixir_def_arity(node)
+        // B3 (Tier B audit): Elixir's def/defp exact arity -- see
+        // `elixir_def_arity`'s doc comment for why an exact-arity gate is
+        // sound here (0% default-argument clauses) but not assumed for any
+        // other language without its own verified grammar facts. Go's
+        // min-arity + variadic-flag pair is a separate shape (see
+        // `go_def_arity`'s doc comment) -- extended here 2026-07-29, A'
+        // self-audit pass. Every other language stays `(None, false)` until
+        // its own arity extraction is verified per-grammar, same posture
+        // Elixir's original comment already established.
+        let (arity, arity_variadic) = if language == "elixir" && node.kind() == "call" {
+            (elixir_def_arity(node), false)
+        } else if language == "go"
+            && matches!(node.kind(), "function_declaration" | "method_declaration")
+        {
+            match go_def_arity(node) {
+                Some((min_arity, variadic)) => (Some(min_arity), variadic),
+                None => (None, false),
+            }
         } else {
-            None
+            (None, false)
         };
 
         let kind = node_kind_to_symbol_kind(node.kind(), enclosing_class.is_some());
@@ -767,6 +853,7 @@ fn walk_symbols(
             complexity,
             class_context,
             arity,
+            arity_variadic,
         });
     }
 
@@ -1764,8 +1851,8 @@ pub fn extract_calls_from_tree(
     // (lang_constants.rs), so both are covered without a separate check.
     // Every other language keeps its prior `None` (unattributed top-level
     // calls stay dropped, unchanged behavior) until validated separately.
-    let initial_enclosing = matches!(language, "javascript" | "typescript")
-        .then(|| (MODULE_ENCLOSING.to_string(), 0));
+    let initial_enclosing =
+        matches!(language, "javascript" | "typescript").then(|| (MODULE_ENCLOSING.to_string(), 0));
     walk_calls(
         tree.root_node(),
         source,
@@ -2752,6 +2839,7 @@ pub fn extract_symbols_shallow(source: &str, language: &str, path: &str) -> Vec<
             class_context: None,
             complexity: 1,
             arity: None,
+            arity_variadic: false,
         });
     }
     out
@@ -2834,6 +2922,7 @@ pub fn extract_markdown_symbols(source: &str, path: &str) -> Vec<ParsedSymbol> {
             class_context: None,
             complexity: 1,
             arity: None,
+            arity_variadic: false,
         });
     }
     out
@@ -3658,6 +3747,94 @@ def run():
         let code = "package p\ntype T struct{}\nfunc (t T) main() {}\n";
         let symbols = extract_symbols(code, "go", "main.go").unwrap();
         assert!(!find(&symbols, "main").is_entry_point);
+    }
+
+    /// A' pass (2026-07-29 self-audit): Go's multi-name-one-type parameter
+    /// grouping (`a, b int` is ONE `parameter_declaration` with TWO
+    /// `identifier` children sharing one type, verified via a real
+    /// tree-sitter-go 0.23.4 parse) must count as arity 2, not 1 -- counting
+    /// `parameter_declaration` NODES instead of the names within each would
+    /// silently undercount every grouped-parameter signature.
+    #[test]
+    fn test_go_arity_counts_grouped_same_type_parameters() {
+        let code = "package p\nfunc Add(a, b int) int { return a + b }\n";
+        let symbols = extract_symbols(code, "go", "main.go").unwrap();
+        let add = find(&symbols, "Add");
+        assert_eq!(
+            add.arity,
+            Some(2),
+            "Add(a, b int) must count as arity 2, not 1"
+        );
+        assert!(!add.arity_variadic);
+    }
+
+    /// A' pass: an unnamed parameter (`func Unnamed(int, string)`, legal Go)
+    /// is its own `parameter_declaration` with ZERO `identifier` children --
+    /// still exactly one parameter slot each, so this must count as arity 2,
+    /// not 0 (which a naive "count identifier children" implementation with
+    /// no `max(1, ..)` floor would silently produce).
+    #[test]
+    fn test_go_arity_counts_unnamed_parameters_as_one_slot_each() {
+        let code = "package p\nfunc Unnamed(int, string) {}\n";
+        let symbols = extract_symbols(code, "go", "main.go").unwrap();
+        let unnamed = find(&symbols, "Unnamed");
+        assert_eq!(
+            unnamed.arity,
+            Some(2),
+            "two unnamed parameters must still count as arity 2"
+        );
+        assert!(!unnamed.arity_variadic);
+    }
+
+    /// A' pass: `method_declaration` has a separate "receiver" field (itself
+    /// also a `parameter_list` node of the SAME kind as "parameters") --
+    /// verified via a real parse that `go_def_arity` reads the "parameters"
+    /// field specifically, not just any `parameter_list` child, or a
+    /// receiver like `(s *Server)` would be miscounted as part of the
+    /// call-site arity `s.Handle(...)` never actually supplies explicitly.
+    #[test]
+    fn test_go_arity_excludes_method_receiver_from_count() {
+        let code = "package p\ntype Server struct{}\nfunc (s *Server) Handle(w int, r string) bool { return true }\n";
+        let symbols = extract_symbols(code, "go", "main.go").unwrap();
+        let handle = find(&symbols, "Handle");
+        assert_eq!(
+            handle.arity,
+            Some(2),
+            "receiver (s *Server) must not inflate Handle's arity beyond its real 2 parameters"
+        );
+    }
+
+    /// A' pass: `variadic_parameter_declaration` (`nums ...int`) is Go's own
+    /// distinct node kind for a trailing variadic param -- contributes 0 to
+    /// min_arity (callable with zero trailing args) and sets `arity_variadic`.
+    #[test]
+    fn test_go_arity_variadic_only_function() {
+        let code = "package p\nfunc Sum(nums ...int) int { return 0 }\n";
+        let symbols = extract_symbols(code, "go", "main.go").unwrap();
+        let sum = find(&symbols, "Sum");
+        assert_eq!(
+            sum.arity,
+            Some(0),
+            "a variadic-only param contributes 0 to the minimum arity"
+        );
+        assert!(sum.arity_variadic, "Sum must be flagged variadic");
+    }
+
+    /// A' pass: a variadic param preceded by fixed params (`a int, rest
+    /// ...string`) must report the FIXED count as min_arity (1), not 0 --
+    /// only the trailing variadic slot itself contributes nothing to the
+    /// minimum.
+    #[test]
+    fn test_go_arity_mixed_fixed_and_variadic_parameters() {
+        let code = "package p\nfunc Mixed(a int, rest ...string) {}\n";
+        let symbols = extract_symbols(code, "go", "main.go").unwrap();
+        let mixed = find(&symbols, "Mixed");
+        assert_eq!(
+            mixed.arity,
+            Some(1),
+            "the one fixed parameter before the variadic tail must still count"
+        );
+        assert!(mixed.arity_variadic);
     }
 
     #[test]

@@ -561,8 +561,7 @@ fn extract_file_data(
             .get(&(c.enclosing_name.clone(), c.enclosing_line))
             .cloned()
             .or_else(|| {
-                (c.enclosing_name == MODULE_ENCLOSING)
-                    .then(|| format!("{rel}::{MODULE_ENCLOSING}"))
+                (c.enclosing_name == MODULE_ENCLOSING).then(|| format!("{rel}::{MODULE_ENCLOSING}"))
             });
         if let Some(enc_qn) = enc_qn {
             let mut confidence;
@@ -729,10 +728,12 @@ struct ResolutionCtx<'a> {
     path_lang: HashMap<String, String>,
     caller_usings: HashMap<String, HashSet<String>>,
     namespace_map: &'a crate::indexer::csharp_namespace::NamespaceMap,
-    /// qualified_name → declared arity (see `ParsedSymbol::arity`), for the
-    /// Elixir arity gate below (B3, Tier B audit) — only ever populated for
-    /// Elixir symbols so far, `None`/absent elsewhere.
-    arity_by_qn: HashMap<String, i64>,
+    /// qualified_name → (declared arity, is_variadic) (see `ParsedSymbol::arity`/
+    /// `arity_variadic`), for the B3/A' arity gate below — populated for
+    /// Elixir (exact arity, `is_variadic` always `false`) and Go (minimum
+    /// arity, `is_variadic` true when the last param is `...T`). Absent for
+    /// every other language until its own arity extraction is verified.
+    arity_by_qn: HashMap<String, (i64, bool)>,
 }
 
 /// Build the candidate-lookup tables `resolve_sites_to_edges` narrows
@@ -764,12 +765,12 @@ fn build_resolution_context<'a>(
     // own symbols, so it's always populated for any path that could ever be
     // a call site's `from_path` below).
     let mut path_lang: HashMap<String, String> = HashMap::new();
-    // qualified_name → declared arity, Elixir-only for now — feeds the
-    // arity gate below (B3, Tier B audit).
-    let mut arity_by_qn: HashMap<String, i64> = HashMap::new();
+    // qualified_name → (declared arity, is_variadic) -- Elixir/Go for now --
+    // feeds the arity gate below (B3/A').
+    let mut arity_by_qn: HashMap<String, (i64, bool)> = HashMap::new();
     {
         let mut stmt = tx.prepare(
-            "SELECT name, qualified_name, path, class_context, signature, language, arity FROM symbols",
+            "SELECT name, qualified_name, path, class_context, signature, language, arity, arity_variadic FROM symbols",
         )?;
         let rows = stmt
             .query_map([], |r| {
@@ -781,10 +782,11 @@ fn build_resolution_context<'a>(
                     r.get::<_, String>(4)?,
                     r.get::<_, String>(5)?,
                     r.get::<_, Option<i64>>(6)?,
+                    r.get::<_, bool>(7)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        for (name, qn, path, cls, sig, language, arity) in rows {
+        for (name, qn, path, cls, sig, language, arity, variadic) in rows {
             path_lang
                 .entry(path.clone())
                 .or_insert_with(|| language.clone());
@@ -800,7 +802,7 @@ fn build_resolution_context<'a>(
                     .push((qn.clone(), path, language));
             }
             if let Some(a) = arity {
-                arity_by_qn.insert(qn.clone(), a);
+                arity_by_qn.insert(qn.clone(), (a, variadic));
             }
             sig_by_qn.insert(qn, sig);
         }
@@ -947,28 +949,61 @@ fn resolve_sites_to_edges(ctx: &ResolutionCtx, sites: &[CallSiteRow]) -> Vec<Cal
                 if t.is_empty() {
                     return (Vec::new(), false);
                 }
-                // B3 arity gate (Tier B audit), Elixir-only: `greet/1` and
-                // `greet/2` are different clauses, not overloads of one
-                // symbol — a bare-name candidate list can hold both at once
+                // B3/A' arity gate (Tier B audit; extended to Go 2026-07-29
+                // self-audit "A'" pass): Elixir's `greet/1` and `greet/2` are
+                // different clauses, not overloads of one symbol; Go's same-
+                // named functions across different packages can also collide
+                // on a bare name -- either way, a bare-name candidate list can
+                // hold multiple real, distinct declarations at once
                 // (same_file's own match below would otherwise still
-                // conflate them when both live in the caller's file), so
-                // this narrows by each candidate's OWN declared arity
-                // (`ctx.arity_by_qn`, from a real def/defp, not a guess)
-                // before same_file/same_dir/same_namespace even run. Exactly
-                // 1 survivor is real declaration-verified evidence — same
-                // standing as same_namespace's C#-only confirmation below —
-                // so it short-circuits straight to `resolved`. Fail-open
-                // (keep `t` unchanged) when arity is unknown at either end,
-                // or narrowing would leave nothing: absence of a match is
-                // never proof the true candidate isn't in `t` (e.g. a
-                // multi-clause function this pass doesn't fully model).
+                // conflate them when they live in the caller's file), so this
+                // narrows by each candidate's OWN declared arity
+                // (`ctx.arity_by_qn`, from a real def/defp or func/method
+                // declaration, not a guess) before same_file/same_dir/
+                // same_namespace even run. Comparison is variadic-aware: a Go
+                // candidate whose last param is `...T` accepts its minimum
+                // arity or MORE (never fewer), so `n >= min_arity`, not `==` --
+                // Elixir has no variadic-arg concept in the `def`/`defp` shape
+                // this indexer covers, so its own candidates are always
+                // `is_variadic: false` and keep the original exact-match
+                // behavior unchanged. Exactly 1 survivor is real declaration-
+                // verified evidence — same standing as same_namespace's
+                // C#-only confirmation below — so it short-circuits straight
+                // to `resolved`. Fail-open (keep `t` unchanged) when arity is
+                // unknown at either end, or narrowing would leave nothing:
+                // absence of a match is never proof the true candidate isn't
+                // in `t` (e.g. a multi-clause function this pass doesn't
+                // fully model, or a language not yet arity-verified at all).
+                // Guarded on `target_class.is_none()`: when `target_class` IS
+                // set, `t` already came from `ctx.by_name_class` (a real
+                // receiver-type match, e.g. Go's `s.Process()` with `s`
+                // statically typed `*Service`) -- a tier-2 resolution whose
+                // own, already-correct confidence ("inferred") this gate must
+                // not silently overwrite by "confirming" a single survivor
+                // that target_class narrowing already produced for an
+                // unrelated reason. Caught live by
+                // `test_tier2_go_pointer_receiver` regressing to "resolved"
+                // before this guard existed -- same class of bug
+                // `receiver_is_type_path`'s tier-1 skip (see this same
+                // function's earlier comment) was written to prevent.
                 let arity_narrowed: Vec<(String, String)>;
-                let t: &Vec<(String, String)> = if caller_lang.map(String::as_str) == Some("elixir")
+                let t: &Vec<(String, String)> = if target_class.is_none()
+                    && matches!(caller_lang.map(String::as_str), Some("elixir" | "go"))
                     && let Some(n) = arg_count
                 {
                     let narrowed: Vec<(String, String)> = t
                         .iter()
-                        .filter(|(qn, _)| ctx.arity_by_qn.get(qn) == Some(n))
+                        .filter(|(qn, _)| {
+                            ctx.arity_by_qn
+                                .get(qn)
+                                .is_some_and(|&(min_arity, variadic)| {
+                                    if variadic {
+                                        *n >= min_arity
+                                    } else {
+                                        *n == min_arity
+                                    }
+                                })
+                        })
                         .cloned()
                         .collect();
                     if narrowed.len() == 1 {
@@ -3920,6 +3955,126 @@ impl StructB {
             ),
             0,
             "greet(\"world\", \"Hello\") (2 args) must NOT fan out to the arity-1 clause"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    // A' pass (2026-07-29 self-audit): generalizes the B3 Elixir arity gate
+    // to Go. `same_dir` (P1.3, checked BEFORE arity in the cascade) cannot
+    // narrow this on its own since the two colliding `Greet`s live in two
+    // DIFFERENT directories, neither matching the caller's own -- exactly
+    // the case arity narrowing exists to cover once same_file/same_dir both
+    // come up empty. Go can't have two same-named funcs in one package
+    // (unlike Elixir's same-file multi-clause case above), so this needs 3
+    // separate directories: caller's own (no Greet at all), and two
+    // unrelated packages each defining a different-arity Greet.
+    fn test_go_arity_disambiguates_cross_package_same_name_different_arity() {
+        let dir = std::env::temp_dir().join(format!("ci_idx_go_arity_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("moda")).unwrap();
+        std::fs::create_dir_all(dir.join("modb")).unwrap();
+        std::fs::create_dir_all(dir.join("caller")).unwrap();
+        std::fs::write(
+            dir.join("moda/greet.go"),
+            "package moda\nfunc Greet(name string) string {\n\treturn \"Hi \" + name\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("modb/greet.go"),
+            "package modb\nfunc Greet(name, greeting string) string {\n\treturn greeting + name\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("caller/main.go"),
+            "package main\nfunc main() {\n\tGreet(\"world\")\n}\n",
+        )
+        .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
+
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM call_edges \
+                 WHERE from_symbol = (SELECT qualified_name FROM symbols WHERE name = 'main') \
+                 AND to_symbol = (SELECT qualified_name FROM symbols WHERE name = 'Greet' AND path = 'moda/greet.go') \
+                 AND edge_confidence = 'resolved'",
+            ),
+            1,
+            "Greet(\"world\") (1 arg) must resolve confidently to moda's arity-1 Greet"
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM call_edges \
+                 WHERE from_symbol = (SELECT qualified_name FROM symbols WHERE name = 'main') \
+                 AND to_symbol = (SELECT qualified_name FROM symbols WHERE name = 'Greet' AND path = 'modb/greet.go')",
+            ),
+            0,
+            "Greet(\"world\") (1 arg) must NOT fan out to modb's arity-2 Greet"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    // A' pass: a variadic candidate must accept a call with MORE than its own
+    // minimum arity, while an unrelated same-named candidate with a
+    // DIFFERENT exact arity that doesn't match the call's real arg count
+    // stays correctly excluded -- proves the gate does `n >= min_arity` for
+    // a variadic candidate, not a plain `==` (which would wrongly exclude
+    // this legitimate variadic match too).
+    fn test_go_arity_variadic_candidate_accepts_more_than_minimum_args() {
+        let dir =
+            std::env::temp_dir().join(format!("ci_idx_go_arity_variadic_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("moda")).unwrap();
+        std::fs::create_dir_all(dir.join("modb")).unwrap();
+        std::fs::create_dir_all(dir.join("caller")).unwrap();
+        std::fs::write(
+            dir.join("moda/greet.go"),
+            "package moda\nfunc Greet(prefix string, rest ...string) string {\n\treturn prefix\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("modb/greet.go"),
+            "package modb\nfunc Greet(a, b string) string {\n\treturn a + b\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("caller/main.go"),
+            "package main\nfunc main() {\n\tGreet(\"x\", \"y\", \"z\")\n}\n",
+        )
+        .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
+
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM call_edges \
+                 WHERE from_symbol = (SELECT qualified_name FROM symbols WHERE name = 'main') \
+                 AND to_symbol = (SELECT qualified_name FROM symbols WHERE name = 'Greet' AND path = 'moda/greet.go') \
+                 AND edge_confidence = 'resolved'",
+            ),
+            1,
+            "Greet(\"x\", \"y\", \"z\") (3 args) must resolve to moda's variadic Greet (min arity 1)"
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM call_edges \
+                 WHERE from_symbol = (SELECT qualified_name FROM symbols WHERE name = 'main') \
+                 AND to_symbol = (SELECT qualified_name FROM symbols WHERE name = 'Greet' AND path = 'modb/greet.go')",
+            ),
+            0,
+            "3 args must NOT match modb's fixed arity-2 Greet"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

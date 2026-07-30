@@ -765,6 +765,7 @@ mod personalization_tests {
             snippet: None,
             is_test: false,
             churn_score: None,
+            coreness: None,
         }
     }
 

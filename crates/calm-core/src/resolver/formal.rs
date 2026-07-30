@@ -418,7 +418,10 @@ impl<'a> TsgCancellationFlag for TsgBoundedCancellation<'a> {
     fn check(&self, at: &'static str) -> Result<(), tree_sitter_stack_graphs::CancellationError> {
         // Wall-clock layer first -- unchanged existing behavior/safety net.
         self.inner.check(at)?;
-        let n = self.checks.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        let n = self
+            .checks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
         if n > self.max_checks {
             return Err(tree_sitter_stack_graphs::CancellationError(
                 "deterministic TSG-build work cap exceeded (ADR-A2)",
@@ -651,7 +654,8 @@ impl FormalResolver {
         // see BoundedCancellation's doc comment for calibration data and
         // its documented limits. Delegates to `sg_deadline` first, so the
         // existing wall-clock safety net is unchanged.
-        let bounded_deadline = BoundedCancellation::new(&sg_deadline, MAX_STITCH_CANCELLATION_CHECKS);
+        let bounded_deadline =
+            BoundedCancellation::new(&sg_deadline, MAX_STITCH_CANCELLATION_CHECKS);
 
         // Index: find partial paths in this file.
         index_partial_paths_in_file(&graph, &mut partials, file, &mut db, &bounded_deadline)
@@ -833,7 +837,6 @@ mod tests {
         );
     }
 
-
     struct AlwaysOk;
     impl stack_graphs::CancellationFlag for AlwaysOk {
         fn check(&self, _at: &'static str) -> Result<(), stack_graphs::CancellationError> {
@@ -841,7 +844,10 @@ mod tests {
         }
     }
     impl TsgCancellationFlag for AlwaysOk {
-        fn check(&self, _at: &'static str) -> Result<(), tree_sitter_stack_graphs::CancellationError> {
+        fn check(
+            &self,
+            _at: &'static str,
+        ) -> Result<(), tree_sitter_stack_graphs::CancellationError> {
             Ok(())
         }
     }

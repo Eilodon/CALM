@@ -7639,7 +7639,10 @@ mod tests {
             ctx_v["gate_prediction"]["is_hub"], false,
             "response: {ctx_v}"
         );
-        assert_eq!(ctx_v["gate_prediction"]["requires"], "none", "response: {ctx_v}");
+        assert_eq!(
+            ctx_v["gate_prediction"]["requires"], "none",
+            "response: {ctx_v}"
+        );
 
         // The real gate must agree: confirm:false on the exact same range still applies.
         let hash = calm_core::edit::range_checksum("def helper():\n    return 1\n", 2, 2).unwrap();

@@ -674,7 +674,15 @@ fn rename_collides_with_existing_name() {
     .unwrap();
     std::fs::write(
         root.join("gen.go"),
-        "package main\n\nfunc LocalUtil() string {\n\treturn \"util\"\n}\n",
+        // Same arity (1 string param) as helper.go's `Greet(name string)` so
+        // the post-rename collision stays genuinely ambiguous under the Go
+        // arity gate (A' pass, 2026-07-29 self-audit) too -- a 0-arg
+        // LocalUtil renamed to Greet would otherwise let arg_count=1 at the
+        // call site disambiguate down to exactly 1 candidate (helper.go's),
+        // which is a real precision improvement, just not what THIS test is
+        // about (delta re-resolution on a genuine name collision, not arity
+        // narrowing).
+        "package main\n\nfunc LocalUtil(x string) string {\n\treturn \"util\" + x\n}\n",
     )
     .unwrap();
 

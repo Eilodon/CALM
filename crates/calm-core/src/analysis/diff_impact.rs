@@ -386,7 +386,7 @@ pub fn signature_range_has_removal(fd: &FileDiff, signature_range: (i64, i64)) -
     fd.hunks
         .iter()
         .zip(&fd.removed_line_text)
-        .any(|(&(hs, he), removed)| !(he < start || hs > end) && !removed.is_empty())
+        .any(|(&(hs, he), removed)| !(he < start || hs > end || removed.is_empty()))
 }
 
 /// Read-only accessor for the 3 fields `compute_aggregate_risk` and
@@ -810,7 +810,8 @@ mod tests {
     }
 
     #[test]
-    fn test_is_new_symbol_false_when_signature_hunk_had_removal_even_with_zero_callers_and_all_lines_added() {
+    fn test_is_new_symbol_false_when_signature_hunk_had_removal_even_with_zero_callers_and_all_lines_added()
+     {
         // The bug this closes: a comment-only edit on a ZERO-caller function
         // (`caller_count == 0`, so the caller_count guard above doesn't save
         // it) renders as remove-old+add-new for its signature line — every
