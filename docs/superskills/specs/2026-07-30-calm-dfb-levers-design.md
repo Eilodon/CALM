@@ -409,3 +409,41 @@ Not planned for build now. Why (from G1/G2):
 
 > **Next gate:** on approval, set `SPEC_APPROVED: true` → triggers `audit-design`
 > (risk audit) → `writing-plans` (task-level plan). No code before then.
+
+---
+
+## Risk Assessment (audit-design)
+<!-- audit-design: DO NOT DUPLICATE — update this section, do not append a second one -->
+<!-- last-run: 2026-07-30 | trigger: NORMAL -->
+
+**Tier:** 2 (D ships an opt-in but production code path in `embedding.rs`; F/B7-B8 are internal benchmark tooling, Tier 1 on their own — Tier 2 taken as the ceiling for the combined spec) | **Date:** 2026-07-30
+
+### Failure Modes
+1. **B7 Phase 1's pinned corpora (fd/flask) may not build/test hermetically in a fresh clone** — Cargo needs a crates.io fetch (`cargo fetch`/`build`) and Python's flask test deps need `pip install` unless vendored; the spec explicitly calls out npm's network need (Phase 2) but never checks this for Phase 1's own Rust/Python corpora. — **MED-HIGH** — mitigation in plan: **NO** (must add: verify each corpus's test suite runs green, offline-or-not, before Phase 1 starts)
+2. **Build+test-pass is necessary but not sufficient** — a picked symbol whose callsites aren't exercised by the corpus's own test suite would let both arms "pass" even with a genuinely missed callsite, making that task uninformative. — **MED** — mitigation in plan: **PARTIAL** (the dual-oracle design — build/test + independent callsite recall — catches this only if callsite recall is computed correctly and the symbol is chosen well; symbol selection itself is still an open question per §6)
+3. **`tract`'s musl-compatibility evidence is being conflated with model-op-coverage evidence** — tract runs *on* musl, but whether it can execute the *specific* ONNX graph of a modern code-embedding transformer (attention variants, dynamic shapes, newer opset ops) is a completely different, unverified question. The spec's §3.2 "confirmation, not open bet" framing understates this. — **HIGH** — mitigation in plan: **NO** (must add: verify op-coverage for the actual candidate model — e.g. `nomic-ai/CodeRankEmbed` exported to ONNX — under `tract` specifically, before any further D work; if it fails, evaluate a smaller/simpler architecture or fall back to `candle` with its own spike)
+
+### Layer Signals
+- **L3 Data:** Switching `Static`→`Onnx` backend changes the embedding *space*, not just dimension. Existing `heal_dimension_mismatch` only catches a dimension change — two different models could coincidentally share a dimension and silently produce cross-space cosine comparisons against stale vectors during a partial reindex. **Needs explicit invalidate-all-on-backend-switch logic**, not just the dimension check.
+- **L6 Observability:** No pre-refactor baseline test run is specified. Without one, a corpus's own pre-existing flaky/failing test gets misattributed to "the arm broke it." **Add: run each corpus's test suite once before any refactor, on the fresh clone, and require it green before counting a post-refactor failure as arm-caused.**
+- **L2 Concurrency:** Running B7 Phases in parallel (not stated either way) risks the same class of shared-`target/`/shared-build contention this project has hit before in the *server* (see memory: multi-client WAL bloat) — now a risk for the *benchmark harness* instead. No signal that this was considered.
+- L1/L4/L5/L7: no signal beyond what's already addressed in the spec (L4's HF-download error handling should just mirror the existing `Embedder::load` fallback idiom; L5's npm/registry supply-chain exposure is inherent to using real `npm test`, not new).
+
+### Assumptions to Verify
+- **ASSUMED:** B12's 6 pinned corpora build+test cleanly — B12 only ever *reads* them; this design is the first to require them to *build and pass tests*, and that was never checked.
+- **ASSUMED:** `tract` can execute the chosen code-embedding model's actual ONNX graph (Failure Mode 3) — evidence found was musl-general, not model-specific.
+- **ASSUMED:** B7's per-corpus target symbols are real hubs / have real multi-callsite shape — B11's own anchor was *live-verified* via `hotspots` before use (documented inline in B11); B7's §1.3 task list doesn't yet commit to the same verification for the new corpora.
+- **ASSUMED:** N≥3–5 repeats is "enough" for B8 — a reasonable default, not derived from any power calculation; treat as a starting point to revisit if variance is high.
+
+### Abductive Hypotheses
+1. **Hub-gate task × fresh-clone-per-run interaction:** the `narrow_a_hub` task assumes CALM's risk gate fires on the picked symbol, but hub/coreness scores are graph-structural and computed fresh per clone with no prior history — the symbol's hub status was never independently re-verified for the *new* per-language corpora the way B11 verified its own self-repo anchor. Two individually-correct pieces (CALM's real hub-gate logic + B7's correct fresh-clone design) combine into an unverified assumption.
+2. **Resource contention at full scale:** running B7 (multi-language builds) and B8 (concurrent LLM agent-loop calls) in the same environment/timing budget risks the exact resource-contention failure mode already seen in this project's *server* (multi-client WAL bloat, orphaned children — see memory) recurring in the *benchmark harness* instead, manifesting as spurious "arm A beat arm B" noise that's actually contention, not signal.
+
+### Gate Result
+<!-- PASS | PASS WITH FLAGS | HOLD -->
+**PASS WITH FLAGS** — the overall design (per-language B7, `tract`-based D, deferred B) is sound and proceeds. Execution must fold in, as concrete first steps rather than a separate planning doc:
+1. Verify each Phase-1 corpus (fd, flask) builds+tests green on a fresh clone before writing any task against it (closes Failure Mode 1).
+2. Run each corpus's test suite once pre-refactor to establish a green baseline (closes L6).
+3. Verify the actual candidate embedding model's ONNX graph runs under `tract` — not just musl-general evidence — before any further D work (closes Failure Mode 3, the highest-severity open item).
+4. Add embedding-space invalidation on backend switch, not just dimension-mismatch healing (closes L3).
+5. Live-verify hub-status of any B7 `narrow_a_hub` target symbol via `hotspots`/`edit_context` before relying on it, mirroring B11's own discipline (closes Abductive 1).
