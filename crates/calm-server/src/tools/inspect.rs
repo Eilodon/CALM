@@ -1,6 +1,26 @@
 use super::common::*;
 use super::*;
 
+/// `(symbol, path, edge_confidence, edge_kind, line, formal_source)` --
+/// D2 (2026-07-30 stack-graphs-demotion-lever) pushed this past clippy's
+/// type_complexity threshold as a bare tuple; named here purely to satisfy
+/// that lint. Used by `understand`'s single-symbol callers query.
+type EdgeRow = (String, String, String, String, Option<i64>, Option<String>);
+
+/// `(other_symbol, batch_symbol, other_path, edge_confidence, edge_kind,
+/// line, formal_source)` -- same reasoning as `EdgeRow`, one extra column
+/// since `symbols_batch` groups rows by the requested symbol afterward.
+/// Same shape serves both its callers and callees queries.
+type BatchEdgeRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<i64>,
+    Option<String>,
+);
+
 #[rmcp::tool_router(router = "inspect_tool_router", vis = "pub(crate)")]
 impl CalmServer {
     #[tool(
@@ -428,7 +448,7 @@ impl CalmServer {
                         Ok(s) => s,
                         Err(e) => return db_error(e),
                     };
-                    let rows: Vec<(String, String, String, String, Option<i64>, Option<String>)> =
+                    let rows: Vec<EdgeRow> =
                         match stmt.query_map(rusqlite::params![info.qualified_name], |row| {
                             Ok((
                                 row.get::<_, String>(0)?,
@@ -577,8 +597,7 @@ impl CalmServer {
             let mut callees_by_symbol: std::collections::HashMap<String, Vec<CalleeEntry>> = std::collections::HashMap::new();
 
             if p.include_callers && !found_ids.is_empty() {
-                let mut raw: Vec<(String, String, String, String, String, Option<i64>, Option<String>)> =
-                    Vec::new();
+                let mut raw: Vec<BatchEdgeRow> = Vec::new();
                 for chunk in found_ids.chunks(CHUNK) {
                     let placeholders = chunk
                         .iter()
@@ -628,8 +647,7 @@ impl CalmServer {
             }
 
             if p.include_callees && !found_ids.is_empty() {
-                let mut raw: Vec<(String, String, String, String, String, Option<i64>, Option<String>)> =
-                    Vec::new();
+                let mut raw: Vec<BatchEdgeRow> = Vec::new();
                 for chunk in found_ids.chunks(CHUNK) {
                     let placeholders = chunk
                         .iter()

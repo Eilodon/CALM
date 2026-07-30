@@ -1,6 +1,12 @@
 use super::common::*;
 use super::*;
 
+/// `(symbol, path, edge_confidence, edge_kind, line, formal_source)` --
+/// D2 (2026-07-30 stack-graphs-demotion-lever) pushed this past clippy's
+/// type_complexity threshold as a bare tuple; named here purely to satisfy
+/// that lint, same row shape serves both `callers`' and `callees`' queries.
+type EdgeRow = (String, String, String, String, Option<i64>, Option<String>);
+
 #[rmcp::tool_router(router = "trace_tool_router", vis = "pub(crate)")]
 impl CalmServer {
     #[tool(
@@ -50,7 +56,7 @@ impl CalmServer {
                     Ok(s) => s,
                     Err(e) => return db_error_resolved(e),
                 };
-                let rows: Vec<(String, String, String, String, Option<i64>, Option<String>)> =
+                let rows: Vec<EdgeRow> =
                     match stmt.query_map(rusqlite::params![c.qualified_name], |row| {
                         Ok((
                             row.get::<_, String>(0)?,
@@ -257,7 +263,7 @@ impl CalmServer {
                     Ok(s) => s,
                     Err(e) => return db_error_resolved(e),
                 };
-                let rows: Vec<(String, String, String, String, Option<i64>, Option<String>)> =
+                let rows: Vec<EdgeRow> =
                     match stmt.query_map(rusqlite::params![c.qualified_name], |row| {
                         Ok((
                             row.get::<_, String>(0)?,
