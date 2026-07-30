@@ -153,3 +153,52 @@ tasks:
       - [packages/zod/src/v4/classic/tests/error-utils.test.ts, 544]
     build_cmd: ["pnpm", "install"]
     test_cmd: ["pnpm", "test"]
+
+  # --- Phase 3: spring-petclinic/Java (Maven+JVM) -- deferred to last since
+  # it's the heaviest/flakiest setup per the design spec (§5 sequencing
+  # table): confirmed live this session, Maven Wrapper + ~/.m2 cache were
+  # already warm from an earlier session's language-support benchmarking, so
+  # no network/toolchain install was needed here (unlike Go, which needed a
+  # real sudo-gated toolchain install in Phase 2).
+  - id: rename_petclinic_find_pet_types
+    lang: java
+    corpus: java  # key into b12_tier1_tier2_tool_correctness.corpora.get_corpus()
+    symbol: findPetTypes
+    def_path: src/main/java/org/springframework/samples/petclinic/owner/PetTypeRepository.java
+    def_line: 37
+    new_name: findAllPetTypes
+    # verified live 2026-07-30 against spring-petclinic @ 51045d1648dad955df586150c1a1a6e22ef400c2.
+    # Single interface method (no overload -- ruled out Owner.getPet, which
+    # has 3 overloads, and VetRepository.findAll, which collides with
+    # JpaRepository's own inherited findAll), called from 2 production files
+    # + 3 test files -- same real-usage-plus-test-coverage shape as gin's
+    # cleanPath. NOTE (documented, not a rejected-candidate case unlike
+    # zod's slugify): PetTypeFormatter.java:53 also declares a LOCAL
+    # VARIABLE literally named `findPetTypes` (`Collection<PetType>
+    # findPetTypes = this.types.findPetTypes();`), so the word-bounded
+    # substitution renames that local too. This is benign, not a collision:
+    # Java resolves the method call via `.name()` call-shape independently
+    # of the local var's plain identifier, so renaming both consistently
+    # within the same method body changes no semantics and both arms still
+    # compile -- confirmed by the calm arm's real build/test pass below.
+    oracle_callsites:
+      - [src/main/java/org/springframework/samples/petclinic/owner/PetController.java, 63]
+      - [src/main/java/org/springframework/samples/petclinic/owner/PetTypeFormatter.java, 53]
+      - [src/main/java/org/springframework/samples/petclinic/owner/PetTypeFormatter.java, 54]
+      - [src/test/java/org/springframework/samples/petclinic/owner/PetControllerTests.java, 72]
+      - [src/test/java/org/springframework/samples/petclinic/owner/PetTypeFormatterTests.java, 65]
+      - [src/test/java/org/springframework/samples/petclinic/owner/PetTypeFormatterTests.java, 72]
+      - [src/test/java/org/springframework/samples/petclinic/service/ClinicServiceTests.java, 147]
+      - [src/test/java/org/springframework/samples/petclinic/service/ClinicServiceTests.java, 166]
+    build_cmd: null  # `mvn test` compiles+tests in one step, same shape as Rust's `cargo test`
+    # Excludes the 4 Testcontainers-backed *IntegrationTests classes (Docker
+    # MySQL/Postgres containers) -- verified live: including them pulls a
+    # ~260MB mysql image on a cold cache and pushes a single run past 2
+    # minutes, unnecessary risk against oracle.py's fixed 300s run_cmd
+    # timeout given B7 runs build/test up to 3x per task (baseline + naive +
+    # calm arms). The excluded classes never reference findPetTypes (verified
+    # against the oracle_callsites above), so excluding them costs zero
+    # oracle coverage. `-DfailIfNoTests=false` needed because -Dtest exclusion
+    # patterns alone make surefire treat "0 classes newly excluded to explicit
+    # positive match" as a failure otherwise.
+    test_cmd: ["./mvnw", "-q", "test", "-Dtest=!*IntegrationTests", "-DfailIfNoTests=false"]

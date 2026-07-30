@@ -1,4 +1,4 @@
-# B7 — Task-Correctness benchmark (Phase 1: fd/Rust, flask/Python; Phase 2: express/JS, zod/TS, gin/Go)
+# B7 — Task-Correctness benchmark (Phase 1: fd/Rust, flask/Python; Phase 2: express/JS, zod/TS, gin/Go; Phase 3: spring-petclinic/Java)
 
 Measures whether the CALM-scripted refactor workflow (`edit_context` →
 rename at each real reference → `diff_impact`) completes a real rename task
@@ -28,6 +28,7 @@ directly:
 | javascript | express (expressjs/express) | `npm install` | `npm test` |
 | typescript | zod (colinhacks/zod) | `pnpm install` | `pnpm test` |
 | go | gin (gin-gonic/gin) | `go build ./...` | `go test ./...` |
+| java | spring-petclinic (spring-projects) | *(none — `mvn test` compiles+tests in one step)* | `./mvnw -q test -Dtest='!*IntegrationTests' -DfailIfNoTests=false` |
 
 **Go/gin was initially skipped** in this session's first Phase-2 pass — `go`
 wasn't installed and passwordless `sudo` was unavailable (verified live:
@@ -53,6 +54,17 @@ go.mod and guessing:**
   `GOTOOLCHAIN=auto` (Go's default since 1.21) transparently downloaded
   1.25.0 on first `go build`, no manual intervention needed. Verified by
   actually running the build, not assumed from the version mismatch alone.
+- spring-petclinic's Maven Wrapper + `~/.m2` cache were already warm from an
+  earlier session's language-support benchmarking, so no network/toolchain
+  install was needed for Java. The task's `test_cmd` excludes the 4
+  Testcontainers-backed `*IntegrationTests` classes (they spin up real Docker
+  MySQL/Postgres containers): a timed run including them took 2m04s on a cold
+  image cache alone, real risk against `oracle.py::run_cmd`'s fixed 300s
+  timeout given B7 runs build/test up to 3× per task (baseline + naive + calm
+  arms). Excluding them costs zero oracle coverage — verified none of the 8
+  real reference sites fall in those 4 files. `-DfailIfNoTests=false` is
+  needed because `-Dtest` exclusion-only patterns otherwise make surefire
+  treat "0 explicitly-matched classes" as a failure.
 
 ## Isolation
 
@@ -94,7 +106,7 @@ building this, in two separate iterations:
    by widening the pattern to match the bare identifier regardless of what
    follows it.
 
-## Results (all 5 tasks, current methodology)
+## Results (all 6 tasks, current methodology)
 
 | task | baseline | naive build_pass | naive recall | naive tool_calls | calm build_pass | calm recall | calm tool_calls |
 |---|---|---|---|---|---|---|---|
@@ -103,6 +115,11 @@ building this, in two separate iterations:
 | rename_gin_clean_path | green | True | 1.0 | 3 | True | 1.0 | 4 |
 | rename_express_set_charset | green | True | 1.0 | 4 | **False** | **0.667** | 4 |
 | rename_zod_prettify_error | green | True | 1.0 | 5 | **False** | **0.5** | 4 |
+| rename_petclinic_find_pet_types | green | True | 1.0 | 7 | True | 1.0 | 4 |
+
+Java's row reflects the state **after** the parser fix below — see Phase 3
+for the real bug this run found and fixed live, before this number was
+reachable.
 
 ### Phase 1 + gin (fd, flask, gin): an honest tie
 
@@ -168,6 +185,55 @@ in `parser.rs`'s JS/TS call-site extraction (property-access calls on a
 required module's bare identifier vs. a destructured bare-name call to the
 same export).
 
+### Phase 3 (spring-petclinic/Java): a real call-graph bug found and fixed
+live — `this.field.method()` calls were completely invisible
+
+`findPetTypes` (`PetTypeRepository` interface method) was picked for the same
+reasons as gin's `cleanPath`: a single, unambiguous definition, called from 2
+production files and 3 test files with no name collision (ruled out
+`Owner.getPet`, 3 overloads, and `VetRepository.findAll`, which collides with
+`JpaRepository`'s own inherited `findAll`).
+
+**First run: naive=1.0 recall/green build, calm=0.333 recall/`False` build —
+CALM's own arm broke its own rename.** `edit_context("findPetTypes")` (raw
+JSON) reported only 2 caller edges, both in `PetTypeFormatterTests.java`,
+missing `PetController.java` and `PetTypeFormatter.java` (**production code**)
+and `PetControllerTests.java`/`ClinicServiceTests.java`. The naive build
+failure output pinpointed exactly what didn't get renamed:
+`cannot find symbol: method findPetTypes()`.
+
+**Root cause, found by reading the actual call sites, not guessing:** every
+missed site calls `this.types.findPetTypes()` (`this.`-qualified field
+access); the one call CALM *did* find is the only site written as a bare
+`types.findPetTypes()` (no `this.`). That 100%-correlated split led straight
+to `crates/calm-core/src/indexer/parser.rs::last_ident_segment` — the
+function that extracts a call's receiver from Java's `method_invocation`
+"object" field text. It split on `->` (PHP) and `::` (Rust/PHP scope) but
+**never on a plain `.`** — so for the object text `"this.types"`,
+`leading_ident` walked from byte 0 and stopped at the first `.`, returning
+`"this"` instead of `"types"`. Tier-2 resolution then looked up a declared
+type for the fake pseudo-variable `"this"`, found nothing, and silently
+dropped the call edge — no fallback, no low-confidence edge, nothing. This
+makes CALM's call graph (and `edit_context`/`callers()` built on it) blind to
+**every** `this.field.method()` call in Java — one of the two idiomatic
+field-access styles, used specifically to disambiguate a field from a
+same-named constructor parameter (`this.types = types;`, exactly
+`PetTypeRepository`'s own consumers' pattern, and a very common Spring/
+enterprise-Java convention).
+
+**Fixed** by adding `.` as a third segment separator (alongside `->`/`::`),
+taking whichever separator occurs last in the text — the same "rightmost
+identifier segment" contract the function already documented, just extended
+to the one separator style it was missing. Verified additive, not a behavior
+change: PHP's `$this->helper` (no `.` in that text) and every existing
+`this`-only receiver test (`this.logIt()`, no `.` after `this`) are
+unaffected — confirmed by the full workspace test suite staying green (868
+passed) plus a new regression test
+(`test_java_this_qualified_field_call_produces_receiver_not_this`). Re-running
+the benchmark after the fix (and a `cargo build --release -p calm-cli` to
+pick it up): calm build_pass=`True`, recall=1.0, matching naive — see the
+Results table above.
+
 ### A rejected candidate, kept for the audit trail
 
 `slugify` (`packages/zod/src/v4/core/util.ts:347`) was tried first and
@@ -204,6 +270,12 @@ original read-only tool-correctness use in B12).
    `crates/calm-server/src/tools/guardrails.rs`). A naive `c.get("path")`
    would have silently returned `None` for every caller.
 6. **`slugify` name-collision task pick** — see "A rejected candidate" above.
+7. **`last_ident_segment` never split on a plain `.`** (Phase 3, spring-
+   petclinic's `findPetTypes`) — a real, previously-undiscovered call-graph
+   gap in `crates/calm-core/src/indexer/parser.rs`, not a benchmark-harness
+   bug like 1/2 above. See "Phase 3" above for the full root-cause. Fixed in
+   `last_ident_segment` + a new regression test
+   (`test_java_this_qualified_field_call_produces_receiver_not_this`).
 
 ## Running it
 
@@ -226,10 +298,11 @@ which is not committed and safe to delete between runs.
 
 ## Next steps
 
-1. **spring-petclinic/Java** (Phase 3 — Maven+JVM, expected to be the
-   heaviest/flakiest setup of the five, per the design spec).
-2. Investigate the express `setCharset` call-graph gap directly in
+1. Investigate the express `setCharset` call-graph gap directly in
    `parser.rs`'s JS/TS call-site extraction (property-access call through a
    required module's bare identifier vs. a destructured bare-name call to
    the same export) — a candidate root-cause worth its own session, not
-   folded into this benchmark's scope.
+   folded into this benchmark's scope. (Phase 3's Java finding was this same
+   shape of bug — receiver misattribution in `parser.rs` — so it's worth
+   checking whether the `.`-split fix incidentally helps here too before
+   assuming a separate root cause; not verified either way yet.)

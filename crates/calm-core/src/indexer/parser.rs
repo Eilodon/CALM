@@ -1802,11 +1802,36 @@ fn walk_calls(
 /// nested property access used as another call's receiver), "Foo" from a
 /// bare "Foo" scope. Strips a leading `$` (PHP variable sigil) since
 /// tier-2 type_map lookup keys on the plain variable name either way.
+///
+/// Also splits on a plain `.` (not just `->`/`::`) — found live via a real
+/// B7 benchmark run (spring-petclinic/Java, docs/superskills/specs/2026-07-
+/// 30-calm-dfb-levers-design.md Phase 3): Java's `method_invocation` has no
+/// `->` operator, so `this.types.findPetTypes()`'s "object" field text is
+/// the plain-dotted `"this.types"` — before this fix, the missing `.` split
+/// point meant `leading_ident` walked from byte 0 and stopped at the first
+/// `.`, returning `"this"` instead of the real field name `"types"`. Tier-2
+/// then looked up a type for the fake pseudo-variable `"this"`, found
+/// nothing, and dropped the call edge entirely — silently blind to EVERY
+/// `this.field.method()` call in Java, one of the two idiomatic field-access
+/// styles (used specifically to disambiguate a field from a same-named
+/// constructor parameter, e.g. `this.types = types;`) and reproduced on 4 of
+/// 5 real call sites in the corpus's own production+test code. Confirmed
+/// this is genuinely additive, not a behavior change for existing correct
+/// cases: PHP's `$this->helper` already resolved correctly via the `->`
+/// split point (unaffected, no `.` in that text), and Java/PHP/Ruby's
+/// existing single-segment `this`-only tests (`this.logIt()`) have no `.`
+/// after `this` either, so `dot_end` never fires for them.
 fn last_ident_segment(raw: &str) -> Option<String> {
     let raw = raw.trim();
     let arrow_end = raw.rfind("->").map(|i| i + 2);
     let colon_end = raw.rfind("::").map(|i| i + 2);
-    let start = arrow_end.into_iter().chain(colon_end).max().unwrap_or(0);
+    let dot_end = raw.rfind('.').map(|i| i + 1);
+    let start = arrow_end
+        .into_iter()
+        .chain(colon_end)
+        .chain(dot_end)
+        .max()
+        .unwrap_or(0);
     leading_ident(raw[start..].trim_start_matches('$'))
 }
 /// Extract call sites from a source file, each attributed to its enclosing function.
@@ -3276,6 +3301,30 @@ interface Shape {}
         assert_eq!(find(&symbols, "Greeter").kind, SymbolKind::Class);
         assert_eq!(find(&symbols, "hello").kind, SymbolKind::Method);
         assert_eq!(find(&symbols, "Shape").kind, SymbolKind::Interface);
+    }
+
+    #[test]
+    fn test_java_this_qualified_field_call_produces_receiver_not_this() {
+        // Regression for the real bug B7's Phase 3 benchmark run found live
+        // (spring-petclinic/Java, docs/superskills/specs/2026-07-30-calm-
+        // dfb-levers-design.md): `this.field.method()` is one of Java's two
+        // idiomatic field-access styles (used to disambiguate a field from a
+        // same-named constructor parameter, e.g. `this.types = types;`).
+        // Before the `last_ident_segment` fix, the "object" field text
+        // "this.types" had no `.` split point, so `leading_ident` returned
+        // "this" instead of "types" -- tier-2 then looked up a type for the
+        // fake pseudo-variable "this", found nothing, and the call edge was
+        // dropped entirely (reproduced on 4 of 5 real call sites in the
+        // corpus, CALM's own edit_context missing every production caller).
+        let code = "class Repo {\n    java.util.List<String> findAll() { return null; }\n}\nclass Consumer {\n    private final Repo repo;\n    Consumer(Repo repo) { this.repo = repo; }\n    void use() {\n        this.repo.findAll();\n    }\n}\n";
+        let calls = extract_calls(code, "java", "Test.java").unwrap();
+        assert!(
+            calls.iter().any(|c| c.enclosing_name == "use"
+                && c.callee == "findAll"
+                && c.receiver.as_deref() == Some("repo")),
+            "this.field.method() should attribute the field name as receiver, \
+             not the literal string \"this\": {calls:?}"
+        );
     }
 
     #[test]

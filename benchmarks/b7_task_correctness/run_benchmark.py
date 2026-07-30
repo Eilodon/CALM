@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""B7 -- Task-Correctness benchmark (Phase 1: fd [Rust], flask [Python]).
+"""B7 -- Task-Correctness benchmark (Phase 1: fd [Rust], flask [Python];
+Phase 2: express [JS], zod [TS], gin [Go]; Phase 3: spring-petclinic [Java]).
 
 Measures whether the CALM-scripted refactor workflow (edit_context -> edit at
 each real call site -> diff_impact) completes a real rename task more
@@ -70,7 +71,7 @@ TASKS_PATH = LIB_DIR / "refactor_tasks.yaml"
 # needed to worry about for its own read-only use case.
 WORK_ROOT = repo_root_from_here().parent / "calm-b7-work"
 
-SRC_EXTS = {"rust": (".rs",), "python": (".py",), "javascript": (".js",), "typescript": (".ts",), "go": (".go",)}
+SRC_EXTS = {"rust": (".rs",), "python": (".py",), "javascript": (".js",), "typescript": (".ts",), "go": (".go",), "java": (".java",)}
 
 
 def fresh_clone(lang: str, arm: str) -> Path:
@@ -230,7 +231,7 @@ def main() -> int:
         rows.append(row)
 
     summary = {
-        "phase": "B7 Phase 1 (fd/Rust, flask/Python)",
+        "phase": "B7 Phase 1-3 (fd/Rust, flask/Python, express/JS, zod/TS, gin/Go, spring-petclinic/Java)",
         "methodology": "deterministic oracle only (build/test pass + independent "
                         "callsite recall via B12's ground_truth, extension-filtered) "
                         "-- no LLM judge, per design spec constraint",
