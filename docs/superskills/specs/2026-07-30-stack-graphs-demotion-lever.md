@@ -281,8 +281,8 @@ không cần cfg riêng ở đây):
 static SCIP_STACK_GRAPHS_OVERRIDES: AtomicU64 = AtomicU64::new(0);
 
 /// Count of edges where SCIP overrode a `formal_source = 'stack_graphs'`
-/// verdict since this process started -- see `scip_overrides_stack_graphs_
-/// target`/`mark_ruled_out_siblings`. Mỗi lần tăng là 1 bất đồng thật giữa 2
+/// verdict since this process started -- see `ingest_occurrences`'s upgrade
+/// loop and `mark_ruled_out_siblings`. Mỗi lần tăng là 1 bất đồng thật giữa 2
 /// nguồn formal-tier: stack-graphs (heuristic per-file) và SCIP (exact
 /// file,line, cross-module) -- xem ADR-0002. Không tự nói bên nào đúng, chỉ
 /// đánh dấu chỗ đáng nhìn kỹ hơn trước khi tin `formal` không điều kiện.
@@ -291,12 +291,38 @@ pub fn scip_stack_graphs_override_count() -> u64 {
 }
 ```
 
+**Sửa sau audit-design (citation ban đầu sai — `scip_overrides_stack_graphs_
+target` KHÔNG phải production code, đó là `#[test] fn` ở `ingest.rs:985`, tự
+UPDATE dữ liệu fixture để verify hành vi, không phải nơi override thật xảy
+ra).** Điểm production thật:
+
+1. `ingest_occurrences`'s upgrade loop (`ingest.rs`, khối `UPDATE call_edges
+   SET edge_confidence = 'formal', formal_source = 'scip' WHERE id = ?1`,
+   ~dòng 161-167) — chạy cho **mọi** id trong `to_upgrade`, không phân biệt
+   "vừa nâng cấp từ textual/inferred" (không phải bất đồng với stack-graphs,
+   vì stack-graphs chưa từng có ý kiến trên edge đó) với "ghi đè 1 verdict
+   `formal_source = 'stack_graphs'` đã có" (bất đồng thật). **Bắt buộc** thêm
+   điều kiện lọc trước khi tăng counter/log: chỉ khi `row.formal_source ==
+   Some("stack_graphs")` tại thời điểm trước UPDATE (đã có sẵn trong `row`,
+   đọc từ SELECT ở đầu hàm — xem field `formal_source` của struct `EdgeRow`,
+   `ingest.rs:61`).
+2. `mark_ruled_out_siblings` (`ingest.rs:238`, gọi tại dòng 171) — đánh dấu
+   sibling thua trong nhóm ambiguous fan-out. Theo doc comment của hàm này
+   (dòng 199-204), **bất kỳ** sibling không được chọn đều bị `ruled_out_by_scip`
+   — không riêng sibling có nguồn stack_graphs. Cùng yêu cầu lọc: chỉ tăng
+   counter khi sibling bị ruled-out có `formal_source == Some("stack_graphs")`
+   trước khi bị đánh dấu. **Thân hàm `mark_ruled_out_siblings` chưa được đọc
+   đầy đủ trong spec này** — plan thực thi phải đọc lại toàn bộ hàm để thêm
+   điều kiện lọc đúng vị trí, không suy đoán từ doc comment không thôi.
+
+Không lọc đúng ở cả 2 điểm → counter đếm cả những lần nâng cấp không liên
+quan gì đến stack-graphs (overcounting), làm hỏng chính mục đích của D3.
+
 Increment + `tracing::debug!` (cùng style `run_overlay_for`/`run_go_workspace_
-overlay` đã dùng trong `scip/mod.rs`) tại 2 điểm override thật đã xác định:
-`scip_overrides_stack_graphs_target` (`ingest.rs:991`) và
-`mark_ruled_out_siblings` (`ingest.rs:238`). Log fields: `from_symbol`,
-`to_symbol`, `file`, `old_formal_source = "stack_graphs"`, `new_formal_source
-= "scip"`.
+overlay` đã dùng trong `scip/mod.rs`) tại 2 điểm đã lọc đúng ở trên. Log
+fields: `from_symbol`, `to_symbol`, `file`, `old_formal_source =
+"stack_graphs"`, `new_formal_source = "scip"` (điểm 1) hoặc `ruled_out = true`
+(điểm 2).
 
 ### 5.2 Surface qua `indexing_status`
 
@@ -321,6 +347,12 @@ pub(crate) scip_stack_graphs_overrides: Option<u64>,
   per-file resolve khác SCIP exact cross-module) — test assert counter tăng
   đúng 1 SAU khi chạy `ingest_occurrences`, không chỉ assert hàm tồn tại/biên
   dịch.
+- **Test âm tính bắt buộc (chặn chính xác lỗi audit-design vừa bắt được):**
+  fixture chỉ có edge `textual`/`inferred` được SCIP nâng cấp thẳng lên
+  `formal`/`'scip'` — **không** có `formal_source = 'stack_graphs'` nào trước
+  đó — assert counter **không** tăng. Không có test này, một implementation
+  đếm mọi lần `ingest_occurrences` nâng cấp edge (không lọc theo
+  `formal_source` cũ) vẫn pass mọi test dương tính nhưng sai mục đích D3.
 - Test `indexing_status` sau khi chạy fixture đó → `scip_stack_graphs_
   overrides` phản ánh đúng số, theo đúng convention test đã có
   (`indexing_status_includes_formal_resolution_timeouts_field`).
@@ -369,3 +401,135 @@ Mỗi unit qua `adr-commit` review riêng khi merge (không đợi cả 3 xong).
 - D3: `Ordering::Relaxed` (giống `FORMAL_RESOLUTION_TIMEOUTS`) đủ cho 1 counter
   thuần quan sát, nhưng đáng note lại trong PR để không ai "sửa" thành
   `SeqCst` không cần thiết sau này.
+
+## Risk Assessment (audit-design)
+<!-- audit-design: DO NOT DUPLICATE — update this section, do not append a second one -->
+<!-- last-run: 2026-07-30 | trigger: NORMAL -->
+
+**Tier:** 2 (Production — CALM là dev-tool đang chạy hook-enforced gate
+(`edit_context`) mà session khác phụ thuộc; không PII/payments/multi-tenant)
+**Date:** 2026-07-30
+
+```
+CONTEXT_MODE:      DESIGN
+STAKEHOLDER:       CALM maintainer (gokuderafight) + agent sessions tiêu thụ
+                   MCP tool output (stakeholder gián tiếp cho D2/D3)
+GOAL:              pre-mortem trước khi viết plan cho D1+D2+D3
+AUDIT_TARGET_TIER: 2
+```
+
+### Failure Modes
+
+1. **D3's cited production integration point sai — 1 trong 2 "điểm override
+   thật" ban đầu là `#[test] fn scip_overrides_stack_graphs_target`
+   (`ingest.rs:985`), không phải code production.** Đọc trực tiếp source
+   trong lúc audit xác nhận: hàm đó tự `UPDATE ... SET formal_source =
+   'stack_graphs'` để dựng fixture, rồi gọi `ingest_occurrences` và assert kết
+   quả — chỉ là test. Điểm production thật là khối `UPDATE ... formal_source
+   = 'scip'` bên trong `ingest_occurrences` (~dòng 161-167). Thêm nữa: cả
+   điểm đó lẫn `mark_ruled_out_siblings` đều áp dụng cho **mọi** edge được
+   nâng cấp/loại bỏ, không riêng edge có `formal_source = 'stack_graphs'`
+   trước đó — thiếu điều kiện lọc sẽ làm counter đếm cả những lần nâng cấp
+   không liên quan gì đến stack-graphs (overcounting), đánh mất chính mục
+   đích D3 muốn đạt (tín hiệu bất đồng thật, đáng tin). — **HIGH** — mitigation
+   in plan: **YES** (đã sửa trực tiếp §5.1 + thêm test âm tính bắt buộc ở
+   §5.3 trong lúc audit này).
+2. **D1: persisted-index staleness khi feature flag đổi giữa các lần build
+   trên cùng 1 SQLite index.** Spec không mô tả điều gì xảy ra với các row
+   `formal_source = 'stack_graphs'` đã có sẵn trong DB khi 1 build sau đó
+   thiếu `stack-graphs-formal` (downgrade, đổi kênh cài đặt, hoặc CI matrix
+   không nhất quán). Incremental reindex chỉ xử lý file dirty — file không
+   đổi giữ nguyên `formal_source = 'stack_graphs'` vĩnh viễn dù resolver tạo
+   ra verdict đó không còn tồn tại trong binary, không có cách nào re-verify
+   hay downgrade nó. Kết hợp D2 (field này giờ hiển thị trực tiếp cho agent
+   với hàm ý "kém tin cậy hơn scip") tạo ra 1 lớp dữ liệu mới: "tự tin dán
+   nhãn nhưng mồ côi kiến trúc" — agent thấy `formal_source: "stack_graphs"`
+   và hiệu chỉnh độ tin theo đúng hướng dẫn của D2, nhưng không biết verdict
+   đó có thể không bao giờ được re-verify trên build này. — **MED-HIGH** —
+   mitigation in plan: **NO** (chưa có trong spec — cần thêm vào §8/§9 hoặc
+   plan: ít nhất 1 dòng log/field cảnh báo khi `indexing_status` phát hiện
+   `formal_source = 'stack_graphs'` tồn tại trong DB nhưng build hiện tại
+   thiếu feature `stack-graphs-formal`).
+3. **D1: nhánh `#[cfg(not(feature = "stack-graphs-formal"))]` không có CI
+   job nào chạy định kỳ** (tự spec §9 đã nêu, audit xác nhận đây là rủi ro
+   thật và cần 1 quyết định dứt khoát, không để mở). Một code path chỉ được
+   test 1 lần lúc ship, không nằm trong `ci.yml`'s `--features` matrix hiện
+   có, dễ bit-rot âm thầm (ví dụ 1 PR sau này thêm 1 dòng dùng
+   `crate::resolver::formal::*` không cfg-gate đúng, không ai phát hiện cho
+   tới lần build-without-feature tiếp theo, có thể là nhiều tháng sau). —
+   **HIGH** — mitigation in plan: **NO** (quyết định "thêm CI job hay chấp
+   nhận rủi ro" phải chốt trong writing-plans, không để lại làm "TBD" trong
+   code).
+
+### Layer Signals
+
+- **L1 Logic:** xem Failure Mode 1 — nhánh untested + citation sai đã được
+  audit bắt và sửa trực tiếp trong spec.
+- **L2 Concurrency:** no new signal — `AtomicU64`/`Relaxed` đúng pattern đã
+  có (`FORMAL_RESOLUTION_TIMEOUTS`), không có shared-state mới rủi ro hơn.
+- **L3 Data:** xem Failure Mode 2 (persisted-index staleness qua feature-flag
+  boundary) — đây là tín hiệu L3 thật, không phải "no signal".
+- **L4 Integration:** no signal — không có external API/service mới.
+- **L5 Security:** no signal — không đụng auth/permission/scope.
+- **L6 Observability:** D3 chính là cải thiện observability — nhưng bản thân
+  nó có 1 gap nhỏ: `indexing_status.scip_stack_graphs_overrides` không có
+  ngưỡng/alert nào định nghĩa, thuần "phải tự nhìn" — chấp nhận được vì khớp
+  đúng pattern `formal_resolution_timeouts` đã có từ trước (không phải
+  regression riêng của lever này).
+- **L7 Cross-cutting (idempotency):** đã gộp vào Failure Mode 1 — 2 hàm tăng
+  cùng 1 counter phải được xác nhận không double-count cùng 1 sự kiện logic
+  (production `ingest_occurrences` + `mark_ruled_out_siblings` là 2 pass
+  riêng biệt trên cùng 1 lần `ingest_occurrences()` call — cần plan xác nhận
+  chúng không overlap trên cùng 1 edge).
+
+### Assumptions to Verify
+
+- **ASSUMED** (spec §9, D2): "không tool nào phụ thuộc etag ổn định qua
+  deploy boundary theo cách sẽ vỡ" — nêu như điều cần xác nhận, chưa xác
+  nhận. Plan phải grep toàn bộ nơi `hash_caller_entries`/`hash_callee_entries`
+  hoặc `edit_context`'s combined etag được đọc lại ở phía client/hook (đặc
+  biệt: xác nhận etag này KHÔNG phải cơ chế gate an toàn edit riêng biệt so
+  với `source`'s content-hash/`expected_hash` — nếu có, hậu quả nặng hơn 1
+  cache-miss đơn thuần).
+- **ASSUMED** (spec §5.1, đã sửa trong audit này): thân hàm
+  `mark_ruled_out_siblings` chưa được đọc đầy đủ — điều kiện lọc theo
+  `formal_source` cũ phải được xác nhận đọc code thật lúc viết plan, không
+  suy đoán tiếp từ doc comment.
+- **ASSUMED implicit**: build-without-`stack-graphs-formal` không bao giờ
+  chạy trên 1 index đã có sẵn `formal_source = 'stack_graphs'` — spec D1
+  không phát biểu điều này rõ ràng, và Failure Mode 2 cho thấy giả định này
+  (nếu có) không được đảm bảo bởi thiết kế hiện tại.
+
+### Abductive Hypotheses
+
+1. **D1 × D2 interaction:** một khi `stack-graphs-formal` optional và 1 build
+   ship thiếu nó, `formal_source` không bao giờ là `'stack_graphs'` cho edge
+   MỚI trong build đó — nhưng edge CŨ (từ build trước, có feature) vẫn mang
+   nhãn đó mãi mãi (Failure Mode 2). D2 làm nhãn này hiển thị trực tiếp và có
+   hàm ý "kém tin cậy hơn" cho agent — kết hợp lại tạo ra 1 lớp lỗi mà từng
+   unit riêng lẻ không tự sinh ra: dữ liệu "tự tin dán nhãn nhưng không ai
+   còn có thể verify lại được" — không thấy được nếu chỉ pre-mortem D1 hoặc
+   D2 riêng.
+2. **Scale/steady-state alarm fatigue:** counter D3 monotonic từ lúc process
+   start (giống `formal_resolution_timeouts`), không phân biệt "1 bất đồng
+   lịch sử" với "cùng 1 edge bị re-confirm bất đồng qua N lần reindex" trên 1
+   daemon sống lâu, repo lớn với SCIP overlay chạy thường xuyên (Go
+   workspace overlay, rust-analyzer). Codebase này đã có tiền lệ đúng vấn đề
+   này ở nơi khác (ADR-A1/A2: edge "silently flip between formal and textual
+   confidence across reindexes purely due to machine load") — số đếm có thể
+   tăng nhanh trong vận hành bình thường, không phải bất thường, huấn luyện
+   agent/người dùng bỏ qua tín hiệu (alarm fatigue) thay vì điều tra khi thật
+   sự cần. Chỉ lộ ra ở quy mô/thời gian chạy dài, không thấy được trên
+   fixture nhỏ trong test.
+
+### Gate Result
+PASS WITH FLAGS — proceed to writing-plans. Failure Mode 1 đã fix trực tiếp
+trong spec (không cần plan xử lý thêm). Failure Mode 2 và 3 **MUST** có
+mitigation cụ thể trong plan trước khi implementation bắt đầu:
+- FM2: plan phải thêm 1 cơ chế phát hiện/cảnh báo khi DB có
+  `formal_source = 'stack_graphs'` nhưng build hiện tại thiếu
+  `stack-graphs-formal` (tối thiểu: 1 field/log trong `indexing_status`,
+  không cần tự động sửa dữ liệu).
+- FM3: plan phải chốt dứt khoát "thêm CI job matrix mới cho
+  `--no-default-features --features tier0-5,scip-overlay`" hay "chấp nhận rủi
+  ro + ghi lý do" — không để lại như câu hỏi mở trong code review sau này.
