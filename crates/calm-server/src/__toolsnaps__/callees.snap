@@ -137,6 +137,13 @@
           "edge_confidence": {
             "type": "string"
           },
+          "formal_source": {
+            "description": "See `CallerEntry::formal_source`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "edge_kind": {
             "description": "See `CallerEntry::edge_kind`.",
             "type": "string"

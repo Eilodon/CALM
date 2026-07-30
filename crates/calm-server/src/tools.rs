@@ -2234,6 +2234,130 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// D2 (2026-07-30 stack-graphs-demotion-lever): `formal_source` is
+    /// surfaced per-edge on `callers` -- present (and correct) when the edge
+    /// is `formal`, absent (skip_serializing_if) when it isn't.
+    #[test]
+    fn callers_surfaces_formal_source_per_edge() {
+        let dir = std::env::temp_dir().join(format!("ci_callers_fsrc_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("src/caller.rs"),
+            "fn bar() {\n    foo();\n}\nfn baz() {\n    foo();\n}\n",
+        )
+        .unwrap();
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('mod.foo', 'foo', 'function', 'rust', 'src/lib.rs', 1, 1, 'fn foo()', '', 'foo', 2, 0, 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO call_edges (from_symbol, to_symbol, from_path, to_path, edge_confidence, formal_source, call_site_line)
+                 VALUES ('mod.bar', 'mod.foo', 'src/caller.rs', 'src/lib.rs', 'formal', 'stack_graphs', 2)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO call_edges (from_symbol, to_symbol, from_path, to_path, edge_confidence, call_site_line)
+                 VALUES ('mod.baz', 'mod.foo', 'src/caller.rs', 'src/lib.rs', 'resolved', 4)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let v = jv(
+            server.callers(rmcp::handler::server::wrapper::Parameters(CallersParams {
+                symbol: "foo".into(),
+                path: None,
+                line: None,
+                transitive: false,
+                max_depth: None,
+                if_none_match: None,
+            })),
+        );
+
+        let direct = v["direct"].as_array().unwrap();
+        let formal_entry = direct
+            .iter()
+            .find(|e| e["line"] == 2)
+            .expect("the formal/stack_graphs edge must be present");
+        assert_eq!(formal_entry["formal_source"], "stack_graphs");
+        let resolved_entry = direct
+            .iter()
+            .find(|e| e["line"] == 4)
+            .expect("the resolved edge must be present");
+        assert!(
+            resolved_entry.get("formal_source").is_none(),
+            "formal_source must be omitted (skip_serializing_if), not null, when the edge isn't formal: {resolved_entry:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// D2: `formal_source` participates in the `callers` etag -- a
+    /// background SCIP overlay pass can flip `stack_graphs` -> `scip`
+    /// without changing `edge_confidence`/`edge_kind`/`line`/`preview` at
+    /// all, and an `if_none_match` caller must not silently miss that.
+    #[test]
+    fn callers_etag_changes_when_formal_source_changes_without_other_fields_changing() {
+        let dir = std::env::temp_dir().join(format!("ci_callers_fsrc_etag_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/caller.rs"), "fn bar() {\n    foo();\n}\n").unwrap();
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('mod.foo', 'foo', 'function', 'rust', 'src/lib.rs', 1, 1, 'fn foo()', '', 'foo', 1, 0, 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO call_edges (from_symbol, to_symbol, from_path, to_path, edge_confidence, formal_source, call_site_line)
+                 VALUES ('mod.bar', 'mod.foo', 'src/caller.rs', 'src/lib.rs', 'formal', 'stack_graphs', 2)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let params = || {
+            rmcp::handler::server::wrapper::Parameters(CallersParams {
+                symbol: "foo".into(),
+                path: None,
+                line: None,
+                transitive: false,
+                max_depth: None,
+                if_none_match: None,
+            })
+        };
+        let etag_before = jv(server.callers(params()))["etag"].clone();
+
+        {
+            let conn = server.db();
+            conn.execute(
+                "UPDATE call_edges SET formal_source = 'scip' WHERE from_symbol = 'mod.bar'",
+                [],
+            )
+            .unwrap();
+        }
+        let etag_after = jv(server.callers(params()))["etag"].clone();
+
+        assert_ne!(
+            etag_before, etag_after,
+            "formal_source flipping stack_graphs -> scip (with edge_confidence/edge_kind/line/preview unchanged) must still change the etag"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn callers_zero_usage_caveat_distinguishes_entry_point_from_generic() {
         let dir =

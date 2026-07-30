@@ -422,41 +422,46 @@ impl CalmServer {
                     let mut stmt = match conn.prepare(
                         // PATTERN-DEBT call-edges-missing-ruled-out-filter:
                         // a SCIP-disproven caller isn't a real caller.
-                        "SELECT from_symbol, from_path, edge_confidence, call_site_line, edge_kind
+                        "SELECT from_symbol, from_path, edge_confidence, call_site_line, edge_kind, formal_source
                          FROM call_edges WHERE to_symbol = ?1 AND ruled_out_by_scip = 0",
                     ) {
                         Ok(s) => s,
                         Err(e) => return db_error(e),
                     };
-                    let rows: Vec<(String, String, String, String, Option<i64>)> = match stmt
-                        .query_map(rusqlite::params![info.qualified_name], |row| {
+                    let rows: Vec<(String, String, String, String, Option<i64>, Option<String>)> =
+                        match stmt.query_map(rusqlite::params![info.qualified_name], |row| {
                             Ok((
                                 row.get::<_, String>(0)?,
                                 row.get::<_, String>(1).unwrap_or_default(),
                                 row.get::<_, String>(2)?,
                                 row.get::<_, String>(4)?,
                                 row.get::<_, Option<i64>>(3)?,
+                                row.get::<_, Option<String>>(5)?,
                             ))
                         }) {
-                        Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
-                        Err(e) => return db_error(e),
-                    };
+                            Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+                            Err(e) => return db_error(e),
+                        };
                     let preview_items: Vec<(String, Option<i64>)> = rows
                         .iter()
-                        .map(|(_, path, _, _, line)| (path.clone(), *line))
+                        .map(|(_, path, _, _, line, _)| (path.clone(), *line))
                         .collect();
                     let previews = line_previews_batched(&self.project_root, &preview_items);
                     rows.into_iter()
                         .zip(previews)
-                        .map(|((symbol, _path, edge_confidence, edge_kind, line), preview)| {
-                            CallerEntry {
+                        .map(
+                            |(
+                                (symbol, _path, edge_confidence, edge_kind, line, formal_source),
+                                preview,
+                            )| CallerEntry {
                                 symbol,
                                 edge_confidence,
+                                formal_source,
                                 edge_kind,
                                 line,
                                 preview,
-                            }
-                        })
+                            },
+                        )
                         .collect::<Vec<_>>()
                 }
                 None => Vec::new(),
@@ -572,7 +577,8 @@ impl CalmServer {
             let mut callees_by_symbol: std::collections::HashMap<String, Vec<CalleeEntry>> = std::collections::HashMap::new();
 
             if p.include_callers && !found_ids.is_empty() {
-                let mut raw: Vec<(String, String, String, String, String, Option<i64>)> = Vec::new();
+                let mut raw: Vec<(String, String, String, String, String, Option<i64>, Option<String>)> =
+                    Vec::new();
                 for chunk in found_ids.chunks(CHUNK) {
                     let placeholders = chunk
                         .iter()
@@ -581,7 +587,7 @@ impl CalmServer {
                         .collect::<Vec<_>>()
                         .join(", ");
                     let sql = format!(
-                        "SELECT to_symbol, from_symbol, from_path, edge_confidence, call_site_line, edge_kind
+                        "SELECT to_symbol, from_symbol, from_path, edge_confidence, call_site_line, edge_kind, formal_source
                          FROM call_edges WHERE to_symbol IN ({placeholders}) AND ruled_out_by_scip = 0"
                     );
                     if let Ok(mut stmt) = conn.prepare(&sql)
@@ -593,6 +599,7 @@ impl CalmServer {
                                 row.get::<_, String>(3)?,
                                 row.get::<_, String>(5)?,
                                 row.get::<_, Option<i64>>(4)?,
+                                row.get::<_, Option<String>>(6)?,
                             ))
                         })
                     {
@@ -601,15 +608,18 @@ impl CalmServer {
                 }
                 let preview_items: Vec<(String, Option<i64>)> = raw
                     .iter()
-                    .map(|(_, _, from_path, _, _, line)| (from_path.clone(), *line))
+                    .map(|(_, _, from_path, _, _, line, _)| (from_path.clone(), *line))
                     .collect();
                 let previews = line_previews_batched(&self.project_root, &preview_items);
-                for ((to_symbol, from_symbol, _from_path, edge_confidence, edge_kind, line), preview) in
-                    raw.into_iter().zip(previews)
+                for (
+                    (to_symbol, from_symbol, _from_path, edge_confidence, edge_kind, line, formal_source),
+                    preview,
+                ) in raw.into_iter().zip(previews)
                 {
                     callers_by_symbol.entry(to_symbol).or_default().push(CallerEntry {
                         symbol: from_symbol,
                         edge_confidence,
+                        formal_source,
                         edge_kind,
                         line,
                         preview,
@@ -618,7 +628,8 @@ impl CalmServer {
             }
 
             if p.include_callees && !found_ids.is_empty() {
-                let mut raw: Vec<(String, String, String, String, String, Option<i64>)> = Vec::new();
+                let mut raw: Vec<(String, String, String, String, String, Option<i64>, Option<String>)> =
+                    Vec::new();
                 for chunk in found_ids.chunks(CHUNK) {
                     let placeholders = chunk
                         .iter()
@@ -627,7 +638,7 @@ impl CalmServer {
                         .collect::<Vec<_>>()
                         .join(", ");
                     let sql = format!(
-                        "SELECT from_symbol, to_symbol, to_path, edge_confidence, edge_kind, call_site_line
+                        "SELECT from_symbol, to_symbol, to_path, edge_confidence, edge_kind, call_site_line, formal_source
                          FROM call_edges WHERE from_symbol IN ({placeholders}) AND ruled_out_by_scip = 0"
                     );
                     if let Ok(mut stmt) = conn.prepare(&sql)
@@ -639,6 +650,7 @@ impl CalmServer {
                                 row.get::<_, String>(3)?,
                                 row.get::<_, String>(4)?,
                                 row.get::<_, Option<i64>>(5)?,
+                                row.get::<_, Option<String>>(6)?,
                             ))
                         })
                     {
@@ -650,7 +662,7 @@ impl CalmServer {
                 // line_previews_batched sees the real dedup key (audit F11).
                 let preview_items: Vec<(String, Option<i64>)> = raw
                     .iter()
-                    .map(|(from_symbol, _, _, _, _, line)| {
+                    .map(|(from_symbol, _, _, _, _, line, _)| {
                         (
                             found.get(from_symbol).map(|c| c.path.clone()).unwrap_or_default(),
                             *line,
@@ -658,13 +670,16 @@ impl CalmServer {
                     })
                     .collect();
                 let previews = line_previews_batched(&self.project_root, &preview_items);
-                for ((from_symbol, to_symbol, to_path, edge_confidence, edge_kind, line), preview) in
-                    raw.into_iter().zip(previews)
+                for (
+                    (from_symbol, to_symbol, to_path, edge_confidence, edge_kind, line, formal_source),
+                    preview,
+                ) in raw.into_iter().zip(previews)
                 {
                     callees_by_symbol.entry(from_symbol).or_default().push(CalleeEntry {
                         symbol: to_symbol,
                         path: to_path,
                         edge_confidence,
+                        formal_source,
                         edge_kind,
                         line,
                         preview,

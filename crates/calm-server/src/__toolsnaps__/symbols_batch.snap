@@ -149,6 +149,13 @@
           "edge_confidence": {
             "type": "string"
           },
+          "formal_source": {
+            "description": "Nguồn cụ thể đứng sau `edge_confidence == \"formal\"`: `\"stack_graphs\"`\n(heuristic per-file — `resolver/formal.rs::FormalResolver::\nresolve_file` only ever sees ONE file at a time, no cross-module\nstitching) | `\"scip\"` (exact file,line, có thể cross-module) |\n`\"lsp\"` (runtime probe). `None` khi `edge_confidence != \"formal\"`,\nhoặc build thiếu mọi formal-tier feature. Không suy ra \"formal\" đáng\ntin bằng nhau — xem ADR-0002.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "edge_kind": {
             "description": "`\"call\"` or `\"reference\"` (SQL view/proc reading a table via\nFROM/JOIN) — see `call_edges.edge_kind`. Lets a consumer tell a real\ninvocation apart from a mere read without misreading a JOIN as a\nfunction call.",
             "type": "string"
@@ -184,6 +191,13 @@
           },
           "edge_confidence": {
             "type": "string"
+          },
+          "formal_source": {
+            "description": "See `CallerEntry::formal_source`.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "edge_kind": {
             "description": "See `CallerEntry::edge_kind`.",

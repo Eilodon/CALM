@@ -41,7 +41,7 @@ impl CalmServer {
 
             let all: Vec<CallerEntry> = {
                 let mut stmt = match conn.prepare(
-                    "SELECT ce.from_symbol, ce.from_path, ce.edge_confidence, ce.call_site_line, ce.edge_kind
+                    "SELECT ce.from_symbol, ce.from_path, ce.edge_confidence, ce.call_site_line, ce.edge_kind, ce.formal_source
                      FROM call_edges ce
                      LEFT JOIN symbols s ON s.qualified_name = ce.from_symbol
                      WHERE ce.to_symbol = ?1 AND ce.ruled_out_by_scip = 0
@@ -50,30 +50,35 @@ impl CalmServer {
                     Ok(s) => s,
                     Err(e) => return db_error_resolved(e),
                 };
-                let rows: Vec<(String, String, String, String, Option<i64>)> = match stmt
-                    .query_map(rusqlite::params![c.qualified_name], |row| {
+                let rows: Vec<(String, String, String, String, Option<i64>, Option<String>)> =
+                    match stmt.query_map(rusqlite::params![c.qualified_name], |row| {
                         Ok((
                             row.get::<_, String>(0)?,
                             row.get::<_, String>(1).unwrap_or_default(),
                             row.get::<_, String>(2)?,
                             row.get::<_, String>(4)?,
                             row.get::<_, Option<i64>>(3)?,
+                            row.get::<_, Option<String>>(5)?,
                         ))
                     }) {
-                    Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
-                    Err(e) => return db_error_resolved(e),
-                };
+                        Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+                        Err(e) => return db_error_resolved(e),
+                    };
                 let preview_items: Vec<(String, Option<i64>)> = rows
                     .iter()
-                    .map(|(_, path, _, _, line)| (path.clone(), *line))
+                    .map(|(_, path, _, _, line, _)| (path.clone(), *line))
                     .collect();
                 let previews = line_previews_batched(&self.project_root, &preview_items);
                 rows.into_iter()
                     .zip(previews)
                     .map(
-                        |((symbol, _path, edge_confidence, edge_kind, line), preview)| CallerEntry {
+                        |(
+                            (symbol, _path, edge_confidence, edge_kind, line, formal_source),
+                            preview,
+                        )| CallerEntry {
                             symbol,
                             edge_confidence,
+                            formal_source,
                             edge_kind,
                             line,
                             preview,
@@ -243,7 +248,7 @@ impl CalmServer {
 
             let all: Vec<CalleeEntry> = {
                 let mut stmt = match conn.prepare(
-                    "SELECT ce.to_symbol, ce.to_path, ce.edge_confidence, ce.call_site_line, ce.edge_kind
+                    "SELECT ce.to_symbol, ce.to_path, ce.edge_confidence, ce.call_site_line, ce.edge_kind, ce.formal_source
                      FROM call_edges ce
                      LEFT JOIN symbols s ON s.qualified_name = ce.to_symbol
                      WHERE ce.from_symbol = ?1 AND ce.ruled_out_by_scip = 0
@@ -252,19 +257,20 @@ impl CalmServer {
                     Ok(s) => s,
                     Err(e) => return db_error_resolved(e),
                 };
-                let rows: Vec<(String, String, String, String, Option<i64>)> = match stmt
-                    .query_map(rusqlite::params![c.qualified_name], |row| {
+                let rows: Vec<(String, String, String, String, Option<i64>, Option<String>)> =
+                    match stmt.query_map(rusqlite::params![c.qualified_name], |row| {
                         Ok((
                             row.get::<_, String>(0)?,
                             row.get::<_, String>(1).unwrap_or_default(),
                             row.get::<_, String>(2)?,
                             row.get::<_, String>(4)?,
                             row.get::<_, Option<i64>>(3)?,
+                            row.get::<_, Option<String>>(5)?,
                         ))
                     }) {
-                    Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
-                    Err(e) => return db_error_resolved(e),
-                };
+                        Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+                        Err(e) => return db_error_resolved(e),
+                    };
                 // The call site lives in the symbol being inspected
                 // (`c.path`), not in the callee's own file (`to_path`) --
                 // every row's preview key is this same constant path, so
@@ -273,16 +279,20 @@ impl CalmServer {
                 let from_path = c.path.clone();
                 let preview_items: Vec<(String, Option<i64>)> = rows
                     .iter()
-                    .map(|(_, _, _, _, line)| (from_path.clone(), *line))
+                    .map(|(_, _, _, _, line, _)| (from_path.clone(), *line))
                     .collect();
                 let previews = line_previews_batched(&self.project_root, &preview_items);
                 rows.into_iter()
                     .zip(previews)
                     .map(
-                        |((symbol, path, edge_confidence, edge_kind, line), preview)| CalleeEntry {
+                        |(
+                            (symbol, path, edge_confidence, edge_kind, line, formal_source),
+                            preview,
+                        )| CalleeEntry {
                             symbol,
                             path,
                             edge_confidence,
+                            formal_source,
                             edge_kind,
                             line,
                             preview,

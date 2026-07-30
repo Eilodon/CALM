@@ -308,6 +308,15 @@ pub(crate) struct CallerEntry {
     /// first `::` if you need it standalone.
     pub(crate) symbol: String,
     pub(crate) edge_confidence: String,
+    /// Nguồn cụ thể đứng sau `edge_confidence == "formal"`: `"stack_graphs"`
+    /// (heuristic per-file — `resolver/formal.rs::FormalResolver::
+    /// resolve_file` only ever sees ONE file at a time, no cross-module
+    /// stitching) | `"scip"` (exact file,line, có thể cross-module) |
+    /// `"lsp"` (runtime probe). `None` khi `edge_confidence != "formal"`,
+    /// hoặc build thiếu mọi formal-tier feature. Không suy ra "formal" đáng
+    /// tin bằng nhau — xem ADR-0002.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) formal_source: Option<String>,
     /// `"call"` or `"reference"` (SQL view/proc reading a table via
     /// FROM/JOIN) — see `call_edges.edge_kind`. Lets a consumer tell a real
     /// invocation apart from a mere read without misreading a JOIN as a
@@ -319,6 +328,14 @@ pub(crate) struct CallerEntry {
     pub(crate) preview: Option<String>,
 }
 
+/// two calls with the same set of `(symbol, edge_confidence, formal_source,
+/// edge_kind, line, preview)` tuples in the same order are guaranteed to
+/// hash identically. `formal_source` is included deliberately (D2,
+/// 2026-07-30 stack-graphs-demotion-lever): a background SCIP overlay pass
+/// can flip `formal_source` (`stack_graphs` -> `scip`) without changing
+/// `edge_confidence`/`edge_kind`/`line`/`preview` at all -- omitting it here
+/// would let an `if_none_match` caller silently miss that provenance
+/// upgrade.
 /// Deterministic fingerprint of a caller/callee result set, for
 /// `if_none_match`/`etag` conditional-fetch (same pattern as `source`'s own
 /// etag — see `range_checksum`/`hash_content`). Includes `preview` (not just
@@ -337,6 +354,8 @@ pub(crate) fn hash_caller_entries<'a>(
         buf.push_str(&e.symbol);
         buf.push('\u{1}');
         buf.push_str(&e.edge_confidence);
+        buf.push('\u{1}');
+        buf.push_str(e.formal_source.as_deref().unwrap_or(""));
         buf.push('\u{1}');
         buf.push_str(&e.edge_kind);
         buf.push('\u{1}');
@@ -357,6 +376,9 @@ pub(crate) struct CalleeEntry {
     pub(crate) symbol: String,
     pub(crate) path: String,
     pub(crate) edge_confidence: String,
+    /// See `CallerEntry::formal_source`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) formal_source: Option<String>,
     /// See `CallerEntry::edge_kind`.
     pub(crate) edge_kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -377,6 +399,8 @@ pub(crate) fn hash_callee_entries<'a>(
         buf.push_str(&e.path);
         buf.push('\u{1}');
         buf.push_str(&e.edge_confidence);
+        buf.push('\u{1}');
+        buf.push_str(e.formal_source.as_deref().unwrap_or(""));
         buf.push('\u{1}');
         buf.push_str(&e.edge_kind);
         buf.push('\u{1}');
