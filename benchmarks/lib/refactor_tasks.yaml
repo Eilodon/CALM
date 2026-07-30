@@ -1,0 +1,65 @@
+# B7 Phase 1 refactor tasks -- deliberately a SEPARATE file from tasks.yaml
+# (see docs/superskills/specs/2026-07-30-calm-dfb-levers-design.md §1.3a for
+# why: this schema describes a target corpus + a real mutation + a real
+# build/test command, structurally different from tasks.yaml's single-lookup
+# `naive`/`ci` shape consumed by B4/B6/B11 -- zero blast radius on those three
+# by keeping this separate).
+#
+# Each task's `oracle_callsites` is NOT hand-typed -- it's the live output of
+# benchmarks/b7_task_correctness/oracle.py::real_call_sites (B12's
+# ground_truth.git_grep_call_sites, extension-filtered), reproduced this
+# session against the pinned commits below. Re-verify with the same call if
+# the pinned commit changes:
+#   benchmarks/.venv/bin/python3 -c "
+#   import sys; sys.path.insert(0, 'benchmarks/b7_task_correctness')
+#   from oracle import real_call_sites
+#   from pathlib import Path
+#   print(real_call_sites(Path('<corpus>'), '<symbol>', '<def_path>', <def_line>, '<lang>', ('.ext',)))"
+#
+# Corpora are B12's pinned registry (benchmarks/b12_tier1_tier2_tool_correctness/corpora.py)
+# -- reused directly per the design's Finding A3, not re-cloned from scratch.
+
+tasks:
+  - id: rename_fd_pattern_matches_leading_dot
+    lang: rust
+    corpus: rust  # key into b12_tier1_tier2_tool_correctness.corpora.get_corpus()
+    symbol: pattern_matches_strings_with_leading_dot
+    def_path: src/regex_helper.rs
+    def_line: 40
+    new_name: pattern_matches_strings_with_leading_period
+    # verified live 2026-07-30 against fd @ 41532d114e2ba565fb5367d606c111b29b96450c
+    oracle_callsites:
+      - [src/main.rs, 529]
+      - [src/regex_helper.rs, 100]
+      - [src/regex_helper.rs, 102]
+      - [src/regex_helper.rs, 103]
+      - [src/regex_helper.rs, 104]
+    build_cmd: null  # `cargo test` builds+tests in one step for Rust
+    test_cmd: ["cargo", "test", "--quiet"]
+
+  - id: rename_flask_from_prefixed_env
+    lang: python
+    corpus: python  # key into b12_tier1_tier2_tool_correctness.corpora.get_corpus()
+    symbol: from_prefixed_env
+    def_path: src/flask/config.py
+    def_line: 126
+    new_name: from_prefixed_environ
+    # verified live 2026-07-30 against flask @ 36e4a824f340fdee7ed50937ba8e7f6bc7d17f81
+    # (examples/celery/... is a REAL .py callsite pytest never exercises directly --
+    # deliberately kept in the oracle: this is exactly the case build/test-pass
+    # alone would miss but callsite recall catches, illustrating why B7 uses
+    # both oracle legs, not just one)
+    oracle_callsites:
+      - [examples/celery/src/task_app/__init__.py, 16]
+      - [tests/test_config.py, 58]
+      - [tests/test_config.py, 74]
+      - [tests/test_config.py, 87]
+    build_cmd: ["uv", "sync", "--frozen"]
+    # NOT bare `pip install pytest` -- verified live this session that flask's
+    # pyproject.toml pins pytest via uv.lock (`[tool.uv] default-groups`
+    # includes "tests") and `filterwarnings = ["error"]` in
+    # [tool.pytest.ini_options] means a version-mismatched pytest can fail
+    # tests outright (reproduced: bare-latest pytest broke test_cli.py's
+    # `from _pytest.monkeypatch import notset` import, an internal API
+    # removed upstream).
+    test_cmd: ["uv", "run", "pytest", "-q"]

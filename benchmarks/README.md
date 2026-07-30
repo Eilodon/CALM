@@ -13,7 +13,7 @@ thật; khi số đo ra ngoài kỳ vọng (vd B6 `find_callers` = 0%), báo cá
 | B4 | Token Efficiency | MCP tools vs `cat`/`grep` naive workflow | **Implemented** — [`b4_token_efficiency/`](b4_token_efficiency/) |
 | B5 | Incremental Indexing Speed | Reindex chỉ file thay đổi | Planned |
 | B6 | Tool-Call Efficiency | Số round-trip naive vs 1 MCP call (ý tưởng từ CodeGraph) | **Implemented** — [`b6_tool_call_efficiency/`](b6_tool_call_efficiency/) |
-| B7 | Task Correctness / Regression | Agent thật làm refactor, có/không `edit_context`+`diff_impact`, đếm callsite bị bỏ sót (ý tưởng từ Serena) | Planned |
+| B7 | Task Correctness / Regression | Refactor thật (rename) trên corpus thật per-language (fd/Rust, flask/Python), oracle xác định (build/test pass + callsite recall độc lập, không LLM-judge), đếm callsite bị bỏ sót (ý tưởng từ Serena) | **Implemented (Phase 1)** — [`b7_task_correctness/`](b7_task_correctness/) |
 | B8 | Model-Tier Leveling | Model rẻ + calm tools vs model đắt không có tools, cùng task (ý tưởng từ GitNexus) | Planned |
 | B9 | Scaling Curve | Lợi thế `calm` co giãn theo quy mô repo (nhỏ → lớn) | Planned |
 | B10 | Real Competitor A/B | `calm` vs CodeGraph vs Semble — tool call thật trên cả 3 MCP server thật (không phải số tự báo cáo) | **Superseded by B11** — [`b10_real_competitor_ab/`](b10_real_competitor_ab/) (giữ lại, xem B11 cho methodology đã fix) |
