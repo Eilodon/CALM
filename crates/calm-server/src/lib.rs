@@ -6,6 +6,7 @@ mod scip_overlay;
 mod sync_ext;
 pub mod telemetry;
 pub mod tools;
+pub(crate) mod watch_supervisor;
 pub mod watcher;
 
 use std::path::PathBuf;
@@ -157,6 +158,10 @@ pub async fn bootstrap(
     // Phase B T6.5: the watcher records which rebuild path each incremental
     // reindex took into the same shared slot indexing_status reads.
     let watch_graph_mode = server.last_graph_mode_handle();
+    // Keep watcher liveness/freshness separate from indexing phase and graph
+    // mode: a ready historical index is not proof new filesystem changes are
+    // currently being observed.
+    let watch_health = server.watcher_health_handle();
     // Kept outside the `spawn_blocking` closure below so a panic there (caught
     // via the awaited `JoinHandle`) still has a handle to report through —
     // `phase`/`last_index_error` themselves are moved into that closure.
@@ -275,11 +280,28 @@ pub async fn bootstrap(
             if let Ok(mut conn) = calm_core::db::conn::open_writer(&indexer_db_path) {
                 let _ = calm_core::db::schema::init_db(&conn);
 
-                // Use incremental reindex when the index already has data — avoids
-                // a full re-parse of every file on every server restart.
+                // A persisted input contract tells a restart whether unchanged
+                // source bytes can safely take the cheap delta path. Without it,
+                // a changed config/manifest while the daemon was down would be
+                // silently invisible to `file_index` hashes.
                 let existing_files: i64 = conn
                     .query_row("SELECT COUNT(*) FROM file_index", [], |r| r.get(0))
                     .unwrap_or(0);
+                let inputs_before_index =
+                    calm_core::indexer::refresh::InputCatalog::for_project(&indexer_root);
+                let input_drift = match calm_core::indexer::refresh::index_input_drift(
+                    &conn,
+                    &inputs_before_index,
+                ) {
+                    Ok(drift) => drift,
+                    Err(error) => {
+                        tracing::warn!(
+                            "Could not read persisted index input contract ({error}); \
+                             rebuilding a safe full baseline"
+                        );
+                        calm_core::indexer::refresh::IndexInputDrift::Unknown
+                    }
+                };
 
                 enum IndexOutcome {
                     Ok,
@@ -287,7 +309,36 @@ pub async fn bootstrap(
                     Err(String),
                 }
 
-                let index_outcome: IndexOutcome = if existing_files > 0 {
+                let requires_full_baseline = existing_files == 0
+                    || matches!(
+                        input_drift,
+                        calm_core::indexer::refresh::IndexInputDrift::Configuration
+                            | calm_core::indexer::refresh::IndexInputDrift::Unknown
+                    );
+                let index_outcome: IndexOutcome = if requires_full_baseline {
+                    if existing_files == 0 {
+                        tracing::info!("No existing index — running full index");
+                    } else {
+                        tracing::info!(
+                            ?input_drift,
+                            "Persisted index inputs changed or are unknown — running full index"
+                        );
+                    }
+                    match calm_core::indexer::pipeline::run_indexing_pipeline_cancellable(
+                        &mut conn,
+                        &indexer_root,
+                        phase.clone(),
+                        &cancel,
+                    ) {
+                        Ok(calm_core::indexer::pipeline::PipelineOutcome::Completed) => {
+                            IndexOutcome::Ok
+                        }
+                        Ok(calm_core::indexer::pipeline::PipelineOutcome::Cancelled) => {
+                            IndexOutcome::Cancelled
+                        }
+                        Err(e) => IndexOutcome::Err(e.to_string()),
+                    }
+                } else {
                     tracing::info!(
                         "Existing index found ({existing_files} files) — incremental reindex"
                     );
@@ -303,8 +354,27 @@ pub async fn bootstrap(
                                 summary.changed,
                                 summary.deleted
                             );
-                            *phase.write_ok() = calm_core::types::IndexingPhase::Ready;
-                            IndexOutcome::Ok
+                            if matches!(
+                                input_drift,
+                                calm_core::indexer::refresh::IndexInputDrift::Context
+                            ) {
+                                tracing::info!(
+                                    "Index input context changed — rebuilding graph from current source rows"
+                                );
+                                match calm_core::indexer::pipeline::rebuild_graph_from_index(
+                                    &mut conn,
+                                    &indexer_root,
+                                ) {
+                                    Ok(_) => {
+                                        *phase.write_ok() = calm_core::types::IndexingPhase::Ready;
+                                        IndexOutcome::Ok
+                                    }
+                                    Err(error) => IndexOutcome::Err(error.to_string()),
+                                }
+                            } else {
+                                *phase.write_ok() = calm_core::types::IndexingPhase::Ready;
+                                IndexOutcome::Ok
+                            }
                         }
                         Ok(calm_core::indexer::pipeline::ReindexOutcome::Cancelled) => {
                             IndexOutcome::Cancelled
@@ -329,22 +399,6 @@ pub async fn bootstrap(
                             }
                         }
                     }
-                } else {
-                    tracing::info!("No existing index — running full index");
-                    match calm_core::indexer::pipeline::run_indexing_pipeline_cancellable(
-                        &mut conn,
-                        &indexer_root,
-                        phase.clone(),
-                        &cancel,
-                    ) {
-                        Ok(calm_core::indexer::pipeline::PipelineOutcome::Completed) => {
-                            IndexOutcome::Ok
-                        }
-                        Ok(calm_core::indexer::pipeline::PipelineOutcome::Cancelled) => {
-                            IndexOutcome::Cancelled
-                        }
-                        Err(e) => IndexOutcome::Err(e.to_string()),
-                    }
                 };
 
                 // Shutdown requested mid-index: stop immediately rather than
@@ -355,6 +409,22 @@ pub async fn bootstrap(
                 if matches!(index_outcome, IndexOutcome::Cancelled) {
                     tracing::info!("Background indexer stopped early — shutdown requested");
                     return;
+                }
+
+                if matches!(&index_outcome, IndexOutcome::Ok)
+                    && let Err(error) = calm_core::indexer::refresh::persist_index_input_snapshot(
+                        &conn,
+                        &inputs_before_index,
+                    )
+                {
+                    // Persist the input contract observed before indexing, not a
+                    // freshly-read one: a config edit during the index must not
+                    // falsely certify an index created under older semantics. The
+                    // watcher is armed before its immediate reconciliation, so any
+                    // newer input/source drift is caught there safely.
+                    tracing::warn!(
+                        "Could not persist index input contract; next startup will reconcile conservatively: {error}"
+                    );
                 }
 
                 let index_ok = match &index_outcome {
@@ -395,13 +465,14 @@ pub async fn bootstrap(
                 let _ = index_ok;
             }
             // Watch for edits and incrementally reindex (and re-embed) until shutdown.
-            watcher::run_watch_loop(
+            watcher::run_watch_loop_with_health(
                 indexer_root,
                 indexer_db_path,
                 watch_ct,
                 watch_embedder,
                 watch_coverage,
                 watch_graph_mode,
+                watch_health,
                 None,
             );
         });

@@ -516,6 +516,22 @@ export interface IndexingStatusOutput {
    * "full" | "incremental" | "full_fallback:<reason>" (Phase B L6). Absent
    * until this process has served one non-noop reindex. */
   graph_mode?: string;
+  /** File-observation and watcher-driven refresh health. This is deliberately
+   * independent of index phase and graph mode, which only describe the last
+   * completed index work. */
+  watcher: {
+    lifecycle: "not_started" | "starting" | "armed" | "backoff" | "degraded" | "stopped";
+    armed: boolean;
+    freshness: "unknown" | "fresh" | "retrying" | "stale";
+    last_event?: string;
+    last_refresh?: string;
+    last_refresh_kind?: "incremental_paths" | "context_rebuild" | "coverage_reload" | "full_reconciliation";
+    last_reconciliation?: string;
+    last_reconciliation_reason?: "notify_rescan" | "watcher_error" | "unsafe_path" | "unsafe_rename" | "configuration_changed" | "periodic_reconciliation";
+    last_error?: string;
+    consecutive_failures: number;
+    consecutive_refresh_failures: number;
+  };
   suggested_next?: SuggestedNext;
 }
 

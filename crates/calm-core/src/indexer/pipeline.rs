@@ -1251,6 +1251,38 @@ fn rebuild_graph(
     Ok(())
 }
 
+/// Rebuild graph-derived state from the already indexed source rows.
+///
+/// Metadata/context inputs can change resolution without changing a source
+/// file.  Their refresh must therefore evict cached maps and execute the same
+/// graph construction used by a full index, but must not reparse every file.
+///
+/// This deliberately runs in one writer transaction and increments the graph
+/// generation exactly once, so external evidence is coherently marked stale
+/// until the next overlay pass refreshes it.
+pub fn rebuild_graph_from_index(
+    conn: &mut Connection,
+    project_root: &Path,
+) -> rusqlite::Result<GraphMode> {
+    let config = crate::config::load_config_or_warn(project_root);
+    invalidate_resolution_maps_cache(project_root);
+    let maps = cached_resolution_maps(project_root);
+    let tx = conn.transaction()?;
+    rebuild_graph(
+        &tx,
+        project_root,
+        &config.hotspots.default_since,
+        &config.hub_threshold,
+        &maps,
+    )?;
+    tx.execute(
+        "UPDATE graph_generation_state SET generation = generation + 1 WHERE id = 1",
+        [],
+    )?;
+    tx.commit()?;
+    Ok(GraphMode::Full)
+}
+
 /// Result of an `incremental_graph_update` pass — lets the caller set
 /// `ReindexSummary::graph_mode` precisely (plan T4/L6), since only this
 /// function's own delta-expansion (step 1 inside it) can know whether the
@@ -1964,7 +1996,38 @@ pub fn run_indexing_pipeline_cancellable(
     phase: std::sync::Arc<std::sync::RwLock<crate::types::IndexingPhase>>,
     cancel: &dyn Fn() -> bool,
 ) -> rusqlite::Result<PipelineOutcome> {
+    reindex_all_cancellable_with_phase(conn, project_root, Some(&phase), cancel)
+}
+
+/// Rebuild every indexed source row and all derived graph state atomically.
+///
+/// This is the semantic counterpart to a new index database: configuration
+/// inputs can change extraction itself (`entry_points`, ignores, language
+/// policy), so a hash-only delta scan is insufficient after the watcher loses
+/// provenance for a change. Unlike [`run_indexing_pipeline_cancellable`], it
+/// deliberately does not publish a runtime indexing phase; callers such as a
+/// watcher own their lifecycle independently.
+pub fn reindex_all_cancellable(
+    conn: &mut Connection,
+    project_root: &Path,
+    cancel: &dyn Fn() -> bool,
+) -> rusqlite::Result<PipelineOutcome> {
+    reindex_all_cancellable_with_phase(conn, project_root, None, cancel)
+}
+
+fn reindex_all_cancellable_with_phase(
+    conn: &mut Connection,
+    project_root: &Path,
+    phase: Option<&std::sync::Arc<std::sync::RwLock<crate::types::IndexingPhase>>>,
+    cancel: &dyn Fn() -> bool,
+) -> rusqlite::Result<PipelineOutcome> {
     use crate::types::IndexingPhase;
+
+    let set_phase = |next: IndexingPhase| {
+        if let Some(phase) = phase {
+            *phase.write().unwrap() = next;
+        }
+    };
 
     let config = crate::config::load_config_or_warn(project_root);
     let entry_point_patterns = config.entry_points;
@@ -1983,7 +2046,7 @@ pub fn run_indexing_pipeline_cancellable(
         return Ok(PipelineOutcome::Cancelled);
     }
 
-    *phase.write().unwrap() = IndexingPhase::Parsing;
+    set_phase(IndexingPhase::Parsing);
 
     // Parse + resolve + persist in bounded batches: each batch is extracted in
     // parallel (pure CPU, no DB access) and persisted sequentially before the
@@ -2052,7 +2115,7 @@ pub fn run_indexing_pipeline_cancellable(
         }
     }
 
-    *phase.write().unwrap() = IndexingPhase::BuildingEdges;
+    set_phase(IndexingPhase::BuildingEdges);
 
     let maps = cached_resolution_maps(project_root);
     rebuild_graph(
@@ -2068,7 +2131,7 @@ pub fn run_indexing_pipeline_cancellable(
     )?;
     tx.commit()?;
 
-    *phase.write().unwrap() = IndexingPhase::Ready;
+    set_phase(IndexingPhase::Ready);
 
     Ok(PipelineOutcome::Completed)
 }
@@ -2609,15 +2672,11 @@ pub fn reindex_changed_cancellable(
 /// `collect_source_files` + re-read + re-hash *every* file to discover what
 /// changed even when the caller already knows precisely which file it just
 /// wrote). Used by the edit tool (`tools/edit.rs`), which knows the exact
-/// path from its own write. See
-/// `docs/plans/2026-07-12-upgrade-plan-3-architecture.md` §3.1 Phase A —
-/// the watcher path (`watcher.rs::run_watch_loop`) does NOT yet feed this:
-/// its debounce loop only tracks "was any relevant event seen" as a bool,
-/// never the actual touched paths from each `notify::Event`, so it still
-/// calls the full-walk `reindex_changed_cancellable` — left that way
-/// deliberately for this phase (confirmed by reading `run_watch_loop`, not
-/// assumed), tracked as follow-up in the plan doc rather than silently
-/// dropped.
+/// path from its own write. The `ChangeSet`/`WatchSupervisor` path now uses
+/// this same exact-path fast path for safe source events; loss of observation
+/// (`notify` rescan/error, unsafe rename, or configuration drift) deliberately
+/// routes to [`reindex_all_cancellable`] so the fallback is equivalent to a
+/// fresh index rather than a hash-only approximation.
 ///
 /// A path no longer present on disk is treated as a deletion. A path whose
 /// content hash is unchanged from `file_index` is skipped entirely — no

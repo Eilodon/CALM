@@ -455,7 +455,7 @@ async fn main() -> Result<()> {
             #[cfg(feature = "scip-overlay")]
             if let Some(scip_file) = scip_file {
                 let sub_root = sub_root.unwrap_or_default();
-                let occ = calm_core::scip::parse::parse_scip_file(&scip_file, &sub_root)?;
+                let occ = calm_core::scip::parse::parse_scip_file(&scip_file, &sub_root, "")?;
                 let stats = calm_core::scip::ingest::ingest_occurrences(&conn, &occ, true)?;
                 if stats.upgraded > 0 || stats.ruled_out > 0 || stats.inserted > 0 {
                     calm_core::indexer::pipeline::refresh_caller_counts(&conn)?;
@@ -751,7 +751,7 @@ async fn main() -> Result<()> {
         #[cfg(feature = "scip-overlay")]
         Commands::ScipDump { scip_path } => {
             let occ =
-                calm_core::scip::parse::parse_scip_file(&scip_path, std::path::Path::new(""))?;
+                calm_core::scip::parse::parse_scip_file(&scip_path, std::path::Path::new(""), "")?;
             let stdout = std::io::stdout();
             let mut w = stdout.lock();
             for o in &occ {

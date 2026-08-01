@@ -574,6 +574,8 @@ fn deterministic_scip_proofs_have_identical_fresh_fingerprints() {
                 symbol: "deterministic".into(),
                 is_def: true,
                 is_local: false,
+                encoding_provenance: calm_core::scip::parse::EncodingProvenance::Declared,
+                guessed_alt_byte_range: None,
             },
             calm_core::scip::parse::ScipOccurrence {
                 file: from_path,
@@ -584,6 +586,8 @@ fn deterministic_scip_proofs_have_identical_fresh_fingerprints() {
                 symbol: "deterministic".into(),
                 is_def: false,
                 is_local: false,
+                encoding_provenance: calm_core::scip::parse::EncodingProvenance::Declared,
+                guessed_alt_byte_range: None,
             },
         ];
         let context = calm_core::scip::ingest::ExternalProofContext::new(

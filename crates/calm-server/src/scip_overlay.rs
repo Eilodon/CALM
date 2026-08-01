@@ -76,68 +76,233 @@ pub fn run_all(root: &Path, db_path: &Path) {
     // shared `&config.<lang>` borrow into each std::thread::scope closure
     // is sound without cloning.
     let config = calm_core::config::load_config_or_warn(root);
+    // Decide eligibility with one short-lived connection before spawning any
+    // writer tasks. Previously a Markdown-only (or otherwise non-SCIP) repo
+    // opened nine concurrent writer connections only for each task to discover
+    // zero relevant files inside `run_overlay_for_with_catalog`; their shared
+    // busy timeout made the watcher hot path needlessly slow. An unavailable
+    // probe fails open, preserving the old best-effort behavior.
+    let (run_rust, run_go, run_python, run_js, run_java, run_csharp, run_php, run_c, run_ruby) = {
+        let eligibility_conn = rusqlite::Connection::open(db_path).ok();
+        (
+            should_schedule_overlay(
+                eligibility_conn.as_ref(),
+                &calm_core::scip::provider::RUST,
+                &config.rust.scip,
+            ),
+            should_schedule_overlay(
+                eligibility_conn.as_ref(),
+                &calm_core::scip::provider::GO,
+                &config.go.scip,
+            ),
+            should_schedule_overlay(
+                eligibility_conn.as_ref(),
+                &calm_core::scip::provider::PYTHON,
+                &config.python.scip,
+            ),
+            should_schedule_overlay(
+                eligibility_conn.as_ref(),
+                &calm_core::scip::provider::TYPESCRIPT,
+                &config.js.scip,
+            ),
+            should_schedule_overlay(
+                eligibility_conn.as_ref(),
+                &calm_core::scip::provider::JAVA,
+                &config.java.scip,
+            ),
+            should_schedule_overlay(
+                eligibility_conn.as_ref(),
+                &calm_core::scip::provider::CSHARP,
+                &config.csharp.scip,
+            ),
+            should_schedule_overlay(
+                eligibility_conn.as_ref(),
+                &calm_core::scip::provider::PHP,
+                &config.php.scip,
+            ),
+            should_schedule_overlay(
+                eligibility_conn.as_ref(),
+                &calm_core::scip::provider::CLANG,
+                &config.clang.scip,
+            ),
+            should_schedule_overlay(
+                eligibility_conn.as_ref(),
+                &calm_core::scip::provider::RUBY,
+                &config.ruby.scip,
+            ),
+        )
+    };
+    if !(run_rust
+        || run_go
+        || run_python
+        || run_js
+        || run_java
+        || run_csharp
+        || run_php
+        || run_c
+        || run_ruby)
+    {
+        return;
+    }
+    // The input catalog walks the project once and is then borrowed by every
+    // provider.  Rebuilding it inside each of the concurrent language tasks
+    // would turn a single overlay batch into nine equivalent filesystem walks.
+    let catalog = calm_core::indexer::refresh::InputCatalog::new(root, &config.ignore);
     std::thread::scope(|s| {
-        s.spawn(|| {
-            run_one("rust", db_path, |conn| {
-                let dirty = calm_core::scip::rust_source_dirty_keys(conn);
-                let stats = calm_core::scip::run_overlay(conn, root, &config.rust, &dirty)?;
-                // caller_count was computed by the reindex that ran before this
-                // overlay pass, before the overlay flipped
-                // edge_confidence/ruled_out_by_scip on (or inserted) some edges —
-                // refresh it or it goes stale again immediately relative to the
-                // columns it's filtered on. The other 7 languages' `_and_log`
-                // helpers already do this internally (via `run_and_refresh`);
-                // `run_overlay` is the one raw entry point that doesn't, so it's
-                // done here instead.
-                if (stats.upgraded > 0 || stats.ruled_out > 0 || stats.inserted > 0)
-                    && let Err(e) = calm_core::indexer::pipeline::refresh_caller_counts(conn)
-                {
-                    tracing::warn!("caller_count refresh after SCIP overlay (rust) failed: {e}");
-                }
-                Ok(stats)
+        if run_rust {
+            s.spawn(|| {
+                run_one("rust", db_path, |conn| {
+                    let dirty = calm_core::scip::rust_source_dirty_keys(conn);
+                    let stats = calm_core::scip::run_overlay_for_with_catalog(
+                        &calm_core::scip::provider::RUST,
+                        conn,
+                        calm_core::scip::OverlayRunRequest {
+                            root,
+                            sub_root: std::path::Path::new(""),
+                            config: &config.rust.scip,
+                            dirty: &dirty,
+                            force: false,
+                            catalog: &catalog,
+                        },
+                    )?;
+                    // caller_count was computed by the reindex that ran before this
+                    // overlay pass, before the overlay flipped
+                    // edge_confidence/ruled_out_by_scip on (or inserted) some edges —
+                    // refresh it or it goes stale again immediately relative to the
+                    // columns it's filtered on. The other 7 languages' `_and_log`
+                    // helpers already do this internally (via `run_and_refresh`);
+                    // `run_overlay` is the one raw entry point that doesn't, so it's
+                    // done here instead.
+                    if (stats.upgraded > 0 || stats.ruled_out > 0 || stats.inserted > 0)
+                        && let Err(e) = calm_core::indexer::pipeline::refresh_caller_counts(conn)
+                    {
+                        tracing::warn!(
+                            "caller_count refresh after SCIP overlay (rust) failed: {e}"
+                        );
+                    }
+                    Ok(stats)
+                });
             });
-        });
-        s.spawn(|| {
-            run_one("go", db_path, |conn| {
-                calm_core::scip::run_go_overlay_and_log(conn, root, &config.go)
+        }
+        if run_go {
+            s.spawn(|| {
+                run_one("go", db_path, |conn| {
+                    calm_core::scip::run_go_overlay_and_log_with_catalog(
+                        conn, root, &config.go, &catalog,
+                    )
+                });
             });
-        });
-        s.spawn(|| {
-            run_one("python", db_path, |conn| {
-                calm_core::scip::run_python_overlay_and_log(conn, root, &config.python)
+        }
+        if run_python {
+            s.spawn(|| {
+                run_one("python", db_path, |conn| {
+                    calm_core::scip::run_and_refresh_with_catalog(
+                        &calm_core::scip::provider::PYTHON,
+                        conn,
+                        root,
+                        &config.python.scip,
+                        false,
+                        &catalog,
+                    )
+                });
             });
-        });
-        s.spawn(|| {
-            run_one("js", db_path, |conn| {
-                calm_core::scip::run_js_overlay_and_log(conn, root, &config.js)
+        }
+        if run_js {
+            s.spawn(|| {
+                run_one("js", db_path, |conn| {
+                    calm_core::scip::run_and_refresh_with_catalog(
+                        &calm_core::scip::provider::TYPESCRIPT,
+                        conn,
+                        root,
+                        &config.js.scip,
+                        false,
+                        &catalog,
+                    )
+                });
             });
-        });
-        s.spawn(|| {
-            run_one("java", db_path, |conn| {
-                calm_core::scip::run_java_overlay_and_log(conn, root, &config.java)
+        }
+        if run_java {
+            s.spawn(|| {
+                run_one("java", db_path, |conn| {
+                    calm_core::scip::run_and_refresh_with_catalog(
+                        &calm_core::scip::provider::JAVA,
+                        conn,
+                        root,
+                        &config.java.scip,
+                        false,
+                        &catalog,
+                    )
+                });
             });
-        });
-        s.spawn(|| {
-            run_one("csharp", db_path, |conn| {
-                calm_core::scip::run_csharp_overlay_and_log(conn, root, &config.csharp)
+        }
+        if run_csharp {
+            s.spawn(|| {
+                run_one("csharp", db_path, |conn| {
+                    calm_core::scip::run_and_refresh_with_catalog(
+                        &calm_core::scip::provider::CSHARP,
+                        conn,
+                        root,
+                        &config.csharp.scip,
+                        false,
+                        &catalog,
+                    )
+                });
             });
-        });
-        s.spawn(|| {
-            run_one("php", db_path, |conn| {
-                calm_core::scip::run_php_overlay_and_log(conn, root, &config.php)
+        }
+        if run_php {
+            s.spawn(|| {
+                run_one("php", db_path, |conn| {
+                    calm_core::scip::run_and_refresh_with_catalog(
+                        &calm_core::scip::provider::PHP,
+                        conn,
+                        root,
+                        &config.php.scip,
+                        false,
+                        &catalog,
+                    )
+                });
             });
-        });
-        s.spawn(|| {
-            run_one("c", db_path, |conn| {
-                calm_core::scip::run_clang_overlay_and_log(conn, root, &config.clang)
+        }
+        if run_c {
+            s.spawn(|| {
+                run_one("c", db_path, |conn| {
+                    calm_core::scip::run_and_refresh_with_catalog(
+                        &calm_core::scip::provider::CLANG,
+                        conn,
+                        root,
+                        &config.clang.scip,
+                        false,
+                        &catalog,
+                    )
+                });
             });
-        });
-        s.spawn(|| {
-            run_one("ruby", db_path, |conn| {
-                calm_core::scip::run_ruby_overlay_and_log(conn, root, &config.ruby)
+        }
+        if run_ruby {
+            s.spawn(|| {
+                run_one("ruby", db_path, |conn| {
+                    calm_core::scip::run_and_refresh_with_catalog(
+                        &calm_core::scip::provider::RUBY,
+                        conn,
+                        root,
+                        &config.ruby.scip,
+                        false,
+                        &catalog,
+                    )
+                });
             });
-        });
+        }
     });
+}
+
+fn should_schedule_overlay(
+    conn: Option<&rusqlite::Connection>,
+    provider: &calm_core::scip::provider::ScipProvider,
+    config: &calm_core::config::ScipConfig,
+) -> bool {
+    config.enabled != Some(false)
+        && conn
+            .map(|conn| calm_core::scip::provider_has_any_files(conn, provider))
+            .unwrap_or(true)
 }
 
 /// Opens its own connection against `db_path`, runs `run` against it, and
@@ -169,5 +334,45 @@ fn run_one(
         }
         Ok(_) => {}
         Err(e) => tracing::warn!("SCIP overlay ({lang}) error (base graph intact): {e}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scheduler_skips_empty_or_explicitly_disabled_provider_before_opening_writers() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        calm_core::db::schema::init_db(&conn).unwrap();
+        let config = calm_core::config::Config::default();
+        assert!(
+            !should_schedule_overlay(
+                Some(&conn),
+                &calm_core::scip::provider::PYTHON,
+                &config.python.scip,
+            ),
+            "a provider with no indexed source must not spawn a writer task"
+        );
+
+        conn.execute(
+            "INSERT INTO file_index (path, hash, language, symbol_count, last_indexed) \
+             VALUES ('a.py', 'h', 'python', 0, 0.0)",
+            [],
+        )
+        .unwrap();
+        assert!(should_schedule_overlay(
+            Some(&conn),
+            &calm_core::scip::provider::PYTHON,
+            &config.python.scip,
+        ));
+
+        let mut disabled = config.python.scip.clone();
+        disabled.enabled = Some(false);
+        assert!(!should_schedule_overlay(
+            Some(&conn),
+            &calm_core::scip::provider::PYTHON,
+            &disabled,
+        ));
     }
 }

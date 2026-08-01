@@ -137,6 +137,78 @@
           "busy_retries"
         ]
       },
+      "WatcherHealthOutput": {
+        "type": "object",
+        "properties": {
+          "lifecycle": {
+            "description": "OS watcher lifecycle: `not_started`, `starting`, `armed`, `backoff`,\n`degraded`, or `stopped`.",
+            "type": "string"
+          },
+          "armed": {
+            "description": "Whether an OS subscription is currently armed. Independent of whether\nthe last completed index is fresh.",
+            "type": "boolean"
+          },
+          "freshness": {
+            "description": "Freshness of the last watcher-driven refresh: `unknown`, `fresh`,\n`retrying`, or `stale`.",
+            "type": "string"
+          },
+          "last_event": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_refresh": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_refresh_kind": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_reconciliation": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_reconciliation_reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "consecutive_failures": {
+            "description": "Failures to create/maintain the OS watcher itself.",
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0
+          },
+          "consecutive_refresh_failures": {
+            "description": "Refresh failures while an OS watcher may still be armed.",
+            "type": "integer",
+            "format": "uint32",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "lifecycle",
+          "armed",
+          "freshness",
+          "consecutive_failures",
+          "consecutive_refresh_failures"
+        ]
+      },
       "ScipOverlayStatusOutput": {
         "description": "Local mirror of `calm_core::scip::OverlayStatus` — that type lives in\n`calm-core`, which doesn't depend on `schemars`, so it can't derive\n`JsonSchema` itself. Only exists when this crate is built with the\n`scip-overlay` feature (the same gate `calm_core::scip` itself is behind).",
         "type": "object",
@@ -387,6 +459,10 @@
           "string",
           "null"
         ]
+      },
+      "watcher": {
+        "description": "Observation and refresh health of the background file watcher. This is\nintentionally not folded into `indexing_phase` or `graph_mode`: those\ndescribe the last index build, while this describes whether future disk\nchanges are observed and reconciled safely.",
+        "$ref": "#/$defs/WatcherHealthOutput"
       },
       "scip_overlay": {
         "description": "`None` when this build wasn't compiled with the `scip-overlay` feature,\nor `rust.scip.enabled` is explicitly `false` — nothing to report.\nOtherwise reflects whether Rust call edges are currently up to date\nwith SCIP-upgraded (`formal`) confidence — see\n`calm_core::scip::overlay_status`.",

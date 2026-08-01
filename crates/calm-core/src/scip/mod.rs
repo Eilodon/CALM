@@ -10,6 +10,28 @@ use std::path::Path;
 use rusqlite::Connection;
 
 use crate::config::{RustConfig, ScipConfig};
+use crate::indexer::refresh::InputCatalog;
+
+/// Bump whenever `parse::effective_encoding`'s per-provider fallback table or
+/// its ambiguity-rejection logic changes in a way that could change which
+/// edges get upgraded. Folded into every provider's cache key (see
+/// `versioned_cache_key`) so a policy change forces a real re-run instead of
+/// a stale cache-hit standing forever on a repo whose files haven't changed
+/// (VHEATM Tier-2 remediation plan §1 Lớp 3).
+const EVIDENCE_POLICY_VERSION: u32 = 1;
+
+/// Folds shared non-source inputs and the evidence policy into a provider's
+/// own cache key.  `run_overlay_for`, `run_go_workspace_overlay`, and
+/// `overlay_status_for` must all apply this same function, or status could
+/// report freshness that the run path does not actually honor.
+fn versioned_cache_key(
+    base_key: String,
+    provider: &provider::ScipProvider,
+    catalog: &InputCatalog,
+) -> String {
+    let context_key = catalog.provider_context_fingerprint(provider.lang);
+    format!("{base_key}#input-catalog:{context_key}#evidence-policy-v{EVIDENCE_POLICY_VERSION}")
+}
 
 fn proof_context_for(
     provider: &provider::ScipProvider,
@@ -48,6 +70,21 @@ fn proof_context_for(
 /// forever; an empty slice degrades to the old (lockfile/toolchain-only) key,
 /// which remains safe on its own because it can only widen a "skip" into a
 /// "run", never the reverse.
+/// Inputs that must describe one coherent SCIP overlay attempt.
+///
+/// Keeping these values together makes it explicit that the provider's cache
+/// key, its working root, and the shared input catalog all refer to the same
+/// project snapshot. Batch callers can borrow one catalog across providers
+/// without re-walking the filesystem.
+pub struct OverlayRunRequest<'a> {
+    pub root: &'a Path,
+    pub sub_root: &'a Path,
+    pub config: &'a ScipConfig,
+    pub dirty: &'a [String],
+    pub force: bool,
+    pub catalog: &'a InputCatalog,
+}
+
 pub fn run_overlay_for(
     provider: &provider::ScipProvider,
     conn: &Connection,
@@ -57,6 +94,37 @@ pub fn run_overlay_for(
     dirty: &[String],
     force: bool,
 ) -> anyhow::Result<ingest::IngestStats> {
+    let catalog = InputCatalog::for_project(root);
+    run_overlay_for_with_catalog(
+        provider,
+        conn,
+        OverlayRunRequest {
+            root,
+            sub_root,
+            config: cfg,
+            dirty,
+            force,
+            catalog: &catalog,
+        },
+    )
+}
+
+/// Catalog-aware form of [`run_overlay_for`].  Batch callers build one catalog
+/// and share it across providers, avoiding one recursive filesystem discovery
+/// pass per language while preserving the exact same cache contract.
+pub fn run_overlay_for_with_catalog(
+    provider: &provider::ScipProvider,
+    conn: &Connection,
+    request: OverlayRunRequest<'_>,
+) -> anyhow::Result<ingest::IngestStats> {
+    let OverlayRunRequest {
+        root,
+        sub_root,
+        config: cfg,
+        dirty,
+        force,
+        catalog,
+    } = request;
     if cfg.enabled == Some(false) {
         return Ok(ingest::IngestStats::default());
     }
@@ -100,7 +168,7 @@ pub fn run_overlay_for(
     // benchmark root-cause) — see `state`'s module doc comment for why: a
     // sidecar file outlives the database it describes, so wiping/rebuilding
     // `index.db` used to leave a stale skip-signal behind forever.
-    let key = (provider.cache_key)(&bin, root, dirty);
+    let key = versioned_cache_key((provider.cache_key)(&bin, root, dirty), provider, catalog);
     if state::read_cache_key(conn, provider.lang).as_deref() == Some(key.as_str()) {
         tracing::info!(
             "SCIP overlay ({}): cache key unchanged, skipping indexer run",
@@ -123,7 +191,7 @@ pub fn run_overlay_for(
         );
         return Ok(ingest::IngestStats::default());
     }
-    let occ = match parse::parse_scip_file(tmp.path(), sub_root) {
+    let occ = match parse::parse_scip_file(tmp.path(), sub_root, provider.lang) {
         Ok(o) => o,
         Err(e) => {
             tracing::warn!("SCIP parse failed ({}): {e}", provider.lang);
@@ -261,7 +329,7 @@ pub fn source_dirty_keys(conn: &Connection, langs: &[&str]) -> Vec<String> {
 /// posture as `source_dirty_keys`'s own error handling, so a transient DB
 /// hiccup degrades to "probe anyway" rather than silently going blind to a
 /// language that's actually present.
-fn provider_has_any_files(conn: &Connection, provider: &provider::ScipProvider) -> bool {
+pub fn provider_has_any_files(conn: &Connection, provider: &provider::ScipProvider) -> bool {
     let langs = provider.dirty_langs;
     if langs.is_empty() {
         return true;
@@ -298,8 +366,38 @@ fn run_and_refresh(
     cfg: &ScipConfig,
     force: bool,
 ) -> anyhow::Result<ingest::IngestStats> {
+    // Avoid recursive discovery on the common disabled/no-language fast paths;
+    // the catalog-aware implementation keeps the same guards for direct batch
+    // callers that already own a catalog.
+    if cfg.enabled == Some(false) || !provider_has_any_files(conn, provider) {
+        return Ok(ingest::IngestStats::default());
+    }
+    let catalog = InputCatalog::for_project(root);
+    run_and_refresh_with_catalog(provider, conn, root, cfg, force, &catalog)
+}
+
+/// Batch-friendly form of [`run_and_refresh`].
+pub fn run_and_refresh_with_catalog(
+    provider: &provider::ScipProvider,
+    conn: &Connection,
+    root: &Path,
+    cfg: &ScipConfig,
+    force: bool,
+    catalog: &InputCatalog,
+) -> anyhow::Result<ingest::IngestStats> {
     let dirty = source_dirty_keys(conn, provider.dirty_langs);
-    let stats = run_overlay_for(provider, conn, root, Path::new(""), cfg, &dirty, force)?;
+    let stats = run_overlay_for_with_catalog(
+        provider,
+        conn,
+        OverlayRunRequest {
+            root,
+            sub_root: Path::new(""),
+            config: cfg,
+            dirty: &dirty,
+            force,
+            catalog,
+        },
+    )?;
     if stats.upgraded > 0 || stats.ruled_out > 0 || stats.inserted > 0 {
         crate::indexer::pipeline::refresh_caller_counts(conn)?;
     }
@@ -331,6 +429,22 @@ fn run_go_workspace_overlay(
     modules: &[std::path::PathBuf],
     force: bool,
 ) -> anyhow::Result<ingest::IngestStats> {
+    if cfg.enabled == Some(false) || !provider_has_any_files(conn, &provider::GO) {
+        return Ok(ingest::IngestStats::default());
+    }
+    let catalog = InputCatalog::for_project(root);
+    run_go_workspace_overlay_with_catalog(conn, root, cfg, modules, force, &catalog)
+}
+
+/// Catalog-aware workspace form used by multi-provider batches.
+pub fn run_go_workspace_overlay_with_catalog(
+    conn: &Connection,
+    root: &Path,
+    cfg: &ScipConfig,
+    modules: &[std::path::PathBuf],
+    force: bool,
+    catalog: &InputCatalog,
+) -> anyhow::Result<ingest::IngestStats> {
     let provider = &provider::GO;
     if cfg.enabled == Some(false) {
         return Ok(ingest::IngestStats::default());
@@ -357,7 +471,7 @@ fn run_go_workspace_overlay(
 
     // DB-resident, not a sidecar file — see `run_overlay_for`'s equivalent
     // check and `state`'s module doc comment (B4).
-    let key = (provider.cache_key)(&bin, root, &dirty);
+    let key = versioned_cache_key((provider.cache_key)(&bin, root, &dirty), provider, catalog);
     if state::read_cache_key(conn, provider.lang).as_deref() == Some(key.as_str()) {
         tracing::info!("SCIP overlay (go, workspace): cache key unchanged, skipping indexer run");
         return Ok(ingest::IngestStats::default());
@@ -398,7 +512,7 @@ fn run_go_workspace_overlay(
             );
             continue;
         }
-        let occ = match parse::parse_scip_file(tmp.path(), module_rel) {
+        let occ = match parse::parse_scip_file(tmp.path(), module_rel, provider.lang) {
             Ok(o) => o,
             Err(e) => {
                 tracing::warn!(
@@ -470,6 +584,22 @@ pub fn run_go_overlay_and_log(
         return run_go_workspace_overlay(conn, root, &cfg.scip, &modules, false);
     }
     run_and_refresh(&provider::GO, conn, root, &cfg.scip, false)
+}
+
+/// Catalog-aware counterpart to [`run_go_overlay_and_log`] for a batch that
+/// already discovered project inputs once.
+pub fn run_go_overlay_and_log_with_catalog(
+    conn: &Connection,
+    root: &Path,
+    cfg: &crate::config::GoConfig,
+    catalog: &InputCatalog,
+) -> anyhow::Result<ingest::IngestStats> {
+    if let Some(modules) = provider::parse_go_work_modules(root) {
+        return run_go_workspace_overlay_with_catalog(
+            conn, root, &cfg.scip, &modules, false, catalog,
+        );
+    }
+    run_and_refresh_with_catalog(&provider::GO, conn, root, &cfg.scip, false, catalog)
 }
 
 /// Run the Python overlay (`provider::PYTHON`) — the Python-specific
@@ -602,25 +732,92 @@ pub fn refresh_language(
             "unknown SCIP provider {other:?} — expected one of: rust, go, python, javascript, java, csharp, php, c, ruby, all"
         ),
     };
+    let catalog = InputCatalog::new(root, &config.ignore);
     let mut out = Vec::with_capacity(want.len());
     for lang in want {
         let stats = match *lang {
-            "rust" => run_and_refresh(&provider::RUST, conn, root, &config.rust.scip, true)?,
+            "rust" => run_and_refresh_with_catalog(
+                &provider::RUST,
+                conn,
+                root,
+                &config.rust.scip,
+                true,
+                &catalog,
+            )?,
             "go" => match provider::parse_go_work_modules(root) {
-                Some(modules) => {
-                    run_go_workspace_overlay(conn, root, &config.go.scip, &modules, true)?
-                }
-                None => run_and_refresh(&provider::GO, conn, root, &config.go.scip, true)?,
+                Some(modules) => run_go_workspace_overlay_with_catalog(
+                    conn,
+                    root,
+                    &config.go.scip,
+                    &modules,
+                    true,
+                    &catalog,
+                )?,
+                None => run_and_refresh_with_catalog(
+                    &provider::GO,
+                    conn,
+                    root,
+                    &config.go.scip,
+                    true,
+                    &catalog,
+                )?,
             },
-            "python" => run_and_refresh(&provider::PYTHON, conn, root, &config.python.scip, true)?,
-            "javascript" => {
-                run_and_refresh(&provider::TYPESCRIPT, conn, root, &config.js.scip, true)?
-            }
-            "csharp" => run_and_refresh(&provider::CSHARP, conn, root, &config.csharp.scip, true)?,
-            "java" => run_and_refresh(&provider::JAVA, conn, root, &config.java.scip, true)?,
-            "php" => run_and_refresh(&provider::PHP, conn, root, &config.php.scip, true)?,
-            "c" => run_and_refresh(&provider::CLANG, conn, root, &config.clang.scip, true)?,
-            "ruby" => run_and_refresh(&provider::RUBY, conn, root, &config.ruby.scip, true)?,
+            "python" => run_and_refresh_with_catalog(
+                &provider::PYTHON,
+                conn,
+                root,
+                &config.python.scip,
+                true,
+                &catalog,
+            )?,
+            "javascript" => run_and_refresh_with_catalog(
+                &provider::TYPESCRIPT,
+                conn,
+                root,
+                &config.js.scip,
+                true,
+                &catalog,
+            )?,
+            "csharp" => run_and_refresh_with_catalog(
+                &provider::CSHARP,
+                conn,
+                root,
+                &config.csharp.scip,
+                true,
+                &catalog,
+            )?,
+            "java" => run_and_refresh_with_catalog(
+                &provider::JAVA,
+                conn,
+                root,
+                &config.java.scip,
+                true,
+                &catalog,
+            )?,
+            "php" => run_and_refresh_with_catalog(
+                &provider::PHP,
+                conn,
+                root,
+                &config.php.scip,
+                true,
+                &catalog,
+            )?,
+            "c" => run_and_refresh_with_catalog(
+                &provider::CLANG,
+                conn,
+                root,
+                &config.clang.scip,
+                true,
+                &catalog,
+            )?,
+            "ruby" => run_and_refresh_with_catalog(
+                &provider::RUBY,
+                conn,
+                root,
+                &config.ruby.scip,
+                true,
+                &catalog,
+            )?,
             _ => unreachable!("want is filtered to `all` above"),
         };
         out.push((lang.to_string(), stats));
@@ -643,12 +840,29 @@ pub fn overlay_status_for(
     if cfg.enabled == Some(false) {
         return None;
     }
+    let catalog = InputCatalog::for_project(root);
+    overlay_status_for_with_catalog(provider, conn, root, cfg, &catalog)
+}
+
+/// Catalog-aware readiness snapshot.  A caller reporting several providers
+/// should build one [`InputCatalog`] and call this variant for each provider.
+pub fn overlay_status_for_with_catalog(
+    provider: &provider::ScipProvider,
+    conn: &Connection,
+    root: &Path,
+    cfg: &ScipConfig,
+    catalog: &InputCatalog,
+) -> Option<OverlayStatus> {
+    if cfg.enabled == Some(false) {
+        return None;
+    }
     let bin = (provider.resolve_binary)(cfg.binary.as_deref(), root);
     let available = bin.is_some();
     let up_to_date = match &bin {
         Some(bin) => {
             let dirty = source_dirty_keys(conn, provider.dirty_langs);
-            let key = (provider.cache_key)(bin, root, &dirty);
+            let key =
+                versioned_cache_key((provider.cache_key)(bin, root, &dirty), provider, catalog);
             state::read_cache_key(conn, provider.lang).as_deref() == Some(key.as_str())
         }
         None => false,
@@ -715,6 +929,40 @@ pub struct OverlayStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_cache_key_tracks_shared_typescript_context_without_cross_language_churn() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("configs")).unwrap();
+        std::fs::write(
+            root.path().join("tsconfig.json"),
+            "{\"extends\": \"./configs/base\"}",
+        )
+        .unwrap();
+        std::fs::write(root.path().join("configs/base.json"), "{\"strict\": true}").unwrap();
+
+        let first_catalog = InputCatalog::new(root.path(), &[]);
+        let first_js = versioned_cache_key(
+            "provider-base".to_owned(),
+            &provider::TYPESCRIPT,
+            &first_catalog,
+        );
+        let first_rust =
+            versioned_cache_key("provider-base".to_owned(), &provider::RUST, &first_catalog);
+
+        std::fs::write(root.path().join("configs/base.json"), "{\"strict\": false}").unwrap();
+        let second_catalog = InputCatalog::new(root.path(), &[]);
+        let second_js = versioned_cache_key(
+            "provider-base".to_owned(),
+            &provider::TYPESCRIPT,
+            &second_catalog,
+        );
+        let second_rust =
+            versioned_cache_key("provider-base".to_owned(), &provider::RUST, &second_catalog);
+
+        assert_ne!(first_js, second_js);
+        assert_eq!(first_rust, second_rust);
+    }
 
     /// `Some(false)` (explicit force-off) must be a no-op regardless of what's
     /// actually on this machine's `PATH` — unlike unset/auto-detect, this

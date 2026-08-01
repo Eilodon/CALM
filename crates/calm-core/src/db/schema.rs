@@ -150,6 +150,17 @@ CREATE TABLE IF NOT EXISTS graph_generation_state (
 );
 INSERT OR IGNORE INTO graph_generation_state(id, generation) VALUES (1, 0);
 
+-- Durable contract for non-source inputs that can change how identical source
+-- bytes are extracted or resolved. A missing or incompatible row is never
+-- trusted: startup/reconciliation falls back to a full baseline once.
+CREATE TABLE IF NOT EXISTS index_input_state (
+    id                  INTEGER PRIMARY KEY CHECK (id = 1),
+    policy_version      INTEGER NOT NULL,
+    config_fingerprint  TEXT NOT NULL,
+    context_fingerprint TEXT NOT NULL,
+    recorded_at         REAL NOT NULL
+);
+
 -- Semantic search Layer 2: raw code-body slices (whole short bodies, or a
 -- sliding window over longer ones — see indexer::chunker), embedded alongside
 -- Layer 1's symbol-identity (name+signature+docstring) vectors so a query

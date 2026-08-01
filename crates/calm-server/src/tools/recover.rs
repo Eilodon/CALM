@@ -121,10 +121,16 @@ impl CalmServer {
             let phase = self.phase_str();
             let indexing_error = self.last_index_error.read_ok().clone();
             let embeddings_error = self.last_embed_error.read_ok().clone();
+            let watcher = WatcherHealthOutput::from(self.watcher_health_handle().read_ok().clone());
             let sn = if phase == "failed" {
                 suggested(
                     "indexing_status",
                     "Indexing failed — check indexing_error, fix the underlying issue, then restart or retry",
+                )
+            } else if watcher.lifecycle == "degraded" || watcher.freshness == "stale" {
+                suggested(
+                    "indexing_status",
+                    "Filesystem watcher is unavailable or index freshness is stale — inspect watcher health; periodic full reconciliation remains the safety fallback",
                 )
             } else if phase == "ready" {
                 suggested("locate", "Index ready — begin exploration")
@@ -175,6 +181,7 @@ impl CalmServer {
                 external_proofs,
                 identity_migration,
                 graph_mode: self.last_graph_mode.read_ok().clone(),
+                watcher,
                 scip_overlay,
                 scip_overlays,
                 lsp_providers,
@@ -230,6 +237,12 @@ impl CalmServer {
         languages: &[String],
     ) -> Vec<PerLanguageOverlayStatus> {
         let config = self.config();
+        // One discovery pass is shared by all provider status checks.  In
+        // particular this includes transitive TypeScript `extends` files,
+        // which must be fingerprinted exactly as the run path fingerprints
+        // them without multiplying filesystem walks by provider count.
+        let catalog =
+            calm_core::indexer::refresh::InputCatalog::new(&self.project_root, &config.ignore);
         let present = |tags: &[&str]| tags.iter().any(|t| languages.iter().any(|l| l == t));
         // Indexed-file count behind each provider's `last_match_rate` (F5) —
         // the denominator a reader needs to tell a real weak signal from a
@@ -248,11 +261,12 @@ impl CalmServer {
         };
         let mut out = Vec::new();
         if present(&["rust"])
-            && let Some(s) = calm_core::scip::overlay_status_for(
+            && let Some(s) = calm_core::scip::overlay_status_for_with_catalog(
                 &calm_core::scip::provider::RUST,
                 conn,
                 &self.project_root,
                 &config.rust.scip,
+                &catalog,
             )
         {
             out.push(PerLanguageOverlayStatus::new(
@@ -262,11 +276,12 @@ impl CalmServer {
             ));
         }
         if present(&["go"])
-            && let Some(s) = calm_core::scip::overlay_status_for(
+            && let Some(s) = calm_core::scip::overlay_status_for_with_catalog(
                 &calm_core::scip::provider::GO,
                 conn,
                 &self.project_root,
                 &config.go.scip,
+                &catalog,
             )
         {
             out.push(PerLanguageOverlayStatus::new(
@@ -276,11 +291,12 @@ impl CalmServer {
             ));
         }
         if present(&["python"])
-            && let Some(s) = calm_core::scip::overlay_status_for(
+            && let Some(s) = calm_core::scip::overlay_status_for_with_catalog(
                 &calm_core::scip::provider::PYTHON,
                 conn,
                 &self.project_root,
                 &config.python.scip,
+                &catalog,
             )
         {
             out.push(PerLanguageOverlayStatus::new(
@@ -295,11 +311,12 @@ impl CalmServer {
         // `PerLanguageOverlayStatus::new` call below), so presence must
         // check both.
         if present(&["javascript", "typescript"])
-            && let Some(s) = calm_core::scip::overlay_status_for(
+            && let Some(s) = calm_core::scip::overlay_status_for_with_catalog(
                 &calm_core::scip::provider::TYPESCRIPT,
                 conn,
                 &self.project_root,
                 &config.js.scip,
+                &catalog,
             )
         {
             out.push(PerLanguageOverlayStatus::new(
@@ -309,11 +326,12 @@ impl CalmServer {
             ));
         }
         if present(&["java"])
-            && let Some(s) = calm_core::scip::overlay_status_for(
+            && let Some(s) = calm_core::scip::overlay_status_for_with_catalog(
                 &calm_core::scip::provider::JAVA,
                 conn,
                 &self.project_root,
                 &config.java.scip,
+                &catalog,
             )
         {
             out.push(PerLanguageOverlayStatus::new(
@@ -323,11 +341,12 @@ impl CalmServer {
             ));
         }
         if present(&["csharp"])
-            && let Some(s) = calm_core::scip::overlay_status_for(
+            && let Some(s) = calm_core::scip::overlay_status_for_with_catalog(
                 &calm_core::scip::provider::CSHARP,
                 conn,
                 &self.project_root,
                 &config.csharp.scip,
+                &catalog,
             )
         {
             out.push(PerLanguageOverlayStatus::new(
@@ -337,11 +356,12 @@ impl CalmServer {
             ));
         }
         if present(&["php"])
-            && let Some(s) = calm_core::scip::overlay_status_for(
+            && let Some(s) = calm_core::scip::overlay_status_for_with_catalog(
                 &calm_core::scip::provider::PHP,
                 conn,
                 &self.project_root,
                 &config.php.scip,
+                &catalog,
             )
         {
             out.push(PerLanguageOverlayStatus::new(
@@ -354,11 +374,12 @@ impl CalmServer {
         // under the single `"c"` tag — same both-tags reasoning as
         // TYPESCRIPT above.
         if present(&["c", "cpp"])
-            && let Some(s) = calm_core::scip::overlay_status_for(
+            && let Some(s) = calm_core::scip::overlay_status_for_with_catalog(
                 &calm_core::scip::provider::CLANG,
                 conn,
                 &self.project_root,
                 &config.clang.scip,
+                &catalog,
             )
         {
             out.push(PerLanguageOverlayStatus::new(
@@ -368,11 +389,12 @@ impl CalmServer {
             ));
         }
         if present(&["ruby"])
-            && let Some(s) = calm_core::scip::overlay_status_for(
+            && let Some(s) = calm_core::scip::overlay_status_for_with_catalog(
                 &calm_core::scip::provider::RUBY,
                 conn,
                 &self.project_root,
                 &config.ruby.scip,
+                &catalog,
             )
         {
             out.push(PerLanguageOverlayStatus::new(
@@ -697,6 +719,11 @@ pub(crate) struct IndexingStatusOutput {
     /// falling back to full rebuilds.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) graph_mode: Option<String>,
+    /// Observation and refresh health of the background file watcher. This is
+    /// intentionally not folded into `indexing_phase` or `graph_mode`: those
+    /// describe the last index build, while this describes whether future disk
+    /// changes are observed and reconciled safely.
+    pub(crate) watcher: WatcherHealthOutput,
     /// `None` when this build wasn't compiled with the `scip-overlay` feature,
     /// or `rust.scip.enabled` is explicitly `false` — nothing to report.
     /// Otherwise reflects whether Rust call edges are currently up to date
@@ -749,6 +776,61 @@ pub(crate) struct IndexingStatusOutput {
     pub(crate) orphaned_stack_graphs_edges: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) suggested_next: Option<SuggestedNext>,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub(crate) struct WatcherHealthOutput {
+    /// OS watcher lifecycle: `not_started`, `starting`, `armed`, `backoff`,
+    /// `degraded`, or `stopped`.
+    pub(crate) lifecycle: String,
+    /// Whether an OS subscription is currently armed. Independent of whether
+    /// the last completed index is fresh.
+    pub(crate) armed: bool,
+    /// Freshness of the last watcher-driven refresh: `unknown`, `fresh`,
+    /// `retrying`, or `stale`.
+    pub(crate) freshness: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) last_event: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) last_refresh: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) last_refresh_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) last_reconciliation: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) last_reconciliation_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) last_error: Option<String>,
+    /// Failures to create/maintain the OS watcher itself.
+    pub(crate) consecutive_failures: u32,
+    /// Refresh failures while an OS watcher may still be armed.
+    pub(crate) consecutive_refresh_failures: u32,
+}
+
+impl From<crate::watch_supervisor::WatcherHealth> for WatcherHealthOutput {
+    fn from(health: crate::watch_supervisor::WatcherHealth) -> Self {
+        Self {
+            lifecycle: health.lifecycle.as_str().to_owned(),
+            armed: health.armed,
+            freshness: health.freshness.as_str().to_owned(),
+            last_event: health
+                .last_event_unix
+                .map(|secs| epoch_to_iso8601(secs as f64)),
+            last_refresh: health
+                .last_refresh_unix
+                .map(|secs| epoch_to_iso8601(secs as f64)),
+            last_refresh_kind: health
+                .last_refresh_kind
+                .map(|kind| kind.as_str().to_owned()),
+            last_reconciliation: health
+                .last_reconciliation_unix
+                .map(|secs| epoch_to_iso8601(secs as f64)),
+            last_reconciliation_reason: health.last_reconciliation_reason.map(str::to_owned),
+            last_error: health.last_error,
+            consecutive_failures: health.consecutive_failures,
+            consecutive_refresh_failures: health.consecutive_refresh_failures,
+        }
+    }
 }
 
 #[derive(Serialize, JsonSchema)]

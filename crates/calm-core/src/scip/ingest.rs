@@ -40,6 +40,13 @@ pub struct IngestStats {
     pub inserted: usize,
     /// Fraction of exact SCIP call-site references that matched CALM state.
     pub match_rate: f64,
+    /// Occurrences whose primary span came from a guessed (fallback, not
+    /// self-declared) encoding, where the alternate raw-UTF-8
+    /// interpretation ALSO independently resolved to a distinct, real
+    /// CallSite — two plausible-but-different targets, so neither was used
+    /// to upgrade, rule out, or insert anything. See
+    /// `parse::ScipOccurrence::guessed_alt_byte_range`.
+    pub ambiguous: usize,
 }
 
 /// Provider inputs that make an exact external result auditable.  Callers that
@@ -175,6 +182,11 @@ pub fn ingest_occurrences_with_proof_context(
     }
 
     let mut ref_targets: HashMap<ExactCallSiteKey, Vec<DefinitionSite>> = HashMap::new();
+    // Parallel to `ref_targets`: for a `Fallback`-encoded occurrence whose
+    // alternate raw-UTF-8 interpretation disagreed with its primary guess
+    // (`guessed_alt_byte_range`), this holds the alternate span's own key —
+    // checked below against real `call_sites` rows for ambiguity.
+    let mut alt_key_of: HashMap<ExactCallSiteKey, ExactCallSiteKey> = HashMap::new();
     for occurrence in occ {
         let (Some(start_byte), Some(end_byte), Some(source_file_hash)) = (
             occurrence.start_byte,
@@ -183,17 +195,29 @@ pub fn ingest_occurrences_with_proof_context(
         ) else {
             continue;
         };
+        let primary_key: ExactCallSiteKey = (
+            occurrence.file.clone(),
+            start_byte as i64,
+            end_byte as i64,
+            source_file_hash.to_string(),
+        );
+        if let Some((alt_start, alt_end)) = occurrence.guessed_alt_byte_range {
+            alt_key_of.insert(
+                primary_key.clone(),
+                (
+                    occurrence.file.clone(),
+                    alt_start as i64,
+                    alt_end as i64,
+                    source_file_hash.to_string(),
+                ),
+            );
+        }
         if !occurrence.is_def
             && !occurrence.is_local
             && let Some(definition) = def_of.get(occurrence.symbol.as_str())
         {
             ref_targets
-                .entry((
-                    occurrence.file.clone(),
-                    start_byte as i64,
-                    end_byte as i64,
-                    source_file_hash.to_string(),
-                ))
+                .entry(primary_key)
                 .or_default()
                 .push(definition.clone());
         }
@@ -227,6 +251,25 @@ pub fn ingest_occurrences_with_proof_context(
         })?
         .collect::<rusqlite::Result<_>>()?
     };
+
+    // Defense-in-depth (VHEATM Tier-2 §1 Lớp 2): a `Fallback`-encoded
+    // occurrence whose primary AND alternate spans both independently
+    // resolve to distinct, real CallSite rows can't be trusted — reject it
+    // outright (neither span upgrades, rules out, or inserts anything)
+    // rather than guessing which one is right.
+    let row_keys: HashSet<ExactCallSiteKey> =
+        rows.iter().map(|(_, _, key, ..)| key.clone()).collect();
+    let ambiguous_keys: Vec<ExactCallSiteKey> = alt_key_of
+        .iter()
+        .filter(|(primary, alt)| {
+            *alt != *primary && row_keys.contains(*primary) && row_keys.contains(*alt)
+        })
+        .map(|(primary, _)| primary.clone())
+        .collect();
+    for key in &ambiguous_keys {
+        ref_targets.remove(key);
+    }
+    let ambiguous = ambiguous_keys.len();
 
     let mut to_upgrade = Vec::new();
     let mut newly_upgraded = 0;
@@ -295,6 +338,7 @@ pub fn ingest_occurrences_with_proof_context(
         } else {
             satisfied.len() as f64 / ref_targets.len() as f64
         },
+        ambiguous,
     })
 }
 
@@ -595,6 +639,10 @@ fn ingest_line_keyed_occurrences_for_regression(
         ruled_out: to_rule_out,
         inserted,
         match_rate,
+        // Legacy line-keyed path has no per-provider encoding guess to
+        // second-guess (see `parse::ScipOccurrence::guessed_alt_byte_range`'s
+        // doc comment) — nothing to flag as ambiguous.
+        ambiguous: 0,
     })
 }
 
@@ -923,6 +971,8 @@ mod tests {
                 symbol: occurrence.symbol.clone(),
                 is_def: occurrence.is_def,
                 is_local: occurrence.is_local,
+                encoding_provenance: crate::scip::parse::EncodingProvenance::Unresolved,
+                guessed_alt_byte_range: None,
             })
             .collect()
     }
@@ -1001,6 +1051,8 @@ mod tests {
                 symbol: "M".into(),
                 is_def: true,
                 is_local: false,
+                encoding_provenance: crate::scip::parse::EncodingProvenance::Declared,
+                guessed_alt_byte_range: None,
             },
             crate::scip::parse::ScipOccurrence {
                 file: "app/src/main.rs".into(),
@@ -1011,6 +1063,8 @@ mod tests {
                 symbol: "M".into(),
                 is_def: false,
                 is_local: false,
+                encoding_provenance: crate::scip::parse::EncodingProvenance::Declared,
+                guessed_alt_byte_range: None,
             },
         ];
 
@@ -1090,6 +1144,95 @@ mod tests {
     }
 
     #[test]
+    fn ambiguous_guessed_encoding_upgrades_neither_candidate() {
+        // Two real call sites at the same line, same callee — mirrors the
+        // fixture above, but here ONE occurrence's primary span matches the
+        // first call site while its `guessed_alt_byte_range` (defense-in-
+        // depth for a fallback-guessed encoding, VHEATM Tier-2 §1 Lớp 2)
+        // independently matches the second, distinct call site. Two
+        // plausible-but-different targets means neither should be trusted.
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end)
+             VALUES ('core/src/engine.rs::Engine::start', 'start', 'method', 'rust',
+                     'core/src/engine.rs', 6, 8);
+             INSERT INTO file_index (path, hash, language, symbol_count, last_indexed)
+             VALUES ('app/src/main.rs', 'fresh-source', 'rust', 1, 0);
+             INSERT INTO call_sites
+                (from_path, enclosing_qn, callee_name, call_line, callee_start_byte,
+                 callee_end_byte, identity_version, edge_kind)
+             VALUES
+                ('app/src/main.rs', 'app/src/main.rs::main', 'start', 5, 4, 9, 2, 'call'),
+                ('app/src/main.rs', 'app/src/main.rs::main', 'start', 5, 12, 17, 2, 'call');",
+        )
+        .unwrap();
+        let site_ids: Vec<i64> = conn
+            .prepare("SELECT id FROM call_sites ORDER BY callee_start_byte")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        for site_id in &site_ids {
+            conn.execute(
+                "INSERT INTO call_edges
+                    (from_symbol, to_symbol, call_site_line, call_site_id, edge_confidence, from_path, to_path, edge_kind)
+                 VALUES ('app/src/main.rs::main', 'core/src/engine.rs::Engine::start', 5, ?1,
+                         'textual', 'app/src/main.rs', 'core/src/engine.rs', 'call')",
+                [site_id],
+            )
+            .unwrap();
+        }
+
+        let occ = vec![
+            crate::scip::parse::ScipOccurrence {
+                file: "core/src/engine.rs".into(),
+                line: 6,
+                start_byte: None,
+                end_byte: None,
+                source_file_hash: None,
+                symbol: "M".into(),
+                is_def: true,
+                is_local: false,
+                encoding_provenance: crate::scip::parse::EncodingProvenance::Declared,
+                guessed_alt_byte_range: None,
+            },
+            crate::scip::parse::ScipOccurrence {
+                file: "app/src/main.rs".into(),
+                line: 5,
+                start_byte: Some(4),
+                end_byte: Some(9),
+                source_file_hash: Some("fresh-source".into()),
+                symbol: "M".into(),
+                is_def: false,
+                is_local: false,
+                encoding_provenance: crate::scip::parse::EncodingProvenance::Fallback,
+                guessed_alt_byte_range: Some((12, 17)),
+            },
+        ];
+
+        let stats = super::ingest_occurrences(&conn, &occ, false).unwrap();
+        assert_eq!(
+            stats.upgraded, 0,
+            "ambiguous evidence must not upgrade either candidate"
+        );
+        assert_eq!(stats.ambiguous, 1);
+        let confidence: Vec<String> = conn
+            .prepare("SELECT edge_confidence FROM call_edges ORDER BY call_site_id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            confidence,
+            vec!["textual".to_string(), "textual".to_string()],
+            "neither edge should be touched"
+        );
+    }
+
+    #[test]
     fn same_line_non_call_reference_cannot_formalize_or_rule_out_a_call() {
         let conn = Connection::open_in_memory().unwrap();
         crate::db::schema::init_db(&conn).unwrap();
@@ -1121,6 +1264,8 @@ mod tests {
                 symbol: "M".into(),
                 is_def: true,
                 is_local: false,
+                encoding_provenance: crate::scip::parse::EncodingProvenance::Declared,
+                guessed_alt_byte_range: None,
             },
             crate::scip::parse::ScipOccurrence {
                 file: "app/src/main.rs".into(),
@@ -1133,6 +1278,8 @@ mod tests {
                 symbol: "M".into(),
                 is_def: false,
                 is_local: false,
+                encoding_provenance: crate::scip::parse::EncodingProvenance::Declared,
+                guessed_alt_byte_range: None,
             },
         ];
 
@@ -1189,6 +1336,8 @@ mod tests {
                 symbol: "M".into(),
                 is_def: true,
                 is_local: false,
+                encoding_provenance: crate::scip::parse::EncodingProvenance::Declared,
+                guessed_alt_byte_range: None,
             },
             crate::scip::parse::ScipOccurrence {
                 file: "app/src/main.rs".into(),
@@ -1199,6 +1348,8 @@ mod tests {
                 symbol: "M".into(),
                 is_def: false,
                 is_local: false,
+                encoding_provenance: crate::scip::parse::EncodingProvenance::Declared,
+                guessed_alt_byte_range: None,
             },
         ];
 
@@ -1252,6 +1403,8 @@ mod tests {
                 symbol: "M".into(),
                 is_def: true,
                 is_local: false,
+                encoding_provenance: crate::scip::parse::EncodingProvenance::Declared,
+                guessed_alt_byte_range: None,
             },
             crate::scip::parse::ScipOccurrence {
                 file: "app/src/main.rs".into(),
@@ -1262,6 +1415,8 @@ mod tests {
                 symbol: "M".into(),
                 is_def: false,
                 is_local: false,
+                encoding_provenance: crate::scip::parse::EncodingProvenance::Declared,
+                guessed_alt_byte_range: None,
             },
         ];
 

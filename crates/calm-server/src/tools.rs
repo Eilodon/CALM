@@ -245,6 +245,10 @@ pub struct CalmServer {
     /// like `last_index_error`, so every `for_connection` clone reports the
     /// same latest value.
     last_graph_mode: Arc<RwLock<Option<String>>>,
+    /// Watcher liveness and freshness are independent from `phase` and graph
+    /// mode. Shared by every daemon connection so `indexing_status` reports
+    /// the one background supervisor actually responsible for this project.
+    watcher_health: crate::watch_supervisor::WatcherHealthHandle,
     /// Loaded embedding model (None until/unless embeddings are enabled+ready),
     /// shared with the background indexer that loads it.
     embedder: Arc<RwLock<Option<Arc<Embedder>>>>,
@@ -6590,6 +6594,37 @@ mod tests {
             retry_embeddings: false,
         })));
         assert_eq!(after["graph_mode"], "incremental");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn indexing_status_keeps_watcher_health_separate_from_ready_index_phase() {
+        let (dir, server) = test_server("indexing_status_watcher_health");
+        *server.phase_handle().write().unwrap() = calm_core::types::IndexingPhase::Ready;
+        {
+            let health = server.watcher_health_handle();
+            let mut health = health.write().unwrap();
+            health.lifecycle = crate::watch_supervisor::WatcherLifecycle::Degraded;
+            health.armed = false;
+            health.freshness = crate::watch_supervisor::WatcherFreshness::Stale;
+            health.last_reconciliation_reason = Some("watcher_error");
+            health.consecutive_failures = 3;
+            health.consecutive_refresh_failures = 2;
+        }
+
+        let output = jv(server.indexing_status(Parameters(IndexingStatusParams {
+            retry_embeddings: false,
+        })));
+        assert_eq!(output["indexing_phase"], "ready");
+        assert_eq!(output["watcher"]["lifecycle"], "degraded");
+        assert_eq!(output["watcher"]["freshness"], "stale");
+        assert_eq!(
+            output["watcher"]["last_reconciliation_reason"],
+            "watcher_error"
+        );
+        assert_eq!(output["watcher"]["consecutive_failures"], 3);
+        assert_eq!(output["watcher"]["consecutive_refresh_failures"], 2);
+        assert_eq!(output["suggested_next"]["tool"], "indexing_status");
         let _ = std::fs::remove_dir_all(&dir);
     }
     #[test]

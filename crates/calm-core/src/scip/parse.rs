@@ -3,6 +3,60 @@
 //! rich moniker string is preserved verbatim as the identity key.
 
 /// One SCIP occurrence, normalized to 1-based line and `ci`'s conventions.
+/// Where an occurrence's byte span encoding came from — provenance/funnel
+/// accounting only. Never used for matching itself, which stays exact
+/// byte-span + source-hash equality against real `call_sites` rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncodingProvenance {
+    /// The SCIP document declared a non-`Unspecified` encoding — the
+    /// producing indexer followed the protocol.
+    Declared,
+    /// The document left `position_encoding` unset; this provider is one of
+    /// the languages SCIP's own spec (`scip.proto`'s
+    /// `Document.position_encoding` doc comment) documents a convention for,
+    /// so that convention was applied as a fallback instead of failing
+    /// closed. See `effective_encoding`.
+    Fallback,
+    /// The document left `position_encoding` unset and no fallback applies
+    /// (unknown/generic provider) — `start_byte`/`end_byte` stay `None`.
+    Unresolved,
+}
+
+/// SCIP's own documented convention for indexers that omit
+/// `Document.position_encoding` (`scip-0.9.0/src/generated/scip.rs`'s doc
+/// comment on that field, itself a transcription of `scip.proto`): JVM/.NET/
+/// JS/TS indexers should emit UTF-16, Python UTF-32, Go/Rust/C++ UTF-8. This
+/// is an evidence CONTRACT scoped to exactly those verified languages, never
+/// a global fallback — a provider outside this table keeps failing closed,
+/// including any future/unknown provider. A `declared` encoding (anything
+/// other than `Unspecified`) always wins outright: the indexer's own
+/// self-report has protocol precedence over a guess derived from its
+/// implementation language.
+fn effective_encoding(
+    declared: scip::types::PositionEncoding,
+    provider_lang: &str,
+) -> (scip::types::PositionEncoding, EncodingProvenance) {
+    use scip::types::PositionEncoding;
+    if declared != PositionEncoding::UnspecifiedPositionEncoding {
+        return (declared, EncodingProvenance::Declared);
+    }
+    let fallback = match provider_lang {
+        "python" => Some(PositionEncoding::UTF32CodeUnitOffsetFromLineStart),
+        "javascript" | "java" | "csharp" => {
+            Some(PositionEncoding::UTF16CodeUnitOffsetFromLineStart)
+        }
+        "rust" | "go" | "c" => Some(PositionEncoding::UTF8CodeUnitOffsetFromLineStart),
+        _ => None,
+    };
+    match fallback {
+        Some(encoding) => (encoding, EncodingProvenance::Fallback),
+        None => (
+            PositionEncoding::UnspecifiedPositionEncoding,
+            EncodingProvenance::Unresolved,
+        ),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ScipOccurrence {
     pub file: String,
@@ -21,11 +75,25 @@ pub struct ScipOccurrence {
     pub is_def: bool,
     /// True for `local N` monikers (function-scoped, not cross-file useful).
     pub is_local: bool,
+    /// How `start_byte`/`end_byte`'s encoding was determined — see
+    /// `EncodingProvenance`. Funnel accounting only.
+    pub encoding_provenance: EncodingProvenance,
+    /// Defense-in-depth for `EncodingProvenance::Fallback` occurrences only:
+    /// the alternate byte span from interpreting the same SCIP
+    /// line/character position as raw UTF-8 byte offsets instead of the
+    /// guessed encoding. `None` when the primary encoding wasn't guessed, or
+    /// when the alternate interpretation agrees with the primary (nothing to
+    /// disambiguate). Ingest rejects an occurrence outright — neither span
+    /// upgrades anything — if both the primary and this alternate span
+    /// independently resolve to distinct, real `CallSite` rows: two
+    /// plausible-but-different targets means the guess can't be trusted.
+    pub guessed_alt_byte_range: Option<(usize, usize)>,
 }
 
 pub fn parse_index(
     index: &scip::types::Index,
     rebase_prefix: &std::path::Path,
+    provider_lang: &str,
 ) -> Vec<ScipOccurrence> {
     // Some indexers run against a subdirectory rather than the repo root
     // CALM's DB paths are keyed on (e.g. a `go.work` module, or a nested
@@ -40,6 +108,11 @@ pub fn parse_index(
         let source_hash = source
             .as_deref()
             .map(crate::indexer::pipeline::hash_content);
+        let declared_encoding = doc
+            .position_encoding
+            .enum_value()
+            .unwrap_or(scip::types::PositionEncoding::UnspecifiedPositionEncoding);
+        let (encoding, provenance) = effective_encoding(declared_encoding, provider_lang);
         for occ in &doc.occurrences {
             // SCIP range is [startLine, startChar, endLine, endChar] (0-based) or
             // [startLine, startChar, endChar] when single-line.
@@ -55,9 +128,28 @@ pub fn parse_index(
             } else {
                 doc.relative_path.as_str()
             };
-            let byte_range = source.as_deref().and_then(|source| {
-                occurrence_byte_range(source, occ, doc.position_encoding.enum_value().ok()?)
-            });
+            let byte_range = source
+                .as_deref()
+                .and_then(|source| occurrence_byte_range(source, occ, encoding));
+            // Defense-in-depth: only computed when the primary span came from
+            // a guessed (fallback) encoding, and only when the raw-UTF-8
+            // interpretation actually disagrees with that guess — see
+            // `ScipOccurrence::guessed_alt_byte_range`.
+            let guessed_alt_byte_range = if provenance == EncodingProvenance::Fallback {
+                source.as_deref().and_then(|source| {
+                    let alt = occurrence_byte_range(
+                        source,
+                        occ,
+                        scip::types::PositionEncoding::UTF8CodeUnitOffsetFromLineStart,
+                    );
+                    match (byte_range, alt) {
+                        (Some(primary), Some(alt)) if primary != alt => Some(alt),
+                        _ => None,
+                    }
+                })
+            } else {
+                None
+            };
             out.push(ScipOccurrence {
                 file: rebase_path(relative, rebase_prefix),
                 line: (start_line as usize) + 1,
@@ -67,6 +159,8 @@ pub fn parse_index(
                 symbol: occ.symbol.clone(),
                 is_def,
                 is_local: occ.symbol.starts_with("local "),
+                encoding_provenance: provenance,
+                guessed_alt_byte_range,
             });
         }
     }
@@ -297,11 +391,12 @@ fn percent_decode(s: &str) -> String {
 pub fn parse_scip_file(
     path: &std::path::Path,
     rebase_prefix: &std::path::Path,
+    provider_lang: &str,
 ) -> anyhow::Result<Vec<ScipOccurrence>> {
     let bytes = std::fs::read(path)?;
     use protobuf::Message;
     let index = scip::types::Index::parse_from_bytes(&bytes)?;
-    Ok(parse_index(&index, rebase_prefix))
+    Ok(parse_index(&index, rebase_prefix, provider_lang))
 }
 
 #[cfg(test)]
@@ -328,7 +423,7 @@ mod tests {
         doc.occurrences = vec![def, rf];
         index.documents = vec![doc];
 
-        let occ = parse_index(&index, std::path::Path::new(""));
+        let occ = parse_index(&index, std::path::Path::new(""), "");
         assert_eq!(occ.len(), 2);
         let def = occ.iter().find(|o| o.is_def).unwrap();
         assert_eq!(def.file, "core/src/engine.rs");
@@ -343,6 +438,52 @@ mod tests {
     }
 
     #[test]
+    fn effective_encoding_declared_always_wins_over_any_fallback() {
+        use scip::types::PositionEncoding::*;
+        // Even for a provider that IS in the fallback table, a real
+        // self-reported encoding has protocol precedence — never overridden.
+        let (encoding, provenance) = effective_encoding(UTF8CodeUnitOffsetFromLineStart, "python");
+        assert_eq!(encoding, UTF8CodeUnitOffsetFromLineStart);
+        assert_eq!(provenance, EncodingProvenance::Declared);
+    }
+
+    #[test]
+    fn effective_encoding_fallback_table_matches_scip_spec_convention() {
+        use scip::types::PositionEncoding::*;
+        // scip-0.9.0/src/generated/scip.rs's doc comment on
+        // `Document.position_encoding`, transcribed from scip.proto: Python
+        // -> UTF-32, JVM/.NET/JS/TS -> UTF-16, Go/Rust/C++ -> UTF-8.
+        let cases = [
+            ("python", UTF32CodeUnitOffsetFromLineStart),
+            ("javascript", UTF16CodeUnitOffsetFromLineStart),
+            ("java", UTF16CodeUnitOffsetFromLineStart),
+            ("csharp", UTF16CodeUnitOffsetFromLineStart),
+            ("rust", UTF8CodeUnitOffsetFromLineStart),
+            ("go", UTF8CodeUnitOffsetFromLineStart),
+            ("c", UTF8CodeUnitOffsetFromLineStart),
+        ];
+        for (lang, expected) in cases {
+            let (encoding, provenance) = effective_encoding(UnspecifiedPositionEncoding, lang);
+            assert_eq!(encoding, expected, "lang={lang}");
+            assert_eq!(provenance, EncodingProvenance::Fallback, "lang={lang}");
+        }
+    }
+
+    #[test]
+    fn effective_encoding_unknown_or_unverified_provider_stays_fail_closed() {
+        use scip::types::PositionEncoding::*;
+        // PHP/Ruby are real providers but NOT in SCIP's documented
+        // encoding-convention table — this is an evidence CONTRACT scoped to
+        // spec-verified languages, not a global fallback, so they (and any
+        // future/unknown provider) must keep failing closed.
+        for lang in ["php", "ruby", "some-future-language", ""] {
+            let (encoding, provenance) = effective_encoding(UnspecifiedPositionEncoding, lang);
+            assert_eq!(encoding, UnspecifiedPositionEncoding, "lang={lang}");
+            assert_eq!(provenance, EncodingProvenance::Unresolved, "lang={lang}");
+        }
+    }
+
+    #[test]
     fn rebase_prefix_joins_onto_a_subroot() {
         let mut index = scip::types::Index::new();
         let mut doc = scip::types::Document::new();
@@ -354,7 +495,7 @@ mod tests {
         doc.occurrences = vec![def];
         index.documents = vec![doc];
 
-        let occ = parse_index(&index, std::path::Path::new("services/api"));
+        let occ = parse_index(&index, std::path::Path::new("services/api"), "");
         assert_eq!(occ.len(), 1);
         assert_eq!(occ[0].file, "services/api/helper.go");
     }
@@ -370,7 +511,7 @@ mod tests {
         doc.occurrences = vec![def];
         index.documents = vec![doc];
 
-        let occ = parse_index(&index, std::path::Path::new("services/api/"));
+        let occ = parse_index(&index, std::path::Path::new("services/api/"), "");
         assert_eq!(occ[0].file, "services/api/helper.go");
     }
 
@@ -389,7 +530,7 @@ mod tests {
         doc.occurrences = vec![def];
         index.documents = vec![doc];
 
-        let occ = parse_index(&index, std::path::Path::new("services/api"));
+        let occ = parse_index(&index, std::path::Path::new("services/api"), "");
         assert_eq!(occ[0].file, "services/api/helper.go");
     }
 
@@ -408,7 +549,7 @@ mod tests {
         doc.occurrences = vec![def];
         index.documents = vec![doc];
 
-        let occ = parse_index(&index, std::path::Path::new(""));
+        let occ = parse_index(&index, std::path::Path::new(""), "");
         assert_eq!(occ[0].file, "/some/other/tree/helper.go");
     }
 

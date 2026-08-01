@@ -10,4 +10,5 @@ pub mod parser;
 pub mod pipeline;
 pub mod psr4;
 pub mod pysyspath;
+pub mod refresh;
 pub mod sql;

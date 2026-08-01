@@ -54,6 +54,7 @@ impl CalmServer {
             phase: Arc::new(RwLock::new(IndexingPhase::Scanning)),
             last_index_error: Arc::new(RwLock::new(None)),
             last_graph_mode: Arc::new(RwLock::new(None)),
+            watcher_health: crate::watch_supervisor::new_health_handle(),
             embedder: Arc::new(RwLock::new(None)),
             embed_status: Arc::new(RwLock::new(EmbedStatus::Disabled)),
             last_embed_error: Arc::new(RwLock::new(None)),
@@ -625,6 +626,13 @@ impl CalmServer {
     /// took — mirrors `last_index_error_handle`. See `run_watch_loop`.
     pub fn last_graph_mode_handle(&self) -> Arc<RwLock<Option<String>>> {
         Arc::clone(&self.last_graph_mode)
+    }
+
+    /// Shared watcher-health handle for the background supervisor. Unlike
+    /// `phase`, it describes observation/reconciliation health, not whether a
+    /// prior index build finished successfully.
+    pub(crate) fn watcher_health_handle(&self) -> crate::watch_supervisor::WatcherHealthHandle {
+        Arc::clone(&self.watcher_health)
     }
     /// Handles the background indexer uses to publish the loaded model + status.
     pub fn embedder_handle(&self) -> Arc<RwLock<Option<Arc<Embedder>>>> {

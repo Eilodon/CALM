@@ -75,21 +75,27 @@ fn effective_encoding(declared: PositionEncoding, provider: ScipProvider) -> Pos
 }
 ```
 
-Providers không nằm trong bảng tiếp tục fail-closed như hiện tại (không mở rộng rủi ro ra ngoài phạm vi đã verify).
+Providers không nằm trong bảng tiếp tục fail-closed như hiện tại (không mở rộng rủi ro ra ngoài phạm vi đã verify) — kể cả provider generic/unknown tương lai: đây là **evidence contract**, không phải fallback toàn cục, nên mặc định vẫn strict fail-closed trừ khi provider được liệt kê tường minh.
 
-**Lớp 2 — Defense-in-depth: verify byte span bằng nội dung thật, không chỉ tin encoding đoán được** (đây là phần khiến fix "chính xác nhất" chứ không phải chỉ "chạy được"):
-Sau khi có `byte_range` (dù từ encoding khai báo hay fallback), cross-check `source[start..end]` khớp với local-name suy ra từ SCIP symbol moniker (ví dụ `` `pkg.helper`/helper(). `` → local name `helper`) trước khi chấp nhận. Không khớp → fail-closed như cũ (log lý do), không âm thầm chấp nhận offset sai. Cái này biến "đoán encoding" thành "đoán rồi tự kiểm chứng bằng dữ liệu thật" — loại bỏ đúng rủi ro mà lớp 1 một mình không đủ tự tin loại bỏ trên source ngoài ASCII.
+**Lớp 2 — Defense-in-depth: verify span bằng `CallSite` thật, KHÔNG parse SCIP moniker** (đây là phần khiến fix "chính xác nhất" chứ không phải chỉ "chạy được"; sửa so với bản nháp đầu — moniker SCIP là opaque theo spec, suy ra local name từ nó không đủ an toàn):
+Sau khi có `byte_range` (dù từ encoding khai báo hay fallback), sinh tối đa 3 ứng viên span (declared encoding nếu có + các encoding fallback hợp lý theo Lớp 1). Chỉ nâng cấp edge khi ĐÚNG MỘT ứng viên khớp duy nhất với một `CallSite` đã có trong pipeline hiện tại, theo toàn bộ tiêu chí: source hash của file tại thời điểm ingest, byte-span trùng khớp, `edge_kind == Call`, identity version của symbol khớp, và `callee_name` bằng đúng source text tại span đó (đọc trực tiếp từ file, không suy ra từ moniker). Nếu ≥2 ứng viên (từ các encoding khác nhau) cùng trỏ tới các `CallSite` hợp lệ nhưng KHÁC nhau → từ chối vì mơ hồ (`ambiguous`), không đoán đại một cái. Không khớp ứng viên nào → fail-closed như cũ (log lý do). Đây chính là cơ chế biến "đoán encoding" thành "đoán rồi tự kiểm chứng bằng dữ liệu thật" mà không cần tin vào một chuỗi tên suy diễn.
 
-**Lớp 3 — Observability, đúng đề xuất gốc của audit nhưng cụ thể hoá:**
-Thêm counter `IngestStats::skipped_unspecified_encoding: usize` (tăng khi rơi vào nhánh fail-closed dù đã thử fallback) + `skipped_content_mismatch: usize` (tăng khi lớp 2 từ chối). Surface qua `scip_overlay`/`indexing_status` cạnh `last_match_rate`/`last_inserted` hiện có — để lần sau một provider tương lai (hoặc bản nâng cấp scip-python/scip-typescript) tái diễn lỗi này, dashboard tự phân biệt được "0 vì encoding gap" và "0 vì thật sự không có overlap", thay vì che trong một con số 0 mù mờ như hiện tại (đây cũng chính là gốc rễ của finding §4 bên dưới).
+**Lớp 3 — Version hoá evidence policy trong cache/state (bắt buộc, không tuỳ chọn):**
+`effective_encoding()` + quy tắc verify ở Lớp 2 gộp lại thành một `EVIDENCE_POLICY_VERSION` cố định, lưu cạnh SCIP semantic cache/state hiện có (`crates/calm-core/src/scip/mod.rs`). Nếu version trong cache khác version code đang chạy → coi cache đó stale, buộc re-evaluate, không cache-hit mù. Thiếu bước này, một repo không đổi file nào giữa 2 lần chạy sẽ tiếp tục trả `last_inserted=0` cho Python/JS mãi mãi sau khi fix được merge, vì kết quả cũ (từ trước khi có Lớp 1/2) vẫn còn trong cache — bug thật đã sửa trong code nhưng vẫn biểu hiện y hệt bug cũ trên máy đã từng chạy qua bản lỗi. Việc version hoá này thuộc về SCIP orchestration ở `scip/mod.rs`, không thể chỉ sửa trong `parse.rs`.
+
+**Lớp 4 — Provenance/funnel metrics (cụ thể hoá đề xuất observability gốc):**
+Thêm bộ counter theo từng bước của phễu, không chỉ 1 con số tổng: `declared` (occurrence có encoding tự khai báo), `fallback_attempted` (rơi vào bảng Lớp 1), `verified` (qua được Lớp 2), `ambiguous` (bị Lớp 2 từ chối vì ≥2 candidate hợp lệ khác nhau), `rejected` (không candidate nào khớp), `matched`/`upgraded` (thực sự nâng cấp edge). Surface qua `scip_overlay`/`indexing_status` cạnh `last_match_rate`/`last_inserted` hiện có. Nhờ phễu chi tiết này, `upgraded=0` không còn tự động bị đọc thành "unhealthy" — có thể là `declared=0` (repo không có occurrence nào của ngôn ngữ đó) chứ không phải encoding gap; đây cũng là dữ liệu đầu vào cho §4 bên dưới.
 
 ### Test
 
 - Unit test **không cần network/npx** cho `effective_encoding()` — lock bảng mapping, chạy trong CI thường (không phải nightly-only), phát hiện regression ngay nếu ai đó sửa nhầm bảng.
 - Giữ nguyên 2 live-ignored fixture test hiện có làm end-to-end proof thật (đã confirm chạy được khi có node/npx) — nightly vẫn là nơi chạy chúng.
-- Thêm test cho lớp 2: fabricate một SCIP occurrence có encoding "đúng nhãn" nhưng offset trỏ sai chỗ (giả lập trường hợp đoán sai) → phải bị từ chối, không match nhầm.
+- Test cho Lớp 2: fabricate một SCIP occurrence có encoding "đúng nhãn" nhưng offset trỏ sai chỗ (giả lập trường hợp đoán sai) → phải bị `rejected`, không match nhầm.
+- Test ambiguity: fabricate 2 encoding-candidate cùng trỏ tới 2 `CallSite` hợp lệ nhưng khác nhau → phải bị đếm vào `ambiguous`, không tự ý chọn một cái.
+- Test cache-version: chạy overlay 1 lần với policy cũ (giả lập bằng version thấp hơn trong state), bump `EVIDENCE_POLICY_VERSION`, chạy lại không đổi file nguồn nào → phải re-evaluate (không cache-hit), `upgraded` phản ánh kết quả policy mới.
+- Test generic/unknown provider: provider không có trong bảng Lớp 1 vẫn phải fail-closed (không vô tình được hưởng fallback của provider khác).
 
-**Done when:** `cargo test scip::tests::python_overlay_upgrades_a_real_edge_on_the_multi_lang_fixture -- --ignored` và bản JS tương đương pass thật (không sửa assertion), 3 nightly liên tiếp xanh, `indexing_status` trên chính repo CALM cho thấy `python`/`javascript` có `last_inserted > 0` hoặc `last_match_rate > 0` khi có call cross-file thật.
+**Done when:** `cargo test scip::tests::python_overlay_upgrades_a_real_edge_on_the_multi_lang_fixture -- --ignored` và bản JS tương đương pass thật (không sửa assertion), 3 nightly liên tiếp xanh, `indexing_status` trên chính repo CALM cho thấy `python`/`javascript` có `last_inserted > 0` hoặc `last_match_rate > 0` khi có call cross-file thật, và funnel metrics (Lớp 4) phân biệt rõ nguyên nhân khi `upgraded == 0`.
 
 ---
 
@@ -216,12 +222,92 @@ javascript: available=true, up_to_date=true, last_match_rate=0, last_inserted=0
 
 ---
 
-## Thứ tự thi công khuyến nghị
+## Revision 2026-08-01 (v2) — nâng §2/§3/§5 lên kiến trúc thống nhất
 
-1. **§1 (SCIP encoding fix)** — độc lập, giá trị cao nhất, rủi ro thấp nhất (chỉ ảnh hưởng 2 provider hiện đang 0% hiệu quả, không thể làm tệ hơn).
-2. **§4 (freshness/efficacy tách trục)** — làm ngay sau §1 vì dùng chung hạ tầng observability, và §1 tạo dữ liệu thật để calibrate ngưỡng N lần chạy.
-3. **§3 (watcher liveness)** — độc lập, rủi ro thấp, giá trị vận hành cao.
-4. **§2 (watcher dirty-path)** — cần golden-equivalence test kỹ hơn, làm sau khi §3 đã có health signal để phát hiện nếu §2 giới thiệu regression (một reindex "âm thầm biến mất" sẽ lộ ra qua watcher health's `last_reindex_at` không nhích).
-5. **§5 (God-component decomposition)** — quy mô lớn nhất, rủi ro cao nhất, nên làm cuối cùng khi 4 mục trên đã ổn định (bớt code churn đúng lúc đang refactor structure).
+> Sau khi §1 đã đóng ở mức root-cause, tái nghiên cứu cho thấy §2/§3 (watcher) và §5 (CalmServer) nếu làm tuần tự theo đúng như draft v1 sẽ vá từng triệu chứng riêng lẻ (thêm field, thêm ngưỡng, tách file) thay vì đóng root cause kiến trúc chung. Phần dưới đây THAY THẾ cách tiếp cận thực thi của §2/§3/§5 (giữ nguyên bằng chứng/root cause đã nêu ở trên), không đổi §1/§4.
 
-Mỗi mục nên đi qua đúng quy trình dự án đã dùng cho các plan trước: audit-design trước khi code, ADR sau khi xong, `calm fitness_report`/toolsnaps làm bằng chứng "Done" — không tự nhận đã xong bằng lời.
+### Core refresh protocol thay cho watcher tự quyết (thay thế cách làm ở §2/§3)
+
+Thay vì watcher tự gọi `reindex_paths` hay tự quyết ngưỡng `dirty.len() > 50`, đưa quyết định "reindex kiểu gì" vào core dưới dạng `ChangeSet`/`RefreshRequest` mà bất kỳ caller nào (watcher, edit-tool path, CLI) đều tạo ra và core tự phân loại:
+
+- source path xác định được → reindex đúng path (`reindex_paths`, không đổi).
+- metadata/context input đổi (`go.mod`, `pyproject.toml`, `tsconfig`/`extends`, package lock, v.v.) → rebuild graph từ DB, không hash lại toàn repo.
+- coverage-only thay đổi → chỉ reload coverage, không đụng graph.
+- `need_rescan()`, notify error, hoặc rename không phân loại an toàn được → full reconciliation, có `reason` field ghi rõ vì sao (không phải một fallback im lặng).
+
+Song song, dựng một **input catalog** dùng chung giữa resolver (đã biết input nào ảnh hưởng edge nào) và provider fingerprint (dùng để invalidate cache) — đây là cách duy nhất tránh lặp lại lỗi đã có: metadata invalidation hiện tại ở `crates/calm-core/src/indexer/pipeline.rs:2236` không bao phủ hết input thực tế ảnh hưởng graph (ví dụ `tsconfig` `extends` chain), và watcher ở `crates/calm-server/src/watcher.rs:100` vẫn full-scan gần như mọi event vì không có danh mục nào để tra "input này có nghĩa gì". `ChangeSet` là nơi cả hai phía (watcher-path thu thập `dirty: HashSet<PathBuf>` như §2 mô tả, và metadata-path) hội tụ về CÙNG một cơ chế phân loại, thay vì mỗi nơi tự đoán ngưỡng riêng.
+
+### WatchSupervisor — watcher là accelerator, không phải nguồn chân lý duy nhất
+
+Bọc `run_watch_loop` trong một `WatchSupervisor` chịu trách nhiệm: retry/backoff khi init/`watch()` lỗi (đúng tinh thần bounded self-heal đã nêu ở §3), health state (`armed`/`last_event_at`/`last_reindex_at`/`last_error` như §3 đã thiết kế), factory seam để test lỗi init/channel/notify mà không cần OS thật, và periodic full reconciliation có giới hạn thời gian (đề phòng watcher "tưởng sống" nhưng thực ra bỏ sót event lặng lẽ — khác với chết hẳn mà §3 đã xử lý). Watcher chết KHÔNG được để `indexing_phase` âm thầm đứng ở `Ready` — đúng nguyên tắc §3 đã nêu, tách rõ 5 trục trạng thái độc lập thay vì gộp vào 1 huy hiệu: index freshness, watcher liveness, last successful refresh, graph mode, và SCIP efficacy (§4) kèm lý do suy giảm. Không dùng "N lần zero uplift" chung chung làm tín hiệu sức khoẻ watcher — cache hit không được tính vào đó, và zero mutation hoàn toàn khoẻ mạnh nếu mọi edge liên quan đã formal từ trước.
+
+### Đích đến cho §5 — tách theo hành vi, không chỉ theo schema
+
+`__toolsnaps__` (lưới an toàn §5 bước 1) chỉ chứng minh schema của tool, không chứng minh session isolation, guardrail behavior, edit serialization, hay HTTP/daemon behavior không đổi qua refactor — 4 thứ rủi ro cao nhất khi tách `CalmServer`. Trước khi tách file theo 4 cụm đã liệt kê, cần thêm một **behavioral characterization suite**: transcript/tool-invocation chuẩn hoá, 2 session chạy song song, preset/toolset switching, guardrail pre/post-edit, locking, và status transitions — verify các hành vi này KHÔNG đổi ở mỗi bước Strangler-Fig, không chỉ toolsnaps bit-for-bit. Đích kiến trúc cụ thể hoá thêm từ 4 cụm đã liệt kê ở §5:
+
+```text
+CalmServer transport facade
+├─ ServerRuntime        (DB, indexing, refresh, watcher health)
+├─ ConnectionState      (session-local review/write/toolset state)
+├─ SessionRegistry
+├─ EditCoordinator
+└─ ToolRouter / policy
+```
+
+`SessionLog` giữ theo connection như hiện tại — không biến review freshness hay pending diff-impact reminder thành state global khi tách `GuardrailState` ra khỏi `CalmServer`; đây chính là bẫy dễ mắc nhất khi strangler-fig một guardrail gate. Sau khi behavioral suite xanh, mới dùng `[[boundaries]]` trong `thresholds.toml` (dòng ~27, cơ chế đã tồn tại) để khoá dependency ngược giữa các struct mới — đúng bước 5 đã nêu ở §5, không đổi.
+
+## Thứ tự thi công khuyến nghị (v2 — thay thế thứ tự v1)
+
+1. **Baseline contract, migration plan, deterministic fixtures, benchmark** — trước khi sửa dòng code nào: fixture đa ngôn ngữ có ký tự multi-byte, snapshot `indexing_status`/toolsnaps hiện tại làm baseline so sánh.
+2. **§1 (SCIP evidence policy) + `EVIDENCE_POLICY_VERSION` + provenance/funnel status** — độc lập, giá trị cao nhất, rủi ro thấp nhất (chỉ ảnh hưởng provider hiện đang 0% hiệu quả).
+3. **Core `ChangeSet`/`RefreshRequest` + input catalog + golden-equivalence với full rebuild** — nền tảng dùng chung cho cả watcher lẫn metadata-path, làm trước khi đụng watcher.
+4. **`WatchSupervisor`, recovery, và reconciliation scheduler** (gộp §2 + §3) — dùng `ChangeSet` vừa dựng ở bước 3, có health signal trước khi bật dirty-path optimization.
+5. **§4 (freshness/efficacy tách trục)** — dùng dữ liệu funnel thật từ bước 2 để calibrate ngưỡng N lần chạy thay vì đoán số.
+6. **Behavioral characterization harness cho `CalmServer`, rồi Strangler-Fig extraction từng lát** (§5) — quy mô lớn nhất, rủi ro cao nhất, làm cuối cùng khi 4 mục trên đã ổn định.
+7. **Pinned CI contract lane** cho toàn bộ trên; upstream-provider canary (scip-python/scip-typescript qua `npx`) tách thành lane cảnh báo riêng, không để version `npx` mutable quyết định merge gate.
+
+### Gate bắt buộc (không tự nhận "done" bằng lời)
+
+- Unicode/CRLF/alias/duplicate-call-name và ambiguity-rejection cho SCIP evidence policy (§1 Lớp 2).
+- Provider generic/unknown vẫn strict fail-closed kể cả sau khi thêm policy.
+- Semantic-policy migration (bump `EVIDENCE_POLICY_VERSION`) chỉ rerun đúng một lần trên state cũ, sau đó cache hit hợp lệ trở lại.
+- Metadata-only refresh (Cargo/composer/Go/Python/TS) cho kết quả tương đương full rebuild qua golden-equivalence.
+- Watcher failure rồi reconciliation vẫn bắt được drift đã bỏ lỡ trong lúc chết.
+- Session isolation và guardrail behavior không đổi sau MỖI lát Strangler-Fig của §5, không chỉ sau khi xong hết.
+- 3 nightly liên tiếp xanh với provider đã pin; upstream canary chỉ cảnh báo drift, không chặn merge.
+
+### Hướng đã loại bỏ tường minh (để không lặp lại)
+
+Fallback encoding toàn cục (không theo provider); parse SCIP moniker để suy ra tên gọi; dùng ngưỡng `dirty.len() > 50` làm discovery/refresh policy thay vì phân loại theo `ChangeSet`; dùng `last_graph_mode` làm tín hiệu watcher health; coi toolsnap là lưới an toàn DUY NHẤT cho refactor `CalmServer`.
+
+Mỗi mục vẫn đi qua đúng quy trình dự án đã dùng cho các plan trước: audit-design trước khi code, ADR sau khi xong, `calm fitness_report`/toolsnaps làm bằng chứng "Done" — không tự nhận đã xong bằng lời.
+
+## Execution record — §2 + §3 (2026-08-01)
+
+**Đã thực thi và verify trên workspace hiện tại.**
+
+- **§2 — ChangeSet / refresh executor:** `ChangeSet` phân loại theo ngữ nghĩa input (source, context, coverage, unsafe) và chuyển `notify::Event::need_rescan()`, rename không an toàn, watcher error thành reconciliation có lý do tường minh. Không còn ngưỡng số lượng dirty path. `InputCatalog` là nguồn chung cho watcher, refresh và SCIP eligibility/cache context.
+- **Correctness closure cho reconciliation/restart:** thêm persisted `index_input_state` contract. Source bytes không đổi vẫn được xử lý đúng: contract sạch dùng hash-delta; context/manifest drift rebuild graph từ index; config/policy drift hoặc contract thiếu/cũ chạy full atomic baseline. Bootstrap chỉ persist input quan sát *trước* index; sau khi backend watch đã arm, `WatcherStart` reconcile trước readiness sẽ bắt cả config/context đổi trong lúc index lẫn source write ở observation gap.
+- **§3 — WatchSupervisor:** thay vòng watch trực tiếp bằng lifecycle có arm/re-arm bounded backoff, panic/channel-disconnect recovery, degraded mode, periodic reconciliation và status tách `lifecycle` khỏi `freshness`. `ready` chỉ phát sau startup reconciliation (writer-quiescence boundary), trong khi backend đã arm từ trước để buffer event. Event rescan của `notify` là fallback an toàn, không phải full scan vô điều kiện trên mọi event.
+- **SCIP/observability:** overlay sau graph rebuild được coalesce; `indexing_status` đã có watcher health và toolsnap công khai tương ứng.
+
+Evidence mới nhất:
+
+- `cargo fmt --check` và `cargo clippy --workspace --all-targets -- -D warnings` xanh.
+- `cargo test -p calm-server watch_supervisor --lib --no-fail-fast -q`: 5 passed; `watcher_integration`: 3 passed.
+- `cargo test --workspace --no-fail-fast -q`: toàn bộ xanh (`calm-core` 898 passed, 12 ignored; `calm-server` 286 passed).
+- Regression proof gồm config drift với source hash không đổi, persisted contract phân biệt context/config drift, bootstrap observation-gap, và concurrent edit/watcher lock race; toolsnap schema check xanh.
+
+## Task Risk Summary (task-risk-score)
+
+<!-- last-run: 2026-08-01 | context: INFRASTRUCTURE -->
+
+| Task | S×B/D | QBR | Risk | Boundary | Action |
+|---|---:|---:|---|---|---|
+| Core input catalog + `ChangeSet` classifier | 3×3/2 | 4.5 | MEDIUM | SINGLE | Unit/property tests and golden-equivalence |
+| Core refresh executor + metadata-only graph rebuild | 3×3/2 | 4.5 | MEDIUM | SINGLE | Golden equivalence against full rebuild |
+| Watch lifecycle, retry and health state | 3×3/1 | 9 | HIGH | SINGLE | Decomposed; injected failures + integration verification |
+| Periodic reconciliation and stale-drift recovery | 3×3/1 | 9 | HIGH | SINGLE | Decomposed; virtual clock/cancellation + missed-event recovery test |
+| Indexing-status watcher surface | 2×3/2 | 3 | MEDIUM | SINGLE | Schema mirror + behavior test |
+
+High-risk work is intentionally split so lifecycle/retry and reconciliation can be independently tested before integration.
