@@ -6,7 +6,13 @@ scope: đối chiếu HEAD thực tế của hai repo Eilodon/CALM và Eilodon/V
 evidence_base: đọc trực tiếp source (file:line), không lấy prose/spec/comment làm bằng chứng
 verdict_on_source_analysis: đúng ~85–90% — mọi finding lớn được xác nhận trên code thật; một số phần cần thu hẹp phạm vi
 related: docs/plans/2026-07-14-calm-vheatm-full-audit.md, docs/comparison.md
+superseded_by_plan: docs/plans/2026-08-01-calm-master-upgrade-plan.md
 ---
+
+> **Cập nhật:** phần "§5 Kế hoạch áp dụng" của file này đã được hợp nhất với bản Deep Technical
+> Audit thành kế hoạch tổng: **`docs/plans/2026-08-01-calm-master-upgrade-plan.md`**. File này giữ
+> nguyên vai trò *nguồn xác minh* (bảng finding VHEATM↔CALM có `file:line`) và mô hình tích hợp
+> dual-authority; hãy dùng master plan cho lộ trình triển khai.
 
 # CALM nên học gì từ VHEATM
 
