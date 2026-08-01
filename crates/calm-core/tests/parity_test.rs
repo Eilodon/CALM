@@ -221,6 +221,11 @@ fn test_hotspot_parity() {
     // Since it's empty in this synthetic project, it will just be 0 == 0.
 }
 
+// Exercises real stack-graphs Python resolution -- under `no-stack-graphs-formal`
+// (D1, 2026-07-30) `resolver::formal` is a same-API stub that deliberately
+// resolves nothing (crates/calm-core/src/resolver/mod.rs), so this assertion
+// can never hold in that build; skip it there instead of asserting a stub.
+#[cfg(feature = "stack-graphs-formal")]
 #[test]
 fn test_formal_edges_integration() {
     let mut resolver = calm_core::resolver::formal::FormalResolver::new();
