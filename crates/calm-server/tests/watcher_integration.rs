@@ -9,6 +9,32 @@ use std::time::{Duration, Instant};
 
 use tokio_util::sync::CancellationToken;
 
+/// Ensures the watcher thread is always cancelled/joined and the temp
+/// project dir removed, even if an assertion earlier in the test body
+/// panics. A bare `ct.cancel(); handle.join(); remove_dir_all(...)`
+/// sequence placed at the end of a test never runs on panic (e.g. the
+/// `ready_rx.recv_timeout(...).expect(...)` below, which is exactly what
+/// timed out under the CPU contention of the `all-languages` CI job on
+/// 2026-08-01) -- that leaks a live background watcher thread plus its temp
+/// dir for the rest of the process's life, found while investigating a
+/// flaky/hanging CI run. `Drop` runs during unwind too, so wrapping the
+/// handle/dir in this guard makes cleanup unconditional.
+struct WatchGuard {
+    ct: CancellationToken,
+    handle: Option<std::thread::JoinHandle<()>>,
+    dir: std::path::PathBuf,
+}
+
+impl Drop for WatchGuard {
+    fn drop(&mut self) {
+        self.ct.cancel();
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
 fn symbol_count(db: &Path) -> i64 {
     let conn = rusqlite::Connection::open(db).unwrap();
     conn.query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0))
@@ -76,12 +102,18 @@ fn watcher_reindexes_add_and_delete() {
         })
     };
 
+    let _guard = WatchGuard {
+        ct: ct.clone(),
+        handle: Some(handle),
+        dir: dir.clone(),
+    };
+
     // Wait for the watcher to actually arm its OS-level watch before mutating
     // the tree — a fixed sleep here raced real thread-scheduling delay under
     // load (see `run_watch_loop`'s `ready` doc comment).
     ready_rx
-        .recv_timeout(Duration::from_secs(10))
-        .expect("watcher should signal ready within 10s");
+        .recv_timeout(Duration::from_secs(30))
+        .expect("watcher should signal ready within 30s");
 
     // Add a file → watcher should incrementally index it.
     std::fs::write(dir.join("b.py"), "def b():\n    pass\n").unwrap();
@@ -90,10 +122,6 @@ fn watcher_reindexes_add_and_delete() {
     // Delete it → watcher should drop its symbol.
     std::fs::remove_file(dir.join("b.py")).unwrap();
     let removed = wait_for_symbols(&db_path, 1, Duration::from_secs(30));
-
-    ct.cancel();
-    let _ = handle.join();
-    let _ = std::fs::remove_dir_all(&dir);
 
     assert!(added, "watcher should have indexed the added file");
     assert!(removed, "watcher should have dropped the deleted file");
@@ -157,9 +185,15 @@ fn concurrent_edit_write_and_watcher_reindex_does_not_lock_or_go_stale() {
             )
         })
     };
+
+    let _guard = WatchGuard {
+        ct: ct.clone(),
+        handle: Some(handle),
+        dir: dir.clone(),
+    };
     ready_rx
-        .recv_timeout(Duration::from_secs(10))
-        .expect("watcher should signal ready within 10s");
+        .recv_timeout(Duration::from_secs(30))
+        .expect("watcher should signal ready within 30s");
 
     // Simulate edit_lines_impl's own write+reindex sequence, firing right
     // after a file write the watcher is independently about to react to —
@@ -185,10 +219,6 @@ fn concurrent_edit_write_and_watcher_reindex_does_not_lock_or_go_stale() {
     // Both writers should converge on the latest file content (2 symbols),
     // not leave the DB stale relative to disk.
     let converged = wait_for_symbols(&db_path, 2, Duration::from_secs(15));
-
-    ct.cancel();
-    let _ = handle.join();
-    let _ = std::fs::remove_dir_all(&dir);
 
     assert!(
         converged,
@@ -274,9 +304,15 @@ fn watcher_hot_reloads_coverage_file_change() {
         })
     };
 
+    let _guard = WatchGuard {
+        ct: ct.clone(),
+        handle: Some(handle),
+        dir: dir.clone(),
+    };
+
     ready_rx
-        .recv_timeout(Duration::from_secs(10))
-        .expect("watcher should signal ready within 10s");
+        .recv_timeout(Duration::from_secs(30))
+        .expect("watcher should signal ready within 30s");
 
     // Write a coverage report *after* the watcher is running — this is the
     // "regenerated mid-session" case the fix targets.
@@ -287,10 +323,6 @@ fn watcher_hot_reloads_coverage_file_change() {
     .unwrap();
 
     let reloaded = wait_for_coverage_source(&coverage, "lcov", Duration::from_secs(30));
-
-    ct.cancel();
-    let _ = handle.join();
-    let _ = std::fs::remove_dir_all(&dir);
 
     assert!(
         reloaded,
