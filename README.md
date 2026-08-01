@@ -3,19 +3,19 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![CI](https://github.com/Eilodon/CALM/actions/workflows/ci.yml/badge.svg)](https://github.com/Eilodon/CALM/actions/workflows/ci.yml)
 [![npm](https://img.shields.io/npm/v/%40eilodon%2Fcalm-mcp?label=npm)](https://www.npmjs.com/package/@eilodon/calm-mcp)
-![Languages](https://img.shields.io/badge/languages-24%20parsed%20%C2%B7%2013%20call--graph%20by%20default%20%C2%B7%2012%20formal--verified-informational)
+![Languages](https://img.shields.io/badge/languages-24%20parsed%20%C2%B7%2013%20call--graph%20by%20default%20%C2%B7%2012%20formal--upgrade--paths-informational)
 
 **A live, graph-verified map of your codebase — so an AI coding agent can edit with its eyes open instead of grepping in the dark.**
 
-Real call graphs instead of vector-similarity guesses. Compiler-verified edges wherever a compiler is available. Hard safety gates on the write path itself, not just warnings an agent is free to scroll past. Every number in this README is measured — by CALM's own tools, against CALM's own codebase, with a reproducible benchmark suite behind it.
+Real call graphs instead of vector-similarity guesses. Compiler-verified edges wherever a compiler is available. Hard safety gates on the write path itself, not just warnings an agent is free to scroll past. Measured claims in this README are tied either to a current CALM snapshot or to benchmark artifacts; repo-specific values change as the codebase changes.
 
 **New here?** [Quick start](#quick-start) gets you running in under a minute — no clone, no Rust toolchain, works with [Claude Code, VS Code, Cursor, Windsurf/Devin Desktop, Codex, Antigravity, and JetBrains](#quick-start). **Comparing tools in this category?** Jump straight to [Proof, not promises](#proof-not-promises). **Want the internals?** [`docs/architecture.md`](docs/architecture.md) covers multi-tier indexing, the SCIP/LSP overlay system, the concurrency model, and the sanitization layer in full.
 
 | | |
 |---|---|
-| **Coverage** | 24 languages parsed · 13 with full call graphs by default (6 zero-config + 7 more via the default `tier0-5` bundle) · 12 with a formal/compiler-verified upgrade path |
-| **Safety** | the only one of 5 live MCP servers benchmarked that *refused* an unconfirmed edit to a verified hub symbol |
-| **Efficiency** | 29x–241x fewer tokens than a naive read-the-files baseline on multi-file tasks ([benchmark](benchmarks/b4_token_efficiency/)) |
+| **Coverage** | 24 languages parsed · 13 with full call graphs by default (6 zero-config + 7 more via the default `tier0-5` bundle) · 12 with a formal/compiler-verified upgrade path when the provider/toolchain is available |
+| **Safety** | the only one in the published five-server benchmark that *refused* an unconfirmed edit to a verified hub symbol |
+| **Efficiency** | task-specific token savings versus a naive read-the-files baseline; see the [benchmark artifacts](benchmarks/b4_token_efficiency/) |
 
 ---
 
@@ -38,16 +38,16 @@ CALM stands for **Coding Agent Liveness Map**. *Liveness*, because the map is ne
 ## What you get
 
 - **The agent stops guessing who depends on what.** `callers`/`callees`/`edit_context` show every known caller before a change ships. Full tree-sitter call graphs cover **13 languages out of the box**: Python, TypeScript, JavaScript, Java, Rust, and Go with zero configuration, plus C, C++, C#, Ruby, PHP, Shell, and R via the default `tier0-5` grammar bundle. Eleven more (Kotlin, Swift, Scala, Dart, Lua, Elixir, Haskell, OCaml, Zig, PowerShell, Groovy) parse behind opt-in `--features lang-X` build flags — 24 languages parsed in total (see [multi-tier indexing](docs/architecture.md#multi-tier-indexing)).
-- **Edits that can't silently break things.** Every write is hash-verified against the exact line range and syntax-checked before it ever touches disk. Hub and high-fan-in symbols hard-refuse a write until the agent has reviewed the callers and explicitly confirmed — a policy only a tool with a real dependency graph can enforce, and one no other server in [CALM's competitor benchmark](#benchmarked-against-four-other-live-mcp-servers) enforced.
-- **Every edge tells you how much to trust it.** Call edges are confidence-graded (`textual → inferred → resolved → formal`), and when your compiler can double-check the graph, CALM asks it to: SCIP overlays (`rust-analyzer`, `scip-go` — including multi-module `go.work` workspaces — `scip-python`, `scip-ruby`, and more) and live LSP overlays (`gopls`, `clangd`) upgrade best-guess edges to compiler-verified ground truth across 12 languages, with zero behavior change on a machine that doesn't have the toolchain installed.
+- **Edits that can't silently break things.** Every write is hash-verified against the exact line range and syntax-checked before it ever touches disk. Hub and high-fan-in symbols hard-refuse a write until the agent has reviewed the callers and explicitly confirmed — a policy only a tool with a real dependency graph can enforce, and one the published [competitor benchmark](#benchmarked-against-four-other-live-mcp-servers) found no other server enforcing.
+- **Every edge tells you how much to trust it.** Call edges are confidence-graded (`textual → inferred → resolved → formal`), and when your compiler can double-check the graph, CALM asks it to: SCIP overlays (`rust-analyzer`, `scip-go` — including multi-module `go.work` workspaces — `scip-python`, `scip-ruby`, and more) and live LSP overlays (`gopls`, `clangd`) can upgrade best-guess edges to compiler-verified ground truth across 12 supported language integrations when their provider/toolchain is available; unavailable providers sit out without changing the base behavior.
 - **A codebase that grades itself.** `fitness_report` turns hub concentration, dead code, complexity, and architecture-boundary violations into a queryable, CI-enforceable signal instead of a one-off audit — and `remember`/`recall` keep decisions and gotchas available across sessions.
-- **Plays well with others, and stays on your machine.** A cross-process edit lock and single-writer indexing model mean two editor sessions on the same repo don't corrupt each other's writes or double-index — under the shared daemon, sessions can even see each other coming. No code leaves your machine for indexing, search, or editing; the default embedding model is vendored into the binary at build time (zero network at runtime), with a rare, opt-out-able fallback download only if that vendored copy is ever unusable. MIT-licensed. *(One more opt-in exception: building with `--features otel` and setting `OTEL_EXPORTER_OTLP_ENDPOINT` exports span attributes — file paths, symbol names, tool names, timing, never source bodies — to your own collector. Off by default; see [docs/architecture.md](docs/architecture.md#observability-optional) and use `https://` collectors only.)*
+- **Plays well with others, and stays on your machine.** A cross-process edit lock and single-writer indexing model mean two editor sessions on the same repo don't corrupt each other's writes or double-index — under the shared daemon, sessions can even see each other coming. No code leaves your machine for indexing, search, or editing; the default embedding model is vendored into the binary at build time and needs no runtime network when those weights are valid; if they are unavailable, a runtime fallback download is allowed by default and can be disabled for strict offline operation. MIT-licensed. *(One more opt-in exception: building with `--features otel` and setting `OTEL_EXPORTER_OTLP_ENDPOINT` exports span attributes — file paths, symbol names, tool names, timing, never source bodies — to your own collector. Off by default; see [docs/architecture.md](docs/architecture.md#observability-optional) and use `https://` collectors only.)*
 
 ## Where CALM fits
 
-"Code intelligence for AI agents" is a real category now, built up by open-source pioneers — Aider, Serena, Sourcegraph/Cody, and others — that proved an agent works better with real code structure under it than with grep and good intentions. CALM builds on that foundation with a different center of gravity: most tools in the category **inform the read path** — better search, better navigation, better context. CALM also **guards the write path**. The same graph that answers "who calls this?" enforces "you don't change it until you've looked": pre-edit context is mandatory, hub edits demand an explicit confirmation grounded in a real caller, and every write is hash- and syntax-verified before it lands.
+"Code intelligence for AI agents" is a real category now, built up by open-source pioneers — Aider, Serena, Sourcegraph/Cody, and others — that proved an agent works better with real code structure under it than with grep and good intentions. CALM builds on that foundation with a different center of gravity: most tools in the category **inform the read path** — better search, better navigation, better context. CALM also **guards the write path**. The same graph that answers "who calls this?" enforces "you don't change it until you've looked": hub/high-risk edits require fresh pre-edit context plus explicit confirmation grounded in a real caller; the policy can be widened to every edit, and every write is hash- and syntax-verified before it lands.
 
-The trade-off is stated plainly: CALM's full-call-graph tier out of the box is 13 languages, not the 40+ some pure-LSP tools reach — though with 24 languages parsed and 12 carrying a compiler-verified upgrade path, the gap is narrower than it looks. What the trade buys is the part most distinctly CALM's own: confidence-graded edges, hard pre-edit gates, and a codebase that grades its own health — each backed by a number you can reproduce yourself ([Proof, not promises](#proof-not-promises)).
+The trade-off is stated plainly: CALM's full-call-graph tier out of the box is 13 languages, not the 40+ some pure-LSP tools reach — though with 24 languages parsed and 12 carrying a compiler-verified upgrade path when their providers are available, the gap is narrower than it looks. What the trade buys is the part most distinctly CALM's own: confidence-graded edges, hard pre-edit gates, and a codebase that grades its own health — each backed by a number you can reproduce yourself ([Proof, not promises](#proof-not-promises)).
 
 ### Is CALM the right fit?
 
@@ -112,13 +112,13 @@ This repo ships ready-made config for Claude Code (`.mcp.json`), Cursor (`.curso
 
 ```
 agent: repo_overview()
-  → 237 files, 3,583 symbols, indexing_phase=ready
+  → current files/symbols and `indexing_phase=ready` are reported live
 
 agent: "I need to change getUserByEmail"
   → locate("getUserByEmail")        # find the file + symbol metadata
   → source("getUserByEmail")        # read just the function body, not the whole file
   → edit_context("getUserByEmail")  # MANDATORY before any edit
-      → 12 callers, risk_assessment=high → agent reviews each caller before touching the signature
+      → the live caller count and risk assessment determine whether the agent reviews callers before touching the signature
   → edit_symbol("getUserByEmail", expected_hash=..., new_text=...)
       → risk_assessment=high, is_hub=true, no confirm:true → refused, with an explanation
   → edit_symbol(..., confirm=true, reason="checked getUserByToken, still returns the same shape")
@@ -128,19 +128,20 @@ agent: "I need to change getUserByEmail"
 
 ## Proof, not promises
 
-Every number below is measured by pointing CALM's own `fitness_report`/`repo_overview` at its own codebase — reproducible with the same two tool calls on a fresh clone:
+The table below is a CALM snapshot observed on 2026-08-01 from this checkout. Re-run `repo_overview()` and `fitness_report()` to refresh it; repo-specific values change as the codebase changes. Benchmark ratios are task-specific and remain in the benchmark artifacts:
 
 | Metric | Measured value |
 |---|---|
-| Codebase indexed | **237 files, 3,583 symbols** — 15 languages present in this repo alone |
-| Hub concentration (`hub_pct`) | 7.6% — 174 hub symbols (gate: ≤ 20%) |
-| Dead-code rate (`dead_code_pct`, coverage-aware) | 5.6% (gate: ≤ 10%) |
-| Edge coverage (`edge_coverage_pct`) | 70.1% of symbols have at least one call edge (gate: ≥ 60%) |
+| Codebase indexed | **289 files, 4,425 symbols** — 15 language families present in this repo alone |
+| Hub concentration (`hub_pct`) | 8.15% — 218 hub symbols (gate: ≤ 20%) |
+| Dead-code rate (`dead_code_pct`, coverage-aware) | 4.79% (gate: ≤ 10%) |
+| Edge coverage (`edge_coverage_pct`) | 70.80% of symbols have at least one call edge (gate: ≥ 60%) |
 | High-complexity functions (`high_complexity_pct`) | 2.8% (gate: ≤ 15%) |
-| Architecture fit (`avg_distance`, Martin/OOD) | 0.27 average distance from the main sequence (gate: ≤ 1.00) |
+| Architecture fit (`avg_distance`, Martin/OOD) | 0.30 average distance from the main sequence (gate: ≤ 1.00) |
 | Ambiguous symbol boundaries (`boundary_ambiguous_count`) | 0 (gate: ≤ 0) |
 | Architecture boundary violations (`boundary_violations`) | 0 (gate: ≤ 0) — the `watcher → tools` import previously flagged here was fixed by relocating the shared `RwLockExt`/`LockExt` traits it needed out of `tools/common.rs` into their own `sync_ext` module |
-| Token efficiency vs. a naive read-the-files baseline | `source` **241x** · `edit_context` **193x** · `locate` **29x** · `callers` **1.0x** — median 111x across the four benchmark tasks ([methodology](benchmarks/b4_token_efficiency/)) |
+| Config drift (`config_drift_count`) | 0 (gate: ≤ 0) — the current docs/config path declarations resolve cleanly |
+| Token efficiency vs. a naive read-the-files baseline | Benchmark-specific; see [methodology](benchmarks/b4_token_efficiency/) rather than treating one task's ratio as a repo-wide constant |
 | Full test suite (default features) | see [Testing](#testing) below |
 
 <details>
@@ -163,13 +164,13 @@ What the runs showed: CALM matched the best result on caller-recall and blast-ra
 Full technical detail lives in [`docs/architecture.md`](docs/architecture.md) — including the design philosophy behind why every response carries `suggested_next` and why the risky steps are hard-gated instead of just recommended. Section-by-section summary:
 
 - **[Multi-tier indexing](docs/architecture.md#multi-tier-indexing)** — 13 languages with full call graphs by default, 11 more parsed behind opt-in grammar features, 24 in total.
-- **[A call graph you can actually trust](docs/architecture.md#a-call-graph-you-can-actually-trust)** — every edge is labeled by confidence (`resolved`/`inferred`/`formal`/`textual`); SCIP and LSP overlays upgrade edges to compiler-grade ground truth across 12 languages.
+- **[A call graph you can actually trust](docs/architecture.md#a-call-graph-you-can-actually-trust)** — every edge is labeled by confidence (`resolved`/`inferred`/`formal`/`textual`); SCIP and LSP overlays can upgrade edges to compiler-grade ground truth across 12 supported integrations when their providers/toolchains are available; unavailable providers sit out.
 - **[Search that actually finds things](docs/architecture.md#search-that-actually-finds-things)** — FTS5 + semantic embeddings fused via Reciprocal Rank Fusion, plus real grep/glob straight off disk for files the indexer never parses.
 - **[Editing with an actual safety net](docs/architecture.md#editing-with-an-actual-safety-net)** — hash-verified writes, syntax validation before anything touches disk, and a three-part gate (fresh `edit_context`, `confirm:true`, a grounded `reason`) on hub/high-risk symbols.
 - **[Concurrency & reliability](docs/architecture.md#concurrency--reliability)** — a shared daemon, cross-process edit lock, and single-instance indexing lock mean multiple editor sessions on one repo don't corrupt or duplicate work.
-- **[The codebase grading itself](docs/architecture.md#the-codebase-grading-itself)** — 10 fitness metrics, coverage-aware dead-code detection, declared architecture boundaries, doc-drift detection.
+- **[The codebase grading itself](docs/architecture.md#the-codebase-grading-itself)** — 11 fitness metrics, coverage-aware dead-code detection, declared architecture boundaries, doc-drift detection.
 - **[An agent that remembers, and knows when it's stuck](docs/architecture.md#an-agent-that-remembers-and-knows-when-its-stuck)** — durable cross-session notes, git co-change mining, a stuck-loop signal.
-- **[Safe by default](docs/architecture.md#safe-by-default)** — credential/prompt-injection redaction on every tool response, local-only by default.
+- **[Safe by default](docs/architecture.md#safe-by-default)** — credential-shaped content is redacted in `source`/`understand`, prompt-injection-shaped content is flagged, and `scan_text` covers external text; local-first by default with an explicit embedding fallback.
 
 ## Crate layout
 
@@ -229,13 +230,13 @@ Run for real in `.github/workflows/ci.yml`'s `fitness-check` job on every push/P
 
 `calm fitness-check` measures 11 metrics against thresholds declared in `thresholds.toml`:
 
-| Metric | What it measures | Default threshold |
+| Metric | What it measures | Effective threshold |
 |---|---|---|
 | `hub_count` | Count of symbols classified as hubs | ≤ 1000 |
 | `hub_pct` | % of symbols that are hubs (scale-invariant) | ≤ 20.0% |
 | `avg_coreness` | Average k-core coreness across the graph | ≤ 15.0 |
 | `dead_code_pct` | % of symbols with "high" dead-code confidence | ≤ 10% |
-| `hotspot_risk` | Highest hotspot score in the codebase | ≤ 0.75 |
+| `hotspot_risk` | Highest hotspot score in the codebase | ≤ 0.80 in this repo (`thresholds.toml` override; built-in default ≤ 0.75) |
 | `edge_coverage_pct` | % of symbols with at least one call edge | ≥ 60% |
 | `high_complexity_pct` | % of functions/methods with McCabe cyclomatic complexity > 10 (AST-based; Tier-0.5 languages always report complexity 1) | ≤ 15.0% |
 | `avg_distance` | Martin/OOD average distance from the main sequence — how far each file's abstractness sits from the ideal implied by its instability (Ca/Ce) | ≤ 1.00 |
@@ -243,7 +244,7 @@ Run for real in `.github/workflows/ci.yml`'s `fitness-check` job on every push/P
 | `boundary_ambiguous_count` | Count of symbols with an ambiguous line boundary (shared with a neighbor) — `edit_symbol` replace on these is refused until resolved | ≤ 0 |
 | `config_drift_count` | Count of doc file-path references (declared via `[config_drift].doc_paths`) pointing at nothing real | ≤ 0 |
 
-Every `calm fitness-check` run also snapshots metrics to the DB so `edit_context` can show a trend (delta versus the previous day).
+Unless noted above, the table uses built-in numeric defaults; this repo's checked-in `thresholds.toml` is the effective CI policy. Every `calm fitness-check` run also snapshots metrics to the DB so `edit_context` can show a trend (delta versus the previous day).
 
 ### Architecture boundaries — `[[boundaries]]`
 
@@ -262,17 +263,23 @@ This repo's own `thresholds.toml` currently declares two: the one above, plus `c
 
 ## Deployment
 
-- `cargo build --release` → static (musl on Linux) binaries via `.github/workflows/release.yml`, 5-target matrix with `SHA256SUMS` + build-provenance attestation for every asset: `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-pc-windows-msvc`. `scripts/mcp-launcher.sh`/`scripts/install.sh` download and checksum-verify the right platform's build automatically when checkout is on (or you're installing) a matching git tag.
+- `cargo build --release` → static (musl on Linux) binaries via `.github/workflows/release.yml`, 5-target matrix with `SHA256SUMS` + build-provenance attestation for every asset: `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-pc-windows-msvc`. `scripts/mcp-launcher.sh`/`scripts/install.sh` download and checksum-verify the right platform's build automatically on supported targets when checkout is on (or you're installing) a matching git tag; untagged, offline, or unsupported-platform paths fall back to an existing binary or a source build.
 - `Containerfile`, multi-stage (`rust:alpine` → `scratch`) — a single static binary, no runtime image needed, published to `ghcr.io/eilodon/calm-mcp` (tagged by version + `latest`) on every git tag push.
 - `compose.yaml` ships a hardened example (`read_only`, `cap_drop: ALL`, `no-new-privileges`, `pids_limit: 64`, `mem_limit: 256m`).
-- The default embedding model's weights are vendored into the binary via `include_bytes!` — `build.rs::ensure_embedding_weights` fetches `crates/calm-core/assets/potion-code-16m/*.safetensors` from Hugging Face Hub and checksum-verifies it once at *compile* time, so a normal `cargo build`/release binary loads it with zero network I/O at runtime. No Git LFS is involved (the repo carries zero LFS content).
+- The default embedding model's weights are vendored into the binary via `include_bytes!` — `build.rs::ensure_embedding_weights` fetches `crates/calm-core/assets/potion-code-16m/*.safetensors` from Hugging Face Hub and checksum-verifies it once at *compile* time, so a normal `cargo build`/release binary needs no network I/O at runtime when those weights are valid. No Git LFS is involved (the repo carries zero LFS content).
 
 <details>
 <summary>What happens if the build-time fetch fails (offline build, etc.)</summary>
 
-`cargo build` still **compiles successfully** — `build.rs` writes a small placeholder stub in place of the real weights instead of failing the build. Loading that stub **at runtime** fails ("failed to parse safetensors"), so `Embedder::load` automatically falls back to a one-time Hugging Face Hub download of the same model (cached locally afterward, gated by `semantic_search.allow_network_fallback`). If that fallback is disabled or also unavailable, `indexing_status` reports `embeddings_status: "failed"` and `search(kind="semantic"/"hybrid")` degrades to FTS-only — no crash, just no semantic search until the model is available and you rebuild or re-run.
+`cargo build` still **compiles successfully** — `build.rs` writes a small placeholder stub in place of the real weights instead of failing the build. Loading that stub **at runtime** fails ("failed to parse safetensors"), so `Embedder::load` automatically falls back to a one-time Hugging Face Hub download of the same model (cached locally afterward; the default config allows this fallback, while `semantic_search.allow_network_fallback = false` keeps the runtime strictly offline). If that fallback is disabled or also unavailable, `indexing_status` reports `embeddings_status: "failed"` and `search(kind="semantic"/"hybrid")` degrades to FTS-only — no crash, just no semantic search until the model is available and you rebuild or re-run.
 
 </details>
+
+## Runtime and transport
+
+- **Default mode is MCP stdio.** The launcher uses the shared Unix daemon when invoked without extra launcher arguments on Unix; custom invocations, CI, and Windows can use one-process `calm serve`.
+- **HTTP is opt-in.** `calm serve --http` binds to `127.0.0.1:8787` by default. Non-loopback exposure requires `--allow-remote` and a non-empty `CALM_HTTP_TOKEN` sent as a Bearer token.
+- **Remote HTTP is read-only.** CALM forces the effective preset to `full,-edit`; terminate TLS at a reverse proxy. The built-in HTTP transport does not provide rate limiting or DoS protection, so do not expose it directly to an untrusted network.
 
 ## Testing
 
@@ -283,7 +290,7 @@ cargo test --test parity_test test_formal_edges   # Stack Graphs regression corp
 
 Eight CI jobs run on every PR: `verify` (fmt/clippy/test/audit), `stack-graphs-corpus` (formal-resolver parity), `embeddings` (clippy + test with the `embeddings` feature), `no-stack-graphs-formal` (clippy + test with `stack-graphs-formal` off — the only CI coverage of the `resolver::formal` stub that feature gate compiles to), `all-languages` (fixture-repo indexing across all 24 parsed languages, plus `lsp-overlay`), `js-client-interop` (cross-checks the tool schema against a real JS MCP SDK client, not just Rust's own), `otel-http-features` (clippy + test with the `otel`/`http` features, plus a guard against `opentelemetry` core version skew), `fitness-check` (runs `calm fitness-check` against this repo's own index — see [Fitness check](#fitness-check--the-ci-gate) below).
 
-The full workspace suite — 1,000+ tests — passes clean, with a handful of `#[ignore]`d live-binary integration tests (e.g. `rust-analyzer`/`scip-go`/`scip-java`) that need external tools not installed in every environment.
+The workspace contains 1,000+ tests; the latest CI `verify` job is the source of truth for pass/fail. A handful of `#[ignore]`d live-binary integration tests (e.g. `rust-analyzer`/`scip-go`/`scip-java`) need external tools not installed in every environment.
 
 ## Further reading
 
@@ -295,7 +302,7 @@ The full workspace suite — 1,000+ tests — passes clean, with a handful of `#
 - [`docs/mcp-client-setup.md`](docs/mcp-client-setup.md) — every MCP client install path in detail, including Windsurf/Devin Desktop and Codex global config.
 - [`docs/http-transport.md`](docs/http-transport.md) — the opt-in remote/HTTP transport (`calm serve --http`): loopback-by-default, the fail-closed `--allow-remote` + token requirement, why remote exposure forces a read-only preset, and the TLS/reverse-proxy expectation.
 - [`AGENTS.md`](AGENTS.md) — the full tool-by-tool workflow guide this project's own agents follow.
-- [`benchmarks/`](benchmarks/) — the measurement suite behind every number in this README, and a few more: `b2_call_graph_quality/` (precision/recall vs. a SCIP oracle), `b3_search_quality/` (hybrid RRF vs. FTS-only vs. raw grep, NDCG@10), `b4_token_efficiency/` (token cost vs. a naive baseline, per task), `b6_tool_call_efficiency/` (round-trips: naive multi-call vs. one MCP call), `b7_task_correctness/` (real rename refactors across 6 language corpora — fd/Rust, flask/Python, express/JS, zod/TS, gin/Go, spring-petclinic/Java — checked against an independent pass/fail oracle, not an LLM judge), `b11_extended_competitor_ab/` (real calls against 4 other live MCP servers, not self-reported numbers), `b12_tier1_tier2_tool_correctness/` (9 tools driven live over JSON-RPC against 6 external OSS repos, ground-truthed against regex/`git grep`), `resolution/` (tier-distribution baseline across 19 real OSS repos, one per language). Unflattering results are published alongside good ones on purpose — `benchmarks/README.md` states that policy.
+- [`benchmarks/`](benchmarks/) — the measurement suite behind benchmark claims in this README, and a few more: `b2_call_graph_quality/` (precision/recall vs. a SCIP oracle), `b3_search_quality/` (hybrid RRF vs. FTS-only vs. raw grep, NDCG@10), `b4_token_efficiency/` (token cost vs. a naive baseline, per task), `b6_tool_call_efficiency/` (round-trips: naive multi-call vs. one MCP call), `b7_task_correctness/` (real rename refactors across 6 language corpora — fd/Rust, flask/Python, express/JS, zod/TS, gin/Go, spring-petclinic/Java — checked against an independent pass/fail oracle, not an LLM judge), `b11_extended_competitor_ab/` (real calls against 4 other live MCP servers, not self-reported numbers), `b12_tier1_tier2_tool_correctness/` (9 tools driven live over JSON-RPC against 6 external OSS repos, ground-truthed against regex/`git grep`), `resolution/` (tier-distribution baseline across 19 real OSS repos, one per language). Unflattering results are published alongside good ones on purpose — `benchmarks/README.md` states that policy.
 
 ## License
 
