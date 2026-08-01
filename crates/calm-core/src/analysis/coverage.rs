@@ -23,16 +23,12 @@ impl CoverageData {
     }
 }
 
-pub const COVERAGE_SEARCH_PATHS: &[(&str, &str)] = &[
-    ("lcov.info", "lcov"),
-    ("coverage/lcov.info", "lcov"),
-    (".nyc_output/lcov.info", "lcov"),
-    (".coverage", "python"),
-    ("coverage.out", "go"),
-    ("coverage/coverage.out", "go"),
-    ("coverage.xml", "cobertura"),
-    ("coverage/coverage.xml", "cobertura"),
-];
+// Defined in `indexer::coverage_paths`, not here: `indexer::refresh` also
+// needs this plain path list (to classify coverage files during a
+// watch-triggered refresh), and `indexer` must stay upstream of `analysis`
+// per the fitness-check boundary rule -- re-exported here so existing
+// `analysis::coverage::COVERAGE_SEARCH_PATHS` call sites are unaffected.
+pub use crate::indexer::coverage_paths::COVERAGE_SEARCH_PATHS;
 
 pub fn load_coverage(project_root: &Path) -> CoverageData {
     for &(relative, fmt) in COVERAGE_SEARCH_PATHS {

@@ -8,7 +8,7 @@
 use std::collections::{BTreeSet, VecDeque};
 use std::path::{Component, Path, PathBuf};
 
-use crate::analysis::coverage::COVERAGE_SEARCH_PATHS;
+use crate::indexer::coverage_paths::COVERAGE_SEARCH_PATHS;
 use crate::indexer::lang_constants::{is_recognized_unparsed_extension, language_for_extension};
 use crate::walk::{build_walker, is_ignored_dir_component, matches_ignore_pattern};
 

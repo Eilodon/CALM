@@ -1,4 +1,5 @@
 pub mod chunker;
+pub mod coverage_paths;
 pub mod crate_map;
 pub mod csharp_namespace;
 pub mod edges;
