@@ -63,7 +63,20 @@ jobs:
         with:
           key: scip-go
       - name: Install scip-go
-        run: go install github.com/scip-code/scip-go/cmd/scip-go@latest
+        run: |
+          set -euo pipefail
+          # Release metadata verified 2026-07-31 through GitHub's API.
+          # Keep URL, tag, and digest together: do not substitute `latest`.
+          SCIP_GO_VERSION=v0.2.7
+          SCIP_GO_SHA256=5bfe39016ca04f5b3b1cce41d1b63ea120a7d7e93b55407bfb17a6b02d18135a
+          SCIP_GO_ARCHIVE="$RUNNER_TEMP/scip-go-linux-amd64.tar.gz"
+          curl -sSfL -o "$SCIP_GO_ARCHIVE" \
+            "https://github.com/scip-code/scip-go/releases/download/${SCIP_GO_VERSION}/scip-go-linux-amd64.tar.gz"
+          echo "${SCIP_GO_SHA256}  ${SCIP_GO_ARCHIVE}" | sha256sum --check --status -
+          tar -xzf "$SCIP_GO_ARCHIVE" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+      - name: Record pinned scip-go version
+        run: scip-go --version
       - name: Run real-indexer integration tests (scip-go)
         run: |
           cargo test -p calm-core --features scip-overlay -- --ignored \
@@ -279,10 +292,15 @@ jobs:
       - name: Install scip-ruby
         run: |
           set -euo pipefail
+          SCIP_RUBY_VERSION=scip-ruby-v0.4.7
+          SCIP_RUBY_SHA256=a068c7c3b2042b9eac563ce77ce35dcaca666b418530b1db9f932a3dbc7175dd
           curl -sSfL -o "$RUNNER_TEMP/scip-ruby" \
-            "https://github.com/sourcegraph/scip-ruby/releases/latest/download/scip-ruby-x86_64-linux"
+            "https://github.com/sourcegraph/scip-ruby/releases/download/${SCIP_RUBY_VERSION}/scip-ruby-x86_64-linux"
+          echo "${SCIP_RUBY_SHA256}  $RUNNER_TEMP/scip-ruby" | sha256sum --check --status -
           chmod +x "$RUNNER_TEMP/scip-ruby"
           echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+      - name: Record pinned scip-ruby version
+        run: scip-ruby --version
       - name: Run real-indexer integration test (scip-ruby)
         run: |
           cargo test -p calm-core --features scip-overlay -- --ignored \
@@ -315,10 +333,15 @@ jobs:
       - name: Install scip-clang
         run: |
           set -euo pipefail
+          SCIP_CLANG_VERSION=v0.4.0
+          SCIP_CLANG_SHA256=06fd18c576f979a726c651594644ec4a35db4f471f2160b3f72eb89fa6001784
           curl -sSfL -o "$RUNNER_TEMP/scip-clang" \
-            "https://github.com/sourcegraph/scip-clang/releases/latest/download/scip-clang-x86_64-linux"
+            "https://github.com/sourcegraph/scip-clang/releases/download/${SCIP_CLANG_VERSION}/scip-clang-x86_64-linux"
+          echo "${SCIP_CLANG_SHA256}  $RUNNER_TEMP/scip-clang" | sha256sum --check --status -
           chmod +x "$RUNNER_TEMP/scip-clang"
           echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+      - name: Record pinned scip-clang version
+        run: scip-clang --version
       - name: Run real-indexer integration test (scip-clang)
         run: |
           cargo test -p calm-core --features scip-overlay -- --ignored \

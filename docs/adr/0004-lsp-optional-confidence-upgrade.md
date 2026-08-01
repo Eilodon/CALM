@@ -5,6 +5,19 @@
 - **Decision makers**: TBD (draft do Claude chuẩn bị theo yêu cầu, cần chủ dự án duyệt)
 - **Related**: ADR-0001 (Stack Graphs Scope), ADR-0002 (Formal Resolver), `docs/comparison.md`
 
+> **D4 update (2026-07-31).** This ADR's original pilot text is historical.
+> `lsp_refresh` is now the only LSP execution path: it is explicit, opt-in, and
+> never runs from watcher, edit, save, or a legacy automatic-policy value. LSP
+> may upgrade only a current exact CallSite whose edge is residual
+> `ambiguous`/`textual`, has no formal source, and is not SCIP-ruled-out. It
+> cannot alter Stack Graphs or SCIP formal evidence. Each result is fenced by
+> source hash, CallSite bytes, provider/profile/context fingerprints, and graph
+> generation; an obsolete run writes no proof. Runtime status reports support
+> level, binary/version, fingerprints, candidate count, run status, and reason:
+> local deterministic coverage is `fixture-tested`, while only a pinned hosted
+> acquisition plus live run can claim `nightly-verified`.
+> See ADR-0010 for the normative D4 provenance decision.
+
 ## Context
 
 Mục tiêu mới: `ci` hướng tới top-tier về chất lượng/độ chính xác call-graph, hỗ trợ ~15 ngôn

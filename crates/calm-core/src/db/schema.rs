@@ -34,7 +34,9 @@ CREATE TABLE IF NOT EXISTS call_edges (
     from_symbol     TEXT NOT NULL,
     to_symbol       TEXT NOT NULL,
     call_site_line  INTEGER,
+    call_site_id    INTEGER REFERENCES call_sites(id) ON DELETE CASCADE,
     edge_confidence TEXT NOT NULL DEFAULT 'textual',
+    evidence_state  TEXT NOT NULL DEFAULT 'unverified',
     from_path       TEXT,
     to_path         TEXT,
     edge_kind       TEXT NOT NULL DEFAULT 'call'
@@ -85,6 +87,9 @@ CREATE TABLE IF NOT EXISTS call_sites (
     enclosing_qn TEXT NOT NULL,
     callee_name  TEXT NOT NULL,
     call_line    INTEGER,
+    callee_start_byte INTEGER,
+    callee_end_byte   INTEGER,
+    identity_version  INTEGER NOT NULL DEFAULT 1,
     confidence   TEXT NOT NULL DEFAULT 'textual',
     receiver     TEXT,
     target_class TEXT,
@@ -95,6 +100,55 @@ CREATE TABLE IF NOT EXISTS call_sites (
 );
 CREATE INDEX IF NOT EXISTS idx_call_sites_from   ON call_sites(from_path);
 CREATE INDEX IF NOT EXISTS idx_call_sites_callee ON call_sites(callee_name);
+
+-- D4 durable external evidence. Proof is anchored to a stable CallSite plus
+-- target, never a mutable call_edges row. Reindexing deletes/recreates a
+-- CallSite, so CASCADE makes stale proof structurally impossible to reattach.
+CREATE TABLE IF NOT EXISTS external_proofs (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    call_site_id         INTEGER NOT NULL REFERENCES call_sites(id) ON DELETE CASCADE,
+    to_symbol            TEXT NOT NULL,
+    provider             TEXT NOT NULL,
+    source_file_hash     TEXT NOT NULL,
+    callee_start_byte    INTEGER NOT NULL,
+    callee_end_byte      INTEGER NOT NULL,
+    provider_fingerprint TEXT NOT NULL,
+    context_fingerprint  TEXT NOT NULL,
+    graph_generation     INTEGER NOT NULL DEFAULT 0,
+    call_site_identity_version INTEGER NOT NULL DEFAULT 1,
+    definition_snapshot  TEXT,
+    status               TEXT NOT NULL CHECK (status IN ('fresh', 'stale', 'legacy', 'unverified', 'rejected')),
+    observed_at          REAL NOT NULL,
+    failure_reason       TEXT,
+    UNIQUE(call_site_id, to_symbol, provider)
+);
+CREATE INDEX IF NOT EXISTS idx_external_proofs_status ON external_proofs(status, provider);
+
+-- D4 migration observability. This is diagnostic-only and deliberately lives
+-- outside the graph baseline transaction: readers still see an all-old or
+-- all-new graph, while operators can tell whether an identity rebuild is
+-- pending, running, ready, or failed.
+CREATE TABLE IF NOT EXISTS identity_migration_state (
+    id             INTEGER PRIMARY KEY CHECK (id = 1),
+    target_version INTEGER NOT NULL,
+    status         TEXT NOT NULL CHECK (status IN ('pending', 'running', 'baseline_ready', 'failed')),
+    started_at     REAL,
+    completed_at   REAL,
+    failed_at      REAL,
+    failure_reason  TEXT,
+    duration_ms     INTEGER,
+    rows_rebuilt    INTEGER,
+    busy_retries    INTEGER NOT NULL DEFAULT 0,
+    graph_generation INTEGER
+);
+
+-- Monotonic identity of the committed call graph. External semantic proofs
+-- record this generation and must never be applied to a newer graph baseline.
+CREATE TABLE IF NOT EXISTS graph_generation_state (
+    id         INTEGER PRIMARY KEY CHECK (id = 1),
+    generation INTEGER NOT NULL
+);
+INSERT OR IGNORE INTO graph_generation_state(id, generation) VALUES (1, 0);
 
 -- Semantic search Layer 2: raw code-body slices (whole short bodies, or a
 -- sliding window over longer ones — see indexer::chunker), embedded alongside
@@ -288,10 +342,11 @@ fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
         "INTEGER NOT NULL DEFAULT 0",
     )?;
     // Provenance of a `formal`-confidence edge, set by whichever pass upgraded
-    // it: `'scip'` (exact (file,line) match — see `scip::ingest`) or
-    // `'stack_graphs'` (per-file name-set match — see
-    // `indexer::pipeline::extract_file_data`). NULL for every other
-    // confidence tier, and for pre-migration `formal` rows this column can't
+    // it: `'scip'` (exact byte span plus source-hash match — see
+    // `scip::ingest`), `'lsp'` (an exact current CallSite verified by an
+    // on-demand LSP request), or `'stack_graphs'` (per-file name-set match —
+    // see `indexer::pipeline::extract_file_data`). NULL for every other
+    // confidence tier, and for pre-migration `formal` rows this column cannot
     // retroactively attribute (harmless: `ingest_occurrences` treats NULL the
     // same as `'stack_graphs'` — weaker evidence SCIP is allowed to confirm
     // or override — never the same as `'scip'`, which it never re-touches).
@@ -300,6 +355,21 @@ fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
     // exact type-checked evidence beats a per-file name-set heuristic — but
     // never re-litigates its own prior `'scip'` verdict.
     migrate_add_column(conn, "call_edges", "formal_source", "TEXT")?;
+    // D4 keeps evidence freshness distinct from confidence/provenance. Existing
+    // SCIP/LSP rows predate a durable exact CallSite proof record, so migration
+    // marks them legacy rather than presenting a line-derived verdict as fresh.
+    migrate_add_column(
+        conn,
+        "call_edges",
+        "evidence_state",
+        "TEXT NOT NULL DEFAULT 'unverified'",
+    )?;
+    conn.execute(
+        "UPDATE call_edges SET evidence_state = 'legacy'
+         WHERE evidence_state = 'unverified'
+           AND formal_source IN ('scip', 'lsp')",
+        [],
+    )?;
     // SQL indexer (8-language plan P3.3): distinguishes a genuine call
     // (proc/trigger → proc via CALL/EXEC) from a mere read reference
     // (view/proc → table via FROM/JOIN), threaded from `call_sites` straight
@@ -373,6 +443,90 @@ fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
     migrate_add_project_memory_fts(conn)?;
     migrate_add_scip_overlay_state(conn)?;
     dedup_edges_and_add_unique_indexes(conn)?;
+    migrate_call_site_identity_v2(conn)?;
+    migrate_add_column(
+        conn,
+        "external_proofs",
+        "graph_generation",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    migrate_add_column(
+        conn,
+        "external_proofs",
+        "call_site_identity_version",
+        "INTEGER NOT NULL DEFAULT 1",
+    )?;
+    migrate_add_column(conn, "external_proofs", "definition_snapshot", "TEXT")?;
+    migrate_add_column(conn, "identity_migration_state", "duration_ms", "INTEGER")?;
+    migrate_add_column(conn, "identity_migration_state", "rows_rebuilt", "INTEGER")?;
+    migrate_add_column(
+        conn,
+        "identity_migration_state",
+        "busy_retries",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    migrate_add_column(
+        conn,
+        "identity_migration_state",
+        "graph_generation",
+        "INTEGER",
+    )?;
+    // A pre-generation proof cannot establish that its captured graph is the
+    // one currently served. Retain it for diagnosis but never present it fresh.
+    conn.execute(
+        "UPDATE external_proofs
+         SET status = 'legacy', failure_reason = COALESCE(failure_reason, 'missing D4 graph proof')
+         WHERE graph_generation = 0
+            OR call_site_identity_version < 2
+            OR definition_snapshot IS NULL",
+        [],
+    )?;
+    Ok(())
+}
+
+/// Adds the byte-span call-site identity introduced by D4 while retaining
+/// legacy rows that only have a line number.  A current edge is unique per
+/// persisted call site, target, and kind; the legacy key remains only for rows
+/// without a `call_site_id` so older databases stay readable during upgrade.
+fn migrate_call_site_identity_v2(conn: &Connection) -> rusqlite::Result<()> {
+    migrate_add_column(conn, "call_sites", "callee_start_byte", "INTEGER")?;
+    migrate_add_column(conn, "call_sites", "callee_end_byte", "INTEGER")?;
+    migrate_add_column(
+        conn,
+        "call_sites",
+        "identity_version",
+        "INTEGER NOT NULL DEFAULT 1",
+    )?;
+    migrate_add_column(
+        conn,
+        "call_edges",
+        "call_site_id",
+        "INTEGER REFERENCES call_sites(id) ON DELETE CASCADE",
+    )?;
+
+    conn.execute_batch(
+        "DROP INDEX IF EXISTS idx_call_edges_unique;
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_call_edges_legacy_unique
+             ON call_edges(from_symbol, to_symbol, COALESCE(call_site_line, -1), edge_kind)
+             WHERE call_site_id IS NULL;
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_call_edges_current_identity
+             ON call_edges(call_site_id, to_symbol, edge_kind)
+             WHERE call_site_id IS NOT NULL;
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_call_sites_current_identity
+             ON call_sites(
+                 from_path,
+                 enclosing_qn,
+                 callee_start_byte,
+                 callee_end_byte,
+                 edge_kind,
+                 identity_version
+             )
+             WHERE identity_version >= 2
+               AND callee_start_byte IS NOT NULL
+               AND callee_end_byte IS NOT NULL;
+         CREATE INDEX IF NOT EXISTS idx_call_edges_call_site
+             ON call_edges(call_site_id);",
+    )?;
     Ok(())
 }
 
@@ -1092,5 +1246,110 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1, "post-migration trigger must sync new notes too");
+    }
+
+    #[test]
+    fn call_site_identity_schema_uses_byte_spans_and_edge_foreign_key() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        let call_site_columns: Vec<String> = conn
+            .prepare("PRAGMA table_info(call_sites)")
+            .unwrap()
+            .query_map([], |row| row.get(1))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        for column in ["callee_start_byte", "callee_end_byte", "identity_version"] {
+            assert!(
+                call_site_columns.iter().any(|present| present == column),
+                "call_sites must persist {column} for exact CallSite identity"
+            );
+        }
+
+        let edge_columns: Vec<String> = conn
+            .prepare("PRAGMA table_info(call_edges)")
+            .unwrap()
+            .query_map([], |row| row.get(1))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        for column in ["call_site_id", "evidence_state"] {
+            assert!(
+                edge_columns.iter().any(|present| present == column),
+                "call_edges must persist {column} for D4 provenance"
+            );
+        }
+
+        let foreign_keys: Vec<(String, String, String)> = conn
+            .prepare("PRAGMA foreign_key_list(call_edges)")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(2)?, row.get(3)?, row.get(4)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(
+            foreign_keys.iter().any(|(table, from, to)| {
+                table == "call_sites" && from == "call_site_id" && to == "id"
+            }),
+            "call_site_id must carry a database foreign-key relationship"
+        );
+    }
+
+    #[test]
+    fn migration_marks_preexisting_external_formal_evidence_as_legacy() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO call_edges (from_symbol, to_symbol, edge_confidence, formal_source) \
+             VALUES ('caller', 'target', 'formal', 'scip')",
+            [],
+        )
+        .unwrap();
+
+        run_migrations(&conn).unwrap();
+        let state: String = conn
+            .query_row("SELECT evidence_state FROM call_edges", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            state, "legacy",
+            "a pre-D4 external verdict lacks an exact persisted proof record"
+        );
+    }
+
+    #[test]
+    fn external_proof_is_keyed_by_call_site_and_deleted_with_it() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO call_sites
+                (from_path, enclosing_qn, callee_name, call_line, callee_start_byte,
+                 callee_end_byte, identity_version, edge_kind)
+             VALUES ('main.rs', 'main.rs::main', 'target', 1, 0, 6, 2, 'call')",
+            [],
+        )
+        .unwrap();
+        let call_site_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO external_proofs
+                (call_site_id, to_symbol, provider, source_file_hash, callee_start_byte,
+                 callee_end_byte, provider_fingerprint, context_fingerprint, status, observed_at)
+             VALUES (?1, 'lib.rs::target', 'scip:rust', 'source-hash', 0, 6,
+                     'binary-fingerprint', 'context-fingerprint', 'fresh', 1.0)",
+            [call_site_id],
+        )
+        .unwrap();
+
+        conn.execute("DELETE FROM call_sites WHERE id = ?1", [call_site_id])
+            .unwrap();
+        let proofs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM external_proofs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            proofs, 0,
+            "proof lifetime follows CallSite identity, never edge id"
+        );
     }
 }

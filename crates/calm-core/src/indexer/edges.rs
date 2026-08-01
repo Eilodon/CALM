@@ -6,6 +6,9 @@ pub struct CallEdge {
     pub from_symbol: String,
     pub to_symbol: String,
     pub call_site_line: Option<i32>,
+    /// `call_sites.id` for current byte-span identities. `None` is reserved
+    /// for legacy rows that predate D4's exact call-site key.
+    pub call_site_id: Option<i64>,
     pub edge_confidence: String,
     pub from_path: Option<String>,
     pub to_path: Option<String>,
@@ -57,14 +60,15 @@ pub fn insert_call_edges_batch(tx: &Transaction, edges: &[CallEdge]) -> rusqlite
     // so a redundant re-insert (e.g. the same edge extracted twice in one
     // pass) collapses to a no-op instead of a duplicate row.
     let mut stmt = tx.prepare(
-        "INSERT OR IGNORE INTO call_edges (from_symbol, to_symbol, call_site_line, edge_confidence, from_path, to_path, edge_kind)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
+        "INSERT OR IGNORE INTO call_edges (from_symbol, to_symbol, call_site_line, call_site_id, edge_confidence, from_path, to_path, edge_kind)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
     )?;
     for e in edges {
         stmt.execute(rusqlite::params![
             e.from_symbol,
             e.to_symbol,
             e.call_site_line,
+            e.call_site_id,
             e.edge_confidence,
             e.from_path,
             e.to_path,
@@ -168,6 +172,7 @@ mod tests {
             from_symbol: "a".to_string(),
             to_symbol: "b".to_string(),
             call_site_line: Some(10),
+            call_site_id: None,
             edge_confidence: "resolved".to_string(),
             from_path: Some("a.rs".to_string()),
             to_path: Some("b.rs".to_string()),

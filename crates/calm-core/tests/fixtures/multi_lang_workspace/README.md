@@ -41,15 +41,26 @@ language notes:
 - `sql/` — `schema.sql`: `CREATE TABLE users`, a `CREATE VIEW` referencing
   it, and one stored procedure `CALL`-ing another (P3.3 SQL module).
 
-`go/`, `python/`, and `js/` are wired into `#[ignore]`d integration tests in
-`crates/calm-core/src/scip/mod.rs` (`go_overlay_upgrades_a_real_edge_on_the_multi_lang_fixture`,
-`python_overlay_upgrades_a_real_edge_on_the_multi_lang_fixture`,
-`js_overlay_upgrades_a_real_edge_on_the_multi_lang_fixture`) — each asserts
-the real external indexer (`scip-go`/`scip-python`/`scip-typescript`)
-upgrades the fixture's one cross-file call edge to `formal`. The remaining
-subdirectories (`java/`, `csharp/`, `c/`, `cpp/`, `php/`, `sql/`) are still
-unwired — Phase 2/3 work for those languages should add its own `#[ignore]`d
-integration test(s) pointing at the relevant subdirectory here as it lands,
-so the nightly CI job (`.github/workflows/scip-nightly.yml`) picks them up
-automatically via `cargo test --workspace -- --ignored` without any
-workflow-file change.
+The nightly workflow explicitly selects ignored live tests for `go/`,
+`python/`, `js/`, `java/`, `csharp/`, `php/`, Ruby's case-when fixture, and
+the `c/` clang fixture. They are separate provider jobs in
+`.github/workflows/scip-nightly.yml`, not a blanket `cargo test --ignored`.
+`cpp/`, `sql/`, and Kotlin still have no live lane; their fixture presence is
+ground truth for local deterministic coverage, not a claim of hosted support.
+
+## D4 provider qualification
+
+This fixture is SCIP ground truth, not evidence that every installed binary is
+production-ready. Fast PR tests use deterministic AST/SCIP/LSP mocks. A provider
+may be reported as `fixture-tested` after those tests pass; it earns
+`nightly-verified` only from its pinned nightly acquisition, checksum validation,
+binary version smoke probe, and explicitly selected live test. The Go, Ruby, and
+Clang release downloads in `.github/workflows/scip-nightly.yml` are version and
+SHA-256 pinned; CI must never acquire a `latest` release. A missing binary or
+failed version probe remains `unavailable`/`version_probe_failed`, never
+`nightly-verified`.
+
+LSP has no live fixture lane here. It remains opt-in and on-demand through
+`lsp_refresh`; the mock contract verifies protocol initialization, configuration,
+positions, cancellation, and stale-result rejection. Its results are residual
+evidence only and cannot replace current Stack Graphs or SCIP formal evidence.

@@ -137,15 +137,10 @@ backticks in a comment. Plain quotes (`'`/`"`) are fine; backticks are not.
 # simply won't connect, which is recoverable; a dead session is not.
 cargo build --quiet -p calm-cli 2>&1 || true
 
-# Install rust-analyzer if missing. Unrelated to the MCP connection race
-# above -- this is for CALM's own Rust SCIP overlay (audit-design
-# 2026-07-20): RustConfig::default() already auto-detects rust-analyzer
-# and auto-enables on every reindex that touches a .rs file (policy:
-# OnSave), so the only thing an environment without it is missing is the
-# binary itself. Same || true safety rule as the build above: this must
-# never be the thing that kills session startup. Idempotent (a no-op if
-# already installed), so safe to run unconditionally every time.
-rustup component add rust-analyzer 2>&1 || true
+# Do not auto-install rust-analyzer here. D4 makes LSP resolution opt-in and
+# on-demand through `lsp_refresh`; watcher, edit, and save paths neither start
+# nor install an LSP server. A user who explicitly wants LSP resolution can
+# install rust-analyzer after the session starts.
 ```
 
 **Why `|| true`:** Claude Code's cloud docs state: *"If the script exits

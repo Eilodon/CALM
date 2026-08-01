@@ -11,6 +11,18 @@ use rusqlite::Connection;
 
 use crate::config::{RustConfig, ScipConfig};
 
+fn proof_context_for(
+    provider: &provider::ScipProvider,
+    binary: &Path,
+    cache_key: &str,
+) -> ingest::ExternalProofContext {
+    ingest::ExternalProofContext::new(
+        format!("scip:{}", provider.lang),
+        binary.to_string_lossy(),
+        cache_key,
+    )
+}
+
 /// Run the full SCIP overlay: detect rust-analyzer, run batch scip into a temp
 /// file, parse, and upgrade edges. Fail-silent — every failure mode (disabled,
 /// no binary, timeout, parse error) returns `Ok(IngestStats::default())`,
@@ -97,6 +109,12 @@ pub fn run_overlay_for(
         return Ok(ingest::IngestStats::default());
     }
 
+    let graph_generation: i64 = conn.query_row(
+        "SELECT generation FROM graph_generation_state WHERE id = 1",
+        [],
+        |row| row.get(0),
+    )?;
+
     let tmp = tempfile::Builder::new().suffix(".scip").tempfile()?;
     if let Err(e) = runner::run_indexer(provider, &bin, root, tmp.path()) {
         tracing::warn!(
@@ -113,7 +131,14 @@ pub fn run_overlay_for(
         }
     };
     let insert_missing = cfg.insert_missing != Some(false);
-    let stats = ingest::ingest_occurrences(conn, &occ, insert_missing)?;
+    let proof_context =
+        proof_context_for(provider, &bin, &key).at_graph_generation(graph_generation);
+    let stats = ingest::ingest_occurrences_with_proof_context(
+        conn,
+        &occ,
+        insert_missing,
+        Some(&proof_context),
+    )?;
     tracing::info!(
         "SCIP overlay ({}): {} edges upgraded to formal, {} fan-out siblings ruled out, \
          {} edges inserted, match_rate={:.2}",
@@ -339,6 +364,13 @@ fn run_go_workspace_overlay(
     }
 
     let insert_missing = cfg.insert_missing != Some(false);
+    let graph_generation: i64 = conn.query_row(
+        "SELECT generation FROM graph_generation_state WHERE id = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    let proof_context =
+        proof_context_for(provider, &bin, &key).at_graph_generation(graph_generation);
     let mut total = ingest::IngestStats::default();
     let mut match_rate_sum = 0.0;
     let mut ok_modules = 0usize;
@@ -376,7 +408,12 @@ fn run_go_workspace_overlay(
                 continue;
             }
         };
-        let stats = ingest::ingest_occurrences(conn, &occ, insert_missing)?;
+        let stats = ingest::ingest_occurrences_with_proof_context(
+            conn,
+            &occ,
+            insert_missing,
+            Some(&proof_context),
+        )?;
         tracing::info!(
             "SCIP overlay (go, module {}): {} edges upgraded to formal, {} fan-out siblings ruled out, \
              {} edges inserted, match_rate={:.2}",
@@ -1069,9 +1106,9 @@ mod tests {
 
     /// Live integration: real `scip-go` against `multi_lang_workspace/go`
     /// (P2.1 shipped without this — gap closed alongside P3.2). Ignored by
-    /// default — requires `scip-go` on `PATH`/`$GOBIN`/`$HOME/go/bin` (`go
-    /// install github.com/scip-code/scip-go/cmd/scip-go@latest`), which CI
-    /// only installs on the nightly `scip-nightly.yml` job.
+    /// default — requires `scip-go` on `PATH`/`$GOBIN`/`$HOME/go/bin`. For a
+    /// manual install use the version-pinned `.../scip-go@v0.2.7`; nightly CI
+    /// acquires the same release with a SHA-256 check before running this test.
     #[test]
     #[ignore]
     fn go_overlay_upgrades_a_real_edge_on_the_multi_lang_fixture() {
@@ -1774,8 +1811,8 @@ mod tests {
     /// Releases and had no Bazel to build from source (see `provider::CLANG`'s
     /// own doc comment). Verified for real before writing this test: a real
     /// `sourcegraph/scip-clang` release binary downloads fine on an
-    /// unrestricted runner (`releases/latest/download/scip-clang-x86_64-linux`),
-    /// its `--compdb-path`/`--index-output-path`/`-j` flags match
+    /// unrestricted runner when pinned to `v0.4.0` and SHA-256-verified; its
+    /// `--compdb-path`/`--index-output-path`/`-j` flags match
     /// `clang_build_command` exactly (that function's doc comment can drop
     /// its "not confirmed" caveat now), and it indexed the checked-in
     /// `tests/fixtures/multi_lang_workspace/c` fixture correctly — with one

@@ -37,11 +37,35 @@ impl CalmServer {
                     Ok(results) => {
                         let providers: Vec<LspRefreshProviderOutput> = results
                             .into_iter()
-                            .map(|(lang, stats)| LspRefreshProviderOutput {
-                                lang,
-                                upgraded: stats.upgraded,
-                                attempted: stats.attempted,
-                                match_rate: stats.match_rate,
+                            .map(|(lang, stats)| {
+                                let (provider, provider_cfg) = match lang.as_str() {
+                                    "rust" => {
+                                        (&calm_core::lsp::provider::RUST_ANALYZER, &config.rust.lsp)
+                                    }
+                                    "go" => (&calm_core::lsp::provider::GOPLS, &config.go.lsp),
+                                    "c" => (&calm_core::lsp::provider::CLANGD, &config.clang.lsp),
+                                    _ => unreachable!("core filters LSP provider languages"),
+                                };
+                                let runtime = calm_core::lsp::provider::runtime_status(
+                                    provider,
+                                    provider_cfg,
+                                    &self.project_root,
+                                    stats.status.as_str(),
+                                    stats.attempted,
+                                );
+                                LspRefreshProviderOutput {
+                                    lang,
+                                    upgraded: stats.upgraded,
+                                    attempted: stats.attempted,
+                                    match_rate: stats.match_rate,
+                                    status: stats.status.as_str().to_owned(),
+                                    support_level: runtime.support_level,
+                                    binary: runtime.binary,
+                                    version: runtime.version,
+                                    profile_fingerprint: runtime.profile_fingerprint,
+                                    context_fingerprint: runtime.context_fingerprint,
+                                    reason: runtime.reason,
+                                }
                             })
                             .collect();
                         ToolOutcome::success(LspRefreshOutput {
@@ -99,4 +123,18 @@ pub(crate) struct LspRefreshProviderOutput {
     /// everything the same engine could prove.
     pub(crate) attempted: usize,
     pub(crate) match_rate: f64,
+    /// Distinguishes a valid zero-yield run from an unavailable provider,
+    /// no matching files/candidates, a cancelled run, or stale proof inputs.
+    pub(crate) status: String,
+    /// Qualification backed by CALM tests. `nightly-verified` is never inferred
+    /// locally; it requires the hosted pinned-provider lane.
+    pub(crate) support_level: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) binary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) version: Option<String>,
+    pub(crate) profile_fingerprint: String,
+    pub(crate) context_fingerprint: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) reason: Option<String>,
 }

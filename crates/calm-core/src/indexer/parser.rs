@@ -1382,6 +1382,11 @@ pub struct RawCall {
     pub enclosing_line: usize,
     pub enclosing_class: Option<String>,
     pub callee: String,
+    /// Zero-based, half-open UTF-8 byte range of the selected callee token.
+    /// For `receiver.method()`, this is `method`, never the receiver or the
+    /// full member expression.
+    pub callee_start_byte: usize,
+    pub callee_end_byte: usize,
     pub receiver: Option<String>,
     /// True when `receiver` came from a `Type::method()` scoped-path call
     /// (the path segment immediately before the last `::`) rather than a
@@ -1658,12 +1663,16 @@ fn walk_calls(
         && node.kind() == "member_access"
         && let Some((enc_name, enc_line)) = &current
         && let Some((receiver, callee, arg_count)) = dart_call_from_member_access(node, source)
+        && let Some((callee_start_byte, callee_end_byte)) =
+            selected_callee_byte_span(node, source, &callee)
     {
         out.push(RawCall {
             enclosing_name: enc_name.clone(),
             enclosing_line: *enc_line,
             enclosing_class: child_class.clone(),
             callee,
+            callee_start_byte,
+            callee_end_byte,
             receiver_is_type_path: receiver.as_deref().is_some_and(is_type_like),
             receiver,
             module_hint: None,
@@ -1719,6 +1728,8 @@ fn walk_calls(
             })
         && let Some((mut receiver, callee, mut receiver_is_type_path)) =
             split_receiver_callee(&source[fn_node.byte_range()])
+        && let Some((callee_start_byte, callee_end_byte)) =
+            selected_callee_byte_span(fn_node, source, &callee)
     {
         // Some grammars keep the receiver and the bare callee name as two
         // SEPARATE fields on the call node itself ("object"/"scope" + the
@@ -1758,6 +1769,8 @@ fn walk_calls(
             enclosing_line: *enc_line,
             enclosing_class: child_class.clone(),
             callee,
+            callee_start_byte,
+            callee_end_byte,
             receiver,
             receiver_is_type_path,
             module_hint: module_hint_of(&source[fn_node.byte_range()]),
@@ -1833,6 +1846,21 @@ fn last_ident_segment(raw: &str) -> Option<String> {
         .max()
         .unwrap_or(0);
     leading_ident(raw[start..].trim_start_matches('$'))
+}
+
+/// Return the exact trailing callee token inside the AST node that names the
+/// call target. `split_receiver_callee` already derives `callee` from that
+/// node's final identifier segment, so a missing match means the parser cannot
+/// prove a current call-site identity and must fail closed.
+fn selected_callee_byte_span(
+    node: tree_sitter::Node,
+    source: &str,
+    callee: &str,
+) -> Option<(usize, usize)> {
+    let text = source.get(node.byte_range())?;
+    let relative_start = text.rfind(callee)?;
+    let start = node.start_byte() + relative_start;
+    Some((start, start + callee.len()))
 }
 /// Extract call sites from a source file, each attributed to its enclosing function.
 /// Top-level calls (outside any function) are skipped — they have no caller symbol.
@@ -5007,6 +5035,20 @@ class Foo {
         assert!(!bar.looks_option_or_result_chained);
         let baz = calls.iter().find(|c| c.callee == "baz").unwrap();
         assert!(baz.looks_option_or_result_chained);
+    }
+
+    #[test]
+    fn raw_call_keeps_the_selected_callee_utf8_byte_span() {
+        let code = "fn caller() {\n    let café = client();\n    café.method();\n}\n";
+        let calls = extract_calls(code, "rust", "a.rs").unwrap();
+        let method = calls.iter().find(|c| c.callee == "method").unwrap();
+
+        assert_eq!(
+            &code[method.callee_start_byte..method.callee_end_byte],
+            "method"
+        );
+        assert_eq!(method.callee_start_byte, code.rfind("method").unwrap());
+        assert!(method.callee_start_byte > code.find("café").unwrap());
     }
 
     #[test]

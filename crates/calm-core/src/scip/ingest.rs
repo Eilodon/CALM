@@ -1,15 +1,6 @@
-//! Upgrade existing Rust call edges to `formal` confidence using SCIP evidence,
-//! and (gated) insert new ones for a call site tree-sitter's own candidate
-//! selection never produced any row for at all. ADDITIVE in the ADR-0004 §3
-//! sense that follows: an existing `edge_confidence` rank is never
-//! downgraded, and `mark_ruled_out_siblings`'s `ruled_out_by_scip` flag is an
-//! orthogonal, separate column that never touches it either — see that
-//! column's doc comment in `db/schema.rs`. The one place this module
-//! deliberately overrides a *prior verdict* rather than only adding to it:
-//! `formal_source` (also documented in `db/schema.rs`) lets an exact
-//! (file,line) SCIP match override a `formal` edge that got there via the
-//! weaker, per-file-name-set `stack_graphs` heuristic — never one that got
-//! there via a prior SCIP match of its own.
+//! Interpret parsed SCIP occurrences using exact CallSite provenance. D4 only
+//! lets evidence alter the call graph when its byte span and source hash match
+//! the current CallSite; legacy line-keyed occurrences remain observation-only.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -18,63 +9,83 @@ use rusqlite::Connection;
 
 use super::parse::ScipOccurrence;
 
+type ExactCallSiteKey = (String, i64, i64, String);
+type DefinitionSite = (String, i64);
+
 /// Outcome of one `ingest_occurrences` pass.
+///
+/// Exact SCIP ingestion outcome. Legacy line-keyed SCIP evidence leaves every
+/// mutation count at zero.
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
 pub struct IngestStats {
-    /// Edges whose `edge_confidence` actually changed to `formal` this run
-    /// (SCIP confirmed this exact `(from_path, call_site_line) -> to_symbol`
-    /// edge). Does not count a `formal`-already edge merely reconfirmed with
-    /// `formal_source = 'scip'` (no confidence-tier change) — see
-    /// `formal_source`'s doc comment in `db/schema.rs`.
+    /// Existing call edges upgraded by exact SCIP evidence.
     pub upgraded: usize,
-    /// Ambiguous fan-out siblings marked `ruled_out_by_scip` this run — SCIP
-    /// decisively answered "what does this call site resolve to" and it
-    /// wasn't this candidate. See `mark_ruled_out_siblings`.
+    /// Ambiguous sibling edges ruled out at an exact matching CallSite.
     pub ruled_out: usize,
-    /// New `call_edges` rows inserted this run for a call site SCIP resolved
-    /// but that had no existing row representing that exact target at all —
-    /// gated by `insert_missing` (config: `rust.scip.insert_missing`,
-    /// default auto-on). See `insert_missing_edges`.
+    /// Formal edges inserted for an exact matching CallSite.
     pub inserted: usize,
-    /// Fraction (0.0-1.0) of distinct SCIP-resolved call sites — a
-    /// `(from_path, call_line)` with at least one non-local reference whose
-    /// definition this same dump also recorded — that ended this run
-    /// represented by at least one `formal` `call_edges` row (already
-    /// formal, upgraded, or newly inserted). `0.0` when there were no
-    /// SCIP-resolved call sites at all to measure against. A low value on an
-    /// otherwise-healthy `.scip` file is the diagnostic signal the 8-language
-    /// plan's risk list calls out: paths likely aren't rebased correctly for
-    /// wherever this indexer actually ran (see `parse::parse_index`'s
-    /// `rebase_prefix`).
+    /// Fraction of exact SCIP call-site references that matched CALM state.
     pub match_rate: f64,
 }
 
-/// D3 (2026-07-30 stack-graphs-demotion-lever): count of edges where SCIP
-/// overrode a `formal_source = 'stack_graphs'` (or unattributed
-/// pre-migration) verdict since this process started -- incremented from
-/// `ingest_occurrences`'s upgrade loop and from `mark_ruled_out_siblings`.
-/// Deliberately does NOT count a fresh upgrade from `textual`/`inferred` --
-/// stack-graphs never had an opinion on that edge, so overriding it isn't a
-/// disagreement between the two formal-tier sources. See ADR-0002 +
-/// docs/superskills/specs/2026-07-30-stack-graphs-demotion-lever.md.
+/// Provider inputs that make an exact external result auditable.  Callers that
+/// cannot supply these inputs may still ingest observations, but cannot create
+/// a fresh durable proof record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalProofContext {
+    pub provider: String,
+    pub provider_fingerprint: String,
+    pub context_fingerprint: String,
+    /// Graph baseline observed before the external provider began work.  `None`
+    /// keeps compatibility-only observation callers non-durable.
+    pub graph_generation: Option<i64>,
+}
+
+impl ExternalProofContext {
+    pub fn new(
+        provider: impl Into<String>,
+        provider_fingerprint: impl Into<String>,
+        context_fingerprint: impl Into<String>,
+    ) -> Self {
+        Self {
+            provider: provider.into(),
+            provider_fingerprint: provider_fingerprint.into(),
+            context_fingerprint: context_fingerprint.into(),
+            graph_generation: None,
+        }
+    }
+
+    pub fn at_graph_generation(mut self, graph_generation: i64) -> Self {
+        self.graph_generation = Some(graph_generation);
+        self
+    }
+
+    pub fn has_same_provenance_as(&self, other: &Self) -> bool {
+        self.provider == other.provider
+            && self.provider_fingerprint == other.provider_fingerprint
+            && self.context_fingerprint == other.context_fingerprint
+    }
+}
+
+/// D3's historic SCIP-versus-Stack Graphs disagreement counter. Exact D4
+/// evidence has separate provenance, so this counter remains scoped to the
+/// legacy regression oracle until its semantics are upgraded deliberately.
 static SCIP_STACK_GRAPHS_OVERRIDES: AtomicU64 = AtomicU64::new(0);
 
-/// Count of edges where SCIP overrode a `formal_source = 'stack_graphs'`
-/// verdict since this process started -- see `SCIP_STACK_GRAPHS_OVERRIDES`.
-/// A nonzero, growing count on a real repo means the two formal-tier sources
-/// disagree often enough to be worth looking into -- see
-/// `IndexingStatusOutput::scip_stack_graphs_overrides`.
+/// Count of historic line-keyed SCIP-versus-Stack Graphs overrides exercised
+/// by the D3 regression oracle.
 pub fn scip_stack_graphs_override_count() -> u64 {
     SCIP_STACK_GRAPHS_OVERRIDES.load(Ordering::Relaxed)
 }
 
-/// Records one SCIP-vs-stack_graphs disagreement: bumps the process-wide
+/// Records one legacy SCIP-vs-stack_graphs disagreement: bumps the process-wide
 /// counter and logs the call site + target so it can be traced back to a
 /// specific edge without re-querying the DB. `ruled_out` distinguishes the
 /// two call sites this fires from: `false` = `ingest_occurrences`'s upgrade
 /// loop (a `stack_graphs` edge got reconfirmed to `formal_source = 'scip'`),
 /// `true` = `mark_ruled_out_siblings` (a `stack_graphs`-sourced sibling lost
 /// to a SCIP-backed one in an ambiguous fan-out group).
+#[cfg(test)]
 fn record_scip_stack_graphs_override(
     from_path: &str,
     call_line: i64,
@@ -95,6 +106,7 @@ fn record_scip_stack_graphs_override(
 
 /// One existing `call_edges` row with a known call site, joined to its
 /// target's declaration site.
+#[cfg(test)]
 struct EdgeRow {
     id: i64,
     from_path: String,
@@ -106,18 +118,360 @@ struct EdgeRow {
     formal_source: Option<String>,
 }
 
-/// Match SCIP occurrences against existing call edges and upgrade the
-/// confidence of each corroborated edge to `formal` (or, for one already
-/// `formal` via `stack_graphs`, reconfirm its provenance to `'scip'`),
-/// gated-insert new edges for SCIP-resolved call sites with no existing row
-/// for that exact target (see `insert_missing_edges`), then run
-/// `mark_ruled_out_siblings`.
-///
-/// Matching (conservative): a call edge `(from_path, call_site_line) -> to_symbol`
-/// is corroborated when there is a non-local SCIP reference at
-/// `(from_path, call_site_line)` whose definition occurrence lands on the same
-/// file+line as `to_symbol`'s declaration.
+/// Use SCIP only when its source range and source hash identify one current
+/// CallSite byte span exactly. Legacy line-only occurrences remain inert.
 pub fn ingest_occurrences(
+    conn: &Connection,
+    occ: &[ScipOccurrence],
+    insert_missing: bool,
+) -> rusqlite::Result<IngestStats> {
+    ingest_occurrences_with_proof_context(conn, occ, insert_missing, None)
+}
+
+/// Exact SCIP ingestion with the provider/context fingerprints required to
+/// persist a D4 proof. `None` deliberately leaves the result unverified for
+/// compatibility with observation-only callers and narrowly scoped unit tests.
+pub fn ingest_occurrences_with_proof_context(
+    conn: &Connection,
+    occ: &[ScipOccurrence],
+    insert_missing: bool,
+    proof_context: Option<&ExternalProofContext>,
+) -> rusqlite::Result<IngestStats> {
+    if let Some(expected_generation) = proof_context.and_then(|context| context.graph_generation) {
+        let current_generation: i64 = conn.query_row(
+            "SELECT generation FROM graph_generation_state WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        if current_generation != expected_generation {
+            return Ok(IngestStats::default());
+        }
+    }
+    // Moniker -> declaration location is still sufficient for identifying the
+    // callee symbol. The call-site proof below is intentionally stronger: a
+    // reference participates only with its exact byte span and source hash.
+    let mut def_of: HashMap<&str, DefinitionSite> = HashMap::new();
+    for occurrence in occ {
+        if occurrence.is_def && !occurrence.is_local {
+            def_of.insert(
+                occurrence.symbol.as_str(),
+                (occurrence.file.clone(), occurrence.line as i64),
+            );
+        }
+    }
+
+    let mut ref_targets: HashMap<ExactCallSiteKey, Vec<DefinitionSite>> = HashMap::new();
+    for occurrence in occ {
+        let (Some(start_byte), Some(end_byte), Some(source_file_hash)) = (
+            occurrence.start_byte,
+            occurrence.end_byte,
+            occurrence.source_file_hash.as_deref(),
+        ) else {
+            continue;
+        };
+        if !occurrence.is_def
+            && !occurrence.is_local
+            && let Some(definition) = def_of.get(occurrence.symbol.as_str())
+        {
+            ref_targets
+                .entry((
+                    occurrence.file.clone(),
+                    start_byte as i64,
+                    end_byte as i64,
+                    source_file_hash.to_string(),
+                ))
+                .or_default()
+                .push(definition.clone());
+        }
+    }
+
+    let rows: Vec<(
+        i64,
+        i64,
+        ExactCallSiteKey,
+        String,
+        i64,
+        String,
+        Option<String>,
+        bool,
+    )> = {
+        let mut stmt = conn.prepare(
+            "SELECT ce.id, ce.call_site_id, cs.from_path, cs.callee_start_byte,
+                    cs.callee_end_byte, fi.hash, s.path, s.line_start, ce.edge_confidence,
+                    ce.formal_source, ce.ruled_out_by_scip
+             FROM call_edges ce
+             JOIN call_sites cs ON cs.id = ce.call_site_id
+             JOIN file_index fi ON fi.path = cs.from_path
+             JOIN symbols s ON s.qualified_name = ce.to_symbol
+             WHERE ce.call_site_id IS NOT NULL
+               AND cs.identity_version >= 2
+               AND cs.callee_start_byte IS NOT NULL
+               AND cs.callee_end_byte IS NOT NULL",
+        )?;
+        stmt.query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                (row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?),
+                row.get(6)?,
+                row.get(7)?,
+                row.get(8)?,
+                row.get(9)?,
+                row.get::<_, i64>(10)? != 0,
+            ))
+        })?
+        .collect::<rusqlite::Result<_>>()?
+    };
+
+    let mut to_upgrade = Vec::new();
+    let mut newly_upgraded = 0;
+    let mut satisfied = HashSet::new();
+    for (edge_id, _, key, def_path, def_line, confidence, formal_source, _) in &rows {
+        let agrees = ref_targets.get(&key).is_some_and(|targets| {
+            targets
+                .iter()
+                .any(|(path, line)| path == def_path && *line == *def_line)
+        });
+        if !agrees {
+            continue;
+        }
+        satisfied.insert(key.clone());
+        if confidence == "formal" && formal_source.as_deref() == Some("scip") {
+            continue;
+        }
+        if confidence != "formal" {
+            newly_upgraded += 1;
+        }
+        to_upgrade.push(*edge_id);
+    }
+
+    let updated_edge_ids = {
+        let mut update = conn.prepare(
+            "UPDATE call_edges SET edge_confidence = 'formal', formal_source = 'scip',
+                 evidence_state = CASE WHEN ?2 != 0 THEN 'fresh' ELSE 'unverified' END
+             WHERE id = ?1",
+        )?;
+        let mut changed = Vec::new();
+        for edge_id in to_upgrade {
+            if update.execute(rusqlite::params![
+                edge_id,
+                i64::from(proof_context.is_some())
+            ])? > 0
+            {
+                changed.push(edge_id);
+            }
+        }
+        changed
+    };
+    if let Some(context) = proof_context {
+        for edge_id in updated_edge_ids {
+            record_external_proof_for_edge(conn, context, edge_id, "scip")?;
+        }
+    }
+
+    let to_rule_out = exact_sibling_rule_out_ids(&rows, &ref_targets);
+    let mut rule_out = conn.prepare("UPDATE call_edges SET ruled_out_by_scip = 1 WHERE id = ?1")?;
+    for edge_id in &to_rule_out {
+        rule_out.execute([edge_id])?;
+    }
+
+    let inserted = if insert_missing {
+        insert_missing_exact_edges(conn, &ref_targets, &mut satisfied, proof_context)?
+    } else {
+        0
+    };
+
+    Ok(IngestStats {
+        upgraded: newly_upgraded,
+        ruled_out: to_rule_out.len(),
+        inserted,
+        match_rate: if ref_targets.is_empty() {
+            0.0
+        } else {
+            satisfied.len() as f64 / ref_targets.len() as f64
+        },
+        ..IngestStats::default()
+    })
+}
+
+fn exact_sibling_rule_out_ids(
+    rows: &[(
+        i64,
+        i64,
+        ExactCallSiteKey,
+        String,
+        i64,
+        String,
+        Option<String>,
+        bool,
+    )],
+    ref_targets: &HashMap<ExactCallSiteKey, Vec<DefinitionSite>>,
+) -> Vec<i64> {
+    let mut groups: HashMap<i64, Vec<_>> = HashMap::new();
+    for row in rows {
+        if ref_targets.contains_key(&row.2) {
+            groups.entry(row.1).or_default().push(row);
+        }
+    }
+
+    let mut ruled_out = Vec::new();
+    for members in groups.into_values() {
+        if members.len() < 2 {
+            continue;
+        }
+        for (edge_id, _, key, def_path, def_line, _, _, already_ruled_out) in members {
+            let matches_scip = ref_targets.get(key).is_some_and(|targets| {
+                targets
+                    .iter()
+                    .any(|(path, line)| path == def_path && *line == *def_line)
+            });
+            if !matches_scip && !*already_ruled_out {
+                ruled_out.push(*edge_id);
+            }
+        }
+    }
+    ruled_out
+}
+
+fn insert_missing_exact_edges(
+    conn: &Connection,
+    ref_targets: &HashMap<ExactCallSiteKey, Vec<DefinitionSite>>,
+    satisfied: &mut HashSet<ExactCallSiteKey>,
+    proof_context: Option<&ExternalProofContext>,
+) -> rusqlite::Result<usize> {
+    let mut inserted = 0;
+    let mut insert = conn.prepare(
+        "INSERT OR IGNORE INTO call_edges
+            (from_symbol, to_symbol, call_site_line, call_site_id, edge_confidence, from_path,
+             to_path, edge_kind, formal_source, evidence_state, ruled_out_by_scip)
+         VALUES (?1, ?2, ?3, ?4, 'formal', ?5, ?6, 'call', 'scip',
+                 CASE WHEN ?7 != 0 THEN 'fresh' ELSE 'unverified' END, 0)",
+    )?;
+
+    for (key, targets) in ref_targets {
+        let Some((call_site_id, enclosing_qn, call_line)) = exact_current_call_site(conn, key)?
+        else {
+            continue;
+        };
+        for (def_path, def_line) in targets {
+            let Some(to_symbol) = resolve_unique_symbol_at(conn, def_path, *def_line)? else {
+                continue;
+            };
+            let added = insert.execute(rusqlite::params![
+                enclosing_qn,
+                to_symbol,
+                call_line,
+                call_site_id,
+                &key.0,
+                def_path,
+                i64::from(proof_context.is_some()),
+            ])?;
+            if added > 0 {
+                inserted += added;
+                satisfied.insert(key.clone());
+                if let Some(context) = proof_context {
+                    let edge_id = conn.query_row(
+                        "SELECT id FROM call_edges
+                         WHERE call_site_id = ?1 AND to_symbol = ?2 AND edge_kind = 'call'",
+                        rusqlite::params![call_site_id, to_symbol],
+                        |row| row.get(0),
+                    )?;
+                    record_external_proof_for_edge(conn, context, edge_id, "scip")?;
+                }
+            }
+        }
+    }
+    Ok(inserted)
+}
+
+/// Persist evidence only after the graph row itself was accepted.  The SELECT
+/// rechecks the current CallSite/span/file snapshot, so a stale or deleted
+/// edge cannot manufacture a proof record by id alone.
+pub(crate) fn record_external_proof_for_edge(
+    conn: &Connection,
+    context: &ExternalProofContext,
+    edge_id: i64,
+    expected_formal_source: &str,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO external_proofs
+            (call_site_id, to_symbol, provider, source_file_hash, callee_start_byte,
+             callee_end_byte, provider_fingerprint, context_fingerprint, graph_generation,
+             call_site_identity_version, definition_snapshot, status, observed_at)
+         SELECT ce.call_site_id, ce.to_symbol, ?1, fi.hash, cs.callee_start_byte,
+                 cs.callee_end_byte, ?2, ?3, graph.generation, cs.identity_version,
+                 printf('%s:%d:%d:%s', COALESCE(def_file.hash, ''), def.line_start, def.line_end, def.signature),
+                 'fresh', unixepoch('now')
+         FROM call_edges ce
+         JOIN call_sites cs ON cs.id = ce.call_site_id
+         JOIN file_index fi ON fi.path = cs.from_path
+         JOIN symbols def ON def.qualified_name = ce.to_symbol
+         LEFT JOIN file_index def_file ON def_file.path = def.path
+         JOIN graph_generation_state graph ON graph.id = 1
+         WHERE ce.id = ?4
+            AND ce.formal_source = ?5
+            AND cs.identity_version >= 2
+            AND cs.callee_start_byte IS NOT NULL
+            AND cs.callee_end_byte IS NOT NULL
+            AND (?6 IS NULL OR graph.generation = ?6)
+          ON CONFLICT(call_site_id, to_symbol, provider) DO UPDATE SET
+              source_file_hash = excluded.source_file_hash,
+              callee_start_byte = excluded.callee_start_byte,
+              callee_end_byte = excluded.callee_end_byte,
+              provider_fingerprint = excluded.provider_fingerprint,
+              context_fingerprint = excluded.context_fingerprint,
+              graph_generation = excluded.graph_generation,
+              call_site_identity_version = excluded.call_site_identity_version,
+              definition_snapshot = excluded.definition_snapshot,
+              status = 'fresh',
+             observed_at = excluded.observed_at,
+             failure_reason = NULL",
+        rusqlite::params![
+            context.provider,
+            context.provider_fingerprint,
+            context.context_fingerprint,
+            edge_id,
+            expected_formal_source,
+            context.graph_generation,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Finds one current call site only when its source hash proves the SCIP range
+/// was measured against the same bytes CALM parsed. The partial unique index
+/// makes a duplicate impossible for new rows; treating any legacy corruption
+/// as ambiguous still keeps this path fail-closed.
+fn exact_current_call_site(
+    conn: &Connection,
+    key: &ExactCallSiteKey,
+) -> rusqlite::Result<Option<(i64, String, i64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT cs.id, cs.enclosing_qn, cs.call_line
+         FROM call_sites cs
+         JOIN file_index fi ON fi.path = cs.from_path
+         WHERE cs.from_path = ?1
+           AND cs.callee_start_byte = ?2
+           AND cs.callee_end_byte = ?3
+           AND fi.hash = ?4
+           AND cs.identity_version >= 2
+           AND cs.edge_kind = 'call'",
+    )?;
+    let matches = stmt
+        .query_map(rusqlite::params![&key.0, key.1, key.2, &key.3], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok((matches.len() == 1)
+        .then(|| matches.into_iter().next())
+        .flatten())
+}
+
+/// Retains D3's line-keyed behavior exclusively as a regression oracle for
+/// tests. Production code must use [`ingest_occurrences`], which mutates only
+/// when D4 has exact CallSite byte-span and source-hash identity.
+#[cfg(test)]
+fn ingest_line_keyed_occurrences_for_regression(
     conn: &Connection,
     occ: &[ScipOccurrence],
     insert_missing: bool,
@@ -281,8 +635,10 @@ pub fn ingest_occurrences(
 /// `None`/`"stack_graphs"` -- a genuine stack-graphs (or unattributed)
 /// formal verdict this pass might rule out, distinct from an ordinary
 /// non-formal sibling losing a fan-out.
+#[cfg(test)]
 type GroupMember<'a> = (i64, &'a str, i64, bool, bool, bool);
 
+#[cfg(test)]
 fn mark_ruled_out_siblings(
     conn: &Connection,
     rows: &[EdgeRow],
@@ -384,6 +740,7 @@ fn mark_ruled_out_siblings(
 /// low-confidence one) — without this, no amount of a perfect `.scip` file
 /// could ever put a `formal` edge there, since the upgrade pass above only
 /// ever touches a *pre-existing* row.
+#[cfg(test)]
 fn insert_missing_edges(
     conn: &Connection,
     rows: &[EdgeRow],
@@ -474,6 +831,7 @@ fn insert_missing_edges(
 /// `(path, line)`, or `None` when there's no such call site at all, or more
 /// than one *distinct* enclosing symbol claims that exact line (shouldn't
 /// happen for well-formed source — "ambiguous, skip" beats guessing).
+#[cfg(test)]
 fn enclosing_qn_at(conn: &Connection, path: &str, line: i64) -> rusqlite::Result<Option<String>> {
     let mut stmt = conn.prepare(
         "SELECT DISTINCT enclosing_qn FROM call_sites WHERE from_path = ?1 AND call_line = ?2",
@@ -504,6 +862,8 @@ fn resolve_unique_symbol_at(
 /// locations, where no heading rows exist, so `false` preserves their exact
 /// pre-existing behavior. A tie for narrowest span returns `None` (genuinely
 /// ambiguous — stay conservative) for both callers.
+// The optional LSP overlay calls this helper; the default build does not.
+#[allow(dead_code)]
 pub(crate) fn resolve_unique_symbol_at_filtered(
     conn: &Connection,
     path: &str,
@@ -540,6 +900,53 @@ mod tests {
     use super::*;
     use rusqlite::Connection;
 
+    /// D3's line-keyed regression oracle intentionally uses occurrences that
+    /// lack D4's byte-span proof. Keeping that fixture shape local prevents
+    /// legacy tests from accidentally becoming evidence for production ingest.
+    #[derive(Clone)]
+    struct LegacyScipOccurrence {
+        file: String,
+        line: usize,
+        symbol: String,
+        is_def: bool,
+        is_local: bool,
+    }
+
+    type ScipOccurrence = LegacyScipOccurrence;
+
+    fn production_occurrences(
+        occurrences: &[ScipOccurrence],
+    ) -> Vec<crate::scip::parse::ScipOccurrence> {
+        occurrences
+            .iter()
+            .map(|occurrence| crate::scip::parse::ScipOccurrence {
+                file: occurrence.file.clone(),
+                line: occurrence.line,
+                start_byte: None,
+                end_byte: None,
+                source_file_hash: None,
+                symbol: occurrence.symbol.clone(),
+                is_def: occurrence.is_def,
+                is_local: occurrence.is_local,
+            })
+            .collect()
+    }
+
+    // Keep D3's focused mutation cases as a regression oracle without giving
+    // the production ingest API permission to mutate call graph rows.
+    fn ingest_occurrences(
+        conn: &Connection,
+        occ: &[ScipOccurrence],
+        insert_missing: bool,
+    ) -> rusqlite::Result<IngestStats> {
+        let legacy_occurrences = production_occurrences(occ);
+        super::ingest_line_keyed_occurrences_for_regression(
+            conn,
+            &legacy_occurrences,
+            insert_missing,
+        )
+    }
+
     fn db_with_one_textual_edge() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         crate::db::schema::init_db(&conn).unwrap();
@@ -551,6 +958,338 @@ mod tests {
         )
         .unwrap();
         conn
+    }
+
+    #[test]
+    fn exact_span_reference_upgrades_only_its_matching_same_line_call_site() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end)
+             VALUES ('core/src/engine.rs::Engine::start', 'start', 'method', 'rust',
+                     'core/src/engine.rs', 6, 8);
+             INSERT INTO file_index (path, hash, language, symbol_count, last_indexed)
+             VALUES ('app/src/main.rs', 'fresh-source', 'rust', 1, 0);
+             INSERT INTO call_sites
+                (from_path, enclosing_qn, callee_name, call_line, callee_start_byte,
+                 callee_end_byte, identity_version, edge_kind)
+             VALUES
+                ('app/src/main.rs', 'app/src/main.rs::main', 'start', 5, 4, 9, 2, 'call'),
+                ('app/src/main.rs', 'app/src/main.rs::main', 'start', 5, 12, 17, 2, 'call');",
+        )
+        .unwrap();
+        let site_ids: Vec<i64> = conn
+            .prepare("SELECT id FROM call_sites ORDER BY callee_start_byte")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        for site_id in &site_ids {
+            conn.execute(
+                "INSERT INTO call_edges
+                    (from_symbol, to_symbol, call_site_line, call_site_id, edge_confidence, from_path, to_path, edge_kind)
+                 VALUES ('app/src/main.rs::main', 'core/src/engine.rs::Engine::start', 5, ?1,
+                         'textual', 'app/src/main.rs', 'core/src/engine.rs', 'call')",
+                [site_id],
+            )
+            .unwrap();
+        }
+
+        let occ = vec![
+            crate::scip::parse::ScipOccurrence {
+                file: "core/src/engine.rs".into(),
+                line: 6,
+                start_byte: None,
+                end_byte: None,
+                source_file_hash: None,
+                symbol: "M".into(),
+                is_def: true,
+                is_local: false,
+            },
+            crate::scip::parse::ScipOccurrence {
+                file: "app/src/main.rs".into(),
+                line: 5,
+                start_byte: Some(4),
+                end_byte: Some(9),
+                source_file_hash: Some("fresh-source".into()),
+                symbol: "M".into(),
+                is_def: false,
+                is_local: false,
+            },
+        ];
+
+        let proof_context =
+            super::ExternalProofContext::new("scip:test", "test-binary", "test-context");
+        let stats =
+            super::ingest_occurrences_with_proof_context(&conn, &occ, false, Some(&proof_context))
+                .unwrap();
+        assert_eq!(stats.upgraded, 1);
+        let confidence: Vec<String> = conn
+            .prepare(
+                "SELECT edge_confidence FROM call_edges
+                 ORDER BY call_site_id",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(confidence, vec!["formal", "textual"]);
+        let evidence_states: Vec<String> = conn
+            .prepare("SELECT evidence_state FROM call_edges ORDER BY call_site_id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(evidence_states, vec!["fresh", "unverified"]);
+        let proof: (String, String, String, i64, i64, String) = conn
+            .query_row(
+                "SELECT provider, provider_fingerprint, context_fingerprint,
+                        graph_generation, call_site_identity_version, definition_snapshot
+                 FROM external_proofs",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(proof.0, "scip:test");
+        assert_eq!(proof.1, "test-binary");
+        assert_eq!(proof.2, "test-context");
+        assert_eq!(proof.3, 0);
+        assert_eq!(proof.4, 2);
+        assert!(
+            !proof.5.is_empty(),
+            "a durable proof must snapshot the target definition"
+        );
+
+        conn.execute(
+            "UPDATE call_edges SET edge_confidence = 'textual', formal_source = NULL",
+            [],
+        )
+        .unwrap();
+        let mut stale_occurrences = occ;
+        stale_occurrences[1].source_file_hash = Some("stale-source".into());
+        let stale_stats = super::ingest_occurrences(&conn, &stale_occurrences, false).unwrap();
+        assert_eq!(stale_stats.upgraded, 0);
+        let formal_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM call_edges WHERE edge_confidence = 'formal'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            formal_count, 0,
+            "a range derived from different source bytes must not mutate the graph"
+        );
+    }
+
+    #[test]
+    fn same_line_non_call_reference_cannot_formalize_or_rule_out_a_call() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end)
+             VALUES
+                ('a.rs::A::start', 'start', 'method', 'rust', 'a.rs', 1, 1),
+                ('b.rs::B::start', 'start', 'method', 'rust', 'b.rs', 1, 1);
+             INSERT INTO file_index (path, hash, language, symbol_count, last_indexed)
+             VALUES ('app/src/main.rs', 'fresh-source', 'rust', 1, 0);
+             INSERT INTO call_sites
+                (from_path, enclosing_qn, callee_name, call_line, callee_start_byte,
+                 callee_end_byte, identity_version, edge_kind)
+             VALUES ('app/src/main.rs', 'app/src/main.rs::main', 'start', 5, 4, 9, 2, 'call');
+             INSERT INTO call_edges
+                (from_symbol, to_symbol, call_site_line, call_site_id, edge_confidence, from_path, to_path, edge_kind)
+             VALUES
+                ('app/src/main.rs::main', 'a.rs::A::start', 5, 1, 'ambiguous', 'app/src/main.rs', 'a.rs', 'call'),
+                ('app/src/main.rs::main', 'b.rs::B::start', 5, 1, 'ambiguous', 'app/src/main.rs', 'b.rs', 'call');",
+        )
+        .unwrap();
+        let occurrences = vec![
+            crate::scip::parse::ScipOccurrence {
+                file: "b.rs".into(),
+                line: 1,
+                start_byte: None,
+                end_byte: None,
+                source_file_hash: None,
+                symbol: "M".into(),
+                is_def: true,
+                is_local: false,
+            },
+            crate::scip::parse::ScipOccurrence {
+                file: "app/src/main.rs".into(),
+                line: 5,
+                // This is another `start` reference on the same line, not the
+                // call site's callee token at byte range 4..9.
+                start_byte: Some(12),
+                end_byte: Some(17),
+                source_file_hash: Some("fresh-source".into()),
+                symbol: "M".into(),
+                is_def: false,
+                is_local: false,
+            },
+        ];
+
+        let stats = super::ingest_occurrences(&conn, &occurrences, true).unwrap();
+        assert_eq!(stats.upgraded, 0);
+        assert_eq!(stats.ruled_out, 0);
+        assert_eq!(stats.inserted, 0);
+        let rows: Vec<(String, String, i64)> = conn
+            .prepare(
+                "SELECT to_symbol, edge_confidence, ruled_out_by_scip
+                 FROM call_edges ORDER BY to_symbol",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("a.rs::A::start".into(), "ambiguous".into(), 0),
+                ("b.rs::B::start".into(), "ambiguous".into(), 0),
+            ]
+        );
+        let proof_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM external_proofs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(proof_count, 0);
+    }
+
+    #[test]
+    fn exact_span_reference_inserts_for_an_uncandidated_call_site() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end)
+             VALUES ('core/src/engine.rs::Engine::start', 'start', 'method', 'rust',
+                     'core/src/engine.rs', 6, 8);
+             INSERT INTO file_index (path, hash, language, symbol_count, last_indexed)
+             VALUES ('app/src/main.rs', 'fresh-source', 'rust', 1, 0);
+             INSERT INTO call_sites
+                (from_path, enclosing_qn, callee_name, call_line, callee_start_byte,
+                 callee_end_byte, identity_version, edge_kind)
+             VALUES ('app/src/main.rs', 'app/src/main.rs::main', 'start', 5, 4, 9, 2, 'call');",
+        )
+        .unwrap();
+        let occ = vec![
+            crate::scip::parse::ScipOccurrence {
+                file: "core/src/engine.rs".into(),
+                line: 6,
+                start_byte: None,
+                end_byte: None,
+                source_file_hash: None,
+                symbol: "M".into(),
+                is_def: true,
+                is_local: false,
+            },
+            crate::scip::parse::ScipOccurrence {
+                file: "app/src/main.rs".into(),
+                line: 5,
+                start_byte: Some(4),
+                end_byte: Some(9),
+                source_file_hash: Some("fresh-source".into()),
+                symbol: "M".into(),
+                is_def: false,
+                is_local: false,
+            },
+        ];
+
+        let stats = super::ingest_occurrences(&conn, &occ, true).unwrap();
+        assert_eq!(stats.inserted, 1);
+        let (site_id, confidence, source): (i64, String, String) = conn
+            .query_row(
+                "SELECT call_site_id, edge_confidence, formal_source FROM call_edges",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            site_id,
+            conn.query_row("SELECT id FROM call_sites", [], |row| row.get::<_, i64>(0))
+                .unwrap()
+        );
+        assert_eq!(confidence, "formal");
+        assert_eq!(source, "scip");
+    }
+
+    #[test]
+    fn exact_span_reference_rules_out_only_other_targets_of_the_same_call_site() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end)
+             VALUES
+                ('a.rs::A::start', 'start', 'method', 'rust', 'a.rs', 1, 1),
+                ('b.rs::B::start', 'start', 'method', 'rust', 'b.rs', 1, 1);
+             INSERT INTO file_index (path, hash, language, symbol_count, last_indexed)
+             VALUES ('app/src/main.rs', 'fresh-source', 'rust', 1, 0);
+             INSERT INTO call_sites
+                (from_path, enclosing_qn, callee_name, call_line, callee_start_byte,
+                 callee_end_byte, identity_version, edge_kind)
+             VALUES ('app/src/main.rs', 'app/src/main.rs::main', 'start', 5, 4, 9, 2, 'call');
+             INSERT INTO call_edges
+                (from_symbol, to_symbol, call_site_line, call_site_id, edge_confidence, from_path, to_path, edge_kind)
+             VALUES
+                ('app/src/main.rs::main', 'a.rs::A::start', 5, 1, 'ambiguous', 'app/src/main.rs', 'a.rs', 'call'),
+                ('app/src/main.rs::main', 'b.rs::B::start', 5, 1, 'ambiguous', 'app/src/main.rs', 'b.rs', 'call');",
+        )
+        .unwrap();
+        let occ = vec![
+            crate::scip::parse::ScipOccurrence {
+                file: "b.rs".into(),
+                line: 1,
+                start_byte: None,
+                end_byte: None,
+                source_file_hash: None,
+                symbol: "M".into(),
+                is_def: true,
+                is_local: false,
+            },
+            crate::scip::parse::ScipOccurrence {
+                file: "app/src/main.rs".into(),
+                line: 5,
+                start_byte: Some(4),
+                end_byte: Some(9),
+                source_file_hash: Some("fresh-source".into()),
+                symbol: "M".into(),
+                is_def: false,
+                is_local: false,
+            },
+        ];
+
+        let stats = super::ingest_occurrences(&conn, &occ, false).unwrap();
+        assert_eq!(stats.upgraded, 1);
+        assert_eq!(stats.ruled_out, 1);
+        let rows: Vec<(String, String, i64)> = conn
+            .prepare(
+                "SELECT to_symbol, edge_confidence, ruled_out_by_scip
+                 FROM call_edges ORDER BY to_symbol",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("a.rs::A::start".into(), "ambiguous".into(), 1),
+                ("b.rs::B::start".into(), "formal".into(), 0),
+            ]
+        );
     }
 
     #[test]
@@ -599,7 +1338,8 @@ mod tests {
             is_def: false,
             is_local: false,
         }];
-        let stats = ingest_occurrences(&conn, &occ, true).unwrap();
+        let exact_occurrences = production_occurrences(&occ);
+        let stats = super::ingest_occurrences(&conn, &exact_occurrences, true).unwrap();
         assert_eq!(stats.upgraded, 0);
         assert_eq!(stats.ruled_out, 0);
         let (conf, cnt): (String, i64) = conn
@@ -981,6 +1721,24 @@ mod tests {
     /// nothing to name the new edge's `to_symbol` after, so no insert happens
     /// rather than guessing or inventing a placeholder.
     #[test]
+    fn stale_proof_context_is_rejected_before_ingest() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        conn.execute(
+            "UPDATE graph_generation_state SET generation = 1 WHERE id = 1",
+            [],
+        )
+        .unwrap();
+
+        let context = super::ExternalProofContext::new("scip:test", "provider", "context")
+            .at_graph_generation(0);
+        assert_eq!(
+            super::ingest_occurrences_with_proof_context(&conn, &[], true, Some(&context)).unwrap(),
+            super::IngestStats::default()
+        );
+    }
+
+    #[test]
     fn no_insert_when_def_unknown_symbol() {
         let conn = db_with_call_site("app/src/main.rs", "app/src/main.rs::main", 5, "start");
         // No `symbols` row at core/src/engine.rs:6 at all.
@@ -1071,6 +1829,102 @@ mod tests {
     /// assertion. `unwrap_or_else` recovers from lock poisoning so one
     /// failing test in the group doesn't cascade-fail the rest.
     static COUNTER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn p0_observation_only_leaves_scip_proof_out_of_call_graph() {
+        let _guard = COUNTER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let overrides_before = scip_stack_graphs_override_count();
+        let conn = db_with_ambiguous_fan_out(&[
+            ("a.rs::A::as_str", "a.rs", 1),
+            ("b.rs::B::as_str", "b.rs", 1),
+        ]);
+        conn.execute(
+            "UPDATE call_edges SET edge_confidence = 'formal', formal_source = 'stack_graphs' \
+             WHERE to_symbol = 'b.rs::B::as_str'",
+            [],
+        )
+        .unwrap();
+        let occ = vec![
+            ScipOccurrence {
+                file: "a.rs".into(),
+                line: 1,
+                symbol: "M".into(),
+                is_def: true,
+                is_local: false,
+            },
+            ScipOccurrence {
+                file: "app/src/main.rs".into(),
+                line: 5,
+                symbol: "M".into(),
+                is_def: false,
+                is_local: false,
+            },
+        ];
+
+        let exact_occurrences = production_occurrences(&occ);
+        let stats = super::ingest_occurrences(&conn, &exact_occurrences, true).unwrap();
+        assert_eq!(stats.upgraded, 0);
+        assert_eq!(stats.ruled_out, 0);
+        assert_eq!(stats.inserted, 0);
+        assert_eq!(scip_stack_graphs_override_count(), overrides_before);
+        let rows: Vec<(String, String, Option<String>, i64)> = conn
+            .prepare(
+                "SELECT to_symbol, edge_confidence, formal_source, ruled_out_by_scip \
+                 FROM call_edges ORDER BY to_symbol",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("a.rs::A::as_str".into(), "ambiguous".into(), None, 0),
+                (
+                    "b.rs::B::as_str".into(),
+                    "formal".into(),
+                    Some("stack_graphs".into()),
+                    0,
+                ),
+            ]
+        );
+
+        let insertion_conn =
+            db_with_call_site("app/src/main.rs", "app/src/main.rs::main", 5, "start");
+        insertion_conn
+            .execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end) \
+                 VALUES ('core/src/engine.rs::Engine::start', 'start', 'method', 'rust', \
+                         'core/src/engine.rs', 6, 8)",
+                [],
+            )
+            .unwrap();
+        let insert_occ = vec![
+            ScipOccurrence {
+                file: "core/src/engine.rs".into(),
+                line: 6,
+                symbol: "I".into(),
+                is_def: true,
+                is_local: false,
+            },
+            ScipOccurrence {
+                file: "app/src/main.rs".into(),
+                line: 5,
+                symbol: "I".into(),
+                is_def: false,
+                is_local: false,
+            },
+        ];
+        let exact_insert_occurrences = production_occurrences(&insert_occ);
+        let insert_stats =
+            super::ingest_occurrences(&insertion_conn, &exact_insert_occurrences, true).unwrap();
+        assert_eq!(insert_stats.inserted, 0);
+        let edge_count: i64 = insertion_conn
+            .query_row("SELECT COUNT(*) FROM call_edges", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(edge_count, 0);
+    }
 
     #[test]
     fn scip_overrides_stack_graphs_target() {

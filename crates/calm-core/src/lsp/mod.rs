@@ -96,7 +96,10 @@ mod tests {
         let langs: Vec<&str> = results.iter().map(|(l, _)| l.as_str()).collect();
         assert_eq!(langs, vec!["rust", "go", "c"]);
         for (_, stats) in &results {
-            assert_eq!(*stats, LspIngestStats::default());
+            assert_eq!(
+                stats.status,
+                crate::lsp::overlay::LspRunStatus::NoMatchingFiles
+            );
         }
     }
 }

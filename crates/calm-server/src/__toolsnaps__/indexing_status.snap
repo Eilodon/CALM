@@ -34,6 +34,109 @@
           "recoverable"
         ]
       },
+      "ExternalProofStatusOutput": {
+        "type": "object",
+        "properties": {
+          "fresh": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          },
+          "stale": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          },
+          "legacy": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          },
+          "unverified": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          },
+          "rejected": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "fresh",
+          "stale",
+          "legacy",
+          "unverified",
+          "rejected"
+        ]
+      },
+      "IdentityMigrationStatusOutput": {
+        "type": "object",
+        "properties": {
+          "target_version": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "status": {
+            "type": "string"
+          },
+          "started_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "completed_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "failed_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "failure_reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "duration_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "rows_rebuilt": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "busy_retries": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "graph_generation": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          }
+        },
+        "required": [
+          "target_version",
+          "status",
+          "busy_retries"
+        ]
+      },
       "ScipOverlayStatusOutput": {
         "description": "Local mirror of `calm_core::scip::OverlayStatus` — that type lives in\n`calm-core`, which doesn't depend on `schemars`, so it can't derive\n`JsonSchema` itself. Only exists when this crate is built with the\n`scip-overlay` feature (the same gate `calm_core::scip` itself is behind).",
         "type": "object",
@@ -137,6 +240,51 @@
           "up_to_date"
         ]
       },
+      "LspProviderStatusOutput": {
+        "type": "object",
+        "properties": {
+          "lang": {
+            "type": "string"
+          },
+          "support_level": {
+            "type": "string"
+          },
+          "binary": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "version": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "profile_fingerprint": {
+            "type": "string"
+          },
+          "context_fingerprint": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "lang",
+          "support_level",
+          "profile_fingerprint",
+          "context_fingerprint",
+          "status"
+        ]
+      },
       "SuggestedNext": {
         "type": "object",
         "properties": {
@@ -218,6 +366,21 @@
           "null"
         ]
       },
+      "external_proofs": {
+        "description": "D4 proof freshness, grouped by persisted evidence state. A formal edge\nis only current external proof when its corresponding record is fresh.",
+        "$ref": "#/$defs/ExternalProofStatusOutput"
+      },
+      "identity_migration": {
+        "description": "Diagnostic state of the one-transaction CallSite identity migration.\nAbsent until a legacy database actually requires that migration.",
+        "anyOf": [
+          {
+            "$ref": "#/$defs/IdentityMigrationStatusOutput"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
       "graph_mode": {
         "description": "Which graph-rebuild path the most recent non-noop reindex took:\n`\"full\"`, `\"incremental\"`, or `\"full_fallback:<reason>\"` (Phase B\nL6 — `GraphMode::label`). Absent until this process has served one\nnon-noop reindex (edit tool or file watcher). Lets an agent confirm\nthe incremental path is actually engaged rather than silently\nfalling back to full rebuilds.",
         "type": [
@@ -241,6 +404,13 @@
         "type": "array",
         "items": {
           "$ref": "#/$defs/PerLanguageOverlayStatus"
+        }
+      },
+      "lsp_providers": {
+        "description": "Current LSP provider probe/profile evidence. No automatic LSP session is\nstarted here: `status=not_run` remains honest until `lsp_refresh` runs.",
+        "type": "array",
+        "items": {
+          "$ref": "#/$defs/LspProviderStatusOutput"
         }
       },
       "formal_resolution_timeouts": {

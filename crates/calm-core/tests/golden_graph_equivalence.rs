@@ -7,51 +7,146 @@
 //! harness bug or a pre-existing nondeterminism (A-3/A-4 in the plan's risk
 //! assessment) — which is exactly what this sanity stage exists to flush out.
 //!
-//! Comparison uses semantic keys only (never `call_edges.id` — plan D7):
-//! edges as (from_symbol, to_symbol, call_site_line, edge_confidence,
-//! edge_kind, from_path, to_path), symbols as (caller_count, coreness,
-//! is_hub, hub_kind, boundary_ambiguous) per qualified_name. Valid only on
-//! overlay-free DBs: incremental deliberately PRESERVES scip enrichment that
-//! a full rebuild destroys, so post-overlay states are compared by dedicated
-//! T5 tests instead, never by this fingerprint.
+//! Comparison uses semantic keys only (never database IDs, timestamps, or
+//! insertion order). An edge key includes its complete D4 call-site identity,
+//! authority/evidence/rule-out state, and durable SCIP proof provenance. The
+//! proof generation is represented as current/stale relative to the graph
+//! baseline rather than its raw counter, because equivalent clean and
+//! incrementally rebuilt databases can have different generation numbers.
 
 use calm_core::indexer::pipeline::{self, GraphMode};
 use rusqlite::Connection;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-/// (from_symbol, to_symbol, call_site_line, edge_confidence, edge_kind,
-/// from_path, to_path)
-type EdgeKey = (
-    String,
-    String,
-    Option<i64>,
-    String,
-    String,
-    Option<String>,
-    Option<String>,
-);
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct CallSiteKey {
+    path: String,
+    enclosing_symbol: String,
+    callee_name: String,
+    edge_kind: String,
+    identity_version: i64,
+    callee_start_byte: Option<i64>,
+    callee_end_byte: Option<i64>,
+    source_file_hash: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ProofKey {
+    provider: String,
+    provider_fingerprint: String,
+    context_fingerprint: String,
+    source_file_hash: String,
+    callee_start_byte: Option<i64>,
+    callee_end_byte: Option<i64>,
+    definition_snapshot: Option<String>,
+    call_site_identity_version: i64,
+    generation_is_current: bool,
+    status: String,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct EdgeKey {
+    from_symbol: String,
+    to_symbol: String,
+    call_site_line: Option<i64>,
+    edge_confidence: String,
+    edge_kind: String,
+    from_path: Option<String>,
+    to_path: Option<String>,
+    formal_source: Option<String>,
+    evidence_state: String,
+    ruled_out_by_scip: bool,
+    ruled_out_target: Option<String>,
+    call_site: Option<CallSiteKey>,
+    proof: Option<ProofKey>,
+}
+
 /// (caller_count, coreness, is_hub, hub_kind, boundary_ambiguous)
 type SymbolMetrics = (i64, i64, i64, Option<String>, i64);
 
 fn graph_fingerprint(conn: &Connection) -> (BTreeSet<EdgeKey>, BTreeMap<String, SymbolMetrics>) {
     let mut stmt = conn
         .prepare(
-            "SELECT from_symbol, to_symbol, call_site_line, edge_confidence, edge_kind, \
-                    from_path, to_path FROM call_edges",
+            "SELECT ce.from_symbol, ce.to_symbol, ce.call_site_line, ce.edge_confidence, \
+                    ce.edge_kind, ce.from_path, ce.to_path, ce.formal_source, \
+                    ce.evidence_state, ce.ruled_out_by_scip, \
+                    cs.from_path, cs.enclosing_qn, cs.callee_name, cs.edge_kind, \
+                    cs.identity_version, cs.callee_start_byte, cs.callee_end_byte, fi.hash, \
+                    ep.provider, ep.provider_fingerprint, ep.context_fingerprint, \
+                    ep.source_file_hash, ep.callee_start_byte, ep.callee_end_byte, \
+                    ep.definition_snapshot, ep.call_site_identity_version, \
+                    CASE WHEN ep.id IS NULL THEN NULL \
+                         WHEN ep.graph_generation = graph.generation THEN 1 ELSE 0 END, \
+                    ep.status \
+             FROM call_edges ce \
+             LEFT JOIN call_sites cs ON cs.id = ce.call_site_id \
+             LEFT JOIN file_index fi ON fi.path = cs.from_path \
+              LEFT JOIN external_proofs ep \
+                ON ep.call_site_id = cs.id AND ep.to_symbol = ce.to_symbol \
+              LEFT JOIN graph_generation_state graph ON graph.id = 1",
         )
         .unwrap();
     let edges: BTreeSet<EdgeKey> = stmt
         .query_map([], |r| {
-            Ok((
-                r.get(0)?,
-                r.get(1)?,
-                r.get(2)?,
-                r.get(3)?,
-                r.get(4)?,
-                r.get(5)?,
-                r.get(6)?,
-            ))
+            let from_symbol: String = r.get(0)?;
+            let to_symbol: String = r.get(1)?;
+            let ruled_out_by_scip = r.get::<_, i64>(9)? != 0;
+            let call_site_path: Option<String> = r.get(10)?;
+            let enclosing_symbol: Option<String> = r.get(11)?;
+            let callee_name: Option<String> = r.get(12)?;
+            let call_site_edge_kind: Option<String> = r.get(13)?;
+            let call_site_identity_version: Option<i64> = r.get(14)?;
+            let callee_start_byte: Option<i64> = r.get(15)?;
+            let callee_end_byte: Option<i64> = r.get(16)?;
+            let call_site_source_file_hash: Option<String> = r.get(17)?;
+            let call_site = call_site_path.map(|path| CallSiteKey {
+                path,
+                enclosing_symbol: enclosing_symbol.unwrap_or_default(),
+                callee_name: callee_name.unwrap_or_default(),
+                edge_kind: call_site_edge_kind.unwrap_or_default(),
+                identity_version: call_site_identity_version.unwrap_or_default(),
+                callee_start_byte,
+                callee_end_byte,
+                source_file_hash: call_site_source_file_hash,
+            });
+            let provider: Option<String> = r.get(18)?;
+            let provider_fingerprint: Option<String> = r.get(19)?;
+            let context_fingerprint: Option<String> = r.get(20)?;
+            let proof_source_file_hash: Option<String> = r.get(21)?;
+            let proof_callee_start_byte: Option<i64> = r.get(22)?;
+            let proof_callee_end_byte: Option<i64> = r.get(23)?;
+            let definition_snapshot: Option<String> = r.get(24)?;
+            let proof_call_site_identity_version: Option<i64> = r.get(25)?;
+            let generation_is_current: Option<i64> = r.get(26)?;
+            let proof_status: Option<String> = r.get(27)?;
+            let proof = provider.map(|provider| ProofKey {
+                provider,
+                provider_fingerprint: provider_fingerprint.unwrap_or_default(),
+                context_fingerprint: context_fingerprint.unwrap_or_default(),
+                source_file_hash: proof_source_file_hash.unwrap_or_default(),
+                callee_start_byte: proof_callee_start_byte,
+                callee_end_byte: proof_callee_end_byte,
+                definition_snapshot,
+                call_site_identity_version: proof_call_site_identity_version.unwrap_or_default(),
+                generation_is_current: generation_is_current == Some(1),
+                status: proof_status.unwrap_or_default(),
+            });
+            Ok(EdgeKey {
+                from_symbol,
+                ruled_out_target: ruled_out_by_scip.then(|| to_symbol.clone()),
+                to_symbol,
+                call_site_line: r.get(2)?,
+                edge_confidence: r.get(3)?,
+                edge_kind: r.get(4)?,
+                from_path: r.get(5)?,
+                to_path: r.get(6)?,
+                formal_source: r.get(7)?,
+                evidence_state: r.get(8)?,
+                ruled_out_by_scip,
+                call_site,
+                proof,
+            })
         })
         .unwrap()
         .map(|r| r.unwrap())
@@ -359,9 +454,9 @@ fn run_rounds_for_seed(seed: u64, incremental: bool) {
         "generated seed symbols missing from index — harness would be vacuous"
     );
     assert!(
-        edges
-            .iter()
-            .any(|(from, ..)| from.ends_with("::gen_alpha") || from.ends_with("::GenAlpha")),
+        edges.iter().any(|edge| {
+            edge.from_symbol.ends_with("::gen_alpha") || edge.from_symbol.ends_with("::GenAlpha")
+        }),
         "no call edges from generated seed files — harness would be vacuous"
     );
 
@@ -433,6 +528,116 @@ fn fresh_index_is_deterministic_on_identical_tree() {
     let db_1 = index_fresh(&root);
     let db_2 = index_fresh(&root);
     assert_graph_equal(&db_1, &db_2, "determinism: fresh vs fresh, same tree");
+}
+
+/// D4 acceptance #11: deterministic exact SCIP evidence must be part of the
+/// observable fingerprint, not an overlay-free exception.
+#[test]
+fn deterministic_scip_proofs_have_identical_fresh_fingerprints() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("ws");
+    copy_dir_recursive(&fixture_root(), &root);
+    enable_incremental_graph(&root);
+    let mut a = index_fresh(&root);
+    write_seed_files(&root);
+    assert_eq!(
+        reindex_continued(&mut a, &root).graph_mode,
+        GraphMode::Incremental
+    );
+    let b = index_fresh(&root);
+    for conn in [&a, &b] {
+        let (from_path, call_line, start, end, source_hash, to_symbol, def_path, def_line):
+            (String, i64, i64, i64, String, String, String, i64) = conn.query_row(
+                "SELECT cs.from_path, cs.call_line, cs.callee_start_byte, cs.callee_end_byte, fi.hash,
+                        ce.to_symbol, target.path, target.line_start
+                 FROM call_edges ce JOIN call_sites cs ON cs.id = ce.call_site_id
+                 JOIN file_index fi ON fi.path = cs.from_path
+                 JOIN symbols target ON target.qualified_name = ce.to_symbol
+                 WHERE cs.identity_version >= 2 AND cs.edge_kind = 'call'
+                 ORDER BY cs.from_path, cs.callee_start_byte LIMIT 1", [],
+                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?)),
+            ).unwrap();
+        let generation: i64 = conn
+            .query_row(
+                "SELECT generation FROM graph_generation_state WHERE id=1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let occurrences = vec![
+            calm_core::scip::parse::ScipOccurrence {
+                file: def_path,
+                line: def_line as usize,
+                start_byte: None,
+                end_byte: None,
+                source_file_hash: None,
+                symbol: "deterministic".into(),
+                is_def: true,
+                is_local: false,
+            },
+            calm_core::scip::parse::ScipOccurrence {
+                file: from_path,
+                line: call_line as usize,
+                start_byte: Some(start as usize),
+                end_byte: Some(end as usize),
+                source_file_hash: Some(source_hash),
+                symbol: "deterministic".into(),
+                is_def: false,
+                is_local: false,
+            },
+        ];
+        let context = calm_core::scip::ingest::ExternalProofContext::new(
+            "scip:deterministic",
+            "fixture",
+            "context",
+        )
+        .at_graph_generation(generation);
+        calm_core::scip::ingest::ingest_occurrences_with_proof_context(
+            conn,
+            &occurrences,
+            false,
+            Some(&context),
+        )
+        .unwrap();
+        assert!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM external_proofs WHERE to_symbol=?1",
+                [&to_symbol],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap()
+                > 0
+        );
+    }
+    assert_graph_equal(&a, &b, "deterministic SCIP fresh runs");
+
+    let before_stale_context = graph_fingerprint(&a);
+    a.execute(
+        "UPDATE external_proofs
+         SET context_fingerprint = 'changed-context', graph_generation = -1, status = 'stale'
+         WHERE provider = 'scip:deterministic'",
+        [],
+    )
+    .unwrap();
+    assert_ne!(
+        graph_fingerprint(&a),
+        before_stale_context,
+        "a stale proof with changed provider context must change the canonical fingerprint"
+    );
+
+    let before_proof_span = graph_fingerprint(&a);
+    a.execute(
+        "UPDATE external_proofs
+         SET callee_start_byte = callee_start_byte + 1
+         WHERE provider = 'scip:deterministic'",
+        [],
+    )
+    .unwrap();
+    assert_ne!(
+        graph_fingerprint(&a),
+        before_proof_span,
+        "a proof byte-span change must change the canonical fingerprint"
+    );
 }
 
 /// T5 (docs/plans/2026-07-13-phase-b-incremental-graph-update.md §4): turns

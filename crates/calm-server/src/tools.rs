@@ -1083,12 +1083,150 @@ mod tests {
         );
     }
 
-    /// Regression: `get_info()` used to build `ServerInfo` with
-    /// `..Default::default()`, which leaves `capabilities.tools` as `None`.
-    /// A spec-compliant MCP client only calls `tools/list` when the server
-    /// advertises the `tools` capability in `initialize` — with it absent,
-    /// every tool this server implements silently never gets discovered,
-    /// even though `tools/list` itself answers correctly if ever called.
+    /// D4 contract: the hand-written TypeScript status mirror must keep the
+    /// committed IdentityMigrationStatusOutput fields, requiredness, and
+    /// primitive types from the generated indexing_status toolsnap.
+    #[test]
+    fn typescript_identity_migration_mirror_matches_committed_toolsnap() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let snapshot = std::fs::read_to_string(
+            root.join("crates/calm-server/src/__toolsnaps__/indexing_status.snap"),
+        )
+        .expect("committed indexing_status toolsnap");
+        let schema: serde_json::Value =
+            serde_json::from_str(&snapshot).expect("valid indexing_status toolsnap JSON");
+        let output_schema = schema
+            .pointer("/outputSchema")
+            .and_then(serde_json::Value::as_object)
+            .expect("indexing_status output schema");
+        let output_properties = output_schema
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .expect("indexing_status output properties");
+        let output_required: std::collections::BTreeSet<&str> = output_schema
+            .get("required")
+            .and_then(serde_json::Value::as_array)
+            .map(|fields| {
+                fields
+                    .iter()
+                    .map(|value| value.as_str().expect("required output field name"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let outer_migration = output_properties
+            .get("identity_migration")
+            .and_then(serde_json::Value::as_object)
+            .expect("identity_migration output property");
+        assert!(
+            !output_required.contains("identity_migration"),
+            "identity_migration must remain optional in the MCP output"
+        );
+        let outer_variants = outer_migration
+            .get("anyOf")
+            .and_then(serde_json::Value::as_array)
+            .expect("nullable identity_migration schema variants");
+        assert!(
+            outer_variants.iter().any(|variant| {
+                variant.get("$ref").and_then(serde_json::Value::as_str)
+                    == Some("#/$defs/IdentityMigrationStatusOutput")
+            }),
+            "identity_migration must reference IdentityMigrationStatusOutput"
+        );
+        assert!(
+            outer_variants.iter().any(|variant| {
+                variant.get("type").and_then(serde_json::Value::as_str) == Some("null")
+            }),
+            "identity_migration schema must remain nullable when absent"
+        );
+        let identity_schema = schema
+            .pointer("/outputSchema/$defs/IdentityMigrationStatusOutput")
+            .and_then(serde_json::Value::as_object)
+            .expect("identity migration output schema");
+        let properties = identity_schema
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .expect("identity migration properties");
+        let required: std::collections::BTreeSet<&str> = identity_schema
+            .get("required")
+            .and_then(serde_json::Value::as_array)
+            .expect("identity migration required fields")
+            .iter()
+            .map(|value| value.as_str().expect("required field name"))
+            .collect();
+
+        let types = std::fs::read_to_string(root.join("types/mcp_types.ts"))
+            .expect("checked-in TypeScript MCP mirror");
+        let (_, after_marker) = types
+            .split_once("  identity_migration?: {")
+            .expect("identity_migration TypeScript block");
+        let (identity_block, _) = after_marker
+            .split_once("\n  };")
+            .expect("end of identity_migration TypeScript block");
+
+        let mut mirror = std::collections::BTreeMap::new();
+        for line in identity_block.lines() {
+            let line = line.trim();
+            let Some((field, ty)) = line.strip_suffix(';').and_then(|line| line.split_once(':'))
+            else {
+                continue;
+            };
+            let optional = field.ends_with('?');
+            let field = field.trim_end_matches('?');
+            assert!(
+                mirror.insert(field, (optional, ty.trim())).is_none(),
+                "duplicate TypeScript identity_migration field {field}"
+            );
+        }
+
+        let snapshot_fields: std::collections::BTreeSet<&str> =
+            properties.keys().map(String::as_str).collect();
+        let mirror_fields: std::collections::BTreeSet<&str> = mirror.keys().copied().collect();
+        assert_eq!(
+            mirror_fields, snapshot_fields,
+            "TypeScript identity_migration fields must match the committed toolsnap"
+        );
+
+        for (field, property) in properties {
+            let (optional, ts_type) = mirror
+                .get(field.as_str())
+                .expect("field set equality checked above");
+            assert_eq!(
+                !optional,
+                required.contains(field.as_str()),
+                "{field}: TypeScript optionality must match the committed toolsnap"
+            );
+
+            let schema_types: Vec<&str> = match property.get("type") {
+                Some(serde_json::Value::String(ty)) => vec![ty],
+                Some(serde_json::Value::Array(types)) => types
+                    .iter()
+                    .map(|ty| ty.as_str().expect("schema primitive type"))
+                    .collect(),
+                other => panic!("{field}: unsupported schema type {other:?}"),
+            };
+            if schema_types.contains(&"integer") {
+                assert_eq!(
+                    *ts_type, "number",
+                    "{field}: integer schema field must be a TypeScript number"
+                );
+            } else if schema_types.contains(&"string") {
+                assert!(
+                    *ts_type == "string"
+                        || ts_type.split('|').all(|member| {
+                            let member = member.trim();
+                            member.len() >= 2 && member.starts_with('"') && member.ends_with('"')
+                        }),
+                    "{field}: string schema field must be a TypeScript string or string union"
+                );
+            } else {
+                panic!("{field}: unsupported identity_migration schema type {schema_types:?}");
+            }
+        }
+    }
+
+    /// Regression: get_info() used to build ServerInfo with a default
+    /// capability set, which leaves capabilities.tools absent. A compliant
+    /// MCP client then never calls tools/list.
     #[test]
     fn get_info_advertises_tools_capability() {
         use rmcp::ServerHandler;
@@ -5536,6 +5674,59 @@ mod tests {
         assert_eq!(v["files_indexed"], 1);
         assert_eq!(v["files_total"], 2, "both a.py and b.py exist on disk");
         assert_eq!(v["last_updated"], "2023-11-14T22:13:20Z");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn indexing_status_surfaces_external_proof_and_identity_migration_state() {
+        let dir = std::env::temp_dir().join(format!("ci_idxstatus_d4_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO identity_migration_state
+                    (id, target_version, status, started_at, duration_ms, rows_rebuilt,
+                     busy_retries, graph_generation)
+                 VALUES (1, 2, 'running', 1.0, 12, 7, 2, 9)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO call_sites
+                    (from_path, enclosing_qn, callee_name, call_line, callee_start_byte,
+                     callee_end_byte, identity_version, edge_kind)
+                 VALUES ('main.rs', 'main.rs::main', 'target', 1, 0, 6, 2, 'call')",
+                [],
+            )
+            .unwrap();
+            let call_site_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO external_proofs
+                    (call_site_id, to_symbol, provider, source_file_hash, callee_start_byte,
+                     callee_end_byte, provider_fingerprint, context_fingerprint, status, observed_at)
+                 VALUES (?1, 'lib.rs::target', 'scip:rust', 'h', 0, 6, 'p', 'c', 'fresh', 1.0)",
+                [call_site_id],
+            )
+            .unwrap();
+        }
+
+        let v = jv(
+            server.indexing_status(rmcp::handler::server::wrapper::Parameters(
+                IndexingStatusParams {
+                    retry_embeddings: false,
+                },
+            )),
+        );
+        assert_eq!(v["external_proofs"]["fresh"], 1);
+        assert_eq!(v["identity_migration"]["status"], "running");
+        assert_eq!(v["identity_migration"]["target_version"], 2);
+        assert_eq!(v["identity_migration"]["duration_ms"], 12);
+        assert_eq!(v["identity_migration"]["rows_rebuilt"], 7);
+        assert_eq!(v["identity_migration"]["busy_retries"], 2);
+        assert_eq!(v["identity_migration"]["graph_generation"], 9);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

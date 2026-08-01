@@ -44,12 +44,72 @@ impl CalmServer {
                 .query_row("SELECT MAX(last_indexed) FROM file_index", [], |r| r.get(0))
                 .ok()
                 .flatten();
+            let mut external_proofs = ExternalProofStatusOutput::default();
+            if let Ok(mut stmt) = conn.prepare(
+                "SELECT status, COUNT(*) FROM external_proofs GROUP BY status",
+            ) {
+                if let Ok(rows) = stmt.query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
+                }) {
+                    for row in rows.flatten() {
+                        match row.0.as_str() {
+                            "fresh" => external_proofs.fresh = row.1,
+                            "stale" => external_proofs.stale = row.1,
+                            "legacy" => external_proofs.legacy = row.1,
+                            "unverified" => external_proofs.unverified = row.1,
+                            "rejected" => external_proofs.rejected = row.1,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            let identity_migration = conn
+                .query_row(
+                    "SELECT target_version, status, started_at, completed_at, failed_at, failure_reason,
+                            duration_ms, rows_rebuilt, busy_retries, graph_generation
+                     FROM identity_migration_state WHERE id = 1",
+                    [],
+                    |row| {
+                        Ok(IdentityMigrationStatusOutput {
+                            target_version: row.get(0)?,
+                            status: row.get(1)?,
+                            started_at: row.get::<_, Option<f64>>(2)?.map(epoch_to_iso8601),
+                            completed_at: row.get::<_, Option<f64>>(3)?.map(epoch_to_iso8601),
+                            failed_at: row.get::<_, Option<f64>>(4)?.map(epoch_to_iso8601),
+                            failure_reason: row.get(5)?,
+                            duration_ms: row.get(6)?,
+                            rows_rebuilt: row.get(7)?,
+                            busy_retries: row.get(8)?,
+                            graph_generation: row.get(9)?,
+                        })
+                    },
+                )
+                .ok();
 
             if p.retry_embeddings {
                 self.retry_embeddings_if_failed();
             }
 
             let config = self.config();
+            #[cfg(feature = "lsp-overlay")]
+            let lsp_providers = [
+                ("rust", &calm_core::lsp::provider::RUST_ANALYZER, &config.rust.lsp),
+                ("go", &calm_core::lsp::provider::GOPLS, &config.go.lsp),
+                ("c", &calm_core::lsp::provider::CLANGD, &config.clang.lsp),
+            ].into_iter().map(|(lang, provider, provider_cfg)| {
+                let runtime = calm_core::lsp::provider::runtime_status(
+                    provider, provider_cfg, &self.project_root, "not_run", 0,
+                );
+                LspProviderStatusOutput {
+                    lang: lang.into(), support_level: runtime.support_level,
+                    binary: runtime.binary, version: runtime.version,
+                    profile_fingerprint: runtime.profile_fingerprint,
+                    context_fingerprint: runtime.context_fingerprint,
+                    status: runtime.run_status, reason: runtime.reason,
+                }
+            }).collect();
+            #[cfg(not(feature = "lsp-overlay"))]
+            let lsp_providers: Vec<LspProviderStatusOutput> = Vec::new();
             let files_total: i64 = {
                 let mut discovered = Vec::new();
                 calm_core::indexer::pipeline::collect_source_files(
@@ -114,9 +174,12 @@ impl CalmServer {
                 embeddings_error,
                 edges_ready: self.edges_ready(),
                 last_updated: last_updated.map(epoch_to_iso8601),
+                external_proofs,
+                identity_migration,
                 graph_mode: self.last_graph_mode.read_ok().clone(),
                 scip_overlay,
                 scip_overlays,
+                lsp_providers,
                 formal_resolution_timeouts: calm_core::indexer::pipeline::formal_resolution_timeout_count(),
                 #[cfg(feature = "scip-overlay")]
                 scip_stack_graphs_overrides: Some(
@@ -621,6 +684,13 @@ pub(crate) struct IndexingStatusOutput {
     pub(crate) edges_ready: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) last_updated: Option<String>,
+    /// D4 proof freshness, grouped by persisted evidence state. A formal edge
+    /// is only current external proof when its corresponding record is fresh.
+    pub(crate) external_proofs: ExternalProofStatusOutput,
+    /// Diagnostic state of the one-transaction CallSite identity migration.
+    /// Absent until a legacy database actually requires that migration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) identity_migration: Option<IdentityMigrationStatusOutput>,
     /// Which graph-rebuild path the most recent non-noop reindex took:
     /// `"full"`, `"incremental"`, or `"full_fallback:<reason>"` (Phase B
     /// L6 — `GraphMode::label`). Absent until this process has served one
@@ -647,6 +717,9 @@ pub(crate) struct IndexingStatusOutput {
     /// `scip_overlay` being absent for the config reason.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub(crate) scip_overlays: Vec<PerLanguageOverlayStatus>,
+    /// Current LSP provider probe/profile evidence. No automatic LSP session is
+    /// started here: `status=not_run` remains honest until `lsp_refresh` runs.
+    pub(crate) lsp_providers: Vec<LspProviderStatusOutput>,
     /// ADR-A1: count of formal-resolution (StackGraph tier-3) cancellations
     /// since this process started -- see `calm_core::indexer::pipeline::
     /// formal_resolution_timeout_count`. A cancelled resolution (hit
@@ -678,6 +751,51 @@ pub(crate) struct IndexingStatusOutput {
     pub(crate) orphaned_stack_graphs_edges: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) suggested_next: Option<SuggestedNext>,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub(crate) struct LspProviderStatusOutput {
+    pub(crate) lang: String,
+    pub(crate) support_level: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) binary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) version: Option<String>,
+    pub(crate) profile_fingerprint: String,
+    pub(crate) context_fingerprint: String,
+    pub(crate) status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) reason: Option<String>,
+}
+
+#[derive(Default, Serialize, JsonSchema)]
+pub(crate) struct ExternalProofStatusOutput {
+    pub(crate) fresh: u64,
+    pub(crate) stale: u64,
+    pub(crate) legacy: u64,
+    pub(crate) unverified: u64,
+    pub(crate) rejected: u64,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub(crate) struct IdentityMigrationStatusOutput {
+    pub(crate) target_version: i64,
+    pub(crate) status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) started_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) completed_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) failed_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) failure_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) duration_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) rows_rebuilt: Option<i64>,
+    pub(crate) busy_retries: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) graph_generation: Option<i64>,
 }
 
 /// Local mirror of `calm_core::scip::OverlayStatus` — that type lives in
@@ -812,7 +930,7 @@ impl PerLanguageOverlayStatus {
 fn scip_install_hint(lang: &str) -> Option<String> {
     let hint = match lang {
         "rust" => "rustup component add rust-analyzer",
-        "go" => "go install github.com/scip-code/scip-go/cmd/scip-go@latest",
+        "go" => "go install github.com/scip-code/scip-go/cmd/scip-go@v0.2.7",
         "python" => {
             "install Node.js/npm — scip-python bootstraps itself via `npx` once they're on PATH"
         }

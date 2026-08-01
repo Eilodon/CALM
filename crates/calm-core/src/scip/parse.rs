@@ -8,6 +8,14 @@ pub struct ScipOccurrence {
     pub file: String,
     /// 1-based line of the occurrence start.
     pub line: usize,
+    /// Zero-based, half-open UTF-8 byte span when the SCIP document provides a
+    /// usable source range and position encoding. `None` fails closed during
+    /// call-site matching; legacy line-only consumers may still inspect `line`.
+    pub start_byte: Option<usize>,
+    pub end_byte: Option<usize>,
+    /// Hash of the exact source text used to turn SCIP's line/character range
+    /// into the byte span. It is a freshness precondition, never a CallSite key.
+    pub source_file_hash: Option<String>,
     /// SCIP symbol moniker (opaque identity string).
     pub symbol: String,
     pub is_def: bool,
@@ -28,6 +36,10 @@ pub fn parse_index(
     let project_root = file_uri_to_path(&index.metadata.project_root);
     let mut out = Vec::new();
     for doc in &index.documents {
+        let source = document_source(doc, project_root.as_deref());
+        let source_hash = source
+            .as_deref()
+            .map(crate::indexer::pipeline::hash_content);
         for occ in &doc.occurrences {
             // SCIP range is [startLine, startChar, endLine, endChar] (0-based) or
             // [startLine, startChar, endChar] when single-line.
@@ -43,9 +55,15 @@ pub fn parse_index(
             } else {
                 doc.relative_path.as_str()
             };
+            let byte_range = source.as_deref().and_then(|source| {
+                occurrence_byte_range(source, occ, doc.position_encoding.enum_value().ok()?)
+            });
             out.push(ScipOccurrence {
                 file: rebase_path(relative, rebase_prefix),
                 line: (start_line as usize) + 1,
+                start_byte: byte_range.map(|(start, _)| start),
+                end_byte: byte_range.map(|(_, end)| end),
+                source_file_hash: byte_range.as_ref().map(|_| source_hash.clone()).flatten(),
                 symbol: occ.symbol.clone(),
                 is_def,
                 is_local: occ.symbol.starts_with("local "),
@@ -53,6 +71,129 @@ pub fn parse_index(
         }
     }
     out
+}
+
+/// Prefer embedded SCIP document text; otherwise read the document from the
+/// protocol's project root, exactly as SCIP specifies for consumers. Failed or
+/// non-UTF-8 reads are deliberately represented as `None` so range matching
+/// cannot fall back to a lossy line-only approximation.
+fn document_source(
+    doc: &scip::types::Document,
+    project_root: Option<&std::path::Path>,
+) -> Option<String> {
+    if !doc.text.is_empty() {
+        return Some(doc.text.clone());
+    }
+    let path = if std::path::Path::new(&doc.relative_path).is_absolute() {
+        std::path::PathBuf::from(&doc.relative_path)
+    } else {
+        project_root?.join(&doc.relative_path)
+    };
+    std::fs::read_to_string(path).ok()
+}
+
+/// Resolve a SCIP half-open range to absolute UTF-8 byte offsets. Typed ranges
+/// have protocol precedence; malformed, multi-line, unknown-encoding, or
+/// non-boundary positions fail closed rather than becoming a line-key match.
+fn occurrence_byte_range(
+    source: &str,
+    occurrence: &scip::types::Occurrence,
+    encoding: scip::types::PositionEncoding,
+) -> Option<(usize, usize)> {
+    let (start_line, start_character, end_line, end_character) = occurrence_range(occurrence)?;
+    let start = byte_offset_at(source, start_line, start_character, encoding)?;
+    let end = byte_offset_at(source, end_line, end_character, encoding)?;
+    (start <= end).then_some((start, end))
+}
+
+fn occurrence_range(occurrence: &scip::types::Occurrence) -> Option<(usize, usize, usize, usize)> {
+    use scip::types::occurrence::Typed_range;
+
+    let to_usize = |n: i32| usize::try_from(n).ok();
+    match occurrence.typed_range.as_ref() {
+        Some(Typed_range::SingleLineRange(range)) => Some((
+            to_usize(range.line)?,
+            to_usize(range.start_character)?,
+            to_usize(range.line)?,
+            to_usize(range.end_character)?,
+        )),
+        Some(Typed_range::MultiLineRange(range)) => Some((
+            to_usize(range.start_line)?,
+            to_usize(range.start_character)?,
+            to_usize(range.end_line)?,
+            to_usize(range.end_character)?,
+        )),
+        Some(_) => None,
+        None => match occurrence.range.as_slice() {
+            [start_line, start_character, end_character] => Some((
+                to_usize(*start_line)?,
+                to_usize(*start_character)?,
+                to_usize(*start_line)?,
+                to_usize(*end_character)?,
+            )),
+            [start_line, start_character, end_line, end_character] => Some((
+                to_usize(*start_line)?,
+                to_usize(*start_character)?,
+                to_usize(*end_line)?,
+                to_usize(*end_character)?,
+            )),
+            _ => None,
+        },
+    }
+}
+
+fn byte_offset_at(
+    source: &str,
+    line: usize,
+    character: usize,
+    encoding: scip::types::PositionEncoding,
+) -> Option<usize> {
+    use scip::types::PositionEncoding;
+
+    let line_start = if line == 0 {
+        0
+    } else {
+        source.match_indices('\n').nth(line - 1)?.0 + 1
+    };
+    let line_end = source[line_start..]
+        .find('\n')
+        .map(|offset| line_start + offset)
+        .unwrap_or(source.len());
+    let line_text = &source[line_start..line_end];
+    let relative = match encoding {
+        PositionEncoding::UTF8CodeUnitOffsetFromLineStart => (character <= line_text.len()
+            && line_text.is_char_boundary(character))
+        .then_some(character),
+        PositionEncoding::UTF16CodeUnitOffsetFromLineStart => {
+            offset_for_units(line_text, character, |character| character.len_utf16())
+        }
+        PositionEncoding::UTF32CodeUnitOffsetFromLineStart => {
+            offset_for_units(line_text, character, |_| 1)
+        }
+        PositionEncoding::UnspecifiedPositionEncoding => None,
+    }?;
+    Some(line_start + relative)
+}
+
+fn offset_for_units(
+    text: &str,
+    wanted_units: usize,
+    units_for: impl Fn(char) -> usize,
+) -> Option<usize> {
+    let mut units = 0;
+    if wanted_units == 0 {
+        return Some(0);
+    }
+    for (byte, character) in text.char_indices() {
+        if units == wanted_units {
+            return Some(byte);
+        }
+        units = units.checked_add(units_for(character))?;
+        if units > wanted_units {
+            return None;
+        }
+    }
+    (units == wanted_units).then_some(text.len())
 }
 
 /// Join `prefix` onto a (already project-root-relative) SCIP path and
@@ -173,6 +314,10 @@ mod tests {
         let mut index = scip::types::Index::new();
         let mut doc = scip::types::Document::new();
         doc.relative_path = "core/src/engine.rs".into();
+        doc.text = "\n\n    start\n\n\n\n        start\n".into();
+        doc.position_encoding = protobuf::EnumOrUnknown::new(
+            scip::types::PositionEncoding::UTF8CodeUnitOffsetFromLineStart,
+        );
         let mut def = scip::types::Occurrence::new();
         def.range = vec![2, 4, 2, 7]; // line 2 (0-based), cols
         def.symbol = "rust-analyzer cargo demo-core 0.1.0 engine/impl#[Engine]start().".into();
@@ -188,6 +333,9 @@ mod tests {
         let def = occ.iter().find(|o| o.is_def).unwrap();
         assert_eq!(def.file, "core/src/engine.rs");
         assert_eq!(def.line, 3); // 1-based
+        assert_eq!(def.start_byte, Some(6));
+        assert_eq!(def.end_byte, Some(9));
+        assert!(def.source_file_hash.is_some());
         assert_eq!(
             def.symbol,
             "rust-analyzer cargo demo-core 0.1.0 engine/impl#[Engine]start()."

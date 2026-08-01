@@ -490,6 +490,28 @@ export interface IndexingStatusOutput {
     edges_indexed: number | null;
   };
   last_updated: string;
+  /** Persisted external proof records by D4 freshness state. Only `fresh`
+   * records represent current external formal evidence. */
+  external_proofs: {
+    fresh: number;
+    stale: number;
+    legacy: number;
+    unverified: number;
+    rejected: number;
+  };
+  /** Present only when the D4 CallSite identity migration has been needed. */
+  identity_migration?: {
+    target_version: number;
+    status: "pending" | "running" | "baseline_ready" | "failed";
+    started_at?: string;
+    completed_at?: string;
+    failed_at?: string;
+    failure_reason?: string;
+    duration_ms?: number;
+    rows_rebuilt?: number;
+    busy_retries: number;
+    graph_generation?: number;
+  };
   /** Which graph-rebuild path the most recent non-noop reindex took:
    * "full" | "incremental" | "full_fallback:<reason>" (Phase B L6). Absent
    * until this process has served one non-noop reindex. */

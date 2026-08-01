@@ -129,9 +129,9 @@ fn stderr_tail(path: &Path) -> String {
 pub const GO_SCIP_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// Resolve a usable `scip-go` binary: an explicit override, then `PATH`, then
-/// `$HOME/go/bin` and `$GOBIN` (where `go install .../scip-go@latest` lands
-/// when neither is already on `PATH` — the common case for a freshly
-/// installed toolchain).
+/// `$HOME/go/bin` and `$GOBIN` (where a version-pinned `go install
+/// .../scip-go@v0.2.7` lands when neither is already on `PATH`). The hosted
+/// release lane instead downloads that exact version and verifies its SHA-256.
 pub fn go_resolve_binary(override_bin: Option<&str>, _root: &Path) -> Option<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Some(b) = override_bin {

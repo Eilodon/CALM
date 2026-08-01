@@ -45,6 +45,11 @@ pub struct SqlReference {
     pub enclosing_qn: String,
     pub target_name: String,
     pub line: i64,
+    /// Zero-based, half-open UTF-8 byte range of the final target identifier
+    /// in the source file. This mirrors `RawCall`'s selected-callee span:
+    /// `schema.users` identifies `users`, not the whole qualified expression.
+    pub callee_start_byte: usize,
+    pub callee_end_byte: usize,
     pub confidence: EdgeConfidence,
     /// `"reference"` for FROM/JOIN (this object reads another), `"call"` for
     /// CALL/EXEC(UTE) (this object invokes another) — see
@@ -79,7 +84,7 @@ pub fn extract_sql_file(rel: &str, source: &str) -> SqlFile {
     let mut references: Vec<SqlReference> = Vec::new();
     let mut seen_qn: HashSet<String> = HashSet::new();
 
-    for (stmt_text, start_line) in split_statements(source) {
+    for (stmt_text, start_line, stmt_start_byte) in split_statements(source) {
         if stmt_text.is_empty() {
             continue;
         }
@@ -118,7 +123,12 @@ pub fn extract_sql_file(rel: &str, source: &str) -> SqlFile {
             arity: None,
             arity_variadic: false,
         });
-        references.extend(scan_references(&stmt_text, &qn, start_line));
+        references.extend(scan_references(
+            &stmt_text,
+            &qn,
+            start_line,
+            stmt_start_byte,
+        ));
     }
 
     // Same-file membership → Resolved (see doc comment above). Computed as a
@@ -201,12 +211,18 @@ fn create_header_regex() -> &'static Regex {
 /// over raw text rather than walking `sqlparser`'s typed `Query`/body AST —
 /// see the module doc comment for why a structural walk doesn't generalize
 /// across dialects here the way it does for the header.
-fn scan_references(stmt_text: &str, enclosing_qn: &str, start_line: usize) -> Vec<SqlReference> {
+fn scan_references(
+    stmt_text: &str,
+    enclosing_qn: &str,
+    start_line: usize,
+    stmt_start_byte: usize,
+) -> Vec<SqlReference> {
     let mut out = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     for caps in reference_regex().captures_iter(stmt_text) {
         let keyword = caps.get(1).unwrap().as_str().to_ascii_uppercase();
-        let target = last_segment(caps.get(2).unwrap().as_str());
+        let target_match = caps.get(2).unwrap();
+        let target = last_segment(target_match.as_str());
         if target.is_empty() || target.eq_ignore_ascii_case(enclosing_qn) {
             continue;
         }
@@ -221,10 +237,14 @@ fn scan_references(stmt_text: &str, enclosing_qn: &str, start_line: usize) -> Ve
         }
         let offset = caps.get(0).unwrap().start();
         let line = start_line as i64 + stmt_text[..offset].matches('\n').count() as i64;
+        let callee_end_byte = stmt_start_byte + target_match.end();
+        let callee_start_byte = callee_end_byte - target.len();
         out.push(SqlReference {
             enclosing_qn: enclosing_qn.to_string(),
             target_name: target,
             line,
+            callee_start_byte,
+            callee_end_byte,
             confidence: EdgeConfidence::Textual,
             edge_kind,
         });
@@ -295,7 +315,7 @@ fn unique_qualified_name(rel: &str, name: &str, line: usize, seen: &mut HashSet<
 /// bodies (`$$...$$` / `$tag$...$tag$`) — a `;` inside a function body (very
 /// common: `$$ SELECT ...; $$`) must never be treated as a statement
 /// boundary. A trailing statement with no closing `;` is still included.
-fn split_statements(source: &str) -> Vec<(String, usize)> {
+fn split_statements(source: &str) -> Vec<(String, usize, usize)> {
     #[derive(PartialEq)]
     enum State {
         Normal,
@@ -309,14 +329,16 @@ fn split_statements(source: &str) -> Vec<(String, usize)> {
     let mut out = Vec::new();
     let mut buf = String::new();
     let mut stmt_start_line = 1usize;
+    let mut stmt_start_byte = 0usize;
     let mut line = 1usize;
     let mut state = State::Normal;
     let mut dollar_tag = String::new();
     let mut chars = source.char_indices().peekable();
 
-    while let Some((_, c)) = chars.next() {
+    while let Some((byte, c)) = chars.next() {
         if buf.trim().is_empty() && !c.is_whitespace() {
             stmt_start_line = line;
+            stmt_start_byte = byte;
         }
         buf.push(c);
         if c == '\n' {
@@ -400,7 +422,7 @@ fn split_statements(source: &str) -> Vec<(String, usize)> {
                 }
                 ';' => {
                     buf.pop(); // drop the ';' just pushed at the top of the loop
-                    out.push((buf.trim().to_string(), stmt_start_line));
+                    out.push((buf.trim().to_string(), stmt_start_line, stmt_start_byte));
                     buf.clear();
                 }
                 _ => {}
@@ -409,7 +431,7 @@ fn split_statements(source: &str) -> Vec<(String, usize)> {
     }
     let trimmed = buf.trim();
     if !trimmed.is_empty() {
-        out.push((trimmed.to_string(), stmt_start_line));
+        out.push((trimmed.to_string(), stmt_start_line, stmt_start_byte));
     }
     out
 }
@@ -500,6 +522,11 @@ mod tests {
         assert_eq!(r.confidence, EdgeConfidence::Resolved);
         assert_eq!(r.edge_kind, "reference");
         assert!(r.enclosing_qn.ends_with("active_users"));
+        assert_eq!(
+            &src[r.callee_start_byte..r.callee_end_byte],
+            "users",
+            "SQL references must carry their exact UTF-8 callee span"
+        );
     }
 
     #[test]

@@ -554,8 +554,8 @@ fn ruby_gemfile_lock_hash(root: &Path) -> String {
 /// needs Bazel, and only `bazel-bootstrap` was apt-installable there, which
 /// itself needs building Bazel from source first). Neither blocker applies
 /// on a genuine GitHub Actions runner or an unrestricted dev sandbox: a real
-/// `sourcegraph/scip-clang` release binary downloads fine
-/// (`releases/latest/download/scip-clang-x86_64-linux`), its
+/// `sourcegraph/scip-clang` release binary downloads fine when pinned to
+/// `v0.4.0` with its checked SHA-256, its
 /// `--compdb-path`/`--index-output-path`/`-j` flags match
 /// `clang_build_command` below exactly, and it indexes a real fixture
 /// correctly — see `clang_overlay_upgrades_a_real_edge_on_the_c_fixture`

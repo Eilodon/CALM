@@ -58,13 +58,49 @@
           "match_rate": {
             "type": "number",
             "format": "double"
+          },
+          "status": {
+            "description": "Distinguishes a valid zero-yield run from an unavailable provider,\nno matching files/candidates, a cancelled run, or stale proof inputs.",
+            "type": "string"
+          },
+          "support_level": {
+            "description": "Qualification backed by CALM tests. `nightly-verified` is never inferred\nlocally; it requires the hosted pinned-provider lane.",
+            "type": "string"
+          },
+          "binary": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "version": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "profile_fingerprint": {
+            "type": "string"
+          },
+          "context_fingerprint": {
+            "type": "string"
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
           "lang",
           "upgraded",
           "attempted",
-          "match_rate"
+          "match_rate",
+          "status",
+          "support_level",
+          "profile_fingerprint",
+          "context_fingerprint"
         ]
       },
       "SuggestedNext": {

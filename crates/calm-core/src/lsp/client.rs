@@ -45,6 +45,39 @@ pub enum PositionEncoding {
     Utf16,
 }
 
+/// Reviewed launch and initialization contract for one LSP provider. Keeping
+/// this explicit prevents a provider's argv or language identity from becoming
+/// an implicit client default that cannot be audited with its proof.
+#[derive(Clone, Copy)]
+pub struct LspClientProfile {
+    pub server_args: &'static [&'static str],
+    pub language_id: fn(&Path) -> String,
+    pub initialization_options_json: Option<&'static str>,
+    pub include_workspace_folder: bool,
+}
+
+fn extension_language_id(path: &Path) -> String {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|ext| match ext {
+            "rs" => "rust",
+            "py" => "python",
+            "go" => "go",
+            "c" | "h" => "c",
+            "cpp" | "cc" | "cxx" | "hpp" | "hxx" | "hh" => "cpp",
+            other => other,
+        })
+        .unwrap_or("plaintext")
+        .to_string()
+}
+
+const DEFAULT_PROFILE: LspClientProfile = LspClientProfile {
+    server_args: &[],
+    language_id: extension_language_id,
+    initialization_options_json: None,
+    include_workspace_folder: true,
+};
+
 /// One `textDocument/definition` outcome, separating "server said nothing is
 /// there" from "server said ask again" so the overlay can retry the latter.
 #[derive(Debug)]
@@ -74,6 +107,7 @@ pub struct LspClient {
     request_timeout: Duration,
     /// Negotiated during `initialize` — see `PositionEncoding`.
     pub encoding: PositionEncoding,
+    language_id: fn(&Path) -> String,
 }
 
 impl LspClient {
@@ -82,7 +116,17 @@ impl LspClient {
     /// every individual request round-trip (the overlay adds its own overall
     /// pass budget on top).
     pub async fn spawn(bin: &Path, root: &Path, request_timeout: Duration) -> Result<Self> {
+        Self::spawn_with_profile(bin, root, request_timeout, DEFAULT_PROFILE).await
+    }
+
+    pub async fn spawn_with_profile(
+        bin: &Path,
+        root: &Path,
+        request_timeout: Duration,
+        profile: LspClientProfile,
+    ) -> Result<Self> {
         let mut child = Command::new(bin)
+            .args(profile.server_args)
             .current_dir(root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -107,19 +151,20 @@ impl LspClient {
             next_id: 1,
             request_timeout,
             encoding: PositionEncoding::Utf16, // LSP default until negotiated
+            language_id: profile.language_id,
         };
-        me.initialize(root).await?;
+        me.initialize(root, profile).await?;
         Ok(me)
     }
 
     #[allow(deprecated)] // `root_uri` is deprecated in favor of `workspace_folders`, but
     // rust-analyzer (and most servers) still honor it, and it's the simplest
     // correct single-root init for this overlay's one-shot session.
-    async fn initialize(&mut self, root: &Path) -> Result<()> {
+    async fn initialize(&mut self, root: &Path, profile: LspClientProfile) -> Result<()> {
         let root_uri = path_to_uri(root)?;
         let params = InitializeParams {
             process_id: Some(std::process::id()),
-            root_uri: Some(root_uri),
+            root_uri: Some(root_uri.clone()),
             capabilities: ClientCapabilities {
                 general: Some(GeneralClientCapabilities {
                     // Offer utf-8 first: rust-analyzer takes it (verified
@@ -134,9 +179,18 @@ impl LspClient {
             },
             ..Default::default()
         };
-        let result = self
-            .request("initialize", serde_json::to_value(params)?)
-            .await?;
+        let mut params = serde_json::to_value(params)?;
+        if profile.include_workspace_folder {
+            params["workspaceFolders"] = serde_json::json!([{
+                "uri": root_uri.as_str(),
+                "name": root.file_name().and_then(|name| name.to_str()).unwrap_or("workspace"),
+            }]);
+        }
+        if let Some(options) = profile.initialization_options_json {
+            params["initializationOptions"] = serde_json::from_str(options)
+                .context("invalid reviewed LSP initialization options JSON")?;
+        }
+        let result = self.request("initialize", params).await?;
         if let Ok(init) = serde_json::from_value::<InitializeResult>(result)
             && init.capabilities.position_encoding == Some(PositionEncodingKind::UTF8)
         {
@@ -153,25 +207,7 @@ impl LspClient {
     /// resolve positions against. The overlay's per-file grouping already
     /// guarantees at most one call per file per session.
     pub async fn open_file(&mut self, path: &Path, uri: &Uri, text: &str) -> Result<()> {
-        // LSP `languageId` per extension, covering every provider Phase D
-        // wires (rust-analyzer/gopls/clangd; python kept for future use even
-        // though no Python LSP overlay exists yet). Falls back to the LSP
-        // spec's own generic `"plaintext"` for an unmapped/missing
-        // extension rather than lying "rust" for a non-Rust file — the
-        // pre-generalization default this replaces (D.0, 2026-07-11).
-        let language_id = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|ext| match ext {
-                "rs" => "rust",
-                "py" => "python",
-                "go" => "go",
-                "c" | "h" => "c",
-                "cpp" | "cc" | "cxx" | "hpp" | "hxx" | "hh" => "cpp",
-                other => other,
-            })
-            .unwrap_or("plaintext")
-            .to_string();
+        let language_id = (self.language_id)(path);
         let params = DidOpenTextDocumentParams {
             text_document: TextDocumentItem {
                 uri: uri.clone(),
@@ -230,7 +266,17 @@ impl LspClient {
     pub async fn shutdown(&mut self) {
         let _ = self.request("shutdown", Value::Null).await;
         let _ = self.notify("exit", Value::Null).await;
-        let _ = self.child.kill().await;
+        // Closing stdin lets a well-behaved stdio server finish processing the
+        // final `exit` notification and flush any deterministic test/diagnostic
+        // transcript before we resort to a hard kill.
+        let _ = self.stdin.shutdown().await;
+        if tokio::time::timeout(Duration::from_millis(250), self.child.wait())
+            .await
+            .is_err()
+        {
+            let _ = self.child.kill().await;
+            let _ = self.child.wait().await;
+        }
     }
 
     async fn request(&mut self, method: &str, params: Value) -> Result<Value> {
@@ -255,17 +301,17 @@ impl LspClient {
                 })??;
             // A message WITH a `method` is never a response, even when its
             // id numerically collides with ours (rust-analyzer's own request
-            // ids start at 0 — observed colliding live). Requests get a
-            // `null` stub reply (verified sufficient live) so the server
-            // never stalls waiting on us; notifications are dropped.
+            // ids start at 0 — observed colliding live). Requests receive a
+            // reviewed, bounded reply; notifications are dropped.
             if let Some(m) = msg.get("method") {
                 if let Some(their_id) = msg.get("id").cloned() {
-                    tracing::debug!("stub-replying null to server request {m}");
-                    let reply = serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "id": their_id,
-                        "result": Value::Null,
-                    });
+                    let method = m.as_str().unwrap_or_default();
+                    let reply = server_request_reply(
+                        method,
+                        msg.get("params").cloned().unwrap_or(Value::Null),
+                        their_id,
+                    );
+                    tracing::debug!("replying to LSP server request {method}");
                     self.write_message(&reply).await?;
                 }
                 continue;
@@ -304,7 +350,8 @@ impl LspClient {
     }
 
     async fn read_message(&mut self) -> Result<Value> {
-        let mut content_length: Option<usize> = None;
+        const MAX_LSP_HEADER_BYTES: usize = 8 * 1024;
+        let mut headers = String::new();
         loop {
             let mut line = String::new();
             let n = self.stdout.read_line(&mut line).await?;
@@ -315,16 +362,79 @@ impl LspClient {
             if trimmed.is_empty() {
                 break; // blank line ends the header block
             }
-            if let Some(v) = trimmed.strip_prefix("Content-Length:") {
-                content_length = Some(v.trim().parse()?);
+            headers.push_str(trimmed);
+            headers.push('\n');
+            if headers.len() > MAX_LSP_HEADER_BYTES {
+                return Err(anyhow!("LSP header exceeds frame limit"));
             }
         }
-        let len =
-            content_length.ok_or_else(|| anyhow!("LSP message missing Content-Length header"))?;
+        let len = parse_content_length(&headers)?;
         let mut buf = vec![0u8; len];
         self.stdout.read_exact(&mut buf).await?;
         Ok(serde_json::from_slice(&buf)?)
     }
+}
+
+/// Parse LSP framing without allocating the declared body. The protocol allows
+/// arbitrary extension headers, but exactly one bounded `Content-Length` is
+/// mandatory and header names are case-insensitive.
+fn parse_content_length(headers: &str) -> Result<usize> {
+    const MAX_LSP_FRAME_BYTES: usize = 16 * 1024 * 1024;
+    let mut content_length = None;
+    for header in headers.lines() {
+        let Some((name, value)) = header.split_once(':') else {
+            continue;
+        };
+        if !name.eq_ignore_ascii_case("Content-Length") {
+            continue;
+        }
+        if content_length.is_some() {
+            return Err(anyhow!("LSP message has duplicate Content-Length headers"));
+        }
+        let len = value.trim().parse::<usize>()?;
+        if len > MAX_LSP_FRAME_BYTES {
+            return Err(anyhow!(
+                "LSP message exceeds frame limit of {MAX_LSP_FRAME_BYTES} bytes"
+            ));
+        }
+        content_length = Some(len);
+    }
+    content_length.ok_or_else(|| anyhow!("LSP message missing Content-Length header"))
+}
+
+/// Server requests are an input boundary. CALM supports only the reviewed,
+/// bounded no-op requests needed by provider profiles; it never executes a
+/// command or reads arbitrary configuration on a server's behalf.
+fn server_request_reply(method: &str, params: Value, id: Value) -> Value {
+    const MAX_CONFIGURATION_ITEMS: usize = 32;
+    let result = match method {
+        "workspace/configuration" => {
+            let Some(items) = params.get("items").and_then(Value::as_array) else {
+                return serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {"code": -32602, "message": "workspace/configuration requires items"},
+                });
+            };
+            if items.len() > MAX_CONFIGURATION_ITEMS {
+                return serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {"code": -32602, "message": "workspace/configuration item limit exceeded"},
+                });
+            }
+            Value::Array(vec![Value::Null; items.len()])
+        }
+        "client/registerCapability" => Value::Null,
+        _ => {
+            return serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": {"code": -32601, "message": "unsupported LSP server request"},
+            });
+        }
+    };
+    serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result})
 }
 
 /// Typed JSON-RPC error so callers can branch on `code` (e.g. `-32801`).
@@ -431,6 +541,64 @@ fn first_location(resp: GotoDefinitionResponse) -> Option<(Uri, u32)> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn deterministic_mock_server_exercises_initialize_configuration_and_definition() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("mock-lsp.sh");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+emit() { body="$1"; printf 'Content-Length: %s\r\n\r\n%s' "${#body}" "$body"; }
+emit '{"jsonrpc":"2.0","id":1,"result":{"capabilities":{"positionEncoding":"utf-8"}}}'
+emit '{"jsonrpc":"2.0","id":99,"method":"workspace/configuration","params":{"items":[{},{}]}}'
+emit '{"jsonrpc":"2.0","id":100,"method":"client/registerCapability","params":{"registrations":[]}}'
+emit '{"jsonrpc":"2.0","id":2,"result":{"uri":"file:///tmp/definition.rs","range":{"start":{"line":7,"character":0},"end":{"line":7,"character":1}}}}'
+emit '{"jsonrpc":"2.0","id":3,"result":null}'
+printf '%s\n' "$@" > "$0.args"
+cat > "$0.transcript"
+"#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+
+        let source = dir.path().join("sample.rs");
+        std::fs::write(&source, "fn caller() { target(); }\n").unwrap();
+        let uri = path_to_uri(&source).unwrap();
+        let profile = LspClientProfile {
+            server_args: &["--mock-profile"],
+            language_id: |_| "mock-rust".to_string(),
+            initialization_options_json: Some(r#"{"mockOption":true}"#),
+            include_workspace_folder: true,
+        };
+        let mut client =
+            LspClient::spawn_with_profile(&script, dir.path(), Duration::from_secs(1), profile)
+                .await
+                .unwrap();
+        client
+            .open_file(&source, &uri, "fn caller() { target(); }\n")
+            .await
+            .unwrap();
+        assert!(matches!(
+            client.definition(&uri, 0, 14).await.unwrap(),
+            DefinitionOutcome::Resolved(_, 7)
+        ));
+        client.shutdown().await;
+        assert_eq!(
+            std::fs::read_to_string(format!("{}.args", script.display())).unwrap(),
+            "--mock-profile\n"
+        );
+        let transcript =
+            std::fs::read_to_string(format!("{}.transcript", script.display())).unwrap();
+        assert!(transcript.contains("workspaceFolders"));
+        assert!(transcript.contains("initializationOptions"));
+        assert!(transcript.contains("mock-rust"));
+    }
+
     #[test]
     fn percent_encoding_round_trips_a_path_with_spaces() {
         let p = "/home/user/My Projects/repo/src/main.rs";
@@ -447,5 +615,25 @@ mod tests {
             uri_to_path(&uri).unwrap(),
             PathBuf::from("/tmp/with space/f.rs")
         );
+    }
+
+    #[test]
+    fn unknown_server_request_receives_protocol_error_not_successful_null() {
+        let reply = server_request_reply(
+            "workspace/executeCommand",
+            serde_json::json!({"command": "curl attacker.invalid"}),
+            serde_json::json!(7),
+        );
+
+        assert_eq!(reply["id"], 7);
+        assert_eq!(reply["error"]["code"], -32601);
+        assert!(reply.get("result").is_none());
+    }
+
+    #[test]
+    fn content_length_rejects_an_oversized_lsp_frame_before_allocation() {
+        let error = parse_content_length("Content-Length: 16777217\r\n\r\n")
+            .expect_err("a server must not be able to force an unbounded allocation");
+        assert!(error.to_string().contains("frame limit"));
     }
 }

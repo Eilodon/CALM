@@ -72,14 +72,18 @@ fn signature_returns_option_or_result(sig: &str) -> bool {
 /// parsed-but-not-yet-persisted files instead of an entire large repo.
 const PARSE_BATCH_SIZE: usize = 1000;
 
-/// A persisted call site loaded for graph rebuild:
-/// (from_path, enclosing_qn, callee_name, call_line, confidence, target_class,
-/// looks_option_or_result_chained, module_hint, edge_kind).
+/// A persisted call site loaded for graph rebuild. The leading id is the
+/// durable edge identity; byte spans are retained here for exact SCIP matching
+/// even though the resolver itself only needs the selected callee name.
 type CallSiteRow = (
+    i64,
     String,
     String,
     String,
     Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    i64,
     String,
     Option<String>,
     bool,
@@ -255,6 +259,9 @@ struct CallSiteData {
     enclosing_qn: String,
     callee: String,
     line: i64,
+    callee_start_byte: Option<i64>,
+    callee_end_byte: Option<i64>,
+    identity_version: i64,
     confidence: String,
     receiver: Option<String>,
     target_class: Option<String>,
@@ -381,6 +388,9 @@ fn extract_file_data(
                 enclosing_qn: r.enclosing_qn,
                 callee: r.target_name,
                 line: r.line,
+                callee_start_byte: Some(r.callee_start_byte as i64),
+                callee_end_byte: Some(r.callee_end_byte as i64),
+                identity_version: 2,
                 confidence: r.confidence.as_str().to_string(),
                 receiver: None,
                 target_class: None,
@@ -638,6 +648,9 @@ fn extract_file_data(
                 enclosing_qn: enc_qn.clone(),
                 callee,
                 line: c.line as i64,
+                callee_start_byte: Some(c.callee_start_byte as i64),
+                callee_end_byte: Some(c.callee_end_byte as i64),
+                identity_version: 2,
                 confidence: confidence.as_str().to_string(),
                 receiver: c.receiver.clone(),
                 target_class,
@@ -684,8 +697,8 @@ fn persist_file(
     insert_symbols_batch(tx, &extracted.symbols)?;
     insert_import_edges_batch(tx, &extracted.import_edges)?;
     let mut stmt = tx.prepare(
-        "INSERT INTO call_sites (from_path, enclosing_qn, callee_name, call_line, confidence, receiver, target_class, looks_option_or_result_chained, module_hint, edge_kind, arg_count) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        "INSERT INTO call_sites (from_path, enclosing_qn, callee_name, call_line, callee_start_byte, callee_end_byte, identity_version, confidence, receiver, target_class, looks_option_or_result_chained, module_hint, edge_kind, arg_count) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
     )?;
     for c in &extracted.call_sites {
         stmt.execute(rusqlite::params![
@@ -693,6 +706,9 @@ fn persist_file(
             c.enclosing_qn,
             c.callee,
             c.line,
+            c.callee_start_byte,
+            c.callee_end_byte,
+            c.identity_version,
             c.confidence,
             c.receiver,
             c.target_class,
@@ -857,7 +873,9 @@ fn build_resolution_context<'a>(
 /// the query planner prefer an index instead (exactly what incremental's
 /// delta-scoped load does) — see Phase B plan A-3.
 fn resolve_sites_to_edges(ctx: &ResolutionCtx, sites: &[CallSiteRow]) -> Vec<CallEdge> {
-    // One edge per (caller, callee, call-site line) — distinct sites in the same caller stay separate (so `callers`/`callees` show every site); exact same-line dupes are deduped.
+    // One edge per (call site, callee, kind). Distinct calls on the same line
+    // remain distinct because their selected-callee byte spans identify
+    // different `call_sites` rows.
     // Confidence is the resolver's verdict recorded at extraction time. A tier-2
     // call (target_class set) resolves the method within that class only.
     //
@@ -887,9 +905,13 @@ fn resolve_sites_to_edges(ctx: &ResolutionCtx, sites: &[CallSiteRow]) -> Vec<Cal
         .par_iter()
         .map(
             |(
+                _,
                 from_path,
                 _,
                 callee,
+                _,
+                _,
+                _,
                 _,
                 _,
                 target_class,
@@ -1110,9 +1132,24 @@ fn resolve_sites_to_edges(ctx: &ResolutionCtx, sites: &[CallSiteRow]) -> Vec<Cal
         .collect();
 
     let mut edges: Vec<CallEdge> = Vec::new();
-    let mut seen_pairs: HashSet<(String, String, Option<i64>)> = HashSet::new();
+    let mut seen_pairs: HashSet<(i64, String, String)> = HashSet::new();
     for (
-        (from_path, enc_qn, _callee, line, confidence, _target_class, _, _, edge_kind, _),
+        (
+            call_site_id,
+            from_path,
+            enc_qn,
+            _callee,
+            line,
+            _,
+            _,
+            _,
+            confidence,
+            _target_class,
+            _,
+            _,
+            edge_kind,
+            _,
+        ),
         (targets, namespace_confirmed),
     ) in sites.iter().zip(candidates.iter())
     {
@@ -1130,13 +1167,14 @@ fn resolve_sites_to_edges(ctx: &ResolutionCtx, sites: &[CallSiteRow]) -> Vec<Cal
             confidence.as_str()
         };
         for (to_qn, to_path) in targets {
-            if !seen_pairs.insert((enc_qn.clone(), to_qn.clone(), *line)) {
+            if !seen_pairs.insert((*call_site_id, to_qn.clone(), edge_kind.clone())) {
                 continue;
             }
             edges.push(CallEdge {
                 from_symbol: enc_qn.clone(),
                 to_symbol: to_qn.clone(),
                 call_site_line: line.map(|l| l as i32),
+                call_site_id: Some(*call_site_id),
                 edge_confidence: effective_confidence.to_string(),
                 from_path: Some(from_path.clone()),
                 to_path: Some(to_path.clone()),
@@ -1161,22 +1199,27 @@ fn rebuild_graph(
     // `resolve_sites_to_edges` — see that function's doc comment.
     let sites: Vec<CallSiteRow> = {
         let mut stmt = tx.prepare(
-            "SELECT from_path, enclosing_qn, callee_name, call_line, confidence, target_class, \
+            "SELECT id, from_path, enclosing_qn, callee_name, call_line, callee_start_byte, \
+                    callee_end_byte, identity_version, confidence, target_class, \
                     looks_option_or_result_chained, module_hint, edge_kind, arg_count \
              FROM call_sites ORDER BY id",
         )?;
         stmt.query_map([], |r| {
             Ok((
-                r.get::<_, String>(0)?,
+                r.get::<_, i64>(0)?,
                 r.get::<_, String>(1)?,
                 r.get::<_, String>(2)?,
-                r.get::<_, Option<i64>>(3)?,
-                r.get::<_, String>(4)?,
-                r.get::<_, Option<String>>(5)?,
-                r.get::<_, i64>(6)? != 0,
-                r.get::<_, Option<String>>(7)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, Option<i64>>(4)?,
+                r.get::<_, Option<i64>>(5)?,
+                r.get::<_, Option<i64>>(6)?,
+                r.get::<_, i64>(7)?,
                 r.get::<_, String>(8)?,
-                r.get::<_, Option<i64>>(9)?,
+                r.get::<_, Option<String>>(9)?,
+                r.get::<_, i64>(10)? != 0,
+                r.get::<_, Option<String>>(11)?,
+                r.get::<_, String>(12)?,
+                r.get::<_, Option<i64>>(13)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?
@@ -1195,7 +1238,7 @@ fn rebuild_graph(
     // `CallSiteData`/`CallEdge`/`insert_call_edges_batch` for what's
     // otherwise a one-shot fact true immediately after every fresh rebuild.
     tx.execute(
-        "UPDATE call_edges SET formal_source = 'stack_graphs' \
+        "UPDATE call_edges SET formal_source = 'stack_graphs', evidence_state = 'fresh' \
          WHERE edge_confidence = 'formal' AND formal_source IS NULL",
         [],
     )?;
@@ -1311,23 +1354,28 @@ pub fn incremental_graph_update(
     // dedup attribution agrees between the two paths on identical input.
     let sites: Vec<CallSiteRow> = {
         let sql = format!(
-            "SELECT from_path, enclosing_qn, callee_name, call_line, confidence, target_class, \
+            "SELECT id, from_path, enclosing_qn, callee_name, call_line, callee_start_byte, \
+                    callee_end_byte, identity_version, confidence, target_class, \
                     looks_option_or_result_chained, module_hint, edge_kind, arg_count \
              FROM call_sites WHERE from_path IN ({placeholders}) ORDER BY id"
         );
         let mut stmt = tx.prepare(&sql)?;
         stmt.query_map(rusqlite::params_from_iter(path_refs.iter().copied()), |r| {
             Ok((
-                r.get::<_, String>(0)?,
+                r.get::<_, i64>(0)?,
                 r.get::<_, String>(1)?,
                 r.get::<_, String>(2)?,
-                r.get::<_, Option<i64>>(3)?,
-                r.get::<_, String>(4)?,
-                r.get::<_, Option<String>>(5)?,
-                r.get::<_, i64>(6)? != 0,
-                r.get::<_, Option<String>>(7)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, Option<i64>>(4)?,
+                r.get::<_, Option<i64>>(5)?,
+                r.get::<_, Option<i64>>(6)?,
+                r.get::<_, i64>(7)?,
                 r.get::<_, String>(8)?,
-                r.get::<_, Option<i64>>(9)?,
+                r.get::<_, Option<String>>(9)?,
+                r.get::<_, i64>(10)? != 0,
+                r.get::<_, Option<String>>(11)?,
+                r.get::<_, String>(12)?,
+                r.get::<_, Option<i64>>(13)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?
@@ -1342,7 +1390,7 @@ pub fn incremental_graph_update(
     // outside delta already carry their own formal_source from a prior
     // pass.
     tx.execute(
-        "UPDATE call_edges SET formal_source = 'stack_graphs' \
+        "UPDATE call_edges SET formal_source = 'stack_graphs', evidence_state = 'fresh' \
          WHERE edge_confidence = 'formal' AND formal_source IS NULL",
         [],
     )?;
@@ -1953,6 +2001,10 @@ pub fn run_indexing_pipeline_cancellable(
     tx.execute("DELETE FROM symbols", [])?;
     tx.execute("DELETE FROM file_index", [])?;
     tx.execute("DELETE FROM code_chunks", [])?;
+    // A full baseline invalidates all cached SCIP results. In particular, D4's
+    // byte-span identity migration must never let a line-derived cache key skip
+    // the first exact overlay pass after rebuilding the graph.
+    tx.execute("DELETE FROM scip_overlay_state", [])?;
 
     for batch in files.chunks(PARSE_BATCH_SIZE) {
         if cancel() {
@@ -2009,6 +2061,10 @@ pub fn run_indexing_pipeline_cancellable(
         &config.hotspots.default_since,
         &config.hub_threshold,
         &maps,
+    )?;
+    tx.execute(
+        "UPDATE graph_generation_state SET generation = generation + 1 WHERE id = 1",
+        [],
     )?;
     tx.commit()?;
 
@@ -2205,11 +2261,185 @@ fn invalidate_resolution_maps_cache(project_root: &Path) {
     }
 }
 
+/// Whether an existing database still contains CallSites whose line-only
+/// identity predates D4. Incremental indexing cannot repair these rows because
+/// their file hashes are unchanged, so it must take the full transactional
+/// baseline path instead of reporting a no-op.
+fn needs_call_site_identity_baseline(conn: &Connection) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM call_sites
+             WHERE identity_version < 2
+                OR callee_start_byte IS NULL
+                OR callee_end_byte IS NULL
+         )",
+        [],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|exists| exists != 0)
+}
+
+/// Update D4's diagnostic-only migration status.  It is intentionally outside
+/// the graph transaction: a failed/cancelled baseline must preserve the old
+/// graph while still leaving a useful reason for operators.
+fn record_call_site_identity_migration_status(
+    conn: &Connection,
+    status: &str,
+    failure_reason: Option<&str>,
+    metrics: Option<(i64, i64, i64, Option<i64>)>,
+) -> rusqlite::Result<()> {
+    let now = now_secs();
+    let (started_at, completed_at, failed_at) = match status {
+        "running" => (Some(now), None, None),
+        "baseline_ready" => (None, Some(now), None),
+        "failed" => (None, None, Some(now)),
+        _ => (None, None, None),
+    };
+    let (duration_ms, rows_rebuilt, busy_retries, graph_generation) = metrics
+        .map(
+            |(duration_ms, rows_rebuilt, busy_retries, graph_generation)| {
+                (
+                    Some(duration_ms),
+                    Some(rows_rebuilt),
+                    Some(busy_retries),
+                    graph_generation,
+                )
+            },
+        )
+        .unwrap_or((None, None, None, None));
+    conn.execute(
+        "INSERT INTO identity_migration_state
+            (id, target_version, status, started_at, completed_at, failed_at, failure_reason,
+             duration_ms, rows_rebuilt, busy_retries, graph_generation)
+         VALUES (1, 2, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+         ON CONFLICT(id) DO UPDATE SET
+             target_version = excluded.target_version,
+             status = excluded.status,
+             started_at = CASE WHEN excluded.status = 'running'
+                               THEN excluded.started_at
+                               ELSE identity_migration_state.started_at END,
+             completed_at = excluded.completed_at,
+             failed_at = excluded.failed_at,
+             failure_reason = excluded.failure_reason,
+             duration_ms = COALESCE(excluded.duration_ms, identity_migration_state.duration_ms),
+             rows_rebuilt = COALESCE(excluded.rows_rebuilt, identity_migration_state.rows_rebuilt),
+             busy_retries = COALESCE(excluded.busy_retries, identity_migration_state.busy_retries),
+             graph_generation = COALESCE(excluded.graph_generation, identity_migration_state.graph_generation)",
+        rusqlite::params![
+            status,
+            started_at,
+            completed_at,
+            failed_at,
+            failure_reason,
+            duration_ms,
+            rows_rebuilt,
+            busy_retries,
+            graph_generation,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Run the one-time D4 baseline through the normal full-pipeline transaction.
+/// Both incremental entry points must share this path: an unchanged source hash
+/// cannot prove its persisted CallSite identity is current.
+fn rebuild_call_site_identity_baseline(
+    conn: &mut Connection,
+    project_root: &Path,
+    cancel: &dyn Fn() -> bool,
+) -> rusqlite::Result<ReindexOutcome> {
+    let started = std::time::Instant::now();
+    tracing::info!("D4 CallSite identity migration detected — forcing a full baseline reparse");
+    let phase = std::sync::Arc::new(std::sync::RwLock::new(crate::types::IndexingPhase::Parsing));
+    if let Err(error) = record_call_site_identity_migration_status(conn, "running", None, None) {
+        tracing::warn!(%error, "could not record D4 CallSite identity migration start");
+    }
+
+    match run_indexing_pipeline_cancellable(conn, project_root, phase, cancel) {
+        Ok(PipelineOutcome::Completed) => {
+            let rebuilt_files: usize =
+                conn.query_row("SELECT COUNT(*) FROM file_index", [], |row| {
+                    row.get::<_, i64>(0)
+                })? as usize;
+            if let Err(error) = record_call_site_identity_migration_status(
+                conn,
+                "baseline_ready",
+                None,
+                Some((
+                    started.elapsed().as_millis().try_into().unwrap_or(i64::MAX),
+                    rebuilt_files.try_into().unwrap_or(i64::MAX),
+                    0,
+                    conn.query_row(
+                        "SELECT generation FROM graph_generation_state WHERE id = 1",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .ok(),
+                )),
+            ) {
+                tracing::warn!(%error, "could not record D4 CallSite identity migration completion");
+            }
+            Ok(ReindexOutcome::Completed(ReindexSummary {
+                changed: rebuilt_files,
+                graph_mode: GraphMode::FullFallback("call_site_identity_v2".to_string()),
+                ..ReindexSummary::default()
+            }))
+        }
+        Ok(PipelineOutcome::Cancelled) => {
+            if let Err(error) = record_call_site_identity_migration_status(
+                conn,
+                "failed",
+                Some("baseline cancelled"),
+                Some((
+                    started.elapsed().as_millis().try_into().unwrap_or(i64::MAX),
+                    0,
+                    0,
+                    conn.query_row(
+                        "SELECT generation FROM graph_generation_state WHERE id = 1",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .ok(),
+                )),
+            ) {
+                tracing::warn!(%error, "could not record cancelled D4 CallSite identity migration");
+            }
+            Ok(ReindexOutcome::Cancelled)
+        }
+        Err(error) => {
+            let failure_reason = error.to_string();
+            if let Err(status_error) = record_call_site_identity_migration_status(
+                conn,
+                "failed",
+                Some(&failure_reason),
+                Some((
+                    started.elapsed().as_millis().try_into().unwrap_or(i64::MAX),
+                    0,
+                    0,
+                    conn.query_row(
+                        "SELECT generation FROM graph_generation_state WHERE id = 1",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .ok(),
+                )),
+            ) {
+                tracing::warn!(%status_error, "could not record failed D4 CallSite identity migration");
+            }
+            Err(error)
+        }
+    }
+}
+
 pub fn reindex_changed_cancellable(
     conn: &mut Connection,
     project_root: &Path,
     cancel: &dyn Fn() -> bool,
 ) -> rusqlite::Result<ReindexOutcome> {
+    if needs_call_site_identity_baseline(conn)? {
+        return rebuild_call_site_identity_baseline(conn, project_root, cancel);
+    }
+
     let config = crate::config::load_config_or_warn(project_root);
     let entry_point_patterns = config.entry_points;
     let ignore_patterns = config.ignore;
@@ -2365,6 +2595,10 @@ pub fn reindex_changed_cancellable(
             )?;
             summary.graph_mode = GraphMode::Full;
         }
+        tx.execute(
+            "UPDATE graph_generation_state SET generation = generation + 1 WHERE id = 1",
+            [],
+        )?;
     }
     tx.commit()?;
     Ok(ReindexOutcome::Completed(summary))
@@ -2398,6 +2632,16 @@ pub fn reindex_paths(
     rel_paths: &[String],
 ) -> rusqlite::Result<ReindexSummary> {
     use rusqlite::OptionalExtension;
+
+    if needs_call_site_identity_baseline(conn)? {
+        let never_cancel = || false;
+        return match rebuild_call_site_identity_baseline(conn, project_root, &never_cancel)? {
+            ReindexOutcome::Completed(summary) => Ok(summary),
+            ReindexOutcome::Cancelled => {
+                unreachable!("the direct reindex path cannot be cancelled")
+            }
+        };
+    }
 
     let config = crate::config::load_config_or_warn(project_root);
 
@@ -2509,6 +2753,10 @@ pub fn reindex_paths(
             )?;
             summary.graph_mode = GraphMode::Full;
         }
+        tx.execute(
+            "UPDATE graph_generation_state SET generation = generation + 1 WHERE id = 1",
+            [],
+        )?;
     }
     tx.commit()?;
     Ok(summary)
@@ -2613,6 +2861,50 @@ mod tests {
 
     fn dummy_phase() -> std::sync::Arc<std::sync::RwLock<IndexingPhase>> {
         std::sync::Arc::new(std::sync::RwLock::new(IndexingPhase::Scanning))
+    }
+
+    #[test]
+    fn graph_generation_advances_only_after_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        let generation = |conn: &Connection| -> i64 {
+            conn.query_row(
+                "SELECT generation FROM graph_generation_state WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+
+        assert_eq!(generation(&conn), 0);
+        assert_eq!(
+            run_indexing_pipeline_cancellable(&mut conn, dir.path(), dummy_phase(), &|| true)
+                .unwrap(),
+            PipelineOutcome::Cancelled
+        );
+        assert_eq!(generation(&conn), 0);
+
+        run_indexing_pipeline(&mut conn, dir.path(), dummy_phase()).unwrap();
+        assert_eq!(generation(&conn), 1);
+        run_indexing_pipeline(&mut conn, dir.path(), dummy_phase()).unwrap();
+        assert_eq!(generation(&conn), 2);
+
+        std::fs::write(dir.path().join("main.rs"), "fn changed() {}\n").unwrap();
+        assert!(matches!(
+            reindex_changed(&mut conn, dir.path()).unwrap(),
+            ReindexSummary { changed: 1, .. }
+        ));
+        assert_eq!(generation(&conn), 3);
+
+        std::fs::write(dir.path().join("main.rs"), "fn changed_again() {}\n").unwrap();
+        assert!(matches!(
+            reindex_paths(&mut conn, dir.path(), &["main.rs".to_string()]).unwrap(),
+            ReindexSummary { changed: 1, .. }
+        ));
+        assert_eq!(generation(&conn), 4);
     }
 
     #[test]
@@ -5264,6 +5556,326 @@ impl StructB {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn legacy_call_site_identity_forces_a_full_rebuild_even_when_hashes_match() {
+        let dir =
+            std::env::temp_dir().join(format!("calm_d4_identity_migration_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("main.py"),
+            "def caller():\n    helper()\n\ndef helper():\n    pass\n",
+        )
+        .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
+        assert!(count(&conn, "SELECT COUNT(*) FROM call_sites") > 0);
+        conn.execute(
+            "UPDATE call_sites
+             SET callee_start_byte = NULL, callee_end_byte = NULL, identity_version = 1",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO scip_overlay_state (provider, cache_key) VALUES ('python', 'legacy-key')",
+            [],
+        )
+        .unwrap();
+        conn.execute("DELETE FROM file_index", []).unwrap();
+
+        let summary = reindex_changed(&mut conn, &dir).unwrap();
+        assert_eq!(
+            summary.changed, 1,
+            "the unchanged source must still be reparsed"
+        );
+        let (migration_status, target_version, rows_rebuilt): (String, i64, Option<i64>) = conn
+            .query_row(
+                "SELECT status, target_version, rows_rebuilt
+                 FROM identity_migration_state WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(migration_status, "baseline_ready");
+        assert_eq!(target_version, 2);
+        assert_eq!(
+            rows_rebuilt,
+            Some(1),
+            "migration status must report the files actually rebuilt, not stale index rows"
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM call_sites
+                 WHERE identity_version < 2
+                    OR callee_start_byte IS NULL
+                    OR callee_end_byte IS NULL",
+            ),
+            0,
+        );
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM scip_overlay_state"),
+            0,
+            "line-derived overlay cache state cannot survive an identity rebuild",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reindex_paths_repairs_legacy_call_site_identity_even_when_hashes_match() {
+        let dir = std::env::temp_dir().join(format!(
+            "calm_d4_identity_paths_migration_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("main.py"),
+            "def caller():\n    helper()\n\ndef helper():\n    pass\n",
+        )
+        .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
+        conn.execute(
+            "UPDATE call_sites
+             SET callee_start_byte = NULL, callee_end_byte = NULL, identity_version = 1",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO scip_overlay_state (provider, cache_key) VALUES ('python', 'legacy-key')",
+            [],
+        )
+        .unwrap();
+
+        let summary = reindex_paths(&mut conn, &dir, &["main.py".to_string()]).unwrap();
+        assert_eq!(
+            summary.changed, 1,
+            "the direct dirty-path route must not no-op on a legacy identity"
+        );
+        assert!(matches!(
+            summary.graph_mode,
+            GraphMode::FullFallback(ref reason) if reason == "call_site_identity_v2"
+        ));
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM call_sites
+                 WHERE identity_version < 2
+                    OR callee_start_byte IS NULL
+                    OR callee_end_byte IS NULL",
+            ),
+            0,
+        );
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM scip_overlay_state"), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cancelled_identity_baseline_preserves_legacy_graph_and_records_failure() {
+        #[derive(Debug, PartialEq, Eq)]
+        struct LegacyGraphSnapshot {
+            file_index: Vec<Vec<String>>,
+            call_sites: Vec<Vec<String>>,
+            call_edges: Vec<Vec<String>>,
+            external_proofs: Vec<Vec<String>>,
+            overlay_cache: Vec<Vec<String>>,
+            generation: i64,
+        }
+
+        fn rows(conn: &Connection, sql: &str) -> Vec<Vec<String>> {
+            let mut statement = conn.prepare(sql).unwrap();
+            statement
+                .query_map([], |row| {
+                    (0..row.as_ref().column_count())
+                        .map(|index| {
+                            Ok(match row.get_ref(index)? {
+                                rusqlite::types::ValueRef::Null => "null".to_owned(),
+                                rusqlite::types::ValueRef::Integer(value) => {
+                                    format!("integer:{value}")
+                                }
+                                rusqlite::types::ValueRef::Real(value) => format!("real:{value:?}"),
+                                rusqlite::types::ValueRef::Text(value) => {
+                                    format!("text:{}", String::from_utf8_lossy(value))
+                                }
+                                rusqlite::types::ValueRef::Blob(value) => format!("blob:{value:?}"),
+                            })
+                        })
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        }
+
+        fn snapshot(conn: &Connection) -> LegacyGraphSnapshot {
+            LegacyGraphSnapshot {
+                file_index: rows(
+                    conn,
+                    "SELECT path, hash, language, symbol_count, last_indexed
+                     FROM file_index ORDER BY path",
+                ),
+                call_sites: rows(
+                    conn,
+                    "SELECT id, from_path, enclosing_qn, callee_name, call_line,
+                            callee_start_byte, callee_end_byte, identity_version, edge_kind
+                     FROM call_sites ORDER BY id",
+                ),
+                call_edges: rows(
+                    conn,
+                    "SELECT id, from_symbol, to_symbol, call_site_line, call_site_id,
+                            edge_confidence, formal_source, evidence_state, ruled_out_by_scip,
+                            from_path, to_path, edge_kind
+                     FROM call_edges ORDER BY id",
+                ),
+                external_proofs: rows(
+                    conn,
+                    "SELECT id, call_site_id, to_symbol, provider, source_file_hash,
+                            callee_start_byte, callee_end_byte, provider_fingerprint,
+                            context_fingerprint, definition_snapshot, call_site_identity_version,
+                            graph_generation, status, observed_at
+                     FROM external_proofs ORDER BY id",
+                ),
+                overlay_cache: rows(
+                    conn,
+                    "SELECT provider, cache_key FROM scip_overlay_state ORDER BY provider, cache_key",
+                ),
+                generation: conn
+                    .query_row(
+                        "SELECT generation FROM graph_generation_state WHERE id = 1",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap(),
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!(
+            "calm_d4_identity_cancel_migration_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("main.py"),
+            "def caller():\n    helper()\n\ndef helper():\n    pass\n",
+        )
+        .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
+        conn.execute(
+            "UPDATE call_sites
+             SET callee_start_byte = NULL, callee_end_byte = NULL, identity_version = 1",
+            [],
+        )
+        .unwrap();
+        conn.execute("UPDATE call_edges SET ruled_out_by_scip = 1", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO external_proofs
+                (call_site_id, to_symbol, provider, source_file_hash,
+                 callee_start_byte, callee_end_byte, provider_fingerprint,
+                 context_fingerprint, status, observed_at)
+             SELECT call_sites.id, call_edges.to_symbol, 'scip:test', 'legacy-source',
+                    0, 1, 'legacy-provider', 'legacy-context', 'fresh', 0
+             FROM call_sites
+             JOIN call_edges ON call_edges.call_site_id = call_sites.id
+             LIMIT 1",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO scip_overlay_state (provider, cache_key)
+             VALUES ('python', 'legacy-key')",
+            [],
+        )
+        .unwrap();
+        let baseline_snapshot = snapshot(&conn);
+        assert_eq!(
+            baseline_snapshot.external_proofs.len(),
+            1,
+            "fixture must contain a proof"
+        );
+        assert!(
+            baseline_snapshot
+                .call_edges
+                .iter()
+                .any(|edge| edge.get(8).is_some_and(|value| value == "integer:1")),
+            "fixture must contain a rule-out"
+        );
+        assert_eq!(
+            baseline_snapshot.overlay_cache.len(),
+            1,
+            "fixture must contain overlay cache state"
+        );
+
+        let cancel_checks = std::sync::atomic::AtomicUsize::new(0);
+        assert!(matches!(
+            reindex_changed_cancellable(&mut conn, &dir, &|| cancel_checks
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                >= 1,)
+            .unwrap(),
+            ReindexOutcome::Cancelled
+        ));
+        assert!(
+            cancel_checks.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "cancellation must occur after the transactional baseline has started"
+        );
+        let post_cancel_snapshot = snapshot(&conn);
+        assert_eq!(
+            post_cancel_snapshot, baseline_snapshot,
+            "a mid-transaction cancellation must preserve every persisted legacy graph value"
+        );
+        assert!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM call_sites WHERE identity_version = 1"
+            ) > 0,
+            "a cancelled transaction must leave the previously committed legacy graph intact"
+        );
+        let (status, reason, duration_ms, rows_rebuilt, busy_retries, graph_generation): (
+            String,
+            Option<String>,
+            Option<i64>,
+            Option<i64>,
+            i64,
+            Option<i64>,
+        ) = conn
+            .query_row(
+                "SELECT status, failure_reason, duration_ms, rows_rebuilt, busy_retries,
+                        graph_generation
+                 FROM identity_migration_state WHERE id = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(status, "failed");
+        assert_eq!(reason.as_deref(), Some("baseline cancelled"));
+        assert!(duration_ms.is_some());
+        assert_eq!(rows_rebuilt, Some(0));
+        assert_eq!(busy_retries, 0);
+        assert!(graph_generation.is_some());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Layer-2 code chunks must track incremental reindex the same way symbols
     /// do: a changed file's stale chunks are replaced (not duplicated
     /// alongside the new ones), and a deleted file's chunks disappear too.
@@ -5641,18 +6253,17 @@ impl StructB {
     }
 
     /// Regression for the duplicate-call-site collapse: two calls to the same
-    /// function from the same caller (different lines) used to dedupe to a
-    /// single (from, to) edge, losing the second site. The key now includes the
-    /// call-site line, so both survive.
+    /// function from the same caller on the *same* line must retain separate
+    /// byte-span identities, rather than collapsing through a line-based key.
     #[test]
     fn distinct_call_sites_in_one_caller_are_kept_as_separate_edges() {
         let dir = std::env::temp_dir().join(format!("ci_idx_dupsite_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        // `helper` defined once; `caller` calls it twice, on lines 3 and 4.
+        // `helper` defined once; `caller` calls it twice on line 3.
         std::fs::write(
             dir.join("a.rs"),
-            "fn helper() {}\nfn caller() {\n    helper();\n    helper();\n}\n",
+            "fn helper() {}\nfn caller() {\n    helper(); helper();\n}\n",
         )
         .unwrap();
 
@@ -5671,24 +6282,36 @@ impl StructB {
             "two distinct call sites must be kept as two edges, not deduped to one"
         );
 
-        let lines: Vec<i64> = {
+        let edge_sites: Vec<(i64, i64, i64)> = {
             let mut stmt = conn
                 .prepare(
-                    "SELECT call_site_line FROM call_edges \
-                     WHERE from_symbol = (SELECT qualified_name FROM symbols WHERE name = 'caller') \
-                     AND to_symbol = (SELECT qualified_name FROM symbols WHERE name = 'helper') \
-                     ORDER BY call_site_line",
+                    "SELECT call_edges.call_site_id, call_edges.call_site_line, call_sites.callee_start_byte \
+                     FROM call_edges JOIN call_sites ON call_sites.id = call_edges.call_site_id \
+                     WHERE call_edges.from_symbol = (SELECT qualified_name FROM symbols WHERE name = 'caller') \
+                     AND call_edges.to_symbol = (SELECT qualified_name FROM symbols WHERE name = 'helper') \
+                     ORDER BY call_sites.callee_start_byte",
                 )
                 .unwrap();
-            stmt.query_map([], |r| r.get(0))
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
                 .unwrap()
                 .filter_map(|r| r.ok())
                 .collect()
         };
         assert_eq!(
-            lines,
-            vec![3, 4],
-            "the two edges carry the two call-site lines"
+            edge_sites
+                .iter()
+                .map(|(_, line, _)| *line)
+                .collect::<Vec<_>>(),
+            vec![3, 3],
+            "both edges come from the same source line"
+        );
+        assert_ne!(
+            edge_sites[0].0, edge_sites[1].0,
+            "each edge must point at its own persisted CallSite"
+        );
+        assert_ne!(
+            edge_sites[0].2, edge_sites[1].2,
+            "same-line calls must be distinguished by selected-callee byte start"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
