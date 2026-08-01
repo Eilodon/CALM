@@ -112,7 +112,7 @@ This repo ships ready-made config for Claude Code (`.mcp.json`), Cursor (`.curso
 
 ```
 agent: repo_overview()
-  → 233 files, 3,488 symbols, indexing_phase=ready
+  → 237 files, 3,583 symbols, indexing_phase=ready
 
 agent: "I need to change getUserByEmail"
   → locate("getUserByEmail")        # find the file + symbol metadata
@@ -132,11 +132,12 @@ Every number below is measured by pointing CALM's own `fitness_report`/`repo_ove
 
 | Metric | Measured value |
 |---|---|
-| Codebase indexed | **233 files, 3,488 symbols** — 15 languages present in this repo alone |
-| Hub concentration (`hub_pct`) | 7.5% — 169 hub symbols (gate: ≤ 20%) |
-| Dead-code rate (`dead_code_pct`, coverage-aware) | 5.0% (gate: ≤ 10%) |
-| Edge coverage (`edge_coverage_pct`) | 74.9% of symbols have at least one call edge (gate: ≥ 60%) |
-| High-complexity functions (`high_complexity_pct`) | 2.9% (gate: ≤ 15%) |
+| Codebase indexed | **237 files, 3,583 symbols** — 15 languages present in this repo alone |
+| Hub concentration (`hub_pct`) | 7.6% — 174 hub symbols (gate: ≤ 20%) |
+| Dead-code rate (`dead_code_pct`, coverage-aware) | 5.6% (gate: ≤ 10%) |
+| Edge coverage (`edge_coverage_pct`) | 70.1% of symbols have at least one call edge (gate: ≥ 60%) |
+| High-complexity functions (`high_complexity_pct`) | 2.8% (gate: ≤ 15%) |
+| Architecture fit (`avg_distance`, Martin/OOD) | 0.27 average distance from the main sequence (gate: ≤ 1.00) |
 | Ambiguous symbol boundaries (`boundary_ambiguous_count`) | 0 (gate: ≤ 0) |
 | Architecture boundary violations (`boundary_violations`) | 0 (gate: ≤ 0) — the `watcher → tools` import previously flagged here was fixed by relocating the shared `RwLockExt`/`LockExt` traits it needed out of `tools/common.rs` into their own `sync_ext` module |
 | Token efficiency vs. a naive read-the-files baseline | `source` **241x** · `edit_context` **193x** · `locate` **29x** · `callers` **1.0x** — median 111x across the four benchmark tasks ([methodology](benchmarks/b4_token_efficiency/)) |
@@ -226,7 +227,7 @@ Distinct from the `tools` above — MCP Prompts (`prompts/list`, `prompts/get`) 
 
 Run for real in `.github/workflows/ci.yml`'s `fitness-check` job on every push/PR — `calm index` first (a fresh checkout has no `.calm/index.db` yet), then `calm fitness-check --project-root . --config thresholds.toml`. That `--config` flag is not optional: without it, `[[boundaries]]` and `[config_drift]` are silently treated as "no rules declared" rather than erroring — only the numeric thresholds have a real default.
 
-`calm fitness-check` measures 10 metrics against thresholds declared in `thresholds.toml`:
+`calm fitness-check` measures 11 metrics against thresholds declared in `thresholds.toml`:
 
 | Metric | What it measures | Default threshold |
 |---|---|---|
@@ -237,6 +238,7 @@ Run for real in `.github/workflows/ci.yml`'s `fitness-check` job on every push/P
 | `hotspot_risk` | Highest hotspot score in the codebase | ≤ 0.75 |
 | `edge_coverage_pct` | % of symbols with at least one call edge | ≥ 60% |
 | `high_complexity_pct` | % of functions/methods with McCabe cyclomatic complexity > 10 (AST-based; Tier-0.5 languages always report complexity 1) | ≤ 15.0% |
+| `avg_distance` | Martin/OOD average distance from the main sequence — how far each file's abstractness sits from the ideal implied by its instability (Ca/Ce) | ≤ 1.00 |
 | `boundary_violations` | Count of `import_edges` violating a declared `[[boundaries]]` rule | ≤ 0 |
 | `boundary_ambiguous_count` | Count of symbols with an ambiguous line boundary (shared with a neighbor) — `edit_symbol` replace on these is refused until resolved | ≤ 0 |
 | `config_drift_count` | Count of doc file-path references (declared via `[config_drift].doc_paths`) pointing at nothing real | ≤ 0 |
@@ -255,6 +257,8 @@ reason = "indexer (extraction) must stay upstream of analysis (dead-code, hotspo
 ```
 
 `calm fitness-check` reports each violation concretely (the real from/to path, the rule, and the reason) outside `--json` mode; the default `max_boundary_violations = 0` means a rule you bothered to declare is one you actually keep.
+
+This repo's own `thresholds.toml` currently declares two: the one above, plus `crates/calm-server/src/watcher.rs` → `crates/calm-server/src/tools/` ("the background reindex/watch loop must not depend on the MCP tool-handler layer it runs independently of") — both hold at 0 violations.
 
 ## Deployment
 
@@ -277,7 +281,7 @@ cargo test --workspace                        # unit + integration (embeddings i
 cargo test --test parity_test test_formal_edges   # Stack Graphs regression corpus
 ```
 
-Five CI jobs run on every PR: `verify` (fmt/clippy/test/audit), `stack-graphs-corpus` (formal-resolver parity), `embeddings` (clippy + test with the `embeddings` feature), `all-languages` (fixture-repo indexing across all 24 parsed languages), `js-client-interop` (cross-checks the tool schema against a real JS MCP SDK client, not just Rust's own).
+Eight CI jobs run on every PR: `verify` (fmt/clippy/test/audit), `stack-graphs-corpus` (formal-resolver parity), `embeddings` (clippy + test with the `embeddings` feature), `no-stack-graphs-formal` (clippy + test with `stack-graphs-formal` off — the only CI coverage of the `resolver::formal` stub that feature gate compiles to), `all-languages` (fixture-repo indexing across all 24 parsed languages, plus `lsp-overlay`), `js-client-interop` (cross-checks the tool schema against a real JS MCP SDK client, not just Rust's own), `otel-http-features` (clippy + test with the `otel`/`http` features, plus a guard against `opentelemetry` core version skew), `fitness-check` (runs `calm fitness-check` against this repo's own index — see [Fitness check](#fitness-check--the-ci-gate) below).
 
 The full workspace suite — 1,000+ tests — passes clean, with a handful of `#[ignore]`d live-binary integration tests (e.g. `rust-analyzer`/`scip-go`/`scip-java`) that need external tools not installed in every environment.
 
@@ -291,7 +295,7 @@ The full workspace suite — 1,000+ tests — passes clean, with a handful of `#
 - [`docs/mcp-client-setup.md`](docs/mcp-client-setup.md) — every MCP client install path in detail, including Windsurf/Devin Desktop and Codex global config.
 - [`docs/http-transport.md`](docs/http-transport.md) — the opt-in remote/HTTP transport (`calm serve --http`): loopback-by-default, the fail-closed `--allow-remote` + token requirement, why remote exposure forces a read-only preset, and the TLS/reverse-proxy expectation.
 - [`AGENTS.md`](AGENTS.md) — the full tool-by-tool workflow guide this project's own agents follow.
-- [`benchmarks/`](benchmarks/) — the measurement suite behind every number in this README: `b2_call_graph_quality/` (precision/recall vs. a SCIP oracle), `b4_token_efficiency/` (token cost vs. a naive baseline, per task), `b11_extended_competitor_ab/` (real calls against 4 other live MCP servers, not self-reported numbers), `resolution/` (tier-distribution baseline across 19 real OSS repos, one per language). Unflattering results are published alongside good ones on purpose — `benchmarks/README.md` states that policy.
+- [`benchmarks/`](benchmarks/) — the measurement suite behind every number in this README, and a few more: `b2_call_graph_quality/` (precision/recall vs. a SCIP oracle), `b3_search_quality/` (hybrid RRF vs. FTS-only vs. raw grep, NDCG@10), `b4_token_efficiency/` (token cost vs. a naive baseline, per task), `b6_tool_call_efficiency/` (round-trips: naive multi-call vs. one MCP call), `b7_task_correctness/` (real rename refactors across 6 language corpora — fd/Rust, flask/Python, express/JS, zod/TS, gin/Go, spring-petclinic/Java — checked against an independent pass/fail oracle, not an LLM judge), `b11_extended_competitor_ab/` (real calls against 4 other live MCP servers, not self-reported numbers), `b12_tier1_tier2_tool_correctness/` (9 tools driven live over JSON-RPC against 6 external OSS repos, ground-truthed against regex/`git grep`), `resolution/` (tier-distribution baseline across 19 real OSS repos, one per language). Unflattering results are published alongside good ones on purpose — `benchmarks/README.md` states that policy.
 
 ## License
 
