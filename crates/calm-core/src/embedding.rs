@@ -360,9 +360,13 @@ mod imp {
             }
             let model = model
                 .into_optimized()
-                .map_err(|e| anyhow::anyhow!("optimize onnx model at {}: {e}", onnx_path.display()))?
+                .map_err(|e| {
+                    anyhow::anyhow!("optimize onnx model at {}: {e}", onnx_path.display())
+                })?
                 .into_runnable()
-                .map_err(|e| anyhow::anyhow!("compile onnx model at {}: {e}", onnx_path.display()))?;
+                .map_err(|e| {
+                    anyhow::anyhow!("compile onnx model at {}: {e}", onnx_path.display())
+                })?;
 
             let mut this = Self {
                 model,
@@ -397,8 +401,11 @@ mod imp {
                 .encode(text, true)
                 .map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;
             let mut ids: Vec<i64> = encoding.get_ids().iter().map(|&x| x as i64).collect();
-            let mut mask: Vec<i64> =
-                encoding.get_attention_mask().iter().map(|&x| x as i64).collect();
+            let mut mask: Vec<i64> = encoding
+                .get_attention_mask()
+                .iter()
+                .map(|&x| x as i64)
+                .collect();
             ids.truncate(ONNX_MAX_SEQ_LEN);
             mask.truncate(ONNX_MAX_SEQ_LEN);
             while ids.len() < ONNX_MAX_SEQ_LEN {

@@ -63,7 +63,7 @@ pub fn parse_index(
                 line: (start_line as usize) + 1,
                 start_byte: byte_range.map(|(start, _)| start),
                 end_byte: byte_range.map(|(_, end)| end),
-                source_file_hash: byte_range.as_ref().map(|_| source_hash.clone()).flatten(),
+                source_file_hash: byte_range.as_ref().and_then(|_| source_hash.clone()),
                 symbol: occ.symbol.clone(),
                 is_def,
                 is_local: occ.symbol.starts_with("local "),

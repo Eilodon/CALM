@@ -1726,6 +1726,18 @@ fn walk_calls(
                     None
                 }
             })
+        // A legitimate callee expression (`a.b.method`, `Type::method`) is
+        // always single-line/single-expression text in every currently
+        // supported grammar. Reject a multi-line `fn_node` here -- e.g. an
+        // immediately-invoked closure `(|| { ...multi-statement body... })()`
+        // resolves its "function" field to the WHOLE closure body, and
+        // `split_receiver_callee`'s naive last-`.`/`::` scan then silently
+        // latches onto some unrelated call buried inside that body (found
+        // via a real UNIQUE-constraint collision on a real repo: an
+        // IIFE-shaped `(|| {...})()` produced a phantom RawCall whose
+        // `rfind`-derived byte span landed on the SAME bytes as the real,
+        // separately-walked call a few lines later).
+        && !source[fn_node.byte_range()].contains('\n')
         && let Some((mut receiver, callee, mut receiver_is_type_path)) =
             split_receiver_callee(&source[fn_node.byte_range()])
         && let Some((callee_start_byte, callee_end_byte)) =

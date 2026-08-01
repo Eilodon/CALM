@@ -11,6 +11,20 @@ use super::parse::ScipOccurrence;
 
 type ExactCallSiteKey = (String, i64, i64, String);
 type DefinitionSite = (String, i64);
+/// One joined `call_edges`/`call_sites`/`file_index`/`symbols` row used by
+/// both the upgrade pass and `exact_sibling_rule_out_ids`: (edge id,
+/// call_site id, exact CallSite key, target def path, target def line,
+/// edge_confidence, formal_source, ruled_out_by_scip).
+type CallEdgeRow = (
+    i64,
+    i64,
+    ExactCallSiteKey,
+    String,
+    i64,
+    String,
+    Option<String>,
+    bool,
+);
 
 /// Outcome of one `ingest_occurrences` pass.
 ///
@@ -185,16 +199,7 @@ pub fn ingest_occurrences_with_proof_context(
         }
     }
 
-    let rows: Vec<(
-        i64,
-        i64,
-        ExactCallSiteKey,
-        String,
-        i64,
-        String,
-        Option<String>,
-        bool,
-    )> = {
+    let rows: Vec<CallEdgeRow> = {
         let mut stmt = conn.prepare(
             "SELECT ce.id, ce.call_site_id, cs.from_path, cs.callee_start_byte,
                     cs.callee_end_byte, fi.hash, s.path, s.line_start, ce.edge_confidence,
@@ -227,7 +232,7 @@ pub fn ingest_occurrences_with_proof_context(
     let mut newly_upgraded = 0;
     let mut satisfied = HashSet::new();
     for (edge_id, _, key, def_path, def_line, confidence, formal_source, _) in &rows {
-        let agrees = ref_targets.get(&key).is_some_and(|targets| {
+        let agrees = ref_targets.get(key).is_some_and(|targets| {
             targets
                 .iter()
                 .any(|(path, line)| path == def_path && *line == *def_line)
@@ -290,21 +295,11 @@ pub fn ingest_occurrences_with_proof_context(
         } else {
             satisfied.len() as f64 / ref_targets.len() as f64
         },
-        ..IngestStats::default()
     })
 }
 
 fn exact_sibling_rule_out_ids(
-    rows: &[(
-        i64,
-        i64,
-        ExactCallSiteKey,
-        String,
-        i64,
-        String,
-        Option<String>,
-        bool,
-    )],
+    rows: &[CallEdgeRow],
     ref_targets: &HashMap<ExactCallSiteKey, Vec<DefinitionSite>>,
 ) -> Vec<i64> {
     let mut groups: HashMap<i64, Vec<_>> = HashMap::new();

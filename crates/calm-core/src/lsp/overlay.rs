@@ -497,6 +497,7 @@ enum PhaseThreeOutcome {
 /// Leader-only portion of an LSP refresh. The coordinator guarantees that no
 /// same-baseline peer starts another server, and its cancellation token fences
 /// a superseded generation before it can write evidence in phase 3.
+#[allow(clippy::too_many_arguments)]
 fn run_lsp_overlay_prepared(
     conn: &Connection,
     root: &Path,

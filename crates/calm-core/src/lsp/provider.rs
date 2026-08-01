@@ -355,7 +355,7 @@ mod tests {
             (CLANGD.client_profile.language_id)(Path::new("x.cpp")),
             "cpp"
         );
-        assert!(RUST_ANALYZER.client_profile.include_workspace_folder);
+        const { assert!(RUST_ANALYZER.client_profile.include_workspace_folder) };
     }
 
     #[test]

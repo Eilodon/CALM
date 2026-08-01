@@ -47,19 +47,17 @@ impl CalmServer {
             let mut external_proofs = ExternalProofStatusOutput::default();
             if let Ok(mut stmt) = conn.prepare(
                 "SELECT status, COUNT(*) FROM external_proofs GROUP BY status",
-            ) {
-                if let Ok(rows) = stmt.query_map([], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
-                }) {
-                    for row in rows.flatten() {
-                        match row.0.as_str() {
-                            "fresh" => external_proofs.fresh = row.1,
-                            "stale" => external_proofs.stale = row.1,
-                            "legacy" => external_proofs.legacy = row.1,
-                            "unverified" => external_proofs.unverified = row.1,
-                            "rejected" => external_proofs.rejected = row.1,
-                            _ => {}
-                        }
+            ) && let Ok(rows) = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
+            }) {
+                for row in rows.flatten() {
+                    match row.0.as_str() {
+                        "fresh" => external_proofs.fresh = row.1,
+                        "stale" => external_proofs.stale = row.1,
+                        "legacy" => external_proofs.legacy = row.1,
+                        "unverified" => external_proofs.unverified = row.1,
+                        "rejected" => external_proofs.rejected = row.1,
+                        _ => {}
                     }
                 }
             }
