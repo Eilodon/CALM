@@ -696,12 +696,25 @@ fn persist_file(
 ) -> rusqlite::Result<()> {
     insert_symbols_batch(tx, &extracted.symbols)?;
     insert_import_edges_batch(tx, &extracted.import_edges)?;
+    // `OR IGNORE`, not a plain INSERT: `idx_call_sites_current_identity` (schema.rs
+    // migrate_call_site_identity_v2) enforces one row per (from_path, enclosing_qn,
+    // callee_start_byte, callee_end_byte, edge_kind, identity_version) -- a real,
+    // reproducible tree-sitter extractor duplicate for that exact tuple (observed
+    // live indexing pallets/flask: a UNIQUE-constraint error here aborted the whole
+    // transaction, failing the ENTIRE file's index, not just this one row) must not
+    // be allowed to take down indexing for every other file in the batch. Every
+    // sibling INSERT into an identity-constrained table (`call_edges`, `import_edges`
+    // -- see indexer/edges.rs) already uses this exact `OR IGNORE` idiom; this one
+    // was the one place still using a bare INSERT against a constraint added after
+    // it was written. Skips are counted and surfaced via `tracing::debug!` below --
+    // fail-soft, not silently swallowed.
     let mut stmt = tx.prepare(
-        "INSERT INTO call_sites (from_path, enclosing_qn, callee_name, call_line, callee_start_byte, callee_end_byte, identity_version, confidence, receiver, target_class, looks_option_or_result_chained, module_hint, edge_kind, arg_count) \
+        "INSERT OR IGNORE INTO call_sites (from_path, enclosing_qn, callee_name, call_line, callee_start_byte, callee_end_byte, identity_version, confidence, receiver, target_class, looks_option_or_result_chained, module_hint, edge_kind, arg_count) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
     )?;
+    let mut skipped = 0u32;
     for c in &extracted.call_sites {
-        stmt.execute(rusqlite::params![
+        let inserted = stmt.execute(rusqlite::params![
             rel,
             c.enclosing_qn,
             c.callee,
@@ -717,6 +730,14 @@ fn persist_file(
             c.edge_kind,
             c.arg_count,
         ])?;
+        if inserted == 0 {
+            skipped += 1;
+        }
+    }
+    if skipped > 0 {
+        tracing::debug!(
+            "persist_file({rel}): {skipped} duplicate call_sites row(s) (identical from_path/enclosing_qn/callee_start_byte/callee_end_byte/edge_kind/identity_version) skipped by OR IGNORE"
+        );
     }
     insert_code_chunks_batch(tx, rel, file_hash, &extracted.chunks)?;
     Ok(())
@@ -6371,6 +6392,73 @@ impl StructB {
         assert_ne!(
             edge_sites[0].2, edge_sites[1].2,
             "same-line calls must be distinguished by selected-callee byte start"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persist_file_ignores_a_call_site_that_collides_on_the_full_identity_tuple() {
+        // Regression test for a real, reproducible bug found live benchmarking
+        // CALM against pallets/flask (2026-08-02): the tree-sitter Python
+        // extractor emitted two `CallSiteData` entries whose (from_path,
+        // enclosing_qn, callee_start_byte, callee_end_byte, edge_kind,
+        // identity_version) tuple was byte-for-byte identical --
+        // `idx_call_sites_current_identity` (schema.rs
+        // migrate_call_site_identity_v2) correctly rejects that as a
+        // duplicate, but `persist_file`'s INSERT had no `OR IGNORE`, so the
+        // UNIQUE-constraint error aborted the whole transaction and failed
+        // indexing for the ENTIRE file (in the real case: the entire flask
+        // corpus, 0/93 files indexed). This doesn't attempt to reproduce the
+        // exact upstream Python parser condition that produced the duplicate
+        // (still an open question -- see design doc) -- it directly verifies
+        // the persistence layer's own contract: a duplicate-identity call
+        // site must be silently deduped, never crash the transaction.
+        let dir = std::env::temp_dir().join(format!("ci_idx_dupcallsite_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.rs"), "fn helper() {}\nfn caller() {\n    helper();\n}\n").unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
+
+        let before: i64 = count(&conn, "SELECT COUNT(*) FROM call_sites");
+
+        fn make_dup() -> CallSiteData {
+            CallSiteData {
+                enclosing_qn: "a.rs::caller".to_string(),
+                callee: "helper".to_string(),
+                line: 3,
+                callee_start_byte: Some(4),
+                callee_end_byte: Some(10),
+                identity_version: 2,
+                confidence: "resolved".to_string(),
+                receiver: None,
+                target_class: None,
+                looks_option_or_result_chained: false,
+                module_hint: None,
+                edge_kind: "call".to_string(),
+                arg_count: Some(0),
+            }
+        }
+        let tx = conn.transaction().unwrap();
+        let extracted = ExtractedFile {
+            symbols: vec![],
+            import_edges: vec![],
+            call_sites: vec![make_dup(), make_dup()],
+            symbol_count: 0,
+            chunks: vec![],
+        };
+        persist_file(&tx, "a.rs", "irrelevant-hash", &extracted)
+            .expect("a duplicate-identity call site must be ignored, not crash the transaction");
+        tx.commit().unwrap();
+
+        let after: i64 = count(&conn, "SELECT COUNT(*) FROM call_sites");
+        assert_eq!(
+            after,
+            before + 1,
+            "exactly one of the two identical CallSiteData entries should have been persisted"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
