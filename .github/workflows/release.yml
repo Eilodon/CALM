@@ -8,8 +8,71 @@ permissions:
   contents: write
 
 jobs:
+  # WS-13 (docs/plans/2026-08-01-calm-adopt-from-vheatm-plan.md P3-1 /
+  # docs/plans/2026-08-01-calm-master-upgrade-plan.md WS-13): a single
+  # quality gate every publish job below depends on, so a tag push can
+  # never reach a binary/container publish without the checks ci.yml
+  # already runs on main actually passing for the exact tagged commit --
+  # previously `build`/`docker` had no `needs:` at all and would publish
+  # unconditionally. Deliberately NOT a `workflow_call`/reusable-workflow
+  # refactor of ci.yml (bigger surface, more risk for a Tier-A/low-risk
+  # change) -- GitHub Actions `needs:` cannot cross workflow files, so this
+  # duplicates the checks ci.yml's `verify`/`stack-graphs-corpus`/
+  # `fitness-check`/`js-client-interop`/`status-drift` jobs already run,
+  # self-contained in this workflow. Keep the two in sync by hand if either
+  # changes -- the same trade VHEATM's own RG-00..RG-15 qualification job
+  # (evaluation.py) makes for its release gate.
+  qualify-release:
+    name: Qualify release
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Audit
+        run: cargo install cargo-audit --locked && cargo audit
+
+      - name: Stack Graphs regression corpus
+        run: cargo test --test parity_test test_formal_edges -- --nocapture
+
+      - name: Build calm binary
+        run: cargo build --bin calm
+
+      - name: Index this repo
+        run: ./target/debug/calm index --project-root .
+
+      - name: Fitness check
+        run: ./target/debug/calm fitness-check --project-root . --config thresholds.toml
+
+      - name: Check docs/status.generated.md is not stale
+        run: ./scripts/gen-status.sh --check
+
+      - name: Install JS interop test dependencies
+        working-directory: tests/js_client_interop
+        run: npm ci
+
+      - name: Run cross-SDK MCP interop check
+        working-directory: tests/js_client_interop
+        run: node client.mjs "$GITHUB_WORKSPACE/target/debug/calm" "$GITHUB_WORKSPACE/crates/calm-core/tests/fixtures/rust_workspace"
+
   build:
     name: Build ${{ matrix.target }}
+    needs: qualify-release
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -166,6 +229,7 @@ jobs:
 
   docker:
     name: Publish container image
+    needs: qualify-release
     runs-on: ubuntu-latest
     permissions:
       contents: read
