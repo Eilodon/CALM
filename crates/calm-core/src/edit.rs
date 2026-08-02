@@ -475,43 +475,156 @@ pub fn validate_syntax_diff(original: &str, new_content: &str, extension: &str) 
 /// observe a half-written file — `rename` within one filesystem is atomic,
 /// unlike a direct `fs::write` which truncates-then-writes in place.
 pub fn atomic_write(path: &Path, content: &str) -> std::io::Result<()> {
+    atomic_write_with(path, content, WriteAssurance::Fast)
+}
+
+/// Controls how `atomic_write_with` treats a failure that doesn't affect the
+/// written content itself — currently just permission preservation.
+/// `Fast` (what `atomic_write` uses) keeps the original best-effort
+/// behavior: a permission-preservation failure never fails a write whose
+/// content already landed correctly (see `atomic_write`'s doc comment,
+/// audit F5). `HighAssurance` surfaces that same failure as an `Err`
+/// instead of silently dropping it — for callers that need to know when
+/// metadata was lost rather than finding out later. See
+/// docs/plans/2026-08-02-phase1-p0-execution-plan.md §3.2; WS-1's
+/// transaction commit path is the first planned `HighAssurance` caller,
+/// nothing calls it yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteAssurance {
+    Fast,
+    HighAssurance,
+}
+
+/// Same atomic-rename contract as `atomic_write` (temp file in the same
+/// directory, then `rename()` over the target — never a half-written file
+/// visible to a concurrent reader), plus fixes for audit A06 applied
+/// unconditionally regardless of `assurance`:
+/// - the temp file name carries a random nonce instead of `process::id()`
+///   — a reused PID, or two edits racing in the same process, could
+///   otherwise collide on the same temp path.
+/// - the temp file is opened with `create_new(true)` (`O_EXCL` on every
+///   std-supported platform), so a name collision is a loud retry instead
+///   of silently truncating another in-flight write's temp file.
+/// - on Unix, the parent directory is fsync'd after `rename()` succeeds —
+///   `sync_all` on the temp file only durably persists the file's
+///   *content*; the new name→inode link itself needs the directory fsync'd
+///   too. No-op on non-Unix targets: there is no portable directory-fsync
+///   via `std`.
+///
+/// `assurance` changes exactly one thing: what happens when permission
+/// preservation fails after the content write already succeeded. `Fast`
+/// matches `atomic_write`'s existing behavior byte-for-byte; `HighAssurance`
+/// surfaces it as an `Err` (and removes the orphaned temp file) instead.
+pub fn atomic_write_with(
+    path: &Path,
+    content: &str,
+    assurance: WriteAssurance,
+) -> std::io::Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let tmp_path = dir.join(format!(".{file_name}.ci-edit-{}.tmp", std::process::id()));
 
-    // Captured before the write so a set_permissions failure below can never
-    // make this function fail a write that already succeeded content-wise —
-    // audit F5: File::create(tmp) + rename() used to always hand the new
-    // file umask-derived perms, silently dropping the executable bit off
-    // scripts/*.sh (or any other non-default mode) on every edit_lines/
-    // edit_symbol write.
+    // Captured before the write so a set_permissions failure below can
+    // never make this function fail a write that already succeeded
+    // content-wise (Fast mode) — same rationale as the original
+    // `atomic_write` (audit F5).
     let original_perms = std::fs::metadata(path).ok().map(|m| m.permissions());
 
-    let write_result = (|| -> std::io::Result<()> {
-        let mut f = std::fs::File::create(&tmp_path)?;
-        std::io::Write::write_all(&mut f, content.as_bytes())?;
-        f.sync_all()?;
-        Ok(())
-    })();
-
-    match write_result {
-        Ok(()) => {
-            if let Some(perms) = original_perms {
-                // Best-effort: a permissions mismatch (e.g. read-only fs,
-                // owner mismatch) must not fail a write whose content
-                // already landed correctly.
-                let _ = std::fs::set_permissions(&tmp_path, perms);
+    const MAX_NONCE_RETRIES: u32 = 8;
+    let (tmp_path, mut file) = {
+        let mut last_err = None;
+        let mut created = None;
+        for _ in 0..MAX_NONCE_RETRIES {
+            let candidate = dir.join(format!(".{file_name}.ci-edit-{}.tmp", write_nonce()));
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&candidate)
+            {
+                Ok(f) => {
+                    created = Some((candidate, f));
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    last_err = Some(e);
+                    continue;
+                }
+                Err(e) => return Err(e),
             }
-            std::fs::rename(&tmp_path, path)
         }
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp_path);
-            Err(e)
+        match created {
+            Some(pair) => pair,
+            None => {
+                return Err(last_err.unwrap_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        "atomic_write_with: exhausted nonce retries for temp file name",
+                    )
+                }));
+            }
         }
+    };
+
+    let write_result = (|| -> std::io::Result<()> {
+        std::io::Write::write_all(&mut file, content.as_bytes())?;
+        file.sync_all()
+    })();
+    drop(file);
+    if let Err(e) = write_result {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
     }
+
+    if let Some(perms) = original_perms
+        && let Err(e) = std::fs::set_permissions(&tmp_path, perms)
+        && assurance == WriteAssurance::HighAssurance
+    {
+        // Fast falls through here and stays best-effort, matching the
+        // original atomic_write exactly.
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+
+    std::fs::rename(&tmp_path, path)?;
+    fsync_parent_dir(dir);
+    Ok(())
+}
+
+/// fsync's `dir` itself so a just-`rename()`d name→inode link is durable,
+/// not just the renamed file's content. Best-effort: an `Err` here (e.g.
+/// permission denied opening the directory) must never fail a write whose
+/// content and rename already succeeded — it only weakens the durability
+/// guarantee for that one write, the same trade-off `atomic_write` already
+/// makes for permission preservation in `Fast` mode.
+#[cfg(unix)]
+fn fsync_parent_dir(dir: &Path) {
+    if let Ok(dir_file) = std::fs::File::open(dir) {
+        let _ = dir_file.sync_all();
+    }
+}
+
+#[cfg(not(unix))]
+fn fsync_parent_dir(_dir: &Path) {
+    // No portable directory-fsync via std on non-Unix targets.
+}
+
+/// Best-effort-unique suffix for a temp file name: a process-local
+/// monotonic counter combined with wall-clock nanoseconds and the PID.
+/// Not a CSPRNG nonce — doesn't need to be, since uniqueness (not
+/// unpredictability) is the only property `atomic_write_with` relies on,
+/// and `create_new(true)` turns any residual collision into a loud retry
+/// rather than silent data loss.
+fn write_nonce() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{}-{nanos:x}-{counter:x}", std::process::id())
 }
 
 #[cfg(test)]
@@ -952,6 +1065,123 @@ mod tests {
             mode & 0o777,
             0o755,
             "atomic_write must preserve the original file's mode, not hand the replacement umask-derived perms"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn atomic_write_with_fast_and_high_assurance_both_round_trip() {
+        for (label, assurance) in [
+            ("fast", WriteAssurance::Fast),
+            ("high_assurance", WriteAssurance::HighAssurance),
+        ] {
+            let dir = std::env::temp_dir().join(format!(
+                "ci_edit_atomic_with_{label}_{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("f.txt");
+            std::fs::write(&path, "old\n").unwrap();
+
+            atomic_write_with(&path, "new content\n", assurance).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                "new content\n",
+                "{label} mode must write the new content"
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn atomic_write_with_leaves_no_orphaned_temp_files_after_success() {
+        let dir =
+            std::env::temp_dir().join(format!("ci_edit_atomic_with_notemp_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("f.txt");
+        std::fs::write(&path, "old\n").unwrap();
+
+        atomic_write_with(&path, "new\n", WriteAssurance::Fast).unwrap();
+
+        let leftover: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name != "f.txt")
+            .collect();
+        assert!(
+            leftover.is_empty(),
+            "no temp/nonce file should survive a successful write, found: {leftover:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn atomic_write_with_concurrent_writes_to_distinct_paths_all_succeed() {
+        // Exercises the random-nonce + create_new(O_EXCL) retry path under
+        // real concurrency (not just single-threaded sequential calls) —
+        // if two threads ever raced onto the same temp name without the
+        // retry loop handling it, one of these would fail instead of
+        // silently corrupting the other's write.
+        let dir = std::env::temp_dir().join(format!(
+            "ci_edit_atomic_with_concurrent_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let dir = dir.clone();
+                std::thread::spawn(move || {
+                    let path = dir.join(format!("f{i}.txt"));
+                    let content = format!("content-{i}\n");
+                    atomic_write_with(&path, &content, WriteAssurance::Fast).unwrap();
+                    (path, content)
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            let (path, expected) = handle.join().unwrap();
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn atomic_write_high_assurance_preserves_permissions_like_fast() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "ci_edit_atomic_with_perms_ha_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("script.sh");
+        std::fs::write(&path, "#!/bin/sh\necho old\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        atomic_write_with(
+            &path,
+            "#!/bin/sh\necho new\n",
+            WriteAssurance::HighAssurance,
+        )
+        .unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o755,
+            "HighAssurance must preserve permissions on the success path exactly like Fast"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

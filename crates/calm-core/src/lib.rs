@@ -1,6 +1,7 @@
 pub mod analysis;
 pub mod config;
 pub mod db;
+pub mod digest;
 pub mod edit;
 pub mod embedding;
 pub mod fitness;
@@ -11,14 +12,18 @@ pub mod graph;
 pub mod hooks;
 pub mod hooks_check;
 pub mod indexer;
+pub mod ledger;
 #[cfg(feature = "lsp-overlay")]
 pub mod lsp;
+pub mod maintenance;
 pub mod memory;
+pub mod path_policy;
 pub mod resolver;
 pub mod sanitize;
 #[cfg(feature = "scip-overlay")]
 pub mod scip;
 pub mod search;
+pub mod txn;
 pub mod types;
 pub mod walk;
 pub mod workflow;

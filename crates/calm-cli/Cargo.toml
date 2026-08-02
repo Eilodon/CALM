@@ -26,6 +26,11 @@ anyhow = { workspace = true }
 clap = { workspace = true }
 rusqlite = { workspace = true }
 serde_json = { workspace = true }
+# Real (non-dev) dependency, matching calm-server's own libc entry: needed by
+# src/bin/txn_crash_harness.rs (WS-1 task 4.8 crash-injection suite,
+# docs/plans/2026-08-02-phase1-p0-execution-plan.md §6) for `libc::raise` --
+# a `[[bin]]` target only sees `[dependencies]`, never `[dev-dependencies]`.
+libc = "0.2"
 opentelemetry = { workspace = true, optional = true }
 opentelemetry_sdk = { workspace = true, optional = true }
 opentelemetry-otlp = { workspace = true, optional = true }
@@ -33,7 +38,6 @@ tracing-opentelemetry = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = "3"
-libc = "0.2"
 
 [features]
 default = ["embeddings", "tier0-5", "scip-overlay", "stack-graphs-formal"]

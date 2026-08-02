@@ -518,6 +518,16 @@ impl CalmServer {
 
         let mut results = Vec::with_capacity(paths.len());
         let mut changed_paths: Vec<String> = Vec::new();
+        // Shadow-mode WS-1 (docs/plans/2026-08-02-phase1-p0-execution-plan.md
+        // §4.4): same non-blocking posture as edit_lines_impl_gated -- every
+        // txn:: call is best-effort, a failure never changes this
+        // function's outcome. One shadow tx per formatted file
+        // (action_class = semantics_preserving_transform per adopt-plan §5
+        // P0-3), all advanced to IndexCommitted/Done together after the
+        // single batched reindex below, since format_files reindexes every
+        // changed path in one call rather than per-file.
+        let mut shadow_tx_ids: Vec<String> = Vec::new();
+        let project_id = self.project_root.to_string_lossy().into_owned();
 
         for path in &paths {
             let full_path = match resolve_repo_path(&self.project_root, path) {
@@ -571,13 +581,57 @@ impl CalmServer {
                 });
                 continue;
             }
+            let shadow_tx_id: Option<String> = calm_core::db::conn::open_writer(&self.db_path)
+                .ok()
+                .and_then(|conn| {
+                    let base_digest = calm_core::digest::evidence_digest(original.as_bytes());
+                    let proposed_digest = calm_core::digest::evidence_digest(formatted.as_bytes());
+                    match calm_core::txn::begin(
+                        &conn,
+                        &project_id,
+                        path,
+                        &base_digest,
+                        &proposed_digest,
+                    ) {
+                        Ok(tx) => Some(tx.tx_id),
+                        Err(e) => {
+                            tracing::warn!("shadow txn::begin failed (non-blocking): {e}");
+                            None
+                        }
+                    }
+                });
             if let Err(e) = calm_core::edit::atomic_write(&full_path, &formatted) {
+                if let Some(tx_id) = &shadow_tx_id
+                    && let Ok(conn) = calm_core::db::conn::open_writer(&self.db_path)
+                {
+                    let _ = calm_core::txn::advance(
+                        &conn,
+                        tx_id,
+                        calm_core::txn::TxState::Failed,
+                        "system",
+                        &e.to_string(),
+                    );
+                }
                 results.push(FormatFileResult {
                     path: path.clone(),
                     status: "error".to_string(),
                     detail: Some(format!("failed to write {path}: {e}")),
                 });
                 continue;
+            }
+            if let Some(tx_id) = &shadow_tx_id
+                && let Ok(conn) = calm_core::db::conn::open_writer(&self.db_path)
+            {
+                let _ = calm_core::txn::advance(
+                    &conn,
+                    tx_id,
+                    calm_core::txn::TxState::FileCommitted,
+                    "system",
+                    "atomic_write succeeded (format)",
+                );
+            }
+            if let Some(tx_id) = shadow_tx_id {
+                shadow_tx_ids.push(tx_id);
             }
             self.track_file(path);
             self.mark_written(path);
@@ -600,6 +654,34 @@ impl CalmServer {
                         &changed_paths,
                     ) {
                         index_stale = Some(format!("reindex failed: {e}"));
+                    }
+                }
+            }
+        }
+        if !shadow_tx_ids.is_empty()
+            && let Ok(conn) = calm_core::db::conn::open_writer(&self.db_path)
+        {
+            let (to, reason): (calm_core::txn::TxState, String) = match &index_stale {
+                None => (
+                    calm_core::txn::TxState::IndexCommitted,
+                    "base index refreshed (batched format)".to_string(),
+                ),
+                Some(detail) => (calm_core::txn::TxState::Failed, detail.clone()),
+            };
+            for tx_id in &shadow_tx_ids {
+                match calm_core::txn::advance(&conn, tx_id, to, "system", &reason) {
+                    Ok(()) if to == calm_core::txn::TxState::IndexCommitted => {
+                        let _ = calm_core::txn::advance(
+                            &conn,
+                            tx_id,
+                            calm_core::txn::TxState::Done,
+                            "system",
+                            "base index committed, disk+index consistent",
+                        );
+                    }
+                    Ok(()) => {}
+                    Err(e) => {
+                        tracing::warn!("shadow txn::advance to {to:?} failed (non-blocking): {e}")
                     }
                 }
             }
@@ -992,8 +1074,51 @@ impl CalmServer {
                 // purely structural gate leaves open (calling edit_context and
                 // never reading the response is as cheap as never calling it).
                 let reason = reason.unwrap_or("").trim();
+                // WS-2 Phase 1 (docs/plans/2026-08-02-ws2-review-token-execution-plan.md
+                // §3.1, closing the confirmed live bypass): when a touched
+                // symbol's `known_caller_qns` is empty, the OLD unconditional
+                // `!reason.is_empty()` bypass here let a low-effort but
+                // non-empty string like "ok" satisfy the gate regardless of
+                // WHY there are no callers. `uncertain_zero_caller` (already
+                // computed above, same signal edit_context's own risk
+                // escalation and the bridge-downgrade eligibility check
+                // already trust) distinguishes two very different
+                // situations:
+                //   - EntryPoint/TestOnly: the system already has a
+                //     STRUCTURAL, independently-derived explanation for zero
+                //     callers (is_entry_point/is_test are indexer facts, not
+                //     the agent's claim) -- still just requires a non-blank
+                //     reason, same bar as the confirmed-safe
+                //     (uncertain_zero_caller=None) case, deliberately
+                //     unchanged. This is exactly this session's own common
+                //     dogfooding pattern: editing a zero-caller
+                //     `#[tool(...)]` MCP handler after creating it --
+                //     is_entry_point=true, permanently 0 static callers by
+                //     construction.
+                //   - LowConfidence: no structural explanation at all -- the
+                //     dead-code heuristic just disagrees this looks safe,
+                //     full stop. THIS is the case a free-text reason cannot
+                //     manufacture confidence for. Deliberately NOT keyword-
+                //     matched against `reason`'s content either (an agent
+                //     could learn "always mention entry_point" exactly the
+                //     way the old unconditional bypass was trivially
+                //     learnable) -- passing now additionally requires an
+                //     elicitation round-trip to actually run (Ask -> human
+                //     approves -> Approved); when elicitation isn't
+                //     configured at all (`ElicitGate::Off`, the default),
+                //     there is no such second check available, so this
+                //     fails closed with no override.
+                let uncertain_empty_caller_needs_review = known_caller_qns.is_empty()
+                    && matches!(
+                        uncertain_zero_caller,
+                        Some(UncertainZeroCallerReason::LowConfidence)
+                    );
                 let cites_real_signal = if known_caller_qns.is_empty() {
-                    !reason.is_empty()
+                    if uncertain_empty_caller_needs_review {
+                        !reason.is_empty() && matches!(gate, ElicitGate::Ask | ElicitGate::Approved)
+                    } else {
+                        !reason.is_empty()
+                    }
                 } else {
                     known_caller_qns.iter().any(|qn| {
                         let short = qn.rsplit("::").next().unwrap_or(qn);
@@ -1004,16 +1129,33 @@ impl CalmServer {
                     })
                 };
                 if !cites_real_signal {
+                    let reason_code = if uncertain_empty_caller_needs_review {
+                        "UNCERTAIN_ZERO_CALLER"
+                    } else {
+                        "REASON_NOT_GROUNDED"
+                    };
                     tracing::info!(
                         target: crate::telemetry::AUDIT_TARGET,
                         session_id = self.session_id,
                         decision = "denied",
-                        reason_code = "REASON_NOT_GROUNDED",
+                        reason_code,
                         path,
                         reason,
                         risk = risk.as_deref().unwrap_or("none"),
                         hub_hit,
                     );
+                    if uncertain_empty_caller_needs_review {
+                        return ToolOutcome::error(error_detail(
+                            "UNCERTAIN_ZERO_CALLER",
+                            "this symbol has zero confirmed callers AND the dead-code \
+                             heuristic disagrees it looks safely removable — a written \
+                             reason cannot substitute for that missing confidence. \
+                             Enable [edit] elicit_hub_confirm and get human approval via \
+                             the elicitation round-trip, or investigate further \
+                             (callers/understand) before treating this as safe to edit",
+                            true,
+                        ));
+                    }
                     let examples: Vec<String> = known_caller_qns
                         .iter()
                         .map(|qn| {
@@ -1072,7 +1214,48 @@ impl CalmServer {
                 ));
             }
         }
+        // Shadow-mode WS-1 (docs/plans/2026-08-02-phase1-p0-execution-plan.md
+        // §4.4/§4.6 task 4.4): observes the same write this function already
+        // performs, never changes its outcome. Every txn:: call below is
+        // best-effort -- a failure just logs and shadow_tx_id becomes None,
+        // the real edit proceeds exactly as it did before this block
+        // existed. `atomic_write` itself is UNCHANGED (still Fast mode) --
+        // switching to `atomic_write_with(.., HighAssurance)` is a
+        // deliberate later enforce-stage change, not bundled into shadow
+        // wiring.
+        let project_id = self.project_root.to_string_lossy().into_owned();
+        let shadow_tx_id: Option<String> = calm_core::db::conn::open_writer(&self.db_path)
+            .ok()
+            .and_then(|conn| {
+                let base_digest = calm_core::digest::evidence_digest(original.as_bytes());
+                let proposed_digest = calm_core::digest::evidence_digest(new_content.as_bytes());
+                match calm_core::txn::begin(
+                    &conn,
+                    &project_id,
+                    path,
+                    &base_digest,
+                    &proposed_digest,
+                ) {
+                    Ok(tx) => Some(tx.tx_id),
+                    Err(e) => {
+                        tracing::warn!("shadow txn::begin failed (non-blocking): {e}");
+                        None
+                    }
+                }
+            });
+
         if let Err(e) = calm_core::edit::atomic_write(&full_path, &new_content) {
+            if let Some(tx_id) = &shadow_tx_id
+                && let Ok(conn) = calm_core::db::conn::open_writer(&self.db_path)
+            {
+                let _ = calm_core::txn::advance(
+                    &conn,
+                    tx_id,
+                    calm_core::txn::TxState::Failed,
+                    "system",
+                    &e.to_string(),
+                );
+            }
             drop(_cross_guard);
             drop(_guard);
             return ToolOutcome::error(error_detail(
@@ -1080,6 +1263,17 @@ impl CalmServer {
                 &format!("failed to write {path}: {e}"),
                 false,
             ));
+        }
+        if let Some(tx_id) = &shadow_tx_id
+            && let Ok(conn) = calm_core::db::conn::open_writer(&self.db_path)
+        {
+            let _ = calm_core::txn::advance(
+                &conn,
+                tx_id,
+                calm_core::txn::TxState::FileCommitted,
+                "system",
+                "atomic_write succeeded",
+            );
         }
         {
             // One audit event per successful write, unconditional (not just
@@ -1167,13 +1361,75 @@ impl CalmServer {
                         {
                             let root = self.project_root.clone();
                             let db = self.db_path.clone();
+                            // WS-1 durable outbox (plan
+                            // §4.1b/§4.3/§4.6 task 4.5): records the
+                            // trigger before spawning so a crash between
+                            // here and the thread completing still leaves
+                            // a 'queued'/'running' row for startup
+                            // recovery to find -- run_all_coalesced itself
+                            // is UNCHANGED, still fire-and-forget, still
+                            // self-coalescing via its own in-memory flags.
+                            // mark_completed after it returns is an honest
+                            // "the call returned", not "every language's
+                            // pass is proven fresh" -- a concurrent
+                            // caller's own OVERLAY_RERUN loop can still be
+                            // running a rerun that covers this trigger
+                            // when this returns; that's inherent to
+                            // run_all_coalesced's existing design, not
+                            // something this wrapper changes or hides.
+                            if let Ok(conn) = calm_core::db::conn::open_writer(&self.db_path) {
+                                let _ = calm_core::maintenance::enqueue(
+                                    &conn,
+                                    calm_core::maintenance::MaintenanceKind::ScipRefresh,
+                                    shadow_tx_id.as_deref(),
+                                );
+                            }
                             std::thread::spawn(move || {
+                                if let Ok(conn) = calm_core::db::conn::open_writer(&db) {
+                                    let _ = calm_core::maintenance::mark_running(
+                                        &conn,
+                                        calm_core::maintenance::MaintenanceKind::ScipRefresh,
+                                    );
+                                }
                                 crate::scip_overlay::run_all_coalesced(&root, &db);
+                                if let Ok(conn) = calm_core::db::conn::open_writer(&db) {
+                                    let _ = calm_core::maintenance::mark_completed(
+                                        &conn,
+                                        calm_core::maintenance::MaintenanceKind::ScipRefresh,
+                                        Ok(()),
+                                    );
+                                }
                             });
                         }
                     }
                     Ok(_) => {}
                     Err(e) => index_stale = Some(format!("reindex failed: {e}")),
+                }
+            }
+        }
+        if let Some(tx_id) = &shadow_tx_id
+            && let Ok(conn) = calm_core::db::conn::open_writer(&self.db_path)
+        {
+            let (to, reason): (calm_core::txn::TxState, String) = match &index_stale {
+                None => (
+                    calm_core::txn::TxState::IndexCommitted,
+                    "base index refreshed".to_string(),
+                ),
+                Some(detail) => (calm_core::txn::TxState::Failed, detail.clone()),
+            };
+            match calm_core::txn::advance(&conn, tx_id, to, "system", &reason) {
+                Ok(()) if to == calm_core::txn::TxState::IndexCommitted => {
+                    let _ = calm_core::txn::advance(
+                        &conn,
+                        tx_id,
+                        calm_core::txn::TxState::Done,
+                        "system",
+                        "base index committed, disk+index consistent",
+                    );
+                }
+                Ok(()) => {}
+                Err(e) => {
+                    tracing::warn!("shadow txn::advance to {to:?} failed (non-blocking): {e}")
                 }
             }
         }
@@ -1188,24 +1444,59 @@ impl CalmServer {
         // each other, not against reindex_paths itself.
         if should_embed_bg && let Some(model) = self.embedder() {
             let db_path = self.db_path.clone();
+            // WS-1 durable outbox (plan §4.1b/§4.3/§4.6 task 4.5) -- same
+            // rationale as the SCIP wrapper above: enqueue before
+            // spawning, mark_completed after; embed_pending/
+            // embed_pending_chunks themselves are UNCHANGED and already
+            // idempotent/resumable.
+            if let Ok(conn) = calm_core::db::conn::open_writer(&self.db_path) {
+                let _ = calm_core::maintenance::enqueue(
+                    &conn,
+                    calm_core::maintenance::MaintenanceKind::EmbedRefresh,
+                    shadow_tx_id.as_deref(),
+                );
+            }
             std::thread::spawn(move || {
                 let _bg_guard = EMBED_BG.lock_ok();
+                if let Ok(conn) = calm_core::db::conn::open_writer(&db_path) {
+                    let _ = calm_core::maintenance::mark_running(
+                        &conn,
+                        calm_core::maintenance::MaintenanceKind::EmbedRefresh,
+                    );
+                }
+                let mut error_detail: Option<String> = None;
                 match calm_core::db::conn::open_writer(&db_path) {
                     Ok(bg_conn) => {
                         if let Err(e) =
                             calm_core::embedding::embed_pending(&bg_conn, model.as_ref())
                         {
                             tracing::error!("edit_lines: background embedding failed: {e}");
+                            error_detail = Some(e.to_string());
                         }
                         if let Err(e) =
                             calm_core::embedding::embed_pending_chunks(&bg_conn, model.as_ref())
                         {
                             tracing::error!("edit_lines: background chunk embedding failed: {e}");
+                            error_detail.get_or_insert_with(|| e.to_string());
                         }
                     }
-                    Err(e) => tracing::error!(
-                        "edit_lines: could not open DB for background embedding: {e}"
-                    ),
+                    Err(e) => {
+                        tracing::error!(
+                            "edit_lines: could not open DB for background embedding: {e}"
+                        );
+                        error_detail = Some(e.to_string());
+                    }
+                }
+                if let Ok(conn) = calm_core::db::conn::open_writer(&db_path) {
+                    let result = match &error_detail {
+                        None => Ok(()),
+                        Some(detail) => Err(detail.as_str()),
+                    };
+                    let _ = calm_core::maintenance::mark_completed(
+                        &conn,
+                        calm_core::maintenance::MaintenanceKind::EmbedRefresh,
+                        result,
+                    );
                 }
             });
         }
@@ -1908,26 +2199,41 @@ fn resolve_repo_path(
     project_root: &std::path::Path,
     path: &str,
 ) -> Result<std::path::PathBuf, ErrorDetail> {
-    let candidate = project_root.join(path);
-    let real = std::fs::canonicalize(&candidate)
-        .map_err(|e| error_detail("READ_FAILED", &format!("could not read {path}: {e}"), false))?;
-    // `project_root` isn't guaranteed canonical by every caller (tests in
-    // particular construct `CalmServer` directly from an uncanonicalized
-    // temp dir) — canonicalize both sides rather than assume the
-    // constructor already did, so this check can't be defeated simply by
-    // an un-canonicalized root.
-    let root = std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
-    if !real.starts_with(&root) {
-        return Err(error_detail(
+    // Delegates to calm_core::path_policy (WS-3 task 3.3/3.4) under
+    // FollowInternalSymlinks -- the exact containment check this function
+    // always performed inline before that module existed. Error codes and
+    // messages below are reproduced byte-for-byte so all 6 callers
+    // (edit_lines_flow, edit_symbol_flow x2, format_files_impl,
+    // edit_lines_impl_gated, insertion_hunk_for) see zero behavior change.
+    calm_core::path_policy::resolve_within_root(
+        project_root,
+        path,
+        calm_core::path_policy::SymlinkPolicy::FollowInternalSymlinks,
+    )
+    .map_err(|e| match e {
+        calm_core::path_policy::PathPolicyError::ReadFailed { path, detail } => error_detail(
+            "READ_FAILED",
+            &format!("could not read {path}: {detail}"),
+            false,
+        ),
+        calm_core::path_policy::PathPolicyError::EscapesRoot { path } => error_detail(
             "PATH_ESCAPES_PROJECT_ROOT",
             &format!(
                 "{path} resolves outside the project root (via `..` traversal or a symlink) \
                  — refusing to read or write it"
             ),
             false,
-        ));
-    }
-    Ok(real)
+        ),
+        // FollowInternalSymlinks never produces these two -- they're only
+        // reachable under RejectSymlinks/AllowExternalSymlinksWithApproval,
+        // neither of which is wired into this call site yet.
+        calm_core::path_policy::PathPolicyError::SymlinkRejected { path, .. }
+        | calm_core::path_policy::PathPolicyError::NeedsApproval { path } => error_detail(
+            "PATH_ESCAPES_PROJECT_ROOT",
+            &format!("{path}: unexpected path policy result under FollowInternalSymlinks"),
+            false,
+        ),
+    })
 }
 
 fn insertion_hunk_for(

@@ -3741,6 +3741,245 @@ mod tests {
     }
 
     #[test]
+    fn startup_hook_reconciles_a_stale_maintenance_job_left_by_a_previous_process() {
+        // Plan §4.6: a fresh `CalmServer::new_with_preset` call must reconcile
+        // any maintenance_jobs row a previous process's crash left at
+        // queued/running (it cannot belong to THIS process -- nothing has
+        // enqueued anything yet at this point), while leaving a non-terminal
+        // edit_transaction observable but untouched (Phase 1 has no automatic
+        // tx repair -- see `reconcile_stale_at_startup`'s doc comment).
+        let dir = std::env::temp_dir().join(format!("ci_startup_recovery_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("index.db");
+
+        // "Process 1": construct a server (runs schema init), then write DB
+        // state directly the way a real crash mid-edit would leave it -- an
+        // edit_transaction stuck at FileCommitted and a maintenance job stuck
+        // at running -- bypassing the tool layer, since this stands in for "a
+        // prior process died mid-work", not a normal edit_lines call.
+        {
+            let _server =
+                CalmServer::new_with_preset(dir.clone(), db_path.clone(), "full".into()).unwrap();
+            let conn = calm_core::db::conn::open_writer(&db_path).unwrap();
+            let tx = calm_core::txn::begin(&conn, "proj", "a.rs", "sha256:x", "sha256:y").unwrap();
+            calm_core::txn::advance(
+                &conn,
+                &tx.tx_id,
+                calm_core::txn::TxState::FileCommitted,
+                "system",
+                "wrote",
+            )
+            .unwrap();
+            calm_core::maintenance::enqueue(
+                &conn,
+                calm_core::maintenance::MaintenanceKind::ScipRefresh,
+                Some(tx.tx_id.as_str()),
+            )
+            .unwrap();
+            calm_core::maintenance::mark_running(
+                &conn,
+                calm_core::maintenance::MaintenanceKind::ScipRefresh,
+            )
+            .unwrap();
+            // `_server`/`conn` drop here -- standing in for the process exiting
+            // before ever reaching mark_completed/txn::advance(Done).
+        }
+
+        // "Process 2": a fresh construction against the same db_path.
+        let _server2 =
+            CalmServer::new_with_preset(dir.clone(), db_path.clone(), "full".into()).unwrap();
+        let conn = calm_core::db::conn::open_writer(&db_path).unwrap();
+
+        let jobs = calm_core::maintenance::all_jobs(&conn).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].state, calm_core::maintenance::JobState::Failed);
+        assert!(
+            jobs[0]
+                .last_error
+                .as_deref()
+                .unwrap_or("")
+                .contains("restarted"),
+            "got: {:?}",
+            jobs[0].last_error
+        );
+
+        let incomplete = calm_core::txn::recover_incomplete(&conn).unwrap();
+        assert_eq!(
+            incomplete.len(),
+            1,
+            "a tx left FileCommitted must still be observable after restart, not silently dropped"
+        );
+        assert_eq!(incomplete[0].state, calm_core::txn::TxState::FileCommitted);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_transaction_status_reports_a_known_transaction() {
+        let (dir, server) = test_server("edit_transaction_status_known");
+        let conn = calm_core::db::conn::open_writer(&server.db_path).unwrap();
+        let tx = calm_core::txn::begin(&conn, "proj", "a.rs", "sha256:x", "sha256:y").unwrap();
+        calm_core::txn::advance(
+            &conn,
+            &tx.tx_id,
+            calm_core::txn::TxState::FileCommitted,
+            "system",
+            "wrote",
+        )
+        .unwrap();
+        drop(conn);
+
+        let out = jv(
+            server.edit_transaction_status(Parameters(EditTransactionStatusParams {
+                tx_id: tx.tx_id.clone(),
+            })),
+        );
+        assert_eq!(out["tx_id"], tx.tx_id);
+        assert_eq!(out["path"], "a.rs");
+        assert_eq!(out["state"], "FILE_COMMITTED");
+        assert_eq!(out["replay_state"], "FILE_COMMITTED");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_transaction_status_reports_not_found_for_unknown_tx_id() {
+        let (dir, server) = test_server("edit_transaction_status_unknown");
+        let out = jv(
+            server.edit_transaction_status(Parameters(EditTransactionStatusParams {
+                tx_id: "TXN-does-not-exist".to_string(),
+            })),
+        );
+        assert_eq!(out["error"]["code"], "TX_NOT_FOUND");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn maintenance_status_reports_all_kinds_and_suggests_retry_on_failure() {
+        let (dir, server) = test_server("maintenance_status_reports");
+        let conn = calm_core::db::conn::open_writer(&server.db_path).unwrap();
+        calm_core::maintenance::enqueue(
+            &conn,
+            calm_core::maintenance::MaintenanceKind::ScipRefresh,
+            None,
+        )
+        .unwrap();
+        calm_core::maintenance::mark_running(
+            &conn,
+            calm_core::maintenance::MaintenanceKind::ScipRefresh,
+        )
+        .unwrap();
+        calm_core::maintenance::mark_completed(
+            &conn,
+            calm_core::maintenance::MaintenanceKind::ScipRefresh,
+            Err("boom"),
+        )
+        .unwrap();
+        drop(conn);
+
+        let out = jv(server.maintenance_status());
+        let jobs = out["jobs"].as_array().unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0]["job_kind"], "scip_refresh");
+        assert_eq!(jobs[0]["state"], "failed");
+        assert_eq!(jobs[0]["last_error"], "boom");
+        assert_eq!(out["suggested_next"]["tool"], "retry_maintenance");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn retry_maintenance_rejects_an_unknown_job_kind() {
+        let (dir, server) = test_server("retry_maintenance_unknown_kind");
+        let out = jv(server.retry_maintenance(Parameters(RetryMaintenanceParams {
+            job_kind: "not_a_real_kind".to_string(),
+        })));
+        assert_eq!(out["error"]["code"], "UNKNOWN_JOB_KIND");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn retry_maintenance_embed_refresh_reports_failure_when_no_model_loaded() {
+        // semantic_search is disabled by default in a bare test_server, so
+        // self.embedder() is None -- retry_maintenance must report that as a
+        // real failure, not silently succeed.
+        let (dir, server) = test_server("retry_maintenance_embed_no_model");
+        let out = jv(server.retry_maintenance(Parameters(RetryMaintenanceParams {
+            job_kind: "embed_refresh".to_string(),
+        })));
+        assert_eq!(out["error"]["code"], "MAINTENANCE_RETRY_FAILED");
+
+        let conn = calm_core::db::conn::open_writer(&server.db_path).unwrap();
+        let jobs = calm_core::maintenance::all_jobs(&conn).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].state, calm_core::maintenance::JobState::Failed);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn repair_consistency_requires_at_least_one_target() {
+        let (dir, server) = test_server("repair_consistency_missing_target");
+        let out = jv(
+            server.repair_consistency(Parameters(RepairConsistencyParams {
+                tx_id: None,
+                path: None,
+            })),
+        );
+        assert_eq!(out["error"]["code"], "MISSING_TARGET");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn repair_consistency_flags_drift_when_disk_no_longer_matches_proposed_digest() {
+        let (dir, server) = test_server("repair_consistency_drift");
+        let full_path = dir.join("a.rs");
+        std::fs::write(&full_path, "fn a() {}\n").unwrap();
+        let conn = calm_core::db::conn::open_writer(&server.db_path).unwrap();
+        let base = calm_core::digest::evidence_digest(b"fn old() {}\n");
+        let proposed = calm_core::digest::evidence_digest(b"fn a() {}\n");
+        let tx = calm_core::txn::begin(&conn, "proj", "a.rs", &base, &proposed).unwrap();
+        calm_core::txn::advance(
+            &conn,
+            &tx.tx_id,
+            calm_core::txn::TxState::FileCommitted,
+            "system",
+            "wrote",
+        )
+        .unwrap();
+        calm_core::txn::advance(
+            &conn,
+            &tx.tx_id,
+            calm_core::txn::TxState::IndexCommitted,
+            "system",
+            "reindexed",
+        )
+        .unwrap();
+        calm_core::txn::advance(
+            &conn,
+            &tx.tx_id,
+            calm_core::txn::TxState::Done,
+            "system",
+            "done",
+        )
+        .unwrap();
+        drop(conn);
+
+        // Simulate later drift: something rewrote the file after the tx completed.
+        std::fs::write(&full_path, "fn a() { /* changed */ }\n").unwrap();
+
+        let out = jv(
+            server.repair_consistency(Parameters(RepairConsistencyParams {
+                tx_id: None,
+                path: Some("a.rs".to_string()),
+            })),
+        );
+        assert_eq!(out["tx_id"], tx.tx_id);
+        assert_eq!(out["cache_matches_replay"], true);
+        assert_eq!(out["disk_matches_proposed"], false);
+        assert_eq!(out["needs_rescan"], true);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn effective_orientation_mode_stays_block_with_escape_hatch_present() {
         let dir =
             std::env::temp_dir().join(format!("ci_orientation_stayblock_{}", std::process::id()));
@@ -8204,6 +8443,133 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dir.join("a.py")).unwrap(),
             "def mcp_tool_handler():\n    return 2\n"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn empty_caller_set_low_confidence_zero_caller_is_refused_with_elicitation_off() {
+        // WS-2 Phase 1 (docs/plans/2026-08-02-ws2-review-token-execution-plan.md
+        // §3.1): the confirmed live bypass this closes. `language` is
+        // deliberately an unrecognized value (`get_lang_constants` returns
+        // None for it) so `scope_clear_for_language` is false AND
+        // `is_private_symbol`'s language match falls to its `_ => false`
+        // arm -- neither is_entry_point, is_test, nor a private/scope-clear
+        // signal explains the zero caller_count, landing exactly on
+        // `UncertainZeroCallerReason::LowConfidence`, not EntryPoint/TestOnly.
+        let (dir, server) = test_server("edit_confirm_gate_low_confidence");
+        std::fs::write(dir.join("a.cobol"), "def mystery_fn():\n    return 1\n").unwrap();
+        let hash =
+            calm_core::edit::range_checksum("def mystery_fn():\n    return 1\n", 2, 2).unwrap();
+
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point, is_test)
+                 VALUES ('a.cobol::mystery_fn', 'mystery_fn', 'function', 'cobol', 'a.cobol', 1, 2, '', '', 'mystery_fn', 0, 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        }
+
+        server.edit_context(rmcp::handler::server::wrapper::Parameters(
+            EditContextParams {
+                symbol: "mystery_fn".into(),
+                path: None,
+                line: None,
+                if_none_match: None,
+            },
+        ));
+
+        // Layer satisfied structurally (edit_context ran, confirm:true) but
+        // a written reason alone must NOT be enough for a LowConfidence
+        // zero-caller symbol -- unlike the EntryPoint/TestOnly cases, there
+        // is no structural explanation here for the system to independently
+        // trust.
+        let out = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
+            EditLinesParams {
+                path: "a.cobol".into(),
+                edits: vec![EditHunkParam {
+                    old_text: None,
+                    start_line: 2,
+                    end_line: 2,
+                    expected_hash: Some(hash),
+                    new_text: "    return 2\n".into(),
+                }],
+                confirm: true,
+                reason: Some("trust me, totally safe, definitely fine".into()),
+            },
+        ));
+        let v = jv(out);
+        assert_eq!(v["error"]["code"], "UNCERTAIN_ZERO_CALLER", "response: {v}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.cobol")).unwrap(),
+            "def mystery_fn():\n    return 1\n",
+            "must not have written -- no override exists with elicitation off"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn empty_caller_set_low_confidence_zero_caller_can_pass_via_elicitation_ask_then_approved() {
+        use super::edit::{ElicitGate, HubAskContext};
+        // Same fixture shape as the Off-gate test above, but exercised
+        // through `edit_lines_flow` with an explicit `ElicitGate` the way
+        // the existing hub elicitation tests do -- proves the escape hatch
+        // this phase adds actually works end to end (Ask -> pending ->
+        // Approved -> applied), not just that the Off case refuses.
+        let (dir, server) = test_server("edit_confirm_gate_low_confidence_elicit");
+        std::fs::write(dir.join("a.cobol"), "def mystery_fn():\n    return 1\n").unwrap();
+        let hash =
+            calm_core::edit::range_checksum("def mystery_fn():\n    return 1\n", 2, 2).unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point, is_test)
+                 VALUES ('a.cobol::mystery_fn', 'mystery_fn', 'function', 'cobol', 'a.cobol', 1, 2, '', '', 'mystery_fn', 0, 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        }
+        server.edit_context(rmcp::handler::server::wrapper::Parameters(
+            EditContextParams {
+                symbol: "mystery_fn".into(),
+                path: None,
+                line: None,
+                if_none_match: None,
+            },
+        ));
+        let params = EditLinesParams {
+            path: "a.cobol".into(),
+            edits: vec![EditHunkParam {
+                old_text: None,
+                start_line: 2,
+                end_line: 2,
+                expected_hash: Some(hash),
+                new_text: "    return 2\n".into(),
+            }],
+            confirm: true,
+            reason: Some("checked -- no confirmed callers, dead-code heuristic uncertain".into()),
+        };
+
+        let mut ask: Option<HubAskContext> = None;
+        let out = server.edit_lines_flow(&params, ElicitGate::Ask, &mut ask);
+        let v = serde_json::to_value(&out).unwrap();
+        assert_eq!(v["error"]["code"], "ELICITATION_PENDING", "response: {v}");
+        assert!(ask.is_some(), "sentinel must carry the question context");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.cobol")).unwrap(),
+            "def mystery_fn():\n    return 1\n"
+        );
+
+        let out = server.edit_lines_flow(&params, ElicitGate::Approved, &mut None);
+        let v = serde_json::to_value(&out).unwrap();
+        assert_eq!(v["applied"], true, "response: {v}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.cobol")).unwrap(),
+            "def mystery_fn():\n    return 2\n"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

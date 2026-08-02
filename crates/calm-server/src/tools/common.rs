@@ -45,6 +45,43 @@ impl CalmServer {
         // `busy_timeout` gives every other writer.
         let conn = calm_core::db::conn::open_writer(&db_path)?;
         calm_core::db::schema::init_db(&conn)?;
+        // WS-1 startup recovery (docs/plans/2026-08-02-phase1-p0-execution-plan.md
+        // §4.6): every real launch path (stdio, unix daemon, CLI direct) funnels
+        // through `bootstrap` -> here, exactly once per process, so this is the
+        // one place a "new process just started" hook belongs. Log-only for
+        // `edit_transactions` -- Phase 1 has no automatic repair, only
+        // `repair_consistency` (a deliberate, explicit action) knows how to
+        // reconcile a non-terminal tx against real disk content; guessing here
+        // would risk marking a transaction Failed when its file write in fact
+        // already succeeded. `maintenance_jobs` gets an actual state fix
+        // (queued/running -> failed) because a row still queued/running at this
+        // exact point cannot belong to this process (nothing has enqueued
+        // anything yet) -- see `reconcile_stale_at_startup`'s doc comment for
+        // why this does NOT re-invoke the real scip/embed refresh itself
+        // (`bootstrap` already does that unconditionally moments later for
+        // whichever process wins the indexer lock).
+        if let Ok(incomplete) = calm_core::txn::recover_incomplete(&conn) {
+            for tx in &incomplete {
+                tracing::warn!(
+                    target: crate::telemetry::AUDIT_TARGET,
+                    tx_id = %tx.tx_id,
+                    path = %tx.path,
+                    state = tx.state.as_str(),
+                    "startup: found a non-terminal edit transaction left by a previous process"
+                );
+            }
+        }
+        if let Ok(reconciled) = calm_core::maintenance::reconcile_stale_at_startup(&conn) {
+            for job in &reconciled {
+                tracing::warn!(
+                    target: crate::telemetry::AUDIT_TARGET,
+                    job_kind = job.kind.as_str(),
+                    "startup: reconciled a maintenance job a previous process left \
+                     queued/running -- this process's own startup indexing will run a fresh \
+                     pass if it becomes the indexer-lock owner"
+                );
+            }
+        }
         drop(conn);
         let coverage = calm_core::analysis::coverage::load_coverage(&project_root);
         let tool_router = CalmServer::tool_router_for_preset(&preset)?;

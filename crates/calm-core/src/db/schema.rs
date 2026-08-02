@@ -234,7 +234,85 @@ CREATE TABLE IF NOT EXISTS pattern_debt (
     last_checked_at        TEXT,
     last_checked_count     INTEGER
 );
-CREATE INDEX IF NOT EXISTS idx_pattern_debt_topic ON pattern_debt(topic);";
+CREATE INDEX IF NOT EXISTS idx_pattern_debt_topic ON pattern_debt(topic);
+
+-- WS-1 (docs/plans/2026-08-02-phase1-p0-execution-plan.md §4.2): durable edit-transaction
+-- journal. 'state' is a CACHE of replay(tx_events WHERE tx_id=?) -> last state, not an
+-- independent source of truth -- txn::advance() is the only code path allowed to write it,
+-- and always writes a matching tx_events row in the same call. Mirrors VHEATM's
+-- lifecycle.py::AuditLifecycle (ALLOWED_TRANSITIONS + replayable event log).
+CREATE TABLE IF NOT EXISTS edit_transactions (
+    tx_id                   TEXT PRIMARY KEY,
+    project_id               TEXT NOT NULL,
+    path                      TEXT NOT NULL,
+    base_digest               TEXT NOT NULL,
+    proposed_digest           TEXT NOT NULL,
+    review_token_id           TEXT,
+    state                     TEXT NOT NULL DEFAULT 'PREPARED',
+    temp_path                 TEXT,
+    graph_generation_before   INTEGER,
+    graph_generation_after    INTEGER,
+    created_at                REAL NOT NULL,
+    updated_at                REAL NOT NULL,
+    error_code                TEXT,
+    error_detail              TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_edit_transactions_state ON edit_transactions(state);
+CREATE INDEX IF NOT EXISTS idx_edit_transactions_path  ON edit_transactions(path);
+
+-- Replay log for edit_transactions.state above -- one row per txn::advance() call, content-
+-- addressed id (mirrors provenance.py::expected_journal_event_id) so a corrupted/edited row
+-- is detectable, not just a plain audit trail.
+CREATE TABLE IF NOT EXISTS tx_events (
+    event_id       TEXT PRIMARY KEY,
+    tx_id           TEXT NOT NULL REFERENCES edit_transactions(tx_id) ON DELETE CASCADE,
+    sequence        INTEGER NOT NULL,
+    from_state      TEXT NOT NULL,
+    to_state        TEXT NOT NULL,
+    actor           TEXT NOT NULL,
+    reason          TEXT NOT NULL,
+    occurred_at     REAL NOT NULL,
+    UNIQUE(tx_id, sequence)
+);
+
+-- Durable trigger for the two fire-and-forget background refreshes already spawned from
+-- edit_lines_impl_gated/format_files_impl (crates/calm-server/src/tools/edit.rs) --
+-- scip_overlay::run_all_coalesced and embedding::embed_pending(_chunks). Both of those
+-- functions already re-scan/coalesce globally and are idempotent; the gap this table closes
+-- is durability of the trigger itself (see plan doc §4.1b) -- a process killed between
+-- 'reindex committed' and 'background thread finished' previously left nothing recording
+-- that a refresh was still owed. Singleton per job_kind (dedupe_key = job_kind), NOT per-path
+-- or per-tx: these are whole-repo passes, not per-file jobs.
+CREATE TABLE IF NOT EXISTS maintenance_jobs (
+    job_id               TEXT PRIMARY KEY,
+    job_kind              TEXT NOT NULL,
+    dedupe_key            TEXT NOT NULL UNIQUE,
+    state                 TEXT NOT NULL DEFAULT 'queued',
+    triggered_by_tx_id     TEXT,
+    attempts               INTEGER NOT NULL DEFAULT 0,
+    available_at           REAL NOT NULL,
+    lease_owner            TEXT,
+    lease_expires_at       REAL,
+    last_error             TEXT,
+    last_completed_at      REAL
+);
+CREATE INDEX IF NOT EXISTS idx_maintenance_jobs_available ON maintenance_jobs(state, available_at);
+
+-- P0-4 (docs/plans/2026-08-01-calm-adopt-from-vheatm-plan.md#p0-4): append-only,
+-- hash-chained audit ledger. Runs alongside AUDIT_TARGET tracing (a SIEM log line)
+-- as a separate durable, tamper-evident channel -- event_hash =
+-- SHA-256(canonical(payload) || prev_hash) chains every row to the one before it,
+-- so an out-of-band UPDATE/DELETE on this table is detectable by
+-- ledger::verify_chain(), not just a plain audit trail. Mirrors VHEATM's
+-- provenance.py hash chain.
+CREATE TABLE IF NOT EXISTS audit_ledger (
+    seq          INTEGER PRIMARY KEY AUTOINCREMENT,
+    prev_hash    TEXT NOT NULL,
+    event_hash   TEXT NOT NULL UNIQUE,
+    ts           REAL NOT NULL,
+    actor        TEXT NOT NULL,
+    payload      TEXT NOT NULL
+);";
 
 const FTS5_SQL: &str = "
 CREATE VIRTUAL TABLE IF NOT EXISTS fts_exact USING fts5(

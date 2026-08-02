@@ -1,0 +1,132 @@
+{
+  "name": "repair_consistency",
+  "description": "USE WHEN: edit_transaction_status/maintenance_status show something suspicious and you want to check whether a transaction's replayed state agrees with its cached state, and whether disk content still matches what the transaction proposed. Accepts tx_id or path (path resolves to that path's most recent transaction). Read-only diagnostic -- flags drift, does not silently auto-fix it.",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "properties": {
+      "tx_id": {
+        "description": "Exact tx_id to check. At least one of tx_id/path is required.",
+        "type": [
+          "string",
+          "null"
+        ],
+        "default": null
+      },
+      "path": {
+        "description": "Repo-relative path -- resolves to that path's most recent\ntransaction. At least one of tx_id/path is required.",
+        "type": [
+          "string",
+          "null"
+        ],
+        "default": null
+      }
+    },
+    "type": "object"
+  },
+  "outputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$defs": {
+      "ErrorDetail": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "recoverable": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "recoverable"
+        ]
+      },
+      "SuggestedNext": {
+        "type": "object",
+        "properties": {
+          "tool": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "args": true,
+          "gate": {
+            "description": "Plan 3 §3.5(b): `Some(true)` iff skipping `tool` is actually\nhook-enforced (currently only the edit_context/edit_lines/edit_symbol\n→ diff_impact hints set this, via `suggested_gated`) — every other\nhint is left unset (`None`), meaning advisory-only. Lets an agent\ntell \"you'll be blocked if you skip this\" apart from \"you probably\nwant this next\" without re-deriving it from AGENTS.md prose each time.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "tool",
+          "reason"
+        ]
+      }
+    },
+    "properties": {
+      "error": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/ErrorDetail"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "tx_id": {
+        "type": "string"
+      },
+      "path": {
+        "type": "string"
+      },
+      "cached_state": {
+        "type": "string"
+      },
+      "replayed_state": {
+        "type": "string"
+      },
+      "cache_matches_replay": {
+        "type": "boolean"
+      },
+      "disk_digest": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "proposed_digest": {
+        "type": "string"
+      },
+      "disk_matches_proposed": {
+        "type": "boolean"
+      },
+      "needs_rescan": {
+        "type": "boolean"
+      },
+      "suggested_next": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/SuggestedNext"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "type": "object"
+  },
+  "annotations": {
+    "readOnlyHint": true,
+    "destructiveHint": false,
+    "idempotentHint": true,
+    "openWorldHint": false
+  }
+}
