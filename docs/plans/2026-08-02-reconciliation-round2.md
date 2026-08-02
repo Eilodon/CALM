@@ -17,6 +17,8 @@ verified_against: |
   chính phiên này — không copy số liệu từ 3 doc con.
 ---
 
+> **[SUPERSEDED — trạng thái hiện tại]** Xem [2026-08-02-phase2-priority-and-ws2-execution-plan.md](2026-08-02-phase2-priority-and-ws2-execution-plan.md) §2 — N2 (tool-surface) và N4 (ledger mồ côi) dưới đây ĐÃ ĐÓNG từ commit 1830328; N3's "1/6 tiêu chí" nay là 5/6. Nội dung dưới đây giữ nguyên làm bằng chứng xác minh chi tiết (N1-N5).
+
 # Reconciliation Round 2 (2026-08-02)
 
 ## 0. Vì sao cần vòng đọc thứ hai

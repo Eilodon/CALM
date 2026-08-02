@@ -14,6 +14,8 @@ verification: mọi file:line dưới đây đọc trực tiếp qua mcp__calm__
   hiện tại trong phiên này — không copy lại số liệu cũ từ hai plan doc nguồn
 ---
 
+> **[SUPERSEDED — trạng thái hiện tại]** Xem [2026-08-02-phase2-priority-and-ws2-execution-plan.md](2026-08-02-phase2-priority-and-ws2-execution-plan.md) — bảng §2 dưới đây ("WS-1 shadow mode, task 4.8 chưa làm") đã lỗi thời từ commit 1830328 (enforce đã ship). Nội dung dưới đây giữ nguyên làm bằng chứng xác minh chi tiết (C1-C5, Tier A/B/C/D).
+
 # Priority Re-Audit (2026-08-02)
 
 ## 0. Vì sao audit lại

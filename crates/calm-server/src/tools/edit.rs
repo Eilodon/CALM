@@ -993,6 +993,7 @@ impl CalmServer {
             bridge_downgrade_eligible,
             uncertain_zero_caller,
             pre_touched,
+            fresh_caller_digests,
         ) = {
             let conn = match self.make_read_conn() {
                 Ok(c) => c,
@@ -1027,6 +1028,25 @@ impl CalmServer {
                         .map(|t| t.qualified_name.clone())
                         .collect::<Vec<_>>(),
                 );
+            // WS-2 Phase 2 (docs/plans/2026-08-02-phase2-priority-and-ws2-
+            // execution-plan.md §5): fresh caller-set digest per touched
+            // symbol, computed now while `conn` is already open (same DB
+            // snapshot the risk classification above used) so the
+            // freshness-check loop below can detect TOCTOU drift without a
+            // second connection. Only, and always, from `call_edges` —
+            // never derived from `touched`'s own risk fields, so it can
+            // never accidentally agree with a stale review just because
+            // both happened to read the same risk classification.
+            let fresh_caller_digests: std::collections::HashMap<String, String> = touched
+                .iter()
+                .map(|t| {
+                    let live_callers = caller_symbol_set(&conn, &t.qualified_name);
+                    (
+                        t.qualified_name.clone(),
+                        Self::caller_set_digest(&live_callers),
+                    )
+                })
+                .collect();
             (
                 risk,
                 hub_hit,
@@ -1034,6 +1054,7 @@ impl CalmServer {
                 eligible,
                 uncertain_zero_caller,
                 touched,
+                fresh_caller_digests,
             )
         };
         // `always_require_edit_context` (Config.edit) widens this gate to
@@ -1088,13 +1109,30 @@ impl CalmServer {
                 const FRESHNESS_WINDOW_CALLS: u64 = 200;
                 let now = self.session_tool_calls();
                 let mut missing: Vec<&str> = Vec::new();
+                let mut stale_caller_set: Vec<&str> = Vec::new();
                 let mut known_caller_qns: Vec<String> = Vec::new();
                 let mut reviewed_risk_levels: Vec<String> = Vec::new();
                 for t in &pre_touched {
                     match self.edit_context_review(&t.qualified_name) {
                         Some(r) if now.saturating_sub(r.at) <= FRESHNESS_WINDOW_CALLS => {
-                            known_caller_qns.extend(r.caller_qns);
-                            reviewed_risk_levels.push(r.risk_level);
+                            // WS-2 Phase 2 (docs/plans/2026-08-02-phase2-
+                            // priority-and-ws2-execution-plan.md §5): the
+                            // call-count window alone can't see an
+                            // unrelated incremental edit that changed this
+                            // symbol's real caller set since review --
+                            // compare against the fresh digest computed
+                            // above from live `call_edges` before trusting
+                            // the stored review at all.
+                            let fresh = fresh_caller_digests
+                                .get(t.qualified_name.as_str())
+                                .map(String::as_str)
+                                .unwrap_or_default();
+                            if fresh == r.caller_set_digest {
+                                known_caller_qns.extend(r.caller_qns);
+                                reviewed_risk_levels.push(r.risk_level);
+                            } else {
+                                stale_caller_set.push(t.qualified_name.as_str());
+                            }
                         }
                         _ => missing.push(t.qualified_name.as_str()),
                     }
@@ -1117,6 +1155,41 @@ impl CalmServer {
                              session before editing (a prior session's review, or one older \
                              than {FRESHNESS_WINDOW_CALLS} tool calls, doesn't count)",
                             missing[0]
+                        ),
+                        true,
+                    ));
+                }
+                // WS-2 Phase 2 (docs/plans/2026-08-02-phase2-priority-and-
+                // ws2-execution-plan.md §5): distinguished from
+                // EDIT_CONTEXT_REQUIRED above -- edit_context WAS called
+                // for this symbol and is still within the call-count
+                // freshness window, but the caller set it saw has since
+                // drifted (an unrelated incremental edit added/removed a
+                // caller). Fails closed the same shape as "never
+                // reviewed" -- a stale answer is not a current one -- but
+                // with an accurate message instead of a misleading
+                // "call edit_context first" when it already was called.
+                if !stale_caller_set.is_empty() {
+                    tracing::info!(
+                        target: crate::telemetry::AUDIT_TARGET,
+                        session_id = self.session_id,
+                        decision = "denied",
+                        reason_code = "STALE_CALLER_SET",
+                        path,
+                        symbol = stale_caller_set[0],
+                        risk = risk.as_deref().unwrap_or("none"),
+                        hub_hit,
+                    );
+                    return ToolOutcome::error(error_detail(
+                        "STALE_CALLER_SET",
+                        &format!(
+                            "the caller set for \"{}\" changed since edit_context reviewed it \
+                             this session (e.g. an unrelated incremental edit added or removed \
+                             a caller) — still inside the {FRESHNESS_WINDOW_CALLS}-tool-call \
+                             freshness window, but the reviewed caller list is no longer \
+                             accurate. Call edit_context(\"{}\") again to get a fresh review \
+                             before editing",
+                            stale_caller_set[0], stale_caller_set[0]
                         ),
                         true,
                     ));
@@ -2301,6 +2374,36 @@ pub(crate) fn all_caller_edges_confident(
     }) {
         Ok((total, confident)) if total > 0 => confident.unwrap_or(0) == total,
         _ => false,
+    }
+}
+
+/// WS-2 Phase 2 (docs/plans/2026-08-02-phase2-priority-and-ws2-execution-
+/// plan.md §5): the distinct set of caller symbols for `qualified_name`,
+/// read fresh from `call_edges` — same `to_symbol`/`ruled_out_by_scip`
+/// filter `edit_context` itself uses (guardrails.rs) to build the caller
+/// list it digests at review time, so a caller set digested from this
+/// function's output is directly comparable to that stored digest.
+/// `DISTINCT`/`ORDER BY` here are for cheap determinism only, since
+/// `CalmServer::caller_set_digest` dedupes and sorts again regardless —
+/// this query shape just avoids handing it a redundant list for nothing.
+/// A query failure returns an empty set: the fail-closed direction, same
+/// convention as `all_caller_edges_confident` above — a digest mismatch
+/// against whatever was stored at review time is the safe outcome when we
+/// can't confirm freshness, not a silent pass.
+pub(crate) fn caller_symbol_set(conn: &rusqlite::Connection, qualified_name: &str) -> Vec<String> {
+    let mut stmt = match conn.prepare(
+        "SELECT DISTINCT from_symbol FROM call_edges \
+         WHERE to_symbol = ?1 AND ruled_out_by_scip = 0 \
+         ORDER BY from_symbol",
+    ) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    match stmt.query_map(rusqlite::params![qualified_name], |row| {
+        row.get::<_, String>(0)
+    }) {
+        Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+        Err(_) => Vec::new(),
     }
 }
 

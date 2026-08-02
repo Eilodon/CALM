@@ -15,6 +15,8 @@ governing_instruction: >
   to be low-risk-once-reviewed, not yet executed.
 ---
 
+> **[Phase 1 IMPLEMENTED; Phase 2 execution-ready, chưa code]** Xem [2026-08-02-phase2-priority-and-ws2-execution-plan.md](2026-08-02-phase2-priority-and-ws2-execution-plan.md) §5 cho kế hoạch thực thi chi tiết Phase 2 (đọc code mới nhất, line numbers cập nhật). Nội dung dưới đây (§4/§5) vẫn là sketch thiết kế gốc.
+
 ## 0. What was actually verified before writing this (trust level)
 
 Every claim below with a file:line citation was read fresh via `mcp__calm__source`/`search` this

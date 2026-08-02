@@ -16,6 +16,8 @@ verified_against: HEAD after this session's txn.rs/tools.rs/recover.rs/toolset.r
   edit.rs itself untouched this session, so all file:line citations below are still current
 ---
 
+> **[Đã IMPLEMENTED — xem trạng thái hợp nhất hiện hành]** [2026-08-02-phase2-priority-and-ws2-execution-plan.md](2026-08-02-phase2-priority-and-ws2-execution-plan.md) xác nhận cả 2 change (A/B) trong doc này sống trong code hiện tại. Nội dung dưới đây giữ nguyên làm thiết kế/threat-model gốc.
+
 # WS-1 Enforce-Transition + Critical-Risk-Block Execution Plan
 
 > This document is the **required verification step** before either change below touches

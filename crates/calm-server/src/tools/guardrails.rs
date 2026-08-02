@@ -377,10 +377,19 @@ impl CalmServer {
             // cite — the content-grounded half. Uses the full, untruncated
             // `callers` computed above, independent of the conditional-fetch
             // etag branch below (a cache-hit response must not blank this).
+            let caller_qns_full: Vec<String> =
+                callers.iter().map(|e| e.symbol.clone()).collect();
+            // WS-2 Phase 2 (docs/plans/2026-08-02-phase2-priority-and-ws2-
+            // execution-plan.md §5): digest the FULL caller set (before the
+            // 5-item cap below) so `edit_lines_impl_gated` can later detect
+            // when the real caller set drifted since this review, not just
+            // whether the call-count freshness window expired.
+            let caller_set_digest = Self::caller_set_digest(&caller_qns_full);
             self.record_edit_context_review(
                 &c.qualified_name,
-                &callers.iter().map(|e| e.symbol.clone()).collect::<Vec<_>>(),
+                &caller_qns_full,
                 risk.as_ref().map(|r| r.level.as_str()).unwrap_or("unknown"),
+                caller_set_digest,
             );
             self.note_reviewing(&c.qualified_name);
             let trend = calm_core::fitness::compute_trend(

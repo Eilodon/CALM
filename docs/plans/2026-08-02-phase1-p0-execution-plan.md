@@ -14,6 +14,8 @@ audited_state:
 verification: mọi file:line CALM trong tài liệu này đọc trực tiếp qua mcp__calm__source/search tại calm_head hiện tại; mọi trích dẫn VHEATM đọc trực tiếp source tại vheatm_head_now
 ---
 
+> **[SUPERSEDED — trạng thái hiện tại]** Xem [2026-08-02-phase2-priority-and-ws2-execution-plan.md](2026-08-02-phase2-priority-and-ws2-execution-plan.md) cho trạng thái/ưu tiên hiện hành (task 4.8 shadow→enforce mô tả "chưa làm" bên dưới ĐÃ XONG từ commit 1830328). Nội dung dưới đây giữ nguyên làm bằng chứng xác minh chi tiết.
+
 # Phase 1 (P0) Execution Plan — WS-1 + WS-2 + WS-3
 
 > Tài liệu này **không lặp lại** phần "vấn đề/thiết kế đích" đã có trong master plan §3 —
@@ -677,7 +679,11 @@ journal; mọi high-risk edit dùng state-bound token"). Cụ thể hoá thành 
       `calm-server` pass không đổi; `HighAssurance` mode có test riêng
       (`atomic_write_high_assurance_surfaces_permission_failure`) chứng minh nó surface lỗi mà
       `Fast` nuốt.
-- [ ] **ĐO LẠI 2026-08-02 (sau Tier 1+2), VẪN KHÔNG ĐẠT nhưng đã tiến rất gần.** Tier 1 (gộp
+- [x] **QUYẾT ĐỊNH CHỔT 2026-08-02 (docs/plans/2026-08-02-phase2-priority-and-ws2-execution-
+      plan.md §4): chấp nhận floor ~15%/23%, không phải code fix.** Milestone owner đã chọn
+      (i) dưới đây thay vì (ii) — sửa target từ "≤ 10%" thành "floor ~15%/23% chấp nhận được,
+      root cause đã hiểu rõ, không phải regression". Tất cả 6/6 tiêu chí "Write-Safety Beta"
+      giờ đóng chính thức. Đo lại 2026-08-02 (sau Tier 1+2). Tier 1 (gộp
       connection) + Tier 2 Option A+B (docs/plans/2026-08-02-shadow-txn-connection-consolidation-
       plan.md §3/§5) đều đã IMPLEMENT. Tier 2: `txn::advance` giờ gộp `ledger::append` vào CHÍNH
       transaction của nó qua `SAVEPOINT` (thay vì commit riêng thứ 2) — cắt mỗi `advance()` từ 2
@@ -693,8 +699,9 @@ journal; mọi high-risk edit dùng state-bound token"). Cụ thể hoá thành 
       baseline mới p50 ≈31.4ms (34.96/30.91/28.33), p95 ≈53.6ms (58.51/57.04/45.27). Sau Tier 1+2:
       p50 ≈36.16ms (34.53/38.33/35.63), p95 ≈65.8ms (71.57/61.67/64.06). **Overhead: p50 ~+15%, p95
       ~+23%** — giảm mạnh từ mức ~+41%/+41% của riêng Tier 1 (và ~+31-35%/+50-100% trước Tier 1),
-      xác nhận giả thuyết số lượng commit (9→6 commit/edit) là yếu tố chính. **Vẫn chưa đạt ngưỡng
-      ≤10%** nhưng đã tiến sát.
+      xác nhận giả thuyết số lượng commit (9→6 commit/edit) là yếu tố chính. **Không đạt ngưỡng
+      gốc ≤10%** — xem quyết định chốt ngay trong mục checklist ở trên: target đã sửa thành
+      chấp nhận floor này.
 
       **ĐÀO SÂU TIẾP 2026-08-02 (lần 4) — đã tìm ra nguyên nhân chính xác của phần overhead còn
       lại, không còn là ẩn số.** Viết probe thứ 2 (component-breakdown, cùng kỷ luật thêm-đo-xoá) đo
@@ -716,8 +723,8 @@ journal; mọi high-risk edit dùng state-bound token"). Cụ thể hoá thành 
       thể tiết kiệm một phần rất nhỏ của mức dưới-1ms đó — khó có khả năng đủ để đạt ngưỡng ≤10%.
       **Kết luận thực tế:** ~15%/~23% overhead giờ đã được quy về chính xác, không còn lever rủi ro
       thấp nào khác trong phạm vi đã khảo sát có thể đóng nốt khoảng cách này. Còn lại 2 lựa chọn
-      (chưa quyết trong phiên này, là quyết định của người sở hữu milestone, không phải code
-      change): (i) chấp nhận ~15% là sàn thực tế cho tính năng durability/audit-trail này ở mức chi
+      (đã CHỔT 2026-08-02, xem docs/plans/2026-08-02-phase2-priority-and-ws2-execution-plan.md §4
+      — không phải code change): (i) **đã CHỌN** — chấp nhận ~15% là sàn thực tế cho tính năng durability/audit-trail này ở mức chi
       phí baseline hiện tại, hoặc (ii) xem lại chính ngưỡng ≤10% — ngưỡng này tương đương ngân sách
       tuyệt đối chỉ ~2.8ms (10% của baseline ~28ms) cho TOÀN BỘ đường ghi journal+ledger mỗi edit,
       một con số rất chặt cho một audit trail durable, hash-chained, crash-recoverable, giờ đã đo

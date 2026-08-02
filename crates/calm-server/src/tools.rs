@@ -162,6 +162,15 @@ pub(crate) struct EditContextReview {
     /// has zero callers (hub for a structural reason unrelated to fan-in).
     caller_qns: Vec<String>,
     risk_level: String,
+    /// WS-2 Phase 2 (docs/plans/2026-08-02-phase2-priority-and-ws2-execution-
+    /// plan.md §5): SHA-256 digest (`common::caller_set_digest`) of the
+    /// FULL distinct caller-symbol set at review time, not the capped 5 in
+    /// `caller_qns` above. Recomputed fresh from live `call_edges` at gate
+    /// time and compared — closes the TOCTOU gap where `caller_qns` stays
+    /// "known" inside the call-count freshness window even after an
+    /// unrelated incremental edit silently changed who actually calls this
+    /// symbol (`FRESHNESS_WINDOW_CALLS` alone can't see that).
+    caller_set_digest: String,
 }
 
 struct SessionLog {
@@ -8678,6 +8687,143 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dir.join("a.cobol")).unwrap(),
             "def mystery_fn():\n    return 2\n"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn caller_set_digest_mismatch_forces_stale_review_even_within_freshness_window() {
+        // WS-2 Phase 2 (docs/plans/2026-08-02-phase2-priority-and-ws2-
+        // execution-plan.md §5): closes the TOCTOU gap `FRESHNESS_WINDOW_CALLS`
+        // alone can't see (F1: `incremental_graph_update` never bumps
+        // `graph_generation_state`) -- a caller is removed from `call_edges`
+        // AFTER `edit_context` reviewed the symbol but still inside the
+        // call-count freshness window. The old behavior would let this
+        // sail through on the stale review; it must now be refused.
+        let (dir, server) = test_server("caller_set_digest_stale");
+        std::fs::write(dir.join("a.rs"), "fn target() {\n    1\n}\n").unwrap();
+        let hash = calm_core::edit::range_checksum("fn target() {\n    1\n}\n", 2, 2).unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point, is_test)
+                 VALUES ('a.rs::target', 'target', 'function', 'rust', 'a.rs', 1, 3, '', '', 'target', 1, 1, 0, 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO call_edges (from_symbol, to_symbol, from_path, edge_confidence, call_site_line)
+                 VALUES ('b.rs::caller_fn', 'a.rs::target', 'b.rs', 'resolved', 5)",
+                [],
+            )
+            .unwrap();
+        }
+
+        server.edit_context(rmcp::handler::server::wrapper::Parameters(
+            EditContextParams {
+                symbol: "target".into(),
+                path: None,
+                line: None,
+                if_none_match: None,
+            },
+        ));
+
+        // Simulate the real-world case F1 identified: an unrelated
+        // incremental edit to a DIFFERENT file changes the real caller set
+        // without going through a full reindex/generation bump.
+        {
+            let conn = server.db();
+            conn.execute(
+                "DELETE FROM call_edges WHERE from_symbol = 'b.rs::caller_fn'",
+                [],
+            )
+            .unwrap();
+        }
+
+        let out = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
+            EditLinesParams {
+                path: "a.rs".into(),
+                edits: vec![EditHunkParam {
+                    old_text: None,
+                    start_line: 2,
+                    end_line: 2,
+                    expected_hash: Some(hash),
+                    new_text: "    2\n".into(),
+                }],
+                confirm: true,
+                reason: Some("caller_fn already confirmed safe per review".into()),
+            },
+        ));
+        let v = jv(out);
+        assert_eq!(v["error"]["code"], "STALE_CALLER_SET", "response: {v}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.rs")).unwrap(),
+            "fn target() {\n    1\n}\n",
+            "must not have written -- caller set drifted since review, even \
+             though the call-count freshness window hadn't expired"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn caller_set_digest_matches_when_nothing_changed_no_behavior_change() {
+        // WS-2 Phase 2 regression guard: the common case (caller set
+        // unchanged between review and edit) must still pass exactly as
+        // before -- same fixture as the mismatch test above, but no
+        // `call_edges` mutation between `edit_context` and `edit_lines`.
+        let (dir, server) = test_server("caller_set_digest_unchanged");
+        std::fs::write(dir.join("a.rs"), "fn target() {\n    1\n}\n").unwrap();
+        let hash = calm_core::edit::range_checksum("fn target() {\n    1\n}\n", 2, 2).unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point, is_test)
+                 VALUES ('a.rs::target', 'target', 'function', 'rust', 'a.rs', 1, 3, '', '', 'target', 1, 1, 0, 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO call_edges (from_symbol, to_symbol, from_path, edge_confidence, call_site_line)
+                 VALUES ('b.rs::caller_fn', 'a.rs::target', 'b.rs', 'resolved', 5)",
+                [],
+            )
+            .unwrap();
+        }
+
+        server.edit_context(rmcp::handler::server::wrapper::Parameters(
+            EditContextParams {
+                symbol: "target".into(),
+                path: None,
+                line: None,
+                if_none_match: None,
+            },
+        ));
+
+        let out = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
+            EditLinesParams {
+                path: "a.rs".into(),
+                edits: vec![EditHunkParam {
+                    old_text: None,
+                    start_line: 2,
+                    end_line: 2,
+                    expected_hash: Some(hash),
+                    new_text: "    2\n".into(),
+                }],
+                confirm: true,
+                reason: Some("caller_fn already confirmed safe per review".into()),
+            },
+        ));
+        let v = jv(out);
+        assert!(
+            v.get("error").is_none() || v["error"].is_null(),
+            "unchanged caller set must not be refused: {v}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.rs")).unwrap(),
+            "fn target() {\n    2\n}\n",
+            "edit must have applied -- nothing about the caller set changed"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

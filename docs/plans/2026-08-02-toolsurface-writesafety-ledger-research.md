@@ -12,6 +12,8 @@ inputs:
 verified_against: HEAD ab0e374, đọc trực tiếp qua mcp__calm__source/search trong phiên này
 ---
 
+> **[SUPERSEDED — trạng thái hiện tại]** Xem [2026-08-02-phase2-priority-and-ws2-execution-plan.md](2026-08-02-phase2-priority-and-ws2-execution-plan.md) — Phần 1 (N2 fix) dưới đây ĐÃ IMPLEMENTED đúng như khuyến nghị §1.5 (toolset "txn" tách khỏi floor, thêm vào preset edit); Phần 2's "1/6 tiêu chí" nay là 5/6. Nội dung dưới đây giữ nguyên làm bằng chứng thiết kế chi tiết.
+
 # 3 nghiên cứu sâu (2026-08-02)
 
 ---

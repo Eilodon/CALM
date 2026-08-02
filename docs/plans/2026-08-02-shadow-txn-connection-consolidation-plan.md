@@ -26,6 +26,8 @@ verified_against: HEAD, this pass — crates/calm-core/src/txn.rs, ledger.rs, ma
   Tier 2/3 still design-only
 ---
 
+> **[Đã IMPLEMENTED — quyết định còn treo]** Xem [2026-08-02-phase2-priority-and-ws2-execution-plan.md](2026-08-02-phase2-priority-and-ws2-execution-plan.md) §4 — Tier 1+2 dưới đây đã ship, gate criterion 6 (p95) vẫn ~15%/23% overhead, cần quyết định milestone-owner (chấp nhận floor hay đầu tư thêm), không còn code lever rẻ nào được tìm thấy.
+
 # Shadow-Txn Connection/Transaction Consolidation — Research & Design
 
 **Tier 1 implementation & measurement results (2026-08-02, same session):**

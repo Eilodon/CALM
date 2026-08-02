@@ -371,6 +371,7 @@ impl CalmServer {
         qualified_name: &str,
         caller_qns: &[String],
         risk_level: &str,
+        caller_set_digest: String,
     ) {
         if let Ok(mut log) = self.session_log.lock() {
             let at = log.tool_calls;
@@ -380,9 +381,28 @@ impl CalmServer {
                     at,
                     caller_qns: caller_qns.iter().take(5).cloned().collect(),
                     risk_level: risk_level.to_string(),
+                    caller_set_digest,
                 },
             );
         }
+    }
+
+    /// WS-2 Phase 2: SHA-256 digest of a caller set's IDENTITY, independent
+    /// of ordering/duplicates/call-site multiplicity — dedupes via
+    /// `BTreeSet` (also sorts, for determinism) before hashing, so a caller
+    /// list rebuilt from a different query ordering (or with the same
+    /// caller appearing at multiple call sites) still hashes identically
+    /// when the underlying SET of calling symbols hasn't changed. Both the
+    /// review-time digest (`guardrails.rs::edit_context`, full untruncated
+    /// list) and the gate-time recompute (`edit.rs::edit_lines_impl_gated`,
+    /// fresh `call_edges` query) must call this SAME function — that's what
+    /// guarantees they can never drift apart on what counts as "the caller
+    /// set", only on what the query returns.
+    pub(crate) fn caller_set_digest(caller_qns: &[String]) -> String {
+        let unique: std::collections::BTreeSet<&str> =
+            caller_qns.iter().map(|s| s.as_str()).collect();
+        let joined = unique.into_iter().collect::<Vec<_>>().join("\n");
+        calm_core::digest::evidence_digest(joined.as_bytes())
     }
 
     /// Looks up `qualified_name`'s most recent `edit_context` review this
