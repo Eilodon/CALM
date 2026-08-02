@@ -239,6 +239,82 @@ pub fn begin(
     }
 }
 
+/// Mirrors a just-written (not yet committed) transition into the tamper-
+/// evident, hash-chained `audit_ledger` -- inside the caller's currently
+/// open explicit transaction, via a `SAVEPOINT` (docs/plans/2026-08-02-
+/// shadow-txn-connection-consolidation-plan.md §5.1). This is what lets
+/// [`write_transition`] fold the ledger mirror into the SAME commit as the
+/// `tx_events`/`edit_transactions` write instead of a second, separate
+/// commit -- while still preserving P0-4's invariant that a ledger failure
+/// must never affect the transition's own outcome: an ordinary constraint
+/// failure (e.g. a `UNIQUE` collision on `event_hash`) only rolls back this
+/// one statement, but a more severe failure (disk-full, I/O error) could
+/// force SQLite to abort the WHOLE enclosing transaction instead -- the
+/// `SAVEPOINT` is what contains that to just this statement's own effects;
+/// `ROLLBACK TO` undoes only the ledger write, never the transition write
+/// that already happened moments earlier in the same transaction. Best-
+/// effort by construction: swallows every error it can, same as the plain
+/// `let _ = ledger::append(...)` this replaces.
+fn append_ledger_in_savepoint(conn: &Connection, actor: &str, payload: &str) {
+    if conn.execute_batch("SAVEPOINT ledger_append;").is_err() {
+        return;
+    }
+    let outcome = crate::ledger::append(conn, actor, payload);
+    let _ = conn.execute_batch(if outcome.is_ok() {
+        "RELEASE ledger_append;"
+    } else {
+        "ROLLBACK TO ledger_append; RELEASE ledger_append;"
+    });
+}
+
+/// Core per-transition write shared by [`advance`] (one transition inside
+/// its own `BEGIN IMMEDIATE`/`COMMIT`) and [`advance_many`] (N transitions
+/// across independent `tx_id`s inside ONE `BEGIN IMMEDIATE`/`COMMIT` --
+/// docs/plans/2026-08-02-shadow-txn-connection-consolidation-plan.md §5.2).
+/// Assumes the caller has ALREADY verified `to` is a legal transition from
+/// `from` (both callers do this immediately beforehand, using the same
+/// `current_state`+`allowed_next` check `advance` always used). Issues no
+/// `BEGIN`/`COMMIT`/`ROLLBACK` of its own -- the caller owns the enclosing
+/// explicit transaction; this only inserts the `tx_events` row, updates
+/// `edit_transactions.state`, and mirrors into the ledger.
+fn write_transition(
+    conn: &Connection,
+    tx_id: &str,
+    from: TxState,
+    to: TxState,
+    actor: &str,
+    reason: &str,
+) -> Result<(), TxnError> {
+    let now = now_epoch_secs();
+    let sequence = next_sequence(conn, tx_id)?;
+    let payload = format!(
+        "{tx_id}|{}|{}|{actor}|{reason}|{sequence}|{now}",
+        from.as_str(),
+        to.as_str()
+    );
+    conn.execute(
+        "INSERT INTO tx_events \
+         (event_id, tx_id, sequence, from_state, to_state, actor, reason, occurred_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            event_id(&payload),
+            tx_id,
+            sequence,
+            from.as_str(),
+            to.as_str(),
+            actor,
+            reason,
+            now
+        ],
+    )?;
+    conn.execute(
+        "UPDATE edit_transactions SET state = ?1, updated_at = ?2 WHERE tx_id = ?3",
+        params![to.as_str(), now, tx_id],
+    )?;
+    append_ledger_in_savepoint(conn, actor, &payload);
+    Ok(())
+}
+
 /// The only function allowed to change `edit_transactions.state`. Validates
 /// `to` against [`allowed_next`], then writes the `tx_events` row and the
 /// `state`/`updated_at` update inside one SQLite transaction — same
@@ -256,36 +332,8 @@ pub fn advance(
     if !allowed_next(current).contains(&to) {
         return Err(TxnError::InvalidTransition { from: current, to });
     }
-    let now = now_epoch_secs();
     conn.execute_batch("BEGIN IMMEDIATE;")?;
-    let result = (|| -> Result<(), TxnError> {
-        let sequence = next_sequence(conn, tx_id)?;
-        let payload = format!(
-            "{tx_id}|{}|{}|{actor}|{reason}|{sequence}|{now}",
-            current.as_str(),
-            to.as_str()
-        );
-        conn.execute(
-            "INSERT INTO tx_events \
-             (event_id, tx_id, sequence, from_state, to_state, actor, reason, occurred_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
-                event_id(&payload),
-                tx_id,
-                sequence,
-                current.as_str(),
-                to.as_str(),
-                actor,
-                reason,
-                now
-            ],
-        )?;
-        conn.execute(
-            "UPDATE edit_transactions SET state = ?1, updated_at = ?2 WHERE tx_id = ?3",
-            params![to.as_str(), now, tx_id],
-        )?;
-        Ok(())
-    })();
+    let result = write_transition(conn, tx_id, current, to, actor, reason);
     match result {
         Ok(()) => {
             conn.execute_batch("COMMIT;")?;
@@ -296,6 +344,79 @@ pub fn advance(
             Err(e)
         }
     }
+}
+
+/// Batches N `advance()`-equivalent transitions for INDEPENDENT `tx_id`s
+/// into ONE explicit transaction (docs/plans/2026-08-02-shadow-txn-
+/// connection-consolidation-plan.md §5.2) -- e.g. `format_files_impl`
+/// advancing every formatted file's own transaction to `IndexCommitted` (or
+/// `Done`) together, instead of one `BEGIN`/`COMMIT` pair per file. Safe
+/// specifically because every transition here is for a DIFFERENT `tx_id`:
+/// on a crash mid-batch, whichever `tx_id`s didn't get their row committed
+/// yet simply remain at their previous state, identical to their individual
+/// `advance()` call never having been attempted -- `replay_state`/
+/// `recover_incomplete` operate per-`tx_id` and don't care which physical
+/// transaction wrote a given row. Each transition is additionally wrapped in
+/// its own `SAVEPOINT`, so one transition's failure (e.g. `NotFound` or
+/// `InvalidTransition`) never blocks or rolls back any other transition in
+/// the same batch -- matching exactly what N separate `advance()` calls
+/// would have done, just sharing one commit.
+///
+/// **Not for batching different states of the SAME `tx_id`** (e.g.
+/// `IndexCommitted` then `Done` for one transaction) -- that would make an
+/// intermediate `TxState` unreachable as an independently durable, crash-
+/// recoverable checkpoint, which is exactly what gate criterion 1's crash-
+/// injection suite (`crates/calm-cli/tests/txn_crash_injection.rs`) checks
+/// for. See the design doc's §5.0/§5.3 for why that specific case is
+/// deliberately not supported here.
+///
+/// Returns one `Result` per input transition, in the same order, so a
+/// caller can handle each exactly as it would have from N separate
+/// `advance()` calls.
+pub fn advance_many(
+    conn: &Connection,
+    transitions: &[(&str, TxState, &str, &str)],
+) -> Vec<Result<(), TxnError>> {
+    if transitions.is_empty() {
+        return Vec::new();
+    }
+    if let Err(e) = conn.execute_batch("BEGIN IMMEDIATE;") {
+        let msg = format!("could not begin batch transaction: {e}");
+        return transitions
+            .iter()
+            .map(|_| Err(TxnError::Corrupt(msg.clone())))
+            .collect();
+    }
+    let results: Vec<Result<(), TxnError>> = transitions
+        .iter()
+        .enumerate()
+        .map(|(i, (tx_id, to, actor, reason))| -> Result<(), TxnError> {
+            let savepoint = format!("advance_many_{i}");
+            if let Err(e) = conn.execute_batch(&format!("SAVEPOINT {savepoint};")) {
+                return Err(TxnError::from(e));
+            }
+            let outcome = (|| -> Result<(), TxnError> {
+                let current = current_state(conn, tx_id)?.ok_or_else(|| TxnError::NotFound {
+                    tx_id: (*tx_id).to_string(),
+                })?;
+                if !allowed_next(current).contains(to) {
+                    return Err(TxnError::InvalidTransition {
+                        from: current,
+                        to: *to,
+                    });
+                }
+                write_transition(conn, tx_id, current, *to, actor, reason)
+            })();
+            let _ = conn.execute_batch(&if outcome.is_ok() {
+                format!("RELEASE {savepoint};")
+            } else {
+                format!("ROLLBACK TO {savepoint}; RELEASE {savepoint};")
+            });
+            outcome
+        })
+        .collect();
+    let _ = conn.execute_batch("COMMIT;");
+    results
 }
 
 /// Replays every `tx_events` row for `tx_id` in sequence order and returns
@@ -544,6 +665,219 @@ mod tests {
             sequences,
             vec![1, 2, 3, 4],
             "sequence must be contiguous 1..=N"
+        );
+    }
+
+    #[test]
+    fn advance_mirrors_every_committed_transition_into_the_audit_ledger() {
+        // P0-4 wiring (docs/plans/2026-08-02-toolsurface-writesafety-ledger-research.md
+        // #part-3): every committed `advance()` call must also append one chained row
+        // to `audit_ledger`, mirroring the `tx_events` payload it just wrote.
+        let conn = test_conn();
+        let tx = begin(&conn, "proj", "f.rs", "b", "p").unwrap();
+        advance(
+            &conn,
+            &tx.tx_id,
+            TxState::FileCommitted,
+            "system",
+            "wrote to disk",
+        )
+        .unwrap();
+        advance(
+            &conn,
+            &tx.tx_id,
+            TxState::IndexCommitted,
+            "system",
+            "reindexed",
+        )
+        .unwrap();
+        advance(
+            &conn,
+            &tx.tx_id,
+            TxState::Done,
+            "system",
+            "base index consistent",
+        )
+        .unwrap();
+
+        // begin() itself never calls advance(), so only these 3 advance() calls
+        // should have appended to the ledger -- not a 4th row for PREPARED.
+        let ledger_rows: Vec<(i64, String)> = {
+            let mut stmt = conn
+                .prepare("SELECT seq, payload FROM audit_ledger ORDER BY seq")
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        assert_eq!(
+            ledger_rows.len(),
+            3,
+            "one ledger row per committed advance() call, none for begin()'s PREPARED insert"
+        );
+        for (_, payload) in &ledger_rows {
+            assert!(
+                payload.contains(&tx.tx_id),
+                "ledger payload must mirror the tx_events payload this transition wrote"
+            );
+        }
+        assert_eq!(
+            crate::ledger::verify_chain(&conn).unwrap(),
+            None,
+            "a freshly-written chain produced entirely by advance() must verify clean"
+        );
+    }
+
+    /// Tier 2 Option A (docs/plans/2026-08-02-shadow-txn-connection-
+    /// consolidation-plan.md §5.1): the ledger append now happens INSIDE
+    /// advance()'s own transaction via a SAVEPOINT instead of a second,
+    /// separate commit afterward. This proves the invariant that change was
+    /// designed to preserve still holds: even when the ledger insert itself
+    /// fails outright (simulated here by dropping `audit_ledger` after
+    /// `init_db` already created it, so `ledger::append`'s INSERT gets a
+    /// real "no such table" error), the transition's own tx_events row and
+    /// edit_transactions.state update must still commit normally.
+    #[test]
+    fn advance_transition_survives_even_when_the_ledger_insert_itself_fails() {
+        let conn = test_conn();
+        conn.execute_batch("DROP TABLE audit_ledger;").unwrap();
+
+        let tx = begin(&conn, "proj", "a.py", "base", "new").unwrap();
+        let result = advance(
+            &conn,
+            &tx.tx_id,
+            TxState::FileCommitted,
+            "system",
+            "wrote to disk",
+        );
+
+        assert!(
+            result.is_ok(),
+            "advance() must still commit the transition even though the ledger insert \
+             itself failed: {result:?}"
+        );
+        let cached = get(&conn, &tx.tx_id).unwrap().unwrap();
+        assert_eq!(cached.state, TxState::FileCommitted);
+        assert_eq!(
+            replay_state(&conn, &tx.tx_id).unwrap(),
+            TxState::FileCommitted,
+            "tx_events row must exist despite the ledger failure -- replay_state derives \
+             purely from tx_events, independent of the ledger entirely"
+        );
+    }
+
+    /// Tier 2 Option B (docs/plans/2026-08-02-shadow-txn-connection-
+    /// consolidation-plan.md §5.2): `advance_many` batches the SAME state
+    /// transition across independent tx_ids (format_files_impl's use case)
+    /// into one shared transaction. Every tx_id must still get its own
+    /// correct tx_events row, cached state, and ledger entry -- batching the
+    /// commit must not blur or lose any individual tx_id's own history.
+    #[test]
+    fn advance_many_batches_independent_tx_ids_and_all_succeed() {
+        let conn = test_conn();
+        let tx_a = begin(&conn, "proj", "a.py", "ba", "na").unwrap();
+        let tx_b = begin(&conn, "proj", "b.py", "bb", "nb").unwrap();
+        let tx_c = begin(&conn, "proj", "c.py", "bc", "nc").unwrap();
+
+        let results = advance_many(
+            &conn,
+            &[
+                (tx_a.tx_id.as_str(), TxState::FileCommitted, "system", "r"),
+                (tx_b.tx_id.as_str(), TxState::FileCommitted, "system", "r"),
+                (tx_c.tx_id.as_str(), TxState::FileCommitted, "system", "r"),
+            ],
+        );
+
+        assert_eq!(results.len(), 3);
+        for r in &results {
+            assert!(
+                r.is_ok(),
+                "every independent tx_id's transition should succeed: {r:?}"
+            );
+        }
+        for tx in [&tx_a, &tx_b, &tx_c] {
+            let cached = get(&conn, &tx.tx_id).unwrap().unwrap();
+            assert_eq!(cached.state, TxState::FileCommitted);
+            assert_eq!(
+                replay_state(&conn, &tx.tx_id).unwrap(),
+                TxState::FileCommitted
+            );
+        }
+        let ledger_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM audit_ledger", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            ledger_rows, 3,
+            "one ledger row per batched transition, same as 3 separate advance() calls"
+        );
+        assert_eq!(
+            crate::ledger::verify_chain(&conn).unwrap(),
+            None,
+            "a chain produced by one batched advance_many call must still verify clean"
+        );
+    }
+
+    /// Tier 2 Option B, failure isolation: one tx_id's transition being
+    /// invalid (already terminal, or wrong current state) must not block or
+    /// roll back any OTHER tx_id's transition in the same
+    /// `advance_many` batch -- matching exactly what N separate `advance()`
+    /// calls would have done.
+    #[test]
+    fn advance_many_one_invalid_transition_does_not_block_the_others() {
+        let conn = test_conn();
+        let tx_ok = begin(&conn, "proj", "ok.py", "b1", "n1").unwrap();
+        let tx_bad = begin(&conn, "proj", "bad.py", "b2", "n2").unwrap();
+        // Advance tx_bad to a terminal state OUTSIDE the batch, so its batched
+        // transition below is guaranteed invalid (Done has no allowed_next).
+        advance(&conn, &tx_bad.tx_id, TxState::FileCommitted, "system", "r").unwrap();
+        advance(&conn, &tx_bad.tx_id, TxState::IndexCommitted, "system", "r").unwrap();
+        advance(&conn, &tx_bad.tx_id, TxState::Done, "system", "r").unwrap();
+
+        let results = advance_many(
+            &conn,
+            &[
+                (tx_ok.tx_id.as_str(), TxState::FileCommitted, "system", "r"),
+                (tx_bad.tx_id.as_str(), TxState::FileCommitted, "system", "r"),
+            ],
+        );
+
+        assert_eq!(results.len(), 2);
+        assert!(results[0].is_ok(), "tx_ok's transition: {:?}", results[0]);
+        assert!(
+            matches!(results[1], Err(TxnError::InvalidTransition { .. })),
+            "tx_bad's transition must fail as InvalidTransition (Done is terminal): {:?}",
+            results[1]
+        );
+
+        assert_eq!(
+            get(&conn, &tx_ok.tx_id).unwrap().unwrap().state,
+            TxState::FileCommitted,
+            "tx_ok must still have committed despite tx_bad's failure in the same batch"
+        );
+        assert_eq!(
+            get(&conn, &tx_bad.tx_id).unwrap().unwrap().state,
+            TxState::Done,
+            "tx_bad must remain unchanged at Done, not corrupted by its own failed attempt"
+        );
+    }
+
+    #[test]
+    fn advance_never_ledgers_a_rejected_transition() {
+        let conn = test_conn();
+        let tx = begin(&conn, "proj", "f.rs", "b", "p").unwrap();
+        // allowed_next(Prepared) == [FileCommitted, Failed] -- Prepared -> Prepared is
+        // rejected before BEGIN IMMEDIATE (and therefore before the ledger append) is
+        // ever reached.
+        let err = advance(&conn, &tx.tx_id, TxState::Prepared, "system", "no-op").unwrap_err();
+        assert!(matches!(err, TxnError::InvalidTransition { .. }));
+
+        let ledger_row_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM audit_ledger", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            ledger_row_count, 0,
+            "a transition rejected by allowed_next() must never reach the ledger"
         );
     }
 

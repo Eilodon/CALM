@@ -29,6 +29,7 @@ mod security;
 mod testgap;
 mod toolset;
 mod trace;
+mod txn;
 
 // ---------------------------------------------------------------------------
 // Server state
@@ -364,6 +365,7 @@ impl CalmServer {
         router.merge(Self::inspect_tool_router());
         router.merge(Self::edit_tool_router());
         router.merge(Self::patterndebt_tool_router());
+        router.merge(Self::txn_tool_router());
         router
     }
 
@@ -818,6 +820,7 @@ mod tests {
     use super::patterndebt::*;
     use super::recover::*;
     use super::trace::*;
+    use super::txn::*;
     use super::*;
 
     /// DEBT-007 regression: rmcp-macros 0.1.5 only derives a real input_schema
@@ -7604,6 +7607,111 @@ mod tests {
     }
 
     #[test]
+    fn shadow_tx_replay_state_matches_cached_state_across_edit_lines_edit_symbol_and_format_files()
+    {
+        // Gate criterion 2 of the "Write-Safety Beta" milestone
+        // (docs/plans/2026-08-02-phase1-p0-execution-plan.md#6): replay_state(tx_id) must
+        // equal the cached edit_transactions.state for every shadow tx the WS-1 wiring in
+        // edit_lines_impl_gated/format_files_impl actually creates -- exercised here across
+        // all 3 real write paths sharing one DB, not just txn.rs's own synthetic unit tests
+        // (this is also the first test in this file to read edit_transactions directly --
+        // prior coverage only exercised txn::begin/advance in isolation).
+        let (dir, server) = test_server("shadow_replay_state_coverage");
+
+        // 1) edit_lines
+        std::fs::write(dir.join("a.py"), "def helper():\n    return 1\n").unwrap();
+        let hash = calm_core::edit::range_checksum("def helper():\n    return 1\n", 2, 2).unwrap();
+        let out = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
+            EditLinesParams {
+                path: "a.py".into(),
+                edits: vec![EditHunkParam {
+                    old_text: None,
+                    start_line: 2,
+                    end_line: 2,
+                    expected_hash: Some(hash),
+                    new_text: "    return 2\n".into(),
+                }],
+                confirm: false,
+                reason: None,
+            },
+        ));
+        assert_eq!(jv(out)["applied"], true);
+
+        // 2) edit_symbol
+        std::fs::write(dir.join("b.py"), "def other():\n    return 1\n").unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('b.py::other', 'other', 'function', 'python', 'b.py', 1, 2, '', '', 'other', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        }
+        let hash2 = calm_core::edit::range_checksum("def other():\n    return 1\n", 1, 2).unwrap();
+        let out2 = server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
+            EditSymbolParams {
+                symbol: "other".into(),
+                path: None,
+                line: None,
+                expected_hash: Some(hash2),
+                new_text: "def other():\n    return 42\n".into(),
+                position: None,
+                confirm: false,
+                reason: None,
+                old_text: None,
+            },
+        ));
+        assert_eq!(jv(out2)["applied"], true);
+
+        // 3) format_files
+        std::fs::write(
+            dir.join("ugly.rs"),
+            "fn   main( ) { let x=1  ;println!(\"{}\",x);}\n",
+        )
+        .unwrap();
+        let out3 = server.format_files(rmcp::handler::server::wrapper::Parameters(
+            FormatFilesParams {
+                paths: vec!["ugly.rs".into()],
+            },
+        ));
+        assert_eq!(jv(out3)["results"][0]["status"], "formatted");
+
+        // Every shadow tx this shared DB accumulated across all 3 write paths must replay
+        // to exactly the state cached in edit_transactions.state.
+        let conn = server.db();
+        let tx_ids: Vec<String> = {
+            let mut stmt = conn.prepare("SELECT tx_id FROM edit_transactions").unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        assert!(
+            tx_ids.len() >= 3,
+            "expected at least 1 shadow tx per write path (edit_lines, edit_symbol, \
+             format_files), got {tx_ids:?}"
+        );
+        for tx_id in &tx_ids {
+            let cached: String = conn
+                .query_row(
+                    "SELECT state FROM edit_transactions WHERE tx_id = ?1",
+                    rusqlite::params![tx_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let replayed = calm_core::txn::replay_state(&conn, tx_id).unwrap();
+            assert_eq!(
+                replayed.as_str(),
+                cached,
+                "tx {tx_id}: replay_state must match cached edit_transactions.state"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn format_files_second_call_reports_already_formatted() {
         let (dir, server) = test_server("format_idempotent");
         std::fs::write(dir.join("ugly.rs"), "fn   main( ) {}\n").unwrap();
@@ -8572,6 +8680,246 @@ mod tests {
             "def mystery_fn():\n    return 2\n"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn high_risk_edit_off_elicitation_is_blocked_even_with_confirm_and_grounded_reason() {
+        // Gate criterion 4 of the "Write-Safety Beta" milestone
+        // (docs/plans/2026-08-02-phase1-p0-execution-plan.md §6; design verified in
+        // docs/plans/2026-08-02-ws1-enforce-and-critical-risk-execution-plan.md §1):
+        // a >10-caller ("high" risk) touch with NO elicitation configured must be
+        // blocked outright -- a cited real caller is not independent review at this
+        // risk tier. `caller_count: 11` (not `is_hub`) is what drives `risk == "high"`
+        // here, deliberately distinct from the existing hub-triggered gate tests.
+        let (dir, server) = test_server("high_risk_off_elicitation");
+        std::fs::write(dir.join("a.py"), "def helper():\n    return 1\n").unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.py::helper', 'helper', 'function', 'python', 'a.py', 1, 2, '', '', 'helper', 11, 0, 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO call_edges (from_symbol, to_symbol, from_path, to_path, edge_confidence)
+                 VALUES ('a.py::process_order', 'a.py::helper', 'a.py', 'a.py', 'formal')",
+                [],
+            )
+            .unwrap();
+        }
+        server.edit_context(rmcp::handler::server::wrapper::Parameters(
+            EditContextParams {
+                symbol: "helper".into(),
+                path: None,
+                line: None,
+                if_none_match: None,
+            },
+        ));
+        let hash = calm_core::edit::range_checksum("def helper():\n    return 1\n", 2, 2).unwrap();
+
+        // A well-formed reason citing the one real caller edit_context found --
+        // under the pre-Change-A gate this would have been enough (mirrors
+        // edit_symbol_reason_must_cite_a_real_caller_not_generic_keywords'
+        // "grounded" case exactly). At risk=="high" with no elicitation
+        // available, it must now be refused instead.
+        let out = jv(
+            server.edit_lines(rmcp::handler::server::wrapper::Parameters(
+                EditLinesParams {
+                    path: "a.py".into(),
+                    edits: vec![EditHunkParam {
+                        old_text: None,
+                        start_line: 2,
+                        end_line: 2,
+                        expected_hash: Some(hash),
+                        new_text: "    return 2\n".into(),
+                    }],
+                    confirm: true,
+                    reason: Some(
+                        "checked process_order, still passes the same shape of value".into(),
+                    ),
+                },
+            )),
+        );
+        assert_eq!(
+            out["error"]["code"], "HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW",
+            "response: {out}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.py")).unwrap(),
+            "def helper():\n    return 1\n"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn high_risk_edit_can_pass_via_elicitation_ask_then_approved() {
+        use super::edit::{ElicitGate, HubAskContext};
+        // Same fixture as the Off-gate test above, exercised through
+        // edit_lines_flow with an explicit ElicitGate -- proves the
+        // independent-review requirement is satisfiable (not a permanent
+        // block), same round-trip shape
+        // empty_caller_set_low_confidence_zero_caller_can_pass_via_elicitation_ask_then_approved
+        // already established for the LowConfidence case.
+        let (dir, server) = test_server("high_risk_elicit_ask_then_approved");
+        std::fs::write(dir.join("a.py"), "def helper():\n    return 1\n").unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.py::helper', 'helper', 'function', 'python', 'a.py', 1, 2, '', '', 'helper', 11, 0, 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO call_edges (from_symbol, to_symbol, from_path, to_path, edge_confidence)
+                 VALUES ('a.py::process_order', 'a.py::helper', 'a.py', 'a.py', 'formal')",
+                [],
+            )
+            .unwrap();
+        }
+        server.edit_context(rmcp::handler::server::wrapper::Parameters(
+            EditContextParams {
+                symbol: "helper".into(),
+                path: None,
+                line: None,
+                if_none_match: None,
+            },
+        ));
+        let hash = calm_core::edit::range_checksum("def helper():\n    return 1\n", 2, 2).unwrap();
+        let params = EditLinesParams {
+            path: "a.py".into(),
+            edits: vec![EditHunkParam {
+                old_text: None,
+                start_line: 2,
+                end_line: 2,
+                expected_hash: Some(hash),
+                new_text: "    return 2\n".into(),
+            }],
+            confirm: true,
+            reason: Some("checked process_order, still passes the same shape of value".into()),
+        };
+
+        let mut ask: Option<HubAskContext> = None;
+        let out = server.edit_lines_flow(&params, ElicitGate::Ask, &mut ask);
+        let v = serde_json::to_value(&out).unwrap();
+        assert_eq!(v["error"]["code"], "ELICITATION_PENDING", "response: {v}");
+        assert!(ask.is_some(), "sentinel must carry the question context");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.py")).unwrap(),
+            "def helper():\n    return 1\n"
+        );
+
+        let out = server.edit_lines_flow(&params, ElicitGate::Approved, &mut None);
+        let v = serde_json::to_value(&out).unwrap();
+        assert_eq!(v["applied"], true, "response: {v}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.py")).unwrap(),
+            "def helper():\n    return 2\n"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_lines_aborts_when_txn_begin_fails() {
+        // WS-1 enforce transition (docs/plans/2026-08-02-ws1-enforce-and-critical-
+        // risk-execution-plan.md §2): a txn::begin failure must abort the write
+        // entirely rather than proceed with no journal. Forced deterministically by
+        // making the DB file read-only at the OS level after setup -- open_writer
+        // requires write access, so the very first `open_writer` inside
+        // `begin_result`'s construction fails, exercising the same enforce path a
+        // real disk-full/permission problem would.
+        let (dir, server) = test_server("txn_begin_failure_aborts_write");
+        std::fs::write(dir.join("a.py"), "def helper():\n    return 1\n").unwrap();
+        let hash = calm_core::edit::range_checksum("def helper():\n    return 1\n", 2, 2).unwrap();
+
+        let db_path = dir.join("index.db");
+        let mut perms = std::fs::metadata(&db_path).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&db_path, perms).unwrap();
+
+        let out = jv(
+            server.edit_lines(rmcp::handler::server::wrapper::Parameters(
+                EditLinesParams {
+                    path: "a.py".into(),
+                    edits: vec![EditHunkParam {
+                        old_text: None,
+                        start_line: 2,
+                        end_line: 2,
+                        expected_hash: Some(hash),
+                        new_text: "    return 2\n".into(),
+                    }],
+                    confirm: false,
+                    reason: None,
+                },
+            )),
+        );
+        assert_eq!(
+            out["error"]["code"], "TRANSACTION_INIT_FAILED",
+            "response: {out}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.py")).unwrap(),
+            "def helper():\n    return 1\n",
+            "write must not proceed when the transaction journal couldn't even begin"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o644);
+            std::fs::set_permissions(&db_path, perms).unwrap();
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn format_files_skips_one_file_when_txn_begin_fails_without_aborting_the_batch() {
+        // Same enforce posture as edit_lines, but format_files processes a batch --
+        // a per-file begin failure must surface as that file's own "error" result,
+        // not a batch-wide abort of files that would otherwise succeed.
+        let (dir, server) = test_server("format_files_txn_begin_failure_per_file");
+        std::fs::write(
+            dir.join("ugly.rs"),
+            "fn   main( ) { let x=1  ;println!(\"{}\",x);}\n",
+        )
+        .unwrap();
+
+        let db_path = dir.join("index.db");
+        let mut perms = std::fs::metadata(&db_path).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&db_path, perms).unwrap();
+
+        let out = jv(
+            server.format_files(rmcp::handler::server::wrapper::Parameters(
+                FormatFilesParams {
+                    paths: vec!["ugly.rs".into()],
+                },
+            )),
+        );
+        assert_eq!(out["results"][0]["status"], "error", "response: {out}");
+        assert!(
+            out["results"][0]["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("transaction journal"),
+            "response: {out}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("ugly.rs")).unwrap(),
+            "fn   main( ) { let x=1  ;println!(\"{}\",x);}\n",
+            "must not format when the transaction journal couldn't even begin"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o644);
+            std::fs::set_permissions(&db_path, perms).unwrap();
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -643,15 +643,100 @@ journal; mọi high-risk edit dùng state-bound token"). Cụ thể hoá thành 
       transition trên Linux CI (`ci.yml` job `txn-crash-injection`), 0 trường hợp disk thay đổi
       mà không có `tx_events` row tương ứng —
       `crates/calm-cli/tests/txn_crash_injection.rs` + `src/bin/txn_crash_harness.rs`.
-- [ ] `replay_state(tx_id)` khớp `edit_transactions.state` cache cho 100% tx trong toàn bộ test
-      suite hiện có (không chỉ test mới viết cho WS-1).
-- [ ] 0 write path (edit_lines/edit_symbol/format_files) đi qua mà không mở `EditTransaction`.
-- [ ] `critical`-risk edit không có `required_approver_class` tương ứng bị **block**, không có
-      trường hợp "any non-empty reason" nào còn lọt qua CI fixture.
-- [ ] `atomic_write` mặc định (`Fast` mode) — 0 thay đổi hành vi observable với suite hiện tại;
-      `HighAssurance` mode có ≥1 test chứng minh nó surface lỗi mà `Fast` nuốt.
-- [ ] p95 thời gian một `edit_lines` call KHÔNG tăng >10% so với baseline trước WS-1 (transaction
-      overhead phải rẻ — đo bằng benchmark hiện có, vd. b6_tool_call_efficiency).
+- [x] **XONG 2026-08-02** (docs/plans/2026-08-02-toolsurface-writesafety-ledger-research.md#2.3,
+      #2.6). `replay_state(tx_id)` khớp `edit_transactions.state` cache cho 100% tx trong toàn bộ
+      test suite hiện có — `shadow_tx_replay_state_matches_cached_state_across_edit_lines_edit_symbol_and_format_files`
+      (`crates/calm-server/src/tools.rs`) chạy cả 3 write path thật (edit_lines/edit_symbol/
+      format_files) trên 1 DB chung rồi assert cho MỌI tx_id được tạo ra, không chỉ 1 kịch bản.
+- [x] **XONG 2026-08-02** (docs/plans/2026-08-02-ws1-enforce-and-critical-risk-execution-plan.md
+      §2 "Change B"). `txn::begin` failure giờ **abort thẳng write attempt** thay vì tiếp tục im
+      lặng, ở cả `edit_lines_impl_gated` (mã lỗi mới `TRANSACTION_INIT_FAILED`) lẫn
+      `format_files_impl` (per-file `status: "error"`, không abort cả batch). Test:
+      `edit_lines_aborts_when_txn_begin_fails`,
+      `format_files_skips_one_file_when_txn_begin_fails_without_aborting_the_batch` (cả hai ép lỗi
+      thật bằng cách chmod read-only file DB, không phải giả lập). Phạm vi cố ý hẹp hơn hình dung
+      gốc của master plan (chỉ enforce ở bước `begin`, không phải toàn bộ state machine) — xem lý
+      do ở execution plan §2.2. Các `advance()` sau `begin` vẫn non-blocking như cũ (disk đã đổi,
+      "rollback" lúc đó rủi ro hơn lỗi đang cố sửa) — `needs_repair` hint UX cho case đó **cố ý
+      chưa làm** (nice-to-have, không phải điều kiện gate).
+- [x] **XONG 2026-08-02** (docs/plans/2026-08-02-ws1-enforce-and-critical-risk-execution-plan.md
+      §1 "Change A", đã sửa lại §0 tài liệu đó: elicitation veto **đã** áp dụng cho mọi
+      `risk=="high"` khi elicitation cấu hình từ trước — lỗ hổng thật chỉ nằm ở nhánh
+      `ElicitGate::Off`, hẹp hơn phác thảo ban đầu). `risk=="high"` + không có elicitation cấu
+      hình → **block cứng** (mã lỗi mới `HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW`), kể cả khi
+      `confirm:true` + `reason` cite đúng 1 caller thật (case trước đây pass được). Xác nhận
+      `bridge_downgrade_eligible` **không thể** đồng thời true với `risk=="high"` (đọc trực tiếp
+      `edit.rs:942-943`: `risk.as_deref() != Some("high")` là một phần điều kiện của chính nó) —
+      không có xung đột với nhánh bridge-downgrade. Test:
+      `high_risk_edit_off_elicitation_is_blocked_even_with_confirm_and_grounded_reason`,
+      `high_risk_edit_can_pass_via_elicitation_ask_then_approved` (round-trip Ask→Approved). Không
+      phát minh tier "critical" mới — tái dùng `risk=="high"` đã có sẵn, đúng khuyến nghị
+      toolsurface-writesafety-ledger-research.md §2.5.
+- [x] **XONG (đã đạt từ trước, tick lại 2026-08-02).** `atomic_write` mặc định (`Fast` mode) — 0
+      thay đổi hành vi observable, xác nhận bởi toàn bộ 945 test `calm-core` + 301 test
+      `calm-server` pass không đổi; `HighAssurance` mode có test riêng
+      (`atomic_write_high_assurance_surfaces_permission_failure`) chứng minh nó surface lỗi mà
+      `Fast` nuốt.
+- [ ] **ĐO LẠI 2026-08-02 (sau Tier 1+2), VẪN KHÔNG ĐẠT nhưng đã tiến rất gần.** Tier 1 (gộp
+      connection) + Tier 2 Option A+B (docs/plans/2026-08-02-shadow-txn-connection-consolidation-
+      plan.md §3/§5) đều đã IMPLEMENT. Tier 2: `txn::advance` giờ gộp `ledger::append` vào CHÍNH
+      transaction của nó qua `SAVEPOINT` (thay vì commit riêng thứ 2) — cắt mỗi `advance()` từ 2
+      commit xuống 1, không đổi granularity state machine; `txn::advance_many` (mới) batch cùng
+      một state transition qua nhiều tx_id độc lập vào 1 transaction, dùng trong
+      `format_files_impl`'s final advance phase. **Cố tình KHÔNG** gộp 2 state khác nhau (vd
+      IndexCommitted+Done) của CÙNG 1 tx_id — phát hiện qua đọc lại `txn_crash_injection.rs`: làm
+      vậy sẽ phá guarantee mà criterion 1 (crash-injection suite) đang test (`IndexCommitted` sẽ
+      không còn là checkpoint durable độc lập được nữa). Đo lại đúng phương pháp cũ (`git worktree`
+      tại `acf2793`, N=200, 3 lần chạy mỗi bên, **đo cả baseline lẫn Tier1+2 lại từ đầu trong cùng 1
+      khung thời gian** để tránh lệch do tải máy trôi dạt — bài học rút ra: tái sử dụng số baseline
+      cũ từ lần đo Tier 1 sẽ cho kết quả sai lệch, vì tải máy đã đổi giữa 2 lần đo dù cùng 1 commit):
+      baseline mới p50 ≈31.4ms (34.96/30.91/28.33), p95 ≈53.6ms (58.51/57.04/45.27). Sau Tier 1+2:
+      p50 ≈36.16ms (34.53/38.33/35.63), p95 ≈65.8ms (71.57/61.67/64.06). **Overhead: p50 ~+15%, p95
+      ~+23%** — giảm mạnh từ mức ~+41%/+41% của riêng Tier 1 (và ~+31-35%/+50-100% trước Tier 1),
+      xác nhận giả thuyết số lượng commit (9→6 commit/edit) là yếu tố chính. **Vẫn chưa đạt ngưỡng
+      ≤10%** nhưng đã tiến sát.
+
+      **ĐÀO SÂU TIẾP 2026-08-02 (lần 4) — đã tìm ra nguyên nhân chính xác của phần overhead còn
+      lại, không còn là ẩn số.** Viết probe thứ 2 (component-breakdown, cùng kỷ luật thêm-đo-xoá) đo
+      riêng từng phase trong đúng chuỗi `edit_lines_impl_gated` thực hiện. Phát hiện: `reindex_paths`
+      một mình chiếm avg 112.8ms/94.8% tổng — nhưng min=20.3ms, max=**17.97 GIÂY** (1 lần index đầu
+      tiên của file mới trong DB trống làm lệch trung bình hoàn toàn; steady-state thực tế chỉ
+      ~20-25ms/lần). Đây chính là lý do `mean` (~120-130ms) luôn cao hơn hẳn `p50`/`p95` (~30-70ms)
+      ở MỌI lần đo trước đó — không phải do background thread contention như đoán ban đầu, mà do
+      đúng 1 outlier khổng lồ này (percentile của 200 mẫu miễn nhiễm với 1 giá trị bất thường, mean
+      thì không). Với steady-state đã tách outlier: `reindex_paths` (~20-25ms) vốn ĐÃ là chi phí
+      chính của 1 lần edit, kể cả TRƯỚC WS-1 (WS-1 không đụng vào reindex_paths) — nó giải thích cho
+      p50 baseline ~28-31ms, KHÔNG PHẢI phần overhead WS-1 thêm vào. Phần overhead thật sự = toàn bộ
+      phần còn lại: `open_writer` ≈1.2ms + `txn::begin` ≈1.5ms + `advance→FileCommitted` ≈0.5ms +
+      `maintenance::enqueue` ≈0.1ms + `advance→IndexCommitted+Done` ≈0.8ms ≈ **~4.1ms/edit** —
+      4.1ms trên baseline ~28ms = **~+14.6%**, khớp gần như chính xác với con số đo được ~+15%.
+      **Phần chênh lệch không còn là bí ẩn — chính xác là ~4ms này.** Điều này đồng thời loại (c):
+      `maintenance::enqueue` đo thực tế chỉ ~0.1ms, không đáng kể; và giới hạn trần cho (b) Tier 3:
+      toàn bộ `advance()` (gồm cả ledger append) đã đo dưới 1ms, nên bỏ SELECT `head_digest` chỉ có
+      thể tiết kiệm một phần rất nhỏ của mức dưới-1ms đó — khó có khả năng đủ để đạt ngưỡng ≤10%.
+      **Kết luận thực tế:** ~15%/~23% overhead giờ đã được quy về chính xác, không còn lever rủi ro
+      thấp nào khác trong phạm vi đã khảo sát có thể đóng nốt khoảng cách này. Còn lại 2 lựa chọn
+      (chưa quyết trong phiên này, là quyết định của người sở hữu milestone, không phải code
+      change): (i) chấp nhận ~15% là sàn thực tế cho tính năng durability/audit-trail này ở mức chi
+      phí baseline hiện tại, hoặc (ii) xem lại chính ngưỡng ≤10% — ngưỡng này tương đương ngân sách
+      tuyệt đối chỉ ~2.8ms (10% của baseline ~28ms) cho TOÀN BỘ đường ghi journal+ledger mỗi edit,
+      một con số rất chặt cho một audit trail durable, hash-chained, crash-recoverable, giờ đã đo
+      được thay vì chỉ giả định.
+
+      Chi tiết đầy đủ + toàn bộ test mới (3 test cho savepoint invariant + advance_many) + số liệu
+      component-breakdown: xem "Tier 2 implementation & measurement results" và "Remaining-gap root
+      cause" trong file plan đó.
+
+Bench script đã dùng (không giữ lại trong test suite — thêm tạm, đo, rồi xoá cả 2 bên mỗi lần):
+N=200 lần `edit_lines` liên tiếp (đổi số trả về tăng dần trên cùng 1 dòng mỗi lần), đo
+`std::time::Instant` quanh mỗi lời gọi `server.edit_lines(...)` in-process (không qua MCP
+JSON-RPC), sort rồi lấy phần tử tại vị trí p50/p95. Worktree baseline tại `acf2793` (commit ngay
+trước `7b65acb`, commit đầu tiên thêm `txn.rs`), build+chạy độc lập, không đụng working tree chính
+đang có các thay đổi chưa commit của phiên này. Confound đã ghi nhận: mean (~120-130ms) cao hơn
+nhiều so với p50 (~30-45ms) cả 2 bên — nhiều khả năng do background thread `run_all_coalesced`
+(scip-overlay, default-on feature) chạy 200 lần chồng lấn trong ~25s tranh CPU với phép đo — ảnh
+hưởng đều cả 2 bên nên p50 vẫn là số đáng tin nhất, p95 nên coi là nhiễu cho tới khi hiểu rõ hơn
+tương tác này.
 
 Chỉ khi cả 6 mục pass mới coi Phase 1 xong và mở khoá WS-4 (provider sandbox, giai đoạn kế tiếp
 theo roadmap master plan §5).

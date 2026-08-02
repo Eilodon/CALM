@@ -48,6 +48,14 @@ pub(crate) fn preset_tools(preset: &str) -> Option<&'static [&'static str]> {
             "edit_symbol",
             "diff_impact",
             "indexing_status",
+            // WS-1 shadow-mode transaction/maintenance-outbox diagnostics
+            // (2026-08-02, docs/plans/2026-08-02-toolsurface-writesafety-
+            // ledger-research.md#part-1) -- relevant to a session that is
+            // actively editing, unlike orient/trace (read-only exploration).
+            "edit_transaction_status",
+            "maintenance_status",
+            "retry_maintenance",
+            "repair_consistency",
         ]),
         "compound" => Some(&[
             "repo_overview",
@@ -98,6 +106,7 @@ pub(crate) const TOOLSET_NAMES: &[&str] = &[
     "inspect",
     "edit",
     "patterndebt",
+    "txn",
 ];
 
 /// Toolsets that runtime narrowing (`set_toolset`) can NEVER disable — the
@@ -139,6 +148,7 @@ fn toolset_tools(name: &str) -> Option<Vec<String>> {
         "inspect" => CalmServer::inspect_tool_router(),
         "edit" => CalmServer::edit_tool_router(),
         "patterndebt" => CalmServer::patterndebt_tool_router(),
+        "txn" => CalmServer::txn_tool_router(),
         _ => return None,
     };
     Some(

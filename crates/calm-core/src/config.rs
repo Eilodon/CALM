@@ -840,6 +840,7 @@ pub const VALID_TOOLSET_NAMES: &[&str] = &[
     "inspect",
     "edit",
     "patterndebt",
+    "txn",
 ];
 pub fn load_config(project_root: &Path) -> anyhow::Result<Config> {
     match resolve_config_path(project_root) {

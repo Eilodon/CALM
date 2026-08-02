@@ -581,37 +581,73 @@ impl CalmServer {
                 });
                 continue;
             }
-            let shadow_tx_id: Option<String> = calm_core::db::conn::open_writer(&self.db_path)
-                .ok()
-                .and_then(|conn| {
-                    let base_digest = calm_core::digest::evidence_digest(original.as_bytes());
-                    let proposed_digest = calm_core::digest::evidence_digest(formatted.as_bytes());
-                    match calm_core::txn::begin(
-                        &conn,
-                        &project_id,
-                        path,
-                        &base_digest,
-                        &proposed_digest,
-                    ) {
-                        Ok(tx) => Some(tx.tx_id),
-                        Err(e) => {
-                            tracing::warn!("shadow txn::begin failed (non-blocking): {e}");
-                            None
-                        }
-                    }
-                });
-            if let Err(e) = calm_core::edit::atomic_write(&full_path, &formatted) {
-                if let Some(tx_id) = &shadow_tx_id
-                    && let Ok(conn) = calm_core::db::conn::open_writer(&self.db_path)
-                {
-                    let _ = calm_core::txn::advance(
-                        &conn,
-                        tx_id,
-                        calm_core::txn::TxState::Failed,
-                        "system",
-                        &e.to_string(),
+            // WS-1 enforce transition (docs/plans/2026-08-02-ws1-enforce-and-
+            // critical-risk-execution-plan.md §2): same fail-closed posture
+            // as edit_lines_impl_gated -- a file whose transaction journal
+            // couldn't even BEGIN is skipped (as an "error" result for that
+            // file only, not a batch-wide abort) rather than formatted with
+            // no journal at all. Other files in this same paths list are
+            // unaffected, consistent with every other per-file failure this
+            // loop already handles independently.
+            //
+            // Tier-1 perf fix (docs/plans/2026-08-02-shadow-txn-connection-
+            // consolidation-plan.md §3): ONE writer connection per file for
+            // begin + the FileCommitted/Failed advance below, instead of a
+            // fresh open_writer() at each -- same pattern applied to
+            // edit_lines_impl_gated. _guard/_cross_guard are already held
+            // for this whole function, so no other CALM writer contends.
+            let file_conn = match calm_core::db::conn::open_writer(&self.db_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(
+                        "txn::begin failed, skipping format for {path} (enforce mode): \
+                         could not open DB for transaction init: {e}"
                     );
+                    results.push(FormatFileResult {
+                        path: path.clone(),
+                        status: "error".to_string(),
+                        detail: Some(format!(
+                            "could not initialize the durable edit-transaction journal, \
+                             refusing to format this file (could not open DB for \
+                             transaction init: {e})"
+                        )),
+                    });
+                    continue;
                 }
+            };
+            let base_digest = calm_core::digest::evidence_digest(original.as_bytes());
+            let proposed_digest = calm_core::digest::evidence_digest(formatted.as_bytes());
+            let shadow_tx_id = match calm_core::txn::begin(
+                &file_conn,
+                &project_id,
+                path,
+                &base_digest,
+                &proposed_digest,
+            ) {
+                Ok(tx) => tx.tx_id,
+                Err(e) => {
+                    tracing::warn!(
+                        "txn::begin failed, skipping format for {path} (enforce mode): {e}"
+                    );
+                    results.push(FormatFileResult {
+                        path: path.clone(),
+                        status: "error".to_string(),
+                        detail: Some(format!(
+                            "could not initialize the durable edit-transaction journal, \
+                             refusing to format this file ({e})"
+                        )),
+                    });
+                    continue;
+                }
+            };
+            if let Err(e) = calm_core::edit::atomic_write(&full_path, &formatted) {
+                let _ = calm_core::txn::advance(
+                    &file_conn,
+                    &shadow_tx_id,
+                    calm_core::txn::TxState::Failed,
+                    "system",
+                    &e.to_string(),
+                );
                 results.push(FormatFileResult {
                     path: path.clone(),
                     status: "error".to_string(),
@@ -619,20 +655,14 @@ impl CalmServer {
                 });
                 continue;
             }
-            if let Some(tx_id) = &shadow_tx_id
-                && let Ok(conn) = calm_core::db::conn::open_writer(&self.db_path)
-            {
-                let _ = calm_core::txn::advance(
-                    &conn,
-                    tx_id,
-                    calm_core::txn::TxState::FileCommitted,
-                    "system",
-                    "atomic_write succeeded (format)",
-                );
-            }
-            if let Some(tx_id) = shadow_tx_id {
-                shadow_tx_ids.push(tx_id);
-            }
+            let _ = calm_core::txn::advance(
+                &file_conn,
+                &shadow_tx_id,
+                calm_core::txn::TxState::FileCommitted,
+                "system",
+                "atomic_write succeeded (format)",
+            );
+            shadow_tx_ids.push(shadow_tx_id);
             self.track_file(path);
             self.mark_written(path);
             changed_paths.push(path.clone());
@@ -644,6 +674,15 @@ impl CalmServer {
         }
 
         let mut index_stale: Option<String> = None;
+        // Tier-1 perf fix (docs/plans/2026-08-02-shadow-txn-connection-
+        // consolidation-plan.md §3): reindex and the shadow-tx advance loop
+        // below always run together (`changed_paths`/`shadow_tx_ids` are
+        // pushed in lockstep in the loop above, so one is empty iff the
+        // other is) -- reuse reindex's own connection for the advance loop
+        // instead of a separate open_writer call, falling back to an
+        // independent open only if reindex's own open itself failed (same
+        // redundancy the original code had for that one case).
+        let mut reindex_conn: Option<rusqlite::Connection> = None;
         if !changed_paths.is_empty() {
             match calm_core::db::conn::open_writer(&self.db_path) {
                 Err(e) => index_stale = Some(format!("could not open DB to reindex: {e}")),
@@ -655,33 +694,70 @@ impl CalmServer {
                     ) {
                         index_stale = Some(format!("reindex failed: {e}"));
                     }
+                    reindex_conn = Some(write_conn);
                 }
             }
         }
-        if !shadow_tx_ids.is_empty()
-            && let Ok(conn) = calm_core::db::conn::open_writer(&self.db_path)
-        {
-            let (to, reason): (calm_core::txn::TxState, String) = match &index_stale {
-                None => (
-                    calm_core::txn::TxState::IndexCommitted,
-                    "base index refreshed (batched format)".to_string(),
-                ),
-                Some(detail) => (calm_core::txn::TxState::Failed, detail.clone()),
-            };
-            for tx_id in &shadow_tx_ids {
-                match calm_core::txn::advance(&conn, tx_id, to, "system", &reason) {
-                    Ok(()) if to == calm_core::txn::TxState::IndexCommitted => {
-                        let _ = calm_core::txn::advance(
-                            &conn,
-                            tx_id,
-                            calm_core::txn::TxState::Done,
-                            "system",
-                            "base index committed, disk+index consistent",
+        if !shadow_tx_ids.is_empty() {
+            let conn =
+                reindex_conn.or_else(|| calm_core::db::conn::open_writer(&self.db_path).ok());
+            if let Some(conn) = conn {
+                let (to, reason): (calm_core::txn::TxState, String) = match &index_stale {
+                    None => (
+                        calm_core::txn::TxState::IndexCommitted,
+                        "base index refreshed (batched format)".to_string(),
+                    ),
+                    Some(detail) => (calm_core::txn::TxState::Failed, detail.clone()),
+                };
+                // Tier 2 Option B (docs/plans/2026-08-02-shadow-txn-connection-
+                // consolidation-plan.md §5.2): batch the SAME state transition
+                // across every independent tx_id into ONE transaction instead of
+                // one advance() call each -- safe because each tx_id is a fully
+                // independent business object, so batching them changes nothing
+                // about any single tx_id's own crash-recovery story (unlike
+                // batching DIFFERENT states for the SAME tx_id, which §5.0 found
+                // breaks the crash-injection suite's guarantee -- not done here).
+                let first_pass: Vec<(&str, calm_core::txn::TxState, &str, &str)> = shadow_tx_ids
+                    .iter()
+                    .map(|tx_id| (tx_id.as_str(), to, "system", reason.as_str()))
+                    .collect();
+                let first_results = calm_core::txn::advance_many(&conn, &first_pass);
+                for (tx_id, result) in shadow_tx_ids.iter().zip(first_results.iter()) {
+                    if let Err(e) = result {
+                        tracing::warn!(
+                            "shadow txn::advance to {to:?} failed (non-blocking) for {tx_id}: {e}"
                         );
                     }
-                    Ok(()) => {}
-                    Err(e) => {
-                        tracing::warn!("shadow txn::advance to {to:?} failed (non-blocking): {e}")
+                }
+                if to == calm_core::txn::TxState::IndexCommitted {
+                    let done_tx_ids: Vec<&str> = shadow_tx_ids
+                        .iter()
+                        .zip(first_results.iter())
+                        .filter(|(_, r)| r.is_ok())
+                        .map(|(tx_id, _)| tx_id.as_str())
+                        .collect();
+                    if !done_tx_ids.is_empty() {
+                        let done_pass: Vec<(&str, calm_core::txn::TxState, &str, &str)> =
+                            done_tx_ids
+                                .iter()
+                                .map(|tx_id| {
+                                    (
+                                        *tx_id,
+                                        calm_core::txn::TxState::Done,
+                                        "system",
+                                        "base index committed, disk+index consistent",
+                                    )
+                                })
+                                .collect();
+                        let done_results = calm_core::txn::advance_many(&conn, &done_pass);
+                        for (tx_id, result) in done_tx_ids.iter().zip(done_results.iter()) {
+                            if let Err(e) = result {
+                                tracing::warn!(
+                                    "shadow txn::advance to Done failed (non-blocking) for \
+                                     {tx_id}: {e}"
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -848,6 +924,7 @@ impl CalmServer {
                 touched_symbols: vec![],
                 risk_assessment: None,
                 index_stale: None,
+                tx_id: None,
                 note: Some(note),
                 suggested_next: None,
             });
@@ -1113,12 +1190,29 @@ impl CalmServer {
                         uncertain_zero_caller,
                         Some(UncertainZeroCallerReason::LowConfidence)
                     );
+                // Gate criterion 4 of the "Write-Safety Beta" milestone
+                // (docs/plans/2026-08-02-phase1-p0-execution-plan.md §6; design
+                // verified in docs/plans/2026-08-02-ws1-enforce-and-critical-risk-
+                // execution-plan.md §1): a >10-caller ("high") touch is exactly
+                // the tier the master plan calls "critical" and wants an
+                // independent approver for. `bridge_downgrade_eligible`
+                // (`eligible` above) is structurally false whenever
+                // `risk == "high"` (its own `risk.as_deref() != Some("high")`
+                // condition, line ~943) -- so this can never conflict with the
+                // bridge-only-hub downgrade path. A cited real caller is not,
+                // by itself, independent review at this risk tier -- only an
+                // actual elicitation round-trip (Ask -> Approved) is, same
+                // fail-closed shape as LowConfidence above.
+                let high_risk_needs_independent_review = risk.as_deref() == Some("high")
+                    && !matches!(gate, ElicitGate::Ask | ElicitGate::Approved);
                 let cites_real_signal = if known_caller_qns.is_empty() {
-                    if uncertain_empty_caller_needs_review {
+                    if uncertain_empty_caller_needs_review || high_risk_needs_independent_review {
                         !reason.is_empty() && matches!(gate, ElicitGate::Ask | ElicitGate::Approved)
                     } else {
                         !reason.is_empty()
                     }
+                } else if high_risk_needs_independent_review {
+                    false
                 } else {
                     known_caller_qns.iter().any(|qn| {
                         let short = qn.rsplit("::").next().unwrap_or(qn);
@@ -1131,6 +1225,8 @@ impl CalmServer {
                 if !cites_real_signal {
                     let reason_code = if uncertain_empty_caller_needs_review {
                         "UNCERTAIN_ZERO_CALLER"
+                    } else if high_risk_needs_independent_review {
+                        "HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW"
                     } else {
                         "REASON_NOT_GROUNDED"
                     };
@@ -1153,6 +1249,17 @@ impl CalmServer {
                              Enable [edit] elicit_hub_confirm and get human approval via \
                              the elicitation round-trip, or investigate further \
                              (callers/understand) before treating this as safe to edit",
+                            true,
+                        ));
+                    }
+                    if high_risk_needs_independent_review {
+                        return ToolOutcome::error(error_detail(
+                            "HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW",
+                            "this symbol has >10 confirmed callers (\"high\" risk) — a \
+                             cited reason alone is not independent review at this risk \
+                             tier. Enable [edit] elicit_hub_confirm and get human \
+                             approval via the elicitation round-trip before treating \
+                             this as safe to edit",
                             true,
                         ));
                     }
@@ -1224,32 +1331,63 @@ impl CalmServer {
         // deliberate later enforce-stage change, not bundled into shadow
         // wiring.
         let project_id = self.project_root.to_string_lossy().into_owned();
-        let shadow_tx_id: Option<String> = calm_core::db::conn::open_writer(&self.db_path)
-            .ok()
-            .and_then(|conn| {
-                let base_digest = calm_core::digest::evidence_digest(original.as_bytes());
-                let proposed_digest = calm_core::digest::evidence_digest(new_content.as_bytes());
-                match calm_core::txn::begin(
-                    &conn,
-                    &project_id,
-                    path,
-                    &base_digest,
-                    &proposed_digest,
-                ) {
-                    Ok(tx) => Some(tx.tx_id),
-                    Err(e) => {
-                        tracing::warn!("shadow txn::begin failed (non-blocking): {e}");
-                        None
-                    }
-                }
-            });
+        // WS-1 enforce transition (docs/plans/2026-08-02-ws1-enforce-and-
+        // critical-risk-execution-plan.md §2): unlike every other txn::/
+        // maintenance:: call below (still shadow, non-blocking), failing to
+        // even BEGIN the durable transaction journal is fail-closed --
+        // refuse the write rather than proceed with no journal at all. This
+        // is the one point before any real content has changed on disk;
+        // every later step stays non-blocking because a "rollback" once disk
+        // has changed would be a materially riskier operation than the
+        // failure it would be reacting to.
+        //
+        // Tier-1 perf fix (docs/plans/2026-08-02-shadow-txn-connection-
+        // consolidation-plan.md §3): ONE writer connection for this whole
+        // guarded critical section (through the IndexCommitted/Done advance
+        // below) instead of a fresh open_writer() at every step -- same
+        // "one connection, sequential explicit transactions" pattern
+        // txn_crash_harness.rs already uses (and the crash-injection suite
+        // already exercises), just applied here too. _guard/_cross_guard are
+        // already held for this whole section, so no other CALM writer can
+        // be contending with it anyway. Still fail-closed exactly as before:
+        // this one open must succeed before anything proceeds.
+        let txn_init_failed = |detail: String| -> ToolOutcome<EditLinesOutput> {
+            tracing::warn!("txn::begin failed, refusing write (enforce mode): {detail}");
+            ToolOutcome::error(error_detail(
+                "TRANSACTION_INIT_FAILED",
+                &format!(
+                    "could not initialize the durable edit-transaction journal -- \
+                     refusing to write rather than proceed with no journal at all \
+                     ({detail}). This usually indicates a database-level problem (disk \
+                     full, permissions, lock contention) that would likely also \
+                     affect the write itself"
+                ),
+                true,
+            ))
+        };
+        let mut shared_conn = match calm_core::db::conn::open_writer(&self.db_path) {
+            Ok(c) => c,
+            Err(e) => {
+                return txn_init_failed(format!("could not open DB for transaction init: {e}"));
+            }
+        };
+        let base_digest = calm_core::digest::evidence_digest(original.as_bytes());
+        let proposed_digest = calm_core::digest::evidence_digest(new_content.as_bytes());
+        let shadow_tx_id: Option<String> = match calm_core::txn::begin(
+            &shared_conn,
+            &project_id,
+            path,
+            &base_digest,
+            &proposed_digest,
+        ) {
+            Ok(tx) => Some(tx.tx_id),
+            Err(e) => return txn_init_failed(e.to_string()),
+        };
 
         if let Err(e) = calm_core::edit::atomic_write(&full_path, &new_content) {
-            if let Some(tx_id) = &shadow_tx_id
-                && let Ok(conn) = calm_core::db::conn::open_writer(&self.db_path)
-            {
+            if let Some(tx_id) = &shadow_tx_id {
                 let _ = calm_core::txn::advance(
-                    &conn,
+                    &shared_conn,
                     tx_id,
                     calm_core::txn::TxState::Failed,
                     "system",
@@ -1264,11 +1402,9 @@ impl CalmServer {
                 false,
             ));
         }
-        if let Some(tx_id) = &shadow_tx_id
-            && let Ok(conn) = calm_core::db::conn::open_writer(&self.db_path)
-        {
+        if let Some(tx_id) = &shadow_tx_id {
             let _ = calm_core::txn::advance(
-                &conn,
+                &shared_conn,
                 tx_id,
                 calm_core::txn::TxState::FileCommitted,
                 "system",
@@ -1307,109 +1443,106 @@ impl CalmServer {
         // warning on a success response instead.
         let mut index_stale: Option<String> = None;
         let mut should_embed_bg = false;
-        match calm_core::db::conn::open_writer(&self.db_path) {
-            Err(e) => index_stale = Some(format!("could not open DB to reindex: {e}")),
-            Ok(mut write_conn) => {
-                let reindex_start = std::time::Instant::now();
-                let reindex_result = calm_core::indexer::pipeline::reindex_paths(
-                    &mut write_conn,
-                    &self.project_root,
-                    &[path.to_string()],
-                );
-                match reindex_result {
-                    Ok(summary) if !summary.is_noop() => {
-                        // Phase B T6.5: record which rebuild path this edit's
-                        // reindex took (surfaced by indexing_status.graph_mode)
-                        // and log the reindex+graph duration on its own — the
-                        // acceptance number the plan tracks ("reindex+graph <
-                        // 150ms"), isolated here from the surrounding
-                        // write/lock/serialize cost that timed_tool's overall
-                        // duration_ms folds in.
-                        let mode = summary.graph_mode.label();
-                        *self.last_graph_mode.write_ok() = Some(mode.clone());
-                        tracing::info!(
-                            reindex_ms = reindex_start.elapsed().as_millis(),
-                            graph_mode = %mode,
-                            path = %path,
-                            "edit_reindex_completed"
+        {
+            let reindex_start = std::time::Instant::now();
+            let reindex_result = calm_core::indexer::pipeline::reindex_paths(
+                &mut shared_conn,
+                &self.project_root,
+                &[path.to_string()],
+            );
+            match reindex_result {
+                Ok(summary) if !summary.is_noop() => {
+                    // Phase B T6.5: record which rebuild path this edit's
+                    // reindex took (surfaced by indexing_status.graph_mode)
+                    // and log the reindex+graph duration on its own — the
+                    // acceptance number the plan tracks ("reindex+graph <
+                    // 150ms"), isolated here from the surrounding
+                    // write/lock/serialize cost that timed_tool's overall
+                    // duration_ms folds in.
+                    let mode = summary.graph_mode.label();
+                    *self.last_graph_mode.write_ok() = Some(mode.clone());
+                    tracing::info!(
+                        reindex_ms = reindex_start.elapsed().as_millis(),
+                        graph_mode = %mode,
+                        path = %path,
+                        "edit_reindex_completed"
+                    );
+                    // Embedding moved out of this lock-held section (Plan 3
+                    // §3.1 Phase C) — the reindex above already committed the
+                    // DB write, so correctness doesn't depend on embedding
+                    // finishing before the response returns; only semantic-
+                    // search freshness does, and that's an eventual-
+                    // consistency concern, not worth holding _guard/
+                    // _cross_guard (and therefore every OTHER edit_lines/
+                    // edit_symbol call in this and other processes) for.
+                    // Spawned after both guards drop below.
+                    should_embed_bg = self.embedder().is_some();
+                    // This reindex just ran rebuild_graph, which DELETEs every
+                    // call_edges row — including all `formal` upgrades from the
+                    // SCIP/LSP overlays — and re-resolves syntactically. The
+                    // watcher can't restore them either: by the time its file
+                    // event fires, this reindex already updated the hashes, so
+                    // its own reindex_changed is a no-op and its overlay hook
+                    // never runs. Root cause of the formal tier silently dying
+                    // after every CALM-tool edit (observed live 2026-07-10:
+                    // 0 formal edges in a DB whose sidecar recorded 2863
+                    // upgrades 30 minutes earlier). Fire-and-forget on a
+                    // background thread — same posture as the watcher's own
+                    // post-reindex hook — so the edit response isn't held for a
+                    // ~20s rust-analyzer batch run; `run_all_coalesced` keeps
+                    // rapid successive edits from stacking concurrent passes.
+                    #[cfg(feature = "scip-overlay")]
+                    {
+                        let root = self.project_root.clone();
+                        let db = self.db_path.clone();
+                        // WS-1 durable outbox (plan
+                        // §4.1b/§4.3/§4.6 task 4.5): records the
+                        // trigger before spawning so a crash between
+                        // here and the thread completing still leaves
+                        // a 'queued'/'running' row for startup
+                        // recovery to find -- run_all_coalesced itself
+                        // is UNCHANGED, still fire-and-forget, still
+                        // self-coalescing via its own in-memory flags.
+                        // mark_completed after it returns is an honest
+                        // "the call returned", not "every language's
+                        // pass is proven fresh" -- a concurrent
+                        // caller's own OVERLAY_RERUN loop can still be
+                        // running a rerun that covers this trigger
+                        // when this returns; that's inherent to
+                        // run_all_coalesced's existing design, not
+                        // something this wrapper changes or hides.
+                        // Tier-1 perf fix (docs/plans/2026-08-02-shadow-txn-
+                        // connection-consolidation-plan.md §3): reuses
+                        // `shared_conn` (already open for this whole critical
+                        // section) instead of a separate open_writer call here.
+                        let _ = calm_core::maintenance::enqueue(
+                            &shared_conn,
+                            calm_core::maintenance::MaintenanceKind::ScipRefresh,
+                            shadow_tx_id.as_deref(),
                         );
-                        // Embedding moved out of this lock-held section (Plan 3
-                        // §3.1 Phase C) — the reindex above already committed the
-                        // DB write, so correctness doesn't depend on embedding
-                        // finishing before the response returns; only semantic-
-                        // search freshness does, and that's an eventual-
-                        // consistency concern, not worth holding _guard/
-                        // _cross_guard (and therefore every OTHER edit_lines/
-                        // edit_symbol call in this and other processes) for.
-                        // Spawned after both guards drop below.
-                        should_embed_bg = self.embedder().is_some();
-                        // This reindex just ran rebuild_graph, which DELETEs every
-                        // call_edges row — including all `formal` upgrades from the
-                        // SCIP/LSP overlays — and re-resolves syntactically. The
-                        // watcher can't restore them either: by the time its file
-                        // event fires, this reindex already updated the hashes, so
-                        // its own reindex_changed is a no-op and its overlay hook
-                        // never runs. Root cause of the formal tier silently dying
-                        // after every CALM-tool edit (observed live 2026-07-10:
-                        // 0 formal edges in a DB whose sidecar recorded 2863
-                        // upgrades 30 minutes earlier). Fire-and-forget on a
-                        // background thread — same posture as the watcher's own
-                        // post-reindex hook — so the edit response isn't held for a
-                        // ~20s rust-analyzer batch run; `run_all_coalesced` keeps
-                        // rapid successive edits from stacking concurrent passes.
-                        #[cfg(feature = "scip-overlay")]
-                        {
-                            let root = self.project_root.clone();
-                            let db = self.db_path.clone();
-                            // WS-1 durable outbox (plan
-                            // §4.1b/§4.3/§4.6 task 4.5): records the
-                            // trigger before spawning so a crash between
-                            // here and the thread completing still leaves
-                            // a 'queued'/'running' row for startup
-                            // recovery to find -- run_all_coalesced itself
-                            // is UNCHANGED, still fire-and-forget, still
-                            // self-coalescing via its own in-memory flags.
-                            // mark_completed after it returns is an honest
-                            // "the call returned", not "every language's
-                            // pass is proven fresh" -- a concurrent
-                            // caller's own OVERLAY_RERUN loop can still be
-                            // running a rerun that covers this trigger
-                            // when this returns; that's inherent to
-                            // run_all_coalesced's existing design, not
-                            // something this wrapper changes or hides.
-                            if let Ok(conn) = calm_core::db::conn::open_writer(&self.db_path) {
-                                let _ = calm_core::maintenance::enqueue(
+                        std::thread::spawn(move || {
+                            if let Ok(conn) = calm_core::db::conn::open_writer(&db) {
+                                let _ = calm_core::maintenance::mark_running(
                                     &conn,
                                     calm_core::maintenance::MaintenanceKind::ScipRefresh,
-                                    shadow_tx_id.as_deref(),
                                 );
                             }
-                            std::thread::spawn(move || {
-                                if let Ok(conn) = calm_core::db::conn::open_writer(&db) {
-                                    let _ = calm_core::maintenance::mark_running(
-                                        &conn,
-                                        calm_core::maintenance::MaintenanceKind::ScipRefresh,
-                                    );
-                                }
-                                crate::scip_overlay::run_all_coalesced(&root, &db);
-                                if let Ok(conn) = calm_core::db::conn::open_writer(&db) {
-                                    let _ = calm_core::maintenance::mark_completed(
-                                        &conn,
-                                        calm_core::maintenance::MaintenanceKind::ScipRefresh,
-                                        Ok(()),
-                                    );
-                                }
-                            });
-                        }
+                            crate::scip_overlay::run_all_coalesced(&root, &db);
+                            if let Ok(conn) = calm_core::db::conn::open_writer(&db) {
+                                let _ = calm_core::maintenance::mark_completed(
+                                    &conn,
+                                    calm_core::maintenance::MaintenanceKind::ScipRefresh,
+                                    Ok(()),
+                                );
+                            }
+                        });
                     }
-                    Ok(_) => {}
-                    Err(e) => index_stale = Some(format!("reindex failed: {e}")),
                 }
+                Ok(_) => {}
+                Err(e) => index_stale = Some(format!("reindex failed: {e}")),
             }
         }
-        if let Some(tx_id) = &shadow_tx_id
-            && let Ok(conn) = calm_core::db::conn::open_writer(&self.db_path)
-        {
+        if let Some(tx_id) = &shadow_tx_id {
             let (to, reason): (calm_core::txn::TxState, String) = match &index_stale {
                 None => (
                     calm_core::txn::TxState::IndexCommitted,
@@ -1417,10 +1550,10 @@ impl CalmServer {
                 ),
                 Some(detail) => (calm_core::txn::TxState::Failed, detail.clone()),
             };
-            match calm_core::txn::advance(&conn, tx_id, to, "system", &reason) {
+            match calm_core::txn::advance(&shared_conn, tx_id, to, "system", &reason) {
                 Ok(()) if to == calm_core::txn::TxState::IndexCommitted => {
                     let _ = calm_core::txn::advance(
-                        &conn,
+                        &shared_conn,
                         tx_id,
                         calm_core::txn::TxState::Done,
                         "system",
@@ -1529,6 +1662,7 @@ impl CalmServer {
                 touched_symbols: vec![],
                 risk_assessment: risk,
                 index_stale: Some(true),
+                tx_id: shadow_tx_id.clone(),
                 note: Some(note),
                 suggested_next: self.filter_sn(suggested(
                     "indexing_status",
@@ -1549,6 +1683,7 @@ impl CalmServer {
                         touched_symbols: vec![],
                         risk_assessment: risk,
                         index_stale: None,
+                        tx_id: shadow_tx_id.clone(),
                         note: match &dogfood_note {
                             Some(d) => Some(format!(
                                 "edit applied but could not re-query touched symbols. {d}"
@@ -1585,6 +1720,7 @@ impl CalmServer {
             touched_symbols,
             risk_assessment: risk,
             index_stale: None,
+            tx_id: shadow_tx_id.clone(),
             note,
             suggested_next: self.filter_sn(suggested_gated(
                 "diff_impact",
@@ -2651,6 +2787,14 @@ pub(crate) struct EditLinesOutput {
     /// until it recovers (see `note`, and call `indexing_status`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) index_stale: Option<bool>,
+    /// WS-1 shadow-mode transaction id (docs/plans/2026-08-02-
+    /// ws1-enforce-and-critical-risk-execution-plan.md §2.3 stage 2,
+    /// "dual-read") -- absent when nothing was written, or when the shadow
+    /// `txn::begin` call itself failed (logged, non-blocking in shadow
+    /// mode). Look it up with `edit_transaction_status`/`repair_consistency`
+    /// if something about this edit looks wrong.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) tx_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) note: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
