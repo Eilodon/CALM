@@ -6,6 +6,30 @@ git tags in [Releases](https://github.com/Eilodon/CALM/releases).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-08-03
+
+### Added
+- Durable edit-transaction journal (`txn.rs`) and maintenance outbox, wired into `edit_lines`/`format_files`, with a startup recovery hook and 4 new admin tools (`edit_transaction_status`, `maintenance_status`, `retry_maintenance`, `repair_consistency`) exposed under a new `txn` toolset
+- Append-only, hash-chained audit ledger (SHA-256 evidence digests) as a durable channel alongside tracing
+- Caller-set-digest TOCTOU guard on the edit gate: an unrelated edit that changes a symbol's caller set since `edit_context` reviewed it now rejects the stale review (`STALE_CALLER_SET`) instead of trusting it
+- Write-safety enforce-transition: no write path can bypass `EditTransaction`; critical-risk edits without an approver are blocked
+- 3-mode symlink containment (`path_policy.rs`) wired into repo-path resolution
+- OS-level crash-injection test suite (`txn_crash_injection`): self-raised SIGKILL after every reachable transaction-state transition, verified against disk/ledger consistency, 100 iterations/transition
+- `release.yml` `qualify-release` gate (fmt/clippy/test/audit/stack-graphs corpus/fitness-check/doc-drift/cross-SDK interop) that binary and container publish jobs now depend on — a tag push can no longer reach a release without it
+- Refresh reconciliation and bounded watcher supervision: shared input catalog, durable input fingerprints, explicit health reporting distinguishing completed-index state from live filesystem observation
+
+### Changed
+- `edit.rs` and the transaction tool surface reuse a single writer connection per file instead of re-opening per step; independent transaction advances batch under one `BEGIN`/`COMMIT`
+
+### Fixed
+- Rust `Self::method()` calls (inside `impl`/`trait` blocks) resolved to zero call edges instead of the enclosing type — `target_class` now substitutes the real enclosing type/trait name instead of the literal `Self` keyword
+- Duplicate `call_sites` inserts aborted the whole indexing transaction instead of being skipped, permanently failing indexing on affected repos
+- `watcher_integration` tests could leak a background thread and temp directory for the process's life if a panic unwound past cleanup
+- Indexer-to-analysis architecture boundary violation introduced by watcher-supervision work
+- CI jobs had no `timeout-minutes`, letting a hung test silently occupy a runner for GitHub's 6h default instead of failing fast
+- `Cargo.lock` internal package versions left stale after a workspace version bump
+- `cargo fmt` violations in the indexer test module
+
 ## [0.4.0] - 2026-08-01
 
 ### Added
