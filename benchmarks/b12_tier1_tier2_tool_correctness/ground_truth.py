@@ -122,6 +122,33 @@ def _looks_like_a_definition(line_text: str, lang: str) -> bool:
     return any(re.search(pat, line_text) for pat, _kind in PATTERNS[lang])
 
 
+# 2026-08-02 fix: single-line comment marker per language, used by
+# `git_grep_call_sites` to exclude a comment that merely MENTIONS a function
+# name (`// see also foo(...)`) from counting as a real call site. Same
+# "good enough to catch gross oracle noise, not parser-grade" posture as
+# `_looks_like_a_definition` above -- doesn't track block comments
+# (`/* ... */`) or docstrings, only the common single-line-comment case that
+# was verified as a real, already-published false positive (see
+# `git_grep_call_sites`'s own docstring).
+COMMENT_PREFIXES: dict[str, str] = {
+    "python": "#",
+    "rust": "//",
+    "go": "//",
+    "javascript": "//",
+    "typescript": "//",
+    "java": "//",
+}
+
+
+def _is_comment_line(line_text: str, lang: str) -> bool:
+    """True if `line_text` (as returned by `git grep`, leading whitespace
+    intact) is a single-line comment in `lang` -- i.e. its content, after
+    stripping leading whitespace, starts with that language's line-comment
+    marker. Covers Rust's `//`, `///`, and `//!` alike (all start with `//`)."""
+    prefix = COMMENT_PREFIXES.get(lang)
+    return bool(prefix) and line_text.lstrip().startswith(prefix)
+
+
 def git_grep_call_sites(root: Path, name: str, def_path: str, def_line: int, lang: str) -> list[tuple[str, int]]:
     """Real CALL-shaped sites for `name` anywhere in the corpus, excluding the
     definition line itself and any OTHER line that looks like a (re)definition
@@ -139,12 +166,29 @@ def git_grep_call_sites(root: Path, name: str, def_path: str, def_line: int, lan
          as a "call site", when textually there was never one real call
          anywhere (`my_reverse` was always invoked indirectly through a dict:
          `filters["my_reverse"](...)`).
-    Still an approximation, not a call-graph-precision oracle -- only strong
-    enough to flag gross zero-recall failures (a tool returning 0 where this
-    finds several), the same profile that caught the real B1 JS/TS bug."""
+
+    2026-08-02 fix (b13 CALM-vs-CodeGraph investigation): two more ground-truth
+    bugs, found the same way as the two above -- verified real on already-
+    published data, not hypothetical. `git grep` with no pathspec scanned
+    EVERY tracked file in the repo, not just this corpus's own source
+    extension, so a markdown/`.rst` doc that merely MENTIONS `name(` in prose
+    (or inside an illustrative code snippet in a design doc) counted as a real
+    caller; and no comment-line filter existed, so a `// see also name(...)`
+    style comment counted too. b13's published run had 4 such false "oracle
+    files" baked into its denominator (`docs/patterns/celery.rst`,
+    `docs/logging.rst`, a markdown design doc with 3 non-code mentions, and a
+    Rust `// ... common::resolve_preset(...)` re-export comment) -- neither
+    CALM nor CodeGraph ever found any of them (correctly -- none are real call
+    sites), so both tools were being docked for "missing" something that was
+    never really there. Fixed by restricting the pathspec to this language's
+    own source extension(s) and skipping comment-only lines. Still an
+    approximation, not a call-graph-precision oracle -- only strong enough to
+    flag gross zero-recall failures, the same profile that caught the real B1
+    JS/TS bug and the two documented above."""
     pattern = rf"(^|[^A-Za-z0-9_]){re.escape(name)}\("
+    pathspecs = [f"*{ext}" for ext in EXTENSIONS[lang]]
     proc = subprocess.run(
-        ["git", "grep", "-n", "-E", "--", pattern],
+        ["git", "grep", "-n", "-E", "--", pattern, *pathspecs],
         cwd=root, capture_output=True, text=True, check=False,
     )
     sites: list[tuple[str, int]] = []
@@ -160,6 +204,8 @@ def git_grep_call_sites(root: Path, name: str, def_path: str, def_line: int, lan
         if path == def_path and lineno == def_line:
             continue
         if _looks_like_a_definition(text, lang):
+            continue
+        if _is_comment_line(text, lang):
             continue
         sites.append((path, lineno))
     return sites

@@ -253,6 +253,28 @@ def run_freshness_probe(corpus_dir: Path, lang: str, calm: GenericMCPClient, cg:
     }
 
 
+def force_scip_refresh(calm: GenericMCPClient, lang: str) -> dict:
+    """2026-08-02 fix (b13 CALM-vs-CodeGraph investigation): `wait_calm_indexed`
+    only waits for tree-sitter indexing (`indexing_phase=="ready"`) -- the
+    automatic SCIP overlay pass (rust-analyzer/scip-python, upgrading edges to
+    `formal` confidence) runs ASYNCHRONOUSLY after that and is not waited for.
+    Verified live against a fresh fd clone: `indexing_status.scip_overlays
+    [rust].up_to_date` stayed `false` for 15s past `ready` with no automatic
+    trigger, only flipping to `true` after this exact `scip_refresh` call.
+    Forcing it here closes that race before any recall query runs, even
+    though a spot-check on 3 already-published symbols found it changed
+    `edge_confidence` (resolved/textual -> formal) and ruled out a handful of
+    phantom fan-out edges, but did NOT change which files came back -- still
+    correct to wait for CALM's strongest resolution before scoring it rather
+    than rely on that having been harmless by luck on the symbols checked so
+    far."""
+    try:
+        raw = calm.call_tool("scip_refresh", {"lang": lang})
+        return json.loads(raw)
+    except Exception as e:  # noqa: BLE001
+        return {"error": str(e)}
+
+
 def run_corpus(lang: str, corpus_dir: Path, calm_bin: str, pinned_commit: str, do_freshness: bool,
                n_repeats: int = 1) -> dict:
     print(f"=== {lang}: codegraph init ===", file=sys.stderr)
@@ -266,11 +288,13 @@ def run_corpus(lang: str, corpus_dir: Path, calm_bin: str, pinned_commit: str, d
     cg = start_codegraph(corpus_dir)
     try:
         calm_index_seconds = wait_calm_indexed(calm)
-        print(f"=== {lang}: calm indexed in {calm_index_seconds}s, running callers_recall (x{n_repeats}) ===",
-              file=sys.stderr)
+        scip_refresh_result = force_scip_refresh(calm, lang)
+        print(f"=== {lang}: calm indexed in {calm_index_seconds}s, scip_refresh={scip_refresh_result}, "
+              f"running callers_recall (x{n_repeats}) ===", file=sys.stderr)
         result = run_callers_recall(corpus_dir, lang, calm, cg, n_repeats=n_repeats)
         result["pinned_commit"] = pinned_commit
         result["calm_index_seconds"] = calm_index_seconds
+        result["calm_scip_refresh"] = scip_refresh_result
         result["codegraph_init_seconds"] = init_result["seconds"]
 
         if do_freshness and result["rows"]:

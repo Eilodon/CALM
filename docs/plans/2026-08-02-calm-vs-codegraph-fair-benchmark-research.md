@@ -295,3 +295,62 @@ Full results/methodology/limitations: `benchmarks/b13_codegraph_multirepo_ab/REA
 (fully rewritten for Phase 1+2 combined). Still not committed/pushed — held for the
 user's review given this (and the CALM bugfix riding along with it) is headed toward
 public use. fmt/C++ still open (needs `scip-clang` oracle setup).
+
+## §9 (2026-08-03): oracle + rigor correction, requested after publishing the 80.6/72.2 number
+
+User asked why CALM's margin looked thin given its extra complexity, and whether the
+strongest CALM configuration was even used. Two real bugs in this benchmark's OWN
+methodology were found and fixed (not a CALM-vs-CodeGraph tool question this time, an
+oracle-and-harness-correctness question):
+
+1. B12's shared `ground_truth.py::git_grep_call_sites` oracle counted markdown/`.rst`
+   doc mentions and source-code comments as if they were real call sites (`git grep` had
+   no pathspec restriction and no comment filter). Verified directly on 4 already-
+   published oracle entries. Neither tool ever found any of them (correctly), so both
+   were penalized for "missing" call sites that were never real. Fixed: pathspec-
+   restricted to the corpus's own language extension, comment lines excluded.
+2. `run_benchmark.py`'s `wait_calm_indexed` returned before CALM's automatic async SCIP
+   overlay pass (rust-analyzer/scip-python) had run, confirmed live via a fresh fd clone
+   (`scip_overlays[rust].up_to_date` stayed `false` 15s post-ready with no auto-trigger).
+   Fixed: the harness now forces `scip_refresh` explicitly before scoring. Empirically
+   this didn't change recall on the 3 symbols spot-checked pre-fix (only confidence tier
+   + a few ruled-out phantom edges) — fixed anyway, for rigor rather than because it was
+   shown to move the old numbers.
+
+**Corrected, canonical result (fresh re-run, same pins, N=3 repeats, oracle-driven
+sample necessarily differs from Phase 1+2's)**: **CALM 30/31 (96.8%) vs CodeGraph 27/31
+(87.1%)**. The sole row CodeGraph now wins (fd's `replace_separator`) was independently
+verified as a REAL, reproducible CALM gap, not oracle noise: CALM's Rust tree-sitter call
+extractor doesn't resolve `Self::method()` associated-function calls, reproduced on
+CALM's own codebase too (`ConservativeResolver::default`'s `Self::new()` call is invisible
+to `callers`, even though every fully-qualified `ConservativeResolver::new()` call in the
+same file is found). Not fixed as part of this pass — flagged as a concrete, high-value
+follow-up in `crates/calm-core/src/indexer/parser.rs`.
+
+Full writeup: `benchmarks/b13_codegraph_multirepo_ab/README.md`'s "Corrected numbers"
+section (now the canonical entry point; Phase 1+2 sections kept below it, marked
+superseded, not deleted). This section of this doc, like that README, replaces the
+headline number everywhere it was cited above — do not cite 80.6/72.2 going forward.
+
+**Same-day follow-up, per user's explicit ask to root-cause the `Self::` gap and sweep for
+similar bugs before deciding whether to fix**: chased the exact chain through
+`is_type_like`/`split_receiver_callee`/`extract_file_data`/`resolve_sites_to_edges`
+(`crates/calm-core/src/indexer/{parser,pipeline}.rs`) — `target_class` was left as the
+literal keyword text `"Self"` instead of the enclosing `impl` block's real type name,
+even though that name was already tracked correctly (`enclosing_class`). 42 real
+`Self::method()` call sites exist in CALM's own repo alone (15 files) — not a rare case.
+Swept for parallels: found one more real gap in `walk_calls`'s handling of Rust
+`trait_item` (no `"type"` field, unlike `impl_item`) for call extraction specifically.
+First call was to skip it (reasoning: `Self` inside a trait default method seemed
+inherently unbound to one concrete type, so a fix would be a guess) — **that reasoning was
+wrong**, caught on direct follow-up when asked to justify it. A live characterization test
+showed the real mechanism was identical to the `impl_item` bug (`enclosing_class` simply
+`None` inside a trait, `target_class` left as literal `"Self"`), not a "which concrete
+type" ambiguity at all. Fixed the same way (`walk_calls` now reads `trait_item`'s `"name"`
+field, mirroring `walk_symbols`'s existing special-case). Both fixes + regression tests,
+`cargo test -p calm-core --lib -- indexer:: resolver:: rust` → **356 passed, 0 failed**.
+Rebuilt, re-ran b13 after the first fix: **31/31 (100%) CALM vs 27/31 (87.1%) CodeGraph**
+— CALM has zero misses in this sample (the trait fix doesn't change this specific number,
+none of the 24 sampled symbols involve a trait default method, but is real and tested).
+Full detail in `benchmarks/b13_codegraph_multirepo_ab/README.md`'s "A real CALM parser
+bug, found, root-caused, and fixed in this same pass".

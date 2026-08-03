@@ -12,6 +12,119 @@ Design rationale, full pitfall catalogue, and why this composes existing
 infra instead of inventing a new corpus:
 [`docs/plans/2026-08-02-calm-vs-codegraph-fair-benchmark-research.md`](../../docs/plans/2026-08-02-calm-vs-codegraph-fair-benchmark-research.md).
 
+## Corrected numbers (2026-08-03) — read this section first
+
+The Phase 1+2 numbers below (80.6% CALM / 72.2% CodeGraph) were **published with two
+bugs in this benchmark's own methodology**, found during a follow-up investigation
+after the user asked why the margin looked thin. Both are fixed now; the sections
+further down are kept for provenance/audit trail, not deleted, but they are
+**superseded** by this one.
+
+1. **Ground-truth oracle bug** (`benchmarks/b12_tier1_tier2_tool_correctness/
+   ground_truth.py::git_grep_call_sites`, shared with B12/B7): `git grep` scanned
+   *every* tracked file, not just the corpus's own source-file extension, and never
+   excluded comment lines — so a markdown/`.rst` doc that merely *mentions* `name(` in
+   prose, or a source-file comment like `// ... common::resolve_preset(...)`, counted
+   as a real "caller." Verified directly (not assumed) on 4 already-published oracle
+   entries: `docs/patterns/celery.rst`, `docs/logging.rst`, 3 non-code mentions inside a
+   markdown design doc, and one Rust re-export comment. Neither CALM nor CodeGraph ever
+   found any of these (correctly — none are real call sites), so both tools were being
+   docked for "missing" something that was never really there. **Fixed**: the oracle
+   now restricts `git grep` to the corpus's own language extension and skips
+   comment-only lines.
+2. **SCIP-overlay race condition** (`run_benchmark.py`): `wait_calm_indexed()` returns
+   as soon as tree-sitter indexing reaches `phase=="ready"`, before the automatic
+   *async* SCIP overlay pass (rust-analyzer/scip-python, upgrading edges to `formal`
+   confidence) has run. Verified live against a fresh fd clone: `indexing_status.
+   scip_overlays[rust].up_to_date` stayed `false` 15s past ready with no auto-trigger.
+   **Fixed**: the harness now calls the `scip_refresh` MCP tool explicitly right after
+   indexing, before any recall query. (Empirically, on the 3 symbols spot-checked before
+   the fix, forcing the overlay only upgraded `edge_confidence` and ruled out a few
+   phantom fan-out edges — it did not change which files came back. Still fixed for
+   rigor: a skeptical reader shouldn't have to take "it happened not to matter" on
+   faith.)
+
+Because the oracle's eligibility filtering changed, the corrected re-run samples a
+**different** (still deterministic: sorted + fixed stride) set of 24 symbols than
+Phase 1+2 — this is not the same sample with cleaner labels, it's a fresh, methodologically
+superior run. Same pins, same N=3 repeats, same `n=8` symbols/corpus.
+
+### Combined (corrected, post-`Self::` fix) — fd + flask + self-repo, N=24 symbols, 31 real oracle files
+
+| | CALM | CodeGraph |
+|---|---|---|
+| File-recall | **31/31 (100%)** | 27/31 (87.1%) |
+
+| Corpus | CALM | CodeGraph |
+|---|---|---|
+| fd (Rust) | **9/9 (100%)** | 9/9 (100%) |
+| flask (Python) | **12/12 (100%)** | 9/12 (75.0%) |
+| self-repo (Rust) | **10/10 (100%)** | 9/10 (90.0%) |
+
+### A real CALM parser bug, found, root-caused, and fixed in this same pass
+
+The first corrected re-run (before this fix) was **30/31 (96.8%)**, with exactly one row
+where CodeGraph won: fd's `replace_separator` (`src/fmt/mod.rs`) — CodeGraph found it
+(1/1), CALM found **nothing** (0/1, not even an ambiguous edge). Checked directly against
+fd's source at the pinned commit (`raw.githubusercontent.com`, no new clone needed): the
+function is called 5 times in the same file, every time as `Self::replace_separator(...)`
+— an associated-function call through Rust's `Self` shorthand, not `TypeName::method(...)`.
+
+**Reproduced independently on CALM's own codebase**, not just fd — `ConservativeResolver`'s
+`Default::default()` (`crates/calm-core/src/resolver/conservative.rs:123`) calls
+`Self::new()`, and `callers` on `ConservativeResolver::new` used to return 13 real callers
+but **not** `default`, even though every other `ConservativeResolver::new()` (fully
+qualified) call site in the same file *was* found.
+
+**Root cause** (chased through 4 functions in `crates/calm-core/src/indexer/`, all read
+directly, not guessed): `is_type_like()` (`parser.rs`) flags any receiver starting with an
+uppercase letter as a type path — true for `"Self"`. `split_receiver_callee`'s `::` branch
+then sets `receiver_is_type_path=true`. `extract_file_data` (`pipeline.rs`) used this to
+set `target_class = Some("Self")` — the **literal keyword text**, never substituted for the
+enclosing `impl` block's real type name, even though that name was already correctly
+tracked (`enclosing_class`, via Rust's `class_name_field: "type"` on `impl_item`).
+`resolve_sites_to_edges` then looks up `by_name_class[(callee, "Self")]`, which can never
+match — no symbol is ever actually named `"Self"` — so the call site silently resolved to
+zero edges. (`resolve_tier2` already does the equivalent substitution for lowercase
+`self`/`this`, but this branch short-circuits before ever reaching it.) **Real-world
+magnitude on CALM's own repo**: 42 real `Self::method()` call sites across 15 files — a
+common, encouraged Rust idiom (safe under type renames), not a rare edge case.
+
+**Fixed**: `extract_file_data` now substitutes `enclosing_class` for a Rust `"Self"`
+receiver before setting `target_class`, mirroring `resolve_tier2`'s existing `self`/`this`
+handling. New regression test (`rust_self_colon_colon_call_resolves_to_the_enclosing_impl_
+type`, full-pipeline style matching the existing `test_formal_tier_upgrades_textual_
+python_call`) passes; broader suite (`cargo test -p calm-core --lib -- indexer::pipeline
+indexer::parser resolver:: rust`) — **255 passed, 0 failed**, no regressions. Re-running
+this exact benchmark after the fix moved `replace_separator` from 0/1 to 1/1 and the
+combined total from 30/31 to **31/31 — CALM has zero misses left in this sample**.
+
+**Swept for similar bugs, not just this one — and fixed the one it found.** First pass
+flagged (but didn't fix) a related gap: `walk_calls`'s `child_class` tracking used the same
+`class_name_field` unconditionally for every `class_node_types` entry, but Rust's
+`trait_item` has no `"type"` field (only `"name"`) — `walk_symbols` already special-cased
+this for *symbol* extraction but the equivalent fix was never applied to *call* extraction.
+Initial call: skip it, reasoning `Self` inside a trait default method is inherently
+"unbound" to one concrete type so a fix would just be a guess. **That reasoning was wrong**
+— caught on direct follow-up. A live characterization test (`trait Greeter { fn helper()
+{..} fn greet() { Self::helper() } }`) showed the actual mechanism was identical to the
+`impl_item` bug (`target_class` left as literal `"Self"`, zero edges), not a "which
+concrete type" ambiguity at all — `enclosing_class` was simply `None` for anything inside
+a `trait_item`, same broken shape, different root cause. Fixed the same way: `walk_calls`
+now reads `trait_item`'s `"name"` field, mirroring `walk_symbols`'s existing special-case.
+`Self::helper()` inside a trait default method now correctly resolves to that trait's own
+declared `helper` — the same defensible "point at the declaration" choice this call-graph
+already makes elsewhere when a concrete type can't be narrowed further. New regression test
+(`rust_self_colon_colon_call_inside_a_trait_default_method_resolves_to_the_trait`) passes.
+Full `cargo test -p calm-core --lib -- indexer:: resolver:: rust`: **356 passed, 0 failed**.
+
+Also unconfirmed (found by reading code, not live-tested): Swift's `Self.method()`
+(dot-based, not `::`) may hit a parallel gap via `resolve_tier2`'s case-sensitive match
+arm. Ruled out: PHP's `self::`/`static::`/`parent::` are conventionally lowercase so
+`is_type_like` never flags them (the reason PHP doesn't share this bug despite using `::`
+the same way); no other supported language pairs a capitalized self-referencing keyword
+with `::`-call syntax.
+
 ## Scope run so far
 
 **Phase 1**: fd (external, Rust) + CALM self-repo (isolated worktree), N=1.
@@ -69,7 +182,8 @@ therefore only meaningful post-fix — reported that way throughout.
 
 | Tool | Pin | How verified |
 |---|---|---|
-| CALM | git SHA `aba60aa86b7215cdce755d12835083329f4c7172` **plus** the `persist_file` fix above, layered on top the same session (not yet a separate commit at benchmark time) | `git rev-parse HEAD`, recorded independently of `calm --version` — that only ever prints the Cargo.toml package version ("0.4.0"), identical whether you're on the tag or N commits past it. Binary: `target/debug/calm`, rebuilt fresh immediately before each run. |
+| CALM (Phase 1+2, superseded) | git SHA `aba60aa86b7215cdce755d12835083329f4c7172` **plus** the `persist_file` fix above, layered on top the same session (not yet a separate commit at benchmark time) | `git rev-parse HEAD`, recorded independently of `calm --version` — that only ever prints the Cargo.toml package version ("0.4.0"), identical whether you're on the tag or N commits past it. Binary: `target/debug/calm`, rebuilt fresh immediately before each run. |
+| CALM (corrected re-run, canonical) | git SHA `52d1abe682069e018d00d09f2d9ab07b820a557c` (the `b13`-commit itself) plus the oracle + `scip_refresh`-race fixes, uncommitted at benchmark time | Same method: `git rev-parse HEAD`, `target/debug/calm` rebuilt fresh after `cargo clean` (disk pressure forced a full rebuild) immediately before this run. |
 | CodeGraph | `@colbymchenry/codegraph@1.5.0`, pinned **explicitly** in every spawn command | `npm view @colbymchenry/codegraph version` → `1.5.0` (published 2026-07-21). **New pitfall found live during this benchmark's own setup**: a bare `npx -y @colbymchenry/codegraph --version` (no version pin) returned **1.4.1** from local npx cache — silently stale by one minor version despite `-y`. Always pin the exact version string, never trust a bare `npx -y <pkg>` to mean "latest." Added to the design doc's pitfall catalogue. |
 
 ## Methodology
@@ -108,6 +222,13 @@ therefore only meaningful post-fix — reported that way throughout.
   `symbol` string (`path/to/file.rs::Type::method`), which an earlier draft
   of `extract_paths_from_calm_callers` didn't know to split on. Fixed and
   re-run before any number below was recorded.
+
+## Results — Phase 1+2 (2026-08-02, SUPERSEDED by the corrected numbers above)
+
+Kept below for provenance/audit trail only — see "Corrected numbers" at the top of this
+file for the canonical, oracle-fixed results. These tables reflect the 2 methodology bugs
+described above (doc/comment oracle noise + the SCIP-overlay race condition) and should
+not be cited going forward.
 
 ## Results — fd (sharkdp/fd, Rust, external, commit `41532d1`)
 
@@ -246,6 +367,18 @@ symbol samples.
   above). Treat every number here as provisional until independently
   reproduced; that's the point of publishing the exact pins and the runner
   script, not just a table.
+- **Two more found on 2026-08-03, after publishing this file**: the shared
+  ground-truth oracle counted doc/comment mentions as call sites, and the
+  harness didn't wait for CALM's SCIP overlay before querying. Both fixed —
+  see "Corrected numbers" at the top of this file. Left in this list rather
+  than quietly removed, per this same bullet's own point.
+- **CALM did not resolve `Self::method()` associated-function calls** in
+  Rust (found during the 2026-08-03 correction pass, verified on both fd and
+  CALM's own codebase). **Fixed the same day**, along with a related gap in
+  the same area (`Self::` inside a `trait` default method) found by the
+  same sweep and fixed right after — see "A real CALM parser bug, found,
+  root-caused, and fixed in this same pass" above. Corrected combined
+  result: 31/31 (100%), not 30/31.
 
 ## Reproduce this
 
