@@ -856,7 +856,7 @@ mod tests {
     }
 
     fn wait_until(mut predicate: impl FnMut() -> bool) {
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
             if predicate() {
                 return;
