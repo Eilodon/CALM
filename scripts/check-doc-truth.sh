@@ -42,6 +42,7 @@ files=(
     .claude-plugin/marketplace.json
     plugins/calm/.claude-plugin/plugin.json
     crates/calm-core/src/workflow.rs
+    docs/what-external-users-get.md
 )
 
 # Each pattern must have exactly one capture group: the tool count digits.
@@ -49,7 +50,7 @@ patterns=(
     '[0-9]+ tools total'
     '[0-9]+ MCP tools'
     'exposing [0-9]+ tools'
-    'All [0-9]+ tools'
+    '[Aa]ll [0-9]+ tools'
     '[0-9]+ tools\. [0-9]+ stages'
     '[0-9]+ stages, [0-9]+ tools'
 )

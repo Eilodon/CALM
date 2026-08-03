@@ -2890,12 +2890,14 @@ pub(crate) struct EditLinesOutput {
     /// until it recovers (see `note`, and call `indexing_status`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) index_stale: Option<bool>,
-    /// WS-1 shadow-mode transaction id (docs/plans/2026-08-02-
-    /// ws1-enforce-and-critical-risk-execution-plan.md §2.3 stage 2,
-    /// "dual-read") -- absent when nothing was written, or when the shadow
-    /// `txn::begin` call itself failed (logged, non-blocking in shadow
-    /// mode). Look it up with `edit_transaction_status`/`repair_consistency`
-    /// if something about this edit looks wrong.
+    /// Durable edit-transaction id (WS-1). `txn::begin` is fail-closed as of
+    /// v0.5.0 (docs/plans/2026-08-02-ws1-enforce-and-critical-risk-
+    /// execution-plan.md §2) -- absent only when nothing was written at all,
+    /// never because the journal itself silently failed to start. Later
+    /// transitions (FileCommitted -> IndexCommitted -> Done) stay
+    /// best-effort by design (see tools/txn.rs's module comment for why).
+    /// Look it up with `edit_transaction_status`/`repair_consistency` if
+    /// something about this edit looks wrong.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) tx_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

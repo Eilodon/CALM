@@ -4,26 +4,39 @@ use super::*;
 // ---------------------------------------------------------------------------
 // WS-1 durable edit-transaction / maintenance-outbox admin tools
 // (docs/plans/2026-08-02-phase1-p0-execution-plan.md §4.7). All 4 are
-// additive on top of the shadow-mode journal edit_lines/edit_symbol/
-// format_files already write to (tools/edit.rs) -- none of these change what
-// a normal edit does, they only expose what the journal already recorded.
+// read/diagnostic (plus retry_maintenance's explicit force-retry) on top of
+// the durable journal edit_lines/edit_symbol/format_files write through
+// (tools/edit.rs) -- none of these 4 gate anything themselves.
+//
+// As of 2026-08-03 (v0.5.0, docs/plans/2026-08-02-ws1-enforce-and-critical-
+// risk-execution-plan.md §2): starting the journal (`txn::begin`) is now
+// fail-closed -- a write is refused rather than proceeding with no journal
+// at all, so "no write path can bypass EditTransaction" now holds. Later
+// transitions (FileCommitted -> IndexCommitted -> Done) remain deliberately
+// best-effort/non-blocking BY DESIGN, not as a leftover gap: once disk has
+// actually changed, refusing to finish recording that is a materially
+// riskier "rollback" than tolerating a journal/disk disagreement that
+// repair_consistency can detect and report afterward. Separately (a
+// different gate, not this journal), a >10-caller ("critical") edit without
+// an independent approver is blocked outright -- see classify_gate/
+// GateRequirement in tools/edit.rs.
 //
 // Split out of `recover_tool_router` into their own toolset (2026-08-02,
 // docs/plans/2026-08-02-toolsurface-writesafety-ledger-research.md#part-1):
 // unlike indexing_status/session_context -- the real stuck-session escape
-// hatch `recover`'s SAFETY_FLOOR_TOOLSETS membership exists for -- these 4
-// tools diagnose a subsystem (WS-1 shadow-mode transactions) that does not
-// yet change real write-path behavior, so they should not (yet) be part of
-// the non-disableable floor. See toolset.rs's `TOOLSET_NAMES` and
-// `SAFETY_FLOOR_TOOLSETS` doc comments for where this toolset is registered
-// and why it is deliberately excluded from the floor for now.
+// hatch `recover`'s SAFETY_FLOOR_TOOLSETS membership exists for -- none of
+// these 4 tools are themselves a gate mechanism a write path depends on
+// being reachable, so they remain deliberately excluded from the
+// non-disableable floor. See toolset.rs's `TOOLSET_NAMES`/
+// `SAFETY_FLOOR_TOOLSETS` doc comments for the floor's actual membership
+// test.
 // ---------------------------------------------------------------------------
 
 #[rmcp::tool_router(router = "txn_tool_router", vis = "pub(crate)")]
 impl CalmServer {
     #[tool(
         name = "edit_transaction_status",
-        description = "USE WHEN: you have a tx_id (from maintenance_status/repair_consistency, or a future edit_lines/edit_symbol/format_files response once WS-1 leaves shadow mode) and want to see what state that specific edit transaction reached. Read-only -- does not repair anything, see repair_consistency for that.",
+        description = "USE WHEN: you have a tx_id (from maintenance_status/repair_consistency, or the tx_id an edit_lines/edit_symbol/format_files response already returns) and want to see what state that specific edit transaction reached. Read-only -- does not repair anything, see repair_consistency for that.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -306,9 +319,9 @@ impl CalmServer {
 
 #[derive(Deserialize, JsonSchema)]
 pub(crate) struct EditTransactionStatusParams {
-    /// tx_id from maintenance_status/repair_consistency output, or a future
-    /// edit_lines/edit_symbol/format_files response once WS-1 leaves shadow
-    /// mode.
+    /// tx_id from maintenance_status/repair_consistency output, or the
+    /// tx_id an edit_lines/edit_symbol/format_files response already
+    /// returns.
     pub(crate) tx_id: String,
 }
 

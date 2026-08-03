@@ -17,7 +17,7 @@ or feature-flag change; CI's `gen-status.sh --check` fails the build on drift.
 | `edit_context` | no | yes | ALWAYS CALL THIS before any code modification — mandatory, never skip. USE WHEN: you are about to edit, refactor, or delete a symbol. NOT  |
 | `edit_lines` | yes | no | The only write-capable tool in calm — line-range granularity, works on ANY tracked file (source code, Cargo.toml, docs — not just parsed |
 | `edit_symbol` | yes | no | Sugar over edit_lines: resolves symbol (+ optional path/line, same disambiguation contract as edit_context). Default position="replace" swap |
-| `edit_transaction_status` | no | yes | USE WHEN: you have a tx_id (from maintenance_status/repair_consistency, or a future edit_lines/edit_symbol/format_files response once WS-1 l |
+| `edit_transaction_status` | no | yes | USE WHEN: you have a tx_id (from maintenance_status/repair_consistency, or the tx_id an edit_lines/edit_symbol/format_files response already |
 | `file_overview` | no | yes | USE WHEN: you have a file path and want to see its symbols, structure, and inferred role. vs source: file_overview shows ALL symbols in a fi |
 | `fitness_report` | no | yes | Repo-wide codebase health snapshot (hub concentration, dead code, complexity, edge coverage, architecture-boundary/config-drift violations)  |
 | `format_files` | yes | yes | Formats Rust source files via rustfmt — the safe replacement for shelling out to `rustfmt`/`cargo fmt` directly. Only `.rs` files are supp |

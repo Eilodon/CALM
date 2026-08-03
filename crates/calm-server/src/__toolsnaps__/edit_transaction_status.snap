@@ -1,6 +1,6 @@
 {
   "name": "edit_transaction_status",
-  "description": "USE WHEN: you have a tx_id (from maintenance_status/repair_consistency, or a future edit_lines/edit_symbol/format_files response once WS-1 leaves shadow mode) and want to see what state that specific edit transaction reached. Read-only -- does not repair anything, see repair_consistency for that.",
+  "description": "USE WHEN: you have a tx_id (from maintenance_status/repair_consistency, or the tx_id an edit_lines/edit_symbol/format_files response already returns) and want to see what state that specific edit transaction reached. Read-only -- does not repair anything, see repair_consistency for that.",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "required": [
@@ -9,7 +9,7 @@
     "type": "object",
     "properties": {
       "tx_id": {
-        "description": "tx_id from maintenance_status/repair_consistency output, or a future\nedit_lines/edit_symbol/format_files response once WS-1 leaves shadow\nmode.",
+        "description": "tx_id from maintenance_status/repair_consistency output, or the\ntx_id an edit_lines/edit_symbol/format_files response already\nreturns.",
         "type": "string"
       }
     }

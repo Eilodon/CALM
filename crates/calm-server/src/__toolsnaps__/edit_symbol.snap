@@ -327,7 +327,7 @@
         ]
       },
       "tx_id": {
-        "description": "WS-1 shadow-mode transaction id (docs/plans/2026-08-02-\nws1-enforce-and-critical-risk-execution-plan.md §2.3 stage 2,\n\"dual-read\") -- absent when nothing was written, or when the shadow\n`txn::begin` call itself failed (logged, non-blocking in shadow\nmode). Look it up with `edit_transaction_status`/`repair_consistency`\nif something about this edit looks wrong.",
+        "description": "Durable edit-transaction id (WS-1). `txn::begin` is fail-closed as of\nv0.5.0 (docs/plans/2026-08-02-ws1-enforce-and-critical-risk-\nexecution-plan.md §2) -- absent only when nothing was written at all,\nnever because the journal itself silently failed to start. Later\ntransitions (FileCommitted -> IndexCommitted -> Done) stay\nbest-effort by design (see tools/txn.rs's module comment for why).\nLook it up with `edit_transaction_status`/`repair_consistency` if\nsomething about this edit looks wrong.",
         "type": [
           "string",
           "null"

@@ -48,10 +48,12 @@ pub(crate) fn preset_tools(preset: &str) -> Option<&'static [&'static str]> {
             "edit_symbol",
             "diff_impact",
             "indexing_status",
-            // WS-1 shadow-mode transaction/maintenance-outbox diagnostics
-            // (2026-08-02, docs/plans/2026-08-02-toolsurface-writesafety-
-            // ledger-research.md#part-1) -- relevant to a session that is
-            // actively editing, unlike orient/trace (read-only exploration).
+            // WS-1 durable-transaction/maintenance-outbox diagnostics
+            // (added 2026-08-02, docs/plans/2026-08-02-toolsurface-
+            // writesafety-ledger-research.md#part-1; see tools/txn.rs's
+            // module comment for the journal's current shadow-vs-enforced
+            // boundary) -- relevant to a session that is actively editing,
+            // unlike orient/trace (read-only exploration).
             "edit_transaction_status",
             "maintenance_status",
             "retry_maintenance",
