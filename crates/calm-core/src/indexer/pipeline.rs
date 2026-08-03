@@ -616,7 +616,9 @@ fn extract_file_data(
                 // when there's no enclosing class at all — not valid Rust for
                 // a real `Self::` call, so this can't regress a working case.
                 let effective_receiver = if lang == "rust" && receiver == "Self" {
-                    c.enclosing_class.clone().unwrap_or_else(|| receiver.clone())
+                    c.enclosing_class
+                        .clone()
+                        .unwrap_or_else(|| receiver.clone())
                 } else {
                     receiver.clone()
                 };
@@ -6128,115 +6130,115 @@ impl StructB {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-#[test]
-fn rust_self_colon_colon_call_resolves_to_the_enclosing_impl_type() {
-    // 2026-08-03 regression test: `Self::method()` inside an `impl Type { .. }`
-    // block used to resolve to ZERO callers, not even `ambiguous`, because
-    // `extract_file_data` set `target_class` to the literal keyword text
-    // "Self" instead of substituting the enclosing impl's real type name --
-    // "Self" is never itself a registered symbol/class, so the
-    // `by_name_class` lookup in `resolve_sites_to_edges` could never match.
-    // Found via a live CALM-vs-CodeGraph benchmark: fd's `replace_separator`
-    // (called 5x in-file via `Self::replace_separator(...)`) and this exact
-    // codebase's `ConservativeResolver::default` -> `Self::new()` both had 0
-    // callers before this fix. `resolve_tier2` already does the equivalent
-    // substitution for lowercase `self`/`this`; this is the same fix for
-    // Rust's capitalized `Self`, applied one branch earlier.
-    let dir = std::env::temp_dir().join(format!("ci_rust_self_colon_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    #[test]
+    fn rust_self_colon_colon_call_resolves_to_the_enclosing_impl_type() {
+        // 2026-08-03 regression test: `Self::method()` inside an `impl Type { .. }`
+        // block used to resolve to ZERO callers, not even `ambiguous`, because
+        // `extract_file_data` set `target_class` to the literal keyword text
+        // "Self" instead of substituting the enclosing impl's real type name --
+        // "Self" is never itself a registered symbol/class, so the
+        // `by_name_class` lookup in `resolve_sites_to_edges` could never match.
+        // Found via a live CALM-vs-CodeGraph benchmark: fd's `replace_separator`
+        // (called 5x in-file via `Self::replace_separator(...)`) and this exact
+        // codebase's `ConservativeResolver::default` -> `Self::new()` both had 0
+        // callers before this fix. `resolve_tier2` already does the equivalent
+        // substitution for lowercase `self`/`this`; this is the same fix for
+        // Rust's capitalized `Self`, applied one branch earlier.
+        let dir = std::env::temp_dir().join(format!("ci_rust_self_colon_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
 
-    std::fs::write(
-        dir.join("widget.rs"),
-        "struct Widget;\n\
+        std::fs::write(
+            dir.join("widget.rs"),
+            "struct Widget;\n\
          impl Widget {\n    \
              fn new() -> Self {\n        Widget\n    }\n\n    \
              fn make() -> Self {\n        Self::new()\n    }\n\
          }\n",
-    )
-    .unwrap();
-
-    let mut conn = Connection::open_in_memory().unwrap();
-    init_db(&conn).unwrap();
-    run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
-
-    let edge_count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM call_edges \
-             WHERE from_symbol LIKE '%::Widget::make' AND to_symbol LIKE '%::Widget::new'",
-            [],
-            |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(
-        edge_count, 1,
-        "Self::new() inside impl Widget must produce exactly one call edge \
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
+
+        let edge_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM call_edges \
+             WHERE from_symbol LIKE '%::Widget::make' AND to_symbol LIKE '%::Widget::new'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            edge_count, 1,
+            "Self::new() inside impl Widget must produce exactly one call edge \
          make -> new, scoped to Widget (not zero, not fanned out to every \
          same-named `new` in the codebase)"
-    );
+        );
 
-    let confidence: String = conn
-        .query_row(
-            "SELECT edge_confidence FROM call_edges \
+        let confidence: String = conn
+            .query_row(
+                "SELECT edge_confidence FROM call_edges \
              WHERE from_symbol LIKE '%::Widget::make' AND to_symbol LIKE '%::Widget::new'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(
-        confidence, "inferred",
-        "Self:: is a type-path receiver (same tier as Type::method()), so \
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            confidence, "inferred",
+            "Self:: is a type-path receiver (same tier as Type::method()), so \
          confidence must be 'inferred', not 'textual'/'ambiguous'/'resolved'"
-    );
+        );
 
-    let _ = std::fs::remove_dir_all(&dir);
-}
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
-#[test]
-fn rust_self_colon_colon_call_inside_a_trait_default_method_resolves_to_the_trait() {
-    // 2026-08-03 regression test for the walk_calls trait_item fix
-    // (parser.rs): `trait_item` has no "type" field (only "name"), unlike
-    // `impl_item` -- `class_name_field: "type"` is shared by both node kinds
-    // in `lang_constants.rs`, so before this fix `walk_calls`'s child_class
-    // computation silently got `None` for a trait, and a default method's
-    // own `Self::sibling()` call fell through to literal target_class "Self"
-    // (0 call_edges) -- same broken shape as the impl_item `Self::` bug, via
-    // a different root cause. Verified with a live characterization pass
-    // before fixing (not assumed): `call_sites` showed
-    // `target_class=Some("Self")` and `call_edges` was empty.
-    let dir = std::env::temp_dir().join(format!("ci_rust_trait_self_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    #[test]
+    fn rust_self_colon_colon_call_inside_a_trait_default_method_resolves_to_the_trait() {
+        // 2026-08-03 regression test for the walk_calls trait_item fix
+        // (parser.rs): `trait_item` has no "type" field (only "name"), unlike
+        // `impl_item` -- `class_name_field: "type"` is shared by both node kinds
+        // in `lang_constants.rs`, so before this fix `walk_calls`'s child_class
+        // computation silently got `None` for a trait, and a default method's
+        // own `Self::sibling()` call fell through to literal target_class "Self"
+        // (0 call_edges) -- same broken shape as the impl_item `Self::` bug, via
+        // a different root cause. Verified with a live characterization pass
+        // before fixing (not assumed): `call_sites` showed
+        // `target_class=Some("Self")` and `call_edges` was empty.
+        let dir = std::env::temp_dir().join(format!("ci_rust_trait_self_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
 
-    std::fs::write(
-        dir.join("greeter.rs"),
-        "trait Greeter {\n    \
+        std::fs::write(
+            dir.join("greeter.rs"),
+            "trait Greeter {\n    \
              fn helper() -> String {\n        \"hi\".to_string()\n    }\n\n    \
              fn greet() -> String {\n        Self::helper()\n    }\n\
          }\n",
-    )
-    .unwrap();
-
-    let mut conn = Connection::open_in_memory().unwrap();
-    init_db(&conn).unwrap();
-    run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
-
-    let edge_count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM call_edges \
-             WHERE from_symbol LIKE '%::Greeter::greet' AND to_symbol LIKE '%::Greeter::helper'",
-            [],
-            |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(
-        edge_count, 1,
-        "Self::helper() inside a Greeter trait default method must resolve to \
-         Greeter's own declared helper() (not zero, not fanned out elsewhere)"
-    );
 
-    let _ = std::fs::remove_dir_all(&dir);
-}
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
+
+        let edge_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM call_edges \
+             WHERE from_symbol LIKE '%::Greeter::greet' AND to_symbol LIKE '%::Greeter::helper'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            edge_count, 1,
+            "Self::helper() inside a Greeter trait default method must resolve to \
+         Greeter's own declared helper() (not zero, not fanned out elsewhere)"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// Regression for the real-world incident this module's return-shape filter
     /// exists for: `caller.rs` calls a bare `as_str()` on an unresolvable
@@ -6553,7 +6555,11 @@ fn rust_self_colon_colon_call_inside_a_trait_default_method_resolves_to_the_trai
         let dir = std::env::temp_dir().join(format!("ci_idx_dupcallsite_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("a.rs"), "fn helper() {}\nfn caller() {\n    helper();\n}\n").unwrap();
+        std::fs::write(
+            dir.join("a.rs"),
+            "fn helper() {}\nfn caller() {\n    helper();\n}\n",
+        )
+        .unwrap();
 
         let mut conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
