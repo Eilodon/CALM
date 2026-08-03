@@ -58,6 +58,12 @@ pub(crate) fn preset_tools(preset: &str) -> Option<&'static [&'static str]> {
             "maintenance_status",
             "retry_maintenance",
             "repair_consistency",
+            // WS-6 first slice (2026-08-03, docs/plans/2026-08-03-ws6-
+            // verification-pipeline-execution-plan.md): the tool that picks
+            // up a transaction parked at VerifyPending -- same toolset as
+            // the other txn diagnostics, same reasoning (relevant to a
+            // session that is actively editing, not to orient/trace).
+            "verify_change",
         ]),
         "compound" => Some(&[
             "repo_overview",

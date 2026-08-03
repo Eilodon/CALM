@@ -76,3 +76,9 @@ id = "memory_note.staleness_detection"
 level = "best_effort"
 summary = "recall flags a note as stale/gone when a file reference it captured has since changed or been deleted, but a note with no captured file references at all is reported unchecked, not verified fresh -- staleness detection only covers what the note itself recorded a reference to"
 evidence = "crates/calm-server/src/tools/memory.rs (MemoryNote.staleness field doc comment)"
+
+[[behavior]]
+id = "verification.rust_check_on_write"
+level = "optional"
+summary = "WS-6 first slice: off by default (config.verification.rust_check_on_write=false); when turned on, a .rs write parks at VERIFY_PENDING until verify_change runs cargo check on it, and a failing check does not revert the file already on disk"
+evidence = "crates/calm-core/src/config.rs (VerificationConfig), crates/calm-server/src/tools/txn.rs (verify_change), docs/plans/2026-08-03-ws6-verification-pipeline-execution-plan.md"

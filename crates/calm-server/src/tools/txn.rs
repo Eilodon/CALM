@@ -315,6 +315,170 @@ impl CalmServer {
             })
         }))
     }
+
+    #[tool(
+        name = "verify_change",
+        description = "USE WHEN: you have a tx_id (from an edit_lines/edit_symbol response) and want to actually run cargo check on that change instead of just trusting applied:true. Only does anything if [verification] rust_check_on_write is enabled in .calm/config.json AND the file is .rs -- WS-6 first slice (docs/plans/2026-08-03-ws6-verification-pipeline-execution-plan.md), other languages/tiers not implemented yet. Runs cargo check inline, not backgrounded (same posture as retry_maintenance) -- can take a while on a large package. A tx_id that was never routed through verification (feature off, non-Rust file, or already resolved) returns a clear \"nothing to verify\" result, not an error. A failing check does NOT roll back the file already on disk.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    pub(crate) fn verify_change(
+        &self,
+        Parameters(p): Parameters<VerifyChangeParams>,
+    ) -> Json<ToolOutcome<VerifyChangeOutput>> {
+        Json(self.timed_tool("verify_change", || {
+            let conn = match self.make_read_conn() {
+                Ok(c) => c,
+                Err(e) => return db_error(e),
+            };
+            let tx = match calm_core::txn::get(&conn, &p.tx_id) {
+                Ok(Some(tx)) => tx,
+                Ok(None) => {
+                    return ToolOutcome::error(error_detail(
+                        "TX_NOT_FOUND",
+                        &format!("no edit transaction with tx_id {}", p.tx_id),
+                        false,
+                    ));
+                }
+                Err(e) => {
+                    return ToolOutcome::error(error_detail(
+                        "TX_JOURNAL_ERROR",
+                        &e.to_string(),
+                        true,
+                    ));
+                }
+            };
+            let state = match calm_core::txn::replay_state(&conn, &p.tx_id) {
+                Ok(s) => s,
+                Err(e) => {
+                    return ToolOutcome::error(error_detail(
+                        "TX_JOURNAL_ERROR",
+                        &e.to_string(),
+                        true,
+                    ));
+                }
+            };
+
+            if state != calm_core::txn::TxState::VerifyPending {
+                return ToolOutcome::success(VerifyChangeOutput {
+                    tx_id: tx.tx_id,
+                    path: tx.path,
+                    tier: "none".to_string(),
+                    verified: None,
+                    state: state.as_str().to_string(),
+                    diagnostics: Vec::new(),
+                    command: None,
+                    note: format!(
+                        "nothing to verify -- this transaction is at {} (verification either \
+                         wasn't enabled for it, its file isn't a supported language, or it was \
+                         already resolved)",
+                        state.as_str()
+                    ),
+                    suggested_next: None,
+                });
+            }
+
+            let full_path = match calm_core::path_policy::resolve_within_root(
+                &self.project_root,
+                &tx.path,
+                calm_core::path_policy::SymlinkPolicy::FollowInternalSymlinks,
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    return ToolOutcome::error(error_detail(
+                        "PATH_RESOLUTION_FAILED",
+                        &format!("{e:?}"),
+                        true,
+                    ));
+                }
+            };
+
+            if !calm_core::verify::is_verifiable_rust_file(&full_path) {
+                return ToolOutcome::success(VerifyChangeOutput {
+                    tx_id: tx.tx_id,
+                    path: tx.path,
+                    tier: "unsupported".to_string(),
+                    verified: None,
+                    state: state.as_str().to_string(),
+                    diagnostics: Vec::new(),
+                    command: None,
+                    note: "only Rust (.rs) files are supported today (WS-6 first slice)"
+                        .to_string(),
+                    suggested_next: None,
+                });
+            }
+
+            let Some(manifest_path) =
+                calm_core::verify::find_nearest_cargo_toml(&full_path, &self.project_root)
+            else {
+                return ToolOutcome::error(error_detail(
+                    "NO_CARGO_MANIFEST",
+                    &format!("no Cargo.toml found above {}", tx.path),
+                    true,
+                ));
+            };
+
+            let result = match calm_core::verify::run_cargo_check(&manifest_path) {
+                Ok(r) => r,
+                Err(e) => {
+                    return ToolOutcome::error(error_detail("CARGO_SPAWN_FAILED", &e, true));
+                }
+            };
+
+            let (to, advance_reason) = if result.passed {
+                (
+                    calm_core::txn::TxState::Done,
+                    "cargo check passed".to_string(),
+                )
+            } else {
+                (
+                    calm_core::txn::TxState::Failed,
+                    format!(
+                        "cargo check failed: {} diagnostic(s)",
+                        result.diagnostics.len()
+                    ),
+                )
+            };
+            let writer = match calm_core::db::conn::open_writer(&self.db_path) {
+                Ok(c) => c,
+                Err(e) => return db_error(e),
+            };
+            if let Err(e) =
+                calm_core::txn::advance(&writer, &p.tx_id, to, "system", &advance_reason)
+            {
+                return ToolOutcome::error(error_detail("TX_JOURNAL_ERROR", &e.to_string(), true));
+            }
+
+            let sn = if result.passed {
+                None
+            } else {
+                suggested(
+                    "repair_consistency",
+                    "Verification failed -- the file on disk was NOT rolled back; fix the code or use repair_consistency to inspect the transaction",
+                )
+            };
+            ToolOutcome::success(VerifyChangeOutput {
+                tx_id: tx.tx_id,
+                path: tx.path,
+                tier: "semantic:cargo_check".to_string(),
+                verified: Some(result.passed),
+                state: to.as_str().to_string(),
+                diagnostics: result.diagnostics,
+                command: Some(result.command),
+                note: if result.passed {
+                    "cargo check passed".to_string()
+                } else {
+                    "cargo check failed -- see diagnostics; disk content was not reverted"
+                        .to_string()
+                },
+                suggested_next: self.filter_sn(sn),
+            })
+        }))
+    }
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -410,6 +574,38 @@ pub(crate) struct RepairConsistencyOutput {
     pub(crate) proposed_digest: String,
     pub(crate) disk_matches_proposed: bool,
     pub(crate) needs_rescan: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) suggested_next: Option<SuggestedNext>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub(crate) struct VerifyChangeParams {
+    /// tx_id from an edit_lines/edit_symbol response (or
+    /// edit_transaction_status/repair_consistency output).
+    pub(crate) tx_id: String,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub(crate) struct VerifyChangeOutput {
+    pub(crate) tx_id: String,
+    pub(crate) path: String,
+    /// "none" (nothing to verify -- see `note`), "unsupported" (language
+    /// not covered yet), or "semantic:cargo_check" (the one real tier this
+    /// first slice has).
+    pub(crate) tier: String,
+    /// `None` when `tier` is "none"/"unsupported" -- nothing was actually
+    /// run, so there's no pass/fail to report.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) verified: Option<bool>,
+    /// The transaction's state after this call: unchanged when `tier` is
+    /// "none"/"unsupported", else DONE or FAILED depending on the check
+    /// result.
+    pub(crate) state: String,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub(crate) diagnostics: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) command: Option<String>,
+    pub(crate) note: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) suggested_next: Option<SuggestedNext>,
 }

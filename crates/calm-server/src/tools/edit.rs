@@ -1625,13 +1625,29 @@ impl CalmServer {
             };
             match calm_core::txn::advance(&shared_conn, tx_id, to, "system", &reason) {
                 Ok(()) if to == calm_core::txn::TxState::IndexCommitted => {
-                    let _ = calm_core::txn::advance(
-                        &shared_conn,
-                        tx_id,
-                        calm_core::txn::TxState::Done,
-                        "system",
-                        "base index committed, disk+index consistent",
-                    );
+                    // WS-6 first slice (docs/plans/2026-08-03-ws6-verification-
+                    // pipeline-execution-plan.md): opt-in (config default
+                    // false, so this is a no-op for anyone who hasn't turned
+                    // it on) and Rust-only for now. When applicable, land at
+                    // VerifyPending instead of Done -- the first real
+                    // producer of that transition, which existed as a legal
+                    // `allowed_next` target since WS-1 but nothing ever
+                    // emitted it. `verify_change(tx_id)` is the tool that
+                    // picks it up from here and advances it to Done/Failed.
+                    let should_verify = self.config().verification.rust_check_on_write
+                        && calm_core::verify::is_verifiable_rust_file(&full_path);
+                    let next = if should_verify {
+                        calm_core::txn::TxState::VerifyPending
+                    } else {
+                        calm_core::txn::TxState::Done
+                    };
+                    let next_reason = if should_verify {
+                        "base index committed, disk+index consistent, awaiting verify_change"
+                    } else {
+                        "base index committed, disk+index consistent"
+                    };
+                    let _ =
+                        calm_core::txn::advance(&shared_conn, tx_id, next, "system", next_reason);
                 }
                 Ok(()) => {}
                 Err(e) => {

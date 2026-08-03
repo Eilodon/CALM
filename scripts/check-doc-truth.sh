@@ -17,6 +17,16 @@
 # to state CALM's *total* tool count -- add a new pattern here if a future
 # doc introduces a new phrasing, rather than loosening these.
 #
+# Also checks plugins/calm/.claude-plugin/plugin.json's `version` against
+# root Cargo.toml's workspace version (found 2026-08-03: plugin.json's
+# version had never been bumped even once since the file was created --
+# unlike Cargo.toml/npm packages, which get stamped from the release tag at
+# build/publish time (release.yml), the Claude Code plugin has no such
+# build/publish step in this repo -- its manifest is read straight from
+# whatever git ref the marketplace points at, so its version can only ever
+# be right if a human remembers to bump it in the same commit that bumps
+# Cargo.toml. This check is that reminder).
+#
 # Usage:
 #   scripts/check-doc-truth.sh   # print mismatches, exit 1 if any
 set -euo pipefail
@@ -81,3 +91,20 @@ if [ "$fail" -ne 0 ]; then
     exit 1
 fi
 echo "check-doc-truth: all hand-authored tool-count references match ($authoritative tools)."
+
+plugin_json="plugins/calm/.claude-plugin/plugin.json"
+cargo_version=$(grep -oE '^version = "[0-9]+\.[0-9]+\.[0-9]+"' Cargo.toml | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+plugin_version=$(grep -oE '"version": *"[0-9]+\.[0-9]+\.[0-9]+"' "$plugin_json" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+if [ -z "$cargo_version" ]; then
+    echo "check-doc-truth: could not extract version from Cargo.toml" >&2
+    exit 1
+fi
+if [ -z "$plugin_version" ]; then
+    echo "check-doc-truth: could not extract version from $plugin_json" >&2
+    exit 1
+fi
+if [ "$plugin_version" != "$cargo_version" ]; then
+    echo "check-doc-truth: $plugin_json says version $plugin_version but Cargo.toml says $cargo_version -- bump $plugin_json in the same commit that bumps Cargo.toml's version" >&2
+    exit 1
+fi
+echo "check-doc-truth: $plugin_json version ($plugin_version) matches Cargo.toml."
