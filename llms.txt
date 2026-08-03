@@ -2,7 +2,7 @@
 
 > An MCP server that gives coding agents a call-graph-aware, hash-verified
 > view of a codebase instead of grep-and-hope: locate/source/edit_symbol/
-> diff_impact and 22 tools total, backed by a multi-tier resolver
+> diff_impact and 34 tools total, backed by a multi-tier resolver
 > (syntactic -> Stack Graphs -> SCIP). Rust binary, runs as an MCP server
 > over stdio. Repository: https://github.com/Eilodon/CALM
 
@@ -21,7 +21,7 @@
 ## Docs
 
 - [README](https://github.com/Eilodon/CALM/blob/main/README.md): quick
-  start, the 22 MCP tools, architecture, benchmarks.
+  start, the 34 MCP tools, architecture, benchmarks.
 - [docs/mcp-client-setup.md](https://github.com/Eilodon/CALM/blob/main/docs/mcp-client-setup.md):
   wiring CALM into Claude Code, Cursor, VS Code, Windsurf, JetBrains, Codex
   CLI, Antigravity (Vietnamese).

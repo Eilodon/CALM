@@ -12,7 +12,7 @@ Full stage-by-stage guide, all 8 Mandatory Rules, the Preset table, and Tool Qui
 
 ---
 
-> 30 tools. 8 stages. Every response carries `suggested_next` — follow it.
+> 34 tools. 8 stages. Every response carries `suggested_next` — follow it.
 ---
 
 ## Core Principles
@@ -289,9 +289,9 @@ remember("auth-flow", "OAuth callback must validate state param — see incident
 |--------|-----------------|----------|
 | `orient` | `repo_overview`, `locate`, `dependencies`, `hotspots`, `fitness_report`, `indexing_status` | Exploration only, no edits |
 | `trace` | `repo_overview`, `search`, `locate`, `symbol_info`, `source`, `callers`, `callees`, `path`, `dependencies`, `indexing_status` | Call graph traversal |
-| `edit` | `repo_overview`, `search`, `locate`, `symbol_info`, `source`, `callers`, `callees`, `edit_context`, `edit_lines`, `edit_symbol`, `diff_impact`, `indexing_status` | Code modification workflow |
+| `edit` | `repo_overview`, `search`, `locate`, `symbol_info`, `source`, `callers`, `callees`, `edit_context`, `edit_lines`, `edit_symbol`, `diff_impact`, `indexing_status`, `edit_transaction_status`, `maintenance_status`, `retry_maintenance`, `repair_consistency` | Code modification workflow |
 | `compound` | `repo_overview`, `locate`, `hotspots`, `fitness_report`, `source`, `understand`, `edit_context`, `diff_impact`, `session_context`, `indexing_status`, `remember`, `recall` | Full workflow, no raw graph traversal |
-| `full` | All 30 tools | Default; use when workflow spans multiple stages |
+| `full` | All 34 tools | Default; use when workflow spans multiple stages |
 `--preset` is set once at server startup and cannot change mid-session. Use `full` (default) when the workflow spans multiple stages. Use specific presets only when scope is locked to one stage.
 
 Beyond the 5 named presets above, `--preset`/`config.json`'s `preset` field also accept a **composable toolset spec**: a comma-separated list of toolset (module-domain) names — `trace`, `locate`, `orient`, `memory`, `guardrails`, `recover`, `scip`, `lsp`, `security`, `testgap`, `inspect`, `edit`, `patterndebt` — optionally prefixed with `-` to subtract that toolset instead of adding it. E.g. `--preset "trace,security"` unions two toolsets; `--preset "full,-edit"` is every tool except the edit toolset's (`edit_symbol`/`edit_lines`/`format_files`). This is a different, finer-grained axis than the 5 named presets (which are hand-curated cross-cutting workflow bundles, not toolset unions) — an unrecognized token in either syntax is a hard startup error, never a silent full-access fallback.
