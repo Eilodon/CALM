@@ -1,10 +1,16 @@
 ---
 title: "Product-Truth Closure Plan — doc-drift gate cho hand-authored docs + guarantee-level taxonomy + benchmark claim registry"
 date: 2026-08-03
-status: PR1 IMPLEMENTED (cùng commit với doc này) — 6 file sửa về 34 tools + hàng `txn` thêm
-  vào bảng Group/Tools của README + preset `edit` đồng bộ trong AGENTS.md +
-  `scripts/check-doc-truth.sh` mới + wired vào `ci.yml`/`release.yml`. PR2 (guarantee-level
-  taxonomy) và PR3 (benchmark claim registry) còn ở dạng thiết kế, chưa code — xem §4.
+status: PR1 + PR2 + PR3 tất cả ĐÃ IMPLEMENTED. PR1: 7 file sửa về 34 tools (bao gồm
+  docs/what-external-users-get.md phát hiện thêm ở vòng sau) + `scripts/check-doc-truth.sh`.
+  Vòng sau còn phát hiện + sửa: WS-1 "shadow-mode" text đã stale trong txn.rs/edit.rs/
+  toolset.rs kể từ khi v0.5.0 enforce-transition ship (regenerated 3 __toolsnaps__ +
+  status.generated.md), và đánh giá (không thực hiện) việc promote toolset `txn` vào
+  SAFETY_FLOOR_TOOLSETS. PR2: `docs/guarantee-levels.toml` + `gen-status.sh` sinh thêm section
+  "Guarantee levels" — không cần CI job mới, đã nằm trong gate `gen-status.sh --check` có sẵn.
+  PR3: `benchmarks/claims.registry.jsonl` (6 entry, backfill B10→B11, Dart pre/post-C3,
+  B13 Phase1+2→corrected) + `scripts/check-claims-registry.sh` + wired vào `ci.yml`/
+  `release.yml`. Xem §4 cho chi tiết từng PR.
 scope: đóng khoảng trống "capability contract" còn lại sau WS-13 — status.generated.md
   đã CI-gated đúng, nhưng README/AGENTS.md/llms.txt/marketplace.json/plugin.json/workflow.rs
   vẫn hand-typed và đã trôi dạt, ngay cả sau khi v0.5.0 ship (2026-08-03). Không đụng WS-4/

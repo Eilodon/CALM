@@ -1,0 +1,78 @@
+# Hand-maintained catalog of behavior guarantees -- rendered into
+# docs/status.generated.md's "Guarantee levels" section by
+# scripts/gen-status.sh (so a stale/undercited entry shows up in the same
+# `gen-status.sh --check` CI drift gate a stale tool count would).
+# See docs/plans/2026-08-03-product-truth-closure-plan.md PR2.
+#
+# This is NOT a general-purpose TOML file -- gen-status.sh's parser only
+# understands the exact repeated `[[behavior]]` + flat `key = "value"` shape
+# used below. Keep every field on one line, double-quoted, no literal `|`
+# (breaks the generated Markdown table), no embedded double quotes.
+#
+# Level vocabulary -- pick exactly one per entry:
+#   enforced           the system blocks/refuses if this isn't satisfied, no override
+#   advisory           surfaced/nudged but never blocks on its own; can be ignored
+#   best_effort        attempted, but a failure here is tolerated/logged, not
+#                       blocking -- BY DESIGN, not a temporary gap
+#   optional           off by default / opt-in; nothing happens unless enabled
+#   provider_dependent guarantee level depends on an external tool/provider
+#                       being installed and current
+#   unsupported        a known gap -- not silently pretended to work
+#
+# Every entry needs `evidence`: a file (or file:line) a reader can go check
+# the claim against, same discipline this repo's benchmarks already apply to
+# measured claims.
+
+[[behavior]]
+id = "edit_context.before_hub_or_high_risk_write"
+level = "enforced"
+summary = "edit_context must have run THIS session for a hub/high-risk symbol before edit_lines/edit_symbol will apply a confirm:true write to it"
+evidence = "crates/calm-server/src/tools/edit.rs (classify_gate, GateRequirement::EditContextConfirmGroundedReason)"
+
+[[behavior]]
+id = "txn.begin_before_write"
+level = "enforced"
+summary = "a write is refused outright if the durable transaction journal fails to even start -- no write proceeds with no journal entry at all"
+evidence = "crates/calm-server/src/tools/edit.rs (txn_init_failed, error code TRANSACTION_INIT_FAILED)"
+
+[[behavior]]
+id = "txn.transition_after_disk_write"
+level = "best_effort"
+summary = "once disk content has actually changed, later transitions (FileCommitted -> IndexCommitted -> Done) are non-blocking by design -- a failure there is recorded for repair_consistency to detect, not rolled back, since a post-write rollback is a materially riskier operation than tolerating a detectable drift"
+evidence = "crates/calm-server/src/tools/txn.rs (module comment)"
+
+[[behavior]]
+id = "high_risk_edit.independent_review"
+level = "enforced"
+summary = "a greater-than-10-caller (critical/high-risk) edit without an independent elicitation approval is blocked outright -- a self-attested reason string alone is not sufficient at this risk tier"
+evidence = "crates/calm-server/src/tools/edit.rs (high_risk_needs_independent_review, error code HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW)"
+
+[[behavior]]
+id = "diff_impact.before_commit"
+level = "advisory"
+summary = "diff_impact is documented as mandatory before commit/push, but CALM's MCP surface cannot itself block a git commit run outside its own tools -- any hard enforcement comes from an optional, separately-configured client-side hook, not from CALM"
+evidence = "AGENTS.md workflow guide; crates/calm-cli/src/main.rs (apply_hooks_flag, --hooks=enforce)"
+
+[[behavior]]
+id = "scip_formal_edge_upgrade"
+level = "provider_dependent"
+summary = "an edge upgrades to formal confidence only when that language's SCIP or Stack Graphs provider is installed and its index is current -- an unavailable or stale provider leaves edges at their syntactic (textual/inferred/ambiguous) tier instead"
+evidence = "repo_overview's health_summary.weak_cross_reference_languages; crates/calm-core/src/scip/mod.rs"
+
+[[behavior]]
+id = "tier0_5_language.ambiguous_heavy_edges"
+level = "unsupported"
+summary = "Tier-0.5 languages with no SCIP provider (Dart, Kotlin, OCaml, Scala, and others) land mostly in the ambiguous confidence tier on real-world corpora with common short or overloaded method names -- treat their callers/callees results as directional, not a complete or authoritative caller list"
+evidence = "benchmarks/resolution/README.md (per-language resolved/textual/ambiguous split, e.g. Kotlin 89.6%, OCaml 86.3%, Dart 80.9% ambiguous)"
+
+[[behavior]]
+id = "format_files.no_semantic_gate"
+level = "optional"
+summary = "format_files (rustfmt) intentionally skips the confirm/edit_context gate since formatting cannot change program semantics -- a deliberate, scoped exemption, not a general write-path bypass"
+evidence = "README.md Group/Tools table, Edit row"
+
+[[behavior]]
+id = "memory_note.staleness_detection"
+level = "best_effort"
+summary = "recall flags a note as stale/gone when a file reference it captured has since changed or been deleted, but a note with no captured file references at all is reported unchecked, not verified fresh -- staleness detection only covers what the note itself recorded a reference to"
+evidence = "crates/calm-server/src/tools/memory.rs (MemoryNote.staleness field doc comment)"

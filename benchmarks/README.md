@@ -5,6 +5,12 @@ competitor cùng nhóm (CodeGraph, Serena, Semble, Semgrep, GitNexus). Mỗi ben
 thực tế, phương pháp đo cụ thể, và baseline so sánh — không dùng số liệu ước lượng khi có thể đo
 thật; khi số đo ra ngoài kỳ vọng (vd B6 `find_callers` = 0%), báo cáo trung thực thay vì ẩn đi.
 
+Mỗi claim đã đo (kể cả claim đã bị supersede) có một dòng structured, máy-đọc-được trong
+[`claims.registry.jsonl`](claims.registry.jsonl) -- commit/corpus/harness cụ thể, kết quả canonical,
+và chuỗi supersede tường minh (`scripts/check-claims-registry.sh` giữ nó nhất quán trong CI). Prose
+bên dưới và trong từng benchmark README vẫn là nơi đọc full context; registry là index tra cứu
+nhanh, không thay thế nó.
+
 | # | Chiều | Mục tiêu chứng minh | Trạng thái |
 |---|---|---|---|
 | B1 | AST Indexing Accuracy | Tree-sitter vs regex | Planned |

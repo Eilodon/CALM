@@ -65,6 +65,9 @@ jobs:
       - name: Check hand-authored docs match the generated tool count
         run: ./scripts/check-doc-truth.sh
 
+      - name: Check benchmark claims registry is structurally consistent
+        run: ./scripts/check-claims-registry.sh
+
       - name: Install JS interop test dependencies
         working-directory: tests/js_client_interop
         run: npm ci

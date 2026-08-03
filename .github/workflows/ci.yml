@@ -315,3 +315,6 @@ jobs:
       # was regenerated correctly for the same tool-count bump.
       - name: Check hand-authored docs match the generated tool count
         run: ./scripts/check-doc-truth.sh
+
+      - name: Check benchmark claims registry is structurally consistent
+        run: ./scripts/check-claims-registry.sh

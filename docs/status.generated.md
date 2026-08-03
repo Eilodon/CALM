@@ -89,3 +89,22 @@ writes are reviewed):
 - `scip-overlay`
 - `stack-graphs-formal`
 - `tier0-5`
+
+## Guarantee levels
+
+Hand-maintained in `docs/guarantee-levels.toml` (source of truth for the
+names/levels/evidence below); rendered here so a stale entry shows up in
+the same `gen-status.sh --check` drift gate a stale tool count would.
+Level vocabulary is defined in that file's header comment.
+
+| Behavior | Level | Summary |
+|---|---|---|
+| `diff_impact.before_commit` | `advisory` | diff_impact is documented as mandatory before commit/push, but CALM's MCP surface cannot itself block a git commit run outside its own tools -- any hard enforcement comes from an optional, separately-configured client-side hook, not from CALM |
+| `edit_context.before_hub_or_high_risk_write` | `enforced` | edit_context must have run THIS session for a hub/high-risk symbol before edit_lines/edit_symbol will apply a confirm:true write to it |
+| `format_files.no_semantic_gate` | `optional` | format_files (rustfmt) intentionally skips the confirm/edit_context gate since formatting cannot change program semantics -- a deliberate, scoped exemption, not a general write-path bypass |
+| `high_risk_edit.independent_review` | `enforced` | a greater-than-10-caller (critical/high-risk) edit without an independent elicitation approval is blocked outright -- a self-attested reason string alone is not sufficient at this risk tier |
+| `memory_note.staleness_detection` | `best_effort` | recall flags a note as stale/gone when a file reference it captured has since changed or been deleted, but a note with no captured file references at all is reported unchecked, not verified fresh -- staleness detection only covers what the note itself recorded a reference to |
+| `scip_formal_edge_upgrade` | `provider_dependent` | an edge upgrades to formal confidence only when that language's SCIP or Stack Graphs provider is installed and its index is current -- an unavailable or stale provider leaves edges at their syntactic (textual/inferred/ambiguous) tier instead |
+| `tier0_5_language.ambiguous_heavy_edges` | `unsupported` | Tier-0.5 languages with no SCIP provider (Dart, Kotlin, OCaml, Scala, and others) land mostly in the ambiguous confidence tier on real-world corpora with common short or overloaded method names -- treat their callers/callees results as directional, not a complete or authoritative caller list |
+| `txn.begin_before_write` | `enforced` | a write is refused outright if the durable transaction journal fails to even start -- no write proceeds with no journal entry at all |
+| `txn.transition_after_disk_write` | `best_effort` | once disk content has actually changed, later transitions (FileCommitted -> IndexCommitted -> Done) are non-blocking by design -- a failure there is recorded for repair_consistency to detect, not rolled back, since a post-write rollback is a materially riskier operation than tolerating a detectable drift |
