@@ -1643,7 +1643,23 @@ fn walk_calls(
         ));
     }
     let child_class = if consts.class_node_types.contains(&node.kind()) {
-        node.child_by_field_name(consts.class_name_field)
+        // 2026-08-03 fix, mirrors `walk_symbols`' identical special-case (see
+        // its own comment on this exact node kind): Rust's `trait_item` names
+        // itself via field "name", not the shared `class_name_field` ("type",
+        // `impl_item`'s Self-type field). Missing this here meant a trait
+        // default method's own call sites got NO enclosing_class at all --
+        // e.g. `Self::helper()` inside a default `fn greet()` fell through to
+        // literal target_class "Self" (0 call_edges), same broken shape as
+        // the impl_item `Self::` fix above, just via a different root cause.
+        // Resolving it against the trait's OWN declared method is the same
+        // defensible "no concrete impl known, point at the declaration"
+        // choice this call-graph already makes implicitly elsewhere.
+        let name_field = if node.kind() == "trait_item" {
+            "name"
+        } else {
+            consts.class_name_field
+        };
+        node.child_by_field_name(name_field)
             .map(|n| source[n.byte_range()].to_string())
             .or_else(|| enclosing_class.clone())
     } else {
