@@ -43,11 +43,22 @@ impl CalmServer {
             let content_mac = calm_core::memory::load_or_create_mac_key(&self.project_root)
                 .ok()
                 .map(|key| calm_core::memory::compute_mac(&key, topic, content));
+            // audit F7 follow-up: computed BEFORE the write (not after, like
+            // the old ordering) so `quarantined` can be set in the same
+            // INSERT -- still detection-only (the note is saved regardless
+            // of this warning, same philosophy as the warning itself), but
+            // a quarantined note is excluded from `recall`'s default
+            // topic/query/list-all results (see that tool's own doc
+            // comment) so a poisoned note can't silently auto-surface into
+            // a future session's context.
+            let content_warning = calm_core::sanitize::injection_warning(content);
+            let quarantined = content_warning.is_some();
             let result = conn.execute(
-                "INSERT INTO project_memory (topic, content, content_mac, created_at, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?4) \
-                 ON CONFLICT(topic) DO UPDATE SET content = excluded.content, content_mac = excluded.content_mac, updated_at = excluded.updated_at",
-                rusqlite::params![topic, content, content_mac, now],
+                "INSERT INTO project_memory (topic, content, content_mac, quarantined, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?5) \
+                 ON CONFLICT(topic) DO UPDATE SET content = excluded.content, content_mac = excluded.content_mac, \
+                 quarantined = excluded.quarantined, updated_at = excluded.updated_at",
+                rusqlite::params![topic, content, content_mac, quarantined, now],
             );
             if let Err(e) = result {
                 return ToolOutcome::error(error_detail(
@@ -67,15 +78,12 @@ impl CalmServer {
                 tracing::error!("remember: failed to store refs for topic {topic}: {e}");
             }
 
-            // audit F7: detection-only (sanitize.rs's philosophy) — the note
-            // is saved regardless, this just warns whoever wrote it.
-            let content_warning = calm_core::sanitize::injection_warning(content);
-
             ToolOutcome::success(RememberOutput {
                 topic: topic.to_string(),
                 updated_at: now,
                 refs_captured,
                 content_warning,
+                quarantined,
                 suggested_next: self.filter_sn(suggested("recall", "Verify the note was saved")),
             })
         }))
@@ -103,11 +111,25 @@ impl CalmServer {
                 Err(e) => return db_error(e),
             };
 
+            // audit F7 follow-up: a quarantined note (remember flagged its
+            // content as prompt-injection-shaped) is excluded from recall's
+            // AMBIENT/BROAD paths -- FTS `query` search and the no-args
+            // list-all -- unless the caller explicitly opts in. Mirrors
+            // `edit_context`'s own `related_notes` gate (same "ambient
+            // surfacing is dangerous, an explicit targeted ask isn't"
+            // distinction that gate already established -- see
+            // `edit_context_omits_related_notes_flagged_by_injection_warning`):
+            // an exact `topic` lookup is a deliberate, targeted ask for
+            // THIS specific note by name, not passive surfacing, so it
+            // always returns the note (with its `content_warning`/
+            // `quarantined` fields intact) regardless of quarantine status.
+            let include_quarantined = p.include_quarantined;
             let query_result = if let Some(topic) =
                 p.topic.as_deref().map(str::trim).filter(|t| !t.is_empty())
             {
                 conn.prepare(
-                    "SELECT topic, content, updated_at, content_mac FROM project_memory WHERE topic = ?1",
+                    "SELECT topic, content, updated_at, content_mac, quarantined FROM project_memory \
+                     WHERE topic = ?1",
                 )
                 .and_then(|mut stmt| {
                     stmt.query_map(rusqlite::params![topic], memory_note_row)?
@@ -116,28 +138,32 @@ impl CalmServer {
             } else if let Some(q) = p.query.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
                 let fts_query = Self::escape_fts5_query(q);
                 conn.prepare(
-                    "SELECT p.topic, p.content, p.updated_at, p.content_mac \
+                    "SELECT p.topic, p.content, p.updated_at, p.content_mac, p.quarantined \
                      FROM project_memory_fts \
                      JOIN project_memory p ON p.id = project_memory_fts.rowid \
-                     WHERE project_memory_fts MATCH ?1 \
+                     WHERE project_memory_fts MATCH ?1 AND (p.quarantined = 0 OR ?3 = 1) \
                      ORDER BY bm25(project_memory_fts), p.updated_at DESC \
                      LIMIT ?2",
                 )
                 .and_then(|mut stmt| {
                     stmt.query_map(
-                        rusqlite::params![fts_query, RECALL_LIMIT + 1],
+                        rusqlite::params![fts_query, RECALL_LIMIT + 1, include_quarantined],
                         memory_note_row,
                     )?
                     .collect::<Result<Vec<_>, _>>()
                 })
             } else {
                 conn.prepare(
-                    "SELECT topic, content, updated_at, content_mac FROM project_memory \
+                    "SELECT topic, content, updated_at, content_mac, quarantined FROM project_memory \
+                     WHERE quarantined = 0 OR ?2 = 1 \
                      ORDER BY updated_at DESC LIMIT ?1",
                 )
                 .and_then(|mut stmt| {
-                    stmt.query_map(rusqlite::params![RECALL_LIMIT + 1], memory_note_row)?
-                        .collect::<Result<Vec<_>, _>>()
+                    stmt.query_map(
+                        rusqlite::params![RECALL_LIMIT + 1, include_quarantined],
+                        memory_note_row,
+                    )?
+                    .collect::<Result<Vec<_>, _>>()
                 })
             };
 
@@ -268,6 +294,12 @@ pub(crate) struct RememberOutput {
     /// prompt-injection-shaped before it's stored.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) content_warning: Option<String>,
+    /// `true` iff `content_warning` fired -- this note was still saved (see
+    /// that field's own comment), but `recall` will exclude it from
+    /// default topic/query/list-all results until a caller explicitly
+    /// passes `include_quarantined: true`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) quarantined: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) suggested_next: Option<SuggestedNext>,
 }
@@ -288,6 +320,15 @@ pub(crate) struct RecallParams {
     /// `topic` is set.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) query: Option<String>,
+    /// `false` (default): a note `remember` quarantined (its content
+    /// looked prompt-injection-shaped) is excluded from results, whether
+    /// fetched by exact `topic`, `query`, or listed by default. Pass
+    /// `true` to deliberately include quarantined notes too -- e.g. to
+    /// review/clean them up. Every returned note still carries its own
+    /// `content_warning`/`quarantined` fields regardless of this flag, so
+    /// the caller always knows what it's looking at.
+    #[serde(default)]
+    pub(crate) include_quarantined: bool,
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -332,6 +373,13 @@ pub(crate) struct MemoryNote {
     /// `None`/omitted when the content looks clean.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) content_warning: Option<String>,
+    /// Set from the row's own `quarantined` column (not recomputed by
+    /// `recall` the way `content_warning` is) -- `true` iff `remember`
+    /// quarantined this note. Only ever appears in a response at all when
+    /// the caller passed `include_quarantined: true`, since a quarantined
+    /// note is excluded from every other `recall` path.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) quarantined: bool,
     /// Plan 3 §3.5(d): raw `content_mac` from the row, carried through from
     /// `memory_note_row` to `recall`'s post-processing loop (which has the
     /// project's MAC key, unlike this free function) purely as scratch
@@ -358,6 +406,7 @@ pub(crate) fn memory_note_row(row: &rusqlite::Row) -> rusqlite::Result<MemoryNot
         stale_refs: Vec::new(),
         integrity: "unverified",
         content_warning: None,
+        quarantined: row.get(4)?,
         content_mac: row.get(3)?,
     })
 }

@@ -422,12 +422,76 @@ impl CalmServer {
                 ));
             };
 
-            let result = match calm_core::verify::run_cargo_check(&manifest_path) {
+            // Bind verification to the exact content this tx_id proposed --
+            // without this, `verify_change` would run `cargo check` on
+            // whatever happens to be on disk right now and bind a PASS/FAIL
+            // receipt to `tx_id` regardless of who wrote that content or
+            // when (a native editor, another agent, `git checkout`, ...).
+            // Checked both before AND after the check itself: `cargo check`
+            // on a large package can run for seconds to minutes, plenty of
+            // time for a concurrent write to land mid-run and make the
+            // result describe content nobody asked to verify under this
+            // tx_id.
+            let pre_check_digest = match std::fs::read(&full_path) {
+                Ok(bytes) => calm_core::digest::evidence_digest(&bytes),
+                Err(e) => {
+                    return ToolOutcome::error(error_detail(
+                        "VERIFICATION_SNAPSHOT_UNREADABLE",
+                        &format!("failed to read {} before verification: {e}", tx.path),
+                        true,
+                    ));
+                }
+            };
+            if pre_check_digest != tx.proposed_digest {
+                return ToolOutcome::error(error_detail(
+                    "VERIFICATION_SNAPSHOT_CHANGED",
+                    &format!(
+                        "disk content at {} no longer matches this transaction's \
+                         proposed_digest -- something wrote to it after edit_lines/edit_symbol \
+                         produced tx_id {}. Refusing to bind a verification receipt to content \
+                         this transaction never proposed. Use repair_consistency to inspect \
+                         the drift, or start a fresh edit_context/edit_lines cycle for the \
+                         content that's actually on disk now.",
+                        tx.path, tx.tx_id
+                    ),
+                    true,
+                ));
+            }
+
+            let timeout =
+                std::time::Duration::from_secs(self.config().verification.timeout_secs);
+            let result = match calm_core::verify::run_cargo_check(&manifest_path, timeout) {
                 Ok(r) => r,
                 Err(e) => {
                     return ToolOutcome::error(error_detail("CARGO_SPAWN_FAILED", &e, true));
                 }
             };
+
+            let post_check_digest = match std::fs::read(&full_path) {
+                Ok(bytes) => calm_core::digest::evidence_digest(&bytes),
+                Err(e) => {
+                    return ToolOutcome::error(error_detail(
+                        "VERIFICATION_SNAPSHOT_UNREADABLE",
+                        &format!("failed to read {} after verification: {e}", tx.path),
+                        true,
+                    ));
+                }
+            };
+            if post_check_digest != pre_check_digest {
+                return ToolOutcome::error(error_detail(
+                    "VERIFICATION_SNAPSHOT_CHANGED",
+                    &format!(
+                        "disk content at {} changed while cargo check was still running -- \
+                         the {} result does not describe a stable snapshot, so it was \
+                         discarded rather than recorded against tx_id {}. Re-run verify_change \
+                         once the concurrent write has settled.",
+                        tx.path,
+                        if result.passed { "passing" } else { "failing" },
+                        tx.tx_id
+                    ),
+                    true,
+                ));
+            }
 
             let (to, advance_reason) = if result.passed {
                 (

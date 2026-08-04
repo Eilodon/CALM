@@ -46,7 +46,8 @@ enum Commands {
         #[arg(long, default_value = "127.0.0.1:8787")]
         addr: String,
         /// Permit a non-loopback --addr bind. Requires CALM_HTTP_TOKEN to
-        /// be set (fail-closed) and forces a read-only preset ("full,-edit")
+        /// be set (fail-closed) and forces the capability-derived
+        /// "remote-safe" preset (every tool with read_only_hint = true)
         /// regardless of --preset -- see docs/http-transport.md's threat
         /// model for why.
         #[arg(long)]
@@ -106,15 +107,22 @@ enum Commands {
         /// Project root directory
         #[arg(long, default_value = ".")]
         project_root: PathBuf,
-        /// Self-heal a configured-but-not-active hooks install (entrypoint
+        /// Self-heal what doctor can safely auto-repair:
+        /// (1) a configured-but-not-active hooks install (entrypoint
         /// missing — e.g. the project directory was moved/renamed since
         /// `calm init --hooks` last ran, or the npm-resolved binary path
         /// changed) by re-running the equivalent of `calm init
         /// --hooks=<current mode>` with this binary's own current path.
         /// Never touches an explicit `--hooks=off`, and never changes
         /// nudge<->enforce — only repairs a stale/missing entrypoint for
-        /// whichever mode is already configured. A no-op (prints the same
-        /// report as without this flag) when nothing needs fixing.
+        /// whichever mode is already configured.
+        /// (2) loose Unix permissions on `.calm/` and its sensitive files
+        /// (index.db, memory.key, daemon.log, audit.log, daemon.sock) —
+        /// chmods anything found wider than this workspace's intended
+        /// 0700/0600, e.g. a `.calm/` created before this hardening
+        /// existed, or under a permissive umask.
+        /// A no-op section (prints the same report as without this flag)
+        /// for whichever of the two needs no fixing.
         #[arg(long)]
         fix: bool,
     },
@@ -182,10 +190,22 @@ enum Commands {
         /// Write a portable `npx -y @eilodon/calm-mcp serve` entry instead
         /// of an absolute path to this binary. Use when the config will be
         /// committed and shared (teammates/CI that don't have this exact
-        /// binary) or when you want it to track the published npm release
-        /// automatically. Requires Node wherever it runs.
+        /// binary). Requires Node wherever it runs.
         #[arg(long)]
         npx: bool,
+        /// With --npx: which npm version the written entry resolves to.
+        /// "pinned" (default) writes `@eilodon/calm-mcp@<this binary's own
+        /// version>` -- every cold `npx` invocation (a fresh CI runner, a
+        /// teammate's first checkout, a container rebuild) then always
+        /// resolves to the exact same npm release this `calm setup` ran
+        /// from, so tool schemas/behavior can't silently shift between
+        /// runs just because npm published a new version in between.
+        /// "latest" writes the old unpinned `@eilodon/calm-mcp` (npm's own
+        /// dist-tag resolution decides the version on every cold install)
+        /// -- opt into this only if you deliberately want to always track
+        /// the newest release without re-running `calm setup` yourself.
+        #[arg(long, default_value = "pinned")]
+        track: String,
     },
     /// Manually run one or every SCIP provider's indexer right now (P2.6),
     /// bypassing the configured refresh policy — e.g. to force a run for a
@@ -634,7 +654,7 @@ async fn main() -> Result<()> {
                     println!();
                 }
             }
-            calm_server::doctor(&root)?;
+            calm_server::doctor(&root, fix)?;
         }
         Commands::FitnessCheck {
             project_root,
@@ -781,6 +801,22 @@ async fn main() -> Result<()> {
             };
 
             let calm_dir = root.join(".calm");
+            // `calm_server::daemon::create_calm_dir` (atomic 0700), not a
+            // plain `create_dir_all` -- `calm init` is usually the FIRST
+            // thing that creates `.calm/`, and daemon.rs deliberately never
+            // retroactively chmods a `.calm/` it finds already existing (see
+            // `create_calm_dir`'s own doc comment), so whatever permissions
+            // land here are what this project's `.calm/` keeps indefinitely.
+            // A plain `create_dir_all` would leave it at the process umask's
+            // default (often world-readable), exposing the index, audit
+            // ledger, transaction journal, and memory-note HMAC key to any
+            // other local user on a shared machine. Windows: no equivalent
+            // ACL helper exists yet (calm_server::daemon is `#[cfg(unix)]`
+            // only) -- same gap `init_daemon_tracing` already accepts for
+            // the same reason.
+            #[cfg(unix)]
+            calm_server::daemon::create_calm_dir(&calm_dir)?;
+            #[cfg(not(unix))]
             std::fs::create_dir_all(&calm_dir)?;
 
             let config_path = calm_dir.join("config.json");
@@ -819,15 +855,35 @@ async fn main() -> Result<()> {
             project_root,
             force,
             npx,
+            track,
         } => {
             let root = std::fs::canonicalize(&project_root)?;
             let bin_path = std::env::current_exe()?;
             let bin_str = bin_path.to_string_lossy().into_owned();
 
-            // `--npx` writes a portable `npx -y @eilodon/calm-mcp serve`
-            // entry (shareable, tracks the published npm release); the
-            // default points at this exact binary via `write_mcp_config`.
-            let npx_args = ["-y", "@eilodon/calm-mcp", "serve"];
+            // `--npx` writes a portable `npx -y @eilodon/calm-mcp[@version]
+            // serve` entry (shareable across teammates/CI without this
+            // exact binary); the default (no --npx) points at this exact
+            // binary via `write_mcp_config`.
+            //
+            // `--track pinned` (the default) resolves the package spec to
+            // THIS binary's own build version -- reproducible: every cold
+            // `npx` invocation of the written entry always fetches the
+            // exact same npm release, never whatever happens to be
+            // `@latest` at invocation time (see docs/http-transport.md's
+            // sibling reproducibility concern for --http, and the audit
+            // finding this closes: an unpinned `npx -y @eilodon/calm-mcp`
+            // could silently change tool schemas/behavior between two
+            // otherwise-identical `calm setup` runs a release apart).
+            // `--track latest` opts back into the old unpinned behavior.
+            let package_spec = match track.as_str() {
+                "pinned" => format!("@eilodon/calm-mcp@{}", env!("CARGO_PKG_VERSION")),
+                "latest" => "@eilodon/calm-mcp".to_string(),
+                other => {
+                    anyhow::bail!("--track must be \"pinned\" or \"latest\", got {other:?}");
+                }
+            };
+            let npx_args = ["-y", package_spec.as_str(), "serve"];
 
             println!("Configuring MCP clients in {}", root.display());
             println!();

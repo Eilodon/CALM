@@ -9,8 +9,23 @@
 //! behind `config::VerificationConfig::rust_check_on_write`, default
 //! `false`, so it starts in an off state rather than a shadow one).
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+/// Default wall-clock budget for one `run_cargo_check` call --
+/// `VerificationConfig::timeout_secs`'s default when `.calm/config.json`
+/// doesn't override it. `cargo check` can run `build.rs`/proc-macros/
+/// registry or git-dependency fetches; 120s is generous for a `check`
+/// (not `build`) on an already-fetched, already-built-once workspace
+/// while still bounding a genuinely hung child process.
+pub const DEFAULT_VERIFY_TIMEOUT_SECS: u64 = 120;
+
+/// How often the timeout loop polls `Child::try_wait` -- short enough that
+/// the reported wall-clock overrun past `timeout` is negligible, long
+/// enough not to busy-loop.
+const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Only language this module can actually verify today -- checked before
 /// ever routing a transaction through `VerifyPending`
@@ -57,21 +72,85 @@ const MAX_DIAGNOSTIC_LINES: usize = 40;
 /// result. Inline, not backgrounded -- same posture as `retry_maintenance`
 /// (`crates/calm-server/src/tools/txn.rs`): an explicit, on-demand
 /// verification action, not something in a hot write path, so blocking for
-/// however long a real `cargo check` takes is the accepted cost.
-pub fn run_cargo_check(manifest_path: &Path) -> Result<CargoCheckResult, String> {
+/// however long a real `cargo check` takes is the accepted cost -- but only
+/// up to `timeout`. A `build.rs`/proc-macro/registry fetch that hangs would
+/// otherwise wedge the tool call (and, on the stdio transport, the whole
+/// session) forever; exceeding `timeout` kills the child and reports a
+/// failed check instead.
+///
+/// Doesn't use `Command::output()` (which has no timeout support) --
+/// stdout/stderr are drained on background threads while the main thread
+/// polls `Child::try_wait` against `timeout`, the same "avoid a full pipe
+/// buffer deadlocking the wait" trick `output()` uses internally, just with
+/// a deadline added.
+pub fn run_cargo_check(
+    manifest_path: &Path,
+    timeout: Duration,
+) -> Result<CargoCheckResult, String> {
     let command = format!(
         "cargo check --manifest-path {} --message-format=short",
         manifest_path.display()
     );
-    let output = Command::new("cargo")
+    let mut child = Command::new("cargo")
         .arg("check")
         .arg("--manifest-path")
         .arg(manifest_path)
         .arg("--message-format=short")
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|e| format!("failed to spawn cargo: {e} (is it installed and on PATH?)"))?;
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let mut stdout_pipe = child.stdout.take().expect("piped stdout");
+    let mut stderr_pipe = child.stderr.take().expect("piped stderr");
+    let stdout_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout_pipe.read_to_end(&mut buf);
+        buf
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr_pipe.read_to_end(&mut buf);
+        buf
+    });
+
+    let start = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    break None;
+                }
+                std::thread::sleep(POLL_INTERVAL);
+            }
+            Err(e) => return Err(format!("failed to poll cargo check: {e}")),
+        }
+    };
+
+    let Some(status) = status else {
+        // Timed out: kill and reap so the child never outlives this call as
+        // a zombie, then discard whatever partial output the reader threads
+        // collected -- diagnostics from a forcibly-killed, half-finished
+        // run aren't a trustworthy pass/fail signal.
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = stdout_reader.join();
+        let _ = stderr_reader.join();
+        return Ok(CargoCheckResult {
+            command,
+            passed: false,
+            diagnostics: vec![format!(
+                "cargo check timed out after {}s and was killed",
+                timeout.as_secs()
+            )],
+        });
+    };
+
+    let stderr_bytes = stderr_reader.join().unwrap_or_default();
+    let _ = stdout_reader.join(); // drained only to prevent pipe-buffer deadlock; content unused
+    let stderr = String::from_utf8_lossy(&stderr_bytes);
     let diagnostics: Vec<String> = stderr
         .lines()
         .filter(|l| !l.trim().is_empty())
@@ -81,7 +160,7 @@ pub fn run_cargo_check(manifest_path: &Path) -> Result<CargoCheckResult, String>
 
     Ok(CargoCheckResult {
         command,
-        passed: output.status.success(),
+        passed: status.success(),
         diagnostics,
     })
 }
@@ -134,7 +213,8 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
         std::fs::write(dir.path().join("src/lib.rs"), "pub fn ok() -> i32 { 1 }\n").unwrap();
 
-        let result = run_cargo_check(&dir.path().join("Cargo.toml")).expect("cargo on PATH");
+        let result = run_cargo_check(&dir.path().join("Cargo.toml"), Duration::from_secs(60))
+            .expect("cargo on PATH");
         assert!(result.passed, "diagnostics: {:?}", result.diagnostics);
     }
 
@@ -149,8 +229,38 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
         std::fs::write(dir.path().join("src/lib.rs"), "fn broken( { not rust\n").unwrap();
 
-        let result = run_cargo_check(&dir.path().join("Cargo.toml")).expect("cargo on PATH");
+        let result = run_cargo_check(&dir.path().join("Cargo.toml"), Duration::from_secs(60))
+            .expect("cargo on PATH");
         assert!(!result.passed);
         assert!(!result.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn run_cargo_check_kills_and_reports_failure_on_timeout() {
+        // A near-zero timeout should trip almost immediately regardless of
+        // how long the real `cargo check` would have taken, proving the
+        // deadline -- not just the exit status -- controls the outcome.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"verify_fixture_timeout\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/lib.rs"), "pub fn ok() -> i32 { 1 }\n").unwrap();
+
+        let start = Instant::now();
+        let result = run_cargo_check(&dir.path().join("Cargo.toml"), Duration::from_millis(1))
+            .expect("spawn should still succeed even though the run times out");
+        assert!(!result.passed, "a timed-out run must never report passed");
+        assert!(
+            result.diagnostics.iter().any(|d| d.contains("timed out")),
+            "diagnostics: {:?}",
+            result.diagnostics
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "timeout enforcement should return promptly, not wait out a real cargo check"
+        );
     }
 }

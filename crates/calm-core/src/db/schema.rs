@@ -502,6 +502,21 @@ fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
     // has no MAC to check, and `memory::verify_integrity` reports that case
     // as `"unverified"`, distinct from `"ok"`/`"mismatch"`.
     migrate_add_column(conn, "project_memory", "content_mac", "TEXT")?;
+    // audit F7 follow-up: `remember` sets this when `sanitize::
+    // injection_warning` flags the note's content as prompt-injection-
+    // shaped -- still saved either way (detection-only, same philosophy
+    // as the warning itself), but `recall` excludes a quarantined note
+    // from its default topic/query/list-all results unless
+    // `include_quarantined: true` is passed, so a poisoned note can't
+    // silently auto-surface into a future session's context. `0` default
+    // so every pre-existing note (written before this column existed)
+    // reads as NOT quarantined rather than retroactively hiding it.
+    migrate_add_column(
+        conn,
+        "project_memory",
+        "quarantined",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
     // #3 (2026-07-27 martin/entropy/churn plan): normalized [0,1] churn
     // score, written by `graph::churn::update_churn_scores` from the
     // indexer pipeline (rebuild_graph/incremental_graph_update), read by

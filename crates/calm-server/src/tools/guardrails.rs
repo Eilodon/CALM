@@ -326,11 +326,13 @@ impl CalmServer {
                     gate_hub_kind,
                     gate_uncertain_zero_caller,
                     gate_touched,
+                    gate_risk_rule_reason,
                 ) = edit::compute_touch_risk(
                     &conn,
                     &c.path,
                     &[(c.line_start, c.line_end)],
                     &self.coverage.read_ok(),
+                    &config.risk_rules,
                 );
                 // Mirrors edit_lines_impl_gated's own bridge-downgrade
                 // eligibility check exactly (edit.rs) -- computed here too,
@@ -354,6 +356,7 @@ impl CalmServer {
                     gate_uncertain_zero_caller,
                     bridge_downgrade_eligible,
                     config.edit.always_require_edit_context,
+                    gate_risk_rule_reason.as_deref(),
                 );
                 let blocking_symbols: Vec<String> = gate_touched
                     .iter()

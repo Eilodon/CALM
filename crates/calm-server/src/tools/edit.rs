@@ -64,7 +64,14 @@ impl CalmServer {
         let fingerprint = fingerprint_edit_lines(&p);
         match mechanism {
             ElicitMechanism::Mrtr { timeout } => {
-                match self.hub_mrtr_ask("edit_lines", &p.path, &fingerprint, &ask_ctx, p.reason.as_deref(), timeout) {
+                match self.hub_mrtr_ask(
+                    "edit_lines",
+                    &p.path,
+                    &fingerprint,
+                    &ask_ctx,
+                    p.reason.as_deref(),
+                    timeout,
+                ) {
                     Ok(result) => HubEditToolResult::NeedsApproval(result),
                     Err(detail) => HubEditToolResult::Done(Json(ToolOutcome::error(detail))),
                 }
@@ -226,7 +233,12 @@ impl CalmServer {
             let fingerprint = fingerprint_edit_symbol(&p);
             let cache_key_path = p.path.clone().unwrap_or_else(|| p.symbol.clone());
             return HubEditToolResult::Done(Json(
-                match self.hub_mrtr_decide("edit_symbol", &cache_key_path, &fingerprint, continuation) {
+                match self.hub_mrtr_decide(
+                    "edit_symbol",
+                    &cache_key_path,
+                    &fingerprint,
+                    continuation,
+                ) {
                     Ok(()) => self.edit_symbol_flow(&p, ElicitGate::Approved, &mut None),
                     Err(detail) => ResolvedOutcome::error(detail),
                 },
@@ -250,7 +262,14 @@ impl CalmServer {
         let cache_key_path = p.path.clone().unwrap_or_else(|| p.symbol.clone());
         match mechanism {
             ElicitMechanism::Mrtr { timeout } => {
-                match self.hub_mrtr_ask("edit_symbol", &cache_key_path, &fingerprint, &ask_ctx, p.reason.as_deref(), timeout) {
+                match self.hub_mrtr_ask(
+                    "edit_symbol",
+                    &cache_key_path,
+                    &fingerprint,
+                    &ask_ctx,
+                    p.reason.as_deref(),
+                    timeout,
+                ) {
                     Ok(result) => HubEditToolResult::NeedsApproval(result),
                     Err(detail) => HubEditToolResult::Done(Json(ResolvedOutcome::error(detail))),
                 }
@@ -1041,6 +1060,7 @@ impl CalmServer {
             uncertain_zero_caller,
             pre_touched,
             fresh_caller_digests,
+            risk_rule_reason,
         ) = {
             let conn = match self.make_read_conn() {
                 Ok(c) => c,
@@ -1051,8 +1071,8 @@ impl CalmServer {
                 .map(|h| (h.start_line as i64, h.end_line as i64))
                 .collect();
             let coverage = self.coverage.read_ok();
-            let (risk, hub_hit, hub_kind, uncertain_zero_caller, touched) =
-                compute_touch_risk(&conn, path, &ranges, &coverage);
+            let (risk, hub_hit, hub_kind, uncertain_zero_caller, touched, risk_rule_reason) =
+                compute_touch_risk(&conn, path, &ranges, &coverage, &self.config().risk_rules);
             // Plan 3 §3.3 (F10): a bridge-only touch (never degree/both) at
             // risk ≤ medium MAY use the lighter CONFIRM_REQUIRED-only tier
             // below — but ONLY if every touched hub's caller edges are all
@@ -1102,6 +1122,7 @@ impl CalmServer {
                 uncertain_zero_caller,
                 touched,
                 fresh_caller_digests,
+                risk_rule_reason,
             )
         };
         // `always_require_edit_context` (Config.edit) widens this gate to
@@ -1116,6 +1137,7 @@ impl CalmServer {
             uncertain_zero_caller,
             bridge_downgrade_eligible,
             force_gate_always,
+            risk_rule_reason.as_deref(),
         );
         if gate_classification.will_block_without_confirm {
             let why = gate_classification.why.unwrap_or_default();
@@ -1838,7 +1860,8 @@ impl CalmServer {
                 .map(|r| (r.start_line as i64, r.new_end_line as i64))
                 .collect();
             let coverage = self.coverage.read_ok();
-            let (_, _, _, _, touched) = compute_touch_risk(&conn, path, &new_ranges, &coverage);
+            let (_, _, _, _, touched, _) =
+                compute_touch_risk(&conn, path, &new_ranges, &coverage, &[]);
             touched
         };
 
@@ -1963,7 +1986,9 @@ enum HubEditToolResult<T> {
 impl<T: Serialize + JsonSchema + 'static> rmcp::handler::server::tool::IntoCallToolResult
     for HubEditToolResult<T>
 {
-    fn into_call_tool_result(self) -> Result<rmcp::model::CallToolResponse, rmcp::model::ErrorData> {
+    fn into_call_tool_result(
+        self,
+    ) -> Result<rmcp::model::CallToolResponse, rmcp::model::ErrorData> {
         match self {
             Self::Done(json) => json.into_call_tool_result(),
             Self::NeedsApproval(result) => result.into_call_tool_result(),
@@ -1989,9 +2014,9 @@ impl CalmServer {
             return None;
         }
         let timeout = std::time::Duration::from_secs(cfg.elicit_timeout_secs);
-        let mrtr_capable = ctx.protocol_version().is_some_and(|v| {
-            v.as_str() >= rmcp::model::ProtocolVersion::V_2026_07_28.as_str()
-        });
+        let mrtr_capable = ctx
+            .protocol_version()
+            .is_some_and(|v| v.as_str() >= rmcp::model::ProtocolVersion::V_2026_07_28.as_str());
         if mrtr_capable {
             return Some(ElicitMechanism::Mrtr { timeout });
         }
@@ -2102,13 +2127,14 @@ impl CalmServer {
                     false,
                 )
             })?;
-        let schema = rmcp::model::ElicitationSchema::from_type::<HubEditApproval>().map_err(|e| {
-            error_detail(
-                "ELICITATION_FAILED",
-                &format!("could not build the approval schema: {e}"),
-                false,
-            )
-        })?;
+        let schema =
+            rmcp::model::ElicitationSchema::from_type::<HubEditApproval>().map_err(|e| {
+                error_detail(
+                    "ELICITATION_FAILED",
+                    &format!("could not build the approval schema: {e}"),
+                    false,
+                )
+            })?;
         let mut input_requests = rmcp::model::InputRequests::new();
         input_requests.insert(
             "approval".to_string(),
@@ -2156,17 +2182,15 @@ impl CalmServer {
         })?;
         let codec = rmcp::model::RequestStateCodec::new(key.to_vec());
         let seal: HubEditStateSeal =
-            codec
-                .open_json(&continuation.request_state)
-                .map_err(|_| {
-                    error_detail(
-                        "ELICITATION_FAILED",
-                        "the approval request has expired or its state could not be \
+            codec.open_json(&continuation.request_state).map_err(|_| {
+                error_detail(
+                    "ELICITATION_FAILED",
+                    "the approval request has expired or its state could not be \
                          verified — nothing was written (fail-closed); retry the edit \
                          to ask again",
-                        false,
-                    )
-                })?;
+                    false,
+                )
+            })?;
         if seal.tool != tool || seal.cache_path != cache_path || seal.fingerprint != fingerprint {
             return Err(error_detail(
                 "ELICITATION_FAILED",
@@ -2259,9 +2283,7 @@ fn map_elicit_outcome(
 /// peer, exactly like `map_elicit_outcome`. `hub_mrtr_decide` handles the
 /// separate MRTR-specific failure modes (expired/tampered `request_state`,
 /// malformed answer JSON) before ever reaching this function.
-fn decide_mrtr_answer(
-    answer: Option<HubEditApproval>,
-) -> (&'static str, Result<(), ErrorDetail>) {
+fn decide_mrtr_answer(answer: Option<HubEditApproval>) -> (&'static str, Result<(), ErrorDetail>) {
     match answer {
         Some(HubEditApproval { approve: true }) => ("elicit_approved", Ok(())),
         Some(HubEditApproval { approve: false }) | None => (
@@ -2469,18 +2491,29 @@ fn hub_kind_strength(kind: &str) -> u8 {
 /// applicable", not a "confirmed safe" signal, so counting it here would
 /// force the full write gate on nearly every struct/enum edit in this
 /// codebase for no real reason.
-pub(crate) fn compute_touch_risk(
-    conn: &rusqlite::Connection,
-    path: &str,
-    ranges: &[(i64, i64)],
-    coverage: &calm_core::analysis::coverage::CoverageData,
-) -> (
+/// `compute_touch_risk`'s return: `(risk, hub_hit, strongest_hub_kind,
+/// uncertain_zero_caller, touched, risk_rule_reason)`. The 6th element,
+/// `risk_rule_reason`, is `Some(human-readable reason)` iff a `risk_rules`
+/// entry raised `risk` above what the structural (caller-count/hub) signal
+/// alone would have produced -- `classify_gate` uses this instead of its
+/// generic ">10 callers" explanation when present, so the gate's stated
+/// reason stays accurate to what actually triggered it.
+type TouchRiskResult = (
     Option<String>,
     bool,
     Option<String>,
     Option<UncertainZeroCallerReason>,
     Vec<TouchedSymbolOutput>,
-) {
+    Option<String>,
+);
+
+pub(crate) fn compute_touch_risk(
+    conn: &rusqlite::Connection,
+    path: &str,
+    ranges: &[(i64, i64)],
+    coverage: &calm_core::analysis::coverage::CoverageData,
+    risk_rules: &[calm_core::config::RiskRule],
+) -> TouchRiskResult {
     let rows = symbols_overlapping_ranges(conn, path, ranges);
     let mut max_callers = 0i64;
     let mut hub_hit = false;
@@ -2539,14 +2572,54 @@ pub(crate) fn compute_touch_risk(
             hub_kind: row.hub_kind,
         });
     }
-    let risk = (!touched.is_empty()).then(|| risk_level_from_caller_count(max_callers).to_string());
+    let structural_risk =
+        (!touched.is_empty()).then(|| risk_level_from_caller_count(max_callers).to_string());
+    let (risk, risk_rule_reason) = match calm_core::config::risk_floor_for_path(risk_rules, path) {
+        None => (structural_risk, None),
+        Some((floor, glob)) => {
+            let floor_severity = risk_severity(floor);
+            let structural_severity = structural_risk.as_deref().map(risk_severity).unwrap_or(0);
+            if floor_severity > structural_severity {
+                (
+                    Some(floor.to_string()),
+                    Some(format!(
+                        "path {path:?} matches this project's risk_rules glob {glob:?} \
+                         (minimum: {floor})"
+                    )),
+                )
+            } else {
+                (structural_risk, None)
+            }
+        }
+    };
     (
         risk,
         hub_hit,
         strongest_hub_kind,
         uncertain_zero_caller,
         touched,
+        risk_rule_reason,
     )
+}
+
+/// Ordering `classify_gate` itself understands (`"low"` < `"medium"` <
+/// `"high"`) -- deliberately NOT `calm_core::analysis::diff_impact::
+/// RiskOrder`, which also has `"critical"` (understood by `diff_impact`'s
+/// advisory reporting, but not by this write-blocking gate, which only
+/// ever checks `risk == Some("high")`). Any string outside the 3 gate
+/// levels sorts as `0` (lowest) rather than erroring -- `risk_rules`
+/// entries are already validated against exactly this level set at config
+/// load (`calm_core::config::load_config`), so this is unreachable for a
+/// `RiskRule.minimum` in practice; treating an unexpected value as "no
+/// escalation" rather than panicking is the conservative fallback for the
+/// other input, `structural_risk`, which `risk_level_from_caller_count`
+/// guarantees is always one of the 3 anyway.
+fn risk_severity(level: &str) -> u8 {
+    match level {
+        "high" => 2,
+        "medium" => 1,
+        _ => 0,
+    }
 }
 
 /// Which tier of the `edit_lines`/`edit_symbol` write gate a touched range
@@ -2599,12 +2672,18 @@ pub(crate) struct GateClassification {
 /// `edit_lines_impl_gated`'s gate condition exactly; any change to that
 /// gate's structural logic (not its session-state checks) must be made here
 /// so both call sites stay in sync.
+///
+/// `risk_rule_reason` is `compute_touch_risk`'s 6th return value -- when
+/// `risk == Some("high")` was reached via a `risk_rules` path match rather
+/// than caller count, this carries the accurate reason so `why` doesn't
+/// misattribute the gate to ">10 callers".
 pub(crate) fn classify_gate(
     hub_hit: bool,
     risk: Option<&str>,
     uncertain_zero_caller: Option<UncertainZeroCallerReason>,
     bridge_downgrade_eligible: bool,
     force_gate_always: bool,
+    risk_rule_reason: Option<&str>,
 ) -> GateClassification {
     if !(hub_hit || risk == Some("high") || uncertain_zero_caller.is_some() || force_gate_always) {
         return GateClassification {
@@ -2628,7 +2707,9 @@ pub(crate) fn classify_gate(
             }
         }
     } else if risk == Some("high") {
-        "a high-risk symbol (>10 callers)".to_string()
+        risk_rule_reason
+            .map(|r| r.to_string())
+            .unwrap_or_else(|| "a high-risk symbol (>10 callers)".to_string())
     } else {
         "this project's `edit.always_require_edit_context` config (every edit requires edit_context first, regardless of risk)".to_string()
     };
@@ -3475,7 +3556,10 @@ mod elicit_tests {
         let continuation = MrtrContinuation {
             input_responses: {
                 let mut m = rmcp::model::InputResponses::new();
-                m.insert("approval".to_string(), serde_json::json!({ "approve": true }));
+                m.insert(
+                    "approval".to_string(),
+                    serde_json::json!({ "approve": true }),
+                );
                 m
             },
             request_state: "not-a-real-sealed-value".to_string(),
@@ -3493,7 +3577,10 @@ mod elicit_tests {
             ("missing", rmcp::model::InputResponses::new()),
             ("false", {
                 let mut m = rmcp::model::InputResponses::new();
-                m.insert("approval".to_string(), serde_json::json!({ "approve": false }));
+                m.insert(
+                    "approval".to_string(),
+                    serde_json::json!({ "approve": false }),
+                );
                 m
             }),
         ] {

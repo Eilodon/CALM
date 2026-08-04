@@ -23,10 +23,22 @@ pub struct HttpLaunch {
 ///   `CALM_HTTP_TOKEN`) -- an empty string is treated the same as absent,
 ///   never silently accepted as "no auth needed".
 ///
-/// Independent of both gates: any non-loopback bind forces the read-only
-/// `"full,-edit"` preset, overriding `requested_preset` entirely -- the
-/// write path (edit_lines/edit_symbol) must never be network-reachable by
-/// default, which is the audit's FM2 finding this task exists to close.
+/// Independent of both gates: any non-loopback bind forces the
+/// capability-derived `"remote-safe"` preset (every tool with
+/// `read_only_hint = true` -- see `calm_server::tools::common::
+/// remote_safe_tool_names`), overriding `requested_preset` entirely.
+/// Previously forced `"full,-edit"`, which only excludes the `edit`
+/// toolset's 3 tools (edit_lines/edit_symbol/format_files) -- a real gap
+/// closed 2026-08: `remember`, `verify_change`/`retry_maintenance`
+/// (the latter spawns `cargo check`), `scip_refresh`/`lsp_refresh`
+/// (external provider processes), `set_toolset`, and
+/// `pattern_debt_register` are all state-mutating or process-executing
+/// but sit outside the `edit` toolset, so `"full,-edit"` left every one of
+/// them reachable over an authenticated remote connection despite the
+/// "read-only" framing. `"remote-safe"` closes all of them at once by
+/// filtering on the one annotation every tool already declares correctly
+/// (`every_tool_declares_annotations` enforces non-optional declaration)
+/// instead of enumerating toolsets by hand.
 pub fn resolve_http_launch(
     addr: &str,
     allow_remote: bool,
@@ -58,7 +70,7 @@ pub fn resolve_http_launch(
     let effective_preset = if is_loopback {
         requested_preset.to_string()
     } else {
-        "full,-edit".to_string()
+        "remote-safe".to_string()
     };
     Ok(HttpLaunch {
         addr: sock,

@@ -86,7 +86,7 @@ Full walkthrough for every client above, including exact global-config snippets 
 
 Drop that into `.mcp.json` (Claude Code/Cursor) or `.vscode/mcp.json` (VS Code uses a top-level `"servers"` key instead of `"mcpServers"`, same shape otherwise) at your project root. Claude Code plugin instead: `/plugin marketplace add Eilodon/CALM` then `/plugin install calm@CALM`.
 
-Prefer a native binary over npx? `curl -fsSL https://raw.githubusercontent.com/Eilodon/CALM/main/scripts/install.sh | sh`, then run `calm setup` from inside your project — it writes the same MCP config automatically, pointing at the binary you just installed. Add `calm setup --npx` instead to write the portable `npx` entry (shareable/committable — teammates and CI don't need the binary, and it tracks the published release).
+Prefer a native binary over npx? `curl -fsSL https://raw.githubusercontent.com/Eilodon/CALM/main/scripts/install.sh | sh`, then run `calm setup` from inside your project — it writes the same MCP config automatically, pointing at the binary you just installed. Add `calm setup --npx` instead to write the portable `npx` entry (shareable/committable — teammates and CI don't need the binary). It pins to this binary's own version by default for reproducible cold installs; pass `--track latest` to always resolve npm's newest release instead.
 
 **Developing on CALM itself** (this repo):
 
@@ -280,7 +280,7 @@ This repo's own `thresholds.toml` currently declares two: the one above, plus `c
 
 - **Default mode is MCP stdio.** The launcher uses the shared Unix daemon when invoked without extra launcher arguments on Unix; custom invocations, CI, and Windows can use one-process `calm serve`.
 - **HTTP is opt-in.** `calm serve --http` binds to `127.0.0.1:8787` by default. Non-loopback exposure requires `--allow-remote` and a non-empty `CALM_HTTP_TOKEN` sent as a Bearer token.
-- **Remote HTTP is read-only.** CALM forces the effective preset to `full,-edit`; terminate TLS at a reverse proxy. The built-in HTTP transport does not provide rate limiting or DoS protection, so do not expose it directly to an untrusted network.
+- **Remote HTTP is read-only.** CALM forces the effective preset to `remote-safe` — every tool that declares `read_only_hint = true`, computed from the tool router itself rather than a hand-maintained list, so it can't silently miss a newly added state-mutating tool; terminate TLS at a reverse proxy. The built-in HTTP transport does not provide rate limiting or DoS protection, so do not expose it directly to an untrusted network.
 
 ## Testing
 
@@ -303,6 +303,7 @@ The workspace contains 1,000+ tests; the latest CI `verify` job is the source of
 - [`docs/mcp-client-setup.md`](docs/mcp-client-setup.md) — every MCP client install path in detail, including Windsurf/Devin Desktop and Codex global config.
 - [`docs/http-transport.md`](docs/http-transport.md) — the opt-in remote/HTTP transport (`calm serve --http`): loopback-by-default, the fail-closed `--allow-remote` + token requirement, why remote exposure forces a read-only preset, and the TLS/reverse-proxy expectation.
 - [`AGENTS.md`](AGENTS.md) — the full tool-by-tool workflow guide this project's own agents follow.
+- [`KNOWN_LIMITATIONS.md`](KNOWN_LIMITATIONS.md) — an honest list of what CALM doesn't do yet (single-language unsandboxed verification, no multi-file change-set, no reference-impact tool, risk classification with no change-kind signal, and more), and why each is deliberately deferred rather than half-built.
 - [`benchmarks/`](benchmarks/) — the measurement suite behind benchmark claims in this README, and a few more: `b2_call_graph_quality/` (precision/recall vs. a SCIP oracle), `b3_search_quality/` (hybrid RRF vs. FTS-only vs. raw grep, NDCG@10), `b4_token_efficiency/` (token cost vs. a naive baseline, per task), `b6_tool_call_efficiency/` (round-trips: naive multi-call vs. one MCP call), `b7_task_correctness/` (real rename refactors across 6 language corpora — fd/Rust, flask/Python, express/JS, zod/TS, gin/Go, spring-petclinic/Java — checked against an independent pass/fail oracle, not an LLM judge), `b11_extended_competitor_ab/` (real calls against 4 other live MCP servers, not self-reported numbers), `b12_tier1_tier2_tool_correctness/` (9 tools driven live over JSON-RPC against 6 external OSS repos, ground-truthed against regex/`git grep`), `resolution/` (tier-distribution baseline across 19 real OSS repos, one per language). Unflattering results are published alongside good ones on purpose — `benchmarks/README.md` states that policy.
 
 ## License
