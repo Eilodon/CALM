@@ -723,7 +723,7 @@ pub fn default_db_path(project_root: &std::path::Path) -> PathBuf {
     project_root.join(".calm").join("index.db")
 }
 
-pub fn doctor(project_root: &std::path::Path) -> Result<()> {
+pub fn doctor(project_root: &std::path::Path, fix: bool) -> Result<()> {
     use calm_core::db::schema::init_db;
 
     println!("Build: {}", calm_core::BUILD_INFO);
@@ -781,6 +781,10 @@ pub fn doctor(project_root: &std::path::Path) -> Result<()> {
         println!("  created empty DB");
     }
 
+    if let Some(calm_dir) = db_path.parent() {
+        check_and_fix_permissions(calm_dir, fix);
+    }
+
     let grammars = ["python", "typescript", "javascript", "java", "rust", "go"];
     println!("Tree-sitter grammars: {}", grammars.join(", "));
     println!("  status: BUNDLED (compiled in)");
@@ -804,6 +808,77 @@ pub fn doctor(project_root: &std::path::Path) -> Result<()> {
 
     println!("\nAll checks passed.");
     Ok(())
+}
+
+/// Audits `.calm/`'s own mode plus its sensitive files (`index.db`,
+/// `memory.key`, `daemon.log`, `audit.log`, `daemon.sock` -- whichever
+/// happen to exist) against the restrictive permissions this workspace
+/// intends everywhere else (0700 for the directory, 0600 for its files)
+/// and reports drift. `fix=true` additionally chmods anything found loose
+/// -- the one-shot remediation for a `.calm/` first created by a path that
+/// predates (or bypasses) `create_calm_dir`'s atomic-0700 create (`calm
+/// init`'s own `create_dir_all` before this fix, an old checkout, a
+/// manually-created directory, ...): daemon startup deliberately never
+/// retroactively tightens a `.calm/` it finds already existing (see
+/// `daemon::create_calm_dir`'s doc comment), so nothing else in this
+/// codebase will ever fix this on its own.
+#[cfg(unix)]
+fn check_and_fix_permissions(calm_dir: &std::path::Path, fix: bool) {
+    use std::os::unix::fs::PermissionsExt;
+
+    println!("Permissions:");
+    if !calm_dir.exists() {
+        println!(
+            "  (nothing to check -- {} doesn't exist yet)",
+            calm_dir.display()
+        );
+        return;
+    }
+
+    let targets: Vec<(std::path::PathBuf, u32)> = [
+        (calm_dir.to_path_buf(), 0o700),
+        (calm_dir.join("index.db"), 0o600),
+        (calm_dir.join("memory.key"), 0o600),
+        (calm_dir.join("daemon.log"), 0o600),
+        (calm_dir.join("audit.log"), 0o600),
+        (calm_dir.join("daemon.sock"), 0o600),
+    ]
+    .into_iter()
+    .filter(|(path, _)| path.exists())
+    .collect();
+
+    for (path, wanted) in targets {
+        let meta = match std::fs::metadata(&path) {
+            Ok(m) => m,
+            Err(e) => {
+                println!("  {}: unreadable ({e})", path.display());
+                continue;
+            }
+        };
+        let actual = meta.permissions().mode() & 0o777;
+        if actual == wanted {
+            println!("  {}: {actual:03o} OK", path.display());
+        } else if fix {
+            match std::fs::set_permissions(&path, std::fs::Permissions::from_mode(wanted)) {
+                Ok(()) => println!("  {}: {actual:03o} -> {wanted:03o} FIXED", path.display()),
+                Err(e) => println!(
+                    "  {}: {actual:03o} (wanted {wanted:03o}) -- fix failed: {e}",
+                    path.display()
+                ),
+            }
+        } else {
+            println!(
+                "  {}: {actual:03o} \u{26a0} WANT {wanted:03o} -- readable by other local \
+                 users otherwise; run `calm doctor --fix` to tighten",
+                path.display()
+            );
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn check_and_fix_permissions(_calm_dir: &std::path::Path, _fix: bool) {
+    println!("Permissions: not checked (Unix-only for now)");
 }
 
 /// Short (12-char) git HEAD SHA for `project_root`, matching the format

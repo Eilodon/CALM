@@ -95,6 +95,10 @@
           "null"
         ]
       },
+      "quarantined": {
+        "description": "`true` iff `content_warning` fired -- this note was still saved (see\nthat field's own comment), but `recall` will exclude it from\ndefault topic/query/list-all results until a caller explicitly\npasses `include_quarantined: true`.",
+        "type": "boolean"
+      },
       "suggested_next": {
         "anyOf": [
           {

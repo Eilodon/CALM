@@ -67,6 +67,13 @@
           "string",
           "null"
         ]
+      },
+      "cites": {
+        "description": "Stronger, structured alternative to citing a caller inside `reason`'s\nfree text: set this to the EXACT `qualified_name` of one of the\ncaller edges returned by `edit_context` for the touched symbol THIS\nsession (already freshness-checked the same way `reason`'s citation\nis). Checked by exact equality, not a substring search, so it can't\nbe satisfied by pasting a real caller name into an unrelated\nsentence the way `reason` can. When set, it's authoritative on its\nown -- a non-matching `cites` fails with `REASON_NOT_GROUNDED`\nrather than falling back to `reason`. Ignored at the `confirm`-only\nbridge-hub tier and when the symbol has no known callers.",
+        "type": [
+          "string",
+          "null"
+        ]
       }
     },
     "required": [

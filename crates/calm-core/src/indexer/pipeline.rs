@@ -31,6 +31,29 @@ const MAX_INCREMENTAL_DELTA_PATHS: usize = 50;
 /// NUMBER` of 32766 (3.32+). Phase B plan A-1.
 const DELTA_QUERY_CHUNK_SIZE: usize = 500;
 
+/// Above this size, a file is skipped entirely (never read, never parsed) --
+/// defense against a maliciously huge/pathological file turning `calm index`
+/// into a resource-exhaustion vector (`SECURITY.md` names this class of gap
+/// explicitly). 8 MiB comfortably covers real hand-written source files
+/// (even generated ones tend to top out far lower) while bounding worst-case
+/// per-file memory. Skipped files never get a `file_index` row, same as any
+/// other unreadable file -- a subsequent targeted edit still works via
+/// direct tools, just outside the graph.
+const MAX_INDEXABLE_FILE_BYTES: u64 = 8 * 1024 * 1024;
+
+/// `std::fs::read_to_string`, but skipping the read entirely for a file over
+/// `MAX_INDEXABLE_FILE_BYTES` (checked via a cheap `metadata()` stat, not by
+/// reading the file first) -- the shared choke point for all three
+/// indexing entry points below (full reindex, changed-file reindex,
+/// targeted path reindex) so the cap can't be forgotten on any one path.
+fn read_source_capped(path: &Path) -> Option<String> {
+    let len = std::fs::metadata(path).ok()?.len();
+    if len > MAX_INDEXABLE_FILE_BYTES {
+        return None;
+    }
+    std::fs::read_to_string(path).ok()
+}
+
 /// True if a symbol's stored `signature` string's return type is `Option<_>`
 /// or `Result<_, _>` (bare `Option`/`Result` too, for generic/associated-type
 /// signatures that elide the parameter). Looks at the segment after the last
@@ -2166,7 +2189,7 @@ fn reindex_all_cancellable_with_phase(
                 if lang.is_none() && !is_recognized_unparsed_extension(ext) {
                     return None;
                 }
-                let source = std::fs::read_to_string(file).ok()?;
+                let source = read_source_capped(file)?;
                 let rel = rel_path(project_root, file);
                 let hash = hash_content(&source);
                 let mtime = mtime_secs(file);
@@ -2628,7 +2651,7 @@ pub fn reindex_changed_cancellable(
             if lang.is_none() && !is_recognized_unparsed_extension(ext) {
                 return None;
             }
-            let source = std::fs::read_to_string(file).ok()?;
+            let source = read_source_capped(file)?;
             let rel = rel_path(project_root, file);
             let hash = hash_content(&source);
             Some(Candidate {
@@ -2821,8 +2844,9 @@ pub fn reindex_paths(
             continue;
         }
 
-        let Ok(source) = std::fs::read_to_string(&abs) else {
-            // Unreadable (permissions, binary content, or a TOCTOU delete
+        let Some(source) = read_source_capped(&abs) else {
+            // Unreadable, or over MAX_INDEXABLE_FILE_BYTES (permissions,
+            // binary content, an oversized file, or a TOCTOU delete
             // between the exists() check above and this read) — skip
             // rather than guess; a subsequent full/watcher reindex will
             // pick it up once it's readable (or gone) again.
@@ -3275,6 +3299,78 @@ mod tests {
         // A path that's neither on disk nor ever indexed — no-op, no error.
         let summary = reindex_paths(&mut conn, &dir, &["never_existed.py".to_string()]).unwrap();
         assert!(summary.is_noop());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_source_capped_skips_a_file_over_the_byte_cap() {
+        let dir = std::env::temp_dir().join(format!("ci_idx_capped_read_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let small = dir.join("small.py");
+        std::fs::write(&small, "def a():\n    pass\n").unwrap();
+        assert_eq!(
+            read_source_capped(&small).as_deref(),
+            Some("def a():\n    pass\n"),
+            "a normal-sized file must still be read exactly as before"
+        );
+
+        let huge = dir.join("huge.py");
+        // One byte over the cap — checked via metadata(), so this never
+        // actually allocates/reads MAX_INDEXABLE_FILE_BYTES worth of data.
+        let f = std::fs::File::create(&huge).unwrap();
+        f.set_len(MAX_INDEXABLE_FILE_BYTES + 1).unwrap();
+        assert!(
+            read_source_capped(&huge).is_none(),
+            "a file over MAX_INDEXABLE_FILE_BYTES must be skipped, not read"
+        );
+
+        let exactly_at_cap = dir.join("at_cap.py");
+        let f = std::fs::File::create(&exactly_at_cap).unwrap();
+        f.set_len(MAX_INDEXABLE_FILE_BYTES).unwrap();
+        assert!(
+            read_source_capped(&exactly_at_cap).is_some(),
+            "a file exactly AT the cap must still be read (cap is an upper bound, not exclusive)"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_indexing_pipeline_skips_an_oversized_file_but_still_indexes_the_rest() {
+        let dir =
+            std::env::temp_dir().join(format!("ci_idx_oversized_skip_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("normal.py"), "def normal():\n    pass\n").unwrap();
+        let huge = dir.join("huge.py");
+        let f = std::fs::File::create(&huge).unwrap();
+        f.set_len(MAX_INDEXABLE_FILE_BYTES + 1).unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        // Must not error out or hang the whole run just because one file in
+        // the repo is pathologically large -- the run completes and indexes
+        // every OTHER file normally.
+        run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM file_index WHERE path = 'normal.py'"
+            ),
+            1,
+            "the normal-sized sibling file must still be indexed"
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM file_index WHERE path = 'huge.py'"
+            ),
+            0,
+            "the oversized file must be skipped entirely -- no file_index row at all"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

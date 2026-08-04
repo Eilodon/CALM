@@ -17,6 +17,11 @@
           "string",
           "null"
         ]
+      },
+      "include_quarantined": {
+        "description": "`false` (default): a note `remember` quarantined (its content\nlooked prompt-injection-shaped) is excluded from results, whether\nfetched by exact `topic`, `query`, or listed by default. Pass\n`true` to deliberately include quarantined notes too -- e.g. to\nreview/clean them up. Every returned note still carries its own\n`content_warning`/`quarantined` fields regardless of this flag, so\nthe caller always knows what it's looking at.",
+        "type": "boolean",
+        "default": false
       }
     },
     "type": "object"
@@ -75,6 +80,10 @@
               "string",
               "null"
             ]
+          },
+          "quarantined": {
+            "description": "Set from the row's own `quarantined` column (not recomputed by\n`recall` the way `content_warning` is) -- `true` iff `remember`\nquarantined this note. Only ever appears in a response at all when\nthe caller passed `include_quarantined: true`, since a quarantined\nnote is excluded from every other `recall` path.",
+            "type": "boolean"
           }
         },
         "required": [
@@ -82,7 +91,8 @@
           "content",
           "updated_at",
           "staleness",
-          "integrity"
+          "integrity",
+          "quarantined"
         ]
       },
       "StaleRefOutput": {

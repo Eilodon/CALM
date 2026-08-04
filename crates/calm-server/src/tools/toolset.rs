@@ -176,6 +176,41 @@ pub(crate) fn calm_all_tool_names() -> std::collections::BTreeSet<String> {
         .collect()
 }
 
+/// Every tool that declares `read_only_hint = true` in its `#[tool(...)]`
+/// `annotations(...)` -- computed live off `full_tool_router()`, the same
+/// anti-drift discipline `toolset_tools` already uses for real toolset
+/// membership, rather than a hand-maintained list that could silently fall
+/// out of sync with a tool's actual annotation. Backs the `"remote-safe"`
+/// virtual preset token below.
+///
+/// This is a stricter, capability-derived boundary than excluding the
+/// `edit` toolset ever was: `edit_lines`/`edit_symbol`/`format_files` are
+/// the only tools that toolset actually covers, so `"full,-edit"` (this
+/// token's predecessor as the forced non-loopback HTTP preset,
+/// crates/calm-cli/src/http.rs) left every OTHER state-mutating or
+/// process-executing tool reachable -- `remember` (memory), `verify_change`
+/// / `retry_maintenance` (txn, the latter literally spawning `cargo
+/// check`), `scip_refresh` / `lsp_refresh` (external provider processes),
+/// `set_toolset` (session-state mutation), `pattern_debt_register`. Every
+/// one of those already declares `read_only_hint = false` (enforced
+/// non-optional by `every_tool_declares_annotations`), so filtering on
+/// this single existing, already-correct annotation closes all of them at
+/// once instead of enumerating toolsets by hand and hoping the list stays
+/// exhaustive as new tools are added.
+pub(crate) fn remote_safe_tool_names() -> std::collections::BTreeSet<String> {
+    CalmServer::full_tool_router()
+        .list_all()
+        .into_iter()
+        .filter(|t| {
+            t.annotations
+                .as_ref()
+                .and_then(|a| a.read_only_hint)
+                .unwrap_or(false)
+        })
+        .map(|t| t.name.to_string())
+        .collect()
+}
+
 /// The concrete tool-name set a session should see, given the preset ceiling
 /// and an optional runtime narrowing. `None` narrowing = return the ceiling
 /// unchanged. `Some(sets)` = (union of those toolsets' tools ∪ floor) ∩ ceiling.
@@ -214,13 +249,16 @@ pub(crate) fn effective_tool_names(
 ///   `"edit"`'s 12 tools span 6 different toolsets), not toolset unions —
 ///   that's deliberate and predates this function; see `preset_tools`.
 /// - Anything else is parsed as a composable spec: a comma-separated list
-///   of `TOOLSET_NAMES` entries (or `"full"`), each optionally prefixed
-///   with `-` to SUBTRACT that toolset's tools from the accumulated set
-///   instead of adding it (e.g. `"trace,security"` unions two toolsets;
-///   `"full,-edit"` is every tool except the edit toolset's). This is the
-///   new, actually-composable half of the registry — deliberately scoped
-///   to whole-toolset granularity, not individual tool names, both to
-///   keep `calm_core::config::VALID_TOOLSET_NAMES` a small syntactically
+///   of `TOOLSET_NAMES` entries (or `"full"`, or the virtual
+///   capability-derived `"remote-safe"` token — every tool with
+///   `read_only_hint = true`, see `remote_safe_tool_names`), each
+///   optionally prefixed with `-` to SUBTRACT that group's tools from the
+///   accumulated set instead of adding it (e.g. `"trace,security"` unions
+///   two toolsets; `"full,-edit"` is every tool except the edit toolset's).
+///   This is the new, actually-composable half of the registry —
+///   deliberately scoped to whole-toolset (or whole-virtual-group)
+///   granularity, not individual tool names, both to keep
+///   `calm_core::config::VALID_TOOLSET_NAMES` a small syntactically
 ///   checkable list and because per-tool `-`-tokens are a natural, non-
 ///   breaking extension of this same grammar if ever needed later.
 ///
@@ -260,6 +298,19 @@ pub(crate) fn resolve_preset(
                 excluded.extend(calm_all_tool_names());
             } else {
                 include_all = true;
+            }
+            continue;
+        }
+        // Virtual, capability-derived group (not a real `#[tool_router]`
+        // toolset, so deliberately not in `TOOLSET_NAMES`/`toolset_tools`)
+        // -- every tool with `read_only_hint = true`. See
+        // `remote_safe_tool_names`'s doc comment for why this replaced
+        // `"full,-edit"` as the forced non-loopback HTTP preset.
+        if name == "remote-safe" {
+            if is_exclude {
+                excluded.extend(remote_safe_tool_names());
+            } else {
+                included.extend(remote_safe_tool_names());
             }
             continue;
         }
@@ -364,6 +415,52 @@ mod preset_registry_tests {
             resolved.contains("repo_overview"),
             "non-excluded tool should remain"
         );
+    }
+
+    #[test]
+    fn remote_safe_excludes_every_known_state_mutating_or_process_executing_tool() {
+        // The exact set of tools "full,-edit" (the OLD forced non-loopback
+        // preset) left reachable despite the "read-only" framing --
+        // `remote-safe` must exclude every one of them, not just
+        // edit_lines/edit_symbol/format_files.
+        let remote_safe = remote_safe_tool_names();
+        for tool in [
+            "edit_lines",
+            "edit_symbol",
+            "format_files",
+            "remember",
+            "verify_change",
+            "retry_maintenance",
+            "scip_refresh",
+            "lsp_refresh",
+            "set_toolset",
+            "pattern_debt_register",
+        ] {
+            assert!(
+                !remote_safe.contains(tool),
+                "remote-safe must exclude {tool:?} (not read_only_hint=true)"
+            );
+        }
+        for tool in [
+            "repo_overview",
+            "search",
+            "callers",
+            "recall",
+            "repair_consistency",
+            "maintenance_status",
+            "edit_transaction_status",
+        ] {
+            assert!(
+                remote_safe.contains(tool),
+                "remote-safe must still include genuinely read-only tool {tool:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_preset_remote_safe_matches_remote_safe_tool_names() {
+        let resolved = resolve_preset("remote-safe").unwrap().unwrap();
+        assert_eq!(resolved, remote_safe_tool_names());
     }
 
     #[test]

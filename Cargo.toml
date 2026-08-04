@@ -237,6 +237,14 @@ tracing-opentelemetry = { version = "0.33" }
 # 0.8 + rmcp 2.2.0 (transport-streamable-http-server) resolve and build
 # clean together (both on http 1.x / tower-service 0.3.x).
 axum = "0.8"
+# Same `http` feature as axum above -- already present transitively in
+# Cargo.lock (pulled in by axum/hyper's own stack) at this exact version, so
+# declaring it directly adds no new supply-chain surface. `limit` is the
+# only feature enabled: `ConcurrencyLimitLayer`, used for basic HTTP-
+# transport DoS hardening (docs/http-transport.md already documents this
+# transport has no built-in protection -- see serve_http's doc comment for
+# what this closes and what it deliberately doesn't).
+tower = { version = "0.5", default-features = false, features = ["limit"] }
 
 # Internal
 calm-core = { path = "crates/calm-core" }

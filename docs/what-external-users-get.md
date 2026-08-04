@@ -20,13 +20,13 @@ This page describes exactly what you get from **installing CALM via `npx @eilodo
 
 ---
 
-## 2. 35 MCP tools across an 8-stage workflow
+## 2. 36 MCP tools across an 8-stage workflow
 
 **Navigation**: `search`, `locate`, `file_overview`, `symbol_info`, `source`, `understand`, `symbols_batch`
 **Repo health**: `repo_overview`, `hotspots`, `fitness_report`
 **Code edits**: `edit_lines`, `edit_symbol`, `format_files`
 **Safety gates**: `edit_context`, `diff_impact`
-**Graph**: `callers`, `callees`, `dependencies`, `path`
+**Graph**: `callers`, `callees`, `dependencies`, `path`, `reference_impact`
 **Security/test**: `scan_text`, `test_gap_hotspots`
 **Pattern debt**: `pattern_debt_register`, `pattern_debt_status`
 **Memory**: `remember`, `recall`
@@ -38,7 +38,7 @@ This page describes exactly what you get from **installing CALM via `npx @eilodo
 ### Toolsets and presets — two layers, not one flat list
 
 - **14 fine-grained toolsets** (module-domain): `trace`, `locate`, `orient`, `memory`, `guardrails`, `recover`, `scip`, `lsp`, `security`, `testgap`, `inspect`, `edit`, `patterndebt`, `txn`
-- **5 cross-cutting presets**: `full` (default, all 35 tools), `orient`, `trace`, `edit`, `compound`
+- **5 cross-cutting presets**: `full` (default, all 36 tools), `orient`, `trace`, `edit`, `compound`
 - Composable syntax: `--preset "trace,security"` unions toolsets, `--preset "full,-edit"` subtracts one — an unrecognized token is a hard error, never a silent grant of full access
 
 ---

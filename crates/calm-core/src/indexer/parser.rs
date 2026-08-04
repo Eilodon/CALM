@@ -172,6 +172,12 @@ fn node_kind_to_symbol_kind(node_kind: &str, in_class: bool) -> SymbolKind {
         }
     }
 }
+// Bounds a single pathological parse (deeply nested/adversarial source) from
+// hanging the indexer. `Parser::parse` returns `None` on timeout, same as any
+// other parse failure -- every caller's existing `Option` handling already
+// covers this with no further changes needed.
+const PARSE_TIMEOUT_MICROS: u64 = 5_000_000;
+
 /// Parse `source` for a tier-0 `language` into a tree-sitter tree, or `None` if
 /// the language is unsupported or parsing fails. Single source of the per-language
 /// grammar mapping.
@@ -179,6 +185,7 @@ pub fn parse_tree(source: &str, language: &str) -> Option<tree_sitter::Tree> {
     let lang = (crate::indexer::lang_constants::find_spec(language)?.ts_language)()?;
     let mut parser = tree_sitter::Parser::new();
     parser.set_language(&lang).ok()?;
+    parser.set_timeout_micros(PARSE_TIMEOUT_MICROS);
     parser.parse(source, None)
 }
 pub fn extract_symbols(

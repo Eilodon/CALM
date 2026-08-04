@@ -89,9 +89,16 @@ global configs, not project-level.
 
 Want a **portable/shareable** config (commit `.mcp.json` to the repo for the
 whole team/CI, independent of the binary path on your machine)?
-`calm setup --npx` writes the entry as `npx -y @eilodon/calm-mcp serve`
-instead of an absolute path — it automatically tracks the published npm
-version, and only needs Node wherever it runs.
+`calm setup --npx` writes the entry as `npx -y @eilodon/calm-mcp@<version>
+serve` instead of an absolute path — only needs Node wherever it runs.
+By default it **pins** to this `calm` binary's own version, so a fresh `npx`
+resolution (a new CI runner, a teammate's first checkout) always fetches the
+exact same release instead of silently picking up whatever npm happens to
+have published as `@latest` at that moment — reproducible tool
+schemas/behavior across every machine that reads the same committed config.
+Pass `--track latest` if you deliberately want the old unpinned
+`npx -y @eilodon/calm-mcp serve` behavior instead (always resolves to
+npm's current `@latest` on every cold invocation).
 
 ## Launcher resolves a binary in 3 tiers
 

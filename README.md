@@ -86,7 +86,7 @@ Full walkthrough for every client above, including exact global-config snippets 
 
 Drop that into `.mcp.json` (Claude Code/Cursor) or `.vscode/mcp.json` (VS Code uses a top-level `"servers"` key instead of `"mcpServers"`, same shape otherwise) at your project root. Claude Code plugin instead: `/plugin marketplace add Eilodon/CALM` then `/plugin install calm@CALM`.
 
-Prefer a native binary over npx? `curl -fsSL https://raw.githubusercontent.com/Eilodon/CALM/main/scripts/install.sh | sh`, then run `calm setup` from inside your project — it writes the same MCP config automatically, pointing at the binary you just installed. Add `calm setup --npx` instead to write the portable `npx` entry (shareable/committable — teammates and CI don't need the binary, and it tracks the published release).
+Prefer a native binary over npx? `curl -fsSL https://raw.githubusercontent.com/Eilodon/CALM/main/scripts/install.sh | sh`, then run `calm setup` from inside your project — it writes the same MCP config automatically, pointing at the binary you just installed. Add `calm setup --npx` instead to write the portable `npx` entry (shareable/committable — teammates and CI don't need the binary). It pins to this binary's own version by default for reproducible cold installs; pass `--track latest` to always resolve npm's newest release instead.
 
 **Developing on CALM itself** (this repo):
 
@@ -175,7 +175,7 @@ Full technical detail lives in [`docs/architecture.md`](docs/architecture.md) �
 ## Crate layout
 
 - `crates/calm-core/` — the index engine: `tree-sitter` parsing, SQLite schema, the multi-tier resolver (conservative → inferred → formal/Stack-Graphs, SCIP, or LSP), graph algorithms (coreness, hub detection), FTS5/semantic search, analysis (hotspots, coverage, codeowners, diff-impact, dead-code), fitness metrics, gitignore management.
-- `crates/calm-server/` — the MCP server (`rmcp` over stdio or a unix-socket daemon), exposing 35 tools plus the incremental file watcher.
+- `crates/calm-server/` — the MCP server (`rmcp` over stdio or a unix-socket daemon), exposing 36 tools plus the incremental file watcher.
 - `crates/calm-cli/` — the CLI: `calm init`, `calm index`, `calm serve`, `calm connect`, `calm setup`, `calm fitness-check`, `calm doctor`.
 
 ## CLI reference
@@ -199,7 +199,7 @@ calm scip-run --project-root .                  # --lang omitted = run every pro
 calm index    --project-root . --scip-file build/index.scip --sub-root services/api   # ingest a pre-built SCIP index (CI/sandboxed, no external indexer install needed)
 ```
 
-## 35 MCP tools for AI agents
+## 36 MCP tools for AI agents
 CLI presets filter tools by workflow phase: `orient`, `trace`, `edit`, `compound`, `full` (default) via `calm serve --preset` or the `preset` field in `config.json` — or compose a custom set from toolset (module) names, e.g. `--preset "trace,security"` or `--preset "full,-edit"` (see AGENTS.md for the full toolset list). Every response carries `suggested_next` to point at the next step — full detail on each tool and the complete workflow lives in [AGENTS.md](AGENTS.md).
 
 | Group | Tools |
@@ -207,7 +207,7 @@ CLI presets filter tools by workflow phase: `orient`, `trace`, `edit`, `compound
 | Orient | `repo_overview`, `hotspots`, `fitness_report` (health snapshot — same metrics as `calm fitness-check`, queryable mid-session), `indexing_status`, `test_gap_hotspots` (ranks symbols by coreness × dead-code/test-coverage confidence — where test-writing effort pays off most) |
 | Locate | `locate`, `search`, `file_overview` |
 | Inspect | `source`, `symbol_info`, `understand`, `symbols_batch` (source + callers/callees for several exact `qualified_name`s in one round trip) |
-| Trace | `callers`, `callees` (ordered, capped, etag-cacheable on hub symbols), `path`, `dependencies` |
+| Trace | `callers`, `callees` (ordered, capped, etag-cacheable on hub symbols), `path`, `dependencies`, `reference_impact` (merges call edges, import edges, and a textual grep into one classified rename/removal reference list — broader but coarser than `callers`/`dependencies` alone) |
 | Edit | `edit_context` (mandatory before any edit), `edit_lines`/`edit_symbol` (the one write tool for arbitrary content — hash-verified; a hub/high-risk touch is refused unless `edit_context` ran for that exact symbol this session, `confirm:true` is passed, and `reason` cites a real caller `edit_context` returned), `format_files` (rustfmt via stdin only — never a positional file arg, so it can't trigger rustfmt's own crate-wide `mod`-tree discovery and reformat files outside its own `paths` list; no confirm/edit_context gate since formatting can't change semantics), `pattern_debt_register`/`pattern_debt_status` (anchor a duplicated bug pattern by qualified_name via `search(kind="similar")`, re-check later for `open`/`resolved`/`anchor_lost`), `diff_impact` (mandatory before commit) — `edit_context` and `diff_impact` are hook-enforced under Claude Code (see `.claude/hooks/calm-nudge.sh`); `session_context`'s `pending_diff_impact` is the equivalent signal on any other MCP client |
 | Txn (admin) | `edit_transaction_status`, `maintenance_status`, `retry_maintenance`, `repair_consistency`, `verify_change` (WS-6 first slice: on-demand cargo check for an opt-in-verified edit) — transaction/maintenance-outbox diagnostics for the WS-1 durable edit-transaction journal that `edit_lines`/`format_files` now write through; registered under their own `txn` toolset, included in the `edit` preset (not `orient`/`trace`/`compound`) |
 | Recover | `session_context`, `remember`, `recall` |
@@ -280,7 +280,7 @@ This repo's own `thresholds.toml` currently declares two: the one above, plus `c
 
 - **Default mode is MCP stdio.** The launcher uses the shared Unix daemon when invoked without extra launcher arguments on Unix; custom invocations, CI, and Windows can use one-process `calm serve`.
 - **HTTP is opt-in.** `calm serve --http` binds to `127.0.0.1:8787` by default. Non-loopback exposure requires `--allow-remote` and a non-empty `CALM_HTTP_TOKEN` sent as a Bearer token.
-- **Remote HTTP is read-only.** CALM forces the effective preset to `full,-edit`; terminate TLS at a reverse proxy. The built-in HTTP transport does not provide rate limiting or DoS protection, so do not expose it directly to an untrusted network.
+- **Remote HTTP is read-only.** CALM forces the effective preset to `remote-safe` — every tool that declares `read_only_hint = true`, computed from the tool router itself rather than a hand-maintained list, so it can't silently miss a newly added state-mutating tool; terminate TLS at a reverse proxy. The built-in HTTP transport caps request body size and concurrent requests as defense-in-depth, but has no real rate limiting or per-IP DoS protection, so do not expose it directly to an untrusted network.
 
 ## Testing
 
@@ -303,6 +303,7 @@ The workspace contains 1,000+ tests; the latest CI `verify` job is the source of
 - [`docs/mcp-client-setup.md`](docs/mcp-client-setup.md) — every MCP client install path in detail, including Windsurf/Devin Desktop and Codex global config.
 - [`docs/http-transport.md`](docs/http-transport.md) — the opt-in remote/HTTP transport (`calm serve --http`): loopback-by-default, the fail-closed `--allow-remote` + token requirement, why remote exposure forces a read-only preset, and the TLS/reverse-proxy expectation.
 - [`AGENTS.md`](AGENTS.md) — the full tool-by-tool workflow guide this project's own agents follow.
+- [`KNOWN_LIMITATIONS.md`](KNOWN_LIMITATIONS.md) — an honest list of what CALM doesn't do yet (single-language unsandboxed verification, no multi-file change-set, no reference-impact tool, risk classification with no change-kind signal, and more), and why each is deliberately deferred rather than half-built.
 - [`benchmarks/`](benchmarks/) — the measurement suite behind benchmark claims in this README, and a few more: `b2_call_graph_quality/` (precision/recall vs. a SCIP oracle), `b3_search_quality/` (hybrid RRF vs. FTS-only vs. raw grep, NDCG@10), `b4_token_efficiency/` (token cost vs. a naive baseline, per task), `b6_tool_call_efficiency/` (round-trips: naive multi-call vs. one MCP call), `b7_task_correctness/` (real rename refactors across 6 language corpora — fd/Rust, flask/Python, express/JS, zod/TS, gin/Go, spring-petclinic/Java — checked against an independent pass/fail oracle, not an LLM judge), `b11_extended_competitor_ab/` (real calls against 4 other live MCP servers, not self-reported numbers), `b12_tier1_tier2_tool_correctness/` (9 tools driven live over JSON-RPC against 6 external OSS repos, ground-truthed against regex/`git grep`), `resolution/` (tier-distribution baseline across 19 real OSS repos, one per language). Unflattering results are published alongside good ones on purpose — `benchmarks/README.md` states that policy.
 
 ## License

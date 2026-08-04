@@ -64,7 +64,14 @@ impl CalmServer {
         let fingerprint = fingerprint_edit_lines(&p);
         match mechanism {
             ElicitMechanism::Mrtr { timeout } => {
-                match self.hub_mrtr_ask("edit_lines", &p.path, &fingerprint, &ask_ctx, p.reason.as_deref(), timeout) {
+                match self.hub_mrtr_ask(
+                    "edit_lines",
+                    &p.path,
+                    &fingerprint,
+                    &ask_ctx,
+                    p.reason.as_deref(),
+                    timeout,
+                ) {
                     Ok(result) => HubEditToolResult::NeedsApproval(result),
                     Err(detail) => HubEditToolResult::Done(Json(ToolOutcome::error(detail))),
                 }
@@ -196,6 +203,7 @@ impl CalmServer {
                 hunks,
                 p.confirm,
                 p.reason.as_deref(),
+                p.cites.as_deref(),
                 false,
                 None,
                 gate,
@@ -226,7 +234,12 @@ impl CalmServer {
             let fingerprint = fingerprint_edit_symbol(&p);
             let cache_key_path = p.path.clone().unwrap_or_else(|| p.symbol.clone());
             return HubEditToolResult::Done(Json(
-                match self.hub_mrtr_decide("edit_symbol", &cache_key_path, &fingerprint, continuation) {
+                match self.hub_mrtr_decide(
+                    "edit_symbol",
+                    &cache_key_path,
+                    &fingerprint,
+                    continuation,
+                ) {
                     Ok(()) => self.edit_symbol_flow(&p, ElicitGate::Approved, &mut None),
                     Err(detail) => ResolvedOutcome::error(detail),
                 },
@@ -250,7 +263,14 @@ impl CalmServer {
         let cache_key_path = p.path.clone().unwrap_or_else(|| p.symbol.clone());
         match mechanism {
             ElicitMechanism::Mrtr { timeout } => {
-                match self.hub_mrtr_ask("edit_symbol", &cache_key_path, &fingerprint, &ask_ctx, p.reason.as_deref(), timeout) {
+                match self.hub_mrtr_ask(
+                    "edit_symbol",
+                    &cache_key_path,
+                    &fingerprint,
+                    &ask_ctx,
+                    p.reason.as_deref(),
+                    timeout,
+                ) {
                     Ok(result) => HubEditToolResult::NeedsApproval(result),
                     Err(detail) => HubEditToolResult::Done(Json(ResolvedOutcome::error(detail))),
                 }
@@ -357,6 +377,7 @@ impl CalmServer {
                         vec![hunk],
                         p.confirm,
                         p.reason.as_deref(),
+                        p.cites.as_deref(),
                         true,
                         None,
                         gate,
@@ -498,6 +519,7 @@ impl CalmServer {
                 vec![hunk],
                 p.confirm,
                 p.reason.as_deref(),
+                p.cites.as_deref(),
                 position_anchored,
                 insertion_note,
                 gate,
@@ -845,6 +867,7 @@ impl CalmServer {
         hunks: Vec<calm_core::edit::HunkRequest>,
         confirm: bool,
         reason: Option<&str>,
+        cites: Option<&str>,
         position_anchored: bool,
         extra_note: Option<String>,
         gate: ElicitGate,
@@ -1041,6 +1064,7 @@ impl CalmServer {
             uncertain_zero_caller,
             pre_touched,
             fresh_caller_digests,
+            risk_rule_reason,
         ) = {
             let conn = match self.make_read_conn() {
                 Ok(c) => c,
@@ -1050,9 +1074,20 @@ impl CalmServer {
                 .iter()
                 .map(|h| (h.start_line as i64, h.end_line as i64))
                 .collect();
+            let proposed_hunks: Vec<(i64, i64, &str)> = hunks
+                .iter()
+                .map(|h| (h.start_line as i64, h.end_line as i64, h.new_text.as_str()))
+                .collect();
             let coverage = self.coverage.read_ok();
-            let (risk, hub_hit, hub_kind, uncertain_zero_caller, touched) =
-                compute_touch_risk(&conn, path, &ranges, &coverage);
+            let (risk, hub_hit, hub_kind, uncertain_zero_caller, touched, risk_rule_reason) =
+                compute_touch_risk(
+                    &conn,
+                    path,
+                    &ranges,
+                    &coverage,
+                    &self.config().risk_rules,
+                    &proposed_hunks,
+                );
             // Plan 3 §3.3 (F10): a bridge-only touch (never degree/both) at
             // risk ≤ medium MAY use the lighter CONFIRM_REQUIRED-only tier
             // below — but ONLY if every touched hub's caller edges are all
@@ -1102,6 +1137,7 @@ impl CalmServer {
                 uncertain_zero_caller,
                 touched,
                 fresh_caller_digests,
+                risk_rule_reason,
             )
         };
         // `always_require_edit_context` (Config.edit) widens this gate to
@@ -1116,6 +1152,7 @@ impl CalmServer {
             uncertain_zero_caller,
             bridge_downgrade_eligible,
             force_gate_always,
+            risk_rule_reason.as_deref(),
         );
         if gate_classification.will_block_without_confirm {
             let why = gate_classification.why.unwrap_or_default();
@@ -1333,6 +1370,24 @@ impl CalmServer {
                     }
                 } else if high_risk_needs_independent_review {
                     false
+                } else if let Some(cited_qn) = cites.filter(|c| !c.is_empty()) {
+                    // Structured citation: `cites` must be the EXACT
+                    // qualified_name of one of the caller edges edit_context
+                    // returned THIS session for this symbol -- `known_caller_
+                    // qns` above is already freshness/digest-verified (the
+                    // same guarantee a lexical `reason` citation relies on),
+                    // so this is strictly stronger: an equality check against
+                    // a structured field, not a substring search inside free
+                    // text. Closes the gap a lexical match leaves open (an
+                    // agent pasting a real caller name into an unrelated
+                    // sentence still satisfies `cites_token`, but can't
+                    // satisfy an exact-equality check by accident). When
+                    // `cites` is given, it's authoritative on its own --
+                    // deliberately NOT falling back to the lexical check
+                    // below on a mismatch, so a wrong/stale `cites` value
+                    // fails loudly instead of silently degrading to the
+                    // weaker path.
+                    known_caller_qns.iter().any(|qn| qn == cited_qn)
                 } else {
                     known_caller_qns.iter().any(|qn| {
                         let short = qn.rsplit("::").next().unwrap_or(qn);
@@ -1399,15 +1454,27 @@ impl CalmServer {
                         })
                         .take(3)
                         .collect();
+                    let full_qns: Vec<&str> = known_caller_qns
+                        .iter()
+                        .map(String::as_str)
+                        .take(3)
+                        .collect();
                     return ToolOutcome::error(error_detail(
                         "REASON_NOT_GROUNDED",
                         &format!(
                             "reason must reference at least one real caller edit_context \
-                             returned ({}), or explicitly state why none apply",
+                             returned ({}), or set `cites` to one of their exact qualified \
+                             names ({}) -- `cites` is the stronger, ungameable form (exact \
+                             match, not a substring search) -- or explicitly state why none apply",
                             if examples.is_empty() {
                                 "this symbol has no confirmed callers".to_string()
                             } else {
                                 examples.join(", ")
+                            },
+                            if full_qns.is_empty() {
+                                "none".to_string()
+                            } else {
+                                full_qns.join(", ")
                             }
                         ),
                         true,
@@ -1838,7 +1905,8 @@ impl CalmServer {
                 .map(|r| (r.start_line as i64, r.new_end_line as i64))
                 .collect();
             let coverage = self.coverage.read_ok();
-            let (_, _, _, _, touched) = compute_touch_risk(&conn, path, &new_ranges, &coverage);
+            let (_, _, _, _, touched, _) =
+                compute_touch_risk(&conn, path, &new_ranges, &coverage, &[], &[]);
             touched
         };
 
@@ -1963,7 +2031,9 @@ enum HubEditToolResult<T> {
 impl<T: Serialize + JsonSchema + 'static> rmcp::handler::server::tool::IntoCallToolResult
     for HubEditToolResult<T>
 {
-    fn into_call_tool_result(self) -> Result<rmcp::model::CallToolResponse, rmcp::model::ErrorData> {
+    fn into_call_tool_result(
+        self,
+    ) -> Result<rmcp::model::CallToolResponse, rmcp::model::ErrorData> {
         match self {
             Self::Done(json) => json.into_call_tool_result(),
             Self::NeedsApproval(result) => result.into_call_tool_result(),
@@ -1989,9 +2059,9 @@ impl CalmServer {
             return None;
         }
         let timeout = std::time::Duration::from_secs(cfg.elicit_timeout_secs);
-        let mrtr_capable = ctx.protocol_version().is_some_and(|v| {
-            v.as_str() >= rmcp::model::ProtocolVersion::V_2026_07_28.as_str()
-        });
+        let mrtr_capable = ctx
+            .protocol_version()
+            .is_some_and(|v| v.as_str() >= rmcp::model::ProtocolVersion::V_2026_07_28.as_str());
         if mrtr_capable {
             return Some(ElicitMechanism::Mrtr { timeout });
         }
@@ -2102,13 +2172,14 @@ impl CalmServer {
                     false,
                 )
             })?;
-        let schema = rmcp::model::ElicitationSchema::from_type::<HubEditApproval>().map_err(|e| {
-            error_detail(
-                "ELICITATION_FAILED",
-                &format!("could not build the approval schema: {e}"),
-                false,
-            )
-        })?;
+        let schema =
+            rmcp::model::ElicitationSchema::from_type::<HubEditApproval>().map_err(|e| {
+                error_detail(
+                    "ELICITATION_FAILED",
+                    &format!("could not build the approval schema: {e}"),
+                    false,
+                )
+            })?;
         let mut input_requests = rmcp::model::InputRequests::new();
         input_requests.insert(
             "approval".to_string(),
@@ -2156,17 +2227,15 @@ impl CalmServer {
         })?;
         let codec = rmcp::model::RequestStateCodec::new(key.to_vec());
         let seal: HubEditStateSeal =
-            codec
-                .open_json(&continuation.request_state)
-                .map_err(|_| {
-                    error_detail(
-                        "ELICITATION_FAILED",
-                        "the approval request has expired or its state could not be \
+            codec.open_json(&continuation.request_state).map_err(|_| {
+                error_detail(
+                    "ELICITATION_FAILED",
+                    "the approval request has expired or its state could not be \
                          verified — nothing was written (fail-closed); retry the edit \
                          to ask again",
-                        false,
-                    )
-                })?;
+                    false,
+                )
+            })?;
         if seal.tool != tool || seal.cache_path != cache_path || seal.fingerprint != fingerprint {
             return Err(error_detail(
                 "ELICITATION_FAILED",
@@ -2259,9 +2328,7 @@ fn map_elicit_outcome(
 /// peer, exactly like `map_elicit_outcome`. `hub_mrtr_decide` handles the
 /// separate MRTR-specific failure modes (expired/tampered `request_state`,
 /// malformed answer JSON) before ever reaching this function.
-fn decide_mrtr_answer(
-    answer: Option<HubEditApproval>,
-) -> (&'static str, Result<(), ErrorDetail>) {
+fn decide_mrtr_answer(answer: Option<HubEditApproval>) -> (&'static str, Result<(), ErrorDetail>) {
     match answer {
         Some(HubEditApproval { approve: true }) => ("elicit_approved", Ok(())),
         Some(HubEditApproval { approve: false }) | None => (
@@ -2469,24 +2536,40 @@ fn hub_kind_strength(kind: &str) -> u8 {
 /// applicable", not a "confirmed safe" signal, so counting it here would
 /// force the full write gate on nearly every struct/enum edit in this
 /// codebase for no real reason.
-pub(crate) fn compute_touch_risk(
-    conn: &rusqlite::Connection,
-    path: &str,
-    ranges: &[(i64, i64)],
-    coverage: &calm_core::analysis::coverage::CoverageData,
-) -> (
+/// `compute_touch_risk`'s return: `(risk, hub_hit, strongest_hub_kind,
+/// uncertain_zero_caller, touched, risk_rule_reason)`. The 6th element,
+/// `risk_rule_reason`, is `Some(human-readable reason)` iff either a
+/// `risk_rules` entry, OR the edit overlapping a touched symbol's own
+/// signature line range, raised `risk` above what the structural
+/// (caller-count/hub) signal alone would have produced -- `classify_gate`
+/// uses this instead of its generic ">10 callers" explanation when present,
+/// so the gate's stated reason stays accurate to what actually triggered it.
+type TouchRiskResult = (
     Option<String>,
     bool,
     Option<String>,
     Option<UncertainZeroCallerReason>,
     Vec<TouchedSymbolOutput>,
-) {
+    Option<String>,
+);
+
+pub(crate) fn compute_touch_risk(
+    conn: &rusqlite::Connection,
+    path: &str,
+    ranges: &[(i64, i64)],
+    coverage: &calm_core::analysis::coverage::CoverageData,
+    risk_rules: &[calm_core::config::RiskRule],
+    proposed_hunks: &[(i64, i64, &str)],
+) -> TouchRiskResult {
     let rows = symbols_overlapping_ranges(conn, path, ranges);
     let mut max_callers = 0i64;
     let mut hub_hit = false;
     let mut strongest_hub_kind: Option<String> = None;
     let mut uncertain_zero_caller: Option<UncertainZeroCallerReason> = None;
     let mut touched = Vec::with_capacity(rows.len());
+    // First function/method whose own signature is semantically changed by
+    // `proposed_hunks` -- see the signature-escalation block below.
+    let mut signature_touch: Option<String> = None;
     for row in rows {
         max_callers = max_callers.max(row.caller_count);
         hub_hit |= row.is_hub;
@@ -2496,6 +2579,40 @@ pub(crate) fn compute_touch_risk(
                 .is_none_or(|cur| hub_kind_strength(k) > hub_kind_strength(cur));
             if stronger {
                 strongest_hub_kind = Some(k.clone());
+            }
+        }
+        if signature_touch.is_none()
+            && !row.signature.is_empty()
+            && matches!(row.kind.as_str(), "function" | "method")
+        {
+            // Same `sig_end` formula diff_impact's own post-hoc signature
+            // check uses (guardrails.rs) -- the indexer's signature
+            // extraction already scans to the real body-opening delimiter,
+            // so its embedded newline count tells us exactly how many
+            // lines the real signature spans, clamped to the symbol's own
+            // end as a defensive bound.
+            let sig_end =
+                (row.line_start + row.signature.matches('\n').count() as i64).min(row.line_end);
+            // Only a hunk that FULLY COVERS the signature range lets us
+            // extract a trustworthy "new signature" candidate (its own
+            // leading lines) -- a hunk only partially overlapping it, or
+            // not covering it at all (a body-only edit), is deliberately
+            // NOT treated as a signature change. This is why a plain
+            // line-overlap check doesn't work here: edit_symbol's default
+            // "replace whole body" hunk always covers the signature line
+            // too, even when the signature text itself is byte-for-byte
+            // unchanged -- the overwhelmingly common case, which a bare
+            // overlap check would wrongly flag every single time.
+            if let Some(new_sig_text) = proposed_hunks.iter().find_map(|&(hs, he, new_text)| {
+                (hs <= row.line_start && he >= sig_end).then(|| {
+                    let take_n = row.signature.matches('\n').count() + 1;
+                    new_text.lines().take(take_n).collect::<Vec<_>>().join("\n")
+                })
+            }) && calm_core::analysis::diff_impact::is_signature_semantically_changed(
+                &row.signature,
+                &new_sig_text,
+            ) {
+                signature_touch = Some(row.qualified_name.clone());
             }
         }
         if row.caller_count == 0 && matches!(row.kind.as_str(), "function" | "method") {
@@ -2539,14 +2656,83 @@ pub(crate) fn compute_touch_risk(
             hub_kind: row.hub_kind,
         });
     }
-    let risk = (!touched.is_empty()).then(|| risk_level_from_caller_count(max_callers).to_string());
+    let structural_risk =
+        (!touched.is_empty()).then(|| risk_level_from_caller_count(max_callers).to_string());
+
+    // Signature-change escalation: a hunk that fully replaces a touched
+    // function/method's own signature text (not just overlaps its lines)
+    // can break every call site, not just the lines being edited --
+    // escalate the same way diff_impact's own post-hoc
+    // `escalate_risk_if_signature_changed` does, reusing that exact
+    // function and its "high" ceiling. `signature_touch` above already did
+    // the real (semantic, not line-overlap) comparison via
+    // `is_signature_semantically_changed` -- the same function diff_impact
+    // itself calls after its own line-overlap pre-filter.
+    let (risk, escalation_reason) = match (&structural_risk, &signature_touch) {
+        (Some(level), Some(qn)) => {
+            let mut reasons = Vec::new();
+            let escalated = calm_core::analysis::diff_impact::escalate_risk_if_signature_changed(
+                true,
+                level,
+                &mut reasons,
+            );
+            let reason = (escalated != *level).then(|| {
+                format!(
+                    "this edit changes {qn}'s own signature — signature changes can break \
+                     every call site, not just the range being edited"
+                )
+            });
+            (Some(escalated), reason)
+        }
+        _ => (structural_risk, None),
+    };
+
+    let (risk, risk_rule_reason) = match calm_core::config::risk_floor_for_path(risk_rules, path) {
+        None => (risk, escalation_reason),
+        Some((floor, glob)) => {
+            let floor_severity = risk_severity(floor);
+            let current_severity = risk.as_deref().map(risk_severity).unwrap_or(0);
+            if floor_severity > current_severity {
+                (
+                    Some(floor.to_string()),
+                    Some(format!(
+                        "path {path:?} matches this project's risk_rules glob {glob:?} \
+                         (minimum: {floor})"
+                    )),
+                )
+            } else {
+                (risk, escalation_reason)
+            }
+        }
+    };
     (
         risk,
         hub_hit,
         strongest_hub_kind,
         uncertain_zero_caller,
         touched,
+        risk_rule_reason,
     )
+}
+
+/// Ordering `classify_gate` itself understands (`"low"` < `"medium"` <
+/// `"high"`) -- deliberately NOT `calm_core::analysis::diff_impact::
+/// RiskOrder`, which also has `"critical"` (understood by `diff_impact`'s
+/// advisory reporting, but not by this write-blocking gate, which only
+/// ever checks `risk == Some("high")`). Any string outside the 3 gate
+/// levels sorts as `0` (lowest) rather than erroring -- `risk_rules`
+/// entries are already validated against exactly this level set at config
+/// load (`calm_core::config::load_config`), so this is unreachable for a
+/// `RiskRule.minimum` in practice; treating an unexpected value as "no
+/// escalation" rather than panicking is the conservative fallback for the
+/// other input, `structural_risk`, which `risk_level_from_caller_count`
+/// guarantees is always one of the 3 anyway.
+fn risk_severity(level: &str) -> u8 {
+    match level {
+        "high" => 2,
+        "medium" => 1,
+        _ => 0,
+    }
 }
 
 /// Which tier of the `edit_lines`/`edit_symbol` write gate a touched range
@@ -2599,12 +2785,18 @@ pub(crate) struct GateClassification {
 /// `edit_lines_impl_gated`'s gate condition exactly; any change to that
 /// gate's structural logic (not its session-state checks) must be made here
 /// so both call sites stay in sync.
+///
+/// `risk_rule_reason` is `compute_touch_risk`'s 6th return value -- when
+/// `risk == Some("high")` was reached via a `risk_rules` path match rather
+/// than caller count, this carries the accurate reason so `why` doesn't
+/// misattribute the gate to ">10 callers".
 pub(crate) fn classify_gate(
     hub_hit: bool,
     risk: Option<&str>,
     uncertain_zero_caller: Option<UncertainZeroCallerReason>,
     bridge_downgrade_eligible: bool,
     force_gate_always: bool,
+    risk_rule_reason: Option<&str>,
 ) -> GateClassification {
     if !(hub_hit || risk == Some("high") || uncertain_zero_caller.is_some() || force_gate_always) {
         return GateClassification {
@@ -2628,7 +2820,9 @@ pub(crate) fn classify_gate(
             }
         }
     } else if risk == Some("high") {
-        "a high-risk symbol (>10 callers)".to_string()
+        risk_rule_reason
+            .map(|r| r.to_string())
+            .unwrap_or_else(|| "a high-risk symbol (>10 callers)".to_string())
     } else {
         "this project's `edit.always_require_edit_context` config (every edit requires edit_context first, regardless of risk)".to_string()
     };
@@ -3073,6 +3267,18 @@ pub(crate) struct EditLinesParams {
     /// free-form justification a generic phrase could satisfy.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) reason: Option<String>,
+    /// Stronger, structured alternative to citing a caller inside `reason`'s
+    /// free text: set this to the EXACT `qualified_name` of one of the
+    /// caller edges returned by `edit_context` for the touched symbol THIS
+    /// session (already freshness-checked the same way `reason`'s citation
+    /// is). Checked by exact equality, not a substring search, so it can't
+    /// be satisfied by pasting a real caller name into an unrelated
+    /// sentence the way `reason` can. When set, it's authoritative on its
+    /// own -- a non-matching `cites` fails with `REASON_NOT_GROUNDED`
+    /// rather than falling back to `reason`. Ignored at the `confirm`-only
+    /// bridge-hub tier and when the symbol has no known callers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) cites: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -3122,6 +3328,9 @@ pub(crate) struct EditSymbolParams {
     /// See `EditLinesParams::reason`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) reason: Option<String>,
+    /// See `EditLinesParams::cites`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) cites: Option<String>,
     /// Small-text-match mode: when set, `new_text` replaces the FIRST
     /// (and required-to-be-only) occurrence of `old_text` found within the
     /// resolved symbol's current range, instead of replacing the whole
@@ -3331,6 +3540,7 @@ mod elicit_tests {
             }],
             confirm: true,
             reason: Some("r".into()),
+            cites: None,
         }
     }
 
@@ -3475,7 +3685,10 @@ mod elicit_tests {
         let continuation = MrtrContinuation {
             input_responses: {
                 let mut m = rmcp::model::InputResponses::new();
-                m.insert("approval".to_string(), serde_json::json!({ "approve": true }));
+                m.insert(
+                    "approval".to_string(),
+                    serde_json::json!({ "approve": true }),
+                );
                 m
             },
             request_state: "not-a-real-sealed-value".to_string(),
@@ -3493,7 +3706,10 @@ mod elicit_tests {
             ("missing", rmcp::model::InputResponses::new()),
             ("false", {
                 let mut m = rmcp::model::InputResponses::new();
-                m.insert("approval".to_string(), serde_json::json!({ "approve": false }));
+                m.insert(
+                    "approval".to_string(),
+                    serde_json::json!({ "approve": false }),
+                );
                 m
             }),
         ] {

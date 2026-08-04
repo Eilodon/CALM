@@ -31,6 +31,11 @@ pub struct Config {
     pub edit: EditConfig,
     pub orientation: OrientationConfig,
     pub verification: VerificationConfig,
+    /// Path-based floor on top of `compute_touch_risk`'s purely structural
+    /// (caller-count/hub) signal -- see `RiskRule`'s own doc comment for
+    /// why this exists and what it can/can't do. Empty by default: zero
+    /// behavior change unless a project opts in.
+    pub risk_rules: Vec<RiskRule>,
 }
 
 impl Default for Config {
@@ -94,8 +99,84 @@ impl Default for Config {
             edit: EditConfig::default(),
             orientation: OrientationConfig::default(),
             verification: VerificationConfig::default(),
+            risk_rules: Vec::new(),
         }
     }
+}
+
+/// One `.calm/config.json` `risk_rules` entry: any edit touching a path
+/// matching `glob` can never be classified below `minimum` risk by the
+/// write gate (`compute_touch_risk`/`classify_gate`,
+/// crates/calm-server/src/tools/edit.rs), regardless of what the purely
+/// structural caller-count/hub signal alone would say. Closes the gap
+/// where a low-fan-in but security-sensitive file (an auth handler, a CI
+/// workflow, a migration) reads as "low risk" simply because few other
+/// symbols happen to call it yet.
+///
+/// Deliberately a FLOOR, never a ceiling: `risk_floor_for_path` only ever
+/// raises the structural risk to `minimum`, never lowers it, so a
+/// misconfigured or malicious `risk_rules` entry can weaken this gate for
+/// no path -- the worst a bad entry can do is over-gate, never under-gate.
+///
+/// Distinct from the ownership-entropy/dead-code-confidence escalations
+/// `edit_context`'s advisory `risk`/`risk_reasons` field also applies
+/// (guardrails.rs) -- those are deliberately kept OUT of the hard
+/// write-blocking gate (see that code's own doc comment: entropy measures
+/// review coverage, not danger-of-being-wrong). A `risk_rules` glob match
+/// is the opposite case: it says "getting this file wrong is dangerous
+/// regardless of how many callers happen to exist today", which is
+/// exactly the axis the hard gate already exists to protect, so it feeds
+/// the gate directly instead of staying advisory-only.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RiskRule {
+    /// Glob matched against the edited file's repo-relative path (forward
+    /// slashes) -- `globset::Glob` syntax, e.g. `"**/auth/**"`,
+    /// `".github/workflows/**"`, `"**/migrations/**"`.
+    pub glob: String,
+    /// One of `VALID_RISK_LEVELS` (`"low"`/`"medium"`/`"high"`) -- must be
+    /// a level `classify_gate` actually understands; validated at config
+    /// load (`load_config`), not silently clamped, since a silently
+    /// no-op'd rule is worse than a loud config error for a
+    /// security-relevant control.
+    pub minimum: String,
+}
+
+/// Risk levels `classify_gate`'s hard write-blocking gate actually
+/// understands -- `RiskRule.minimum` is validated against this list at
+/// config load, not against `RiskOrder`'s broader set (which also has
+/// `"critical"`, understood by `diff_impact`'s advisory reporting but NOT
+/// by the write gate, which only ever checks `risk == Some("high")`).
+pub const VALID_RISK_LEVELS: &[&str] = &["low", "medium", "high"];
+
+fn risk_rule_severity(level: &str) -> u8 {
+    match level {
+        "high" => 2,
+        "medium" => 1,
+        _ => 0,
+    }
+}
+
+/// The highest-severity `rules` entry whose `glob` matches `path`, as
+/// `(minimum, glob)` -- `None` if no rule matches or `rules` is empty (the
+/// default, zero-behavior-change case). `path` is expected repo-relative
+/// with forward slashes, same convention every other glob match in this
+/// crate uses. Compiles each glob fresh per call rather than caching a
+/// `GlobSet` -- `risk_rules` lists are expected to be small (a handful of
+/// security-sensitive path patterns, not thousands), the same "small list,
+/// compile inline" precedent `search.rs`'s own glob matching already sets;
+/// an unparseable glob is treated as a non-match here (validated loudly at
+/// config load instead, see `load_config`, so a bad glob is caught long
+/// before it would ever reach this silent-skip path in practice).
+pub fn risk_floor_for_path<'a>(rules: &'a [RiskRule], path: &str) -> Option<(&'a str, &'a str)> {
+    rules
+        .iter()
+        .filter(|r| {
+            globset::Glob::new(&r.glob)
+                .map(|g| g.compile_matcher().is_match(path))
+                .unwrap_or(false)
+        })
+        .max_by_key(|r| risk_rule_severity(&r.minimum))
+        .map(|r| (r.minimum.as_str(), r.glob.as_str()))
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -151,7 +232,7 @@ impl Default for EditConfig {
 /// `edit_lines`/`edit_symbol` route a transaction through
 /// `TxState::VerifyPending` (crates/calm-core/src/txn.rs) instead of
 /// straight to `Done`, and whether `verify_change` has anything to do.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct VerificationConfig {
     /// When `true` AND the touched file is `.rs`: after a write reaches
@@ -163,6 +244,21 @@ pub struct VerificationConfig {
     /// Only Rust is supported today; a non-`.rs` file is unaffected by this
     /// flag regardless of its value.
     pub rust_check_on_write: bool,
+    /// Wall-clock budget for one `verify_change` run of `cargo check`
+    /// (build.rs/proc-macros/git-dependency fetches can all hang or run
+    /// long) -- exceeding it kills the child process and reports a failed
+    /// verification rather than blocking the tool call indefinitely.
+    /// `DEFAULT_VERIFY_TIMEOUT_SECS` (120s) if unset.
+    pub timeout_secs: u64,
+}
+
+impl Default for VerificationConfig {
+    fn default() -> Self {
+        Self {
+            rust_check_on_write: false,
+            timeout_secs: crate::verify::DEFAULT_VERIFY_TIMEOUT_SECS,
+        }
+    }
 }
 
 /// `mode` values for `[orientation]` in `.calm/config.json` — see
@@ -835,9 +931,18 @@ impl Default for CoChangeConfig {
 }
 
 /// Preset names recognized by the MCP tool router (`preset_tools` in
-/// calm-server). Kept here so `load_config` can validate `Config.preset`
+/// calm-server), plus `"remote-safe"` -- a virtual, capability-derived
+/// token (every tool with `read_only_hint = true`, computed live off the
+/// real tool router by calm-server's `remote_safe_tool_names`, not a
+/// `#[tool_router]` module like the `VALID_TOOLSET_NAMES` entries below)
+/// that only `resolve_preset`'s composable parser understands, never
+/// `preset_tools` directly. Included here anyway so this lighter
+/// syntax-only check (see `preset_syntax_is_plausible`) doesn't reject a
+/// `.calm/config.json` that legitimately sets `"preset": "remote-safe"`
+/// before calm-server's authoritative validator ever gets a chance to
+/// accept it. Kept here so `load_config` can validate `Config.preset`
 /// without calm-core depending on calm-server.
-pub const VALID_PRESETS: &[&str] = &["full", "orient", "trace", "edit", "compound"];
+pub const VALID_PRESETS: &[&str] = &["full", "orient", "trace", "edit", "compound", "remote-safe"];
 
 /// Toolset (module-domain) names for the composable half of the preset
 /// registry (2026-07-14 upgrade item) — mirrors calm-server's
@@ -877,6 +982,24 @@ pub fn load_config(project_root: &Path) -> anyhow::Result<Config> {
                     VALID_PRESETS.join(", "),
                     VALID_TOOLSET_NAMES.join(", ")
                 );
+            }
+            for rule in &config.risk_rules {
+                if !VALID_RISK_LEVELS.contains(&rule.minimum.as_str()) {
+                    anyhow::bail!(
+                        "Unknown risk_rules minimum {:?} for glob {:?} in {}. Valid levels: {}",
+                        rule.minimum,
+                        rule.glob,
+                        candidate.display(),
+                        VALID_RISK_LEVELS.join(", ")
+                    );
+                }
+                if let Err(e) = globset::Glob::new(&rule.glob) {
+                    anyhow::bail!(
+                        "Invalid risk_rules glob {:?} in {}: {e}",
+                        rule.glob,
+                        candidate.display()
+                    );
+                }
             }
             Ok(config)
         }
@@ -1047,6 +1170,102 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn config_load_rejects_unknown_risk_rule_minimum() {
+        let tmp = std::env::temp_dir().join(format!("ci_cfg_badrisk_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(
+            tmp.join("config.json"),
+            r#"{"risk_rules": [{"glob": "**/auth/**", "minimum": "critical"}]}"#,
+        )
+        .unwrap();
+
+        let result = crate::config::load_config(&tmp);
+        assert!(
+            result.is_err(),
+            "an unrecognized risk_rules minimum must fail to load, got: {result:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn config_load_rejects_invalid_risk_rule_glob() {
+        let tmp = std::env::temp_dir().join(format!("ci_cfg_badglob_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(
+            tmp.join("config.json"),
+            r#"{"risk_rules": [{"glob": "[", "minimum": "high"}]}"#,
+        )
+        .unwrap();
+
+        let result = crate::config::load_config(&tmp);
+        assert!(
+            result.is_err(),
+            "an unparseable glob must fail to load, got: {result:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn config_load_accepts_valid_risk_rules() {
+        let tmp = std::env::temp_dir().join(format!("ci_cfg_goodrisk_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(
+            tmp.join("config.json"),
+            r#"{"risk_rules": [{"glob": "**/auth/**", "minimum": "high"}]}"#,
+        )
+        .unwrap();
+
+        let config = crate::config::load_config(&tmp).unwrap();
+        assert_eq!(config.risk_rules.len(), 1);
+        assert_eq!(config.risk_rules[0].minimum, "high");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn risk_floor_for_path_matches_the_configured_glob() {
+        let rules = vec![RiskRule {
+            glob: "**/auth/**".to_string(),
+            minimum: "high".to_string(),
+        }];
+        assert_eq!(
+            risk_floor_for_path(&rules, "src/auth/login.rs"),
+            Some(("high", "**/auth/**"))
+        );
+        assert_eq!(risk_floor_for_path(&rules, "src/db/query.rs"), None);
+    }
+
+    #[test]
+    fn risk_floor_for_path_picks_the_strictest_of_several_matching_rules() {
+        let rules = vec![
+            RiskRule {
+                glob: "**/auth/**".to_string(),
+                minimum: "medium".to_string(),
+            },
+            RiskRule {
+                glob: "**/*.rs".to_string(),
+                minimum: "high".to_string(),
+            },
+        ];
+        // Both rules match src/auth/login.rs -- the stricter ("high") wins,
+        // regardless of which rule appears first in the list.
+        assert_eq!(
+            risk_floor_for_path(&rules, "src/auth/login.rs"),
+            Some(("high", "**/*.rs"))
+        );
+    }
+
+    #[test]
+    fn risk_floor_for_path_is_none_for_an_empty_rule_list() {
+        assert_eq!(risk_floor_for_path(&[], "src/auth/login.rs"), None);
     }
 
     #[test]

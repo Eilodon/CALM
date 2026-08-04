@@ -12,7 +12,7 @@ Full stage-by-stage guide, all 8 Mandatory Rules, the Preset table, and Tool Qui
 
 ---
 
-> 35 tools. 8 stages. Every response carries `suggested_next` — follow it.
+> 36 tools. 8 stages. Every response carries `suggested_next` — follow it.
 ---
 
 ## Core Principles
@@ -262,7 +262,7 @@ remember("auth-flow", "OAuth callback must validate state param — see incident
 | 1 Orient | `repo_overview`, `hotspots`, `fitness_report`, `test_gap_hotspots` (coreness × test-coverage-gap ranking) | Directory scanning, README reading |
 | 2 Locate | `locate`, `search`, `file_overview` | `grep`, file search |
 | 3 Inspect | `source`, `symbol_info`, `understand`, `symbols_batch` (batch source+callers/callees for several exact `qualified_name`s) | `cat` / full file read |
-| 4 Trace | `callers`, `callees`, `path`, `dependencies` | Manual call tracing |
+| 4 Trace | `callers`, `callees`, `path`, `dependencies`, `reference_impact` (rename/removal reference surface — merges call edges, imports, and textual matches) | Manual call tracing |
 | 5 Pre-Edit | `edit_context` | *(no native equivalent)* |
 | 6 Edit | `edit_symbol`, `edit_lines` (preferred), `format_files` (rustfmt via stdin, safe replacement for shelling out), `pattern_debt_register`/`pattern_debt_status` (track a duplicated bug pattern) | native `Edit`/`Write` (fallback for new/untracked files) |
 | 7 Verify | `diff_impact` | *(no native equivalent)* |
@@ -288,10 +288,10 @@ remember("auth-flow", "OAuth callback must validate state param — see incident
 | Preset | Registered Tools | Use when |
 |--------|-----------------|----------|
 | `orient` | `repo_overview`, `locate`, `dependencies`, `hotspots`, `fitness_report`, `indexing_status` | Exploration only, no edits |
-| `trace` | `repo_overview`, `search`, `locate`, `symbol_info`, `source`, `callers`, `callees`, `path`, `dependencies`, `indexing_status` | Call graph traversal |
+| `trace` | `repo_overview`, `search`, `locate`, `symbol_info`, `source`, `callers`, `callees`, `path`, `dependencies`, `reference_impact`, `indexing_status` | Call graph traversal |
 | `edit` | `repo_overview`, `search`, `locate`, `symbol_info`, `source`, `callers`, `callees`, `edit_context`, `edit_lines`, `edit_symbol`, `diff_impact`, `indexing_status`, `edit_transaction_status`, `maintenance_status`, `retry_maintenance`, `repair_consistency`, `verify_change` | Code modification workflow |
 | `compound` | `repo_overview`, `locate`, `hotspots`, `fitness_report`, `source`, `understand`, `edit_context`, `diff_impact`, `session_context`, `indexing_status`, `remember`, `recall` | Full workflow, no raw graph traversal |
-| `full` | All 35 tools | Default; use when workflow spans multiple stages |
+| `full` | All 36 tools | Default; use when workflow spans multiple stages |
 `--preset` is set once at server startup and cannot change mid-session. Use `full` (default) when the workflow spans multiple stages. Use specific presets only when scope is locked to one stage.
 
 Beyond the 5 named presets above, `--preset`/`config.json`'s `preset` field also accept a **composable toolset spec**: a comma-separated list of toolset (module-domain) names — `trace`, `locate`, `orient`, `memory`, `guardrails`, `recover`, `scip`, `lsp`, `security`, `testgap`, `inspect`, `edit`, `patterndebt` — optionally prefixed with `-` to subtract that toolset instead of adding it. E.g. `--preset "trace,security"` unions two toolsets; `--preset "full,-edit"` is every tool except the edit toolset's (`edit_symbol`/`edit_lines`/`format_files`). This is a different, finer-grained axis than the 5 named presets (which are hand-curated cross-cutting workflow bundles, not toolset unions) — an unrecognized token in either syntax is a hard startup error, never a silent full-access fallback.

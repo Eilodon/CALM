@@ -40,8 +40,8 @@ fn allow_remote_with_valid_token_forces_a_read_only_preset() {
     )
     .expect("non-loopback + --allow-remote + a real token should be allowed to launch");
     assert_eq!(
-        launch.effective_preset, "full,-edit",
-        "remote exposure must force a read-only preset (no edit toolset), regardless of --preset"
+        launch.effective_preset, "remote-safe",
+        "remote exposure must force the capability-derived read-only preset, regardless of --preset"
     );
 }
 

@@ -17,6 +17,8 @@ rmcp = { workspace = true }
 schemars = { workspace = true }
 libc = "0.2"
 axum = { workspace = true, optional = true }
+tower = { workspace = true, optional = true }
+regex = { workspace = true }
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }
@@ -61,4 +63,4 @@ lsp-overlay  = ["calm-core/lsp-overlay"]
 # otel-http-dynamic-toolsets.md). Loopback-only by default even when built
 # with this feature -- see crates/calm-cli's --http/--allow-remote flags
 # and http.rs's fail-closed launch policy (Task 3.4a).
-http = ["rmcp/transport-streamable-http-server", "dep:axum"]
+http = ["rmcp/transport-streamable-http-server", "dep:axum", "dep:tower"]

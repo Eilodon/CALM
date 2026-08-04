@@ -78,7 +78,43 @@ summary = "recall flags a note as stale/gone when a file reference it captured h
 evidence = "crates/calm-server/src/tools/memory.rs (MemoryNote.staleness field doc comment)"
 
 [[behavior]]
+id = "ledger.hmac_signed_not_plain_hash"
+level = "enforced"
+summary = "audit_ledger's event_hash is HMAC-SHA256(audit.key, payload||prev_hash) for every real on-disk connection, keyed by a 0600 per-project key file separate from the SQLite file it chains -- an actor with only SQLite write access (no audit.key) cannot forge a chain that still passes verify_chain, unlike the earlier plain SHA-256 chain where DB write access alone was sufficient. Falls back to the original unkeyed SHA-256 chain only for a path-less (:memory:) connection, which production code never opens"
+evidence = "crates/calm-core/src/ledger.rs (compute_event_hash, ledger_key_for_conn, load_or_create_ledger_key)"
+
+[[behavior]]
+id = "edit.risk_rules_path_floor"
+level = "optional"
+summary = "config.risk_rules (default empty) lets a project force a minimum risk level by file-path glob, e.g. {glob: \"**/auth/**\", minimum: \"high\"} -- a low-fan-in symbol in a matching path still hits the full write gate (edit_context+confirm+grounded_reason, plus independent-review for \"high\") exactly as a >10-caller symbol would, closing the gap where a security-sensitive file with few callers today reads as low risk. A floor only ever raises risk, never lowers it below the structural (caller-count/hub) signal"
+evidence = "crates/calm-core/src/config.rs (RiskRule, risk_floor_for_path), crates/calm-server/src/tools/edit.rs (compute_touch_risk, classify_gate)"
+
+[[behavior]]
+id = "memory.quarantine_excludes_ambient_surfacing"
+level = "enforced"
+summary = "a project_memory note whose content trips sanitize::injection_warning is quarantined at write time and excluded from recall's ambient/broad paths (FTS query search, no-args list-all) by default -- only an explicit recall(include_quarantined=true) or an exact-topic lookup (a deliberate, targeted ask, mirroring edit_context's own related_notes gate) returns it. The note is still saved either way (detection-only), and every returned note still carries its own content_warning/quarantined fields regardless of this filter"
+evidence = "crates/calm-server/src/tools/memory.rs (remember, recall), crates/calm-core/src/db/schema.rs (project_memory.quarantined)"
+
+[[behavior]]
 id = "verification.rust_check_on_write"
 level = "optional"
 summary = "WS-6 first slice: off by default (config.verification.rust_check_on_write=false); when turned on, a .rs write parks at VERIFY_PENDING until verify_change runs cargo check on it, and a failing check does not revert the file already on disk"
 evidence = "crates/calm-core/src/config.rs (VerificationConfig), crates/calm-server/src/tools/txn.rs (verify_change), docs/plans/2026-08-03-ws6-verification-pipeline-execution-plan.md"
+
+[[behavior]]
+id = "verification.bound_to_proposed_digest"
+level = "enforced"
+summary = "verify_change refuses to run (and never advances the transaction) if the file on disk no longer matches the tx_id's proposed_digest, checked both immediately before and immediately after cargo check runs -- a concurrent write can never get bound to someone else's verification receipt"
+evidence = "crates/calm-server/src/tools/txn.rs (verify_change, VERIFICATION_SNAPSHOT_CHANGED)"
+
+[[behavior]]
+id = "http.remote_bind_forces_read_only_hint_tools_only"
+level = "enforced"
+summary = "any non-loopback `calm serve --http` bind forces the effective preset to remote-safe (every tool with read_only_hint=true, computed live off the tool router) regardless of --preset -- covers every state-mutating/process-executing tool (remember, verify_change, retry_maintenance, scip_refresh, lsp_refresh, set_toolset, pattern_debt_register, edit_lines/edit_symbol/format_files), not just the edit toolset the earlier full,-edit preset excluded"
+evidence = "crates/calm-cli/src/http.rs (resolve_http_launch), crates/calm-server/src/tools/toolset.rs (remote_safe_tool_names, resolve_preset), crates/calm-cli/tests/http_guard.rs"
+
+[[behavior]]
+id = "verification.timeout_secs"
+level = "enforced"
+summary = "cargo check is killed if it exceeds config.verification.timeout_secs (default 120s) -- a hung build.rs/proc-macro/registry fetch fails the verification instead of blocking the tool call indefinitely"
+evidence = "crates/calm-core/src/verify.rs (run_cargo_check, DEFAULT_VERIFY_TIMEOUT_SECS), crates/calm-core/src/config.rs (VerificationConfig::timeout_secs)"

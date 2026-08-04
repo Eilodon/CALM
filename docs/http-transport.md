@@ -60,13 +60,20 @@ optional:
    before it ever opens a socket, not left to a middleware layer to catch
    after the fact. Every request then needs
    `Authorization: Bearer <that token>` or gets `401 Unauthorized`.
-2. **The effective preset is forced to `full,-edit`** (every tool except
-   the edit toolset), *regardless of what `--preset` requested*. The
-   write path — `edit_lines`, `edit_symbol`, `format_files` — is never
+2. **The effective preset is forced to `remote-safe`** (every tool that
+   declares `read_only_hint = true`), *regardless of what `--preset`
+   requested*. This is a capability check, not a toolset-name exclusion:
+   it covers not just the obvious write path (`edit_lines`, `edit_symbol`,
+   `format_files`) but every other state-mutating or process-executing
+   tool too — `remember` (writes durable memory), `verify_change` /
+   `retry_maintenance` (the latter spawns `cargo check`), `scip_refresh` /
+   `lsp_refresh` (run external provider processes), `set_toolset`
+   (mutates session state), `pattern_debt_register`. None of those are
    network-reachable via this transport by default. There is currently no
-   flag to override this; if you need remote edit access, you're outside
-   this feature's intended scope and should reconsider the setup instead
-   (e.g. run CALM inside the same trust boundary as the client).
+   flag to override this; if you need remote edit (or memory-write, or
+   verification-triggering) access, you're outside this feature's intended
+   scope and should reconsider the setup instead (e.g. run CALM inside the
+   same trust boundary as the client).
 
 A loopback bind needs neither: no token check, and whatever `--preset` you
 asked for.
@@ -85,8 +92,13 @@ TLS-terminating edge server.
 
 ## What isn't covered here
 
-- **Rate limiting / DoS protection** — none. This is a single-tenant
-  dev-loop tool, not a public service.
+- **Rate limiting / DoS protection** — defense-in-depth only, not a real
+  policy. `serve_http` caps request body size (16 MiB) and concurrent
+  in-flight requests (64) so a malformed or flooding client can't exhaust
+  memory or spawn unbounded concurrent sessions, but there's no per-IP rate
+  limiting, no backoff, no request queueing. This is a single-tenant
+  dev-loop tool, not a public service — put a real reverse proxy in front
+  (see above) if you need actual rate limiting.
 - **Per-request audit detail** — `serve_http`'s session-accept audit log
   (`.calm/audit.log` in daemon mode) doesn't currently carry the remote
   peer's IP; see `crates/calm-server/src/http.rs`'s doc comment for why
