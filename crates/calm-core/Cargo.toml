@@ -20,6 +20,11 @@ fs4 = "0.9"
 hmac = { workspace = true }
 sha2 = { workspace = true }
 rand = { workspace = true }
+# Unix-only kill(2) FFI (verify.rs::kill_process_tree -- kills a spawned
+# `cargo check` child's whole process group, not just its direct PID, on
+# timeout/output-overflow). Same crate calm-server already depends on for
+# its own process-group signalling (daemon.rs).
+libc = "0.2"
 tree-sitter = { workspace = true }
 tree-sitter-python = { workspace = true }
 tree-sitter-typescript = { workspace = true }

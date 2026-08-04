@@ -6070,6 +6070,125 @@ mod tests {
     }
 
     #[test]
+    fn reference_impact_keeps_a_textual_hit_in_a_file_that_also_has_a_call_edge() {
+        // Regression: files_already_seen used to be built from the WHOLE
+        // `seen` set (call edges + import edges), so a textual grep hit in
+        // a file that already had a call-edge hit at a DIFFERENT line got
+        // silently dropped. Only an import edge's file-level hit should
+        // ever suppress a same-file textual match.
+        let dir =
+            std::env::temp_dir().join(format!("ci_ref_impact_same_file_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("def.js"), "function widgetInit() { return 1; }\n").unwrap();
+        std::fs::write(
+            dir.join("caller.js"),
+            "widgetInit();\n// widgetInit is also mentioned here, unrelated to the call above\n",
+        )
+        .unwrap();
+
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('def.js::widgetInit', 'widgetInit', 'function', 'javascript', 'def.js', 1, 1, 'function widgetInit() {', '', 'widgetInit', 1, 0, 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO call_edges (from_symbol, to_symbol, from_path, to_path, call_site_line, edge_confidence)
+                 VALUES ('caller.js::<module>', 'def.js::widgetInit', 'caller.js', 'def.js', 1, 'resolved')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let v = jv(
+            server.reference_impact(rmcp::handler::server::wrapper::Parameters(
+                ReferenceImpactParams {
+                    symbol: "widgetInit".into(),
+                    path: None,
+                    line: None,
+                },
+            )),
+        );
+
+        assert_eq!(v["must_change_count"], 1, "the call edge at line 1: {v}");
+        assert_eq!(
+            v["textual_only_count"], 1,
+            "the unrelated textual mention at line 2 must still surface: {v}"
+        );
+        let refs = v["references"].as_array().unwrap();
+        assert!(
+            refs.iter().any(|r| r["path"] == "caller.js"
+                && r["line"] == 2
+                && r["classification"] == "textual_only"),
+            "expected a textual_only hit at caller.js:2: {v}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reference_impact_counts_reflect_the_full_match_set_even_when_truncated() {
+        // Regression: must_change_count/likely_change_count/review_count/
+        // textual_only_count used to be computed AFTER
+        // hits.truncate(REFERENCE_IMPACT_LIMIT), silently under-reporting
+        // whenever the real match count exceeded the limit.
+        let dir = std::env::temp_dir().join(format!(
+            "ci_ref_impact_truncated_counts_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("def.js"), "function popular() { return 1; }\n").unwrap();
+
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+        let extra_hits: i64 = 210; // > REFERENCE_IMPACT_LIMIT (200)
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('def.js::popular', 'popular', 'function', 'javascript', 'def.js', 1, 1, 'function popular() {', '', 'popular', 210, 0, 0)",
+                [],
+            )
+            .unwrap();
+            for i in 0..extra_hits {
+                conn.execute(
+                    "INSERT INTO call_edges (from_symbol, to_symbol, from_path, to_path, call_site_line, edge_confidence)
+                     VALUES (?1, 'def.js::popular', ?2, 'def.js', 1, 'resolved')",
+                    rusqlite::params![format!("caller{i}.js::<module>"), format!("caller{i}.js")],
+                )
+                .unwrap();
+            }
+        }
+
+        let v = jv(
+            server.reference_impact(rmcp::handler::server::wrapper::Parameters(
+                ReferenceImpactParams {
+                    symbol: "popular".into(),
+                    path: None,
+                    line: None,
+                },
+            )),
+        );
+
+        assert_eq!(v["truncated"], true, "response: {v}");
+        assert_eq!(
+            v["references"].as_array().unwrap().len(),
+            200,
+            "the returned list itself is still capped at REFERENCE_IMPACT_LIMIT: {v}"
+        );
+        assert_eq!(
+            v["must_change_count"], extra_hits,
+            "the COUNT must reflect the full match set, not just the truncated list: {v}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn reference_impact_not_found_for_unknown_symbol() {
         let dir =
             std::env::temp_dir().join(format!("ci_ref_impact_not_found_{}", std::process::id()));
