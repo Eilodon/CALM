@@ -260,6 +260,14 @@ fn append_ledger_in_savepoint(conn: &Connection, actor: &str, payload: &str) {
         return;
     }
     let outcome = crate::ledger::append(conn, actor, payload);
+    if let Err(e) = &outcome {
+        tracing::warn!(
+            actor,
+            error = %e,
+            "audit ledger append failed -- this transition still committed (P0-4), \
+             but the ledger now has a gap for it"
+        );
+    }
     let _ = conn.execute_batch(if outcome.is_ok() {
         "RELEASE ledger_append;"
     } else {
