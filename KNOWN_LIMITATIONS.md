@@ -148,10 +148,17 @@ transition period), not a silent rename — not done here.
 
 ## No Git/CI-native integration path
 
-Everything above assumes an MCP client calling CALM's tools directly. A
-native editor `Edit`/`Bash` call, or a change made outside any MCP
-session entirely (a teammate's local edit, a bot PR), is invisible to
-CALM. There's no `calm guard --staged` / `calm review-diff --base
-origin/main` CLI surface and no publishable GitHub Action — the
-integration points where a team would see CALM's value without depending
-on every contributor's agent calling the right tool. Not started.
+Everything above mostly assumes an MCP client calling CALM's tools
+directly. A first step now exists: `calm guard --project-root .`
+(`crates/calm-cli/src/main.rs`) runs the exact same `diff_impact` tool
+an MCP agent's own Stage-7 pre-commit gate uses, against the staged diff
+(`git diff --cached`), and exits non-zero when the resulting
+`aggregate_risk` is at or above `--fail-on` (default `high`) — usable
+directly as a pre-commit hook or CI step for a change made outside any
+MCP session (a teammate's native editor, a bot PR), which was previously
+invisible to CALM entirely. What's still missing: a `calm review-diff
+--base origin/main`-style PR-range analysis (`calm guard` only looks at
+the staged diff, not an arbitrary commit range — though `diff_impact`
+itself already supports `commits`, so this is mostly CLI plumbing away)
+and no publishable GitHub Action wrapping `calm guard` for one-line CI
+adoption.
