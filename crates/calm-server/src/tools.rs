@@ -650,23 +650,28 @@ impl rmcp::ServerHandler for CalmServer {
     // SDK knows, including `2026-07-28`. Per SEP-2567 (see rmcp's own
     // `StreamableHttpServerConfig::legacy_session_mode` doc comment), a peer
     // that negotiates `2026-07-28` is *always* served statelessly over
-    // Streamable-HTTP regardless of `legacy_session_mode` — which would
-    // silently drop the per-connection state this server leans on today
-    // (session_id, `set_toolset` narrowing, and — load-bearing — the
-    // hub-edit human-veto declined-answer cache in tools/edit.rs). Capping
-    // the ceiling here is what makes Phase 1 of the MCP 2026-07-28 upgrade
-    // (docs/plans/2026-08-04-mcp-2026-07-28-upgrade-plan.md) a true
-    // behavior-preserving bump: no client can negotiate 2026-07-28 with this
-    // server until Phase 2 has given the hub-edit gate an MRTR-based path
-    // that survives statelessness. Remove `V_2026_07_28` from this exclusion
-    // once that lands.
+    // Streamable-HTTP regardless of `legacy_session_mode`.
+    //
+    // Phase 1 of the MCP 2026-07-28 upgrade
+    // (docs/plans/2026-08-04-mcp-2026-07-28-upgrade-plan.md) capped this list
+    // below `2026-07-28`, because statelessness would have silently dropped
+    // the hub-edit human-veto gate's declined-answer cache and left it with
+    // no working mechanism at all (the legacy `elicit_with_timeout` needs a
+    // live back-channel a stateless connection doesn't have). Phase 2 closed
+    // that gap: `elicit_setup` (tools/edit.rs) now offers `ElicitMechanism::
+    // Mrtr` to any peer negotiating `2026-07-28`+, and `hub_mrtr_ask`/
+    // `hub_mrtr_decide` make the approve/decline decision from a self-
+    // contained, HMAC-sealed `requestState` (`RequestStateCodec`) plus the
+    // client-echoed `inputResponses` — it does not read or write any
+    // per-connection state, so it is correct regardless of whether the
+    // request that asks and the request that answers land on the same
+    // `CalmServer` instance. `set_toolset` narrowing and the declined-answer
+    // cache remain per-connection conveniences (a dedup optimization, not a
+    // safety guarantee) that a genuinely stateless deployment may not
+    // preserve across requests — tracked as Phase 4 (stateless HTTP)
+    // territory, not a blocker for allowing negotiation here.
     fn supported_protocol_versions(&self) -> std::borrow::Cow<'static, [rmcp::model::ProtocolVersion]> {
-        std::borrow::Cow::Borrowed(&[
-            rmcp::model::ProtocolVersion::V_2024_11_05,
-            rmcp::model::ProtocolVersion::V_2025_03_26,
-            rmcp::model::ProtocolVersion::V_2025_06_18,
-            rmcp::model::ProtocolVersion::V_2025_11_25,
-        ])
+        std::borrow::Cow::Borrowed(rmcp::model::ProtocolVersion::KNOWN_VERSIONS)
     }
 
     // Hand-written instead of relying on `#[tool_router]`'s bare merged
@@ -697,7 +702,7 @@ impl rmcp::ServerHandler for CalmServer {
     async fn call_tool(
         &self,
         request: rmcp::model::CallToolRequestParams,
-        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+        mut context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<rmcp::model::CallToolResponse, rmcp::model::ErrorData> {
         // Preset scoping already lives in `self.tool_router` (built by
         // `tool_router_for_preset` at construction) — a disabled tool is
@@ -777,6 +782,21 @@ impl rmcp::ServerHandler for CalmServer {
             .into());
         }
 
+        // SEP-2322 MRTR continuation (docs/plans/2026-08-04-mcp-2026-07-28-
+        // upgrade-plan.md Phase 2): `ToolCallContext::new` below discards
+        // `input_responses`/`request_state` from `request` (rmcp 3.x has no
+        // extractor for them), so this is the only place that can forward a
+        // retry's answer to the tool method that asked -- via `extensions`,
+        // rmcp's own typed pass-through, tool-agnostic (no per-tool branch
+        // needed here; `edit_lines_tool`/`edit_symbol_tool` check for it).
+        if let (Some(input_responses), Some(request_state)) =
+            (request.input_responses.clone(), request.request_state.clone())
+        {
+            context.extensions.insert(edit::MrtrContinuation {
+                input_responses,
+                request_state,
+            });
+        }
         let tool_context =
             rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
         let mut result = self.tool_router.call(tool_context).instrument(span).await;

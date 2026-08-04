@@ -23,45 +23,70 @@ impl CalmServer {
             destructive_hint = true,
             idempotent_hint = false,
             open_world_hint = false
-        )
+        ),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<ToolOutcome<EditLinesOutput>>()
     )]
     pub(crate) async fn edit_lines_tool(
         &self,
         Parameters(p): Parameters<EditLinesParams>,
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
-    ) -> Json<ToolOutcome<EditLinesOutput>> {
-        let elicit_timeout = self.elicit_setup(&ctx.peer);
-        let gate = if elicit_timeout.is_some() {
+    ) -> HubEditToolResult<ToolOutcome<EditLinesOutput>> {
+        // SEP-2322 retry: this exact tools/call carries the client's answer
+        // to a prior `input_required` result (dispatcher-stashed — see
+        // `CalmServer::call_tool`'s use of `MrtrContinuation`). Decide from
+        // the sealed state instead of re-asking; `p`/`ctx` are otherwise the
+        // same fresh extraction as any other call since the client retries
+        // the full original request, arguments included.
+        if let Some(continuation) = ctx.extensions.get::<MrtrContinuation>() {
+            let fingerprint = fingerprint_edit_lines(&p);
+            return HubEditToolResult::Done(Json(
+                match self.hub_mrtr_decide("edit_lines", &p.path, &fingerprint, continuation) {
+                    Ok(()) => self.edit_lines_flow(&p, ElicitGate::Approved, &mut None),
+                    Err(detail) => ToolOutcome::error(detail),
+                },
+            ));
+        }
+
+        let elicit_mechanism = self.elicit_setup(&ctx);
+        let gate = if elicit_mechanism.is_some() {
             ElicitGate::Ask
         } else {
             ElicitGate::Off
         };
         let mut ask: Option<HubAskContext> = None;
         let first = self.edit_lines_flow(&p, gate, &mut ask);
-        let (Some(timeout), Some(ask_ctx)) = (elicit_timeout, ask) else {
-            return Json(first);
+        let (Some(mechanism), Some(ask_ctx)) = (elicit_mechanism, ask) else {
+            return HubEditToolResult::Done(Json(first));
         };
         // `first` has fully returned above — neither the in-process
         // edit_lock nor the cross-process lock (both scoped inside
-        // edit_lines_impl_gated) is held across this await (audit FM1).
+        // edit_lines_impl_gated) is held across the await below (audit FM1).
         let fingerprint = fingerprint_edit_lines(&p);
-        Json(
-            match self
-                .hub_elicit_roundtrip(
-                    &ctx.peer,
-                    "edit_lines",
-                    &p.path,
-                    &fingerprint,
-                    &ask_ctx,
-                    p.reason.as_deref(),
-                    timeout,
-                )
-                .await
-            {
-                Ok(()) => self.edit_lines_flow(&p, ElicitGate::Approved, &mut None),
-                Err(detail) => ToolOutcome::error(detail),
-            },
-        )
+        match mechanism {
+            ElicitMechanism::Mrtr { timeout } => {
+                match self.hub_mrtr_ask("edit_lines", &p.path, &fingerprint, &ask_ctx, p.reason.as_deref(), timeout) {
+                    Ok(result) => HubEditToolResult::NeedsApproval(result),
+                    Err(detail) => HubEditToolResult::Done(Json(ToolOutcome::error(detail))),
+                }
+            }
+            ElicitMechanism::LegacyRoundTrip { timeout } => HubEditToolResult::Done(Json(
+                match self
+                    .hub_elicit_roundtrip(
+                        &ctx.peer,
+                        "edit_lines",
+                        &p.path,
+                        &fingerprint,
+                        &ask_ctx,
+                        p.reason.as_deref(),
+                        timeout,
+                    )
+                    .await
+                {
+                    Ok(()) => self.edit_lines_flow(&p, ElicitGate::Approved, &mut None),
+                    Err(detail) => ToolOutcome::error(detail),
+                },
+            )),
+        }
     }
 
     /// Legacy sync surface — same behavior as `edit_lines_tool` with the
@@ -187,45 +212,67 @@ impl CalmServer {
             destructive_hint = true,
             idempotent_hint = false,
             open_world_hint = false
-        )
+        ),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<ResolvedOutcome<EditLinesOutput>>()
     )]
     pub(crate) async fn edit_symbol_tool(
         &self,
         Parameters(p): Parameters<EditSymbolParams>,
         ctx: rmcp::service::RequestContext<rmcp::RoleServer>,
-    ) -> Json<ResolvedOutcome<EditLinesOutput>> {
-        let elicit_timeout = self.elicit_setup(&ctx.peer);
-        let gate = if elicit_timeout.is_some() {
+    ) -> HubEditToolResult<ResolvedOutcome<EditLinesOutput>> {
+        // SEP-2322 retry — see edit_lines_tool's identical branch for the
+        // full rationale.
+        if let Some(continuation) = ctx.extensions.get::<MrtrContinuation>() {
+            let fingerprint = fingerprint_edit_symbol(&p);
+            let cache_key_path = p.path.clone().unwrap_or_else(|| p.symbol.clone());
+            return HubEditToolResult::Done(Json(
+                match self.hub_mrtr_decide("edit_symbol", &cache_key_path, &fingerprint, continuation) {
+                    Ok(()) => self.edit_symbol_flow(&p, ElicitGate::Approved, &mut None),
+                    Err(detail) => ResolvedOutcome::error(detail),
+                },
+            ));
+        }
+
+        let elicit_mechanism = self.elicit_setup(&ctx);
+        let gate = if elicit_mechanism.is_some() {
             ElicitGate::Ask
         } else {
             ElicitGate::Off
         };
         let mut ask: Option<HubAskContext> = None;
         let first = self.edit_symbol_flow(&p, gate, &mut ask);
-        let (Some(timeout), Some(ask_ctx)) = (elicit_timeout, ask) else {
-            return Json(first);
+        let (Some(mechanism), Some(ask_ctx)) = (elicit_mechanism, ask) else {
+            return HubEditToolResult::Done(Json(first));
         };
         // `first` has fully returned above — no edit/DB lock is held across
-        // this await (all scoped inside edit_lines_impl_gated); audit FM1.
+        // the await below (all scoped inside edit_lines_impl_gated); audit FM1.
         let fingerprint = fingerprint_edit_symbol(&p);
         let cache_key_path = p.path.clone().unwrap_or_else(|| p.symbol.clone());
-        Json(
-            match self
-                .hub_elicit_roundtrip(
-                    &ctx.peer,
-                    "edit_symbol",
-                    &cache_key_path,
-                    &fingerprint,
-                    &ask_ctx,
-                    p.reason.as_deref(),
-                    timeout,
-                )
-                .await
-            {
-                Ok(()) => self.edit_symbol_flow(&p, ElicitGate::Approved, &mut None),
-                Err(detail) => ResolvedOutcome::error(detail),
-            },
-        )
+        match mechanism {
+            ElicitMechanism::Mrtr { timeout } => {
+                match self.hub_mrtr_ask("edit_symbol", &cache_key_path, &fingerprint, &ask_ctx, p.reason.as_deref(), timeout) {
+                    Ok(result) => HubEditToolResult::NeedsApproval(result),
+                    Err(detail) => HubEditToolResult::Done(Json(ResolvedOutcome::error(detail))),
+                }
+            }
+            ElicitMechanism::LegacyRoundTrip { timeout } => HubEditToolResult::Done(Json(
+                match self
+                    .hub_elicit_roundtrip(
+                        &ctx.peer,
+                        "edit_symbol",
+                        &cache_key_path,
+                        &fingerprint,
+                        &ask_ctx,
+                        p.reason.as_deref(),
+                        timeout,
+                    )
+                    .await
+                {
+                    Ok(()) => self.edit_symbol_flow(&p, ElicitGate::Approved, &mut None),
+                    Err(detail) => ResolvedOutcome::error(detail),
+                },
+            )),
+        }
     }
 
     /// Legacy sync surface — same behavior as `edit_symbol_tool` with the
@@ -1853,25 +1900,109 @@ pub(crate) struct HubEditApproval {
 }
 rmcp::elicit_safe!(HubEditApproval);
 
+/// Which transport mechanism carries the hub-edit human-veto question to
+/// the client and its answer back (docs/plans/2026-08-04-mcp-2026-07-28-
+/// upgrade-plan.md Phase 2). Both variants converge on the exact same
+/// fail-closed decision — only an explicit `approve: true` lets the write
+/// proceed — via `map_elicit_outcome` (legacy) / `decide_mrtr_answer` (MRTR).
+#[derive(Clone, Copy)]
+enum ElicitMechanism {
+    /// Pre-2026-07-28: server-initiated `elicitation/create` over a live
+    /// back-channel (`peer.elicit_with_timeout`) — requires the client to
+    /// have declared Form-mode elicitation at `initialize`. Byte-identical
+    /// to CALM's original (pre-MRTR) behavior.
+    LegacyRoundTrip { timeout: std::time::Duration },
+    /// SEP-2322: the tool call returns `resultType: "input_required"`
+    /// instead of writing; the client retries the SAME `tools/call` with
+    /// `inputResponses` (and the echoed `requestState`) once a human
+    /// answers. Works over a genuinely stateless connection — no back-
+    /// channel needed — which is exactly what a peer negotiating
+    /// `2026-07-28` may be served over (SEP-2567). `timeout` becomes the
+    /// sealed state's TTL.
+    Mrtr { timeout: std::time::Duration },
+}
+
+/// Sealed payload bound into SEP-2322 `requestState` for a pending hub-edit
+/// approval — verified on retry via `RequestStateCodec` (HMAC-SHA256) so a
+/// client cannot forge an approval or replay one against a since-modified
+/// edit (the retry's freshly-recomputed fingerprint must match this exactly).
+#[derive(serde::Serialize, Deserialize)]
+struct HubEditStateSeal {
+    tool: String,
+    cache_path: String,
+    fingerprint: String,
+}
+
+/// Stashed by the dispatcher (`CalmServer::call_tool` in tools.rs) into
+/// `RequestContext::extensions` when an incoming `tools/call` carries SEP-
+/// 2322 continuation fields — i.e. it's a retry answering a prior
+/// `input_required` result, not a fresh call. `ToolCallContext::new`
+/// (rmcp 3.x) discards `input_responses`/`request_state` from the raw
+/// request before an individual `#[tool]` method ever sees it, so the
+/// dispatcher is the only place that can forward them — `extensions` is
+/// rmcp's own typed pass-through for exactly this.
+#[derive(Clone)]
+pub(crate) struct MrtrContinuation {
+    pub(crate) input_responses: rmcp::model::InputResponses,
+    pub(crate) request_state: String,
+}
+
+/// Either a tool's normal completed result, or a SEP-2322 `input_required`
+/// intermediate result for the hub-edit gate. `#[tool]`'s macro can only
+/// auto-derive `output_schema` from a literal `Json<T>` (or `Result<Json<T>,
+/// _>`) return type, so `edit_lines_tool`/`edit_symbol_tool` each carry an
+/// explicit `output_schema = schema_for_output::<T>()` attribute reproducing
+/// exactly what it would have derived from their original `Json<T>` return
+/// type — verified against a `#[tool(output_schema = ...)]` example in
+/// rmcp's own test suite (tests/test_json_schema_detection.rs).
+enum HubEditToolResult<T> {
+    Done(Json<T>),
+    NeedsApproval(rmcp::model::InputRequiredResult),
+}
+
+impl<T: Serialize + JsonSchema + 'static> rmcp::handler::server::tool::IntoCallToolResult
+    for HubEditToolResult<T>
+{
+    fn into_call_tool_result(self) -> Result<rmcp::model::CallToolResponse, rmcp::model::ErrorData> {
+        match self {
+            Self::Done(json) => json.into_call_tool_result(),
+            Self::NeedsApproval(result) => result.into_call_tool_result(),
+        }
+    }
+}
+
 impl CalmServer {
-    /// `Some(timeout)` when the human-veto flow is active for this
-    /// connection: `[edit] elicit_hub_confirm` opted in AND the client
-    /// declared form-mode elicitation (MCP 2025-06-18 requires clients to
-    /// declare it at initialize). `None` = `ElicitGate::Off`, byte-identical
-    /// legacy behavior — by construction the veto can only ADD a refusal on
-    /// top of the machine gate, never remove one (spec Option A).
-    fn elicit_setup(&self, peer: &rmcp::Peer<rmcp::RoleServer>) -> Option<std::time::Duration> {
+    /// `Some(mechanism)` when the human-veto flow is active for this call:
+    /// `[edit] elicit_hub_confirm` opted in AND (a) the peer negotiated
+    /// `2026-07-28`+ (MRTR — works statelessly, no capability declaration
+    /// needed), or (b) the client declared form-mode elicitation at
+    /// `initialize` (legacy — MCP 2025-06-18 requires declaring it up
+    /// front). `None` = `ElicitGate::Off`, byte-identical legacy behavior —
+    /// by construction the veto can only ADD a refusal on top of the
+    /// machine gate, never remove one (spec Option A).
+    fn elicit_setup(
+        &self,
+        ctx: &rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Option<ElicitMechanism> {
         let cfg = self.config().edit;
         if !cfg.elicit_hub_confirm {
             return None;
         }
-        if !peer
+        let timeout = std::time::Duration::from_secs(cfg.elicit_timeout_secs);
+        let mrtr_capable = ctx.protocol_version().is_some_and(|v| {
+            v.as_str() >= rmcp::model::ProtocolVersion::V_2026_07_28.as_str()
+        });
+        if mrtr_capable {
+            return Some(ElicitMechanism::Mrtr { timeout });
+        }
+        if ctx
+            .peer
             .supported_elicitation_modes()
             .contains(&rmcp::service::ElicitationMode::Form)
         {
-            return None;
+            return Some(ElicitMechanism::LegacyRoundTrip { timeout });
         }
-        Some(std::time::Duration::from_secs(cfg.elicit_timeout_secs))
+        None
     }
 
     /// One human-veto round-trip: declined-cache short-circuit, sanitized
@@ -1922,6 +2053,155 @@ impl CalmServer {
         }
         mapped
     }
+
+    /// SEP-2322 "ask" side: same declined-cache short-circuit and audit
+    /// logging as `hub_elicit_roundtrip`, but builds a sealed
+    /// `InputRequiredResult` instead of awaiting a live round-trip -- the
+    /// client retries this exact `tools/call` with the answer, and
+    /// `hub_mrtr_decide` verifies it. `Err` here means "refuse immediately,
+    /// do not even ask" (mirrors `hub_elicit_roundtrip`'s own declined-cache
+    /// short-circuit) -- the caller returns it as an ordinary completed
+    /// error result, never as `NeedsApproval`.
+    fn hub_mrtr_ask(
+        &self,
+        tool: &str,
+        cache_path: &str,
+        fingerprint: &str,
+        ask: &HubAskContext,
+        reason: Option<&str>,
+        timeout: std::time::Duration,
+    ) -> Result<rmcp::model::InputRequiredResult, ErrorDetail> {
+        if self.elicit_declined_contains(cache_path, fingerprint) {
+            return Err(error_detail(
+                "USER_DECLINED",
+                "a human already declined this exact edit this session — do not \
+                 retry it; surface their veto and let them decide the next step",
+                false,
+            ));
+        }
+        let message = build_hub_elicit_message(tool, cache_path, ask, reason);
+        let seal = HubEditStateSeal {
+            tool: tool.to_string(),
+            cache_path: cache_path.to_string(),
+            fingerprint: fingerprint.to_string(),
+        };
+        let key = calm_core::memory::load_or_create_mac_key(&self.project_root).map_err(|e| {
+            error_detail(
+                "ELICITATION_FAILED",
+                &format!("could not prepare the approval request: {e}"),
+                false,
+            )
+        })?;
+        let codec = rmcp::model::RequestStateCodec::new(key.to_vec());
+        let request_state = codec
+            .seal_json_with(&seal, &rmcp::model::SealOptions::new().ttl(timeout))
+            .map_err(|e| {
+                error_detail(
+                    "ELICITATION_FAILED",
+                    &format!("could not prepare the approval request: {e}"),
+                    false,
+                )
+            })?;
+        let schema = rmcp::model::ElicitationSchema::from_type::<HubEditApproval>().map_err(|e| {
+            error_detail(
+                "ELICITATION_FAILED",
+                &format!("could not build the approval schema: {e}"),
+                false,
+            )
+        })?;
+        let mut input_requests = rmcp::model::InputRequests::new();
+        input_requests.insert(
+            "approval".to_string(),
+            rmcp::model::InputRequest::Elicitation(rmcp::model::ElicitRequest::new(
+                rmcp::model::ElicitRequestParams::FormElicitationParams {
+                    meta: None,
+                    message,
+                    requested_schema: schema,
+                },
+            )),
+        );
+        tracing::info!(
+            target: crate::telemetry::AUDIT_TARGET,
+            session_id = self.session_id,
+            decision = "elicit_asked_mrtr",
+            tool,
+            path = cache_path,
+        );
+        Ok(rmcp::model::InputRequiredResult::new(
+            Some(input_requests),
+            Some(request_state),
+        ))
+    }
+
+    /// SEP-2322 "decide" side: opens the sealed `request_state`, verifying
+    /// it matches this exact retried call (tool/path/fingerprint -- a
+    /// mismatch means the edit changed since it was asked about, or the
+    /// state was forged/replayed), extracts the client's answer from
+    /// `input_responses`, and maps it through `decide_mrtr_answer` --
+    /// exactly the same fail-closed philosophy as `map_elicit_outcome`
+    /// (only an explicit `approve: true` on a verified state ever succeeds).
+    fn hub_mrtr_decide(
+        &self,
+        tool: &str,
+        cache_path: &str,
+        fingerprint: &str,
+        continuation: &MrtrContinuation,
+    ) -> Result<(), ErrorDetail> {
+        let key = calm_core::memory::load_or_create_mac_key(&self.project_root).map_err(|e| {
+            error_detail(
+                "ELICITATION_FAILED",
+                &format!("could not verify the approval: {e}"),
+                false,
+            )
+        })?;
+        let codec = rmcp::model::RequestStateCodec::new(key.to_vec());
+        let seal: HubEditStateSeal =
+            codec
+                .open_json(&continuation.request_state)
+                .map_err(|_| {
+                    error_detail(
+                        "ELICITATION_FAILED",
+                        "the approval request has expired or its state could not be \
+                         verified — nothing was written (fail-closed); retry the edit \
+                         to ask again",
+                        false,
+                    )
+                })?;
+        if seal.tool != tool || seal.cache_path != cache_path || seal.fingerprint != fingerprint {
+            return Err(error_detail(
+                "ELICITATION_FAILED",
+                "the approval does not match this edit — it changed since it was \
+                 asked about — nothing was written (fail-closed); retry the edit to \
+                 ask again",
+                false,
+            ));
+        }
+        let answer = continuation
+            .input_responses
+            .get("approval")
+            .map(|v| serde_json::from_value::<HubEditApproval>(v.clone()))
+            .transpose()
+            .map_err(|_| {
+                error_detail(
+                    "ELICITATION_FAILED",
+                    "the approval answer was malformed — nothing was written \
+                     (fail-closed)",
+                    false,
+                )
+            })?;
+        let (verdict, mapped) = decide_mrtr_answer(answer);
+        tracing::info!(
+            target: crate::telemetry::AUDIT_TARGET,
+            session_id = self.session_id,
+            decision = verdict,
+            tool,
+            path = cache_path,
+        );
+        if verdict == "elicit_declined" {
+            self.elicit_declined_insert(cache_path, fingerprint);
+        }
+        mapped
+    }
 }
 
 /// Pure decision-table mapping — unit-testable without a live peer. Returns
@@ -1964,6 +2244,32 @@ fn map_elicit_outcome(
                  written (fail-closed). The client declared elicitation support \
                  but could not complete it; check the client, or turn off \
                  `elicit_hub_confirm` under `edit` in .calm/config.json",
+                false,
+            )),
+        ),
+    }
+}
+
+/// SEP-2322 sibling of `map_elicit_outcome` — same fail-closed philosophy
+/// (only `approve: true` succeeds) and the same verdict labels, but for a
+/// verified-but-possibly-absent MRTR answer rather than a live round-trip's
+/// richer error taxonomy (no server-side timeout concept applies here: if
+/// the client never retries, nothing happens — there is no pending await to
+/// time out). Pure decision-table mapping — unit-testable without a live
+/// peer, exactly like `map_elicit_outcome`. `hub_mrtr_decide` handles the
+/// separate MRTR-specific failure modes (expired/tampered `request_state`,
+/// malformed answer JSON) before ever reaching this function.
+fn decide_mrtr_answer(
+    answer: Option<HubEditApproval>,
+) -> (&'static str, Result<(), ErrorDetail>) {
+    match answer {
+        Some(HubEditApproval { approve: true }) => ("elicit_approved", Ok(())),
+        Some(HubEditApproval { approve: false }) | None => (
+            "elicit_declined",
+            Err(error_detail(
+                "USER_DECLINED",
+                "the human reviewing this session refused this hub edit — do not \
+                 retry; surface their veto and let them decide the next step",
                 false,
             )),
         ),
@@ -3060,5 +3366,173 @@ mod elicit_tests {
         assert!(msg.contains("a.py::helper (12 callers)"));
         assert!(msg.contains("hub_kind=degree"));
         assert!(msg.contains("risk=high"));
+    }
+
+    // --- SEP-2322 MRTR (docs/plans/2026-08-04-mcp-2026-07-28-upgrade-plan.md
+    // Phase 2). `decide_mrtr_answer` is `map_elicit_outcome`'s sibling for
+    // the MRTR answer shape — same fail-closed table, mirrored 1:1. ---
+
+    #[test]
+    fn decide_mrtr_answer_approve_true_is_the_only_ok() {
+        let (verdict, mapped) = decide_mrtr_answer(Some(HubEditApproval { approve: true }));
+        assert_eq!(verdict, "elicit_approved");
+        assert!(mapped.is_ok());
+    }
+
+    #[test]
+    fn decide_mrtr_answer_approve_false_and_missing_answer_decline() {
+        for answer in [Some(HubEditApproval { approve: false }), None] {
+            let (verdict, mapped) = decide_mrtr_answer(answer);
+            assert_eq!(verdict, "elicit_declined");
+            assert_eq!(mapped.unwrap_err().code, "USER_DECLINED");
+        }
+    }
+
+    fn mrtr_test_server(name: &str) -> (std::path::PathBuf, CalmServer) {
+        let dir = std::env::temp_dir().join(format!("ci_mrtr_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+        (dir, server)
+    }
+
+    fn ask_context() -> HubAskContext {
+        HubAskContext {
+            why: "a hub symbol (is_hub=true)".into(),
+            risk: Some("high".into()),
+            hub_kind: Some("degree".into()),
+            touched: vec![("a.py::helper".into(), 12)],
+        }
+    }
+
+    #[test]
+    fn hub_mrtr_ask_then_decide_approved_round_trip() {
+        let (dir, server) = mrtr_test_server("approved_round_trip");
+        let ask = ask_context();
+        let result = server
+            .hub_mrtr_ask(
+                "edit_lines",
+                "a.py",
+                "fp-1",
+                &ask,
+                None,
+                std::time::Duration::from_secs(60),
+            )
+            .map_err(|e| e.code)
+            .expect("first ask must not be short-circuited");
+        let request_state = result.request_state.expect("must carry sealed state");
+        let mut input_responses = rmcp::model::InputResponses::new();
+        input_responses.insert(
+            "approval".to_string(),
+            serde_json::json!({ "approve": true }),
+        );
+        let continuation = MrtrContinuation {
+            input_responses,
+            request_state,
+        };
+        let decision = server.hub_mrtr_decide("edit_lines", "a.py", "fp-1", &continuation);
+        assert!(decision.map_err(|e| e.code).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hub_mrtr_decide_rejects_when_edit_changed_since_the_ask() {
+        // Defense against replaying a stale approval against a
+        // since-modified edit: the retry's freshly-recomputed fingerprint
+        // must match what was sealed, or the decision fails closed.
+        let (dir, server) = mrtr_test_server("tampered_fingerprint");
+        let ask = ask_context();
+        let result = server
+            .hub_mrtr_ask(
+                "edit_lines",
+                "a.py",
+                "fp-original",
+                &ask,
+                None,
+                std::time::Duration::from_secs(60),
+            )
+            .map_err(|e| e.code)
+            .unwrap();
+        let mut input_responses = rmcp::model::InputResponses::new();
+        input_responses.insert(
+            "approval".to_string(),
+            serde_json::json!({ "approve": true }),
+        );
+        let continuation = MrtrContinuation {
+            input_responses,
+            request_state: result.request_state.unwrap(),
+        };
+        // Retry claims a DIFFERENT fingerprint than what was sealed.
+        let decision = server.hub_mrtr_decide("edit_lines", "a.py", "fp-changed", &continuation);
+        let err = decision.unwrap_err();
+        assert_eq!(err.code, "ELICITATION_FAILED");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hub_mrtr_decide_rejects_a_forged_request_state() {
+        let (dir, server) = mrtr_test_server("forged_state");
+        let continuation = MrtrContinuation {
+            input_responses: {
+                let mut m = rmcp::model::InputResponses::new();
+                m.insert("approval".to_string(), serde_json::json!({ "approve": true }));
+                m
+            },
+            request_state: "not-a-real-sealed-value".to_string(),
+        };
+        let decision = server.hub_mrtr_decide("edit_lines", "a.py", "fp-1", &continuation);
+        assert_eq!(decision.unwrap_err().code, "ELICITATION_FAILED");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hub_mrtr_decide_declines_on_missing_or_false_answer() {
+        let (dir, server) = mrtr_test_server("declined_answer");
+        let ask = ask_context();
+        for (label, responses) in [
+            ("missing", rmcp::model::InputResponses::new()),
+            ("false", {
+                let mut m = rmcp::model::InputResponses::new();
+                m.insert("approval".to_string(), serde_json::json!({ "approve": false }));
+                m
+            }),
+        ] {
+            let result = server
+                .hub_mrtr_ask(
+                    "edit_lines",
+                    "a.py",
+                    &format!("fp-{label}"),
+                    &ask,
+                    None,
+                    std::time::Duration::from_secs(60),
+                )
+                .map_err(|e| e.code)
+                .unwrap();
+            let continuation = MrtrContinuation {
+                input_responses: responses,
+                request_state: result.request_state.unwrap(),
+            };
+            let decision =
+                server.hub_mrtr_decide("edit_lines", "a.py", &format!("fp-{label}"), &continuation);
+            assert_eq!(decision.unwrap_err().code, "USER_DECLINED", "case {label}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hub_mrtr_ask_short_circuits_when_already_declined_this_session() {
+        let (dir, server) = mrtr_test_server("already_declined_short_circuit");
+        server.elicit_declined_insert("a.py", "fp-1");
+        let ask = ask_context();
+        let result = server.hub_mrtr_ask(
+            "edit_lines",
+            "a.py",
+            "fp-1",
+            &ask,
+            None,
+            std::time::Duration::from_secs(60),
+        );
+        assert_eq!(result.unwrap_err().code, "USER_DECLINED");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

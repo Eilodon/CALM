@@ -176,39 +176,47 @@ fn daemon_survives_forwarders_process_group_sigterm() {
     }
 }
 
-/// MCP 2026-07-28 upgrade Phase 1
-/// (docs/plans/2026-08-04-mcp-2026-07-28-upgrade-plan.md): `CalmServer`
-/// caps `supported_protocol_versions()` below `2026-07-28` on purpose, so
-/// that no client can negotiate the version whose Streamable-HTTP
-/// transport is *always* served statelessly (SEP-2567) regardless of the
-/// server's session-manager setup — which would silently break the
-/// per-connection state this server leans on today (toolset narrowing,
-/// the hub-edit human-veto declined-answer cache) before Phase 2 gives
-/// that gate an MRTR-based path that survives statelessness. rmcp's own
-/// `negotiate_protocol_version` degrades a request for an unsupported
-/// version to the server's fallback rather than erroring, so this must
-/// stay a graceful downgrade, not a rejected `initialize`.
+/// MCP 2026-07-28 upgrade (docs/plans/2026-08-04-mcp-2026-07-28-upgrade-
+/// plan.md). Phase 1 capped `supported_protocol_versions()` below
+/// `2026-07-28` because negotiating it forces Streamable-HTTP statelessness
+/// (SEP-2567) regardless of session-manager setup, and the hub-edit
+/// human-veto gate had no mechanism that survived that at the time. Phase 2
+/// gave the gate an MRTR path (`hub_mrtr_ask`/`hub_mrtr_decide`,
+/// tools/edit.rs) whose approve/decline decision is self-contained in a
+/// sealed `requestState` rather than per-connection state, closing that gap
+/// — so the cap was lifted and a peer offering `2026-07-28` now gets it
+/// back, not a downgrade.
 #[test]
-fn initialize_requesting_2026_07_28_gracefully_downgrades_below_the_cap() {
+fn initialize_requesting_2026_07_28_is_now_negotiated_after_phase_2() {
     let project = fresh_project();
 
     let output = send_initialize_and_capture(project.path(), "2026-07-28");
     assert!(
         output.status.success(),
-        "a client offering 2026-07-28 must still get a successful initialize \
-         (graceful downgrade, not a protocol error): {}",
+        "a client offering 2026-07-28 must get a successful initialize: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     let response = String::from_utf8_lossy(&output.stdout);
     assert!(
-        !response.contains("\"protocolVersion\":\"2026-07-28\""),
-        "the server must not negotiate 2026-07-28 yet (Phase 2 opens that \
-         door once the hub-edit gate has an MRTR path): {response}"
+        response.contains("\"protocolVersion\":\"2026-07-28\""),
+        "expected the server to negotiate 2026-07-28 now that the hub-edit \
+         gate has an MRTR path that survives statelessness: {response}"
     );
+}
+
+/// A pre-2026-07-28 client (this exact string is what every other test in
+/// this file hardcodes) must still negotiate cleanly — the cap lift must
+/// not have disturbed the floor of `ProtocolVersion::SUPPORTED`.
+#[test]
+fn initialize_requesting_2024_11_05_still_negotiates_that_exact_version() {
+    let project = fresh_project();
+
+    let output = send_initialize_and_capture(project.path(), "2024-11-05");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let response = String::from_utf8_lossy(&output.stdout);
     assert!(
-        response.contains("\"protocolVersion\":\"2025-11-25\""),
-        "expected a downgrade to the server's own default (ProtocolVersion::LATEST \
-         = 2025-11-25), got: {response}"
+        response.contains("\"protocolVersion\":\"2024-11-05\""),
+        "response: {response}"
     );
 }
 
