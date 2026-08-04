@@ -170,7 +170,12 @@ tokio-util = "0.7"
 notify = "6.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-rmcp = { version = "2", features = ["server", "transport-io", "macros", "elicitation", "schemars"] }
+# rmcp 3.x = MCP 2026-07-28 spec support (docs/plans/2026-08-04-mcp-2026-07-28-upgrade-plan.md,
+# Phase 1). Live-verified in a scratch spike (rmcp 3.1.0 + axum 0.8 + schemars 1 + the
+# `transport-streamable-http-server` feature): `cargo tree -d` shows exactly one `rmcp` and one
+# `axum` node (no OTEL-style split-core repeat of Dependabot PR #46). `transport-streamable-http-server`
+# lives in crates/calm-server/Cargo.toml's `http` feature, same as before.
+rmcp = { version = "3", features = ["server", "transport-io", "macros", "elicitation", "schemars"] }
 schemars = "1"
 clap = { version = "4", features = ["derive"] }
 rayon = "1"
