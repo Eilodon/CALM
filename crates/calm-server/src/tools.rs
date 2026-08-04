@@ -646,6 +646,34 @@ impl rmcp::ServerHandler for CalmServer {
         )
     }
 
+    // rmcp 3.x defaults `supported_protocol_versions()` to every version the
+    // SDK knows, including `2026-07-28`. Per SEP-2567 (see rmcp's own
+    // `StreamableHttpServerConfig::legacy_session_mode` doc comment), a peer
+    // that negotiates `2026-07-28` is *always* served statelessly over
+    // Streamable-HTTP regardless of `legacy_session_mode`.
+    //
+    // Phase 1 of the MCP 2026-07-28 upgrade
+    // (docs/plans/2026-08-04-mcp-2026-07-28-upgrade-plan.md) capped this list
+    // below `2026-07-28`, because statelessness would have silently dropped
+    // the hub-edit human-veto gate's declined-answer cache and left it with
+    // no working mechanism at all (the legacy `elicit_with_timeout` needs a
+    // live back-channel a stateless connection doesn't have). Phase 2 closed
+    // that gap: `elicit_setup` (tools/edit.rs) now offers `ElicitMechanism::
+    // Mrtr` to any peer negotiating `2026-07-28`+, and `hub_mrtr_ask`/
+    // `hub_mrtr_decide` make the approve/decline decision from a self-
+    // contained, HMAC-sealed `requestState` (`RequestStateCodec`) plus the
+    // client-echoed `inputResponses` — it does not read or write any
+    // per-connection state, so it is correct regardless of whether the
+    // request that asks and the request that answers land on the same
+    // `CalmServer` instance. `set_toolset` narrowing and the declined-answer
+    // cache remain per-connection conveniences (a dedup optimization, not a
+    // safety guarantee) that a genuinely stateless deployment may not
+    // preserve across requests — tracked as Phase 4 (stateless HTTP)
+    // territory, not a blocker for allowing negotiation here.
+    fn supported_protocol_versions(&self) -> std::borrow::Cow<'static, [rmcp::model::ProtocolVersion]> {
+        std::borrow::Cow::Borrowed(rmcp::model::ProtocolVersion::KNOWN_VERSIONS)
+    }
+
     // Hand-written instead of relying on `#[tool_router]`'s bare merged
     // router so `list_tools`/`call_tool` go through `self.tool_router`,
     // which already has every tool outside `self.preset` disabled (see
@@ -657,23 +685,25 @@ impl rmcp::ServerHandler for CalmServer {
         _context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<rmcp::model::ListToolsResult, rmcp::model::ErrorData> {
         let visible = self.current_visible_tool_names();
-        Ok(rmcp::model::ListToolsResult {
-            next_cursor: None,
-            tools: self
-                .tool_router
+        // `with_all_items` leaves result_type/ttl_ms/cache_scope (SEP-2549) at
+        // their no-cache-hint defaults -- Phase 3 of the MCP 2026-07-28 upgrade
+        // (docs/plans/2026-08-04-mcp-2026-07-28-upgrade-plan.md) is where this
+        // toolset already emits `tool_list_changed` on every `set_toolset`
+        // narrowing, so that's the natural cache-bust signal to wire up then.
+        Ok(rmcp::model::ListToolsResult::with_all_items(
+            self.tool_router
                 .list_all()
                 .into_iter()
                 .filter(|t| visible.contains(t.name.as_ref()))
                 .collect(),
-            meta: None,
-        })
+        ))
     }
 
     async fn call_tool(
         &self,
         request: rmcp::model::CallToolRequestParams,
-        context: rmcp::service::RequestContext<rmcp::RoleServer>,
-    ) -> Result<rmcp::model::CallToolResult, rmcp::model::ErrorData> {
+        mut context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::CallToolResponse, rmcp::model::ErrorData> {
         // Preset scoping already lives in `self.tool_router` (built by
         // `tool_router_for_preset` at construction) — a disabled tool is
         // rejected by `ToolRouter::call` itself, so no separate
@@ -724,7 +754,8 @@ impl rmcp::ServerHandler for CalmServer {
             );
             return Ok(rmcp::model::CallToolResult::error(vec![
                 rmcp::model::ContentBlock::text(self.orientation_required_message()),
-            ]));
+            ])
+            .into());
         }
 
         // Runtime toolset gate (Phase 1). Enforced here, not just in
@@ -747,13 +778,40 @@ impl rmcp::ServerHandler for CalmServer {
                     "tool {tool_name:?} is not in this session's active toolset; \
                      call set_toolset to widen it"
                 )),
-            ]));
+            ])
+            .into());
         }
 
+        // SEP-2322 MRTR continuation (docs/plans/2026-08-04-mcp-2026-07-28-
+        // upgrade-plan.md Phase 2): `ToolCallContext::new` below discards
+        // `input_responses`/`request_state` from `request` (rmcp 3.x has no
+        // extractor for them), so this is the only place that can forward a
+        // retry's answer to the tool method that asked -- via `extensions`,
+        // rmcp's own typed pass-through, tool-agnostic (no per-tool branch
+        // needed here; `edit_lines_tool`/`edit_symbol_tool` check for it).
+        if let (Some(input_responses), Some(request_state)) =
+            (request.input_responses.clone(), request.request_state.clone())
+        {
+            context.extensions.insert(edit::MrtrContinuation {
+                input_responses,
+                request_state,
+            });
+        }
         let tool_context =
             rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
         let mut result = self.tool_router.call(tool_context).instrument(span).await;
-        if let Ok(r) = &mut result {
+        // rmcp 3.x: `ToolRouter::call` returns `CallToolResponse`, an enum
+        // covering the ordinary completed result plus the MRTR
+        // (`InputRequired`) and Tasks (`Task`) variants (SEP-2322/SEP-2663) —
+        // neither of which any tool on this server emits yet, so this always
+        // matches `Complete` in practice today. Written as a real match (not
+        // an `if let ... else` that silently drops the other arms) so the
+        // orientation-injection / pending-diff-impact-reminder text keeps
+        // landing correctly the day a tool starts returning `InputRequired`
+        // (docs/plans/2026-08-04-mcp-2026-07-28-upgrade-plan.md Phase 2) —
+        // there is no `content` to append text to on that variant, so it's a
+        // deliberate no-op rather than a bug.
+        if let Ok(rmcp::model::CallToolResponse::Complete(r)) = &mut result {
             if is_adjacent {
                 self.oriented
                     .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -770,6 +828,11 @@ impl rmcp::ServerHandler for CalmServer {
             {
                 r.content.push(rmcp::model::ContentBlock::text(reminder));
             }
+        } else if let Ok(_) = &result
+            && is_adjacent
+        {
+            self.oriented
+                .store(true, std::sync::atomic::Ordering::SeqCst);
         }
         result
     }
@@ -781,11 +844,9 @@ impl rmcp::ServerHandler for CalmServer {
         Output = Result<rmcp::model::ListPromptsResult, rmcp::model::ErrorData>,
     > + Send
     + '_ {
-        std::future::ready(Ok(rmcp::model::ListPromptsResult {
-            next_cursor: None,
-            prompts: ci_prompts(),
-            meta: None,
-        }))
+        std::future::ready(Ok(rmcp::model::ListPromptsResult::with_all_items(
+            ci_prompts(),
+        )))
     }
 
     fn get_prompt(
@@ -793,7 +854,7 @@ impl rmcp::ServerHandler for CalmServer {
         request: rmcp::model::GetPromptRequestParams,
         _context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> impl std::future::Future<
-        Output = Result<rmcp::model::GetPromptResult, rmcp::model::ErrorData>,
+        Output = Result<rmcp::model::GetPromptResponse, rmcp::model::ErrorData>,
     > + Send
     + '_ {
         let result =
@@ -806,7 +867,7 @@ impl rmcp::ServerHandler for CalmServer {
                         .into_iter()
                         .find(|p| p.name == request.name)
                         .and_then(|p| p.description);
-                    Ok(result)
+                    Ok(result.into())
                 }
                 None => Err(rmcp::model::ErrorData::invalid_params(
                     format!("unknown prompt: {}", request.name),

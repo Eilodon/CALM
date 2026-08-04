@@ -170,7 +170,20 @@ tokio-util = "0.7"
 notify = "6.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-rmcp = { version = "2", features = ["server", "transport-io", "macros", "elicitation", "schemars"] }
+# rmcp 3.x = MCP 2026-07-28 spec support (docs/plans/2026-08-04-mcp-2026-07-28-upgrade-plan.md,
+# Phase 1). Live-verified in a scratch spike (rmcp 3.1.0 + axum 0.8 + schemars 1 + the
+# `transport-streamable-http-server` feature): `cargo tree -d` shows exactly one `rmcp` and one
+# `axum` node (no OTEL-style split-core repeat of Dependabot PR #46). `transport-streamable-http-server`
+# lives in crates/calm-server/Cargo.toml's `http` feature, same as before.
+#
+# `request-state` (Phase 2, added 2026-08-04): gates `rmcp::model::RequestStateCodec`, used to
+# HMAC-seal the SEP-2322 MRTR `requestState` for the hub-edit human-veto gate
+# (crates/calm-server/src/tools/edit.rs). Pulls in `hmac 0.13`/`sha2 0.11` as NEW transitive deps,
+# distinct majors from this workspace's own `hmac 0.12`/`sha2 0.10` pins below -- unlike the
+# OTEL two-cores bug this isn't a problem: `RequestStateCodec` is self-contained (key bytes in,
+# sealed string out), CALM's code never constructs an `Hmac`/`Sha2` value itself, and neither
+# crate carries global mutable state across versions the way `opentelemetry`'s SDK singleton does.
+rmcp = { version = "3", features = ["server", "transport-io", "macros", "elicitation", "schemars", "request-state"] }
 schemars = "1"
 clap = { version = "4", features = ["derive"] }
 rayon = "1"

@@ -57,9 +57,13 @@ fn wait_for(timeout: Duration, cond: impl Fn() -> bool) -> bool {
     false
 }
 
-fn send_initialize_and_capture(calm_dir_project: &Path) -> std::process::Output {
-    let request = br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"it","version":"0"}}}
-"#;
+fn send_initialize_and_capture(
+    calm_dir_project: &Path,
+    protocol_version: &str,
+) -> std::process::Output {
+    let request = format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"{protocol_version}\",\"capabilities\":{{}},\"clientInfo\":{{\"name\":\"it\",\"version\":\"0\"}}}}}}\n"
+    );
     let mut child = Command::new(calm_bin())
         .arg("connect")
         .arg("--project-root")
@@ -72,7 +76,7 @@ fn send_initialize_and_capture(calm_dir_project: &Path) -> std::process::Output 
 
     let stdout = child.stdout.take().expect("piped stdout");
     let mut stdin = child.stdin.take().unwrap();
-    stdin.write_all(request).unwrap();
+    stdin.write_all(request.as_bytes()).unwrap();
 
     // Wait for the real response (echoes back "id":1) before closing stdin
     // — see `StdoutWatcher`'s doc comment. Closing stdin immediately after
@@ -146,7 +150,7 @@ fn daemon_survives_forwarders_process_group_sigterm() {
     let _ = connect.wait();
     std::thread::sleep(Duration::from_millis(300));
 
-    let output = send_initialize_and_capture(project.path());
+    let output = send_initialize_and_capture(project.path(), "2024-11-05");
     assert!(
         output.status.success(),
         "a follow-up calm connect must still succeed against the surviving daemon: {}",
@@ -170,6 +174,50 @@ fn daemon_survives_forwarders_process_group_sigterm() {
     unsafe {
         libc::kill(daemon_pid_after as i32, libc::SIGTERM);
     }
+}
+
+/// MCP 2026-07-28 upgrade (docs/plans/2026-08-04-mcp-2026-07-28-upgrade-
+/// plan.md). Phase 1 capped `supported_protocol_versions()` below
+/// `2026-07-28` because negotiating it forces Streamable-HTTP statelessness
+/// (SEP-2567) regardless of session-manager setup, and the hub-edit
+/// human-veto gate had no mechanism that survived that at the time. Phase 2
+/// gave the gate an MRTR path (`hub_mrtr_ask`/`hub_mrtr_decide`,
+/// tools/edit.rs) whose approve/decline decision is self-contained in a
+/// sealed `requestState` rather than per-connection state, closing that gap
+/// — so the cap was lifted and a peer offering `2026-07-28` now gets it
+/// back, not a downgrade.
+#[test]
+fn initialize_requesting_2026_07_28_is_now_negotiated_after_phase_2() {
+    let project = fresh_project();
+
+    let output = send_initialize_and_capture(project.path(), "2026-07-28");
+    assert!(
+        output.status.success(),
+        "a client offering 2026-07-28 must get a successful initialize: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        response.contains("\"protocolVersion\":\"2026-07-28\""),
+        "expected the server to negotiate 2026-07-28 now that the hub-edit \
+         gate has an MRTR path that survives statelessness: {response}"
+    );
+}
+
+/// A pre-2026-07-28 client (this exact string is what every other test in
+/// this file hardcodes) must still negotiate cleanly — the cap lift must
+/// not have disturbed the floor of `ProtocolVersion::SUPPORTED`.
+#[test]
+fn initialize_requesting_2024_11_05_still_negotiates_that_exact_version() {
+    let project = fresh_project();
+
+    let output = send_initialize_and_capture(project.path(), "2024-11-05");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let response = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        response.contains("\"protocolVersion\":\"2024-11-05\""),
+        "response: {response}"
+    );
 }
 
 /// Reads `stdout` incrementally on a background thread and polls the
