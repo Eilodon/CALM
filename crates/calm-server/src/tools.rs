@@ -429,6 +429,36 @@ impl CalmServer {
         true
     }
 
+    /// Narrows THIS connection's own effective preset ceiling to `preset`
+    /// (any spec `resolve_preset` accepts — bare legacy names, composable
+    /// comma-separated toolset tokens, `-exclude`, `remote-safe`). Used
+    /// only by the daemon's per-connection handshake (`daemon.rs`'s
+    /// `read_connection_preset_preamble`/`run_accept_loop`) so a client's
+    /// own `calm connect --preset` request takes effect even when
+    /// attaching to an already-live daemon, not just when it happens to
+    /// be the one that spawns it (`KNOWN_LIMITATIONS.md` "Shared daemon
+    /// has one capability ceiling for every connection").
+    ///
+    /// Can only ever narrow, never widen, past what this daemon's own
+    /// `tool_router` already allows: `resolve_preset`'s output here only
+    /// feeds `current_visible_tool_names`'s ceiling (checked in
+    /// `list_tools`/`call_tool`), never `tool_router`'s own routes —
+    /// those were `disable_route`'d once at construction from whatever
+    /// preset the daemon actually spawned with, and `ToolRouter::call`
+    /// still enforces that regardless of this value. So a connection
+    /// that requests a WIDER preset than the daemon's own gets exactly
+    /// nothing extra: `current_visible_tool_names` would report the tool
+    /// as visible, but dispatching it still fails inside `tool_router`'s
+    /// own disabled-route check — a request can only ever end up
+    /// narrower than or equal to the daemon's real ceiling, never past
+    /// it. Returns `Err` (leaving `self.preset` untouched) on an invalid
+    /// spec, mirroring `resolve_preset`'s own validation.
+    pub(crate) fn narrow_connection_preset(&mut self, preset: &str) -> anyhow::Result<()> {
+        common::resolve_preset(preset)?;
+        self.preset = preset.to_string();
+        Ok(())
+    }
+
     /// Test-only entry point for `apply_toolset_inner` — production code
     /// only reaches it through the `set_toolset` MCP tool, which also
     /// validates names against `TOOLSET_NAMES` and notifies the client.
