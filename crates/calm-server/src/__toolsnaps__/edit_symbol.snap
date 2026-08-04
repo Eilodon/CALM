@@ -58,6 +58,13 @@
           "null"
         ]
       },
+      "cites": {
+        "description": "See `EditLinesParams::cites`.",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
       "old_text": {
         "description": "Small-text-match mode: when set, `new_text` replaces the FIRST\n(and required-to-be-only) occurrence of `old_text` found within the\nresolved symbol's current range, instead of replacing the whole\nsymbol. No line numbers, no `expected_hash` needed — the server\nreads the symbol's live content to find the match, so staleness is\nimpossible by construction. Refused with `BOUNDARY_AMBIGUOUS` if\nthe target symbol carries that flag (its own range can't be\ntrusted as a search scope — see fitness_report). Ignored when\n`position` is not `\"replace\"`.",
         "type": [

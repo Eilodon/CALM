@@ -5961,6 +5961,136 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn reference_impact_classifies_signals_into_the_right_buckets() {
+        let dir =
+            std::env::temp_dir().join(format!("ci_ref_impact_buckets_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // The real files matter here: line_previews_batched and the textual
+        // grep floor both read from disk, not just the DB.
+        std::fs::write(
+            dir.join("utils.js"),
+            "function setCharset() {\n    return 1;\n}\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("response.js"), "setCharset();\n").unwrap();
+        std::fs::write(dir.join("weird.js"), "obj.setCharset();\n").unwrap();
+        std::fs::write(dir.join("fanout.js"), "x.setCharset();\n").unwrap();
+        std::fs::write(
+            dir.join("reexport.js"),
+            "var utils = require('./utils');\nmodule.exports.setCharset = utils.setCharset;\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("notes.md"), "See setCharset for details.\n").unwrap();
+
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('utils.js::setCharset', 'setCharset', 'function', 'javascript', 'utils.js', 1, 3, 'function setCharset() {', '', 'setCharset', 3, 0, 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO call_edges (from_symbol, to_symbol, from_path, to_path, call_site_line, edge_confidence)
+                 VALUES ('response.js::<module>', 'utils.js::setCharset', 'response.js', 'utils.js', 1, 'resolved')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO call_edges (from_symbol, to_symbol, from_path, to_path, call_site_line, edge_confidence)
+                 VALUES ('weird.js::<module>', 'utils.js::setCharset', 'weird.js', 'utils.js', 1, 'textual')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO call_edges (from_symbol, to_symbol, from_path, to_path, call_site_line, edge_confidence)
+                 VALUES ('fanout.js::<module>', 'utils.js::setCharset', 'fanout.js', 'utils.js', 1, 'ambiguous')",
+                [],
+            )
+            .unwrap();
+            // The exact gap this tool closes: a bare re-export with no call
+            // edge at all -- only visible via the import graph.
+            conn.execute(
+                "INSERT INTO import_edges (from_path, to_path, module_name, symbols_used)
+                 VALUES ('reexport.js', 'utils.js', './utils', '[\"setCharset\"]')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let v = jv(
+            server.reference_impact(rmcp::handler::server::wrapper::Parameters(
+                ReferenceImpactParams {
+                    symbol: "setCharset".into(),
+                    path: None,
+                    line: None,
+                },
+            )),
+        );
+
+        assert_eq!(
+            v["must_change_count"], 2,
+            "response.js call edge + reexport.js import: {v}"
+        );
+        assert_eq!(
+            v["likely_change_count"], 1,
+            "weird.js textual-confidence call edge: {v}"
+        );
+        assert_eq!(v["review_count"], 1, "fanout.js ambiguous call edge: {v}");
+        assert_eq!(
+            v["textual_only_count"], 1,
+            "only notes.md should be left over -- reexport.js's own setCharset \
+             mentions are already covered by the import edge: {v}"
+        );
+
+        let refs = v["references"].as_array().unwrap();
+        let must_change_paths: Vec<&str> = refs
+            .iter()
+            .filter(|r| r["classification"] == "must_change")
+            .map(|r| r["path"].as_str().unwrap())
+            .collect();
+        assert!(must_change_paths.contains(&"response.js"));
+        assert!(must_change_paths.contains(&"reexport.js"));
+
+        let textual_only: Vec<&str> = refs
+            .iter()
+            .filter(|r| r["classification"] == "textual_only")
+            .map(|r| r["path"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            textual_only,
+            vec!["notes.md"],
+            "utils.js's own definition line must never appear as a reference: {v}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reference_impact_not_found_for_unknown_symbol() {
+        let dir =
+            std::env::temp_dir().join(format!("ci_ref_impact_not_found_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        let v = jv(
+            server.reference_impact(rmcp::handler::server::wrapper::Parameters(
+                ReferenceImpactParams {
+                    symbol: "doesNotExist".into(),
+                    path: None,
+                    line: None,
+                },
+            )),
+        );
+        assert_eq!(v["error"]["code"], "NOT_FOUND", "response: {v}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Regression for Task 14 (schema drift): `indexing_status` used to omit
     /// `files_total`/`last_updated` entirely.
     #[test]
@@ -7706,6 +7836,7 @@ mod tests {
                 }],
                 confirm: false,
                 reason: None,
+                cites: None,
             },
         ));
         let v = jv(out);
@@ -7739,6 +7870,7 @@ mod tests {
                 }],
                 confirm: false,
                 reason: None,
+                cites: None,
             },
         ));
         let v = jv(out);
@@ -7771,6 +7903,7 @@ mod tests {
                 }],
                 confirm: false,
                 reason: None,
+                cites: None,
             },
         ));
         let v = jv(out);
@@ -7845,6 +7978,7 @@ mod tests {
                 }],
                 confirm: false,
                 reason: None,
+                cites: None,
             },
         ));
         let v = jv(out);
@@ -7918,6 +8052,7 @@ mod tests {
                 }],
                 confirm: false,
                 reason: None,
+                cites: None,
             },
         ));
         assert_eq!(jv(out)["applied"], true);
@@ -7944,6 +8079,7 @@ mod tests {
                 position: None,
                 confirm: false,
                 reason: None,
+                cites: None,
                 old_text: None,
             },
         ));
@@ -8182,6 +8318,7 @@ mod tests {
                 }],
                 confirm: false,
                 reason: None,
+                cites: None,
             },
         ));
         let v = jv(out);
@@ -8222,6 +8359,7 @@ mod tests {
                 }],
                 confirm: false,
                 reason: None,
+                cites: None,
             },
         ));
 
@@ -8369,6 +8507,7 @@ mod tests {
                 }],
                 confirm: false,
                 reason: None,
+                cites: None,
             },
         ));
         let v = jv(out);
@@ -8411,6 +8550,7 @@ mod tests {
                 }],
                 confirm: false,
                 reason: None,
+                cites: None,
             },
         ));
         let v = jv(out);
@@ -8455,6 +8595,7 @@ mod tests {
                 }],
                 confirm: false,
                 reason: None,
+                cites: None,
             },
         ));
         let v = jv(out);
@@ -8488,8 +8629,12 @@ mod tests {
 
         // Baseline: 2 callers alone is structurally "low" (risk_level_from_
         // caller_count only escalates past 3), no risk_rules configured.
+        // Range is the body line only (2, 2) -- line 1 is the function's own
+        // signature (`signature = ''` here still spans line_start=1 with 0
+        // embedded newlines), and touching it would trip the separate
+        // signature-escalation signal this test isn't exercising.
         let (risk, _, _, _, _, reason) =
-            compute_touch_risk(&conn, "a.py", &[(1, 2)], &coverage, &[]);
+            compute_touch_risk(&conn, "a.py", &[(2, 2)], &coverage, &[], &[]);
         assert_eq!(risk.as_deref(), Some("low"), "baseline structural risk");
         assert!(reason.is_none());
 
@@ -8500,7 +8645,7 @@ mod tests {
             minimum: "high".to_string(),
         }];
         let (risk, _, _, _, _, reason) =
-            compute_touch_risk(&conn, "a.py", &[(1, 2)], &coverage, &rules);
+            compute_touch_risk(&conn, "a.py", &[(2, 2)], &coverage, &rules, &[]);
         assert_eq!(risk.as_deref(), Some("high"));
         let reason = reason.expect("risk_rule_reason must be set when a rule raises the floor");
         assert!(
@@ -8531,7 +8676,7 @@ mod tests {
             minimum: "low".to_string(),
         }];
         let (risk, _, _, _, _, reason) =
-            compute_touch_risk(&conn, "a.py", &[(1, 2)], &coverage, &rules);
+            compute_touch_risk(&conn, "a.py", &[(1, 2)], &coverage, &rules, &[]);
         assert_eq!(
             risk.as_deref(),
             Some("high"),
@@ -8540,6 +8685,122 @@ mod tests {
         assert!(
             reason.is_none(),
             "no escalation happened, so there's nothing to attribute to a rule"
+        );
+    }
+
+    #[test]
+    fn compute_touch_risk_escalates_when_edit_touches_the_signature_line() {
+        let (dir, server) = test_server("touch_risk_signature_escalate");
+        std::fs::write(dir.join("a.py"), "def helper():\n    return 1\n").unwrap();
+        {
+            let conn = server.db();
+            // caller_count=2 -> structurally "low" on its own (see the
+            // sibling risk_rules tests) -- isolates this test to the
+            // signature-touch signal alone.
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.py::helper', 'helper', 'function', 'python', 'a.py', 1, 2, 'def helper():', '', 'helper', 2, 0, 0)",
+                [],
+            )
+            .unwrap();
+        }
+        let conn = server.make_read_conn().unwrap();
+        let coverage = calm_core::analysis::coverage::CoverageData::none();
+
+        // A hunk fully covering the signature range (1, 1) with genuinely
+        // different text ("def helper():" -> "def helper(x):") must
+        // escalate "low" to "high", same ceiling
+        // escalate_risk_if_signature_changed uses.
+        let (risk, _, _, _, _, reason) = compute_touch_risk(
+            &conn,
+            "a.py",
+            &[(1, 1)],
+            &coverage,
+            &[],
+            &[(1, 1, "def helper(x):")],
+        );
+        assert_eq!(
+            risk.as_deref(),
+            Some("high"),
+            "a hunk that actually changes the signature text must escalate past the low \
+             structural signal"
+        );
+        let reason = reason.expect("escalation must carry a reason explaining why");
+        assert!(
+            reason.contains("a.py::helper") && reason.contains("signature"),
+            "reason should name the touched symbol and the signature, got: {reason}"
+        );
+    }
+
+    #[test]
+    fn compute_touch_risk_body_only_edit_does_not_trigger_signature_escalation() {
+        let (dir, server) = test_server("touch_risk_signature_body_only");
+        std::fs::write(dir.join("a.py"), "def helper():\n    return 1\n").unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.py::helper', 'helper', 'function', 'python', 'a.py', 1, 2, 'def helper():', '', 'helper', 2, 0, 0)",
+                [],
+            )
+            .unwrap();
+        }
+        let conn = server.make_read_conn().unwrap();
+        let coverage = calm_core::analysis::coverage::CoverageData::none();
+
+        // The hunk only covers the body line (2, 2), never the line-1
+        // signature range -- must stay at the plain structural "low" signal
+        // even though its new text obviously differs from the old body.
+        let (risk, _, _, _, _, reason) = compute_touch_risk(
+            &conn,
+            "a.py",
+            &[(2, 2)],
+            &coverage,
+            &[],
+            &[(2, 2, "    return 2")],
+        );
+        assert_eq!(
+            risk.as_deref(),
+            Some("low"),
+            "a hunk that never covers the signature range must not trigger escalation"
+        );
+        assert!(reason.is_none());
+    }
+
+    #[test]
+    fn compute_touch_risk_signature_escalation_reason_is_none_when_already_high() {
+        let (dir, server) = test_server("touch_risk_signature_already_high");
+        std::fs::write(dir.join("a.py"), "def hot():\n    return 1\n").unwrap();
+        {
+            let conn = server.db();
+            // caller_count=11 -> structurally "high" on its own already.
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.py::hot', 'hot', 'function', 'python', 'a.py', 1, 2, 'def hot():', '', 'hot', 11, 0, 0)",
+                [],
+            )
+            .unwrap();
+        }
+        let conn = server.make_read_conn().unwrap();
+        let coverage = calm_core::analysis::coverage::CoverageData::none();
+
+        // The signature genuinely changes ("def hot():" -> "def hot(x):"),
+        // but risk was already "high" from caller count alone -- nothing
+        // was actually escalated, so there's nothing new to attribute a
+        // reason to (avoids implying a rule or signature change did work
+        // that caller count already did).
+        let (risk, _, _, _, _, reason) = compute_touch_risk(
+            &conn,
+            "a.py",
+            &[(1, 1)],
+            &coverage,
+            &[],
+            &[(1, 1, "def hot(x):")],
+        );
+        assert_eq!(risk.as_deref(), Some("high"));
+        assert!(
+            reason.is_none(),
+            "no escalation happened (already high), so there's nothing to attribute: {reason:?}"
         );
     }
 
@@ -8612,6 +8873,7 @@ mod tests {
                     }],
                     confirm: true,
                     reason: Some("looks fine".into()),
+                    cites: None,
                 },
             )),
         );
@@ -8657,6 +8919,7 @@ mod tests {
                 }],
                 confirm: true,
                 reason: Some("looks fine".into()),
+                cites: None,
             },
         ));
         let v = jv(never_reviewed);
@@ -8689,6 +8952,7 @@ mod tests {
                 }],
                 confirm: false,
                 reason: Some("looks fine".into()),
+                cites: None,
             },
         ));
         let v = jv(no_confirm);
@@ -8710,6 +8974,7 @@ mod tests {
                 }],
                 confirm: true,
                 reason: Some("   ".into()),
+                cites: None,
             },
         ));
         let v = jv(blank_reason);
@@ -8728,6 +8993,7 @@ mod tests {
                 }],
                 confirm: true,
                 reason: Some("checked -- helper has no confirmed callers".into()),
+                cites: None,
             },
         ));
         let v = jv(with_all);
@@ -8796,6 +9062,7 @@ mod tests {
                 }],
                 confirm: false,
                 reason: None,
+                cites: None,
             },
         ));
         let v = jv(no_confirm);
@@ -8858,6 +9125,7 @@ mod tests {
                 }],
                 confirm: false,
                 reason: None,
+                cites: None,
             },
         ));
         let v = jv(no_confirm);
@@ -8905,6 +9173,7 @@ mod tests {
                 }],
                 confirm: true,
                 reason: Some("looks fine".into()),
+                cites: None,
             },
         ));
         let v = jv(never_reviewed);
@@ -8939,6 +9208,7 @@ mod tests {
                 }],
                 confirm: false,
                 reason: Some("looks fine".into()),
+                cites: None,
             },
         ));
         let v = jv(no_confirm);
@@ -8966,6 +9236,7 @@ mod tests {
                 }],
                 confirm: true,
                 reason: Some("   ".into()),
+                cites: None,
             },
         ));
         let v = jv(blank_reason);
@@ -8986,6 +9257,7 @@ mod tests {
                 reason: Some(
                     "checked -- entry point, no confirmed callers, dispatched externally".into(),
                 ),
+                cites: None,
             },
         ));
         let v = jv(with_all);
@@ -9049,6 +9321,7 @@ mod tests {
                 }],
                 confirm: true,
                 reason: Some("trust me, totally safe, definitely fine".into()),
+                cites: None,
             },
         ));
         let v = jv(out);
@@ -9102,6 +9375,7 @@ mod tests {
             }],
             confirm: true,
             reason: Some("checked -- no confirmed callers, dead-code heuristic uncertain".into()),
+            cites: None,
         };
 
         let mut ask: Option<HubAskContext> = None;
@@ -9186,6 +9460,7 @@ mod tests {
                 }],
                 confirm: true,
                 reason: Some("caller_fn already confirmed safe per review".into()),
+                cites: None,
             },
         ));
         let v = jv(out);
@@ -9246,6 +9521,7 @@ mod tests {
                 }],
                 confirm: true,
                 reason: Some("caller_fn already confirmed safe per review".into()),
+                cites: None,
             },
         ));
         let v = jv(out);
@@ -9318,6 +9594,7 @@ mod tests {
                     reason: Some(
                         "checked process_order, still passes the same shape of value".into(),
                     ),
+                    cites: None,
                 },
             )),
         );
@@ -9379,6 +9656,7 @@ mod tests {
             }],
             confirm: true,
             reason: Some("checked process_order, still passes the same shape of value".into()),
+            cites: None,
         };
 
         let mut ask: Option<HubAskContext> = None;
@@ -9433,6 +9711,7 @@ mod tests {
                     }],
                     confirm: false,
                     reason: None,
+                    cites: None,
                 },
             )),
         );
@@ -9533,6 +9812,7 @@ mod tests {
             }],
             confirm: false,
             reason: None,
+            cites: None,
         })));
         assert_eq!(out["applied"], true, "response: {out}");
         let tx_id = out["tx_id"].as_str().expect("tx_id present").to_string();
@@ -9577,6 +9857,7 @@ mod tests {
             }],
             confirm: false,
             reason: None,
+            cites: None,
         })));
         assert_eq!(out["applied"], true, "response: {out}");
         let tx_id = out["tx_id"].as_str().expect("tx_id present").to_string();
@@ -9632,6 +9913,7 @@ mod tests {
             }],
             confirm: false,
             reason: None,
+            cites: None,
         })));
         assert_eq!(out["applied"], true, "response: {out}");
         let tx_id = out["tx_id"].as_str().expect("tx_id present").to_string();
@@ -9693,6 +9975,7 @@ mod tests {
             }],
             confirm: false,
             reason: None,
+            cites: None,
         })));
         assert_eq!(out["applied"], true, "response: {out}");
         let tx_id = out["tx_id"].as_str().expect("tx_id present").to_string();
@@ -9768,6 +10051,7 @@ mod tests {
                 }],
                 confirm: false,
                 reason: None,
+                cites: None,
             },
         ));
         let v = jv(outcome);
@@ -9814,6 +10098,7 @@ mod tests {
                 }],
                 confirm: false,
                 reason: None,
+                cites: None,
             },
         ));
         let v = jv(outcome);
@@ -9867,6 +10152,7 @@ mod tests {
                 }],
                 confirm: false,
                 reason: Some("looks fine".into()),
+                cites: None,
             },
         ));
         let v = jv(no_confirm);
@@ -9907,6 +10193,7 @@ mod tests {
             }],
             confirm: true,
             reason: Some(reason.into()),
+            cites: None,
         };
 
         // Machine gate NOT yet passed (edit_context never ran): Ask mode
@@ -9979,6 +10266,7 @@ mod tests {
                 }],
                 confirm: false,
                 reason: None,
+                cites: None,
             },
             ElicitGate::Ask,
             &mut ask,
@@ -10030,6 +10318,7 @@ mod tests {
                 }],
                 confirm: false,
                 reason: None,
+                cites: None,
             },
         ));
         let v = jv(no_confirm);
@@ -10050,6 +10339,7 @@ mod tests {
                 }],
                 confirm: true,
                 reason: None,
+                cites: None,
             },
         ));
         let v = jv(with_confirm_only);
@@ -10121,6 +10411,7 @@ mod tests {
                 }],
                 confirm: true,
                 reason: None,
+                cites: None,
             },
         ));
         let v = jv(with_confirm_only);
@@ -10179,6 +10470,7 @@ mod tests {
                     }],
                     confirm: true,
                     reason: None,
+                    cites: None,
                 },
             )),
         );
@@ -10220,6 +10512,7 @@ mod tests {
                 ],
                 confirm: false,
                 reason: None,
+                cites: None,
             },
         ));
         let v = jv(out);
@@ -10259,6 +10552,7 @@ mod tests {
                 }],
                 confirm: false,
                 reason: None,
+                cites: None,
             },
         ));
         let v = jv(out);
@@ -10292,6 +10586,7 @@ mod tests {
                 }],
                 confirm: false,
                 reason: None,
+                cites: None,
             },
         ));
         let v = jv(out);
@@ -10330,6 +10625,7 @@ mod tests {
                 }],
                 confirm: false,
                 reason: None,
+                cites: None,
             },
         ));
         let v = jv(out);
@@ -10362,6 +10658,7 @@ mod tests {
                 }],
                 confirm: false,
                 reason: None,
+                cites: None,
             },
         ));
         let v = jv(out);
@@ -10401,6 +10698,7 @@ mod tests {
                 position: None,
                 confirm: false,
                 reason: None,
+                cites: None,
                 old_text: None,
             },
         ));
@@ -10445,6 +10743,7 @@ mod tests {
                 position: None,
                 confirm: true,
                 reason: None,
+                cites: None,
                 old_text: None,
             },
         ));
@@ -10483,6 +10782,7 @@ mod tests {
                 position: None,
                 confirm: true,
                 reason: None,
+                cites: None,
                 old_text: Some("let x = 1;".into()),
             },
         ));
@@ -10524,6 +10824,7 @@ mod tests {
                 position: None,
                 confirm: true,
                 reason: None,
+                cites: None,
                 old_text: Some("let x".into()),
             },
         ));
@@ -10569,6 +10870,7 @@ mod tests {
                 position: None,
                 confirm: true,
                 reason: None,
+                cites: None,
                 old_text: Some("1".into()),
             },
         ));
@@ -10608,6 +10910,7 @@ mod tests {
                 position: Some("append_inside".into()),
                 confirm: false,
                 reason: None,
+                cites: None,
                 old_text: None,
             },
         ));
@@ -10647,6 +10950,7 @@ mod tests {
                 position: Some("after".into()),
                 confirm: false,
                 reason: None,
+                cites: None,
                 old_text: None,
             },
         ));
@@ -10695,6 +10999,7 @@ mod tests {
                 position: Some("before".into()),
                 confirm: false,
                 reason: None,
+                cites: None,
                 old_text: None,
             },
         ));
@@ -10753,6 +11058,7 @@ mod tests {
                 position: Some("before".into()),
                 confirm: false,
                 reason: None,
+                cites: None,
                 old_text: None,
             },
         ));
@@ -10795,6 +11101,7 @@ mod tests {
                 position: Some("before".into()),
                 confirm: false,
                 reason: None,
+                cites: None,
                 old_text: None,
             },
         ));
@@ -10837,6 +11144,7 @@ mod tests {
                 position: Some("after".into()),
                 confirm: false,
                 reason: None,
+                cites: None,
                 old_text: None,
             },
         ));
@@ -10862,6 +11170,7 @@ mod tests {
                 position: Some("top_of_file".into()),
                 confirm: false,
                 reason: None,
+                cites: None,
                 old_text: None,
             },
         ));
@@ -10890,6 +11199,7 @@ mod tests {
                 position: Some("end_of_file".into()),
                 confirm: false,
                 reason: None,
+                cites: None,
                 old_text: None,
             },
         ));
@@ -10918,6 +11228,7 @@ mod tests {
                 position: Some("top_of_file".into()),
                 confirm: false,
                 reason: None,
+                cites: None,
                 old_text: None,
             },
         ));
@@ -10945,6 +11256,7 @@ mod tests {
                 }],
                 confirm: false,
                 reason: None,
+                cites: None,
             },
         ));
         let v = jv(out);
@@ -10981,6 +11293,7 @@ mod tests {
                 }],
                 confirm: false,
                 reason: None,
+                cites: None,
             },
         ));
         let v = jv(out);
@@ -11475,6 +11788,7 @@ mod tests {
                     position: None,
                     confirm: true,
                     reason: Some("this should be safe, low risk, no problem".into()),
+                    cites: None,
                     old_text: None,
                 },
             )),
@@ -11502,6 +11816,7 @@ mod tests {
                     reason: Some(
                         "checked process_order, still passes the same shape of value".into(),
                     ),
+                    cites: None,
                     old_text: None,
                 },
             )),
@@ -11564,6 +11879,7 @@ mod tests {
                     position: None,
                     confirm: true,
                     reason: Some("renewed the flow, still correct".into()),
+                    cites: None,
                     old_text: None,
                 },
             )),
@@ -11585,11 +11901,184 @@ mod tests {
                     position: None,
                     confirm: true,
                     reason: Some("checked CalmServer::new — return shape unchanged".into()),
+                    cites: None,
                     old_text: None,
                 },
             )),
         );
         assert_eq!(grounded["applied"], true, "response: {grounded}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_symbol_cites_exact_qualified_name_passes_without_reason_text() {
+        let (dir, server) = test_server("edit_cites_exact_match");
+        std::fs::write(dir.join("a.py"), "def helper():\n    return 1\n").unwrap();
+
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.py::helper', 'helper', 'function', 'python', 'a.py', 1, 2, '', '', 'helper', 1, 1, 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO call_edges (from_symbol, to_symbol, from_path, to_path, edge_confidence)
+                 VALUES ('a.py::CalmServer::new', 'a.py::helper', 'a.py', 'a.py', 'formal')",
+                [],
+            )
+            .unwrap();
+        }
+
+        server.edit_context(rmcp::handler::server::wrapper::Parameters(
+            EditContextParams {
+                symbol: "helper".into(),
+                path: None,
+                line: None,
+                if_none_match: None,
+            },
+        ));
+        let hash = calm_core::edit::range_checksum("def helper():\n    return 1\n", 1, 2).unwrap();
+
+        // `cites` set to the EXACT qualified_name edit_context returned --
+        // no `reason` text needed at all, unlike the lexical path.
+        let out = jv(
+            server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
+                EditSymbolParams {
+                    symbol: "helper".into(),
+                    path: None,
+                    line: None,
+                    expected_hash: Some(hash),
+                    new_text: "def helper():\n    return 42\n".into(),
+                    position: None,
+                    confirm: true,
+                    reason: None,
+                    cites: Some("a.py::CalmServer::new".into()),
+                    old_text: None,
+                },
+            )),
+        );
+        assert_eq!(out["applied"], true, "response: {out}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_symbol_cites_requires_exact_qualified_name_not_a_substring() {
+        let (dir, server) = test_server("edit_cites_not_substring");
+        std::fs::write(dir.join("a.py"), "def helper():\n    return 1\n").unwrap();
+
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.py::helper', 'helper', 'function', 'python', 'a.py', 1, 2, '', '', 'helper', 1, 1, 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO call_edges (from_symbol, to_symbol, from_path, to_path, edge_confidence)
+                 VALUES ('a.py::CalmServer::new', 'a.py::helper', 'a.py', 'a.py', 'formal')",
+                [],
+            )
+            .unwrap();
+        }
+
+        server.edit_context(rmcp::handler::server::wrapper::Parameters(
+            EditContextParams {
+                symbol: "helper".into(),
+                path: None,
+                line: None,
+                if_none_match: None,
+            },
+        ));
+        let hash = calm_core::edit::range_checksum("def helper():\n    return 1\n", 1, 2).unwrap();
+
+        // Bare short name ("new") is a real substring of the real caller's
+        // qualified_name, but `cites` requires exact equality -- structured,
+        // not lexical. Must fail even though `reason` alone would have
+        // passed via the short-name word-boundary path.
+        let out = jv(
+            server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
+                EditSymbolParams {
+                    symbol: "helper".into(),
+                    path: None,
+                    line: None,
+                    expected_hash: Some(hash),
+                    new_text: "def helper():\n    return 42\n".into(),
+                    position: None,
+                    confirm: true,
+                    reason: Some("checked new — still correct".into()),
+                    cites: Some("new".into()),
+                    old_text: None,
+                },
+            )),
+        );
+        assert_eq!(
+            out["error"]["code"], "REASON_NOT_GROUNDED",
+            "response: {out}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_symbol_cites_does_not_fall_back_to_reason_on_mismatch() {
+        let (dir, server) = test_server("edit_cites_no_fallback");
+        std::fs::write(dir.join("a.py"), "def helper():\n    return 1\n").unwrap();
+
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.py::helper', 'helper', 'function', 'python', 'a.py', 1, 2, '', '', 'helper', 1, 1, 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO call_edges (from_symbol, to_symbol, from_path, to_path, edge_confidence)
+                 VALUES ('a.py::CalmServer::new', 'a.py::helper', 'a.py', 'a.py', 'formal')",
+                [],
+            )
+            .unwrap();
+        }
+
+        server.edit_context(rmcp::handler::server::wrapper::Parameters(
+            EditContextParams {
+                symbol: "helper".into(),
+                path: None,
+                line: None,
+                if_none_match: None,
+            },
+        ));
+        let hash = calm_core::edit::range_checksum("def helper():\n    return 1\n", 1, 2).unwrap();
+
+        // `cites` is wrong (not a real caller at all), but `reason` itself
+        // properly cites the real caller by its qualified name -- `cites`
+        // being present and wrong must still fail, not silently fall back
+        // to the (otherwise-passing) lexical `reason` check.
+        let out = jv(
+            server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
+                EditSymbolParams {
+                    symbol: "helper".into(),
+                    path: None,
+                    line: None,
+                    expected_hash: Some(hash),
+                    new_text: "def helper():\n    return 42\n".into(),
+                    position: None,
+                    confirm: true,
+                    reason: Some("checked a.py::CalmServer::new — still correct".into()),
+                    cites: Some("not::a::real::caller".into()),
+                    old_text: None,
+                },
+            )),
+        );
+        assert_eq!(
+            out["error"]["code"], "REASON_NOT_GROUNDED",
+            "response: {out}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -11642,6 +12131,7 @@ mod tests {
                     position: None,
                     confirm: true,
                     reason: Some("xrefresh_caller_countsy still fine".into()),
+                    cites: None,
                     old_text: None,
                 },
             )),
@@ -11664,6 +12154,7 @@ mod tests {
                     position: None,
                     confirm: true,
                     reason: Some("cites refresh_caller_counts directly, unaffected".into()),
+                    cites: None,
                     old_text: None,
                 },
             )),
@@ -11726,6 +12217,7 @@ mod tests {
                     position: None,
                     confirm: true,
                     reason: Some("checked run(), looks fine".into()),
+                    cites: None,
                     old_text: None,
                 },
             )),
@@ -11747,6 +12239,7 @@ mod tests {
                     position: None,
                     confirm: true,
                     reason: Some("checked a.py::run, unaffected".into()),
+                    cites: None,
                     old_text: None,
                 },
             )),
@@ -11809,6 +12302,7 @@ mod tests {
                     }],
                     confirm: true,
                     reason: Some("fine".into()),
+                    cites: None,
                 },
             )),
         );
@@ -11831,6 +12325,7 @@ mod tests {
                     }],
                     confirm: true,
                     reason: Some("fine, 0 confirmed callers".into()),
+                    cites: None,
                 },
             )),
         );

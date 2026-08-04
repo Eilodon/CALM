@@ -5,6 +5,17 @@
 //! -- this module only knows how to serve, given an already-decided
 //! address/preset; it makes no policy decisions of its own.
 
+/// Defense-in-depth request-body cap (see `serve_http`'s doc comment for
+/// what this is and isn't). 16 MiB: generous headroom over
+/// `indexer::pipeline::MAX_INDEXABLE_FILE_BYTES` (8 MiB) for a whole-file
+/// edit payload plus JSON-RPC/MCP framing overhead.
+const MAX_HTTP_BODY_BYTES: usize = 16 * 1024 * 1024;
+
+/// Defense-in-depth concurrency cap (see `serve_http`'s doc comment).
+/// Deliberately generous -- this is a dev tool serving a handful of MCP
+/// clients, not a public API with real load to size against.
+const MAX_HTTP_CONCURRENT_REQUESTS: usize = 64;
+
 /// Serves `daemon_server` over Streamable-HTTP at `addr`. `daemon_server`
 /// must already be the product of `crate::bootstrap()` (same as the
 /// unix-socket daemon path, `daemon::serve_unix_daemon`) -- NOT a bare
@@ -59,6 +70,26 @@ pub async fn serve_http(
             async move { crate::http::require_bearer_token(token, req, next).await }
         }));
     }
+    // Defense-in-depth only, not a full DoS policy -- docs/http-transport.md
+    // and README.md already tell operators to put this behind a reverse
+    // proxy for real rate limiting; this just closes the most egregious
+    // unbounded-resource gaps a bare axum Router had (both docs previously
+    // said "no built-in rate limiting or request-size/DoS protection" --
+    // now updated to describe this floor instead). `DefaultBodyLimit` rejects an
+    // oversized request body before it's ever buffered into memory --
+    // `MAX_HTTP_BODY_BYTES` is generous headroom over
+    // `indexer::pipeline::MAX_INDEXABLE_FILE_BYTES` (8 MiB) for a
+    // whole-file `edit_lines`/`format_files` payload plus JSON-RPC framing.
+    // `ConcurrencyLimitLayer` caps simultaneous in-flight requests so a
+    // connection flood can't spawn unbounded concurrent `CalmServer`
+    // sessions -- this is a dev tool serving a handful of MCP clients, not
+    // a public API, so `MAX_HTTP_CONCURRENT_REQUESTS` is deliberately
+    // generous rather than tightly tuned.
+    app = app
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
+        .layer(tower::limit::ConcurrencyLimitLayer::new(
+            MAX_HTTP_CONCURRENT_REQUESTS,
+        ));
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("Serving MCP over HTTP at http://{addr}/mcp");

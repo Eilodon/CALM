@@ -203,6 +203,7 @@ impl CalmServer {
                 hunks,
                 p.confirm,
                 p.reason.as_deref(),
+                p.cites.as_deref(),
                 false,
                 None,
                 gate,
@@ -376,6 +377,7 @@ impl CalmServer {
                         vec![hunk],
                         p.confirm,
                         p.reason.as_deref(),
+                        p.cites.as_deref(),
                         true,
                         None,
                         gate,
@@ -517,6 +519,7 @@ impl CalmServer {
                 vec![hunk],
                 p.confirm,
                 p.reason.as_deref(),
+                p.cites.as_deref(),
                 position_anchored,
                 insertion_note,
                 gate,
@@ -864,6 +867,7 @@ impl CalmServer {
         hunks: Vec<calm_core::edit::HunkRequest>,
         confirm: bool,
         reason: Option<&str>,
+        cites: Option<&str>,
         position_anchored: bool,
         extra_note: Option<String>,
         gate: ElicitGate,
@@ -1070,9 +1074,20 @@ impl CalmServer {
                 .iter()
                 .map(|h| (h.start_line as i64, h.end_line as i64))
                 .collect();
+            let proposed_hunks: Vec<(i64, i64, &str)> = hunks
+                .iter()
+                .map(|h| (h.start_line as i64, h.end_line as i64, h.new_text.as_str()))
+                .collect();
             let coverage = self.coverage.read_ok();
             let (risk, hub_hit, hub_kind, uncertain_zero_caller, touched, risk_rule_reason) =
-                compute_touch_risk(&conn, path, &ranges, &coverage, &self.config().risk_rules);
+                compute_touch_risk(
+                    &conn,
+                    path,
+                    &ranges,
+                    &coverage,
+                    &self.config().risk_rules,
+                    &proposed_hunks,
+                );
             // Plan 3 §3.3 (F10): a bridge-only touch (never degree/both) at
             // risk ≤ medium MAY use the lighter CONFIRM_REQUIRED-only tier
             // below — but ONLY if every touched hub's caller edges are all
@@ -1355,6 +1370,24 @@ impl CalmServer {
                     }
                 } else if high_risk_needs_independent_review {
                     false
+                } else if let Some(cited_qn) = cites.filter(|c| !c.is_empty()) {
+                    // Structured citation: `cites` must be the EXACT
+                    // qualified_name of one of the caller edges edit_context
+                    // returned THIS session for this symbol -- `known_caller_
+                    // qns` above is already freshness/digest-verified (the
+                    // same guarantee a lexical `reason` citation relies on),
+                    // so this is strictly stronger: an equality check against
+                    // a structured field, not a substring search inside free
+                    // text. Closes the gap a lexical match leaves open (an
+                    // agent pasting a real caller name into an unrelated
+                    // sentence still satisfies `cites_token`, but can't
+                    // satisfy an exact-equality check by accident). When
+                    // `cites` is given, it's authoritative on its own --
+                    // deliberately NOT falling back to the lexical check
+                    // below on a mismatch, so a wrong/stale `cites` value
+                    // fails loudly instead of silently degrading to the
+                    // weaker path.
+                    known_caller_qns.iter().any(|qn| qn == cited_qn)
                 } else {
                     known_caller_qns.iter().any(|qn| {
                         let short = qn.rsplit("::").next().unwrap_or(qn);
@@ -1421,15 +1454,27 @@ impl CalmServer {
                         })
                         .take(3)
                         .collect();
+                    let full_qns: Vec<&str> = known_caller_qns
+                        .iter()
+                        .map(String::as_str)
+                        .take(3)
+                        .collect();
                     return ToolOutcome::error(error_detail(
                         "REASON_NOT_GROUNDED",
                         &format!(
                             "reason must reference at least one real caller edit_context \
-                             returned ({}), or explicitly state why none apply",
+                             returned ({}), or set `cites` to one of their exact qualified \
+                             names ({}) -- `cites` is the stronger, ungameable form (exact \
+                             match, not a substring search) -- or explicitly state why none apply",
                             if examples.is_empty() {
                                 "this symbol has no confirmed callers".to_string()
                             } else {
                                 examples.join(", ")
+                            },
+                            if full_qns.is_empty() {
+                                "none".to_string()
+                            } else {
+                                full_qns.join(", ")
                             }
                         ),
                         true,
@@ -1861,7 +1906,7 @@ impl CalmServer {
                 .collect();
             let coverage = self.coverage.read_ok();
             let (_, _, _, _, touched, _) =
-                compute_touch_risk(&conn, path, &new_ranges, &coverage, &[]);
+                compute_touch_risk(&conn, path, &new_ranges, &coverage, &[], &[]);
             touched
         };
 
@@ -2493,11 +2538,12 @@ fn hub_kind_strength(kind: &str) -> u8 {
 /// codebase for no real reason.
 /// `compute_touch_risk`'s return: `(risk, hub_hit, strongest_hub_kind,
 /// uncertain_zero_caller, touched, risk_rule_reason)`. The 6th element,
-/// `risk_rule_reason`, is `Some(human-readable reason)` iff a `risk_rules`
-/// entry raised `risk` above what the structural (caller-count/hub) signal
-/// alone would have produced -- `classify_gate` uses this instead of its
-/// generic ">10 callers" explanation when present, so the gate's stated
-/// reason stays accurate to what actually triggered it.
+/// `risk_rule_reason`, is `Some(human-readable reason)` iff either a
+/// `risk_rules` entry, OR the edit overlapping a touched symbol's own
+/// signature line range, raised `risk` above what the structural
+/// (caller-count/hub) signal alone would have produced -- `classify_gate`
+/// uses this instead of its generic ">10 callers" explanation when present,
+/// so the gate's stated reason stays accurate to what actually triggered it.
 type TouchRiskResult = (
     Option<String>,
     bool,
@@ -2513,6 +2559,7 @@ pub(crate) fn compute_touch_risk(
     ranges: &[(i64, i64)],
     coverage: &calm_core::analysis::coverage::CoverageData,
     risk_rules: &[calm_core::config::RiskRule],
+    proposed_hunks: &[(i64, i64, &str)],
 ) -> TouchRiskResult {
     let rows = symbols_overlapping_ranges(conn, path, ranges);
     let mut max_callers = 0i64;
@@ -2520,6 +2567,9 @@ pub(crate) fn compute_touch_risk(
     let mut strongest_hub_kind: Option<String> = None;
     let mut uncertain_zero_caller: Option<UncertainZeroCallerReason> = None;
     let mut touched = Vec::with_capacity(rows.len());
+    // First function/method whose own signature is semantically changed by
+    // `proposed_hunks` -- see the signature-escalation block below.
+    let mut signature_touch: Option<String> = None;
     for row in rows {
         max_callers = max_callers.max(row.caller_count);
         hub_hit |= row.is_hub;
@@ -2529,6 +2579,40 @@ pub(crate) fn compute_touch_risk(
                 .is_none_or(|cur| hub_kind_strength(k) > hub_kind_strength(cur));
             if stronger {
                 strongest_hub_kind = Some(k.clone());
+            }
+        }
+        if signature_touch.is_none()
+            && !row.signature.is_empty()
+            && matches!(row.kind.as_str(), "function" | "method")
+        {
+            // Same `sig_end` formula diff_impact's own post-hoc signature
+            // check uses (guardrails.rs) -- the indexer's signature
+            // extraction already scans to the real body-opening delimiter,
+            // so its embedded newline count tells us exactly how many
+            // lines the real signature spans, clamped to the symbol's own
+            // end as a defensive bound.
+            let sig_end =
+                (row.line_start + row.signature.matches('\n').count() as i64).min(row.line_end);
+            // Only a hunk that FULLY COVERS the signature range lets us
+            // extract a trustworthy "new signature" candidate (its own
+            // leading lines) -- a hunk only partially overlapping it, or
+            // not covering it at all (a body-only edit), is deliberately
+            // NOT treated as a signature change. This is why a plain
+            // line-overlap check doesn't work here: edit_symbol's default
+            // "replace whole body" hunk always covers the signature line
+            // too, even when the signature text itself is byte-for-byte
+            // unchanged -- the overwhelmingly common case, which a bare
+            // overlap check would wrongly flag every single time.
+            if let Some(new_sig_text) = proposed_hunks.iter().find_map(|&(hs, he, new_text)| {
+                (hs <= row.line_start && he >= sig_end).then(|| {
+                    let take_n = row.signature.matches('\n').count() + 1;
+                    new_text.lines().take(take_n).collect::<Vec<_>>().join("\n")
+                })
+            }) && calm_core::analysis::diff_impact::is_signature_semantically_changed(
+                &row.signature,
+                &new_sig_text,
+            ) {
+                signature_touch = Some(row.qualified_name.clone());
             }
         }
         if row.caller_count == 0 && matches!(row.kind.as_str(), "function" | "method") {
@@ -2574,12 +2658,41 @@ pub(crate) fn compute_touch_risk(
     }
     let structural_risk =
         (!touched.is_empty()).then(|| risk_level_from_caller_count(max_callers).to_string());
+
+    // Signature-change escalation: a hunk that fully replaces a touched
+    // function/method's own signature text (not just overlaps its lines)
+    // can break every call site, not just the lines being edited --
+    // escalate the same way diff_impact's own post-hoc
+    // `escalate_risk_if_signature_changed` does, reusing that exact
+    // function and its "high" ceiling. `signature_touch` above already did
+    // the real (semantic, not line-overlap) comparison via
+    // `is_signature_semantically_changed` -- the same function diff_impact
+    // itself calls after its own line-overlap pre-filter.
+    let (risk, escalation_reason) = match (&structural_risk, &signature_touch) {
+        (Some(level), Some(qn)) => {
+            let mut reasons = Vec::new();
+            let escalated = calm_core::analysis::diff_impact::escalate_risk_if_signature_changed(
+                true,
+                level,
+                &mut reasons,
+            );
+            let reason = (escalated != *level).then(|| {
+                format!(
+                    "this edit changes {qn}'s own signature — signature changes can break \
+                     every call site, not just the range being edited"
+                )
+            });
+            (Some(escalated), reason)
+        }
+        _ => (structural_risk, None),
+    };
+
     let (risk, risk_rule_reason) = match calm_core::config::risk_floor_for_path(risk_rules, path) {
-        None => (structural_risk, None),
+        None => (risk, escalation_reason),
         Some((floor, glob)) => {
             let floor_severity = risk_severity(floor);
-            let structural_severity = structural_risk.as_deref().map(risk_severity).unwrap_or(0);
-            if floor_severity > structural_severity {
+            let current_severity = risk.as_deref().map(risk_severity).unwrap_or(0);
+            if floor_severity > current_severity {
                 (
                     Some(floor.to_string()),
                     Some(format!(
@@ -2588,7 +2701,7 @@ pub(crate) fn compute_touch_risk(
                     )),
                 )
             } else {
-                (structural_risk, None)
+                (risk, escalation_reason)
             }
         }
     };
@@ -3154,6 +3267,18 @@ pub(crate) struct EditLinesParams {
     /// free-form justification a generic phrase could satisfy.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) reason: Option<String>,
+    /// Stronger, structured alternative to citing a caller inside `reason`'s
+    /// free text: set this to the EXACT `qualified_name` of one of the
+    /// caller edges returned by `edit_context` for the touched symbol THIS
+    /// session (already freshness-checked the same way `reason`'s citation
+    /// is). Checked by exact equality, not a substring search, so it can't
+    /// be satisfied by pasting a real caller name into an unrelated
+    /// sentence the way `reason` can. When set, it's authoritative on its
+    /// own -- a non-matching `cites` fails with `REASON_NOT_GROUNDED`
+    /// rather than falling back to `reason`. Ignored at the `confirm`-only
+    /// bridge-hub tier and when the symbol has no known callers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) cites: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -3203,6 +3328,9 @@ pub(crate) struct EditSymbolParams {
     /// See `EditLinesParams::reason`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) reason: Option<String>,
+    /// See `EditLinesParams::cites`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) cites: Option<String>,
     /// Small-text-match mode: when set, `new_text` replaces the FIRST
     /// (and required-to-be-only) occurrence of `old_text` found within the
     /// resolved symbol's current range, instead of replacing the whole
@@ -3412,6 +3540,7 @@ mod elicit_tests {
             }],
             confirm: true,
             reason: Some("r".into()),
+            cites: None,
         }
     }
 

@@ -333,6 +333,12 @@ impl CalmServer {
                     &[(c.line_start, c.line_end)],
                     &self.coverage.read_ok(),
                     &config.risk_rules,
+                    // No proposed edit content exists yet at this pre-edit
+                    // exploration call -- the agent hasn't decided what to
+                    // write, so there's nothing to compare the current
+                    // signature against. edit_lines_impl_gated's own real
+                    // gate call supplies real hunks once an edit is proposed.
+                    &[],
                 );
                 // Mirrors edit_lines_impl_gated's own bridge-downgrade
                 // eligibility check exactly (edit.rs) -- computed here too,

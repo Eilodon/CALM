@@ -1,0 +1,294 @@
+{
+  "name": "reference_impact",
+  "description": "USE WHEN: planning a rename/removal and need the FULL reference surface, not just the call graph -- imports, re-exports, and textual matches too. Merges call edges (callers), import edges naming this symbol, and a repo-wide textual grep into one classified list (must_change/likely_change/review/textual_only). Broader but coarser than callers/dependencies alone -- composes them instead of replacing them; still not a substitute for a real compiler/language-server rename.",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "required": [
+      "symbol"
+    ],
+    "type": "object",
+    "properties": {
+      "symbol": {
+        "description": "Bare symbol name (not a `path::name` qualified name).",
+        "type": "string"
+      },
+      "path": {
+        "description": "Narrows the search to one file when `symbol` alone is ambiguous\nacross the repo. Repo-relative path.",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "line": {
+        "description": "Disambiguates same-named symbols in the same file -- any line within\nthe intended candidate's range (see an earlier `ambiguous` response's\n`line_start`/`line_end`).",
+        "type": [
+          "integer",
+          "null"
+        ],
+        "format": "int64"
+      }
+    }
+  },
+  "outputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$defs": {
+      "ErrorDetail": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "recoverable": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "recoverable"
+        ]
+      },
+      "AmbiguousCandidate": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "line_start": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "line_end": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "class_context": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "caller_count": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "language": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "signature": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "name",
+          "path",
+          "kind",
+          "line_start",
+          "line_end"
+        ]
+      },
+      "ReferenceHit": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "line": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "classification": {
+            "description": "`\"must_change\"` (a confirmed call site, or an import statement\ndirectly naming this symbol) / `\"likely_change\"` (a heuristically-\nresolved call site) / `\"review\"` (an ambiguous-confidence call site\n-- needs a human look) / `\"textual_only\"` (a bare-name grep match\nnot otherwise explained -- could be a real reference this repo's\nparser doesn't model, e.g. a string/config reference, or could be an\nunrelated identifier that merely shares this name).",
+            "type": "string"
+          },
+          "source": {
+            "description": "`\"call_edge\"` / `\"import\"` / `\"textual\"` -- which signal produced\nthis hit.",
+            "type": "string"
+          },
+          "confidence": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "snippet": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "path",
+          "classification",
+          "source"
+        ]
+      },
+      "SuggestedNext": {
+        "type": "object",
+        "properties": {
+          "tool": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "args": true,
+          "gate": {
+            "description": "Plan 3 §3.5(b): `Some(true)` iff skipping `tool` is actually\nhook-enforced (currently only the edit_context/edit_lines/edit_symbol\n→ diff_impact hints set this, via `suggested_gated`) — every other\nhint is left unset (`None`), meaning advisory-only. Lets an agent\ntell \"you'll be blocked if you skip this\" apart from \"you probably\nwant this next\" without re-deriving it from AGENTS.md prose each time.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "tool",
+          "reason"
+        ]
+      },
+      "Caveat": {
+        "description": "Structured, machine-checkable hint attached to a tool result whose\nliteral content (empty list / not-found) could otherwise be misread as\nproof of absence. `class` lets a safety gate branch without parsing\n`message`; `message` is the human-readable explanation. Design mirrors\nzzet/gortex's `ZeroEdgeCaveat` (Apache-2.0) — reimplemented against\nCALM's own resolver shape, not a line-for-line port.",
+        "type": "object",
+        "properties": {
+          "class": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "class",
+          "message"
+        ]
+      }
+    },
+    "properties": {
+      "error": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/ErrorDetail"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "ambiguous": {
+        "type": "boolean"
+      },
+      "total": {
+        "description": "Total candidates matched before the display cap of\n`MAX_AMBIGUOUS_CANDIDATES`. `truncated` is `true` when `total >\ncandidates.len()`, telling the caller there are more matches than\nshown and to narrow with `path`/`line` — the list is never silently\npresented as the complete set.",
+        "type": "integer",
+        "format": "uint",
+        "minimum": 0
+      },
+      "truncated": {
+        "description": "`true` when `references` was cut down to `REFERENCE_IMPACT_LIMIT`\nentries.",
+        "type": [
+          "boolean",
+          "null"
+        ]
+      },
+      "candidates": {
+        "type": "array",
+        "items": {
+          "$ref": "#/$defs/AmbiguousCandidate"
+        }
+      },
+      "symbol": {
+        "type": "string"
+      },
+      "qualified_name": {
+        "type": "string"
+      },
+      "definition_path": {
+        "type": "string"
+      },
+      "definition_line_start": {
+        "type": "integer",
+        "format": "int64"
+      },
+      "definition_line_end": {
+        "type": "integer",
+        "format": "int64"
+      },
+      "references": {
+        "type": "array",
+        "items": {
+          "$ref": "#/$defs/ReferenceHit"
+        }
+      },
+      "must_change_count": {
+        "type": "integer",
+        "format": "uint",
+        "minimum": 0
+      },
+      "likely_change_count": {
+        "type": "integer",
+        "format": "uint",
+        "minimum": 0
+      },
+      "review_count": {
+        "type": "integer",
+        "format": "uint",
+        "minimum": 0
+      },
+      "textual_only_count": {
+        "type": "integer",
+        "format": "uint",
+        "minimum": 0
+      },
+      "suggested_next": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/SuggestedNext"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "caveat": {
+        "description": "Advisory hint on an empty/not-found result. Never set alongside a\npopulated `success` unless a tool opts in via `with_caveat` (e.g.\n`callers` on zero direct callers).",
+        "anyOf": [
+          {
+            "$ref": "#/$defs/Caveat"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "type": "object"
+  },
+  "annotations": {
+    "readOnlyHint": true,
+    "destructiveHint": false,
+    "idempotentHint": true,
+    "openWorldHint": false
+  }
+}

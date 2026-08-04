@@ -6,7 +6,7 @@ annotations) and crates/calm-core/Cargo.toml's `[features]` table. Not
 hand-maintained prose -- run `scripts/gen-status.sh` to refresh after any tool
 or feature-flag change; CI's `gen-status.sh --check` fails the build on drift.
 
-## MCP tool inventory (35 tools)
+## MCP tool inventory (36 tools)
 
 | Tool | Write | Idempotent | Description |
 |---|---|---|---|
@@ -30,6 +30,7 @@ or feature-flag change; CI's `gen-status.sh --check` fails the build on drift.
 | `pattern_debt_register` | yes | yes | Register a duplicate-code-pattern anchor for later re-checking via pattern_debt_status. Resolves `symbol` the same way edit_context does (sa |
 | `pattern_debt_status` | yes | yes | Re-check registered pattern-debt anchor(s): re-resolves each anchor's current location by qualified_name (never a stale line number) and re- |
 | `recall` | no | yes | Retrieve durable notes saved by remember. USE WHEN: starting work on a topic you might have left notes about, or checking for known gotchas  |
+| `reference_impact` | no | yes | USE WHEN: planning a rename/removal and need the FULL reference surface, not just the call graph -- imports, re-exports, and textual matches |
 | `remember` | yes | yes | Save a durable, interpretive note (architecture decision, gotcha, rationale) under a short topic key. Persists across sessions and server re |
 | `repair_consistency` | no | yes | USE WHEN: edit_transaction_status/maintenance_status show something suspicious and you want to check whether a transaction's replayed state  |
 | `repo_overview` | no | yes | ALWAYS call this FIRST at the start of every session — never skip. USE WHEN: starting a new session, switching projects, or after server r |

@@ -175,7 +175,7 @@ Full technical detail lives in [`docs/architecture.md`](docs/architecture.md) �
 ## Crate layout
 
 - `crates/calm-core/` — the index engine: `tree-sitter` parsing, SQLite schema, the multi-tier resolver (conservative → inferred → formal/Stack-Graphs, SCIP, or LSP), graph algorithms (coreness, hub detection), FTS5/semantic search, analysis (hotspots, coverage, codeowners, diff-impact, dead-code), fitness metrics, gitignore management.
-- `crates/calm-server/` — the MCP server (`rmcp` over stdio or a unix-socket daemon), exposing 35 tools plus the incremental file watcher.
+- `crates/calm-server/` — the MCP server (`rmcp` over stdio or a unix-socket daemon), exposing 36 tools plus the incremental file watcher.
 - `crates/calm-cli/` — the CLI: `calm init`, `calm index`, `calm serve`, `calm connect`, `calm setup`, `calm fitness-check`, `calm doctor`.
 
 ## CLI reference
@@ -199,7 +199,7 @@ calm scip-run --project-root .                  # --lang omitted = run every pro
 calm index    --project-root . --scip-file build/index.scip --sub-root services/api   # ingest a pre-built SCIP index (CI/sandboxed, no external indexer install needed)
 ```
 
-## 35 MCP tools for AI agents
+## 36 MCP tools for AI agents
 CLI presets filter tools by workflow phase: `orient`, `trace`, `edit`, `compound`, `full` (default) via `calm serve --preset` or the `preset` field in `config.json` — or compose a custom set from toolset (module) names, e.g. `--preset "trace,security"` or `--preset "full,-edit"` (see AGENTS.md for the full toolset list). Every response carries `suggested_next` to point at the next step — full detail on each tool and the complete workflow lives in [AGENTS.md](AGENTS.md).
 
 | Group | Tools |
@@ -207,7 +207,7 @@ CLI presets filter tools by workflow phase: `orient`, `trace`, `edit`, `compound
 | Orient | `repo_overview`, `hotspots`, `fitness_report` (health snapshot — same metrics as `calm fitness-check`, queryable mid-session), `indexing_status`, `test_gap_hotspots` (ranks symbols by coreness × dead-code/test-coverage confidence — where test-writing effort pays off most) |
 | Locate | `locate`, `search`, `file_overview` |
 | Inspect | `source`, `symbol_info`, `understand`, `symbols_batch` (source + callers/callees for several exact `qualified_name`s in one round trip) |
-| Trace | `callers`, `callees` (ordered, capped, etag-cacheable on hub symbols), `path`, `dependencies` |
+| Trace | `callers`, `callees` (ordered, capped, etag-cacheable on hub symbols), `path`, `dependencies`, `reference_impact` (merges call edges, import edges, and a textual grep into one classified rename/removal reference list — broader but coarser than `callers`/`dependencies` alone) |
 | Edit | `edit_context` (mandatory before any edit), `edit_lines`/`edit_symbol` (the one write tool for arbitrary content — hash-verified; a hub/high-risk touch is refused unless `edit_context` ran for that exact symbol this session, `confirm:true` is passed, and `reason` cites a real caller `edit_context` returned), `format_files` (rustfmt via stdin only — never a positional file arg, so it can't trigger rustfmt's own crate-wide `mod`-tree discovery and reformat files outside its own `paths` list; no confirm/edit_context gate since formatting can't change semantics), `pattern_debt_register`/`pattern_debt_status` (anchor a duplicated bug pattern by qualified_name via `search(kind="similar")`, re-check later for `open`/`resolved`/`anchor_lost`), `diff_impact` (mandatory before commit) — `edit_context` and `diff_impact` are hook-enforced under Claude Code (see `.claude/hooks/calm-nudge.sh`); `session_context`'s `pending_diff_impact` is the equivalent signal on any other MCP client |
 | Txn (admin) | `edit_transaction_status`, `maintenance_status`, `retry_maintenance`, `repair_consistency`, `verify_change` (WS-6 first slice: on-demand cargo check for an opt-in-verified edit) — transaction/maintenance-outbox diagnostics for the WS-1 durable edit-transaction journal that `edit_lines`/`format_files` now write through; registered under their own `txn` toolset, included in the `edit` preset (not `orient`/`trace`/`compound`) |
 | Recover | `session_context`, `remember`, `recall` |
@@ -280,7 +280,7 @@ This repo's own `thresholds.toml` currently declares two: the one above, plus `c
 
 - **Default mode is MCP stdio.** The launcher uses the shared Unix daemon when invoked without extra launcher arguments on Unix; custom invocations, CI, and Windows can use one-process `calm serve`.
 - **HTTP is opt-in.** `calm serve --http` binds to `127.0.0.1:8787` by default. Non-loopback exposure requires `--allow-remote` and a non-empty `CALM_HTTP_TOKEN` sent as a Bearer token.
-- **Remote HTTP is read-only.** CALM forces the effective preset to `remote-safe` — every tool that declares `read_only_hint = true`, computed from the tool router itself rather than a hand-maintained list, so it can't silently miss a newly added state-mutating tool; terminate TLS at a reverse proxy. The built-in HTTP transport does not provide rate limiting or DoS protection, so do not expose it directly to an untrusted network.
+- **Remote HTTP is read-only.** CALM forces the effective preset to `remote-safe` — every tool that declares `read_only_hint = true`, computed from the tool router itself rather than a hand-maintained list, so it can't silently miss a newly added state-mutating tool; terminate TLS at a reverse proxy. The built-in HTTP transport caps request body size and concurrent requests as defense-in-depth, but has no real rate limiting or per-IP DoS protection, so do not expose it directly to an untrusted network.
 
 ## Testing
 

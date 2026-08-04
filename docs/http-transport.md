@@ -92,8 +92,13 @@ TLS-terminating edge server.
 
 ## What isn't covered here
 
-- **Rate limiting / DoS protection** — none. This is a single-tenant
-  dev-loop tool, not a public service.
+- **Rate limiting / DoS protection** — defense-in-depth only, not a real
+  policy. `serve_http` caps request body size (16 MiB) and concurrent
+  in-flight requests (64) so a malformed or flooding client can't exhaust
+  memory or spawn unbounded concurrent sessions, but there's no per-IP rate
+  limiting, no backoff, no request queueing. This is a single-tenant
+  dev-loop tool, not a public service — put a real reverse proxy in front
+  (see above) if you need actual rate limiting.
 - **Per-request audit detail** — `serve_http`'s session-accept audit log
   (`.calm/audit.log` in daemon mode) doesn't currently carry the remote
   peer's IP; see `crates/calm-server/src/http.rs`'s doc comment for why

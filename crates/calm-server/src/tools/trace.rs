@@ -564,6 +564,231 @@ impl CalmServer {
             })
         }))
     }
+
+    #[tool(
+        name = "reference_impact",
+        description = "USE WHEN: planning a rename/removal and need the FULL reference surface, not just the call graph -- imports, re-exports, and textual matches too. Merges call edges (callers), import edges naming this symbol, and a repo-wide textual grep into one classified list (must_change/likely_change/review/textual_only). Broader but coarser than callers/dependencies alone -- composes them instead of replacing them; still not a substitute for a real compiler/language-server rename.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    pub(crate) fn reference_impact(
+        &self,
+        Parameters(p): Parameters<ReferenceImpactParams>,
+    ) -> Json<ResolvedOutcome<ReferenceImpactOutput>> {
+        Json(self.timed_tool("reference_impact", || {
+            // READ-only: open a dedicated read connection (SINGLE_WRITER enforcement)
+            let conn = match self.make_read_conn() {
+                Ok(c) => c,
+                Err(e) => return db_error_resolved(e),
+            };
+            let resolution = match resolve_symbol(&conn, &p.symbol, p.path.as_deref(), p.line) {
+                Ok(r) => r,
+                Err(e) => return db_error_resolved(e),
+            };
+            let c = match resolution {
+                SymbolResolution::NotFound => return ResolvedOutcome::not_found(&p.symbol),
+                SymbolResolution::Ambiguous(candidates) => {
+                    return ResolvedOutcome::ambiguous(&candidates);
+                }
+                SymbolResolution::Found(c) => *c,
+            };
+            self.track_symbol(&c.qualified_name);
+            self.track_file(&c.path);
+
+            let mut hits: Vec<ReferenceHit> = Vec::new();
+            // Dedup key: (path, line) for a line-precise hit; a file-level
+            // hit (an import edge, which carries no line number) keys on
+            // (path, None).
+            let mut seen: std::collections::HashSet<(String, Option<i64>)> =
+                std::collections::HashSet::new();
+
+            // 1. Call edges -- same query shape `callers` uses, but
+            // classified by edge_confidence instead of split into
+            // direct/ambiguous.
+            let call_rows: Vec<(String, Option<i64>, String)> = {
+                let mut stmt = match conn.prepare(
+                    "SELECT ce.from_path, ce.call_site_line, ce.edge_confidence \
+                     FROM call_edges ce \
+                     WHERE ce.to_symbol = ?1 AND ce.ruled_out_by_scip = 0",
+                ) {
+                    Ok(s) => s,
+                    Err(e) => return db_error_resolved(e),
+                };
+                match stmt.query_map(rusqlite::params![c.qualified_name], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                }) {
+                    Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+                    Err(e) => return db_error_resolved(e),
+                }
+            };
+            let preview_items: Vec<(String, Option<i64>)> = call_rows
+                .iter()
+                .map(|(path, line, _)| (path.clone(), *line))
+                .collect();
+            let previews = line_previews_batched(&self.project_root, &preview_items);
+            for ((path, line, confidence), preview) in call_rows.into_iter().zip(previews) {
+                if !seen.insert((path.clone(), line)) {
+                    continue;
+                }
+                let classification = match confidence.as_str() {
+                    "resolved" | "formal" => "must_change",
+                    "inferred" | "textual" => "likely_change",
+                    _ => "review",
+                };
+                hits.push(ReferenceHit {
+                    path,
+                    line,
+                    classification: classification.to_string(),
+                    source: "call_edge".to_string(),
+                    confidence: Some(confidence),
+                    snippet: preview,
+                });
+            }
+
+            // 2. Import edges directly naming this symbol -- catches a bare
+            // re-export/import that never becomes a call edge. This is the
+            // exact gap behind two real benchmarks/b7_task_correctness
+            // misses (rename_express_set_charset, rename_zod_prettify_error
+            // -- both miss a bare re-export statement; see
+            // KNOWN_LIMITATIONS.md "No unified reference-impact tool").
+            {
+                let mut stmt = match conn
+                    .prepare("SELECT from_path, symbols_used FROM import_edges WHERE to_path = ?1")
+                {
+                    Ok(s) => s,
+                    Err(e) => return db_error_resolved(e),
+                };
+                let rows: Vec<(String, String)> = match stmt
+                    .query_map(rusqlite::params![c.path], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    }) {
+                    Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+                    Err(e) => return db_error_resolved(e),
+                };
+                for (from_path, symbols_used_raw) in rows {
+                    if from_path == c.path {
+                        continue;
+                    }
+                    let names = parse_symbols_used(&symbols_used_raw);
+                    if !names.iter().any(|n| n == &c.name) {
+                        continue;
+                    }
+                    if !seen.insert((from_path.clone(), None)) {
+                        continue;
+                    }
+                    hits.push(ReferenceHit {
+                        path: from_path,
+                        line: None,
+                        classification: "must_change".to_string(),
+                        source: "import".to_string(),
+                        confidence: None,
+                        snippet: None,
+                    });
+                }
+            }
+
+            // 3. Textual grep floor -- a word-boundary match on the bare
+            // name anywhere in the repo, for whatever the two structured
+            // signals above miss entirely (string/config references, a
+            // language the indexer doesn't resolve calls for, ...).
+            // Deliberately the widest and least precise signal:
+            // `textual_only` may include false positives from an unrelated
+            // same-named identifier -- that imprecision is why it's its own
+            // bottom tier, not merged into `review`.
+            let files_already_seen: std::collections::HashSet<String> =
+                seen.iter().map(|(path, _)| path.clone()).collect();
+            let ignore_patterns = self.config().ignore;
+            let pattern = format!(r"\b{}\b", regex::escape(&c.name));
+            match calm_core::search::search_grep(
+                &conn,
+                &self.project_root,
+                &pattern,
+                None,
+                false,
+                0,
+                &ignore_patterns,
+                REFERENCE_IMPACT_LIMIT,
+            ) {
+                Ok(grep) => {
+                    for r in grep.results {
+                        if r.path == c.path
+                            && r.line_start
+                                .is_some_and(|l| l >= c.line_start && l <= c.line_end)
+                        {
+                            continue; // the definition site itself
+                        }
+                        if files_already_seen.contains(&r.path) {
+                            continue; // already flagged (file-level) via an import edge
+                        }
+                        if !seen.insert((r.path.clone(), r.line_start)) {
+                            continue;
+                        }
+                        hits.push(ReferenceHit {
+                            path: r.path,
+                            line: r.line_start,
+                            classification: "textual_only".to_string(),
+                            source: "textual".to_string(),
+                            confidence: None,
+                            snippet: r.snippet,
+                        });
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("reference_impact: textual grep failed: {e}");
+                }
+            }
+
+            hits.sort_by(|a, b| (a.path.as_str(), a.line).cmp(&(b.path.as_str(), b.line)));
+            let truncated = hits.len() > REFERENCE_IMPACT_LIMIT;
+            hits.truncate(REFERENCE_IMPACT_LIMIT);
+
+            let must_change_count = hits
+                .iter()
+                .filter(|h| h.classification == "must_change")
+                .count();
+            let likely_change_count = hits
+                .iter()
+                .filter(|h| h.classification == "likely_change")
+                .count();
+            let review_count = hits.iter().filter(|h| h.classification == "review").count();
+            let textual_only_count = hits
+                .iter()
+                .filter(|h| h.classification == "textual_only")
+                .count();
+
+            let sn = if review_count > 0 || textual_only_count > 0 {
+                suggested(
+                    "edit_context",
+                    "Some references need manual review before a mechanical rename",
+                )
+            } else {
+                None
+            };
+
+            ResolvedOutcome::success(ReferenceImpactOutput {
+                symbol: p.symbol,
+                qualified_name: c.qualified_name,
+                definition_path: c.path,
+                definition_line_start: c.line_start,
+                definition_line_end: c.line_end,
+                references: hits,
+                must_change_count,
+                likely_change_count,
+                review_count,
+                textual_only_count,
+                truncated: truncated.then_some(true),
+                suggested_next: self.filter_sn(sn),
+            })
+        }))
+    }
     #[tool(
         name = "path",
         description = "USE WHEN: you need to trace if and how symbol A can reach symbol B through call chain. Bidirectional BFS — cycles terminate cleanly. path is DIRECTED: A→B ≠ B→A. terminated_by=null + exists=true/false → certain result.",
@@ -803,6 +1028,73 @@ pub(crate) struct CalleesOutput {
     pub(crate) etag: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) not_modified: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) suggested_next: Option<SuggestedNext>,
+}
+
+// ---------------------------------------------------------------------------
+// Tool: reference_impact
+// ---------------------------------------------------------------------------
+
+/// Cap on the merged `references` list (and the textual-grep sub-search
+/// feeding it) -- same rationale as `callers.direct_list_cap`: a real hub
+/// symbol can have far more usages than are useful to dump in one response.
+const REFERENCE_IMPACT_LIMIT: usize = 200;
+
+#[derive(Deserialize, JsonSchema)]
+#[allow(dead_code)]
+pub(crate) struct ReferenceImpactParams {
+    /// Bare symbol name (not a `path::name` qualified name).
+    pub(crate) symbol: String,
+    /// Narrows the search to one file when `symbol` alone is ambiguous
+    /// across the repo. Repo-relative path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) path: Option<String>,
+    /// Disambiguates same-named symbols in the same file -- any line within
+    /// the intended candidate's range (see an earlier `ambiguous` response's
+    /// `line_start`/`line_end`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) line: Option<i64>,
+}
+
+#[derive(Serialize, JsonSchema, Clone)]
+pub(crate) struct ReferenceHit {
+    pub(crate) path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) line: Option<i64>,
+    /// `"must_change"` (a confirmed call site, or an import statement
+    /// directly naming this symbol) / `"likely_change"` (a heuristically-
+    /// resolved call site) / `"review"` (an ambiguous-confidence call site
+    /// -- needs a human look) / `"textual_only"` (a bare-name grep match
+    /// not otherwise explained -- could be a real reference this repo's
+    /// parser doesn't model, e.g. a string/config reference, or could be an
+    /// unrelated identifier that merely shares this name).
+    pub(crate) classification: String,
+    /// `"call_edge"` / `"import"` / `"textual"` -- which signal produced
+    /// this hit.
+    pub(crate) source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) confidence: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) snippet: Option<String>,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub(crate) struct ReferenceImpactOutput {
+    pub(crate) symbol: String,
+    pub(crate) qualified_name: String,
+    pub(crate) definition_path: String,
+    pub(crate) definition_line_start: i64,
+    pub(crate) definition_line_end: i64,
+    pub(crate) references: Vec<ReferenceHit>,
+    pub(crate) must_change_count: usize,
+    pub(crate) likely_change_count: usize,
+    pub(crate) review_count: usize,
+    pub(crate) textual_only_count: usize,
+    /// `true` when `references` was cut down to `REFERENCE_IMPACT_LIMIT`
+    /// entries.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) truncated: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) suggested_next: Option<SuggestedNext>,
 }

@@ -55,58 +55,49 @@ failed) with no aggregate "did the whole refactor succeed" view. There is
 no `prepare → validate-all → atomic-ish commit → verify` pipeline across
 files, no `PARTIALLY_APPLIED` status, no rollback plan spanning a set.
 
-## No unified reference-impact tool
+## Risk classification's change-kind signal covers signatures only
 
-`callers`/`edit_context` model the *call* graph. A safe rename needs the
-full reference surface — imports, re-exports, type positions, string/
-config references — which today means composing `edit_context` +
-`dependencies` + `search(kind="grep")` by hand. This is not
-hypothetical: `benchmarks/b7_task_correctness` has two real, currently
-failing cases from this exact gap (`rename_express_set_charset`,
-`rename_zod_prettify_error` — both miss a bare re-export statement). A
-single `reference_impact(symbol, operation="rename")` tool that merges
-call edges, SCIP references, imports/re-exports, and textual matches into
-one classified list (`must_change`/`likely_change`/`review`/
-`textual_only`) would close this, but doesn't exist yet.
+`compute_touch_risk` (`crates/calm-server/src/tools/edit.rs`) now detects
+one specific change kind: an edit that actually changes a touched
+function/method's own signature TEXT (not just overlaps its line range —
+a hunk that fully covers the signature but leaves it byte-for-byte
+identical, e.g. `edit_symbol`'s default whole-body replace, does NOT
+escalate) raises risk to "high", reusing `diff_impact`'s own
+`escalate_risk_if_signature_changed` after a real semantic comparison
+(`is_signature_semantically_changed`). What's still not modeled: the
+broader taxonomy this entry originally asked for (comment-only /
+body-only / visibility / deletion / security-sensitive). Two edits to the
+same low-fan-in symbol that both leave the signature alone — one renaming
+a local variable, one deleting an authorization check in the body — still
+get the same risk tier. Turning the actual diff content into a full
+change-kind classification remains unstarted; the signature dimension was
+the highest-value, most tractable slice to land first.
 
-## Risk classification has no change-kind signal
+## `reason` grounding has a stronger opt-in path; the default is still lexical
 
-`compute_touch_risk` (`crates/calm-server/src/tools/edit.rs`) is driven by
-caller-count/hub-status and, as of this pass, an optional path-based
-`risk_rules` floor (`.calm/config.json`) — but it has no idea whether the
-edit itself is a comment tweak, a body-only change, or a public-signature
-break. Two edits to the same low-fan-in symbol get the same risk tier
-whether one renames a local variable and the other removes an
-authorization check. A real fix needs the actual diff content turned into
-a classified "change kind" (comment-only / body-only / signature /
-visibility / deletion / security-sensitive) and folded into the risk
-model as its own axis — not started.
+`edit_lines`/`edit_symbol` gained a `cites` param: set it to the EXACT
+`qualified_name` of a caller `edit_context` returned this session (already
+freshness/digest-verified the same way the existing lexical citation is —
+see `known_caller_qns`'s own freshness-window + caller-set-digest check)
+and the gate checks it by equality, not a substring search — closing the
+"paste a real caller name into an unrelated sentence" gaming path this
+entry used to describe. But `cites` is optional and additive, not a
+replacement: an agent that never sets it still goes through the original
+`cites_token` word-boundary substring check against `reason`, which is
+exactly as gameable as before. Cutting over to `cites`-only (deprecating
+the lexical path entirely) would close this properly, but is a breaking
+change to every existing caller's request shape — a deliberate follow-up,
+not attempted here.
 
-## `reason` grounding is a lexical check, not semantic
+## Remote HTTP has a request-size/concurrency floor, not a real DoS policy
 
-The write gate's "cites a real caller" check (`cites_token`,
-`crates/calm-server/src/tools/edit.rs`) is a word-boundary substring
-match against `edit_context`'s returned caller names. An agent can
-satisfy it by pasting a caller name into an unrelated sentence. This is
-narrower than it sounds: risk ≥ "high" already requires an independent
-elicitation round-trip regardless of what `reason` says (`
-high_risk_needs_independent_review`), so the exploitable window is
-specifically the medium-risk, cited-caller path. Replacing free-text
-`reason` with structured evidence IDs (`edit_context` returns stable
-per-caller IDs, `prepare_edit`-style tools require citing one, the server
-verifies it's real/fresh/not-superseded) would close this properly; not
-started.
-
-## Remote HTTP has no per-tool network/DoS policy
-
-`calm serve --http --allow-remote` forces the `remote-safe` preset
-(every tool with `read_only_hint = true` — see `CHANGELOG.md`'s
-Unreleased section for what that replaced), but the transport itself
-still has no built-in rate limiting or request-size/DoS protection
-(`README.md` already says so). A read-only tool can still be hammered.
-Out of scope for this feature's current threat model
-(`docs/http-transport.md`); put it behind a reverse proxy if that
-matters for your deployment.
+`serve_http` (`crates/calm-server/src/http.rs`) now caps request body size
+(16 MiB) and concurrent in-flight requests (64) via `axum::extract::
+DefaultBodyLimit` and `tower::limit::ConcurrencyLimitLayer` — closing the
+most egregious unbounded-resource gaps a bare `axum::Router` had. Still
+genuinely absent: per-IP rate limiting, backoff, or request queueing.
+`docs/http-transport.md` is explicit this remains defense-in-depth only;
+put a real reverse proxy in front if you need actual rate limiting.
 
 ## Shared daemon has one capability ceiling for every connection
 
@@ -118,14 +109,20 @@ there's no per-connection handshake negotiating a narrower profile per
 client. Each connection *does* get its own session state (`oriented`,
 `enabled_toolsets`, `session_log`), just not its own ceiling.
 
-## Malicious/pathological-repo indexing DoS is explicitly out of scope
+## Malicious/pathological-repo indexing DoS has partial mitigations
 
-`SECURITY.md` states this directly: a maliciously huge/malformed repo
-causing resource exhaustion is out of scope unless it also causes memory
-corruption or RCE. For a tool whose entire job is indexing repos an agent
-may point it at without much vetting, that's a real gap, not just a
-formality — no file-size cap, AST-node budget, parse timeout, or
-`.calm/` disk quota exists today.
+`SECURITY.md` still calls resource-exhaustion-via-huge-repo out of scope
+unless it also causes memory corruption or RCE, but two of the concrete
+gaps that stance used to rest on are now closed: `read_source_capped`
+(`crates/calm-core/src/indexer/pipeline.rs`) skips any file over 8 MiB
+before it's ever read into memory (checked via a cheap `metadata()` stat,
+not a full read), and `parse_tree` (`crates/calm-core/src/indexer/
+parser.rs`) now bounds a single tree-sitter parse to 5 seconds via
+`Parser::set_timeout_micros`. Still genuinely missing: an AST-node budget
+for a file that's under the size cap but pathologically nested, and a
+`.calm/` disk quota. Those would need their own design (a node-count
+callback into tree-sitter's walk, and a disk-usage check somewhere in the
+maintenance/checkpoint path) — not attempted here.
 
 ## CLI binary name collides with an unrelated project
 
