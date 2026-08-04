@@ -25,6 +25,7 @@ pub mod scip;
 pub mod search;
 pub mod txn;
 pub mod types;
+pub mod verify;
 pub mod walk;
 pub mod workflow;
 

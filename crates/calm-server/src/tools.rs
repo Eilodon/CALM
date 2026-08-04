@@ -9069,6 +9069,171 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // WS-6 first slice (2026-08-03, docs/plans/2026-08-03-ws6-verification-
+    // pipeline-execution-plan.md): `verify_change` + the opt-in
+    // VerifyPending routing in `edit_lines_impl_gated`.
+
+    #[test]
+    fn verify_change_reports_nothing_to_verify_when_disabled_by_default() {
+        // Default config leaves rust_check_on_write off, so a transaction
+        // still advances straight to Done exactly as before this feature
+        // existed -- verify_change must say so plainly, not error.
+        let (dir, server) = test_server("verify_change_disabled_default");
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"verify_fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        let original = "pub fn helper() -> i32 {\n    1\n}\n";
+        std::fs::write(dir.join("src/lib.rs"), original).unwrap();
+        let hash = calm_core::edit::range_checksum(original, 2, 2).unwrap();
+
+        let out = jv(server.edit_lines(Parameters(EditLinesParams {
+            path: "src/lib.rs".into(),
+            edits: vec![EditHunkParam {
+                old_text: None,
+                start_line: 2,
+                end_line: 2,
+                expected_hash: Some(hash),
+                new_text: "    2\n".into(),
+            }],
+            confirm: false,
+            reason: None,
+        })));
+        assert_eq!(out["applied"], true, "response: {out}");
+        let tx_id = out["tx_id"].as_str().expect("tx_id present").to_string();
+
+        let verify_out = jv(server.verify_change(Parameters(VerifyChangeParams { tx_id })));
+        assert_eq!(verify_out["tier"], "none", "response: {verify_out}");
+        assert_eq!(verify_out["state"], "DONE", "response: {verify_out}");
+        assert!(
+            verify_out.get("verified").is_none(),
+            "response: {verify_out}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_change_advances_to_done_when_cargo_check_passes() {
+        let (dir, server) = test_server("verify_change_passes");
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"verification": {"rust_check_on_write": true}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"verify_fixture_pass\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        let original = "pub fn helper() -> i32 {\n    1\n}\n";
+        std::fs::write(dir.join("src/lib.rs"), original).unwrap();
+        let hash = calm_core::edit::range_checksum(original, 2, 2).unwrap();
+
+        let out = jv(server.edit_lines(Parameters(EditLinesParams {
+            path: "src/lib.rs".into(),
+            edits: vec![EditHunkParam {
+                old_text: None,
+                start_line: 2,
+                end_line: 2,
+                expected_hash: Some(hash),
+                new_text: "    2\n".into(),
+            }],
+            confirm: false,
+            reason: None,
+        })));
+        assert_eq!(out["applied"], true, "response: {out}");
+        let tx_id = out["tx_id"].as_str().expect("tx_id present").to_string();
+
+        let status = jv(
+            server.edit_transaction_status(Parameters(EditTransactionStatusParams {
+                tx_id: tx_id.clone(),
+            })),
+        );
+        assert_eq!(
+            status["state"], "VERIFY_PENDING",
+            "flag on + .rs file must park at VerifyPending, not Done: {status}"
+        );
+
+        let verify_out = jv(server.verify_change(Parameters(VerifyChangeParams { tx_id })));
+        assert_eq!(
+            verify_out["tier"], "semantic:cargo_check",
+            "response: {verify_out}"
+        );
+        assert_eq!(verify_out["verified"], true, "response: {verify_out}");
+        assert_eq!(verify_out["state"], "DONE", "response: {verify_out}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_change_advances_to_failed_without_reverting_disk_when_cargo_check_fails() {
+        let (dir, server) = test_server("verify_change_fails");
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"verification": {"rust_check_on_write": true}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"verify_fixture_fail\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        let original = "pub fn helper() -> i32 {\n    1\n}\n";
+        std::fs::write(dir.join("src/lib.rs"), original).unwrap();
+        let hash = calm_core::edit::range_checksum(original, 2, 2).unwrap();
+        let broken_line = "    \"not a number\"\n";
+
+        let out = jv(server.edit_lines(Parameters(EditLinesParams {
+            path: "src/lib.rs".into(),
+            edits: vec![EditHunkParam {
+                old_text: None,
+                start_line: 2,
+                end_line: 2,
+                expected_hash: Some(hash),
+                new_text: broken_line.into(),
+            }],
+            confirm: false,
+            reason: None,
+        })));
+        assert_eq!(out["applied"], true, "response: {out}");
+        let tx_id = out["tx_id"].as_str().expect("tx_id present").to_string();
+
+        let verify_out = jv(server.verify_change(Parameters(VerifyChangeParams { tx_id })));
+        assert_eq!(
+            verify_out["tier"], "semantic:cargo_check",
+            "response: {verify_out}"
+        );
+        assert_eq!(verify_out["verified"], false, "response: {verify_out}");
+        assert_eq!(verify_out["state"], "FAILED", "response: {verify_out}");
+        assert!(
+            !verify_out["diagnostics"].as_array().unwrap().is_empty(),
+            "response: {verify_out}"
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(dir.join("src/lib.rs")).unwrap(),
+            "pub fn helper() -> i32 {\n    \"not a number\"\n}\n",
+            "a failed verification must NOT revert the file already written to disk"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_change_on_unknown_tx_id_is_an_error() {
+        let (dir, server) = test_server("verify_change_unknown_tx");
+        let out = jv(server.verify_change(Parameters(VerifyChangeParams {
+            tx_id: "TXN-does-not-exist".into(),
+        })));
+        assert_eq!(out["error"]["code"], "TX_NOT_FOUND", "response: {out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn edit_lines_entry_point_with_confirmed_caller_does_not_force_confirm_gate() {
         // Documents the fix's boundary: the entry-point escalation only

@@ -307,3 +307,14 @@ jobs:
 
       - name: Check docs/status.generated.md is not stale
         run: ./scripts/gen-status.sh --check
+
+      # 2026-08-03 (docs/plans/2026-08-03-product-truth-closure-plan.md):
+      # gen-status.sh --check above only protects status.generated.md
+      # itself -- README/AGENTS.md/llms.txt/marketplace.json/plugin.json/
+      # workflow.rs are hand-authored and drifted from it even after it
+      # was regenerated correctly for the same tool-count bump.
+      - name: Check hand-authored docs match the generated tool count
+        run: ./scripts/check-doc-truth.sh
+
+      - name: Check benchmark claims registry is structurally consistent
+        run: ./scripts/check-claims-registry.sh

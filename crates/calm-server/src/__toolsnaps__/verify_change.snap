@@ -1,6 +1,6 @@
 {
-  "name": "edit_transaction_status",
-  "description": "USE WHEN: you have a tx_id (from maintenance_status/repair_consistency, or the tx_id an edit_lines/edit_symbol/format_files response already returns) and want to see what state that specific edit transaction reached. Read-only -- does not repair anything, see repair_consistency for that.",
+  "name": "verify_change",
+  "description": "USE WHEN: you have a tx_id (from an edit_lines/edit_symbol response) and want to actually run cargo check on that change instead of just trusting applied:true. Only does anything if [verification] rust_check_on_write is enabled in .calm/config.json AND the file is .rs -- WS-6 first slice (docs/plans/2026-08-03-ws6-verification-pipeline-execution-plan.md), other languages/tiers not implemented yet. Runs cargo check inline, not backgrounded (same posture as retry_maintenance) -- can take a while on a large package. A tx_id that was never routed through verification (feature off, non-Rust file, or already resolved) returns a clear \"nothing to verify\" result, not an error. A failing check does NOT roll back the file already on disk.",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "required": [
@@ -9,7 +9,7 @@
     "type": "object",
     "properties": {
       "tx_id": {
-        "description": "tx_id from maintenance_status/repair_consistency output, or the\ntx_id an edit_lines/edit_symbol/format_files response already\nreturns.",
+        "description": "tx_id from an edit_lines/edit_symbol response (or\nedit_transaction_status/repair_consistency output).",
         "type": "string"
       }
     }
@@ -77,19 +77,34 @@
       "path": {
         "type": "string"
       },
-      "state": {
+      "tier": {
+        "description": "\"none\" (nothing to verify -- see `note`), \"unsupported\" (language\nnot covered yet), or \"semantic:cargo_check\" (the one real tier this\nfirst slice has).",
         "type": "string"
       },
-      "replay_state": {
+      "verified": {
+        "description": "`None` when `tier` is \"none\"/\"unsupported\" -- nothing was actually\nrun, so there's no pass/fail to report.",
+        "type": [
+          "boolean",
+          "null"
+        ]
+      },
+      "state": {
+        "description": "The transaction's state after this call: unchanged when `tier` is\n\"none\"/\"unsupported\", else DONE or FAILED depending on the check\nresult.",
+        "type": "string"
+      },
+      "diagnostics": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "command": {
         "type": [
           "string",
           "null"
         ]
       },
-      "base_digest": {
-        "type": "string"
-      },
-      "proposed_digest": {
+      "note": {
         "type": "string"
       },
       "suggested_next": {
@@ -106,9 +121,9 @@
     "type": "object"
   },
   "annotations": {
-    "readOnlyHint": true,
+    "readOnlyHint": false,
     "destructiveHint": false,
     "idempotentHint": true,
-    "openWorldHint": false
+    "openWorldHint": true
   }
 }

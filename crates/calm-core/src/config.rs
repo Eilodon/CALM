@@ -30,6 +30,7 @@ pub struct Config {
     pub indexing: IndexingConfig,
     pub edit: EditConfig,
     pub orientation: OrientationConfig,
+    pub verification: VerificationConfig,
 }
 
 impl Default for Config {
@@ -92,6 +93,7 @@ impl Default for Config {
             indexing: IndexingConfig::default(),
             edit: EditConfig::default(),
             orientation: OrientationConfig::default(),
+            verification: VerificationConfig::default(),
         }
     }
 }
@@ -142,6 +144,25 @@ impl Default for EditConfig {
             always_require_edit_context: false,
         }
     }
+}
+
+/// `[verification]` in `.calm/config.json` -- WS-6 first slice (docs/plans/
+/// 2026-08-03-ws6-verification-pipeline-execution-plan.md). Gates whether
+/// `edit_lines`/`edit_symbol` route a transaction through
+/// `TxState::VerifyPending` (crates/calm-core/src/txn.rs) instead of
+/// straight to `Done`, and whether `verify_change` has anything to do.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct VerificationConfig {
+    /// When `true` AND the touched file is `.rs`: after a write reaches
+    /// `IndexCommitted`, the transaction advances to `VerifyPending`
+    /// instead of `Done`, and the `edit_lines`/`edit_symbol` response
+    /// includes a `tx_id` with a suggestion to call `verify_change` on it.
+    /// Default `false` -- zero behavior change unless opted in; every
+    /// transaction still advances straight to `Done` exactly as before.
+    /// Only Rust is supported today; a non-`.rs` file is unaffected by this
+    /// flag regardless of its value.
+    pub rust_check_on_write: bool,
 }
 
 /// `mode` values for `[orientation]` in `.calm/config.json` — see

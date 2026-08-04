@@ -4,8 +4,11 @@
 # crates/calm-server/src/__toolsnaps__/*.snap (the committed JSON schema
 # snapshots tool_schemas_match_committed_snapshots already keeps honest
 # against the real running tool schemas, including each tool's
-# readOnlyHint/idempotentHint annotations), and feature/language coverage
-# comes from crates/calm-core/Cargo.toml's [features] table. WS-13
+# readOnlyHint/idempotentHint annotations), feature/language coverage comes
+# from crates/calm-core/Cargo.toml's [features] table, and the guarantee-
+# level catalog comes from docs/guarantee-levels.toml (hand-maintained, but
+# its rendering into this file is still covered by the same --check gate --
+# see docs/plans/2026-08-03-product-truth-closure-plan.md PR2). WS-13
 # (docs/plans/2026-08-01-calm-adopt-from-vheatm-plan.md P3-2): CALM's own
 # status must never drift the way VHEATM's own README ("pilot") drifted
 # from its own registry ("complete") -- generate from a source another
@@ -82,6 +85,31 @@ tool_count=$(ls crates/calm-server/src/__toolsnaps__/*.snap 2>/dev/null | wc -l 
         | sed -E 's/^([a-zA-Z0-9_-]+)[[:space:]]*=.*/- `\1`/' \
         | grep '^- `' \
         | LC_ALL=C sort
+    echo
+    echo "## Guarantee levels"
+    echo
+    echo "Hand-maintained in \`docs/guarantee-levels.toml\` (source of truth for the"
+    echo "names/levels/evidence below); rendered here so a stale entry shows up in"
+    echo "the same \`gen-status.sh --check\` drift gate a stale tool count would."
+    echo "Level vocabulary is defined in that file's header comment."
+    echo
+    echo "| Behavior | Level | Summary |"
+    echo "|---|---|---|"
+    # Not a general TOML parser -- understands only this file's exact
+    # repeated `[[behavior]]` + flat single-line `key = "value"` shape (see
+    # that file's own header comment for the contract).
+    awk '
+        function emit() { if (id != "") printf "%s\t%s\t%s\n", id, level, summary }
+        /^\[\[behavior\]\]/ { emit(); id=""; level=""; summary=""; next }
+        /^id = / { id=$0; sub(/^id = "/, "", id); sub(/"[[:space:]]*$/, "", id) }
+        /^level = / { level=$0; sub(/^level = "/, "", level); sub(/"[[:space:]]*$/, "", level) }
+        /^summary = / { summary=$0; sub(/^summary = "/, "", summary); sub(/"[[:space:]]*$/, "", summary) }
+        END { emit() }
+    ' docs/guarantee-levels.toml \
+        | LC_ALL=C sort \
+        | while IFS=$'\t' read -r id level summary; do
+            echo "| \`$id\` | \`$level\` | $summary |"
+        done
 } >"$tmp"
 
 if [ "${1:-}" = "--check" ]; then
