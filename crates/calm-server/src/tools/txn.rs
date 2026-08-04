@@ -94,6 +94,77 @@ impl CalmServer {
     }
 
     #[tool(
+        name = "batch_status",
+        description = "USE WHEN: you made several edit_lines/edit_symbol/format_files calls as one multi-file change (each already returned its own tx_id) and want ONE aggregate view of how the whole change-set landed, instead of calling edit_transaction_status once per tx_id. Read-only, observability only -- this does not group or track a change-set server-side (see KNOWN_LIMITATIONS.md \"No multi-file change-set\"); pass the tx_id list you already collected from each write's own response.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    pub(crate) fn batch_status(
+        &self,
+        Parameters(p): Parameters<BatchStatusParams>,
+    ) -> Json<ToolOutcome<BatchStatusOutput>> {
+        Json(self.timed_tool("batch_status", || {
+            let conn = match self.make_read_conn() {
+                Ok(c) => c,
+                Err(e) => return db_error(e),
+            };
+            let mut by_state: std::collections::BTreeMap<String, usize> =
+                std::collections::BTreeMap::new();
+            let mut not_found = Vec::new();
+            let mut transactions = Vec::new();
+            let mut any_failed = false;
+            for tx_id in &p.tx_ids {
+                match calm_core::txn::get(&conn, tx_id) {
+                    Ok(Some(tx)) => {
+                        if tx.state == calm_core::txn::TxState::Failed {
+                            any_failed = true;
+                        }
+                        *by_state.entry(tx.state.as_str().to_string()).or_insert(0) += 1;
+                        transactions.push(BatchStatusEntry {
+                            tx_id: tx.tx_id,
+                            path: tx.path,
+                            state: tx.state.as_str().to_string(),
+                        });
+                    }
+                    Ok(None) => not_found.push(tx_id.clone()),
+                    Err(e) => {
+                        return ToolOutcome::error(error_detail(
+                            "TX_JOURNAL_ERROR",
+                            &e.to_string(),
+                            true,
+                        ));
+                    }
+                }
+            }
+            let all_done = not_found.is_empty()
+                && !transactions.is_empty()
+                && by_state.get(calm_core::txn::TxState::Done.as_str()).copied().unwrap_or(0)
+                    == transactions.len();
+            let sn = if any_failed {
+                suggested(
+                    "repair_consistency",
+                    "At least one transaction in this batch failed -- repair_consistency can check disk/index drift",
+                )
+            } else {
+                None
+            };
+            ToolOutcome::success(BatchStatusOutput {
+                total: p.tx_ids.len(),
+                by_state,
+                not_found,
+                all_done,
+                any_failed,
+                transactions,
+                suggested_next: self.filter_sn(sn),
+            })
+        }))
+    }
+
+    #[tool(
         name = "maintenance_status",
         description = "USE WHEN: you want to check whether the background SCIP-overlay/embedding refresh outbox (WS-1, plan §4.1b) has a stuck or failed job. Read-only, global status -- each of scip_refresh/embed_refresh has at most one current row, not one per transaction.",
         annotations(
@@ -562,6 +633,33 @@ pub(crate) struct EditTransactionStatusOutput {
     pub(crate) replay_state: Option<String>,
     pub(crate) base_digest: String,
     pub(crate) proposed_digest: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) suggested_next: Option<SuggestedNext>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub(crate) struct BatchStatusParams {
+    /// tx_ids collected from a set of edit_lines/edit_symbol/format_files
+    /// responses that together made up one multi-file change.
+    pub(crate) tx_ids: Vec<String>,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub(crate) struct BatchStatusEntry {
+    pub(crate) tx_id: String,
+    pub(crate) path: String,
+    pub(crate) state: String,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub(crate) struct BatchStatusOutput {
+    pub(crate) total: usize,
+    pub(crate) by_state: std::collections::BTreeMap<String, usize>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) not_found: Vec<String>,
+    pub(crate) all_done: bool,
+    pub(crate) any_failed: bool,
+    pub(crate) transactions: Vec<BatchStatusEntry>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) suggested_next: Option<SuggestedNext>,
 }

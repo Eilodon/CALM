@@ -8,7 +8,7 @@
   "plugins": [
     {
       "name": "calm",
-      "description": "Adds the CALM MCP server: call-graph-aware locate/source/edit_symbol/diff_impact and 36 tools total for navigating and safely editing a codebase, backed by a multi-tier resolver (syntactic -> Stack Graphs -> SCIP) instead of grep.",
+      "description": "Adds the CALM MCP server: call-graph-aware locate/source/edit_symbol/diff_impact and 37 tools total for navigating and safely editing a codebase, backed by a multi-tier resolver (syntactic -> Stack Graphs -> SCIP) instead of grep.",
       "author": {
         "name": "Eilodon"
       },

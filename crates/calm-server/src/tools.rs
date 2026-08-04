@@ -3963,6 +3963,72 @@ mod tests {
     }
 
     #[test]
+    fn batch_status_aggregates_multiple_transactions() {
+        let (dir, server) = test_server("batch_status_aggregates");
+        let conn = calm_core::db::conn::open_writer(&server.db_path).unwrap();
+        let tx1 = calm_core::txn::begin(&conn, "proj", "a.rs", "sha256:x", "sha256:y").unwrap();
+        calm_core::txn::advance(
+            &conn,
+            &tx1.tx_id,
+            calm_core::txn::TxState::FileCommitted,
+            "system",
+            "wrote",
+        )
+        .unwrap();
+        let tx2 = calm_core::txn::begin(&conn, "proj", "b.rs", "sha256:x", "sha256:y").unwrap();
+        drop(conn);
+
+        let out = jv(server.batch_status(Parameters(BatchStatusParams {
+            tx_ids: vec![
+                tx1.tx_id.clone(),
+                tx2.tx_id.clone(),
+                "TXN-does-not-exist".to_string(),
+            ],
+        })));
+
+        assert_eq!(out["total"], 3, "response: {out}");
+        assert_eq!(out["by_state"]["FILE_COMMITTED"], 1, "response: {out}");
+        assert_eq!(out["by_state"]["PREPARED"], 1, "response: {out}");
+        assert_eq!(
+            out["not_found"],
+            serde_json::json!(["TXN-does-not-exist"]),
+            "response: {out}"
+        );
+        assert_eq!(out["all_done"], false, "response: {out}");
+        assert_eq!(out["any_failed"], false, "response: {out}");
+        let txns = out["transactions"].as_array().unwrap();
+        assert_eq!(txns.len(), 2, "response: {out}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn batch_status_all_done_true_only_when_every_tx_is_done_and_none_missing() {
+        let (dir, server) = test_server("batch_status_all_done");
+        let conn = calm_core::db::conn::open_writer(&server.db_path).unwrap();
+        let tx = calm_core::txn::begin(&conn, "proj", "a.rs", "sha256:x", "sha256:y").unwrap();
+        for state in [
+            calm_core::txn::TxState::FileCommitted,
+            calm_core::txn::TxState::IndexCommitted,
+            calm_core::txn::TxState::Done,
+        ] {
+            calm_core::txn::advance(&conn, &tx.tx_id, state, "system", "step").unwrap();
+        }
+        drop(conn);
+
+        let out = jv(server.batch_status(Parameters(BatchStatusParams {
+            tx_ids: vec![tx.tx_id.clone()],
+        })));
+        assert_eq!(out["all_done"], true, "response: {out}");
+        assert!(
+            out.get("not_found").is_none(),
+            "not_found is skip_serializing_if empty, must be omitted entirely: {out}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn maintenance_status_reports_all_kinds_and_suggests_retry_on_failure() {
         let (dir, server) = test_server("maintenance_status_reports");
         let conn = calm_core::db::conn::open_writer(&server.db_path).unwrap();

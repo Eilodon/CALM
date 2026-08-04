@@ -51,9 +51,20 @@ Every `edit_lines`/`edit_symbol`/`format_files` call gets its own,
 independent `EditTransaction` (`crates/calm-core/src/txn.rs`), scoped to
 one file. A multi-file rename or refactor is N independent transactions
 that can each land in a different state (one committed, one gated, one
-failed) with no aggregate "did the whole refactor succeed" view. There is
-no `prepare → validate-all → atomic-ish commit → verify` pipeline across
-files, no `PARTIALLY_APPLIED` status, no rollback plan spanning a set.
+failed). There is no `prepare → validate-all → atomic-ish commit →
+verify` pipeline across files, no `PARTIALLY_APPLIED` status, no rollback
+plan spanning a set -- and none of that is what's described below.
+
+What now exists is strictly narrower: a new `batch_status` tool
+(`crates/calm-server/src/tools/txn.rs`) takes a caller-supplied list of
+`tx_id`s (the ones each independent write already returned) and reports
+one aggregate view -- counts by state, which are still missing, whether
+any failed -- instead of requiring a separate `edit_transaction_status`
+call per file. Purely observability: it doesn't group transactions
+server-side (there's no stored notion of "these N tx_ids are one
+change-set"), doesn't gate anything, and doesn't change what `edit_lines`/
+`edit_symbol`/`format_files` themselves do. The atomicity/rollback gap
+above is unchanged.
 
 ## Risk classification's change-kind signal covers signatures only
 
