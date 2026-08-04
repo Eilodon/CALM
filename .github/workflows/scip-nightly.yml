@@ -54,6 +54,30 @@ jobs:
           cargo test -p calm-cli --features scip-overlay -- --ignored \
             calm_index_cli_upgrades_a_real_edge_on_the_fixture
 
+  # B2 (benchmarks/b2_call_graph_quality) -- self-repo Rust call-graph
+  # precision/recall against a rust-analyzer SCIP oracle. Self-contained (no
+  # external corpus clone, pure-stdlib Python script) so unlike B7 it's
+  # cheap enough to gate nightly rather than staying manual-only -- see
+  # scripts/check-b2-thresholds.sh for the floors and why they were picked.
+  # Piggybacks this job's own rust-analyzer install (same reasoning as the
+  # calm-cli step in scip-rust above) rather than getting a separate one.
+  b2-call-graph-quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          components: rust-analyzer
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: b2-call-graph-quality
+      - name: Build calm-cli with scip-overlay (needed for the hidden scip-dump subcommand)
+        run: cargo build --release -p calm-cli --features scip-overlay
+      - name: Run B2 benchmark (self-repo)
+        run: python3 benchmarks/b2_call_graph_quality/run_benchmark.py
+      - name: Check B2 results against regression floors
+        run: scripts/check-b2-thresholds.sh
+
   scip-go:
     runs-on: ubuntu-latest
     steps:

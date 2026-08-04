@@ -576,6 +576,7 @@ fn extract_file_data(
         if let Some(enc_qn) = enc_qn {
             let mut confidence;
             let mut target_class: Option<String> = None;
+            let mut module_hint = c.module_hint.clone();
 
             if c.receiver_is_type_path
                 && let Some(receiver) = &c.receiver
@@ -663,6 +664,37 @@ fn extract_file_data(
                     // runs per-file, in parallel, before it's built).
                     confidence = EdgeConfidence::Inferred;
                     target_class = Some(receiver.clone());
+                } else if confidence == EdgeConfidence::Textual
+                    && module_hint.is_none()
+                    && let Some(receiver) = &c.receiver
+                    && let Some(module_path) = ctx.import_map.get(receiver)
+                    && let Some(seg) = crate::indexer::parser::module_path_last_segment(module_path)
+                {
+                    // Whole-module require/import binding (`var utils =
+                    // require('../lib/utils')`, Python `import os`): tier-1
+                    // above only checks `ctx.import_map` keyed by the
+                    // CALLEE name (`setCharset`), and tier-2 only checks
+                    // `ctx.type_map` (a real type annotation) or self/this —
+                    // neither ever asks "is the RECEIVER itself a name this
+                    // file imported as a whole module?", so a call like
+                    // `utils.setCharset(...)` fell all the way through to
+                    // Textual with no receiver-derived signal at all, unlike
+                    // the destructured-import sibling call `setCharset(...)`
+                    // (bare, resolves fine via tier-1's own import_map
+                    // check). Reuses the exact same `module_hint` file-stem
+                    // filter `resolve_sites_to_edges` already applies for
+                    // Rust's `crate::module::function()` (module_hint_of
+                    // above) -- a pure NARROWING filter over the
+                    // already-name-matched `ctx.by_name` candidate list,
+                    // fail-open when the hint matches nothing (identical to
+                    // today's behavior), never a source of new candidates on
+                    // its own. Found live via B7 (benchmarks/
+                    // b7_task_correctness/README.md): express's
+                    // `test/utils.js` calls `utils.setCharset(...)` after
+                    // `var utils = require('../lib/utils')` -- completely
+                    // absent from `callers()`/`blast_radius` before this fix.
+                    confidence = EdgeConfidence::Inferred;
+                    module_hint = Some(seg);
                 }
             }
             let callee = aliases.get(&c.callee).unwrap_or(&c.callee).clone();
@@ -683,7 +715,7 @@ fn extract_file_data(
                 receiver: c.receiver.clone(),
                 target_class,
                 looks_option_or_result_chained: c.looks_option_or_result_chained,
-                module_hint: c.module_hint.clone(),
+                module_hint,
                 edge_kind: "call".to_string(),
                 arg_count: c.arg_count,
             });
@@ -5135,6 +5167,75 @@ impl StructB {
         assert_eq!(
             to_path, "src/Service/Foo.php",
             "PSR-4 must resolve the App\\ prefix to src/, landing on the real file"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_js_require_namespace_object_property_call_resolves_via_module_hint() {
+        // Regression test for the real, reproducible gap found in
+        // benchmarks/b7_task_correctness/README.md (express's `test/utils.js`):
+        // `utils.setCharset(...)` after `var utils = require('./lib/utils')`
+        // was completely invisible to `callers()`/`blast_radius` -- tier-1
+        // (extract_file_data) only checks `ctx.import_map` keyed by the CALLEE
+        // name, tier-2 only checks `ctx.type_map` (a real type annotation) or
+        // self/this, so a call whose RECEIVER is itself a whole-module import
+        // binding had no signal at all. See extract_file_data's
+        // receiver-import-alias branch (module_path_last_segment).
+        //
+        // Fixture deliberately includes a same-named DECOY (`other/helpers.js`
+        // also exports `setCharset`) with a DIFFERENT file basename than the
+        // required module ("helpers" vs "utils") -- without the fix, both
+        // candidates survive `resolve_sites_to_edges`'s unscoped by-name
+        // fallback (JS gets no same_dir narrowing) and the edge comes out
+        // `Ambiguous` with 2 targets; the fix's module_hint ("utils", from the
+        // require path) should filter the decoy out by file-stem mismatch,
+        // leaving exactly one edge to the real target.
+        let dir = std::env::temp_dir().join(format!("ci_idx_js_require_ns_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("lib")).unwrap();
+        std::fs::create_dir_all(dir.join("other")).unwrap();
+        std::fs::write(
+        dir.join("lib/utils.js"),
+        "exports.setCharset = function (type, charset) {\n    return type + '; charset=' + charset;\n};\n",
+    )
+    .unwrap();
+        std::fs::write(
+            dir.join("other/helpers.js"),
+            "exports.setCharset = function (type, charset) {\n    return 'decoy';\n};\n",
+        )
+        .unwrap();
+        std::fs::write(
+        dir.join("caller.js"),
+        "var utils = require('./lib/utils');\nfunction run() {\n    utils.setCharset('text/html', 'utf-8');\n}\n",
+    )
+    .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT to_symbol, edge_confidence FROM call_edges \
+             WHERE from_symbol = 'caller.js::run' AND to_symbol LIKE '%setCharset'",
+            )
+            .unwrap();
+        let rows: Vec<(String, String)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+
+        assert_eq!(
+            rows,
+            vec![(
+                "lib/utils.js::setCharset".to_string(),
+                "inferred".to_string()
+            )],
+            "utils.setCharset(...) via `var utils = require(...)` must resolve to exactly \
+         lib/utils.js::setCharset (not the other/helpers.js decoy, not Ambiguous): {rows:?}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

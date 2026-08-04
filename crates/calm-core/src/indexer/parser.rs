@@ -1531,6 +1531,29 @@ fn module_hint_of(raw: &str) -> Option<String> {
     }
 }
 
+// The rightmost meaningful segment of a module specifier string -- "utils"
+// from "../lib/utils" or "./utils", "os" from "os", "path" from Python's
+// dotted "os.path". Counterpart to `module_hint_of` above for languages
+// that name their module via `ctx.import_map` (populated from a parsed
+// import/require statement) rather than a `::`-delimited path in the call
+// text itself -- see `extract_file_data`'s receiver-import-alias branch,
+// the only caller. Deliberately simple (slash-split, then dot-split,
+// first non-empty segment) to match `module_hint_of`'s own "best-effort
+// hint, not a real module resolver" scope: `resolve_sites_to_edges`
+// treats whatever this returns as a fail-open filter over an
+// already-name-matched candidate list, never a source of new candidates,
+// so an imprecise segment on some exotic module-path shape just narrows
+// nothing (today's behavior) rather than resolving wrong.
+pub fn module_path_last_segment(module_path: &str) -> Option<String> {
+    let after_slash = module_path.rsplit('/').next().unwrap_or(module_path);
+    let after_dot = after_slash.rsplit('.').next().unwrap_or(after_slash);
+    if after_dot.is_empty() {
+        None
+    } else {
+        Some(after_dot.to_string())
+    }
+}
+
 /// Heuristic: a path segment is "type-like" when it starts with an uppercase
 /// letter, matching Rust/C#/Java/Kotlin/Swift convention for types/classes
 /// (vs. snake_case modules or lowerCamelCase namespaces/packages). Not

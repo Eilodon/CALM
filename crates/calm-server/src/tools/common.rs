@@ -935,3 +935,55 @@ pub(crate) struct RelatedNoteOutput {
     /// confident freshness read).
     pub(crate) staleness: &'static str,
 }
+
+#[cfg(test)]
+mod caller_set_digest_tests {
+    use super::CalmServer;
+
+    // WS-2 Phase 2's whole safety guarantee rests on `caller_set_digest`
+    // hashing the SET of callers, not the list -- these lock in the
+    // property the docstring promises but no existing test isolates
+    // (the 2 integration tests in tools.rs exercise the gate end-to-end
+    // on one fixed caller list, never a reordered/duplicated one).
+
+    #[test]
+    fn order_and_duplicates_do_not_change_the_digest() {
+        let a = vec![
+            "b.rs::caller_one".to_string(),
+            "a.rs::caller_two".to_string(),
+        ];
+        let b = vec![
+            "a.rs::caller_two".to_string(),
+            "a.rs::caller_two".to_string(),
+            "b.rs::caller_one".to_string(),
+        ];
+        assert_eq!(
+            CalmServer::caller_set_digest(&a),
+            CalmServer::caller_set_digest(&b),
+            "same underlying caller set, different order/duplicates -- must hash identically"
+        );
+    }
+
+    #[test]
+    fn a_real_change_in_the_caller_set_changes_the_digest() {
+        let before = vec!["a.rs::caller_one".to_string()];
+        let after = vec![
+            "a.rs::caller_one".to_string(),
+            "b.rs::caller_two".to_string(),
+        ];
+        assert_ne!(
+            CalmServer::caller_set_digest(&before),
+            CalmServer::caller_set_digest(&after),
+            "adding a real caller must change the digest -- this is exactly what STALE_CALLER_SET detects"
+        );
+    }
+
+    #[test]
+    fn empty_caller_set_is_deterministic() {
+        let empty: Vec<String> = Vec::new();
+        assert_eq!(
+            CalmServer::caller_set_digest(&empty),
+            CalmServer::caller_set_digest(&empty)
+        );
+    }
+}
