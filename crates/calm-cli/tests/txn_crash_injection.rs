@@ -63,6 +63,13 @@ fn db_path_for(dir: &Path, run_key: &str) -> std::path::PathBuf {
     dir.join(format!("index-{run_key}.db"))
 }
 
+/// state.db counterpart of `db_path_for` -- edit_transactions/tx_events now
+/// live there (docs/plans/2026-08-05-state-db-rewiring-execution-plan.md),
+/// not in the rebuildable index.db `db_path_for` points at.
+fn state_db_path_for(dir: &Path, run_key: &str) -> std::path::PathBuf {
+    dir.join(format!("state-{run_key}.db"))
+}
+
 /// Spawns one `txn_crash_harness` subprocess with `--crash-after step` (or
 /// no crash at all if `step` is `None`), waits for it to die, and returns
 /// what's observable afterward. Panics if a crash was requested but the
@@ -70,12 +77,15 @@ fn db_path_for(dir: &Path, run_key: &str) -> std::path::PathBuf {
 /// stopped testing what it claims to.
 fn run_one(dir: &Path, run_key: &str, step: Option<&str>) -> CrashOutcome {
     let db_path = db_path_for(dir, run_key);
+    let state_db_path = state_db_path_for(dir, run_key);
     let file_path = dir.join(format!("a-{run_key}.txt"));
     std::fs::write(&file_path, ORIGINAL_CONTENT).unwrap();
 
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_txn_crash_harness"));
     cmd.arg("--db")
         .arg(&db_path)
+        .arg("--state-db")
+        .arg(&state_db_path)
         .arg("--file")
         .arg(&file_path)
         .arg("--new-content")
@@ -108,7 +118,7 @@ fn run_one(dir: &Path, run_key: &str, step: Option<&str>) -> CrashOutcome {
         // crash run, recover it from the DB directly the way a real
         // recovering process would (there's exactly one transaction ever
         // created against this DB, now that db_path is unique per run_key).
-        let conn = calm_core::db::conn::open_writer(&db_path).ok();
+        let conn = calm_core::db::conn::open_state_writer(&state_db_path).ok();
         conn.and_then(|c| {
             c.query_row("SELECT tx_id FROM edit_transactions LIMIT 1", [], |r| {
                 r.get::<_, String>(0)
@@ -154,8 +164,9 @@ fn assert_journal_consistent(
          synchronous, not partial"
     );
 
-    let db_path = db_path_for(dir, run_key);
-    let conn = calm_core::db::conn::open_writer(&db_path).expect("reopen db after crash");
+    let state_db_path = state_db_path_for(dir, run_key);
+    let conn = calm_core::db::conn::open_state_writer(&state_db_path)
+        .expect("reopen state db after crash");
 
     let cached = calm_core::txn::get(&conn, tx_id)
         .expect("txn::get")

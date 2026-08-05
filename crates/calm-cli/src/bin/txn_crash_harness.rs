@@ -26,6 +26,7 @@ use std::path::PathBuf;
 
 fn main() {
     let mut db_path: Option<PathBuf> = None;
+    let mut state_db_path: Option<PathBuf> = None;
     let mut file_path: Option<PathBuf> = None;
     let mut crash_after: Option<String> = None;
     let mut new_content = String::from("new content\n");
@@ -34,6 +35,7 @@ fn main() {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--db" => db_path = args.next().map(PathBuf::from),
+            "--state-db" => state_db_path = args.next().map(PathBuf::from),
             "--file" => file_path = args.next().map(PathBuf::from),
             "--crash-after" => crash_after = args.next(),
             "--new-content" => new_content = args.next().unwrap_or(new_content),
@@ -44,6 +46,7 @@ fn main() {
         }
     }
     let db_path = db_path.expect("--db required");
+    let state_db_path = state_db_path.expect("--state-db required");
     let file_path = file_path.expect("--file required");
 
     // SIGKILL, not `std::process::exit` -- `exit` runs libc atexit handlers
@@ -62,11 +65,18 @@ fn main() {
 
     let original = std::fs::read_to_string(&file_path).unwrap_or_default();
 
+    // index.db: schema init only in this harness (it deliberately skips a
+    // real reindex -- see module doc), kept for parity with a real
+    // process's own startup. All durable txn::begin/advance calls below go
+    // through state_conn/state.db instead (docs/plans/2026-08-05-state-db-
+    // rewiring-execution-plan.md).
     let conn = calm_core::db::conn::open_writer(&db_path).expect("open db");
     calm_core::db::schema::init_db(&conn).expect("init db");
+    let state_conn = calm_core::db::conn::open_state_writer(&state_db_path).expect("open state db");
+    calm_core::db::schema::init_state_db(&state_conn).expect("init state db");
 
     let tx = calm_core::txn::begin(
-        &conn,
+        &state_conn,
         "crash-harness-project",
         file_path.file_name().unwrap().to_str().unwrap(),
         &calm_core::digest::evidence_digest(original.as_bytes()),
@@ -77,7 +87,7 @@ fn main() {
 
     calm_core::edit::atomic_write(&file_path, &new_content).expect("atomic_write");
     calm_core::txn::advance(
-        &conn,
+        &state_conn,
         &tx.tx_id,
         calm_core::txn::TxState::FileCommitted,
         "system",
@@ -87,7 +97,7 @@ fn main() {
     crash_here("file_committed");
 
     calm_core::txn::advance(
-        &conn,
+        &state_conn,
         &tx.tx_id,
         calm_core::txn::TxState::IndexCommitted,
         "system",
@@ -97,7 +107,7 @@ fn main() {
     crash_here("index_committed");
 
     calm_core::txn::advance(
-        &conn,
+        &state_conn,
         &tx.tx_id,
         calm_core::txn::TxState::Done,
         "system",

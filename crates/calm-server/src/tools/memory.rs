@@ -28,7 +28,7 @@ impl CalmServer {
                 ));
             }
 
-            let conn = match self.memory_write_conn() {
+            let conn = match self.state_write_conn() {
                 Ok(c) => c,
                 Err(e) => return db_error(e),
             };
@@ -106,7 +106,7 @@ impl CalmServer {
         Json(self.timed_tool("recall", || {
             const RECALL_LIMIT: i64 = 50;
 
-            let conn = match self.make_read_conn() {
+            let conn = match self.make_state_read_conn() {
                 Ok(c) => c,
                 Err(e) => return db_error(e),
             };
