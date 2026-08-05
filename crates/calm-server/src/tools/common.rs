@@ -44,7 +44,7 @@ impl CalmServer {
         // "MCP server failed to connect" instead of the brief, silent wait
         // `busy_timeout` gives every other writer.
         let conn = calm_core::db::conn::open_writer(&db_path)?;
-        calm_core::db::schema::init_db(&conn)?;
+        calm_core::db::schema::init_db_versioned(&conn)?;
         drop(conn);
 
         // docs/plans/2026-08-05-state-db-rewiring-execution-plan.md Phase 1:
@@ -64,7 +64,7 @@ impl CalmServer {
             std::fs::create_dir_all(parent)?;
         }
         let state_conn = calm_core::db::conn::open_state_writer(&state_db_path)?;
-        calm_core::db::schema::init_state_db(&state_conn)?;
+        calm_core::db::schema::init_state_db_versioned(&state_conn)?;
         if let Err(e) = calm_core::db::schema::migrate_legacy_durable_tables(&state_conn, &db_path)
         {
             tracing::warn!(

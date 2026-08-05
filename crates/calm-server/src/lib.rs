@@ -735,8 +735,6 @@ pub fn default_state_db_path(project_root: &std::path::Path) -> PathBuf {
 }
 
 pub fn doctor(project_root: &std::path::Path, fix: bool) -> Result<()> {
-    use calm_core::db::schema::init_db;
-
     println!("Build: {}", calm_core::BUILD_INFO);
     match current_git_head_short(project_root) {
         Some(head) if calm_core::BUILD_INFO.starts_with(&head) => {
@@ -788,7 +786,7 @@ pub fn doctor(project_root: &std::path::Path, fix: bool) -> Result<()> {
             std::fs::create_dir_all(parent)?;
         }
         let conn = calm_core::db::conn::open_writer(&db_path)?;
-        init_db(&conn)?;
+        calm_core::db::schema::init_db_versioned(&conn)?;
         println!("  created empty DB");
     }
 

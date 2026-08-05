@@ -1,3 +1,78 @@
+// -- Downgrade guard (added post-2026-08-05 state.db rewiring incident) --
+// See docs/plans/2026-08-05-state-db-rewiring-execution-plan.md for the
+// incident this is a direct response to: a schema split shipped with no
+// version marker anywhere, so an older binary opening a newer-schema file
+// had no way to detect the mismatch and just failed on "no such table"
+// instead of refusing up front with a clear message.
+//
+// `INDEX_DB_SCHEMA_VERSION`/`STATE_DB_SCHEMA_VERSION` are stamped into
+// `PRAGMA user_version` -- SQLite's own reserved 32-bit header integer, so
+// this costs no extra table or I/O. Bump the relevant constant whenever a
+// schema change means an OLDER binary can no longer safely continue
+// writing to the file.
+//
+// `init_db`/`init_state_db` themselves are deliberately left untouched --
+// both are hub symbols with 100+ callers (nearly all test helpers
+// building a fresh, disposable temp DB, where a version check is a
+// no-op), and this repo's own edit-safety gate correctly refuses a
+// citation-only edit to a >10-caller "high" risk hub without a live
+// human-approval round-trip. `init_db_versioned`/`init_state_db_versioned`
+// below are thin wrappers real (non-test) entry points should call
+// instead: calm-cli `index`/`fitness-check`, calm-server `new_with_preset`
+// (the `calm serve`/daemon bootstrap) and `doctor`.
+pub const INDEX_DB_SCHEMA_VERSION: i64 = 1;
+pub const STATE_DB_SCHEMA_VERSION: i64 = 1;
+
+/// Refuses to proceed if `conn`'s stamped `PRAGMA user_version` is HIGHER
+/// than `expected` -- meaning a newer CALM binary already created or
+/// migrated this exact file. An older binary continuing past this point
+/// would write under schema assumptions the file has already outgrown,
+/// silently corrupting durable state a newer process later trusts. A
+/// version <= `expected` (including SQLite's default of 0, meaning never
+/// stamped) is always fine here -- bringing an older-but-stamped file
+/// forward is `run_migrations`'s job for index.db, or simply re-running
+/// the idempotent `IF NOT EXISTS` DDL for state.db.
+fn refuse_if_schema_newer(
+    conn: &Connection,
+    expected: i64,
+    db_label: &str,
+) -> rusqlite::Result<()> {
+    let on_disk: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if on_disk > expected {
+        return Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_MISMATCH),
+            Some(format!(
+                "{db_label} was created or migrated by a newer CALM version (schema {on_disk}) \
+                 than this binary supports (schema {expected}). Refusing to open it -- \
+                 continuing would risk silently corrupting durable state. Upgrade this CALM \
+                 binary, then try again."
+            )),
+        ));
+    }
+    Ok(())
+}
+
+/// Production-path wrapper around `init_db` -- enforces the downgrade
+/// guard, then delegates to the unchanged `init_db`, then stamps the
+/// current version. Real (non-test) entry points should call this instead
+/// of `init_db` directly; test helpers keep calling `init_db` unversioned
+/// (see the module-level doc comment above for why that's fine).
+pub fn init_db_versioned(conn: &Connection) -> rusqlite::Result<()> {
+    refuse_if_schema_newer(conn, INDEX_DB_SCHEMA_VERSION, "index.db")?;
+    init_db(conn)?;
+    conn.pragma_update(None, "user_version", INDEX_DB_SCHEMA_VERSION)?;
+    Ok(())
+}
+
+/// `init_state_db`'s counterpart to `init_db_versioned` -- see that
+/// function's doc comment.
+pub fn init_state_db_versioned(conn: &Connection) -> rusqlite::Result<()> {
+    refuse_if_schema_newer(conn, STATE_DB_SCHEMA_VERSION, "state.db")?;
+    init_state_db(conn)?;
+    conn.pragma_update(None, "user_version", STATE_DB_SCHEMA_VERSION)?;
+    Ok(())
+}
+
 use rusqlite::Connection;
 use std::path::Path;
 
@@ -952,6 +1027,91 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 0);
+    }
+    #[test]
+    fn init_db_versioned_stamps_version_on_fresh_db_and_stays_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db_versioned(&conn).unwrap();
+        let stamped: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stamped, INDEX_DB_SCHEMA_VERSION);
+
+        // Calling again (every real startup after the first) must not fail
+        // -- on_disk == expected is explicitly the "nothing to do" case.
+        init_db_versioned(&conn).unwrap();
+        let stamped_again: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stamped_again, INDEX_DB_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn init_db_versioned_refuses_when_disk_schema_is_newer_than_this_binary() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Simulates a file a NEWER CALM binary already created/migrated --
+        // this binary must refuse rather than silently write past it.
+        conn.pragma_update(None, "user_version", INDEX_DB_SCHEMA_VERSION + 1)
+            .unwrap();
+        let err = init_db_versioned(&conn).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("newer CALM version") && msg.contains("index.db"),
+            "error should name the db and explain the mismatch, got: {msg}"
+        );
+
+        // Refusal must happen BEFORE any schema DDL runs -- confirms this
+        // by checking the table that DDL would have created doesn't exist.
+        let table_exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='symbols'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|c| c > 0)
+            .unwrap_or(false);
+        assert!(!table_exists, "must refuse before creating any schema DDL");
+    }
+
+    #[test]
+    fn init_state_db_versioned_stamps_version_on_fresh_db_and_stays_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_state_db_versioned(&conn).unwrap();
+        let stamped: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stamped, STATE_DB_SCHEMA_VERSION);
+
+        init_state_db_versioned(&conn).unwrap();
+        let stamped_again: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stamped_again, STATE_DB_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn init_state_db_versioned_refuses_when_disk_schema_is_newer_than_this_binary() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "user_version", STATE_DB_SCHEMA_VERSION + 1)
+            .unwrap();
+        let err = init_state_db_versioned(&conn).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("newer CALM version") && msg.contains("state.db"),
+            "error should name the db and explain the mismatch, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn refuse_if_schema_newer_allows_older_and_equal_versions() {
+        let conn = Connection::open_in_memory().unwrap();
+        // SQLite default (never stamped) is 0 -- always <= any expected.
+        assert!(refuse_if_schema_newer(&conn, 5, "test.db").is_ok());
+
+        conn.pragma_update(None, "user_version", 5i64).unwrap();
+        assert!(refuse_if_schema_newer(&conn, 5, "test.db").is_ok());
+        assert!(refuse_if_schema_newer(&conn, 10, "test.db").is_ok());
+        assert!(refuse_if_schema_newer(&conn, 4, "test.db").is_err());
     }
 
     #[test]

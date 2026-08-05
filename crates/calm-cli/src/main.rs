@@ -434,7 +434,7 @@ async fn main() -> Result<()> {
                 std::fs::create_dir_all(parent)?;
             }
             let mut conn = calm_core::db::conn::open_writer(&db_path)?;
-            calm_core::db::schema::init_db(&conn)?;
+            calm_core::db::schema::init_db_versioned(&conn)?;
             let phase = std::sync::Arc::new(std::sync::RwLock::new(
                 calm_core::types::IndexingPhase::Scanning,
             ));
@@ -701,7 +701,7 @@ async fn main() -> Result<()> {
             // a locked/corrupted index.db), with no signal why. Matches the
             // policy on `Serve`'s own load_config(&root)? above.
             let conn = calm_core::db::conn::open_writer(&db_path)?;
-            calm_core::db::schema::init_db(&conn)?;
+            calm_core::db::schema::init_db_versioned(&conn)?;
 
             let coverage = calm_core::analysis::coverage::load_coverage(&root);
             let result = calm_core::fitness::run_fitness_check(
