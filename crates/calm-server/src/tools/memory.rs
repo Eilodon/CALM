@@ -28,7 +28,7 @@ impl CalmServer {
                 ));
             }
 
-            let conn = match self.memory_write_conn() {
+            let conn = match self.state_write_conn() {
                 Ok(c) => c,
                 Err(e) => return db_error(e),
             };
