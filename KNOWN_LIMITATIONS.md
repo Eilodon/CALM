@@ -29,34 +29,6 @@ allowlist, resource limits) applied uniformly first — bolting each new
 language's runner directly onto today's bare `Command::new(...)` would
 just multiply the unsandboxed surface instead of closing it. Not started.
 
-## Durable state and the rebuildable index share one SQLite file at runtime
-
-`.calm/index.db` holds the symbol/call-graph index (rebuildable from
-source, `PRAGMA synchronous=NORMAL` is a deliberate tradeoff for it) *and*
-the edit-transaction journal, audit ledger, and project-memory notes
-(none of which are rebuildable). All of it currently shares that same
-`synchronous=NORMAL` posture and the same physical file. A hard
-power-loss can only lose the last few committed rows under WAL+NORMAL,
-never corrupt the file — an acceptable cost for a cache, less obviously
-so for a journal used as evidence.
-
-The storage-layer foundation for a split now exists in `calm-core`:
-`db::schema::STATE_SCHEMA_SQL`/`init_state_db` define the durable tables
-(`project_memory`, `project_memory_refs`, `edit_transactions`, `tx_events`,
-`maintenance_jobs`, `audit_ledger`) as a schema separate from the
-rebuildable `SCHEMA_SQL`/`init_db`; `db::conn::open_state_writer` opens a
-connection at `PRAGMA synchronous=FULL`; and
-`db::schema::migrate_legacy_durable_tables` does a one-time, idempotent,
-copy-only migration of any pre-split `index.db`'s durable rows into a
-`state.db`. All of this is unit-tested but **not yet wired up** — every
-real call site in `calm-server` (`edit.rs`, `txn.rs`, `memory.rs`,
-`common.rs`, `lib.rs`, and others) still opens and writes through the one
-shared `index.db`/`open_writer` connection. Rewiring those call sites to
-actually use `state.db` for durable writes is a separate follow-up, scoped
-by `open_writer`'s own blast radius (~320 transitively-affected files per
-`diff_impact`) rather than attempted alongside the schema/migration
-groundwork.
-
 ## No multi-file change-set / transaction
 
 Every `edit_lines`/`edit_symbol`/`format_files` call gets its own,
