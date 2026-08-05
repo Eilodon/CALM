@@ -198,6 +198,8 @@ calm guard    --project-root .    # pre-commit/CI gate on the staged diff, exits
 calm guard    --project-root . --fail-on medium --json   # stricter threshold, machine-readable output
 calm guard    --project-root . --base origin/main         # review this branch/PR against a base ref instead of the staged diff
 calm guard    --project-root . --commits HEAD~3..HEAD      # raw commit range, passed straight through to git diff
+calm value-report --project-root .                        # real counts from .calm/audit.log: risky edits blocked, risk distribution on what was applied
+calm value-report --project-root . --json                 # machine-readable output
 calm scip-run --project-root . --lang go        # force one SCIP provider to run now, bypassing refresh policy
 calm scip-run --project-root .                  # --lang omitted = run every provider ("rust,go,python,javascript,java,csharp,php,ruby,c")
 calm index    --project-root . --scip-file build/index.scip --sub-root services/api   # ingest a pre-built SCIP index (CI/sandboxed, no external indexer install needed)

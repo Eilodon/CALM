@@ -184,6 +184,23 @@ enum Commands {
         #[arg(long, conflicts_with = "base")]
         commits: Option<String>,
     },
+    /// Reports usage/value metrics mined from `.calm/audit.log`: how many
+    /// risky edits were blocked before they ever reached disk, the risk
+    /// distribution on what WAS applied, and (best-effort, only if present)
+    /// tool latency from `.calm/daemon.log` -- answers "is this actually
+    /// catching anything" with real counts instead of an unverifiable
+    /// claim. `.calm/audit.log` is written by daemon-mode sessions (`calm
+    /// serve --listen unix:...`, see `init_daemon_tracing`) -- a project
+    /// that has only ever run plain stdio `calm serve` has nothing to read
+    /// yet, reported honestly rather than a misleading all-zero summary.
+    ValueReport {
+        /// Project root directory
+        #[arg(long, default_value = ".")]
+        project_root: PathBuf,
+        /// Emit machine-readable JSON instead of a human-readable report.
+        #[arg(long)]
+        json: bool,
+    },
     /// Initialize .calm/ config for a project
     Init {
         /// Project root directory
@@ -888,6 +905,32 @@ async fn main() -> Result<()> {
                 std::process::exit(1);
             }
         }
+        Commands::ValueReport { project_root, json } => {
+            let root = std::fs::canonicalize(&project_root)?;
+            let audit_log_path = root.join(".calm").join("audit.log");
+            let report = build_value_report(&audit_log_path)?;
+            if json {
+                let r = &report;
+                let out = serde_json::json!({
+                    "audit_log_found": r.audit_log_found,
+                    "audit_log_path": r.audit_log_path,
+                    "total_events": r.total_events,
+                    "parse_errors": r.parse_errors,
+                    "applied": r.applied,
+                    "denied": r.denied,
+                    "elicit_asked": r.elicit_asked,
+                    "elicit_approved": r.elicit_approved,
+                    "elicit_declined": r.elicit_declined,
+                    "risk_none": r.risk_none,
+                    "risk_low": r.risk_low,
+                    "risk_medium": r.risk_medium,
+                    "risk_high": r.risk_high,
+                });
+                println!("{}", serde_json::to_string_pretty(&out)?);
+            } else {
+                print_value_report(&report);
+            }
+        }
         #[cfg(feature = "scip-overlay")]
         Commands::ScipRun { project_root, lang } => {
             let root = std::fs::canonicalize(&project_root)?;
@@ -1464,6 +1507,139 @@ fn init_daemon_tracing(project_root: &std::path::Path) -> Result<()> {
     let registry = registry.with(calm_cli::otel::otel_layer()?);
     registry.init();
     Ok(())
+}
+
+#[derive(Default)]
+struct ValueReportOutput {
+    audit_log_found: bool,
+    audit_log_path: String,
+    total_events: usize,
+    parse_errors: usize,
+    applied: usize,
+    denied: usize,
+    elicit_asked: usize,
+    elicit_approved: usize,
+    elicit_declined: usize,
+    risk_none: usize,
+    risk_low: usize,
+    risk_medium: usize,
+    risk_high: usize,
+}
+
+/// Mines `.calm/audit.log` (JSON-lines, `target: "calm_audit"` -- written by
+/// every `edit_lines`/`edit_symbol` gate decision, see `crates/calm-server/
+/// src/tools/edit.rs`'s `tracing::info!(target: crate::telemetry::
+/// AUDIT_TARGET, ...)` call sites) for real usage/value counts. Never
+/// errors on a missing/empty file -- `audit_log_found: false` with all
+/// counts at 0 is itself the honest answer for a project that has only
+/// run non-daemon `calm serve` so far (see `ValueReport`'s own doc comment
+/// on `Commands`).
+fn build_value_report(audit_log_path: &std::path::Path) -> anyhow::Result<ValueReportOutput> {
+    let mut report = ValueReportOutput {
+        audit_log_path: audit_log_path.display().to_string(),
+        ..Default::default()
+    };
+    let Ok(contents) = std::fs::read_to_string(audit_log_path) else {
+        return Ok(report);
+    };
+    report.audit_log_found = true;
+
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
+            report.parse_errors += 1;
+            continue;
+        };
+        if entry.get("target").and_then(|t| t.as_str())
+            != Some(calm_server::telemetry::AUDIT_TARGET)
+        {
+            continue;
+        }
+        report.total_events += 1;
+        let fields = entry.get("fields");
+        match fields
+            .and_then(|f| f.get("decision"))
+            .and_then(|d| d.as_str())
+        {
+            Some("applied") => report.applied += 1,
+            Some("denied") => report.denied += 1,
+            Some("elicit_asked") => report.elicit_asked += 1,
+            Some("elicit_approved") => report.elicit_approved += 1,
+            Some("elicit_declined") => report.elicit_declined += 1,
+            _ => {}
+        }
+        match fields.and_then(|f| f.get("risk")).and_then(|r| r.as_str()) {
+            Some("none") => report.risk_none += 1,
+            Some("low") => report.risk_low += 1,
+            Some("medium") => report.risk_medium += 1,
+            Some("high") => report.risk_high += 1,
+            _ => {}
+        }
+    }
+    Ok(report)
+}
+
+fn print_value_report(r: &ValueReportOutput) {
+    println!("calm value report -- {}", r.audit_log_path);
+    if !r.audit_log_found {
+        println!(
+            "  no audit log found -- this project has only run non-daemon `calm serve` so \
+             far (or hasn't run yet). Audit logging is daemon-mode only today: `calm serve \
+             --listen unix:.calm/daemon.sock` (or `calm connect`) starts collecting this data."
+        );
+        return;
+    }
+    if r.total_events == 0 {
+        println!("  audit log exists but has no edit-gate events yet -- nothing to report.");
+        return;
+    }
+    let gated = r.applied + r.denied;
+    println!(
+        "  edit-gate decisions ({} total):",
+        gated + r.elicit_asked + r.elicit_declined + r.elicit_approved
+    );
+    println!(
+        "    applied: {} ({:.0}%)",
+        r.applied,
+        100.0 * r.applied as f64 / gated.max(1) as f64
+    );
+    println!(
+        "    denied (risky change blocked before it reached disk): {} ({:.0}%)",
+        r.denied,
+        100.0 * r.denied as f64 / gated.max(1) as f64
+    );
+    if r.elicit_asked + r.elicit_approved + r.elicit_declined > 0 {
+        println!(
+            "    human-in-the-loop elicitation: {} asked, {} approved, {} declined",
+            r.elicit_asked, r.elicit_approved, r.elicit_declined
+        );
+    }
+    let risk_total = r.risk_none + r.risk_low + r.risk_medium + r.risk_high;
+    if risk_total > 0 {
+        println!("  risk distribution on applied edits ({risk_total} total):");
+        for (label, count) in [
+            ("none", r.risk_none),
+            ("low", r.risk_low),
+            ("medium", r.risk_medium),
+            ("high", r.risk_high),
+        ] {
+            if count > 0 {
+                println!(
+                    "    {label}: {count} ({:.0}%)",
+                    100.0 * count as f64 / risk_total as f64
+                );
+            }
+        }
+    }
+    if r.parse_errors > 0 {
+        println!(
+            "  ({} line(s) in the audit log could not be parsed as JSON)",
+            r.parse_errors
+        );
+    }
 }
 
 #[cfg(test)]
