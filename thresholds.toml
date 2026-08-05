@@ -4,18 +4,20 @@
 # here; every other numeric threshold keeps FitnessThresholds::default().
 
 [thresholds]
-# common.rs is this repo's genuine "core" file — the CalmServer state/method
-# hub every tool builds on — so it leads both churn and complexity. The
-# 2026-07-28 hotspot split (tools/{outcome,detail,toolset}.rs) moved every
-# free-standing helper out of it (complexity 313->134), dropping the max
-# hotspot risk from 0.82 to 0.74 (verified via `calm fitness-check`). common.rs
-# still drives the metric because it stays the highest-churn file (~41 commits/
-# 6mo) even after the split, so 0.74 clears the 0.75 default by only 0.01. This
-# raises the gate to 0.80 purely as a churn-drift margin: each further commit
-# to common.rs adds ~0.018 to the score, so 0.80 gives ~3 commits of headroom
-# while future edits migrate into the split-out modules, without masking a real
-# regression (a NEW god-file would still blow past 0.80). Revisit downward once
-# common.rs's churn share falls.
+# NOTE (2026-08-05, re-verified against `calm fitness-check --config
+# thresholds.toml` and `git log --since="6 months ago"`): the story below
+# about common.rs driving this metric predates this repo's current git
+# history, which starts 2026-07-30 (50 commits total as of this note) — the
+# 2026-07-28 split and its "~41 commits/6mo" figure no longer correspond to
+# any commit this repo's log actually has. Today's max hotspot risk is 0.15,
+# driven by tools.rs (15 commits/6mo, complexity 73.7); common.rs is down to
+# 7 commits/6mo and a hotspot_risk of ~0.14, no longer the leader. 0.80 has
+# ~0.65 of margin right now, not the ~0.01 the story below once described.
+#
+# Left at 0.80 rather than reverted to the 0.75 default because churn counts
+# are still artificially low from the recent history reset and will climb as
+# the 6-month window fills back in — revisit downward once churn stabilizes
+# and the true steady-state max is known.
 max_hotspot_risk = 0.80
 
 # Layering rules Rust's own crate/module visibility does NOT already enforce
