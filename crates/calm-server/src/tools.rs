@@ -239,6 +239,13 @@ type CoChangeCache = Arc<
 pub struct CalmServer {
     project_root: PathBuf,
     db_path: PathBuf,
+    /// Durable-state sibling of `db_path` (`docs/plans/2026-08-05-state-db-
+    /// rewiring-execution-plan.md`) — `project_memory`/`edit_transactions`/
+    /// `tx_events`/`maintenance_jobs`/`audit_ledger` live here
+    /// (`db::conn::open_state_writer`, `synchronous=FULL`), not in the
+    /// rebuildable index `db_path` points at. Propagates to every
+    /// `for_connection` clone via `..self.clone()`, same as `db_path`.
+    state_db_path: PathBuf,
     /// Current indexing phase, shared with the background indexer thread.
     /// Tools read it to report `indexing_phase` / `edges_ready` honestly instead
     /// of assuming the graph is built.

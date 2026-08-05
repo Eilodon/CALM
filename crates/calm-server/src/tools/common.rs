@@ -45,6 +45,36 @@ impl CalmServer {
         // `busy_timeout` gives every other writer.
         let conn = calm_core::db::conn::open_writer(&db_path)?;
         calm_core::db::schema::init_db(&conn)?;
+        drop(conn);
+
+        // docs/plans/2026-08-05-state-db-rewiring-execution-plan.md Phase 1:
+        // durable state (project_memory/edit_transactions/tx_events/
+        // maintenance_jobs/audit_ledger) lives in a separate state.db opened
+        // at synchronous=FULL (open_state_writer), not index.db's
+        // synchronous=NORMAL (open_writer) — none of it is rebuildable from
+        // source the way the index is. init_state_db is safe on every
+        // startup (every statement IF NOT EXISTS). migrate_legacy_durable_tables
+        // is a one-time, idempotent, copy-only pull of any durable rows a
+        // pre-split index.db still has — it must run BEFORE
+        // recover_incomplete/reconcile_stale_at_startup below so rows a
+        // previous process left are already present in state.db when those
+        // two scan it.
+        let state_db_path = crate::default_state_db_path(&project_root);
+        if let Some(parent) = state_db_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let state_conn = calm_core::db::conn::open_state_writer(&state_db_path)?;
+        calm_core::db::schema::init_state_db(&state_conn)?;
+        if let Err(e) =
+            calm_core::db::schema::migrate_legacy_durable_tables(&state_conn, &db_path)
+        {
+            tracing::warn!(
+                error = %e,
+                "startup: migrate_legacy_durable_tables failed -- a pre-split index.db's \
+                 durable rows (if any) were not copied into state.db this attempt; safe to \
+                 retry next startup (copy-only, idempotent)"
+            );
+        }
         // WS-1 startup recovery (docs/plans/2026-08-02-phase1-p0-execution-plan.md
         // §4.6): every real launch path (stdio, unix daemon, CLI direct) funnels
         // through `bootstrap` -> here, exactly once per process, so this is the
@@ -60,7 +90,7 @@ impl CalmServer {
         // why this does NOT re-invoke the real scip/embed refresh itself
         // (`bootstrap` already does that unconditionally moments later for
         // whichever process wins the indexer lock).
-        if let Ok(incomplete) = calm_core::txn::recover_incomplete(&conn) {
+        if let Ok(incomplete) = calm_core::txn::recover_incomplete(&state_conn) {
             for tx in &incomplete {
                 tracing::warn!(
                     target: crate::telemetry::AUDIT_TARGET,
@@ -71,7 +101,7 @@ impl CalmServer {
                 );
             }
         }
-        if let Ok(reconciled) = calm_core::maintenance::reconcile_stale_at_startup(&conn) {
+        if let Ok(reconciled) = calm_core::maintenance::reconcile_stale_at_startup(&state_conn) {
             for job in &reconciled {
                 tracing::warn!(
                     target: crate::telemetry::AUDIT_TARGET,
@@ -82,12 +112,13 @@ impl CalmServer {
                 );
             }
         }
-        drop(conn);
+        drop(state_conn);
         let coverage = calm_core::analysis::coverage::load_coverage(&project_root);
         let tool_router = CalmServer::tool_router_for_preset(&preset)?;
         Ok(Self {
             project_root,
             db_path,
+            state_db_path,
             phase: Arc::new(RwLock::new(IndexingPhase::Scanning)),
             last_index_error: Arc::new(RwLock::new(None)),
             last_graph_mode: Arc::new(RwLock::new(None)),
@@ -192,6 +223,29 @@ impl CalmServer {
         Ok(conn)
     }
 
+    /// State-db sibling of `make_read_conn` — a dedicated `query_only`
+    /// connection to `state_db_path` instead of `db_path`, for reading a
+    /// durable table (`project_memory`/`edit_transactions`/`tx_events`/
+    /// `maintenance_jobs`/`audit_ledger`). See `docs/plans/2026-08-05-
+    /// state-db-rewiring-execution-plan.md`.
+    pub(crate) fn make_state_read_conn(&self) -> Result<rusqlite::Connection, rusqlite::Error> {
+        let conn = rusqlite::Connection::open(&self.state_db_path)?;
+        conn.execute_batch("PRAGMA query_only = ON;")?;
+        Ok(conn)
+    }
+
+    /// Write connection to `state.db` (`synchronous=FULL`) for a durable
+    /// table (`project_memory`/`edit_transactions`/`tx_events`/
+    /// `maintenance_jobs`/`audit_ledger`) — the state-db counterpart of
+    /// `memory_write_conn`. NOT for `pattern_debt` (`memory_write_conn`
+    /// still serves that — `pattern_debt` lives in the rebuildable
+    /// `index.db`, not `state.db`; see `docs/plans/2026-08-05-state-db-
+    /// rewiring-execution-plan.md` §2.1, which specifically flags this
+    /// distinction after `edit_context` showed `memory_write_conn` is
+    /// shared by `remember` AND `pattern_debt_register`/`pattern_debt_status`).
+    pub(crate) fn state_write_conn(&self) -> Result<rusqlite::Connection, rusqlite::Error> {
+        calm_core::db::conn::open_state_writer(&self.state_db_path)
+    }
     /// Cached `load_config` (audit F12): checks `config.json`'s current
     /// mtime against what's cached; a match serves the cached `Config`
     /// clone without touching disk beyond the one `stat()` inside
