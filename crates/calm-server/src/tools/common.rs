@@ -65,8 +65,7 @@ impl CalmServer {
         }
         let state_conn = calm_core::db::conn::open_state_writer(&state_db_path)?;
         calm_core::db::schema::init_state_db(&state_conn)?;
-        if let Err(e) =
-            calm_core::db::schema::migrate_legacy_durable_tables(&state_conn, &db_path)
+        if let Err(e) = calm_core::db::schema::migrate_legacy_durable_tables(&state_conn, &db_path)
         {
             tracing::warn!(
                 error = %e,
@@ -362,6 +361,13 @@ impl CalmServer {
         rusqlite::Connection::open(&self.db_path).unwrap()
     }
 
+    /// state.db counterpart of `db()` -- for seeding/asserting durable
+    /// fixture rows (project_memory/edit_transactions/tx_events/
+    /// maintenance_jobs/audit_ledger) directly, same test-only posture.
+    #[cfg(test)]
+    pub(crate) fn state_db(&self) -> rusqlite::Connection {
+        rusqlite::Connection::open(&self.state_db_path).unwrap()
+    }
     /// Write connection for `remember` — the one tool handler that isn't
     /// read-only (every other tool must use `make_read_conn()`). Scoped
     /// narrowly: `project_memory` is never touched by the indexer/watcher,
