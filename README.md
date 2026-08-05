@@ -196,6 +196,8 @@ calm fitness-check --project-root . --json                      # JSON output
 calm fitness-check --project-root . --config thresholds.toml    # custom thresholds
 calm guard    --project-root .    # pre-commit/CI gate on the staged diff, exits 1 if aggregate risk >= --fail-on (default: high)
 calm guard    --project-root . --fail-on medium --json   # stricter threshold, machine-readable output
+calm guard    --project-root . --base origin/main         # review this branch/PR against a base ref instead of the staged diff
+calm guard    --project-root . --commits HEAD~3..HEAD      # raw commit range, passed straight through to git diff
 calm scip-run --project-root . --lang go        # force one SCIP provider to run now, bypassing refresh policy
 calm scip-run --project-root .                  # --lang omitted = run every provider ("rust,go,python,javascript,java,csharp,php,ruby,c")
 calm index    --project-root . --scip-file build/index.scip --sub-root services/api   # ingest a pre-built SCIP index (CI/sandboxed, no external indexer install needed)
@@ -226,6 +228,18 @@ Distinct from the `tools` above — MCP Prompts (`prompts/list`, `prompts/get`) 
 | `onboard_area` | `path` | `repo_overview` → `file_overview`/`dependencies` → `hotspots` scoped to that path |
 | `review_pr` | `range` | `diff_impact(commits=range)` → `hotspots` (overlap check) → `fitness_report` → aggregate risk summary before merge |
 | `calm_workflow` | *(none)* | No-argument orientation to the full Stage 1-8 tool workflow — for a client that never auto-loads AGENTS.md, or a mid-session refresher |
+
+## One-line CI: the CALM Guard GitHub Action
+
+[`action.yml`](action.yml) wraps `calm index` + `calm guard` as a reusable composite action -- one-line adoption for a repo that just wants blast-radius review on every PR, no MCP client involved:
+
+```yaml
+- uses: Eilodon/CALM@main
+  with:
+    fail-on: high   # default; "low"/"medium" also accepted
+```
+
+On a `pull_request` event it auto-detects the PR's base branch (fetching just that ref, since a default shallow checkout won't have it) and reviews the merge-base-relative range; on a plain `push` it reviews `before..after`. Both are overridable with `base`/`commits` inputs matching `calm guard`'s own `--base`/`--commits` flags (see [CLI reference](#cli-reference) above) -- set one explicitly for anything the auto-detection doesn't cover (`workflow_dispatch`, a merge-queue event, etc.). Requires an npm-published `@eilodon/calm-mcp` release reachable from the runner; nothing else to install.
 
 ## Fitness check — the CI gate
 

@@ -142,16 +142,20 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
-    /// Git/CI-native guard: analyzes the staged diff (`git diff --cached`)
-    /// and exits non-zero if its aggregate risk is at or above `--fail-on`
-    /// (exits 1 also when project_root isn't a git repo, or git itself
-    /// fails). Wraps the exact `diff_impact` tool an MCP agent's own
-    /// Stage-7 pre-commit gate already runs, so a change made outside any
-    /// MCP session (a teammate's native editor, a bot PR) gets the same
-    /// analysis instead of none at all -- see `KNOWN_LIMITATIONS.md` "No
-    /// Git/CI-native integration path". Usable directly as a pre-commit
-    /// hook or CI step; requires an existing index (run `calm index`
-    /// first).
+    /// Git/CI-native guard: by default analyzes the staged diff (`git diff
+    /// --cached`) and exits non-zero if its aggregate risk is at or above
+    /// `--fail-on` (exits 1 also when project_root isn't a git repo, or
+    /// git itself fails). Wraps the exact `diff_impact` tool an MCP
+    /// agent's own Stage-7 pre-commit gate already runs, so a change made
+    /// outside any MCP session (a teammate's native editor, a bot PR) gets
+    /// the same analysis instead of none at all -- see
+    /// `KNOWN_LIMITATIONS.md` "No Git/CI-native integration path". Usable
+    /// directly as a pre-commit hook or CI step; requires an existing
+    /// index (run `calm index` first). `--base`/`--commits` switch it from
+    /// the staged diff to a commit-range review (e.g. a PR against a base
+    /// branch) -- the CLI-plumbing gap that same KNOWN_LIMITATIONS.md
+    /// section named, now closed: `diff_impact` itself already supported
+    /// `commits`.
     Guard {
         /// Project root directory
         #[arg(long, default_value = ".")]
@@ -164,6 +168,21 @@ enum Commands {
         /// Emit the raw `diff_impact` JSON instead of a human-readable report.
         #[arg(long)]
         json: bool,
+        /// Review this branch/PR against a base ref instead of the staged
+        /// diff, e.g. `--base origin/main`. Internally becomes the commit
+        /// range `<base>...HEAD` (three-dot: only commits reachable from
+        /// HEAD but not from base -- the same merge-base-relative range
+        /// most PR-diff UIs use, so a commit already on both branches
+        /// doesn't show up as "new"). Mutually exclusive with --commits.
+        #[arg(long, conflicts_with = "commits")]
+        base: Option<String>,
+        /// Raw commit range/rev passed straight through to `git diff`
+        /// (same syntax `diff_impact`'s own `commits` param takes), e.g.
+        /// `HEAD~3..HEAD` or a single SHA -- full control when --base's
+        /// three-dot convention isn't what's wanted. Mutually exclusive
+        /// with --base.
+        #[arg(long, conflicts_with = "base")]
+        commits: Option<String>,
     },
     /// Initialize .calm/ config for a project
     Init {
@@ -779,11 +798,29 @@ async fn main() -> Result<()> {
             project_root,
             fail_on,
             json,
+            base,
+            commits,
         } => {
             let root = std::fs::canonicalize(&project_root)?;
             let db_path = calm_server::default_db_path(&root);
             let server = calm_server::tools::CalmServer::new(root, db_path)?;
-            let output = server.diff_impact_json(None, Some(true), None);
+            // At most one of diff/staged/commits may reach diff_impact --
+            // --base is just sugar for a three-dot commits range, so it
+            // collapses into the same commits_arg as --commits (clap's
+            // conflicts_with on the two flags already rules out both
+            // being set at once). Neither given -> today's staged-diff
+            // default, byte-for-byte unchanged.
+            let commits_arg = commits.or_else(|| base.map(|b| format!("{b}...HEAD")));
+            let staged_arg = if commits_arg.is_some() {
+                None
+            } else {
+                Some(true)
+            };
+            let scope_label = match &commits_arg {
+                Some(c) => format!("commit range {c}"),
+                None => "staged diff".to_string(),
+            };
+            let output = server.diff_impact_json(None, staged_arg, commits_arg);
 
             if let Some(err) = output.get("error").filter(|e| !e.is_null()) {
                 let message = err["message"].as_str().unwrap_or("diff_impact failed");
@@ -801,7 +838,7 @@ async fn main() -> Result<()> {
                 let files_changed = output["files_changed"].as_array().map_or(0, |a| a.len());
                 let aggregate_risk = output["aggregate_risk"].as_str().unwrap_or("low");
                 println!(
-                    "calm guard — staged diff: {files_changed} file(s) changed, aggregate risk: {aggregate_risk}"
+                    "calm guard — {scope_label}: {files_changed} file(s) changed, aggregate risk: {aggregate_risk}"
                 );
                 if let Some(symbols) = output["affected_symbols"].as_array() {
                     for sym in symbols {

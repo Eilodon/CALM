@@ -31,6 +31,30 @@ jobs:
       - name: Audit
         run: cargo install cargo-audit --locked && cargo audit
 
+  # Dogfoods action.yml against this repo's own PRs -- proves the
+  # published-npm-package + composite-action path actually works end to
+  # end, not just that `cargo test` passes against the Rust source directly.
+  # continue-on-error: shadow mode while this is new (matches this repo's
+  # own rollout convention for new gates -- elicit_hub_confirm, verification,
+  # etc. all default off/observe-only at first) -- promote to blocking once
+  # it's run clean across enough real PRs.
+  calm-guard-dogfood:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          # Full history, not action.yml's own best-effort shallow-fetch
+          # fallback -- this job is specifically what proves the merge-base
+          # calculation is correct, so it shouldn't lean on the same
+          # fallback it's meant to be testing.
+          fetch-depth: 0
+
+      - uses: ./
+        # No `base`/`commits` input -- exercises action.yml's own
+        # pull_request/push auto-detection, not an explicit override.
+
   stack-graphs-corpus:
     runs-on: ubuntu-latest
     timeout-minutes: 15

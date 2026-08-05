@@ -143,3 +143,98 @@ fn calm_guard_rejects_an_invalid_fail_on_value() {
         "expected an invalid --fail-on value to fail, not silently do something else"
     );
 }
+
+#[test]
+fn calm_guard_base_reviews_a_committed_range_instead_of_the_staged_diff() {
+    let dir = init_fixture();
+    run_index(dir.path());
+    let base_sha = String::from_utf8(
+        Command::new("git")
+            .current_dir(dir.path())
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    // A risky change, but COMMITTED (not staged) -- the default staged-diff
+    // mode would see nothing here at all, proving --base is really what
+    // picked this up.
+    std::fs::write(
+        dir.path().join("src/lib.rs"),
+        "pub fn helper(x: i32, y: i32) -> i32 {\n    x + y\n}\n\npub fn caller_one() -> i32 {\n    helper(1, 0)\n}\n\npub fn caller_two() -> i32 {\n    helper(2, 0)\n}\n\npub fn caller_three() -> i32 {\n    helper(3, 0)\n}\n",
+    )
+    .unwrap();
+    git(dir.path(), &["commit", "-aq", "-m", "signature change"]);
+
+    let out = run_guard(dir.path(), &["--base", &base_sha]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "expected --base {base_sha} to see the committed signature change: stdout={stdout}\nstderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains("commit range") && stdout.contains(&base_sha[..7]),
+        "expected the report to label the scope as the commit range, not \"staged diff\": stdout={stdout}"
+    );
+}
+
+#[test]
+fn calm_guard_commits_accepts_a_raw_range_and_passes_it_through_unmodified() {
+    let dir = init_fixture();
+    run_index(dir.path());
+    let base_sha = String::from_utf8(
+        Command::new("git")
+            .current_dir(dir.path())
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    std::fs::write(
+        dir.path().join("src/lib.rs"),
+        "pub fn helper(x: i32) -> i32 {\n    x + 1 // body-only change, same signature\n}\n\npub fn caller_one() -> i32 {\n    helper(1)\n}\n\npub fn caller_two() -> i32 {\n    helper(2)\n}\n\npub fn caller_three() -> i32 {\n    helper(3)\n}\n",
+    )
+    .unwrap();
+    git(dir.path(), &["commit", "-aq", "-m", "body-only change"]);
+
+    let range = format!("{base_sha}..HEAD");
+    let out = run_guard(dir.path(), &["--commits", &range]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "expected --commits {range} (a body-only change) to pass at the default --fail-on high: \
+         stdout={}\nstderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn calm_guard_base_and_commits_are_mutually_exclusive() {
+    let dir = init_fixture();
+    run_index(dir.path());
+
+    let out = run_guard(
+        dir.path(),
+        &["--base", "HEAD~1", "--commits", "HEAD~1..HEAD"],
+    );
+    assert!(
+        !out.status.success(),
+        "expected clap to reject --base and --commits together, not silently pick one"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("cannot be used with"),
+        "expected clap's own conflicts_with error, got: {stderr}"
+    );
+}

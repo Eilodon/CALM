@@ -1,0 +1,128 @@
+name: 'CALM Guard'
+description: >-
+  Blocks risky code changes using CALM's blast-radius analysis (the same
+  diff_impact tool an MCP agent's own pre-commit gate runs) -- caller-count,
+  hub, and signature-change risk scored against the codebase's own call
+  graph, not a generic linter. One-line CI adoption; closes
+  KNOWN_LIMITATIONS.md's "No Git/CI-native integration path" for a change
+  made outside any MCP session (a teammate's native editor, a bot PR).
+author: 'Eilodon'
+branding:
+  icon: 'shield'
+  color: 'blue'
+
+inputs:
+  project-root:
+    description: 'Path to the project root to index and guard.'
+    required: false
+    default: '.'
+  base:
+    description: >-
+      Ref/SHA to review HEAD against, e.g. "origin/main" -- becomes the
+      merge-base-relative `<base>...HEAD` range (calm guard --base). Leave
+      unset to auto-detect: the PR's base branch on a pull_request event,
+      the pushed-from commit on a push event, or (with neither) fall back
+      to calm guard's own default of the staged diff.
+    required: false
+    default: ''
+  commits:
+    description: >-
+      Raw commit range/rev passed straight through to `calm guard
+      --commits`, e.g. "HEAD~3..HEAD". Takes precedence over `base` and the
+      pull_request/push auto-detection when set. Mutually exclusive with
+      `base` (calm guard itself enforces this).
+    required: false
+    default: ''
+  fail-on:
+    description: 'Minimum aggregate risk that fails the step: low, medium, or high.'
+    required: false
+    default: 'high'
+  json:
+    description: 'Emit the raw diff_impact JSON as this step''s stdout instead of a human-readable report.'
+    required: false
+    default: 'false'
+  version:
+    description: 'Which @eilodon/calm-mcp npm version to install. Defaults to the latest published release.'
+    required: false
+    default: 'latest'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Install calm
+      shell: bash
+      env:
+        CALM_VERSION: ${{ inputs.version }}
+      run: npm install --global "@eilodon/calm-mcp@$CALM_VERSION"
+
+    # All `github.*`/`inputs.*` context values are threaded in via `env:`
+    # rather than interpolated directly into the `run:` script -- a branch
+    # name, PR title, or other attacker-influenced context value spliced
+    # straight into shell text is a known GitHub Actions script-injection
+    # vector; reading it back out of an env var instead (quoted) keeps it
+    # as inert data no matter what it contains.
+    - name: Resolve review scope
+      id: scope
+      shell: bash
+      env:
+        INPUT_BASE: ${{ inputs.base }}
+        INPUT_COMMITS: ${{ inputs.commits }}
+        EVENT_NAME: ${{ github.event_name }}
+        PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+        PUSH_BEFORE: ${{ github.event.before }}
+        PUSH_AFTER: ${{ github.event.after }}
+      run: |
+        set -euo pipefail
+        commits="$INPUT_COMMITS"
+        base="$INPUT_BASE"
+        fetch_ref=""
+
+        if [ -z "$commits" ] && [ -z "$base" ]; then
+          if [ "$EVENT_NAME" = "pull_request" ] && [ -n "$PR_BASE_REF" ]; then
+            base="origin/$PR_BASE_REF"
+            fetch_ref="$PR_BASE_REF"
+          elif [ "$EVENT_NAME" = "push" ] \
+               && [ -n "$PUSH_BEFORE" ] \
+               && [ "$PUSH_BEFORE" != "0000000000000000000000000000000000000000" ]; then
+            commits="$PUSH_BEFORE..$PUSH_AFTER"
+          fi
+        fi
+
+        # A default `actions/checkout` is a shallow (depth=1) clone -- the
+        # base branch's tip is very unlikely to already be present locally,
+        # so `calm guard --base` would fail to resolve it. Fetch it
+        # explicitly rather than requiring every caller to remember
+        # `fetch-depth: 0` in their own checkout step.
+        if [ -n "$fetch_ref" ]; then
+          git fetch --no-tags --depth=1 origin "$fetch_ref" || true
+        fi
+
+        echo "commits=$commits" >> "$GITHUB_OUTPUT"
+        echo "base=$base" >> "$GITHUB_OUTPUT"
+
+    - name: calm index
+      shell: bash
+      env:
+        PROJECT_ROOT: ${{ inputs.project-root }}
+      run: calm-mcp index --project-root "$PROJECT_ROOT"
+
+    - name: calm guard
+      shell: bash
+      env:
+        PROJECT_ROOT: ${{ inputs.project-root }}
+        FAIL_ON: ${{ inputs.fail-on }}
+        EMIT_JSON: ${{ inputs.json }}
+        SCOPE_COMMITS: ${{ steps.scope.outputs.commits }}
+        SCOPE_BASE: ${{ steps.scope.outputs.base }}
+      run: |
+        set -euo pipefail
+        args=(guard --project-root "$PROJECT_ROOT" --fail-on "$FAIL_ON")
+        if [ -n "$SCOPE_COMMITS" ]; then
+          args+=(--commits "$SCOPE_COMMITS")
+        elif [ -n "$SCOPE_BASE" ]; then
+          args+=(--base "$SCOPE_BASE")
+        fi
+        if [ "$EMIT_JSON" = "true" ]; then
+          args+=(--json)
+        fi
+        calm-mcp "${args[@]}"
