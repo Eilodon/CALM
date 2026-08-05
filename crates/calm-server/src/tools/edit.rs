@@ -665,7 +665,7 @@ impl CalmServer {
             // fresh open_writer() at each -- same pattern applied to
             // edit_lines_impl_gated. _guard/_cross_guard are already held
             // for this whole function, so no other CALM writer contends.
-            let file_conn = match calm_core::db::conn::open_writer(&self.db_path) {
+            let file_conn = match calm_core::db::conn::open_state_writer(&self.state_db_path) {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::warn!(
@@ -767,9 +767,15 @@ impl CalmServer {
                 }
             }
         }
+        // reindex_conn is index.db only, never reused for the durable
+        // advance_many calls below (they now need state.db -- a separate
+        // physical connection/pragma, so the original reuse-for-perf trick
+        // this block predates no longer applies); dropped explicitly here
+        // instead of at end-of-scope so the index-side connection is
+        // released before the cross-process edit lock below.
+        let _ = reindex_conn;
         if !shadow_tx_ids.is_empty() {
-            let conn =
-                reindex_conn.or_else(|| calm_core::db::conn::open_writer(&self.db_path).ok());
+            let conn = calm_core::db::conn::open_state_writer(&self.state_db_path).ok();
             if let Some(conn) = conn {
                 let (to, reason): (calm_core::txn::TxState, String) = match &index_stale {
                     None => (
@@ -1558,10 +1564,25 @@ impl CalmServer {
                 return txn_init_failed(format!("could not open DB for transaction init: {e}"));
             }
         };
+        // docs/plans/2026-08-05-state-db-rewiring-execution-plan.md Phase 4:
+        // edit_transactions/tx_events/maintenance_jobs now live in state.db,
+        // a separate physical connection (different file, different
+        // synchronous pragma) from shared_conn's index.db -- opened here,
+        // alongside shared_conn, so both are available for the rest of this
+        // critical section. shared_conn itself stays scoped to reindex_paths
+        // only from this point on.
+        let state_conn = match calm_core::db::conn::open_state_writer(&self.state_db_path) {
+            Ok(c) => c,
+            Err(e) => {
+                return txn_init_failed(format!(
+                    "could not open state DB for transaction init: {e}"
+                ));
+            }
+        };
         let base_digest = calm_core::digest::evidence_digest(original.as_bytes());
         let proposed_digest = calm_core::digest::evidence_digest(new_content.as_bytes());
         let shadow_tx_id: Option<String> = match calm_core::txn::begin(
-            &shared_conn,
+            &state_conn,
             &project_id,
             path,
             &base_digest,
@@ -1574,7 +1595,7 @@ impl CalmServer {
         if let Err(e) = calm_core::edit::atomic_write(&full_path, &new_content) {
             if let Some(tx_id) = &shadow_tx_id {
                 let _ = calm_core::txn::advance(
-                    &shared_conn,
+                    &state_conn,
                     tx_id,
                     calm_core::txn::TxState::Failed,
                     "system",
@@ -1591,7 +1612,7 @@ impl CalmServer {
         }
         if let Some(tx_id) = &shadow_tx_id {
             let _ = calm_core::txn::advance(
-                &shared_conn,
+                &state_conn,
                 tx_id,
                 calm_core::txn::TxState::FileCommitted,
                 "system",
@@ -1682,6 +1703,13 @@ impl CalmServer {
                     {
                         let root = self.project_root.clone();
                         let db = self.db_path.clone();
+                        // state.db counterpart of `db` -- maintenance_jobs is
+                        // durable (docs/plans/2026-08-05-state-db-rewiring-
+                        // execution-plan.md), so the mark_running/
+                        // mark_completed calls inside the spawned thread need
+                        // their own state connection; `db`/run_all_coalesced
+                        // itself is still index-side and unchanged.
+                        let state_db = self.state_db_path.clone();
                         // WS-1 durable outbox (plan
                         // §4.1b/§4.3/§4.6 task 4.5): records the
                         // trigger before spawning so a crash between
@@ -1700,22 +1728,23 @@ impl CalmServer {
                         // something this wrapper changes or hides.
                         // Tier-1 perf fix (docs/plans/2026-08-02-shadow-txn-
                         // connection-consolidation-plan.md §3): reuses
-                        // `shared_conn` (already open for this whole critical
-                        // section) instead of a separate open_writer call here.
+                        // `state_conn` (already open for this whole critical
+                        // section) instead of a separate open_state_writer
+                        // call here.
                         let _ = calm_core::maintenance::enqueue(
-                            &shared_conn,
+                            &state_conn,
                             calm_core::maintenance::MaintenanceKind::ScipRefresh,
                             shadow_tx_id.as_deref(),
                         );
                         std::thread::spawn(move || {
-                            if let Ok(conn) = calm_core::db::conn::open_writer(&db) {
+                            if let Ok(conn) = calm_core::db::conn::open_state_writer(&state_db) {
                                 let _ = calm_core::maintenance::mark_running(
                                     &conn,
                                     calm_core::maintenance::MaintenanceKind::ScipRefresh,
                                 );
                             }
                             crate::scip_overlay::run_all_coalesced(&root, &db);
-                            if let Ok(conn) = calm_core::db::conn::open_writer(&db) {
+                            if let Ok(conn) = calm_core::db::conn::open_state_writer(&state_db) {
                                 let _ = calm_core::maintenance::mark_completed(
                                     &conn,
                                     calm_core::maintenance::MaintenanceKind::ScipRefresh,
@@ -1737,7 +1766,7 @@ impl CalmServer {
                 ),
                 Some(detail) => (calm_core::txn::TxState::Failed, detail.clone()),
             };
-            match calm_core::txn::advance(&shared_conn, tx_id, to, "system", &reason) {
+            match calm_core::txn::advance(&state_conn, tx_id, to, "system", &reason) {
                 Ok(()) if to == calm_core::txn::TxState::IndexCommitted => {
                     // WS-6 first slice (docs/plans/2026-08-03-ws6-verification-
                     // pipeline-execution-plan.md): opt-in (config default
@@ -1761,7 +1790,7 @@ impl CalmServer {
                         "base index committed, disk+index consistent"
                     };
                     let _ =
-                        calm_core::txn::advance(&shared_conn, tx_id, next, "system", next_reason);
+                        calm_core::txn::advance(&state_conn, tx_id, next, "system", next_reason);
                 }
                 Ok(()) => {}
                 Err(e) => {
@@ -1780,12 +1809,17 @@ impl CalmServer {
         // each other, not against reindex_paths itself.
         if should_embed_bg && let Some(model) = self.embedder() {
             let db_path = self.db_path.clone();
+            // state.db counterpart of `db_path` -- maintenance_jobs is
+            // durable (docs/plans/2026-08-05-state-db-rewiring-execution-
+            // plan.md); `db_path` stays index-side, still used below for
+            // `bg_conn`'s real embed_pending/embed_pending_chunks writes.
+            let state_db_path = self.state_db_path.clone();
             // WS-1 durable outbox (plan §4.1b/§4.3/§4.6 task 4.5) -- same
             // rationale as the SCIP wrapper above: enqueue before
             // spawning, mark_completed after; embed_pending/
             // embed_pending_chunks themselves are UNCHANGED and already
             // idempotent/resumable.
-            if let Ok(conn) = calm_core::db::conn::open_writer(&self.db_path) {
+            if let Ok(conn) = calm_core::db::conn::open_state_writer(&self.state_db_path) {
                 let _ = calm_core::maintenance::enqueue(
                     &conn,
                     calm_core::maintenance::MaintenanceKind::EmbedRefresh,
@@ -1794,7 +1828,7 @@ impl CalmServer {
             }
             std::thread::spawn(move || {
                 let _bg_guard = EMBED_BG.lock_ok();
-                if let Ok(conn) = calm_core::db::conn::open_writer(&db_path) {
+                if let Ok(conn) = calm_core::db::conn::open_state_writer(&state_db_path) {
                     let _ = calm_core::maintenance::mark_running(
                         &conn,
                         calm_core::maintenance::MaintenanceKind::EmbedRefresh,
@@ -1823,7 +1857,7 @@ impl CalmServer {
                         error_detail = Some(e.to_string());
                     }
                 }
-                if let Ok(conn) = calm_core::db::conn::open_writer(&db_path) {
+                if let Ok(conn) = calm_core::db::conn::open_state_writer(&state_db_path) {
                     let result = match &error_detail {
                         None => Ok(()),
                         Some(detail) => Err(detail.as_str()),
