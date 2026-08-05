@@ -9908,18 +9908,22 @@ mod tests {
         // WS-1 enforce transition (docs/plans/2026-08-02-ws1-enforce-and-critical-
         // risk-execution-plan.md §2): a txn::begin failure must abort the write
         // entirely rather than proceed with no journal. Forced deterministically by
-        // making the DB file read-only at the OS level after setup -- open_writer
-        // requires write access, so the very first `open_writer` inside
-        // `begin_result`'s construction fails, exercising the same enforce path a
-        // real disk-full/permission problem would.
+        // making state.db read-only at the OS level after setup -- since the
+        // 2026-08-05 state.db rewiring (docs/plans/2026-08-05-state-db-rewiring-
+        // execution-plan.md), `edit_transactions`/`tx_events` live in state.db, not
+        // index.db, so it's `txn::begin`'s own `BEGIN IMMEDIATE` against state.db
+        // that must fail here, exercising the same enforce path a real
+        // disk-full/permission problem would. (index.db itself is untouched -- a
+        // read-only *index.db* only surfaces later, as a non-fatal `index_stale`
+        // warning on an otherwise-applied write, not a TRANSACTION_INIT_FAILED.)
         let (dir, server) = test_server("txn_begin_failure_aborts_write");
         std::fs::write(dir.join("a.py"), "def helper():\n    return 1\n").unwrap();
         let hash = calm_core::edit::range_checksum("def helper():\n    return 1\n", 2, 2).unwrap();
 
-        let db_path = dir.join("index.db");
-        let mut perms = std::fs::metadata(&db_path).unwrap().permissions();
+        let state_db_path = dir.join(".calm").join("state.db");
+        let mut perms = std::fs::metadata(&state_db_path).unwrap().permissions();
         perms.set_readonly(true);
-        std::fs::set_permissions(&db_path, perms).unwrap();
+        std::fs::set_permissions(&state_db_path, perms).unwrap();
 
         let out = jv(
             server.edit_lines(rmcp::handler::server::wrapper::Parameters(
@@ -9952,7 +9956,7 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt;
             let perms = std::fs::Permissions::from_mode(0o644);
-            std::fs::set_permissions(&db_path, perms).unwrap();
+            std::fs::set_permissions(&state_db_path, perms).unwrap();
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -9961,7 +9965,10 @@ mod tests {
     fn format_files_skips_one_file_when_txn_begin_fails_without_aborting_the_batch() {
         // Same enforce posture as edit_lines, but format_files processes a batch --
         // a per-file begin failure must surface as that file's own "error" result,
-        // not a batch-wide abort of files that would otherwise succeed.
+        // not a batch-wide abort of files that would otherwise succeed. See
+        // edit_lines_aborts_when_txn_begin_fails's comment above for why state.db
+        // (not index.db) is the file that must be read-only to force this path
+        // since the 2026-08-05 state.db rewiring.
         let (dir, server) = test_server("format_files_txn_begin_failure_per_file");
         std::fs::write(
             dir.join("ugly.rs"),
@@ -9969,10 +9976,10 @@ mod tests {
         )
         .unwrap();
 
-        let db_path = dir.join("index.db");
-        let mut perms = std::fs::metadata(&db_path).unwrap().permissions();
+        let state_db_path = dir.join(".calm").join("state.db");
+        let mut perms = std::fs::metadata(&state_db_path).unwrap().permissions();
         perms.set_readonly(true);
-        std::fs::set_permissions(&db_path, perms).unwrap();
+        std::fs::set_permissions(&state_db_path, perms).unwrap();
 
         let out = jv(
             server.format_files(rmcp::handler::server::wrapper::Parameters(
@@ -9999,7 +10006,7 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt;
             let perms = std::fs::Permissions::from_mode(0o644);
-            std::fs::set_permissions(&db_path, perms).unwrap();
+            std::fs::set_permissions(&state_db_path, perms).unwrap();
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

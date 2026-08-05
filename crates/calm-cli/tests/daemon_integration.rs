@@ -408,7 +408,14 @@ fn daemon_respects_per_connection_preset() {
     let watcher_b = StdoutWatcher::spawn(stdout_b);
     stdin_b.write_all(initialize).unwrap();
     stdin_b.write_all(list_tools).unwrap();
-    watcher_b.wait_for("\"id\":2", Duration::from_secs(8));
+    // 20s, not the usual 8s (see other `wait_for` call sites in this file): this
+    // is the one test where B must attach to a daemon A is *concurrently still
+    // spawning/initializing* rather than one already confirmed live, so the full
+    // round trip (connect_live_and_current's own up-to-5s budget, plus B's real
+    // tools/list) has less headroom than elsewhere -- flaky in CI under load
+    // (missing content in stdout_b_text) but never locally, same class of fix as
+    // the watch_supervisor wait_until widening in b4c43d7.
+    watcher_b.wait_for("\"id\":2", Duration::from_secs(20));
     drop(stdin_b);
     let mut stderr_b = Vec::new();
     if let Some(mut stderr) = child_b.stderr.take() {
