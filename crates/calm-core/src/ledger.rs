@@ -301,11 +301,11 @@ pub fn verify_chain(conn: &Connection) -> Result<Option<ChainBreak>, LedgerError
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::schema::init_db;
+    use crate::db::schema::init_state_db;
 
     fn test_conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        init_db(&conn).unwrap();
+        init_state_db(&conn).unwrap();
         conn
     }
 
@@ -435,7 +435,7 @@ mod tests {
         let calm_dir = dir.path().join(".calm");
         std::fs::create_dir_all(&calm_dir).unwrap();
         let conn = crate::db::conn::open_writer(&calm_dir.join("index.db")).unwrap();
-        init_db(&conn).unwrap();
+        init_state_db(&conn).unwrap();
         (dir, conn)
     }
 
@@ -479,7 +479,7 @@ mod tests {
 
         {
             let conn = crate::db::conn::open_writer(&db_path).unwrap();
-            init_db(&conn).unwrap();
+            init_state_db(&conn).unwrap();
             append(&conn, "system", "one").unwrap();
             append(&conn, "system", "two").unwrap();
         } // conn dropped -- a fresh connection object below must derive the SAME key.
@@ -545,7 +545,7 @@ mod tests {
         std::fs::create_dir_all(&calm_dir).unwrap();
         std::fs::create_dir_all(calm_dir.join(LEDGER_KEY_FILENAME)).unwrap();
         let conn = crate::db::conn::open_writer(&calm_dir.join("index.db")).unwrap();
-        init_db(&conn).unwrap();
+        init_state_db(&conn).unwrap();
 
         let result = append(&conn, "system", "one");
         assert!(

@@ -29,7 +29,7 @@ const MAC_KEY_FILENAME: &str = "memory.key";
 /// Reads the per-project MAC key from `.calm/memory.key`, generating one
 /// with the OS CSPRNG on first use (lazy — most projects with this feature
 /// available will never call `remember` in a given checkout, so eagerly
-/// creating the key at `init_db` time would be pure waste). `0600` on
+/// creating the key at `init_state_db` time would be pure waste). `0600` on
 /// Unix so only the owning user can read it — a key any local user can
 /// read defeats the point of a keyed MAC. Best-effort on non-Unix: the
 /// permission narrowing is skipped rather than failing the whole
@@ -275,11 +275,11 @@ pub fn notes_for_path(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::schema::init_db;
+    use crate::db::schema::init_state_db;
 
     fn test_conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        init_db(&conn).unwrap();
+        init_state_db(&conn).unwrap();
         conn
     }
 

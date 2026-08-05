@@ -547,11 +547,11 @@ pub fn latest_for_path(conn: &Connection, path: &str) -> Result<Option<EditTrans
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::schema::init_db;
+    use crate::db::schema::init_state_db;
 
     fn test_conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        init_db(&conn).unwrap();
+        init_state_db(&conn).unwrap();
         conn
     }
 
