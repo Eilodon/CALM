@@ -49,7 +49,7 @@ impl CalmServer {
         Parameters(p): Parameters<EditTransactionStatusParams>,
     ) -> Json<ToolOutcome<EditTransactionStatusOutput>> {
         Json(self.timed_tool("edit_transaction_status", || {
-            let conn = match self.make_read_conn() {
+            let conn = match self.make_state_read_conn() {
                 Ok(c) => c,
                 Err(e) => return db_error(e),
             };
@@ -108,7 +108,7 @@ impl CalmServer {
         Parameters(p): Parameters<BatchStatusParams>,
     ) -> Json<ToolOutcome<BatchStatusOutput>> {
         Json(self.timed_tool("batch_status", || {
-            let conn = match self.make_read_conn() {
+            let conn = match self.make_state_read_conn() {
                 Ok(c) => c,
                 Err(e) => return db_error(e),
             };
@@ -176,7 +176,7 @@ impl CalmServer {
     )]
     pub(crate) fn maintenance_status(&self) -> Json<ToolOutcome<MaintenanceStatusOutput>> {
         Json(self.timed_tool("maintenance_status", || {
-            let conn = match self.make_read_conn() {
+            let conn = match self.make_state_read_conn() {
                 Ok(c) => c,
                 Err(e) => return db_error(e),
             };
@@ -226,7 +226,7 @@ impl CalmServer {
                     false,
                 ));
             };
-            match calm_core::db::conn::open_writer(&self.db_path) {
+            match calm_core::db::conn::open_state_writer(&self.state_db_path) {
                 Ok(conn) => {
                     if let Err(e) = calm_core::maintenance::force_requeue(&conn, kind) {
                         return ToolOutcome::error(error_detail("DB_ERROR", &e.to_string(), true));
@@ -278,7 +278,7 @@ impl CalmServer {
                 Ok(()) => Ok(()),
                 Err(e) => Err(e.as_str()),
             };
-            if let Ok(conn) = calm_core::db::conn::open_writer(&self.db_path) {
+            if let Ok(conn) = calm_core::db::conn::open_state_writer(&self.state_db_path) {
                 let _ = calm_core::maintenance::mark_completed(&conn, kind, outcome_for_db);
             }
             match result {
@@ -320,7 +320,7 @@ impl CalmServer {
                     false,
                 ));
             }
-            let conn = match self.make_read_conn() {
+            let conn = match self.make_state_read_conn() {
                 Ok(c) => c,
                 Err(e) => return db_error(e),
             };
@@ -402,7 +402,7 @@ impl CalmServer {
         Parameters(p): Parameters<VerifyChangeParams>,
     ) -> Json<ToolOutcome<VerifyChangeOutput>> {
         Json(self.timed_tool("verify_change", || {
-            let conn = match self.make_read_conn() {
+            let conn = match self.make_state_read_conn() {
                 Ok(c) => c,
                 Err(e) => return db_error(e),
             };
@@ -578,7 +578,7 @@ impl CalmServer {
                     ),
                 )
             };
-            let writer = match calm_core::db::conn::open_writer(&self.db_path) {
+            let writer = match calm_core::db::conn::open_state_writer(&self.state_db_path) {
                 Ok(c) => c,
                 Err(e) => return db_error(e),
             };

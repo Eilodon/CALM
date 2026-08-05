@@ -904,6 +904,22 @@ impl CalmServer {
         // candidates, so asking for exactly CAP would under-return once either
         // filter removes anything.
         const OVERFETCH: usize = 8;
+        // Silences unused-variable on the now-unused `conn` param (kept,
+        // not renamed, so both call sites' signatures stay untouched — see
+        // the shadowing comment just below).
+        let _ = conn;
+
+        // project_memory/project_memory_refs now live in state.db (docs/
+        // plans/2026-08-05-state-db-rewiring-execution-plan.md) — shadows
+        // the caller-supplied (index-side) `conn` argument with a fresh
+        // state connection instead, so the signature stays byte-for-byte
+        // identical and both call sites (edit_context in guardrails.rs,
+        // locate.rs) need no change at all.
+        let state_conn = match self.make_state_read_conn() {
+            Ok(c) => c,
+            Err(_) => return Vec::new(),
+        };
+        let conn = &state_conn;
 
         let candidates = match calm_core::memory::notes_for_path(conn, path, OVERFETCH) {
             Ok(c) => c,

@@ -201,9 +201,12 @@ impl CalmServer {
             // agent deciding for itself when to call `recall()` over having
             // content pushed at it). This is just enough signal to make that
             // decision cheaply instead of guessing whether any notes exist.
-            let memory_notes_count: i64 = conn
-                .query_row("SELECT COUNT(*) FROM project_memory", [], |r| r.get(0))
-                .unwrap_or(0);
+            let memory_notes_count: i64 = match self.make_state_read_conn() {
+                Ok(state_conn) => state_conn
+                    .query_row("SELECT COUNT(*) FROM project_memory", [], |r| r.get(0))
+                    .unwrap_or(0),
+                Err(_) => 0,
+            };
 
             // "Repo-map" style architectural skeleton (inspired by Aider's
             // PageRank-ranked repo map) — reuses `coreness` (k-core), which
