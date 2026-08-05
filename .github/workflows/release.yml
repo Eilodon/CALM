@@ -29,6 +29,29 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
+      # Cargo.toml's own version field is cosmetic for the actual release
+      # artifacts -- the `build` job below stamps release binaries from the
+      # tag directly (sed, "Set crate version from tag"), and npm-publish's
+      # stage-release.sh takes the tag as its own argument -- so a stale
+      # Cargo.toml can't ship a wrong-versioned binary or npm package. What
+      # it DOES still break: `scripts/mcp-launcher.sh`'s verified-download
+      # fast path, which compares a checked-out `workspace_version` against
+      # the downloaded release binary's real `--version` and treats any
+      # mismatch as a corrupted download, falling back to a from-source
+      # rebuild on every single invocation for the whole release cycle --
+      # exactly what happened for real, stuck at 0.1.1 through
+      # v0.1.2/v0.1.3/v0.1.4 (see Cargo.toml's own version-field comment).
+      # Catch that here, before any publish job runs, not after.
+      - name: Verify Cargo.toml version matches the release tag
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          cargo_version=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+          if [ "$cargo_version" != "$tag_version" ]; then
+            echo "::error::Cargo.toml's [workspace.package].version ('${cargo_version}') does not match release tag ${GITHUB_REF_NAME} (expected '${tag_version}'). Bump it in the same commit as cutting this tag -- see Cargo.toml's own comment for what breaks otherwise (scripts/mcp-launcher.sh's fast path, defeated for this whole release cycle)."
+            exit 1
+          fi
+          echo "Cargo.toml version ${cargo_version} matches release tag ${GITHUB_REF_NAME}"
+
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           components: clippy, rustfmt

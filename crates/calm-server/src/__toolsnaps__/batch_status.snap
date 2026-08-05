@@ -1,0 +1,146 @@
+{
+  "name": "batch_status",
+  "description": "USE WHEN: you made several edit_lines/edit_symbol/format_files calls as one multi-file change (each already returned its own tx_id) and want ONE aggregate view of how the whole change-set landed, instead of calling edit_transaction_status once per tx_id. Read-only, observability only -- this does not group or track a change-set server-side (see KNOWN_LIMITATIONS.md \"No multi-file change-set\"); pass the tx_id list you already collected from each write's own response.",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "required": [
+      "tx_ids"
+    ],
+    "type": "object",
+    "properties": {
+      "tx_ids": {
+        "description": "tx_ids collected from a set of edit_lines/edit_symbol/format_files\nresponses that together made up one multi-file change.",
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      }
+    }
+  },
+  "outputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$defs": {
+      "ErrorDetail": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "recoverable": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "recoverable"
+        ]
+      },
+      "BatchStatusEntry": {
+        "type": "object",
+        "properties": {
+          "tx_id": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "state": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "tx_id",
+          "path",
+          "state"
+        ]
+      },
+      "SuggestedNext": {
+        "type": "object",
+        "properties": {
+          "tool": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "args": true,
+          "gate": {
+            "description": "Plan 3 §3.5(b): `Some(true)` iff skipping `tool` is actually\nhook-enforced (currently only the edit_context/edit_lines/edit_symbol\n→ diff_impact hints set this, via `suggested_gated`) — every other\nhint is left unset (`None`), meaning advisory-only. Lets an agent\ntell \"you'll be blocked if you skip this\" apart from \"you probably\nwant this next\" without re-deriving it from AGENTS.md prose each time.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "tool",
+          "reason"
+        ]
+      }
+    },
+    "properties": {
+      "error": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/ErrorDetail"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "total": {
+        "type": "integer",
+        "format": "uint",
+        "minimum": 0
+      },
+      "by_state": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        }
+      },
+      "not_found": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "all_done": {
+        "type": "boolean"
+      },
+      "any_failed": {
+        "type": "boolean"
+      },
+      "transactions": {
+        "type": "array",
+        "items": {
+          "$ref": "#/$defs/BatchStatusEntry"
+        }
+      },
+      "suggested_next": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/SuggestedNext"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "type": "object"
+  },
+  "annotations": {
+    "readOnlyHint": true,
+    "destructiveHint": false,
+    "idempotentHint": true,
+    "openWorldHint": false
+  }
+}

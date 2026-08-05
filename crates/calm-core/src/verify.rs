@@ -9,7 +9,6 @@
 //! behind `config::VerificationConfig::rust_check_on_write`, default
 //! `false`, so it starts in an off state rather than a shadow one).
 
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -68,21 +67,93 @@ pub struct CargoCheckResult {
 
 const MAX_DIAGNOSTIC_LINES: usize = 40;
 
+/// Per-stream (stdout, stderr) byte cap on `run_cargo_check`'s captured
+/// output. A pathological/malicious `build.rs`/proc-macro can write output
+/// far faster than any reasonable wall-clock timeout would catch; without
+/// a cap the two reader threads below buffer everything in memory for the
+/// whole `timeout` window, which can exhaust host memory well before that
+/// deadline ever arrives. 8 MiB per stream is generous for even a very
+/// verbose real compile-error dump.
+const MAX_OUTPUT_BYTES_PER_STREAM: usize = 8 * 1024 * 1024;
+
+/// Chunk size `read_capped` reads in -- small enough that hitting the cap
+/// mid-chunk never overshoots it by more than this, large enough not to
+/// thrash on syscall overhead for a normal, well-behaved `cargo check`.
+const READ_CHUNK_SIZE: usize = 64 * 1024;
+
+/// Drains `pipe` into a `Vec<u8>` capped at `max_bytes`, stopping the
+/// instant the cap is hit rather than reading to EOF -- letting the
+/// caller's poll loop kill the child immediately instead of waiting out
+/// the rest of `timeout`. Sets `output_exceeded` (shared with the sibling
+/// stream's reader thread and the poll loop) so the caller can tell "hit
+/// the byte cap" apart from "hit EOF normally" after the fact.
+fn read_capped(
+    mut pipe: impl std::io::Read,
+    max_bytes: usize,
+    output_exceeded: &std::sync::atomic::AtomicBool,
+) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; READ_CHUNK_SIZE];
+    loop {
+        if buf.len() >= max_bytes {
+            output_exceeded.store(true, std::sync::atomic::Ordering::SeqCst);
+            break;
+        }
+        let want = READ_CHUNK_SIZE.min(max_bytes - buf.len());
+        match pipe.read(&mut chunk[..want]) {
+            Ok(0) => break, // EOF
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(_) => break,
+        }
+    }
+    buf
+}
+
+/// Kills `child` and, on Unix, its whole process group -- not just the
+/// direct PID `Child::kill()` alone targets, which leaves any descendant
+/// (rustc invocations, build scripts, proc-macro servers -- none of which
+/// get their own process group by default, so they'd otherwise keep
+/// running after a "successful" kill) still alive. Relies on the spawn
+/// side having called `process_group(0)` (see `run_cargo_check`), which
+/// makes the child its own group leader, so `-pid` targets that whole
+/// group via the same `kill(-pgid, sig)` convention `daemon.rs` already
+/// uses for its own child process groups. Falls back to `Child::kill()`
+/// alone on non-Unix (no process-group story there in this fix) or if the
+/// group kill itself is a no-op (e.g. the child already exited).
+fn kill_process_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        let pid = child.id() as i32;
+        // SAFETY: FFI call to `kill(2)` with a valid PID and signal number --
+        // its behavior for every input (including "no such process", e.g. if
+        // the child already exited between the caller noticing and this
+        // call) is fully defined by POSIX; there's no caller-upheld
+        // invariant beyond that.
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+    }
+    let _ = child.kill();
+}
+
 /// Runs `cargo check --manifest-path <manifest_path>` and classifies the
 /// result. Inline, not backgrounded -- same posture as `retry_maintenance`
 /// (`crates/calm-server/src/tools/txn.rs`): an explicit, on-demand
 /// verification action, not something in a hot write path, so blocking for
 /// however long a real `cargo check` takes is the accepted cost -- but only
-/// up to `timeout`. A `build.rs`/proc-macro/registry fetch that hangs would
-/// otherwise wedge the tool call (and, on the stdio transport, the whole
-/// session) forever; exceeding `timeout` kills the child and reports a
-/// failed check instead.
+/// up to `timeout`, and only up to `MAX_OUTPUT_BYTES_PER_STREAM` of
+/// captured output per stream. A `build.rs`/proc-macro/registry fetch that
+/// hangs (or floods stdout/stderr) would otherwise wedge the tool call
+/// (and, on the stdio transport, the whole session) forever, or exhaust
+/// host memory well before `timeout` fires; exceeding either bound kills
+/// the child (and, on Unix, its whole process group -- see
+/// `kill_process_tree`) and reports a failed check instead.
 ///
 /// Doesn't use `Command::output()` (which has no timeout support) --
 /// stdout/stderr are drained on background threads while the main thread
 /// polls `Child::try_wait` against `timeout`, the same "avoid a full pipe
 /// buffer deadlocking the wait" trick `output()` uses internally, just with
-/// a deadline added.
+/// a deadline (and a byte cap) added.
 pub fn run_cargo_check(
     manifest_path: &Path,
     timeout: Duration,
@@ -91,28 +162,38 @@ pub fn run_cargo_check(
         "cargo check --manifest-path {} --message-format=short",
         manifest_path.display()
     );
-    let mut child = Command::new("cargo")
-        .arg("check")
+    let mut cmd = Command::new("cargo");
+    cmd.arg("check")
         .arg("--manifest-path")
         .arg(manifest_path)
         .arg("--message-format=short")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    // Put `cargo` (and every process it spawns -- rustc, build scripts,
+    // proc-macro servers, all of which inherit the parent's process group
+    // by default) in a NEW process group of its own, so a later kill can
+    // target the whole tree via `kill_process_tree` instead of only the
+    // direct `cargo` PID.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let mut child = cmd
         .spawn()
         .map_err(|e| format!("failed to spawn cargo: {e} (is it installed and on PATH?)"))?;
 
-    let mut stdout_pipe = child.stdout.take().expect("piped stdout");
-    let mut stderr_pipe = child.stderr.take().expect("piped stderr");
+    let stdout_pipe = child.stdout.take().expect("piped stdout");
+    let stderr_pipe = child.stderr.take().expect("piped stderr");
+    let output_exceeded = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stdout_flag = std::sync::Arc::clone(&output_exceeded);
+    let stderr_flag = std::sync::Arc::clone(&output_exceeded);
     let stdout_reader = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stdout_pipe.read_to_end(&mut buf);
-        buf
+        read_capped(stdout_pipe, MAX_OUTPUT_BYTES_PER_STREAM, &stdout_flag)
     });
     let stderr_reader = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stderr_pipe.read_to_end(&mut buf);
-        buf
+        read_capped(stderr_pipe, MAX_OUTPUT_BYTES_PER_STREAM, &stderr_flag)
     });
 
     let start = Instant::now();
@@ -120,7 +201,9 @@ pub fn run_cargo_check(
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
             Ok(None) => {
-                if start.elapsed() >= timeout {
+                if start.elapsed() >= timeout
+                    || output_exceeded.load(std::sync::atomic::Ordering::SeqCst)
+                {
                     break None;
                 }
                 std::thread::sleep(POLL_INTERVAL);
@@ -130,21 +213,32 @@ pub fn run_cargo_check(
     };
 
     let Some(status) = status else {
-        // Timed out: kill and reap so the child never outlives this call as
-        // a zombie, then discard whatever partial output the reader threads
+        // Timed out, or exceeded the output cap on either stream: kill the
+        // whole process group (not just the direct `cargo` PID) and reap so
+        // nothing outlives this call as a zombie or an orphaned descendant,
+        // then discard whatever partial output the reader threads
         // collected -- diagnostics from a forcibly-killed, half-finished
         // run aren't a trustworthy pass/fail signal.
-        let _ = child.kill();
+        kill_process_tree(&mut child);
         let _ = child.wait();
+        let exceeded_output = output_exceeded.load(std::sync::atomic::Ordering::SeqCst);
         let _ = stdout_reader.join();
         let _ = stderr_reader.join();
+        let diagnostic = if exceeded_output {
+            format!(
+                "cargo check produced more than {MAX_OUTPUT_BYTES_PER_STREAM} bytes of output \
+                 on one stream and was killed"
+            )
+        } else {
+            format!(
+                "cargo check timed out after {}s and was killed",
+                timeout.as_secs()
+            )
+        };
         return Ok(CargoCheckResult {
             command,
             passed: false,
-            diagnostics: vec![format!(
-                "cargo check timed out after {}s and was killed",
-                timeout.as_secs()
-            )],
+            diagnostics: vec![diagnostic],
         });
     };
 
@@ -194,6 +288,34 @@ mod tests {
         let src = dir.path().join("src/lib.rs");
         std::fs::create_dir_all(src.parent().unwrap()).unwrap();
         assert_eq!(find_nearest_cargo_toml(&src, dir.path()), None);
+    }
+
+    #[test]
+    fn read_capped_returns_everything_when_under_the_cap() {
+        let data = b"short diagnostic output";
+        let exceeded = std::sync::atomic::AtomicBool::new(false);
+        let buf = read_capped(&data[..], 1024, &exceeded);
+        assert_eq!(buf, data.to_vec());
+        assert!(!exceeded.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn read_capped_stops_at_the_cap_and_flags_exceeded() {
+        // Bigger than READ_CHUNK_SIZE so this also exercises the
+        // multi-chunk loop, not just a single short read.
+        let data = vec![b'x'; READ_CHUNK_SIZE * 3];
+        let exceeded = std::sync::atomic::AtomicBool::new(false);
+        let cap = READ_CHUNK_SIZE + 10;
+        let buf = read_capped(&data[..], cap, &exceeded);
+        assert_eq!(
+            buf.len(),
+            cap,
+            "must stop exactly at the cap, not overshoot"
+        );
+        assert!(
+            exceeded.load(std::sync::atomic::Ordering::SeqCst),
+            "must flag that more data was available than the cap allowed"
+        );
     }
 
     // Both cargo-spawning tests below build an isolated, standalone crate

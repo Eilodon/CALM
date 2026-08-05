@@ -29,7 +29,7 @@ allowlist, resource limits) applied uniformly first — bolting each new
 language's runner directly onto today's bare `Command::new(...)` would
 just multiply the unsandboxed surface instead of closing it. Not started.
 
-## Durable state and the rebuildable index share one SQLite file
+## Durable state and the rebuildable index share one SQLite file at runtime
 
 `.calm/index.db` holds the symbol/call-graph index (rebuildable from
 source, `PRAGMA synchronous=NORMAL` is a deliberate tradeoff for it) *and*
@@ -40,10 +40,22 @@ power-loss can only lose the last few committed rows under WAL+NORMAL,
 never corrupt the file — an acceptable cost for a cache, less obviously
 so for a journal used as evidence.
 
-Splitting into two files (`index.db` at NORMAL, a `state.db` at FULL for
-transactions/ledger/memory) is a real architecture change — new
-migration path, two DB handles instead of one, cross-file consistency to
-reason about — not attempted here.
+The storage-layer foundation for a split now exists in `calm-core`:
+`db::schema::STATE_SCHEMA_SQL`/`init_state_db` define the durable tables
+(`project_memory`, `project_memory_refs`, `edit_transactions`, `tx_events`,
+`maintenance_jobs`, `audit_ledger`) as a schema separate from the
+rebuildable `SCHEMA_SQL`/`init_db`; `db::conn::open_state_writer` opens a
+connection at `PRAGMA synchronous=FULL`; and
+`db::schema::migrate_legacy_durable_tables` does a one-time, idempotent,
+copy-only migration of any pre-split `index.db`'s durable rows into a
+`state.db`. All of this is unit-tested but **not yet wired up** — every
+real call site in `calm-server` (`edit.rs`, `txn.rs`, `memory.rs`,
+`common.rs`, `lib.rs`, and others) still opens and writes through the one
+shared `index.db`/`open_writer` connection. Rewiring those call sites to
+actually use `state.db` for durable writes is a separate follow-up, scoped
+by `open_writer`'s own blast radius (~320 transitively-affected files per
+`diff_impact`) rather than attempted alongside the schema/migration
+groundwork.
 
 ## No multi-file change-set / transaction
 
@@ -51,9 +63,20 @@ Every `edit_lines`/`edit_symbol`/`format_files` call gets its own,
 independent `EditTransaction` (`crates/calm-core/src/txn.rs`), scoped to
 one file. A multi-file rename or refactor is N independent transactions
 that can each land in a different state (one committed, one gated, one
-failed) with no aggregate "did the whole refactor succeed" view. There is
-no `prepare → validate-all → atomic-ish commit → verify` pipeline across
-files, no `PARTIALLY_APPLIED` status, no rollback plan spanning a set.
+failed). There is no `prepare → validate-all → atomic-ish commit →
+verify` pipeline across files, no `PARTIALLY_APPLIED` status, no rollback
+plan spanning a set -- and none of that is what's described below.
+
+What now exists is strictly narrower: a new `batch_status` tool
+(`crates/calm-server/src/tools/txn.rs`) takes a caller-supplied list of
+`tx_id`s (the ones each independent write already returned) and reports
+one aggregate view -- counts by state, which are still missing, whether
+any failed -- instead of requiring a separate `edit_transaction_status`
+call per file. Purely observability: it doesn't group transactions
+server-side (there's no stored notion of "these N tx_ids are one
+change-set"), doesn't gate anything, and doesn't change what `edit_lines`/
+`edit_symbol`/`format_files` themselves do. The atomicity/rollback gap
+above is unchanged.
 
 ## Risk classification's change-kind signal covers signatures only
 
@@ -137,10 +160,17 @@ transition period), not a silent rename — not done here.
 
 ## No Git/CI-native integration path
 
-Everything above assumes an MCP client calling CALM's tools directly. A
-native editor `Edit`/`Bash` call, or a change made outside any MCP
-session entirely (a teammate's local edit, a bot PR), is invisible to
-CALM. There's no `calm guard --staged` / `calm review-diff --base
-origin/main` CLI surface and no publishable GitHub Action — the
-integration points where a team would see CALM's value without depending
-on every contributor's agent calling the right tool. Not started.
+Everything above mostly assumes an MCP client calling CALM's tools
+directly. A first step now exists: `calm guard --project-root .`
+(`crates/calm-cli/src/main.rs`) runs the exact same `diff_impact` tool
+an MCP agent's own Stage-7 pre-commit gate uses, against the staged diff
+(`git diff --cached`), and exits non-zero when the resulting
+`aggregate_risk` is at or above `--fail-on` (default `high`) — usable
+directly as a pre-commit hook or CI step for a change made outside any
+MCP session (a teammate's native editor, a bot PR), which was previously
+invisible to CALM entirely. What's still missing: a `calm review-diff
+--base origin/main`-style PR-range analysis (`calm guard` only looks at
+the staged diff, not an arbitrary commit range — though `diff_impact`
+itself already supports `commits`, so this is mostly CLI plumbing away)
+and no publishable GitHub Action wrapping `calm guard` for one-line CI
+adoption.

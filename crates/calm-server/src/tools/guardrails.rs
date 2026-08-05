@@ -777,6 +777,33 @@ impl CalmServer {
             })
         }))
     }
+
+    /// Runs `diff_impact` and returns its output as plain `serde_json::Value`
+    /// -- for a caller outside this crate (the `calm guard` CLI command,
+    /// `calm-cli`) that needs the result without depending on this crate's
+    /// internal (`pub(crate)`) tool param/output types (`DiffImpactParams`,
+    /// `DiffImpactOutput`, ...). Same pattern this crate's own tests use
+    /// (`jv`) to assert on tool output without naming those types either.
+    /// `calm guard` is CALM's Git/CI-native integration point
+    /// (`KNOWN_LIMITATIONS.md` "No Git/CI-native integration path"): a
+    /// pre-commit hook or CI step running against a diff made outside any
+    /// MCP session, reusing this exact tool instead of a second risk-
+    /// analysis implementation.
+    pub fn diff_impact_json(
+        &self,
+        diff: Option<String>,
+        staged: Option<bool>,
+        commits: Option<String>,
+    ) -> serde_json::Value {
+        let result = self.diff_impact(rmcp::handler::server::wrapper::Parameters(
+            DiffImpactParams {
+                diff,
+                staged,
+                commits,
+            },
+        ));
+        serde_json::to_value(result.0).unwrap()
+    }
 }
 
 #[derive(Deserialize, JsonSchema)]

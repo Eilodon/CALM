@@ -6,10 +6,11 @@ annotations) and crates/calm-core/Cargo.toml's `[features]` table. Not
 hand-maintained prose -- run `scripts/gen-status.sh` to refresh after any tool
 or feature-flag change; CI's `gen-status.sh --check` fails the build on drift.
 
-## MCP tool inventory (36 tools)
+## MCP tool inventory (37 tools)
 
 | Tool | Write | Idempotent | Description |
 |---|---|---|---|
+| `batch_status` | no | yes | USE WHEN: you made several edit_lines/edit_symbol/format_files calls as one multi-file change (each already returned its own tx_id) and want |
 | `callees` | no | yes | USE WHEN: you need to trace what a symbol calls — understanding logic flow, internal deps. NOT for finding who calls this symbol (use call |
 | `callers` | no | yes | USE WHEN: you need to know who calls a specific symbol — blast radius scan, refactoring impact. USE THIS for SYMBOL-LEVEL call sites. NOT  |
 | `dependencies` | no | yes | USE WHEN: you need to understand file-level architectural connections. USE THIS for FILE-LEVEL import graph. NOT for symbol-level call sites |

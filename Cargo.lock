@@ -354,6 +354,7 @@ dependencies = [
  "globset",
  "hmac 0.12.1",
  "ignore",
+ "libc",
  "lsp-types",
  "model2vec-rs",
  "proptest",

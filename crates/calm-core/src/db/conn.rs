@@ -26,6 +26,26 @@ pub fn open_writer(db_path: &Path) -> rusqlite::Result<Connection> {
     Ok(conn)
 }
 
+/// Opens a write-capable connection to `db_path` the same way `open_writer`
+/// does (`busy_timeout`, WAL), except `PRAGMA synchronous=FULL` instead of
+/// `NORMAL` -- for `state.db` (`edit_transactions`/`tx_events`/
+/// `audit_ledger`/`maintenance_jobs`/`project_memory`/`project_memory_refs`),
+/// none of which are rebuildable from source the way the symbol/call-graph
+/// index is. `synchronous` is a per-connection PRAGMA (SQLite docs, WAL
+/// mode): a commit made on a `FULL` connection fsyncs the WAL before
+/// returning and is durable across a hard crash regardless of what
+/// `synchronous` level any other connection later uses to checkpoint that
+/// WAL frame into the main file -- checkpointing durability and original-
+/// commit durability are independent, so mixing levels across connections
+/// to the same file is safe. See `KNOWN_LIMITATIONS.md` "Durable state and
+/// the rebuildable index share one SQLite file" for the full rationale.
+pub fn open_state_writer(db_path: &Path) -> rusqlite::Result<Connection> {
+    let conn = Connection::open(db_path)?;
+    conn.busy_timeout(WRITER_BUSY_TIMEOUT)?;
+    conn.execute_batch("PRAGMA synchronous=FULL;")?;
+    Ok(conn)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -54,5 +74,27 @@ mod tests {
             .query_row("PRAGMA synchronous", [], |r| r.get(0))
             .unwrap();
         assert_eq!(mode, 1, "1 == NORMAL (0=OFF, 1=NORMAL, 2=FULL, 3=EXTRA)");
+    }
+
+    #[test]
+    fn open_state_writer_sets_busy_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("state.db");
+        let conn = open_state_writer(&db_path).unwrap();
+        let ms: i64 = conn
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ms, WRITER_BUSY_TIMEOUT.as_millis() as i64);
+    }
+
+    #[test]
+    fn open_state_writer_sets_synchronous_full() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("state.db");
+        let conn = open_state_writer(&db_path).unwrap();
+        let mode: i64 = conn
+            .query_row("PRAGMA synchronous", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode, 2, "2 == FULL (0=OFF, 1=NORMAL, 2=FULL, 3=EXTRA)");
     }
 }

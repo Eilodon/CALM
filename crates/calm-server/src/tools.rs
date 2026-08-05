@@ -429,6 +429,36 @@ impl CalmServer {
         true
     }
 
+    /// Narrows THIS connection's own effective preset ceiling to `preset`
+    /// (any spec `resolve_preset` accepts — bare legacy names, composable
+    /// comma-separated toolset tokens, `-exclude`, `remote-safe`). Used
+    /// only by the daemon's per-connection handshake (`daemon.rs`'s
+    /// `read_connection_preset_preamble`/`run_accept_loop`) so a client's
+    /// own `calm connect --preset` request takes effect even when
+    /// attaching to an already-live daemon, not just when it happens to
+    /// be the one that spawns it (`KNOWN_LIMITATIONS.md` "Shared daemon
+    /// has one capability ceiling for every connection").
+    ///
+    /// Can only ever narrow, never widen, past what this daemon's own
+    /// `tool_router` already allows: `resolve_preset`'s output here only
+    /// feeds `current_visible_tool_names`'s ceiling (checked in
+    /// `list_tools`/`call_tool`), never `tool_router`'s own routes —
+    /// those were `disable_route`'d once at construction from whatever
+    /// preset the daemon actually spawned with, and `ToolRouter::call`
+    /// still enforces that regardless of this value. So a connection
+    /// that requests a WIDER preset than the daemon's own gets exactly
+    /// nothing extra: `current_visible_tool_names` would report the tool
+    /// as visible, but dispatching it still fails inside `tool_router`'s
+    /// own disabled-route check — a request can only ever end up
+    /// narrower than or equal to the daemon's real ceiling, never past
+    /// it. Returns `Err` (leaving `self.preset` untouched) on an invalid
+    /// spec, mirroring `resolve_preset`'s own validation.
+    pub(crate) fn narrow_connection_preset(&mut self, preset: &str) -> anyhow::Result<()> {
+        common::resolve_preset(preset)?;
+        self.preset = preset.to_string();
+        Ok(())
+    }
+
     /// Test-only entry point for `apply_toolset_inner` — production code
     /// only reaches it through the `set_toolset` MCP tool, which also
     /// validates names against `TOOLSET_NAMES` and notifies the client.
@@ -3933,6 +3963,72 @@ mod tests {
     }
 
     #[test]
+    fn batch_status_aggregates_multiple_transactions() {
+        let (dir, server) = test_server("batch_status_aggregates");
+        let conn = calm_core::db::conn::open_writer(&server.db_path).unwrap();
+        let tx1 = calm_core::txn::begin(&conn, "proj", "a.rs", "sha256:x", "sha256:y").unwrap();
+        calm_core::txn::advance(
+            &conn,
+            &tx1.tx_id,
+            calm_core::txn::TxState::FileCommitted,
+            "system",
+            "wrote",
+        )
+        .unwrap();
+        let tx2 = calm_core::txn::begin(&conn, "proj", "b.rs", "sha256:x", "sha256:y").unwrap();
+        drop(conn);
+
+        let out = jv(server.batch_status(Parameters(BatchStatusParams {
+            tx_ids: vec![
+                tx1.tx_id.clone(),
+                tx2.tx_id.clone(),
+                "TXN-does-not-exist".to_string(),
+            ],
+        })));
+
+        assert_eq!(out["total"], 3, "response: {out}");
+        assert_eq!(out["by_state"]["FILE_COMMITTED"], 1, "response: {out}");
+        assert_eq!(out["by_state"]["PREPARED"], 1, "response: {out}");
+        assert_eq!(
+            out["not_found"],
+            serde_json::json!(["TXN-does-not-exist"]),
+            "response: {out}"
+        );
+        assert_eq!(out["all_done"], false, "response: {out}");
+        assert_eq!(out["any_failed"], false, "response: {out}");
+        let txns = out["transactions"].as_array().unwrap();
+        assert_eq!(txns.len(), 2, "response: {out}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn batch_status_all_done_true_only_when_every_tx_is_done_and_none_missing() {
+        let (dir, server) = test_server("batch_status_all_done");
+        let conn = calm_core::db::conn::open_writer(&server.db_path).unwrap();
+        let tx = calm_core::txn::begin(&conn, "proj", "a.rs", "sha256:x", "sha256:y").unwrap();
+        for state in [
+            calm_core::txn::TxState::FileCommitted,
+            calm_core::txn::TxState::IndexCommitted,
+            calm_core::txn::TxState::Done,
+        ] {
+            calm_core::txn::advance(&conn, &tx.tx_id, state, "system", "step").unwrap();
+        }
+        drop(conn);
+
+        let out = jv(server.batch_status(Parameters(BatchStatusParams {
+            tx_ids: vec![tx.tx_id.clone()],
+        })));
+        assert_eq!(out["all_done"], true, "response: {out}");
+        assert!(
+            out.get("not_found").is_none(),
+            "not_found is skip_serializing_if empty, must be omitted entirely: {out}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn maintenance_status_reports_all_kinds_and_suggests_retry_on_failure() {
         let (dir, server) = test_server("maintenance_status_reports");
         let conn = calm_core::db::conn::open_writer(&server.db_path).unwrap();
@@ -6064,6 +6160,125 @@ mod tests {
             textual_only,
             vec!["notes.md"],
             "utils.js's own definition line must never appear as a reference: {v}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reference_impact_keeps_a_textual_hit_in_a_file_that_also_has_a_call_edge() {
+        // Regression: files_already_seen used to be built from the WHOLE
+        // `seen` set (call edges + import edges), so a textual grep hit in
+        // a file that already had a call-edge hit at a DIFFERENT line got
+        // silently dropped. Only an import edge's file-level hit should
+        // ever suppress a same-file textual match.
+        let dir =
+            std::env::temp_dir().join(format!("ci_ref_impact_same_file_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("def.js"), "function widgetInit() { return 1; }\n").unwrap();
+        std::fs::write(
+            dir.join("caller.js"),
+            "widgetInit();\n// widgetInit is also mentioned here, unrelated to the call above\n",
+        )
+        .unwrap();
+
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('def.js::widgetInit', 'widgetInit', 'function', 'javascript', 'def.js', 1, 1, 'function widgetInit() {', '', 'widgetInit', 1, 0, 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO call_edges (from_symbol, to_symbol, from_path, to_path, call_site_line, edge_confidence)
+                 VALUES ('caller.js::<module>', 'def.js::widgetInit', 'caller.js', 'def.js', 1, 'resolved')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let v = jv(
+            server.reference_impact(rmcp::handler::server::wrapper::Parameters(
+                ReferenceImpactParams {
+                    symbol: "widgetInit".into(),
+                    path: None,
+                    line: None,
+                },
+            )),
+        );
+
+        assert_eq!(v["must_change_count"], 1, "the call edge at line 1: {v}");
+        assert_eq!(
+            v["textual_only_count"], 1,
+            "the unrelated textual mention at line 2 must still surface: {v}"
+        );
+        let refs = v["references"].as_array().unwrap();
+        assert!(
+            refs.iter().any(|r| r["path"] == "caller.js"
+                && r["line"] == 2
+                && r["classification"] == "textual_only"),
+            "expected a textual_only hit at caller.js:2: {v}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reference_impact_counts_reflect_the_full_match_set_even_when_truncated() {
+        // Regression: must_change_count/likely_change_count/review_count/
+        // textual_only_count used to be computed AFTER
+        // hits.truncate(REFERENCE_IMPACT_LIMIT), silently under-reporting
+        // whenever the real match count exceeded the limit.
+        let dir = std::env::temp_dir().join(format!(
+            "ci_ref_impact_truncated_counts_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("def.js"), "function popular() { return 1; }\n").unwrap();
+
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+        let extra_hits: i64 = 210; // > REFERENCE_IMPACT_LIMIT (200)
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('def.js::popular', 'popular', 'function', 'javascript', 'def.js', 1, 1, 'function popular() {', '', 'popular', 210, 0, 0)",
+                [],
+            )
+            .unwrap();
+            for i in 0..extra_hits {
+                conn.execute(
+                    "INSERT INTO call_edges (from_symbol, to_symbol, from_path, to_path, call_site_line, edge_confidence)
+                     VALUES (?1, 'def.js::popular', ?2, 'def.js', 1, 'resolved')",
+                    rusqlite::params![format!("caller{i}.js::<module>"), format!("caller{i}.js")],
+                )
+                .unwrap();
+            }
+        }
+
+        let v = jv(
+            server.reference_impact(rmcp::handler::server::wrapper::Parameters(
+                ReferenceImpactParams {
+                    symbol: "popular".into(),
+                    path: None,
+                    line: None,
+                },
+            )),
+        );
+
+        assert_eq!(v["truncated"], true, "response: {v}");
+        assert_eq!(
+            v["references"].as_array().unwrap().len(),
+            200,
+            "the returned list itself is still capped at REFERENCE_IMPACT_LIMIT: {v}"
+        );
+        assert_eq!(
+            v["must_change_count"], extra_hits,
+            "the COUNT must reflect the full match set, not just the truncated list: {v}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

@@ -175,8 +175,8 @@ Full technical detail lives in [`docs/architecture.md`](docs/architecture.md) �
 ## Crate layout
 
 - `crates/calm-core/` — the index engine: `tree-sitter` parsing, SQLite schema, the multi-tier resolver (conservative → inferred → formal/Stack-Graphs, SCIP, or LSP), graph algorithms (coreness, hub detection), FTS5/semantic search, analysis (hotspots, coverage, codeowners, diff-impact, dead-code), fitness metrics, gitignore management.
-- `crates/calm-server/` — the MCP server (`rmcp` over stdio or a unix-socket daemon), exposing 36 tools plus the incremental file watcher.
-- `crates/calm-cli/` — the CLI: `calm init`, `calm index`, `calm serve`, `calm connect`, `calm setup`, `calm fitness-check`, `calm doctor`.
+- `crates/calm-server/` — the MCP server (`rmcp` over stdio or a unix-socket daemon), exposing 37 tools plus the incremental file watcher.
+- `crates/calm-cli/` — the CLI: `calm init`, `calm index`, `calm serve`, `calm connect`, `calm setup`, `calm fitness-check`, `calm guard`, `calm doctor`.
 
 ## CLI reference
 
@@ -194,12 +194,14 @@ calm setup    --project-root .    # writes/merges MCP config (.mcp.json/.cursor/
 calm fitness-check --project-root .                             # CI gate, exits 1 on failure
 calm fitness-check --project-root . --json                      # JSON output
 calm fitness-check --project-root . --config thresholds.toml    # custom thresholds
+calm guard    --project-root .    # pre-commit/CI gate on the staged diff, exits 1 if aggregate risk >= --fail-on (default: high)
+calm guard    --project-root . --fail-on medium --json   # stricter threshold, machine-readable output
 calm scip-run --project-root . --lang go        # force one SCIP provider to run now, bypassing refresh policy
 calm scip-run --project-root .                  # --lang omitted = run every provider ("rust,go,python,javascript,java,csharp,php,ruby,c")
 calm index    --project-root . --scip-file build/index.scip --sub-root services/api   # ingest a pre-built SCIP index (CI/sandboxed, no external indexer install needed)
 ```
 
-## 36 MCP tools for AI agents
+## 37 MCP tools for AI agents
 CLI presets filter tools by workflow phase: `orient`, `trace`, `edit`, `compound`, `full` (default) via `calm serve --preset` or the `preset` field in `config.json` — or compose a custom set from toolset (module) names, e.g. `--preset "trace,security"` or `--preset "full,-edit"` (see AGENTS.md for the full toolset list). Every response carries `suggested_next` to point at the next step — full detail on each tool and the complete workflow lives in [AGENTS.md](AGENTS.md).
 
 | Group | Tools |

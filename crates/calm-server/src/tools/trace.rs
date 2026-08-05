@@ -605,6 +605,16 @@ impl CalmServer {
             // (path, None).
             let mut seen: std::collections::HashSet<(String, Option<i64>)> =
                 std::collections::HashSet::new();
+            // Files with a file-level import-edge hit (no line number) --
+            // used below to suppress a textual grep hit that's really just
+            // re-finding that same import statement. Deliberately NOT
+            // built from `seen` as a whole (which also holds line-precise
+            // call-edge hits): a file can have a real call edge at one
+            // line AND an unrelated textual reference at another line --
+            // the latter must still surface, not get suppressed just
+            // because the file already appears elsewhere in `seen`.
+            let mut import_hit_files: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
 
             // 1. Call edges -- same query shape `callers` uses, but
             // classified by edge_confidence instead of split into
@@ -684,6 +694,7 @@ impl CalmServer {
                     if !seen.insert((from_path.clone(), None)) {
                         continue;
                     }
+                    import_hit_files.insert(from_path.clone());
                     hits.push(ReferenceHit {
                         path: from_path,
                         line: None,
@@ -703,8 +714,6 @@ impl CalmServer {
             // `textual_only` may include false positives from an unrelated
             // same-named identifier -- that imprecision is why it's its own
             // bottom tier, not merged into `review`.
-            let files_already_seen: std::collections::HashSet<String> =
-                seen.iter().map(|(path, _)| path.clone()).collect();
             let ignore_patterns = self.config().ignore;
             let pattern = format!(r"\b{}\b", regex::escape(&c.name));
             match calm_core::search::search_grep(
@@ -725,7 +734,7 @@ impl CalmServer {
                         {
                             continue; // the definition site itself
                         }
-                        if files_already_seen.contains(&r.path) {
+                        if import_hit_files.contains(&r.path) {
                             continue; // already flagged (file-level) via an import edge
                         }
                         if !seen.insert((r.path.clone(), r.line_start)) {
@@ -747,9 +756,12 @@ impl CalmServer {
             }
 
             hits.sort_by(|a, b| (a.path.as_str(), a.line).cmp(&(b.path.as_str(), b.line)));
-            let truncated = hits.len() > REFERENCE_IMPACT_LIMIT;
-            hits.truncate(REFERENCE_IMPACT_LIMIT);
 
+            // Counts must reflect the FULL match set, not just what
+            // survives truncation below -- computed here, before
+            // truncating, so a caller relying on e.g. must_change_count to
+            // gauge blast radius never sees a number that silently shrinks
+            // just because hits.len() crossed REFERENCE_IMPACT_LIMIT.
             let must_change_count = hits
                 .iter()
                 .filter(|h| h.classification == "must_change")
@@ -763,6 +775,9 @@ impl CalmServer {
                 .iter()
                 .filter(|h| h.classification == "textual_only")
                 .count();
+
+            let truncated = hits.len() > REFERENCE_IMPACT_LIMIT;
+            hits.truncate(REFERENCE_IMPACT_LIMIT);
 
             let sn = if review_count > 0 || textual_only_count > 0 {
                 suggested(

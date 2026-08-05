@@ -212,7 +212,11 @@ fn initialize_requesting_2024_11_05_still_negotiates_that_exact_version() {
     let project = fresh_project();
 
     let output = send_initialize_and_capture(project.path(), "2024-11-05");
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let response = String::from_utf8_lossy(&output.stdout);
     assert!(
         response.contains("\"protocolVersion\":\"2024-11-05\""),
@@ -349,6 +353,85 @@ fn calm_connect_forwards_preset_to_the_daemon_it_spawns() {
         !stdout_text.contains("\"edit_context\""),
         "orient preset must NOT include edit_context — if it's present, --preset wasn't forwarded to the spawned daemon. stdout: {stdout_text}"
     );
+}
+
+#[test]
+fn daemon_respects_per_connection_preset() {
+    use std::io::{BufRead, BufReader};
+
+    let project = fresh_project();
+    let initialize = br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"it","version":"0"}}}
+"#;
+    let initialized = br#"{"jsonrpc":"2.0","method":"notifications/initialized"}
+"#;
+    let list_tools = br#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}
+"#;
+
+    // Connection A: no --preset, spawns the daemon at its default (wide)
+    // ceiling, stays open for the whole test so the daemon it spawned
+    // stays live while B connects.
+    let mut child_a = Command::new(calm_bin())
+        .arg("connect")
+        .arg("--project-root")
+        .arg(project.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawning connection A (no --preset)");
+    let mut stdin_a = child_a.stdin.take().unwrap();
+    let mut stdout_a = BufReader::new(child_a.stdout.take().unwrap());
+    stdin_a.write_all(initialize).unwrap();
+    let mut init_a = String::new();
+    stdout_a
+        .read_line(&mut init_a)
+        .expect("A: initialize response");
+    stdin_a.write_all(initialized).unwrap();
+
+    // Connection B: attaches to the daemon A already spawned (does NOT
+    // spawn its own — A is still alive) with --preset orient. Before the
+    // per-connection handshake, this --preset was silently dropped for
+    // any connection that didn't do the spawning.
+    let mut child_b = Command::new(calm_bin())
+        .arg("connect")
+        .arg("--project-root")
+        .arg(project.path())
+        .arg("--preset")
+        .arg("orient")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawning connection B (--preset orient)");
+    let stdout_b = child_b.stdout.take().expect("B: piped stdout");
+    let mut stdin_b = child_b.stdin.take().expect("B: piped stdin");
+    let watcher_b = StdoutWatcher::spawn(stdout_b);
+    stdin_b.write_all(initialize).unwrap();
+    stdin_b.write_all(list_tools).unwrap();
+    watcher_b.wait_for("\"id\":2", Duration::from_secs(8));
+    drop(stdin_b);
+    let mut stderr_b = Vec::new();
+    if let Some(mut stderr) = child_b.stderr.take() {
+        let _ = stderr.read_to_end(&mut stderr_b);
+    }
+    let _ = child_b.wait();
+    let stdout_b_text = watcher_b.finish();
+    let stderr_b_text = String::from_utf8_lossy(&stderr_b);
+
+    assert!(
+        stdout_b_text.contains("\"repo_overview\""),
+        "B (--preset orient, attaching to A's daemon) must include repo_overview: \
+         stdout: {stdout_b_text}\nstderr: {stderr_b_text}"
+    );
+    assert!(
+        !stdout_b_text.contains("\"edit_context\""),
+        "B (--preset orient, attaching to A's daemon) must NOT include edit_context -- if \
+         it's present, the per-connection preset handshake isn't taking effect for a \
+         connection that attached rather than spawned. stdout: {stdout_b_text}"
+    );
+
+    drop(stdin_a);
+    let _ = child_a.wait();
 }
 
 /// [Task 1.5 / audit FM1] Runtime toolset narrowing must be enforced at

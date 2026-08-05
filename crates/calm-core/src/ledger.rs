@@ -82,19 +82,31 @@ fn load_or_create_ledger_key(calm_dir: &Path) -> std::io::Result<[u8; LEDGER_KEY
 /// existing `append`/`verify_chain`/`head_digest` call site keeps working
 /// completely unchanged (calm-core's `txn.rs` alone has ~15 call sites
 /// across `begin`/`advance`/`advance_many` that would otherwise all need
-/// a new parameter). `None` only for a path-less connection (`:memory:`,
-/// what every test in this crate uses) or a key-file I/O failure (e.g. a
-/// read-only `.calm/`) — both fall back to the unkeyed `evidence_digest`
-/// chain this module had before HMAC signing existed, same
-/// detection-degrades-gracefully posture `content_mac: NULL` already has
-/// in `memory.rs`. Every REAL writer/reader connection
-/// (`calm_core::db::conn::open_writer`, `make_read_conn`) always opens a
-/// genuine file path, so production usage always gets a key — only this
-/// module's own in-memory tests exercise the fallback.
-fn ledger_key_for_conn(conn: &Connection) -> Option<[u8; LEDGER_KEY_LEN]> {
-    let db_path = conn.path()?;
-    let calm_dir = Path::new(db_path).parent()?;
-    load_or_create_ledger_key(calm_dir).ok()
+/// a new parameter). `Ok(None)` only for a path-less connection
+/// (`:memory:`, what every test in this crate uses) — that case still
+/// falls back to the unkeyed `evidence_digest` chain this module had
+/// before HMAC signing existed, same detection-degrades-gracefully
+/// posture `content_mac: NULL` already has in `memory.rs` (no real risk:
+/// nothing production-facing ever opens a path-less connection). A REAL
+/// on-disk connection whose key file can't be read or created (e.g. a
+/// read-only `.calm/`) is a DIFFERENT case and must NOT collapse into the
+/// same fallback -- that used to silently downgrade a real ledger to a
+/// forgeable unkeyed chain while looking untouched; it now returns
+/// `Err(LedgerError::KeyUnavailable)` instead. Every REAL writer/reader
+/// connection (`calm_core::db::conn::open_writer`, `make_read_conn`)
+/// always opens a genuine file path, so production usage always gets a
+/// key or a loud error — only this module's own in-memory tests exercise
+/// the `Ok(None)` fallback.
+fn ledger_key_for_conn(conn: &Connection) -> Result<Option<[u8; LEDGER_KEY_LEN]>, LedgerError> {
+    let Some(db_path) = conn.path() else {
+        return Ok(None);
+    };
+    let Some(calm_dir) = Path::new(db_path).parent() else {
+        return Ok(None);
+    };
+    load_or_create_ledger_key(calm_dir)
+        .map(Some)
+        .map_err(LedgerError::KeyUnavailable)
 }
 
 /// `event_hash = HMAC-SHA256(ledger_key, payload || prev_hash)` when a key
@@ -105,9 +117,16 @@ fn ledger_key_for_conn(conn: &Connection) -> Option<[u8; LEDGER_KEY_LEN]> {
 /// reading raw `event_hash` values can tell which mode produced a row;
 /// `append`/`verify_chain` never need to branch on the prefix themselves
 /// since both always re-derive the key the same way for the same `conn`.
-fn compute_event_hash(conn: &Connection, payload: &str, prev_hash: &str) -> String {
+/// Propagates `LedgerError::KeyUnavailable` for a real on-disk connection
+/// whose key file is unreadable/uncreatable -- fails closed instead of
+/// silently producing an unkeyed, forgeable hash.
+fn compute_event_hash(
+    conn: &Connection,
+    payload: &str,
+    prev_hash: &str,
+) -> Result<String, LedgerError> {
     let input = format!("{payload}|{prev_hash}");
-    match ledger_key_for_conn(conn) {
+    Ok(match ledger_key_for_conn(conn)? {
         Some(key) => {
             let mut mac =
                 <HmacSha256 as Mac>::new_from_slice(&key).expect("HMAC accepts any key length");
@@ -121,18 +140,35 @@ fn compute_event_hash(conn: &Connection, payload: &str, prev_hash: &str) -> Stri
             hex
         }
         None => evidence_digest(input.as_bytes()),
-    }
+    })
 }
 
 #[derive(Debug)]
 pub enum LedgerError {
     Db(rusqlite::Error),
+    /// A real on-disk connection's `audit.key` couldn't be read or
+    /// created (e.g. a read-only or otherwise broken `.calm/`). Every
+    /// event_hash this module computes for a real ledger MUST be
+    /// HMAC-signed -- see `compute_event_hash` -- so this fails the
+    /// operation instead of silently falling back to the old unkeyed
+    /// SHA-256 chain, which any actor with plain SQLite file write access
+    /// could forge. `append_ledger_in_savepoint` (txn.rs) already treats
+    /// every `LedgerError` as best-effort (P0-4: a ledger failure must
+    /// never block the write it's auditing) -- this variant just makes
+    /// sure that failure is loud (a rolled-back savepoint, no ledger row
+    /// at all) instead of silently downgrading the row's own integrity.
+    KeyUnavailable(std::io::Error),
 }
 
 impl fmt::Display for LedgerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             LedgerError::Db(e) => write!(f, "audit ledger db error: {e}"),
+            LedgerError::KeyUnavailable(e) => write!(
+                f,
+                "audit ledger signing key unavailable: {e} -- refusing to fall back to an \
+                 unkeyed, forgeable chain for a real on-disk ledger"
+            ),
         }
     }
 }
@@ -194,7 +230,7 @@ pub fn head_digest(conn: &Connection) -> Result<String, LedgerError> {
 /// being audited, only that it's chained and content-addressed.
 pub fn append(conn: &Connection, actor: &str, payload: &str) -> Result<LedgerEntry, LedgerError> {
     let prev_hash = head_digest(conn)?;
-    let event_hash = compute_event_hash(conn, payload, &prev_hash);
+    let event_hash = compute_event_hash(conn, payload, &prev_hash)?;
     let ts = now_epoch_secs();
     conn.execute(
         "INSERT INTO audit_ledger (prev_hash, event_hash, ts, actor, payload) \
@@ -247,7 +283,7 @@ pub fn verify_chain(conn: &Connection) -> Result<Option<ChainBreak>, LedgerError
                 ),
             }));
         }
-        let recomputed = compute_event_hash(conn, &payload, &prev_hash);
+        let recomputed = compute_event_hash(conn, &payload, &prev_hash)?;
         if recomputed != event_hash {
             return Ok(Some(ChainBreak {
                 seq,
@@ -265,11 +301,11 @@ pub fn verify_chain(conn: &Connection) -> Result<Option<ChainBreak>, LedgerError
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::schema::init_db;
+    use crate::db::schema::init_state_db;
 
     fn test_conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        init_db(&conn).unwrap();
+        init_state_db(&conn).unwrap();
         conn
     }
 
@@ -399,7 +435,7 @@ mod tests {
         let calm_dir = dir.path().join(".calm");
         std::fs::create_dir_all(&calm_dir).unwrap();
         let conn = crate::db::conn::open_writer(&calm_dir.join("index.db")).unwrap();
-        init_db(&conn).unwrap();
+        init_state_db(&conn).unwrap();
         (dir, conn)
     }
 
@@ -443,7 +479,7 @@ mod tests {
 
         {
             let conn = crate::db::conn::open_writer(&db_path).unwrap();
-            init_db(&conn).unwrap();
+            init_state_db(&conn).unwrap();
             append(&conn, "system", "one").unwrap();
             append(&conn, "system", "two").unwrap();
         } // conn dropped -- a fresh connection object below must derive the SAME key.
@@ -488,6 +524,41 @@ mod tests {
             break_at.map(|b| b.seq),
             Some(2),
             "a forged row using the OLD unkeyed formula must still fail HMAC verification"
+        );
+    }
+
+    #[test]
+    fn real_on_disk_ledger_fails_closed_when_the_key_file_is_unusable() {
+        // Regression: a real on-disk connection whose audit.key can't be
+        // read/created used to silently fall back to the old unkeyed,
+        // forgeable SHA-256 chain -- a row that LOOKED like every other
+        // row but carried none of HMAC's guarantees. It must now fail the
+        // append entirely instead. Force the I/O failure deterministically
+        // (works even running as root, unlike a permission-bit trick):
+        // pre-create `audit.key` as a DIRECTORY, so `std::fs::write` to
+        // that path is guaranteed to fail regardless of caller privilege.
+        let dir = tempfile::Builder::new()
+            .prefix("ci_ledger_key_unusable_")
+            .tempdir()
+            .unwrap();
+        let calm_dir = dir.path().join(".calm");
+        std::fs::create_dir_all(&calm_dir).unwrap();
+        std::fs::create_dir_all(calm_dir.join(LEDGER_KEY_FILENAME)).unwrap();
+        let conn = crate::db::conn::open_writer(&calm_dir.join("index.db")).unwrap();
+        init_state_db(&conn).unwrap();
+
+        let result = append(&conn, "system", "one");
+        assert!(
+            matches!(result, Err(LedgerError::KeyUnavailable(_))),
+            "expected a KeyUnavailable error, got: {result:?}"
+        );
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM audit_ledger", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "a failed append must never leave a row behind, keyed or not"
         );
     }
 }

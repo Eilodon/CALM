@@ -142,6 +142,29 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Git/CI-native guard: analyzes the staged diff (`git diff --cached`)
+    /// and exits non-zero if its aggregate risk is at or above `--fail-on`
+    /// (exits 1 also when project_root isn't a git repo, or git itself
+    /// fails). Wraps the exact `diff_impact` tool an MCP agent's own
+    /// Stage-7 pre-commit gate already runs, so a change made outside any
+    /// MCP session (a teammate's native editor, a bot PR) gets the same
+    /// analysis instead of none at all -- see `KNOWN_LIMITATIONS.md` "No
+    /// Git/CI-native integration path". Usable directly as a pre-commit
+    /// hook or CI step; requires an existing index (run `calm index`
+    /// first).
+    Guard {
+        /// Project root directory
+        #[arg(long, default_value = ".")]
+        project_root: PathBuf,
+        /// Minimum aggregate risk that fails the command: "low", "medium",
+        /// or "high". Matches the same three levels `diff_impact`'s own
+        /// `aggregate_risk` output uses.
+        #[arg(long, default_value = "high")]
+        fail_on: String,
+        /// Emit the raw `diff_impact` JSON instead of a human-readable report.
+        #[arg(long)]
+        json: bool,
+    },
     /// Initialize .calm/ config for a project
     Init {
         /// Project root directory
@@ -749,6 +772,82 @@ async fn main() -> Result<()> {
             }
 
             if !result.passed {
+                std::process::exit(1);
+            }
+        }
+        Commands::Guard {
+            project_root,
+            fail_on,
+            json,
+        } => {
+            let root = std::fs::canonicalize(&project_root)?;
+            let db_path = calm_server::default_db_path(&root);
+            let server = calm_server::tools::CalmServer::new(root, db_path)?;
+            let output = server.diff_impact_json(None, Some(true), None);
+
+            if let Some(err) = output.get("error").filter(|e| !e.is_null()) {
+                let message = err["message"].as_str().unwrap_or("diff_impact failed");
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&output)?);
+                } else {
+                    eprintln!("calm guard: {message}");
+                }
+                std::process::exit(1);
+            }
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&output)?);
+            } else {
+                let files_changed = output["files_changed"].as_array().map_or(0, |a| a.len());
+                let aggregate_risk = output["aggregate_risk"].as_str().unwrap_or("low");
+                println!(
+                    "calm guard — staged diff: {files_changed} file(s) changed, aggregate risk: {aggregate_risk}"
+                );
+                if let Some(symbols) = output["affected_symbols"].as_array() {
+                    for sym in symbols {
+                        let level = sym["risk_assessment"]["level"].as_str().unwrap_or("low");
+                        if level == "low" {
+                            continue;
+                        }
+                        let qn = sym["qualified_name"].as_str().unwrap_or("?");
+                        let reasons: Vec<&str> = sym["risk_assessment"]["reasons"]
+                            .as_array()
+                            .map(|a| a.iter().filter_map(|r| r.as_str()).collect())
+                            .unwrap_or_default();
+                        let reason_text = if reasons.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" — {}", reasons.join("; "))
+                        };
+                        println!("  [{level}] {qn}{reason_text}");
+                    }
+                }
+                if let Some(unindexed) = output["unindexed_files"].as_array()
+                    && !unindexed.is_empty()
+                {
+                    println!(
+                        "  ({} file(s) not indexed yet -- run `calm index` for full coverage)",
+                        unindexed.len()
+                    );
+                }
+            }
+
+            let threshold_severity = match fail_on.as_str() {
+                "low" => 0,
+                "medium" => 1,
+                "high" => 2,
+                other => {
+                    anyhow::bail!(
+                        "--fail-on must be \"low\", \"medium\", or \"high\", got {other:?}"
+                    );
+                }
+            };
+            let actual_severity = match output["aggregate_risk"].as_str().unwrap_or("low") {
+                "high" => 2,
+                "medium" => 1,
+                _ => 0,
+            };
+            if actual_severity >= threshold_severity {
                 std::process::exit(1);
             }
         }

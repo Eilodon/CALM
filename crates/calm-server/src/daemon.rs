@@ -131,6 +131,54 @@ impl Drop for ConnectionGuard {
     }
 }
 
+/// Reads this connection's one-line preset-narrowing preamble (`relay`
+/// writes it, forwarder-side, before starting its pure byte relay) directly
+/// off the raw socket, one byte at a time so no extra buffering risks
+/// consuming bytes meant for the MCP/JSON-RPC stream that immediately
+/// follows -- a `BufReader::read_line` would over-read into its own
+/// internal buffer, and there's no clean way to hand `rmcp` the leftover
+/// afterward without a wrapper stream. Bounded on both a max line length
+/// and a short timeout so a misbehaving or malicious connector that never
+/// sends the newline can't hang or balloon memory for this connection's
+/// task; either bound gives up and returns an empty string ("no preset
+/// requested") rather than failing the connection outright, since this
+/// handshake is a best-effort UX affordance, not this daemon's real
+/// security boundary (see `CalmServer::narrow_connection_preset`'s own doc
+/// comment for why a too-wide request can never actually grant more than
+/// the daemon's own spawn-time `tool_router` already allows).
+async fn read_connection_preset_preamble(stream: &mut tokio::net::UnixStream) -> String {
+    use tokio::io::AsyncReadExt;
+    const MAX_LINE_LEN: usize = 256;
+    const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+    let read_line = async {
+        let mut line = Vec::new();
+        loop {
+            if line.len() >= MAX_LINE_LEN {
+                break;
+            }
+            let mut byte = [0u8; 1];
+            match stream.read_exact(&mut byte).await {
+                Ok(_) if byte[0] == b'\n' => break,
+                Ok(_) => line.push(byte[0]),
+                Err(_) => break,
+            }
+        }
+        line
+    };
+
+    match tokio::time::timeout(READ_TIMEOUT, read_line).await {
+        Ok(line) => String::from_utf8_lossy(&line).trim().to_string(),
+        Err(_) => {
+            tracing::warn!(
+                "per-connection preset preamble read timed out after {READ_TIMEOUT:?} -- \
+                 proceeding with no per-connection narrowing"
+            );
+            String::new()
+        }
+    }
+}
+
 /// The daemon's whole service lifetime: accept connections, spawn one
 /// `serve_server_with_ct` task per connection, and watch for either
 /// SIGTERM/SIGINT (`ct` cancelled — reuses `bootstrap`'s existing handlers)
@@ -160,7 +208,7 @@ async fn run_accept_loop(
                 break;
             }
             accepted = listener.accept() => {
-                let stream = match accepted {
+                let mut stream = match accepted {
                     Ok((stream, _addr)) => stream,
                     Err(e) => {
                         tracing::warn!("daemon accept() failed: {e}");
@@ -173,7 +221,7 @@ async fn run_accept_loop(
                 // with it; only the reverse (daemon-wide shutdown cancelling
                 // every connection) is correct.
                 let conn_ct = ct.child_token();
-                let conn_server = server.for_connection();
+                let mut conn_server = server.for_connection();
                 // Captured *before* `conn_server` moves into
                 // `serve_server_with_ct` below — `session_registry_handle`
                 // returns cheap clones (an `Arc` and a `Copy` u64), not a
@@ -192,6 +240,19 @@ async fn run_accept_loop(
                         session_registry,
                         session_id,
                     };
+                    // Read this connection's own preset-narrowing preamble
+                    // (`relay`'s doc comment) before handing the socket to
+                    // `rmcp` -- `calm connect --preset` must take effect
+                    // per-connection, not just for whichever connection
+                    // happened to spawn this daemon.
+                    let requested_preset = read_connection_preset_preamble(&mut stream).await;
+                    if !requested_preset.is_empty()
+                        && let Err(e) = conn_server.narrow_connection_preset(&requested_preset)
+                    {
+                        tracing::warn!(
+                            "ignoring invalid per-connection preset {requested_preset:?}: {e}"
+                        );
+                    }
                     match rmcp::service::serve_server_with_ct(conn_server, stream, conn_ct).await {
                         Ok(service) => {
                             if let Err(e) = service.waiting().await {
@@ -462,7 +523,7 @@ pub async fn connect_or_spawn(
         db_path.as_deref(),
     )
     .await?;
-    relay(stream).await
+    relay(stream, preset.as_deref()).await
 }
 
 /// `<calm_dir>/daemon.sock` when it fits, else a short deterministic
@@ -660,8 +721,25 @@ fn spawn_detached_daemon(
 /// rather than silently exiting 0 — consistent with this codebase's
 /// existing "never fake ready" honesty (`embed_status`/`indexing_phase`
 /// never pretend a failure didn't happen).
-async fn relay(stream: tokio::net::UnixStream) -> Result<()> {
+async fn relay(stream: tokio::net::UnixStream, preset: Option<&str>) -> Result<()> {
     let (mut sock_read, mut sock_write) = tokio::io::split(stream);
+
+    // One-line preamble ahead of the raw MCP/JSON-RPC byte stream this
+    // function otherwise never inspects (see its own doc comment above) --
+    // always sent, even empty, so the daemon's read side
+    // (`read_connection_preset_preamble`) never has to guess whether one
+    // is coming. Lets a `calm connect --preset` request narrow THIS
+    // connection's own tool visibility (`CalmServer::narrow_connection_
+    // preset`) even when attaching to an already-live daemon that was
+    // spawned with a different (wider) preset -- previously `--preset`
+    // only took effect for whichever connection happened to spawn the
+    // daemon in the first place.
+    use tokio::io::AsyncWriteExt;
+    sock_write
+        .write_all(format!("{}\n", preset.unwrap_or("")).as_bytes())
+        .await
+        .context("writing preset handshake preamble to daemon")?;
+
     let mut stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
 

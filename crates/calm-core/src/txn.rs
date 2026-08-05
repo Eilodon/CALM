@@ -260,6 +260,14 @@ fn append_ledger_in_savepoint(conn: &Connection, actor: &str, payload: &str) {
         return;
     }
     let outcome = crate::ledger::append(conn, actor, payload);
+    if let Err(e) = &outcome {
+        tracing::warn!(
+            actor,
+            error = %e,
+            "audit ledger append failed -- this transition still committed (P0-4), \
+             but the ledger now has a gap for it"
+        );
+    }
     let _ = conn.execute_batch(if outcome.is_ok() {
         "RELEASE ledger_append;"
     } else {
@@ -539,11 +547,11 @@ pub fn latest_for_path(conn: &Connection, path: &str) -> Result<Option<EditTrans
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::schema::init_db;
+    use crate::db::schema::init_state_db;
 
     fn test_conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        init_db(&conn).unwrap();
+        init_state_db(&conn).unwrap();
         conn
     }
 

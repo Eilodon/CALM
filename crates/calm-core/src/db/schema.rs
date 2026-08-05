@@ -1,4 +1,5 @@
 use rusqlite::Connection;
+use std::path::Path;
 
 const SCHEMA_SQL: &str = "
 CREATE TABLE IF NOT EXISTS symbols (
@@ -181,6 +182,36 @@ CREATE TABLE IF NOT EXISTS code_chunks (
 );
 CREATE INDEX IF NOT EXISTS idx_code_chunks_path ON code_chunks(path);
 
+-- Pattern-debt tracker (docs/superskills/specs/2026-07-11-superskills-inspired-features.md
+-- #1, revised post-audit): a registered duplicate-code-pattern anchor, keyed
+-- by a stable `anchor_qualified_name` (NOT path+line -- a symbol's lines
+-- shift on every unrelated edit elsewhere in the file, but its qualified
+-- name survives until the symbol itself is renamed/removed/split, at which
+-- point `pattern_debt_status` reports `anchor_lost` explicitly instead of a
+-- false `resolved`). Deliberately a dedicated table, not folded into
+-- `project_memory`: its structured fields (baseline_count, status) would
+-- otherwise pollute `project_memory_fts`'s full-text index used by the
+-- unrelated `recall` tool.
+CREATE TABLE IF NOT EXISTS pattern_debt (
+    id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+    topic                  TEXT NOT NULL UNIQUE,
+    anchor_qualified_name  TEXT NOT NULL,
+    note                   TEXT NOT NULL,
+    baseline_count         INTEGER NOT NULL,
+    status                 TEXT NOT NULL DEFAULT 'open',
+    created_at             TEXT NOT NULL,
+    last_checked_at        TEXT,
+    last_checked_count     INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_pattern_debt_topic ON pattern_debt(topic);";
+
+/// Durable state (project memory, edit-transaction journal, audit ledger,
+/// maintenance outbox) lives in a SEPARATE file (`state.db`, see
+/// `init_state_db` below) at `PRAGMA synchronous=FULL` -- none of it is
+/// rebuildable from source the way everything in `SCHEMA_SQL` above is.
+/// `migrate_legacy_durable_tables` copies any pre-existing rows out of an
+/// older `index.db` that still has these tables (from before this split).
+const STATE_SCHEMA_SQL: &str = "
 -- Durable, agent-written interpretive notes (architecture decisions, gotchas,
 -- rationale) — distinct from anything derived from the AST/call-graph, and
 -- distinct from `session_context`'s per-session navigational state (which
@@ -190,7 +221,16 @@ CREATE TABLE IF NOT EXISTS project_memory (
     topic       TEXT NOT NULL UNIQUE,
     content     TEXT NOT NULL,
     created_at  TEXT NOT NULL,
-    updated_at  TEXT NOT NULL
+    updated_at  TEXT NOT NULL,
+    -- Plan 3 §3.5(d): HMAC-SHA256(topic, content), written by `remember`.
+    -- Nullable, not backfilled -- a pre-existing note has no MAC to check,
+    -- and memory::verify_integrity reports that case as unverified.
+    content_mac TEXT,
+    -- audit F7 follow-up: set when `remember` flags the note's content as
+    -- prompt-injection-shaped (still saved either way, detection-only);
+    -- `recall` excludes a quarantined note from its default results unless
+    -- `include_quarantined: true` is passed.
+    quarantined INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_project_memory_topic ON project_memory(topic);
 
@@ -213,28 +253,6 @@ CREATE INDEX IF NOT EXISTS idx_project_memory_refs_topic ON project_memory_refs(
 -- `related_notes`) -- a reverse lookup by file path, the mirror image of
 -- the topic index above.
 CREATE INDEX IF NOT EXISTS idx_project_memory_refs_path ON project_memory_refs(ref_path);
--- Pattern-debt tracker (docs/superskills/specs/2026-07-11-superskills-inspired-features.md
--- #1, revised post-audit): a registered duplicate-code-pattern anchor, keyed
--- by a stable `anchor_qualified_name` (NOT path+line -- a symbol's lines
--- shift on every unrelated edit elsewhere in the file, but its qualified
--- name survives until the symbol itself is renamed/removed/split, at which
--- point `pattern_debt_status` reports `anchor_lost` explicitly instead of a
--- false `resolved`). Deliberately a dedicated table, not folded into
--- `project_memory`: its structured fields (baseline_count, status) would
--- otherwise pollute `project_memory_fts`'s full-text index used by the
--- unrelated `recall` tool.
-CREATE TABLE IF NOT EXISTS pattern_debt (
-    id                     INTEGER PRIMARY KEY AUTOINCREMENT,
-    topic                  TEXT NOT NULL UNIQUE,
-    anchor_qualified_name  TEXT NOT NULL,
-    note                   TEXT NOT NULL,
-    baseline_count         INTEGER NOT NULL,
-    status                 TEXT NOT NULL DEFAULT 'open',
-    created_at             TEXT NOT NULL,
-    last_checked_at        TEXT,
-    last_checked_count     INTEGER
-);
-CREATE INDEX IF NOT EXISTS idx_pattern_debt_topic ON pattern_debt(topic);
 
 -- WS-1 (docs/plans/2026-08-02-phase1-p0-execution-plan.md §4.2): durable edit-transaction
 -- journal. 'state' is a CACHE of replay(tx_events WHERE tx_id=?) -> last state, not an
@@ -370,6 +388,132 @@ pub fn init_db(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// Initializes `state.db` -- the durable-state sibling of `index.db`
+/// (project memory, edit-transaction journal, audit ledger, maintenance
+/// outbox; see `STATE_SCHEMA_SQL`'s own doc comment for why these live in a
+/// separate file at a separate durability posture). Unlike `init_db`, there
+/// is no incremental migration story here beyond the one-time data copy
+/// (`migrate_legacy_durable_tables`): `state.db` is always created fresh
+/// with the CURRENT full schema (including columns/tables that used to be
+/// added onto `index.db` incrementally, e.g. `project_memory.content_mac`,
+/// `project_memory_fts`), so there's nothing to migrate forward on repeat
+/// calls -- every statement here is `IF NOT EXISTS`, safe to run on every
+/// startup.
+pub fn init_state_db(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+    conn.execute_batch(STATE_SCHEMA_SQL)?;
+    conn.execute_batch(PROJECT_MEMORY_FTS_SQL)?;
+    conn.execute_batch(PROJECT_MEMORY_TRIGGERS_SQL)?;
+    tracing::info!("state.db schema initialized");
+    Ok(())
+}
+
+/// One-time, idempotent copy of durable-table rows out of a pre-split
+/// `index.db` -- before the state.db split, `project_memory`,
+/// `project_memory_refs`, `edit_transactions`, `tx_events`,
+/// `maintenance_jobs`, and `audit_ledger` all lived in `index.db` itself.
+/// Copy-only: never DROPs/DELETEs anything from `legacy_index_db_path`, so a
+/// crash mid-copy just means the remaining rows get picked up on retry.
+/// Every insert is `INSERT OR IGNORE` keyed on each table's real primary
+/// key, so calling this on every startup (not just once) stays cheap and
+/// safe -- already-copied rows are silently skipped. `audit_ledger.seq` is
+/// copied verbatim (not re-autoincremented) so `ledger::verify_chain`'s
+/// hash chain, which is keyed on row order, stays intact across the copy.
+/// `project_memory`'s AFTER INSERT trigger fires per genuinely-inserted row
+/// (SQLite skips it for rows an `OR IGNORE` conflict suppresses), so
+/// `project_memory_fts` stays in sync without a separate rebuild step.
+/// A no-op if `legacy_index_db_path` doesn't exist yet (fresh project) or
+/// predates these tables entirely (already-split `index.db`).
+pub fn migrate_legacy_durable_tables(
+    state_conn: &Connection,
+    legacy_index_db_path: &Path,
+) -> rusqlite::Result<()> {
+    if !legacy_index_db_path.exists() {
+        return Ok(());
+    }
+    state_conn.execute(
+        "ATTACH DATABASE ?1 AS legacy",
+        [legacy_index_db_path.to_string_lossy().as_ref()],
+    )?;
+    let result = migrate_legacy_durable_tables_inner(state_conn);
+    // Always detach, even on failure, so a caller can retry without leaking
+    // the attachment on a `Connection` it may keep reusing.
+    state_conn.execute_batch("DETACH DATABASE legacy;")?;
+    result
+}
+
+fn migrate_legacy_durable_tables_inner(conn: &Connection) -> rusqlite::Result<()> {
+    let present: Vec<String> = {
+        let mut stmt = conn.prepare(
+            "SELECT name FROM legacy.sqlite_master WHERE type = 'table' AND name IN \
+             ('project_memory', 'project_memory_refs', 'edit_transactions', \
+              'tx_events', 'maintenance_jobs', 'audit_ledger')",
+        )?;
+        stmt.query_map([], |r| r.get::<_, String>(0))?
+            .filter_map(|r| r.ok())
+            .collect()
+    };
+    let has = |t: &str| present.iter().any(|n| n == t);
+
+    // Parent-before-child for the one real FK (tx_events -> edit_transactions
+    // ON DELETE CASCADE); the rest have no cross-table FK so order among them
+    // doesn't matter.
+    if has("project_memory") {
+        conn.execute_batch(
+            "INSERT OR IGNORE INTO project_memory \
+                (id, topic, content, created_at, updated_at, content_mac, quarantined) \
+             SELECT id, topic, content, created_at, updated_at, content_mac, quarantined \
+             FROM legacy.project_memory;",
+        )?;
+    }
+    if has("project_memory_refs") {
+        conn.execute_batch(
+            "INSERT OR IGNORE INTO project_memory_refs (id, topic, ref_path, ref_hash) \
+             SELECT id, topic, ref_path, ref_hash FROM legacy.project_memory_refs;",
+        )?;
+    }
+    if has("edit_transactions") {
+        conn.execute_batch(
+            "INSERT OR IGNORE INTO edit_transactions \
+                (tx_id, project_id, path, base_digest, proposed_digest, review_token_id, \
+                 state, temp_path, graph_generation_before, graph_generation_after, \
+                 created_at, updated_at, error_code, error_detail) \
+             SELECT tx_id, project_id, path, base_digest, proposed_digest, review_token_id, \
+                    state, temp_path, graph_generation_before, graph_generation_after, \
+                    created_at, updated_at, error_code, error_detail \
+             FROM legacy.edit_transactions;",
+        )?;
+    }
+    if has("tx_events") {
+        conn.execute_batch(
+            "INSERT OR IGNORE INTO tx_events \
+                (event_id, tx_id, sequence, from_state, to_state, actor, reason, occurred_at) \
+             SELECT event_id, tx_id, sequence, from_state, to_state, actor, reason, occurred_at \
+             FROM legacy.tx_events;",
+        )?;
+    }
+    if has("maintenance_jobs") {
+        conn.execute_batch(
+            "INSERT OR IGNORE INTO maintenance_jobs \
+                (job_id, job_kind, dedupe_key, state, triggered_by_tx_id, attempts, \
+                 available_at, lease_owner, lease_expires_at, last_error, last_completed_at) \
+             SELECT job_id, job_kind, dedupe_key, state, triggered_by_tx_id, attempts, \
+                    available_at, lease_owner, lease_expires_at, last_error, last_completed_at \
+             FROM legacy.maintenance_jobs;",
+        )?;
+    }
+    if has("audit_ledger") {
+        conn.execute_batch(
+            "INSERT OR IGNORE INTO audit_ledger (seq, prev_hash, event_hash, ts, actor, payload) \
+             SELECT seq, prev_hash, event_hash, ts, actor, payload FROM legacy.audit_ledger;",
+        )?;
+    }
+    if !present.is_empty() {
+        tracing::info!(tables = ?present, "Migrated legacy durable-state rows into state.db");
+    }
+    Ok(())
+}
+
 fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
     migrate_add_column(conn, "symbols", "name_tokens", "TEXT NOT NULL DEFAULT ''")?;
     migrate_add_column(
@@ -497,26 +641,10 @@ fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
         "boundary_ambiguous",
         "INTEGER NOT NULL DEFAULT 0",
     )?;
-    // Plan 3 §3.5(d): HMAC-SHA256(topic, content) over `memory::compute_mac`,
-    // written by `remember`. Nullable, not backfilled — a pre-existing note
-    // has no MAC to check, and `memory::verify_integrity` reports that case
-    // as `"unverified"`, distinct from `"ok"`/`"mismatch"`.
-    migrate_add_column(conn, "project_memory", "content_mac", "TEXT")?;
-    // audit F7 follow-up: `remember` sets this when `sanitize::
-    // injection_warning` flags the note's content as prompt-injection-
-    // shaped -- still saved either way (detection-only, same philosophy
-    // as the warning itself), but `recall` excludes a quarantined note
-    // from its default topic/query/list-all results unless
-    // `include_quarantined: true` is passed, so a poisoned note can't
-    // silently auto-surface into a future session's context. `0` default
-    // so every pre-existing note (written before this column existed)
-    // reads as NOT quarantined rather than retroactively hiding it.
-    migrate_add_column(
-        conn,
-        "project_memory",
-        "quarantined",
-        "INTEGER NOT NULL DEFAULT 0",
-    )?;
+    // project_memory's own content_mac/quarantined columns are handled by
+    // STATE_SCHEMA_SQL/init_state_db now (project_memory lives in state.db,
+    // not here -- see the "Durable state... lives in a SEPARATE file"
+    // comment above STATE_SCHEMA_SQL).
     // #3 (2026-07-27 martin/entropy/churn plan): normalized [0,1] churn
     // score, written by `graph::churn::update_churn_scores` from the
     // indexer pipeline (rebuild_graph/incremental_graph_update), read by
@@ -544,7 +672,6 @@ fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
         "INTEGER NOT NULL DEFAULT 0",
     )?;
     migrate_fts_add_signature(conn)?;
-    migrate_add_project_memory_fts(conn)?;
     migrate_add_scip_overlay_state(conn)?;
     dedup_edges_and_add_unique_indexes(conn)?;
     migrate_call_site_identity_v2(conn)?;
@@ -760,32 +887,6 @@ CREATE TRIGGER IF NOT EXISTS project_memory_au
         VALUES (new.id, new.topic, new.content);
 END;
 ";
-
-/// Unlike `fts_exact` (always unconditionally (re)created by `FTS5_SQL`
-/// before migrations run, so `migrate_fts_add_signature` above has to key
-/// off a column, not the table's existence), `project_memory_fts` is a
-/// brand-new table that no pre-existing DB has — so its absence from
-/// `sqlite_master` is itself a reliable "not yet migrated" marker. `remember`
-/// upserts via `ON CONFLICT DO UPDATE`, which SQLite fires as an UPDATE
-/// trigger (not INSERT) against the pre-existing row, hence the `AFTER
-/// UPDATE OF content` trigger — `topic` never changes on an upsert (it's the
-/// conflict key) so it isn't watched.
-fn migrate_add_project_memory_fts(conn: &Connection) -> rusqlite::Result<()> {
-    let already_migrated: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'project_memory_fts'",
-        [],
-        |r| r.get(0),
-    )?;
-    if already_migrated > 0 {
-        return Ok(());
-    }
-
-    conn.execute_batch(PROJECT_MEMORY_FTS_SQL)?;
-    conn.execute_batch(PROJECT_MEMORY_TRIGGERS_SQL)?;
-    conn.execute_batch("INSERT INTO project_memory_fts(project_memory_fts) VALUES ('rebuild');")?;
-    tracing::info!("Migration: created project_memory_fts and backfilled existing notes");
-    Ok(())
-}
 
 /// B4 (2026-07-28 benchmark root-cause): replaces the old
 /// `.calm/<provider>.cache` + `.calm/<provider>-stats.json` sidecar files
@@ -1230,7 +1331,7 @@ mod tests {
     #[test]
     fn test_project_memory_fts_trigger_sync() {
         let conn = Connection::open_in_memory().unwrap();
-        init_db(&conn).unwrap();
+        init_state_db(&conn).unwrap();
 
         conn.execute(
             "INSERT INTO project_memory (topic, content, created_at, updated_at) \
@@ -1290,66 +1391,175 @@ mod tests {
         );
     }
 
+    /// Simulates a pre-split `index.db`: same durable-table DDL as
+    /// `STATE_SCHEMA_SQL`, just living in a file that plays the role of the
+    /// old, unsplit `index.db`.
+    fn write_legacy_index_db(path: &std::path::Path) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(STATE_SCHEMA_SQL).unwrap();
+    }
+
     #[test]
-    fn test_migrate_add_project_memory_fts_backfills_existing_rows() {
-        let conn = Connection::open_in_memory().unwrap();
-        // Old-shape DB: SCHEMA_SQL only, predating project_memory_fts entirely.
-        conn.execute_batch(SCHEMA_SQL).unwrap();
-        conn.execute(
-            "INSERT INTO project_memory (topic, content, created_at, updated_at) \
-             VALUES ('legacy-note', 'uses widgetronic auth', '2026-01-01', '2026-01-01')",
-            [],
-        )
-        .unwrap();
+    fn migrate_legacy_durable_tables_copies_rows_from_a_pre_split_index_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy_path = dir.path().join("index.db");
+        write_legacy_index_db(&legacy_path);
+        {
+            let legacy_conn = Connection::open(&legacy_path).unwrap();
+            legacy_conn
+                .execute(
+                    "INSERT INTO project_memory (topic, content, created_at, updated_at) \
+                     VALUES ('t', 'legacy note content', '2024-01-01', '2024-01-01')",
+                    [],
+                )
+                .unwrap();
+            legacy_conn
+                .execute(
+                    "INSERT INTO project_memory_refs (topic, ref_path, ref_hash) \
+                     VALUES ('t', 'src/lib.rs', 'abc123')",
+                    [],
+                )
+                .unwrap();
+            legacy_conn
+                .execute(
+                    "INSERT INTO edit_transactions \
+                        (tx_id, project_id, path, base_digest, proposed_digest, created_at, updated_at) \
+                     VALUES ('tx1', 'proj', 'f.rs', 'base', 'proposed', 1.0, 1.0)",
+                    [],
+                )
+                .unwrap();
+            legacy_conn
+                .execute(
+                    "INSERT INTO tx_events \
+                        (event_id, tx_id, sequence, from_state, to_state, actor, reason, occurred_at) \
+                     VALUES ('ev1', 'tx1', 1, 'NONE', 'PREPARED', 'agent', 'begin', 1.0)",
+                    [],
+                )
+                .unwrap();
+            legacy_conn
+                .execute(
+                    "INSERT INTO maintenance_jobs (job_id, job_kind, dedupe_key, available_at) \
+                     VALUES ('j1', 'reindex', 'reindex', 1.0)",
+                    [],
+                )
+                .unwrap();
+            legacy_conn
+                .execute(
+                    "INSERT INTO audit_ledger (seq, prev_hash, event_hash, ts, actor, payload) \
+                     VALUES (1, 'genesis', 'h1', 1.0, 'agent', '{}')",
+                    [],
+                )
+                .unwrap();
+            legacy_conn
+                .execute(
+                    "INSERT INTO audit_ledger (seq, prev_hash, event_hash, ts, actor, payload) \
+                     VALUES (2, 'h1', 'h2', 2.0, 'agent', '{}')",
+                    [],
+                )
+                .unwrap();
+        }
 
-        let exists_before: i64 = conn
+        let state_conn = Connection::open_in_memory().unwrap();
+        init_state_db(&state_conn).unwrap();
+        migrate_legacy_durable_tables(&state_conn, &legacy_path).unwrap();
+
+        let count = |table: &str| -> i64 {
+            state_conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(count("project_memory"), 1);
+        assert_eq!(count("project_memory_refs"), 1);
+        assert_eq!(count("edit_transactions"), 1);
+        assert_eq!(count("tx_events"), 1);
+        assert_eq!(count("maintenance_jobs"), 1);
+        assert_eq!(count("audit_ledger"), 2);
+
+        // FTS trigger fired for the copied row, not just a table-level copy.
+        let fts_hits: i64 = state_conn
             .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'project_memory_fts'",
+                "SELECT COUNT(*) FROM project_memory_fts WHERE project_memory_fts MATCH 'legacy'",
                 [],
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(exists_before, 0);
+        assert_eq!(fts_hits, 1);
 
-        // init_db on an already-populated old-shape DB is the upgrade path.
-        init_db(&conn).unwrap();
+        // audit_ledger.seq is copied verbatim, not renumbered -- the hash
+        // chain in `payload`/`prev_hash` is keyed on exact row order.
+        let seqs: Vec<i64> = {
+            let mut stmt = state_conn
+                .prepare("SELECT seq FROM audit_ledger ORDER BY seq")
+                .unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect()
+        };
+        assert_eq!(seqs, vec![1, 2]);
+    }
 
-        let exists_after: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'project_memory_fts'",
-                [],
-                |r| r.get(0),
-            )
+    #[test]
+    fn migrate_legacy_durable_tables_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy_path = dir.path().join("index.db");
+        write_legacy_index_db(&legacy_path);
+        {
+            let legacy_conn = Connection::open(&legacy_path).unwrap();
+            legacy_conn
+                .execute(
+                    "INSERT INTO project_memory (topic, content, created_at, updated_at) \
+                     VALUES ('t', 'c', '2024-01-01', '2024-01-01')",
+                    [],
+                )
+                .unwrap();
+        }
+
+        let state_conn = Connection::open_in_memory().unwrap();
+        init_state_db(&state_conn).unwrap();
+        migrate_legacy_durable_tables(&state_conn, &legacy_path).unwrap();
+        migrate_legacy_durable_tables(&state_conn, &legacy_path).unwrap();
+        migrate_legacy_durable_tables(&state_conn, &legacy_path).unwrap();
+
+        let count: i64 = state_conn
+            .query_row("SELECT COUNT(*) FROM project_memory", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(exists_after, 1);
+        assert_eq!(count, 1, "repeat migrations must not duplicate rows");
+    }
 
-        let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM project_memory_fts WHERE project_memory_fts MATCH 'widgetronic'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            count, 1,
-            "pre-existing note must be backfilled by 'rebuild'"
-        );
+    #[test]
+    fn migrate_legacy_durable_tables_is_a_no_op_when_legacy_db_is_missing() {
+        let state_conn = Connection::open_in_memory().unwrap();
+        init_state_db(&state_conn).unwrap();
 
-        // Triggers sync notes inserted after the migration too.
-        conn.execute(
-            "INSERT INTO project_memory (topic, content, created_at, updated_at) \
-             VALUES ('new-note', 'uses zorbex cache', '2026-01-02', '2026-01-02')",
-            [],
-        )
-        .unwrap();
-        let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM project_memory_fts WHERE project_memory_fts MATCH 'zorbex'",
-                [],
-                |r| r.get(0),
-            )
+        let missing = std::path::Path::new("/nonexistent/does-not-exist/index.db");
+        migrate_legacy_durable_tables(&state_conn, missing).unwrap();
+
+        let count: i64 = state_conn
+            .query_row("SELECT COUNT(*) FROM project_memory", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(count, 1, "post-migration trigger must sync new notes too");
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn migrate_legacy_durable_tables_is_a_no_op_when_legacy_db_predates_durable_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy_path = dir.path().join("index.db");
+        {
+            // An already-split (or pre-durable-state) `index.db`: has the
+            // rebuildable schema but none of the durable tables.
+            let legacy_conn = Connection::open(&legacy_path).unwrap();
+            legacy_conn.execute_batch(SCHEMA_SQL).unwrap();
+        }
+
+        let state_conn = Connection::open_in_memory().unwrap();
+        init_state_db(&state_conn).unwrap();
+        migrate_legacy_durable_tables(&state_conn, &legacy_path).unwrap();
+
+        let count: i64 = state_conn
+            .query_row("SELECT COUNT(*) FROM project_memory", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
     }
 
     #[test]
