@@ -40,7 +40,7 @@ jobs:
   # it's run clean across enough real PRs.
   calm-guard-dogfood:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     continue-on-error: true
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -51,7 +51,30 @@ jobs:
           # fallback it's meant to be testing.
           fetch-depth: 0
 
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      # Dogfooding must exercise THIS commit's own calm-cli, not whatever
+      # was last published to npm -- action.yml's default `version: latest`
+      # install can lag a real subcommand by days (found for real: `guard`
+      # landed in 9773d41, after the v0.5.0 npm tag, so the plain npm-install
+      # path 404'd on `error: unrecognized subcommand 'guard'` here until
+      # this fix). Building from source and aliasing it as `calm-mcp` on
+      # PATH, then passing skip-install: true, tests the actual wiring this
+      # PR/push is changing instead of a stale release.
+      - name: Build calm-cli from source (this commit, not the last npm release)
+        run: cargo build -p calm-cli
+
+      - name: Alias the freshly built binary as calm-mcp on PATH
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          ln -sf "$GITHUB_WORKSPACE/target/debug/calm" "$HOME/.local/bin/calm-mcp"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
       - uses: ./
+        with:
+          skip-install: true
         # No `base`/`commits` input -- exercises action.yml's own
         # pull_request/push auto-detection, not an explicit override.
 

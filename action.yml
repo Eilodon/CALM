@@ -45,11 +45,23 @@ inputs:
     description: 'Which @eilodon/calm-mcp npm version to install. Defaults to the latest published release.'
     required: false
     default: 'latest'
+  skip-install:
+    description: >-
+      Skip the npm install step and use whatever `calm-mcp` is already on
+      PATH. For dogfooding this action against a not-yet-released commit
+      (build calm-cli from source, put a `calm-mcp`-named symlink to it on
+      PATH, then call this action with skip-install: true) -- see
+      .github/workflows/ci.yml's calm-guard-dogfood job for the pattern.
+      Most callers should leave this false and let npm install a real
+      published release.
+    required: false
+    default: 'false'
 
 runs:
   using: 'composite'
   steps:
     - name: Install calm
+      if: inputs.skip-install != 'true'
       shell: bash
       env:
         CALM_VERSION: ${{ inputs.version }}
