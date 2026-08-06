@@ -42,7 +42,13 @@ inputs:
     required: false
     default: 'false'
   version:
-    description: 'Which @eilodon/calm-mcp npm version to install. Defaults to the latest published release.'
+    description: >-
+      Which @eilodon/calm-mcp npm version to install. Defaults to 'latest',
+      which the install step resolves to the exact npm version matching
+      THIS action instance's own tag (release.yml publishes the action and
+      the npm package from the same tag in one coordinated workflow) rather
+      than npm's floating `latest` dist-tag -- set this explicitly only to
+      deliberately override that pinning.
     required: false
     default: 'latest'
   skip-install:
@@ -60,11 +66,47 @@ inputs:
 runs:
   using: 'composite'
   steps:
+    # Audit 11.3 (release-skew hazard): `action.yml`'s implementation comes
+    # from whatever ref the caller's `uses: eilodon/calm-mcp-action@X`
+    # checked out, but a bare npm `latest` install is a SEPARATE, floating
+    # identity that can drift out of sync with it -- a real past incident
+    # (see .github/workflows/ci.yml's calm-guard-dogfood job comment): this
+    # action called a subcommand that existed in source but hadn't been
+    # published to npm yet under `latest`, so CI had to switch to building
+    # calm-cli from source + skip-install to work around it. Since
+    # release.yml stamps the crate version from the release tag and
+    # publishes the matching npm version from that SAME tag in one
+    # coordinated workflow, `github.action_ref` (the tag THIS action
+    # instance was invoked at, e.g. "v0.6.0") is exactly the npm version
+    # guaranteed to match what this copy of action.yml expects -- resolved
+    # here instead of trusting npm's independently-moving `latest` dist-tag.
+    - name: Resolve calm version
+      if: inputs.skip-install != 'true'
+      id: calm_version
+      shell: bash
+      env:
+        INPUT_VERSION: ${{ inputs.version }}
+        ACTION_REF: ${{ github.action_ref }}
+      run: |
+        set -euo pipefail
+        version="$INPUT_VERSION"
+        if [ "$version" = "latest" ]; then
+          if [[ "$ACTION_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            version="${ACTION_REF#v}"
+          else
+            # Not invoked at a release tag (e.g. a branch ref during this
+            # action's own development) -- no fixed release point to pin
+            # to, so fall back to real npm latest rather than guessing.
+            version="latest"
+          fi
+        fi
+        echo "version=$version" >> "$GITHUB_OUTPUT"
+
     - name: Install calm
       if: inputs.skip-install != 'true'
       shell: bash
       env:
-        CALM_VERSION: ${{ inputs.version }}
+        CALM_VERSION: ${{ steps.calm_version.outputs.version }}
       run: npm install --global "@eilodon/calm-mcp@$CALM_VERSION"
 
     # All `github.*`/`inputs.*` context values are threaded in via `env:`
@@ -105,8 +147,23 @@ runs:
         # so `calm guard --base` would fail to resolve it. Fetch it
         # explicitly rather than requiring every caller to remember
         # `fetch-depth: 0` in their own checkout step.
+        #
+        # Audit 11.4: a plain `--depth=1` fetch of the base ref (the prior
+        # version of this fix) has NO history shared with this checkout's
+        # OWN also-depth=1 HEAD -- `calm guard --base` builds a
+        # merge-base-relative `<base>...HEAD` range, and `git merge-base`
+        # then fails outright ("fatal: <base>...HEAD: no merge base")
+        # unless the two single commits happen to coincide. Reproduced for
+        # real in calm-guard-dogfood CI. `--depth=100` covers the
+        # overwhelming common case (most branches diverge by a handful of
+        # commits from their base); the `--unshallow` fallback guarantees a
+        # merge-base is found for anything that diverged further, at the
+        # cost of a slower fetch only in that rarer case.
         if [ -n "$fetch_ref" ]; then
-          git fetch --no-tags --depth=1 origin "$fetch_ref" || true
+          git fetch --no-tags --depth=100 origin "$fetch_ref" || true
+          if ! git merge-base "origin/$fetch_ref" HEAD >/dev/null 2>&1; then
+            git fetch --no-tags --unshallow origin || true
+          fi
         fi
 
         echo "commits=$commits" >> "$GITHUB_OUTPUT"

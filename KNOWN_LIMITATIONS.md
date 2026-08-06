@@ -94,16 +94,6 @@ genuinely absent: per-IP rate limiting, backoff, or request queueing.
 `docs/http-transport.md` is explicit this remains defense-in-depth only;
 put a real reverse proxy in front if you need actual rate limiting.
 
-## Shared daemon has one capability ceiling for every connection
-
-A daemon's tool-preset ceiling is fixed at whichever process first
-spawned it (`crates/calm-server/src/daemon.rs`); `calm connect --preset`
-only takes effect if that connection is the one doing the spawning. Two
-MCP clients attached to the same project daemon share the same ceiling —
-there's no per-connection handshake negotiating a narrower profile per
-client. Each connection *does* get its own session state (`oriented`,
-`enabled_toolsets`, `session_log`), just not its own ceiling.
-
 ## Malicious/pathological-repo indexing DoS has partial mitigations
 
 `SECURITY.md` still calls resource-exhaustion-via-huge-repo out of scope
@@ -129,22 +119,3 @@ native/GitHub-release path doesn't. Renaming the native binary is a
 breaking change for anyone who's already scripted against `calm` and
 needs a deliberate decision (and probably a compatibility-alias
 transition period), not a silent rename — not done here.
-
-## No Git/CI-native integration path
-
-Everything above mostly assumes an MCP client calling CALM's tools
-directly. A first step now exists: `calm guard --project-root .`
-(`crates/calm-cli/src/main.rs`) runs the exact same `diff_impact` tool
-an MCP agent's own Stage-7 pre-commit gate uses, against the staged diff
-(`git diff --cached`) by default, and exits non-zero when the resulting
-`aggregate_risk` is at or above `--fail-on` (default `high`) — usable
-directly as a pre-commit hook or CI step for a change made outside any
-MCP session (a teammate's native editor, a bot PR), which was previously
-invisible to CALM entirely. `calm guard --base origin/main`-style
-PR-range analysis now also exists (`--base <ref>`, sugar for the
-merge-base-relative `<ref>...HEAD` commits range; `--commits <range>`
-for raw passthrough when that convention isn't what's wanted) — this
-was indeed mostly CLI plumbing onto `diff_impact`'s pre-existing
-`commits` param, as this section previously predicted. What's still
-missing: no publishable GitHub Action wrapping `calm guard` for
-one-line CI adoption.

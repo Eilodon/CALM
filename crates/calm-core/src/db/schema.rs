@@ -92,6 +92,7 @@ CREATE TABLE IF NOT EXISTS symbols (
     caller_count    INTEGER NOT NULL DEFAULT 0,
     is_hub          INTEGER NOT NULL DEFAULT 0,
     coreness        INTEGER,
+    possible_coreness INTEGER,
     is_entry_point  INTEGER NOT NULL DEFAULT 0,
     file_hash       TEXT NOT NULL DEFAULT '',
     indexed_at      REAL NOT NULL DEFAULT 0,
@@ -598,6 +599,7 @@ fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
         "INTEGER NOT NULL DEFAULT 0",
     )?;
     migrate_add_column(conn, "symbols", "coreness", "INTEGER")?;
+    migrate_add_column(conn, "symbols", "possible_coreness", "INTEGER")?;
     migrate_add_column(conn, "symbols", "class_context", "TEXT")?;
     migrate_add_column(conn, "symbols", "is_test", "INTEGER NOT NULL DEFAULT 0")?;
     migrate_add_column(

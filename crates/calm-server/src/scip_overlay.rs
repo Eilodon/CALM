@@ -39,13 +39,25 @@ static OVERLAY_RERUN: AtomicBool = AtomicBool::new(false);
 /// *incremental* trigger — the watcher loop and the edit tools' post-write
 /// reindex — while startup (`lib.rs`) keeps calling `run_all` directly (a
 /// single, naturally serialized call).
-pub fn run_all_coalesced(root: &Path, db_path: &Path) {
+///
+/// Returns `true` if THIS call was the one that actually drove the pass (it
+/// won the `OVERLAY_IN_FLIGHT` CAS and looped until no rerun was pending —
+/// by construction, everything requested by any caller up to the moment
+/// this returns has been covered), `false` if it deferred entirely to an
+/// already-in-flight leader (only flagged a rerun and returned immediately,
+/// having done no real work of its own). Audit 3.3: the durable
+/// `maintenance_jobs` outbox (`crates/calm-server/src/tools/edit.rs`'s SCIP
+/// spawn) needs this distinction — a deferred call finishing near-instantly
+/// must NOT be allowed to call `maintenance::mark_completed`, or a still-
+/// running leader's actual coverage of a newer trigger can get marked
+/// 'done' before it's true.
+pub fn run_all_coalesced(root: &Path, db_path: &Path) -> bool {
     if OVERLAY_IN_FLIGHT
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
     {
         OVERLAY_RERUN.store(true, Ordering::Release);
-        return;
+        return false;
     }
     loop {
         OVERLAY_RERUN.store(false, Ordering::Release);
@@ -57,9 +69,12 @@ pub fn run_all_coalesced(root: &Path, db_path: &Path) {
     OVERLAY_IN_FLIGHT.store(false, Ordering::Release);
     // Close the lost-wakeup window: a rerun flagged between the final load
     // above and the in-flight release would otherwise be dropped silently.
+    // The recursive call's own return value is irrelevant here — THIS call
+    // was still the (continuing) leader for its own trigger either way.
     if OVERLAY_RERUN.swap(false, Ordering::AcqRel) {
         run_all_coalesced(root, db_path);
     }
+    true
 }
 
 /// Runs the rust + go + python + js + java + csharp + php + clang SCIP
@@ -374,5 +389,72 @@ mod tests {
             &calm_core::scip::provider::PYTHON,
             &disabled,
         ));
+    }
+
+    /// Audit 3.3: `crates/calm-server/src/tools/edit.rs`'s durable
+    /// maintenance outbox now depends on `run_all_coalesced`'s return value
+    /// to decide whether it's safe to call `maintenance::mark_completed` --
+    /// only the call that actually led the pass may report completion, a
+    /// deferred one must not. This exercises the CAS/rerun-flag contract
+    /// directly rather than through real language overlays: an empty
+    /// project (no `file_index` rows for any language) makes `run_all`
+    /// itself a fast no-op via `should_schedule_overlay`'s early-return, so
+    /// only the coalescing mechanics are under test.
+    ///
+    /// One combined test, not two, because `OVERLAY_IN_FLIGHT`/
+    /// `OVERLAY_RERUN` are process-global statics — a second `#[test]`
+    /// touching them could interleave with this one under the default
+    /// parallel test harness.
+    #[test]
+    fn run_all_coalesced_reports_leader_vs_deferred_correctly() {
+        let dir = std::env::temp_dir().join(format!(
+            "ci_run_all_coalesced_leader_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("index.db");
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            calm_core::db::schema::init_db(&conn).unwrap();
+        }
+
+        // Precondition: nothing else in this process currently holds the
+        // in-flight flag (true by construction in a fresh test binary
+        // process unless another test both touches it AND doesn't clean up
+        // -- guarded explicitly so a future such test fails loudly here
+        // instead of this one flaking silently).
+        assert!(
+            !OVERLAY_IN_FLIGHT.load(Ordering::Acquire),
+            "OVERLAY_IN_FLIGHT was already held entering this test -- another test leaked it"
+        );
+
+        // A normal call with no contention: this call must become leader.
+        assert!(
+            run_all_coalesced(&dir, &db_path),
+            "an uncontended call must lead (and fully drain) the pass"
+        );
+        assert!(
+            !OVERLAY_IN_FLIGHT.load(Ordering::Acquire),
+            "a leader call must release the flag before returning"
+        );
+
+        // Simulate another thread already being the leader, then a second
+        // trigger arriving concurrently: it must defer, not double-run.
+        OVERLAY_IN_FLIGHT.store(true, Ordering::Release);
+        assert!(
+            !run_all_coalesced(&dir, &db_path),
+            "a call while another leader is in flight must defer, not lead"
+        );
+        assert!(
+            OVERLAY_RERUN.load(Ordering::Acquire),
+            "deferring must flag a rerun so the real leader picks up this trigger"
+        );
+
+        // Clean up process-global state so later tests in this binary don't
+        // inherit it.
+        OVERLAY_IN_FLIGHT.store(false, Ordering::Release);
+        OVERLAY_RERUN.store(false, Ordering::Release);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

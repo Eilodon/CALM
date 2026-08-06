@@ -243,8 +243,26 @@ impl CalmServer {
                 calm_core::maintenance::MaintenanceKind::ScipRefresh => {
                     #[cfg(feature = "scip-overlay")]
                     {
-                        crate::scip_overlay::run_all_coalesced(&self.project_root, &self.db_path);
-                        Ok(())
+                        // Audit 3.3: same reasoning as the edit.rs SCIP spawn
+                        // -- if this explicit retry call merely deferred to
+                        // an already-in-flight leader elsewhere (another
+                        // process's edit triggered one concurrently), it did
+                        // no real work of its own and must not report success
+                        // here; the caller sees this as a request that's
+                        // "covered by the in-flight pass", not a failure.
+                        let led =
+                            crate::scip_overlay::run_all_coalesced(&self.project_root, &self.db_path);
+                        if led {
+                            Ok(())
+                        } else {
+                            Err(
+                                "deferred to an already-in-flight scip_refresh pass elsewhere \
+                                 (likely another process/session) -- that pass covers this \
+                                 request too; check maintenance_status shortly instead of \
+                                 retrying immediately"
+                                    .to_string(),
+                            )
+                        }
                     }
                     #[cfg(not(feature = "scip-overlay"))]
                     {

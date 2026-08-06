@@ -334,14 +334,31 @@ pub fn advance(
     actor: &str,
     reason: &str,
 ) -> Result<(), TxnError> {
-    let current = current_state(conn, tx_id)?.ok_or_else(|| TxnError::NotFound {
-        tx_id: tx_id.to_string(),
-    })?;
-    if !allowed_next(current).contains(&to) {
-        return Err(TxnError::InvalidTransition { from: current, to });
-    }
+    // PATTERN-DEBT txn-advance-check-then-act-race, fixed 2026-08-06:
+    // `BEGIN IMMEDIATE` now runs FIRST, before the state read below --
+    // previously `current_state` was a plain, unlocked SELECT taken BEFORE
+    // acquiring the write lock, so two concurrent `advance()` calls on the
+    // SAME tx_id (e.g. an MCP client retrying `verify_change` after a slow
+    // `cargo check`) could both read the same pre-lock state, both pass
+    // `allowed_next`, and then serialize their COMMITs into two CONFLICTING
+    // terminal transitions -- the second writer's `write_transition` used
+    // its own stale `current` as `from`, not whatever the first writer
+    // actually left behind. `BEGIN IMMEDIATE` blocks (up to the
+    // connection's `busy_timeout`) until any other writer's transaction on
+    // this database finishes, so by the time `current_state` runs below,
+    // it is guaranteed to reflect the very latest committed state for as
+    // long as this transaction continues to hold the lock -- closing the
+    // race instead of narrowing its window.
     conn.execute_batch("BEGIN IMMEDIATE;")?;
-    let result = write_transition(conn, tx_id, current, to, actor, reason);
+    let result = (|| -> Result<(), TxnError> {
+        let current = current_state(conn, tx_id)?.ok_or_else(|| TxnError::NotFound {
+            tx_id: tx_id.to_string(),
+        })?;
+        if !allowed_next(current).contains(&to) {
+            return Err(TxnError::InvalidTransition { from: current, to });
+        }
+        write_transition(conn, tx_id, current, to, actor, reason)
+    })();
     match result {
         Ok(()) => {
             conn.execute_batch("COMMIT;")?;
@@ -378,23 +395,30 @@ pub fn advance(
 /// for. See the design doc's §5.0/§5.3 for why that specific case is
 /// deliberately not supported here.
 ///
-/// Returns one `Result` per input transition, in the same order, so a
-/// caller can handle each exactly as it would have from N separate
-/// `advance()` calls.
+/// Returns `Ok(Vec<Result<...>>)` — one inner `Result` per input transition,
+/// in the same order, so a caller can handle each exactly as it would have
+/// from N separate `advance()` calls, PROVIDED the outer call itself
+/// returned `Ok`. The outer `Result` is the fix for PATTERN-DEBT
+/// advance-many-swallows-commit-failure (2026-08-06): every inner `Ok` in
+/// the returned `Vec` was computed by successfully applying that
+/// transition to `conn` inside a `SAVEPOINT`, but a `SAVEPOINT` is only
+/// durable once the ENCLOSING `BEGIN IMMEDIATE`/`COMMIT` itself succeeds —
+/// this used to run the outer `COMMIT` and discard its `Result` with
+/// `let _ = ...`, so a caller inspecting a per-item `Ok` had no way to tell
+/// "durably committed" from "computed correctly, then discarded by a
+/// failed outer commit nobody surfaced". A `BEGIN`/`COMMIT` failure now
+/// returns `Err` for the WHOLE batch instead — the caller cannot naively
+/// treat any individual item as durable when that happens, exactly as it
+/// should be since none of them are.
 pub fn advance_many(
     conn: &Connection,
     transitions: &[(&str, TxState, &str, &str)],
-) -> Vec<Result<(), TxnError>> {
+) -> Result<Vec<Result<(), TxnError>>, TxnError> {
     if transitions.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
-    if let Err(e) = conn.execute_batch("BEGIN IMMEDIATE;") {
-        let msg = format!("could not begin batch transaction: {e}");
-        return transitions
-            .iter()
-            .map(|_| Err(TxnError::Corrupt(msg.clone())))
-            .collect();
-    }
+    conn.execute_batch("BEGIN IMMEDIATE;")
+        .map_err(|e| TxnError::Corrupt(format!("could not begin batch transaction: {e}")))?;
     let results: Vec<Result<(), TxnError>> = transitions
         .iter()
         .enumerate()
@@ -423,8 +447,14 @@ pub fn advance_many(
             outcome
         })
         .collect();
-    let _ = conn.execute_batch("COMMIT;");
-    results
+    conn.execute_batch("COMMIT;").map_err(|e| {
+        TxnError::Corrupt(format!(
+            "advance_many outer commit failed: {e} -- {} item result(s) were computed but are \
+             NOT durable",
+            results.len()
+        ))
+    })?;
+    Ok(results)
 }
 
 /// Replays every `tx_events` row for `tx_id` in sequence order and returns
@@ -795,7 +825,8 @@ mod tests {
                 (tx_b.tx_id.as_str(), TxState::FileCommitted, "system", "r"),
                 (tx_c.tx_id.as_str(), TxState::FileCommitted, "system", "r"),
             ],
-        );
+        )
+        .expect("outer batch transaction must commit cleanly here");
 
         assert_eq!(results.len(), 3);
         for r in &results {
@@ -826,6 +857,141 @@ mod tests {
         );
     }
 
+    /// PATTERN-DEBT txn-advance-check-then-act-race, fixed 2026-08-06: two
+    /// real OS threads, each with its OWN connection to the SAME
+    /// file-backed state.db, both call `advance()` on the SAME tx_id with
+    /// two DIFFERENT, mutually exclusive terminal transitions (the exact
+    /// shape of a client retrying `verify_change` while a previous call is
+    /// still finishing `cargo check`). Before the fix, `current_state` was
+    /// read before `BEGIN IMMEDIATE` acquired the write lock, so both
+    /// threads could read the same pre-lock `VERIFY_PENDING` state, both
+    /// pass `allowed_next`, and then serialize their commits into two
+    /// conflicting `tx_events` rows both claiming `from: VERIFY_PENDING` --
+    /// the loser's write landing last regardless of which state was
+    /// actually current when it ran. `BEGIN IMMEDIATE` now runs first, so
+    /// the loser blocks until the winner commits, then re-reads state and
+    /// correctly sees it's no longer `VERIFY_PENDING`.
+    #[test]
+    fn advance_concurrent_conflicting_transitions_do_not_corrupt_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("state.db");
+
+        let tx_id = {
+            let conn = crate::db::conn::open_state_writer(&db_path).unwrap();
+            crate::db::schema::init_state_db(&conn).unwrap();
+            let tx = begin(&conn, "proj", "f.rs", "base", "proposed").unwrap();
+            advance(&conn, &tx.tx_id, TxState::FileCommitted, "system", "r").unwrap();
+            advance(&conn, &tx.tx_id, TxState::IndexCommitted, "system", "r").unwrap();
+            advance(&conn, &tx.tx_id, TxState::VerifyPending, "system", "r").unwrap();
+            tx.tx_id
+        };
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+        let handle_done = {
+            let db_path = db_path.clone();
+            let tx_id = tx_id.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let conn = crate::db::conn::open_state_writer(&db_path).unwrap();
+                barrier.wait();
+                advance(&conn, &tx_id, TxState::Done, "system", "cargo check passed")
+            })
+        };
+        let handle_failed = {
+            let db_path = db_path.clone();
+            let tx_id = tx_id.clone();
+            std::thread::spawn(move || {
+                let conn = crate::db::conn::open_state_writer(&db_path).unwrap();
+                barrier.wait();
+                advance(&conn, &tx_id, TxState::Failed, "system", "cargo check failed")
+            })
+        };
+
+        let result_done = handle_done.join().unwrap();
+        let result_failed = handle_failed.join().unwrap();
+
+        // VERIFY_PENDING can legally become Done XOR Failed, never both --
+        // exactly one of the two racing terminal transitions may win.
+        let wins = [result_done.is_ok(), result_failed.is_ok()];
+        assert_eq!(
+            wins.iter().filter(|w| **w).count(),
+            1,
+            "exactly one racing terminal transition must win: done={result_done:?} failed={result_failed:?}"
+        );
+
+        let conn = crate::db::conn::open_state_writer(&db_path).unwrap();
+        let cached_state = get(&conn, &tx_id).unwrap().unwrap().state;
+        let replayed_state = replay_state(&conn, &tx_id).unwrap();
+        assert_eq!(
+            cached_state, replayed_state,
+            "cached state and event-log replay must always agree, even under this race"
+        );
+        let expected = if result_done.is_ok() {
+            TxState::Done
+        } else {
+            TxState::Failed
+        };
+        assert_eq!(
+            cached_state, expected,
+            "final state must match whichever side's advance() call actually returned Ok"
+        );
+    }
+
+    /// PATTERN-DEBT advance-many-swallows-commit-failure, fixed 2026-08-06:
+    /// `advance_many` used to run its outer `COMMIT`/`BEGIN IMMEDIATE` with
+    /// `let _ = ...`, discarding the result -- a caller inspecting the
+    /// returned `Vec<Result<...>>` had no way to tell "every item durably
+    /// committed" from "every item computed correctly, then silently
+    /// dropped by a failed outer transaction". Simulated here by holding
+    /// the write lock open on a SEPARATE connection so `advance_many`'s own
+    /// `BEGIN IMMEDIATE` can never acquire it and times out `SQLITE_BUSY`
+    /// -- stands in for any real outer-transaction failure (disk full, I/O
+    /// error, genuine contention) the same way: a failure at `BEGIN
+    /// IMMEDIATE` itself, not at any individual item's `SAVEPOINT` (a
+    /// read-only connection was tried first and does NOT reproduce this --
+    /// SQLite only rejects the write at the `SAVEPOINT`/write statement,
+    /// which is already the separately-tested per-item-isolation path).
+    #[test]
+    fn advance_many_surfaces_a_failed_outer_transaction_instead_of_lying() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("state.db");
+        let tx_id = {
+            let conn = crate::db::conn::open_state_writer(&db_path).unwrap();
+            crate::db::schema::init_state_db(&conn).unwrap();
+            begin(&conn, "proj", "f.rs", "base", "proposed").unwrap().tx_id
+        };
+
+        // Holds the RESERVED lock for the whole test -- advance_many's own
+        // BEGIN IMMEDIATE below can never acquire it.
+        let blocker = crate::db::conn::open_state_writer(&db_path).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE;").unwrap();
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.busy_timeout(std::time::Duration::from_millis(50))
+            .unwrap();
+
+        let result = advance_many(
+            &conn,
+            &[(tx_id.as_str(), TxState::FileCommitted, "system", "r")],
+        );
+
+        assert!(
+            result.is_err(),
+            "a batch that can never even acquire BEGIN IMMEDIATE's write lock must return a \
+             single Err, not a Vec of item results a caller could mistake for durable: {result:?}"
+        );
+
+        blocker.execute_batch("ROLLBACK;").unwrap();
+
+        let check_conn = crate::db::conn::open_state_writer(&db_path).unwrap();
+        assert_eq!(
+            get(&check_conn, &tx_id).unwrap().unwrap().state,
+            TxState::Prepared,
+            "a batch that could not even begin its transaction must leave every tx_id untouched"
+        );
+    }
+
     /// Tier 2 Option B, failure isolation: one tx_id's transition being
     /// invalid (already terminal, or wrong current state) must not block or
     /// roll back any OTHER tx_id's transition in the same
@@ -848,7 +1014,8 @@ mod tests {
                 (tx_ok.tx_id.as_str(), TxState::FileCommitted, "system", "r"),
                 (tx_bad.tx_id.as_str(), TxState::FileCommitted, "system", "r"),
             ],
-        );
+        )
+        .expect("outer batch transaction must commit even though one item is invalid");
 
         assert_eq!(results.len(), 2);
         assert!(results[0].is_ok(), "tx_ok's transition: {:?}", results[0]);

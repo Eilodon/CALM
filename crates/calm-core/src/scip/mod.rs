@@ -207,6 +207,27 @@ pub fn run_overlay_for_with_catalog(
         insert_missing,
         Some(&proof_context),
     )?;
+    if stats.discarded_stale_generation {
+        // PATTERN-DEBT scip-cache-commits-discarded-generation, fixed
+        // 2026-08-06: the graph mutated (another edit's reindex bumped
+        // `graph_generation_state`) between capturing `graph_generation`
+        // above and this ingest call actually running, so every mutation
+        // this pass would have made was discarded by the fence inside
+        // `ingest_occurrences_with_proof_context`. Returning here WITHOUT
+        // calling `state::write_state` below is the fix: writing the cache
+        // key anyway would make `read_cache_key(...) == Some(key)` true on
+        // the next call (the early-return check above), silently skipping
+        // this provider's indexer forever for this exact input — the
+        // formal-tier evidence this run was supposed to produce would
+        // never be retried.
+        tracing::info!(
+            "SCIP overlay ({}): graph generation changed mid-run — discarding this \
+             pass's evidence and leaving the cache key untouched so the next reindex \
+             retries it",
+            provider.lang
+        );
+        return Ok(stats);
+    }
     tracing::info!(
         "SCIP overlay ({}): {} edges upgraded to formal, {} fan-out siblings ruled out, \
          {} edges inserted, match_rate={:.2}",
@@ -488,6 +509,7 @@ pub fn run_go_workspace_overlay_with_catalog(
     let mut total = ingest::IngestStats::default();
     let mut match_rate_sum = 0.0;
     let mut ok_modules = 0usize;
+    let mut discarded_stale_generation = false;
 
     for module_rel in modules {
         let module_root = root.join(module_rel);
@@ -528,6 +550,24 @@ pub fn run_go_workspace_overlay_with_catalog(
             insert_missing,
             Some(&proof_context),
         )?;
+        if stats.discarded_stale_generation {
+            // Same fence as `run_overlay_for_with_catalog` (PATTERN-DEBT
+            // scip-cache-commits-discarded-generation): the graph mutated
+            // while this workspace pass was still iterating modules.
+            // `proof_context` was captured once, before the loop, so
+            // EVERY remaining module will hit this same fence from here
+            // on -- there's no way for a later module in this same call
+            // to still be trustworthy. Don't accumulate its (all-zero)
+            // stats, and don't let the write below persist a cache key
+            // that would claim full workspace coverage.
+            tracing::info!(
+                "SCIP overlay (go workspace, module {}): graph generation changed mid-run — \
+                 discarding this module's evidence",
+                module_rel.display()
+            );
+            discarded_stale_generation = true;
+            continue;
+        }
         tracing::info!(
             "SCIP overlay (go, module {}): {} edges upgraded to formal, {} fan-out siblings ruled out, \
              {} edges inserted, match_rate={:.2}",
@@ -551,6 +591,15 @@ pub fn run_go_workspace_overlay_with_catalog(
 
     if total.upgraded > 0 || total.ruled_out > 0 || total.inserted > 0 {
         crate::indexer::pipeline::refresh_caller_counts(conn)?;
+    }
+
+    if discarded_stale_generation {
+        tracing::info!(
+            "SCIP overlay (go workspace): at least one module's evidence was discarded due to \
+             a graph-generation change mid-run — leaving the cache key untouched so the next \
+             reindex retries the whole workspace"
+        );
+        return Ok(total);
     }
 
     // DB-resident, not a sidecar file — same posture and mechanism as

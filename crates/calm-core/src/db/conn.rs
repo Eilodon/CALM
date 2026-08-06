@@ -62,6 +62,41 @@ mod tests {
             .unwrap();
         assert_eq!(ms, WRITER_BUSY_TIMEOUT.as_millis() as i64);
     }
+
+    /// Neither `open_writer` nor `open_state_writer` ever runs `PRAGMA
+    /// foreign_keys = ON` explicitly -- easy to misread as "FK enforcement
+    /// is inert here" (SQLite's own PRAGMA docs describe the runtime
+    /// default as OFF). It is NOT inert in this binary specifically
+    /// because `libsqlite3-sys`'s bundled build (this workspace's
+    /// `rusqlite = { features = ["bundled", ...] }`, see root `Cargo.toml`)
+    /// unconditionally compiles the vendored `sqlite3.c` with
+    /// `-DSQLITE_DEFAULT_FOREIGN_KEYS=1`, which changes the COMPILED-IN
+    /// default for every fresh connection to ON. This test exists so that
+    /// invariant is asserted where it can actually break: dropping the
+    /// `bundled` feature (e.g. to link a system SQLite instead) would
+    /// silently flip this default back to OFF with no compiler error,
+    /// since nothing in this crate's own source enables it explicitly.
+    #[test]
+    fn writer_connections_enforce_foreign_keys_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        for (label, conn) in [
+            ("open_writer", open_writer(&dir.path().join("index.db")).unwrap()),
+            (
+                "open_state_writer",
+                open_state_writer(&dir.path().join("state.db")).unwrap(),
+            ),
+        ] {
+            let fk: i64 = conn
+                .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(
+                fk, 1,
+                "{label}: PRAGMA foreign_keys must default to ON (relies on the bundled \
+                 SQLite's SQLITE_DEFAULT_FOREIGN_KEYS=1 compile flag -- if this ever fails, \
+                 every ON DELETE CASCADE in db/schema.rs silently stopped being enforced)"
+            );
+        }
+    }
     /// audit H5: writer connections must run under synchronous=NORMAL, not
     /// the SQLite default (FULL) — safe under the WAL mode init_db already
     /// sets, and cheaper for an index.db that's fully rebuildable anyway.

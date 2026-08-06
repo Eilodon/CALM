@@ -47,6 +47,22 @@ pub struct IngestStats {
     /// to upgrade, rule out, or insert anything. See
     /// `parse::ScipOccurrence::guessed_alt_byte_range`.
     pub ambiguous: usize,
+    /// `true` when this ENTIRE pass was discarded because the graph
+    /// mutated between when the caller captured `graph_generation`
+    /// (`ExternalProofContext::at_graph_generation`) and when this
+    /// function's fence checked it against `graph_generation_state` --
+    /// every other field is forced to its zero/default value in that case,
+    /// since no DB row was touched. Distinguishes "discarded, stale" from
+    /// "ran cleanly and genuinely found nothing" (both otherwise look like
+    /// an all-zero `IngestStats`). Callers MUST NOT persist a cache key /
+    /// "this input has been seen" marker when this is `true` -- doing so
+    /// makes the discarded evidence silently unrecoverable, because the
+    /// next run would then skip re-invoking the indexer for the same
+    /// input entirely (PATTERN-DEBT scip-cache-commits-discarded-generation,
+    /// fixed 2026-08-06: `run_overlay_for_with_catalog`/
+    /// `run_go_workspace_overlay_with_catalog` both now check this before
+    /// calling `state::write_state`).
+    pub discarded_stale_generation: bool,
 }
 
 /// Provider inputs that make an exact external result auditable.  Callers that
@@ -165,7 +181,13 @@ pub fn ingest_occurrences_with_proof_context(
             |row| row.get(0),
         )?;
         if current_generation != expected_generation {
-            return Ok(IngestStats::default());
+            // Tagged (not a bare `default()`) so callers can tell "discarded,
+            // stale" apart from "ran cleanly and found nothing" -- see
+            // `IngestStats::discarded_stale_generation`'s doc comment.
+            return Ok(IngestStats {
+                discarded_stale_generation: true,
+                ..Default::default()
+            });
         }
     }
     // Moniker -> declaration location is still sufficient for identifying the
@@ -339,6 +361,7 @@ pub fn ingest_occurrences_with_proof_context(
             satisfied.len() as f64 / ref_targets.len() as f64
         },
         ambiguous,
+        discarded_stale_generation: false,
     })
 }
 
@@ -643,6 +666,9 @@ fn ingest_line_keyed_occurrences_for_regression(
         // second-guess (see `parse::ScipOccurrence::guessed_alt_byte_range`'s
         // doc comment) — nothing to flag as ambiguous.
         ambiguous: 0,
+        // This legacy path never checks `graph_generation_state` at all —
+        // it can't discard for staleness in the first place.
+        discarded_stale_generation: false,
     })
 }
 
@@ -1882,9 +1908,25 @@ mod tests {
 
         let context = super::ExternalProofContext::new("scip:test", "provider", "context")
             .at_graph_generation(0);
+        let stats =
+            super::ingest_occurrences_with_proof_context(&conn, &[], true, Some(&context))
+                .unwrap();
+        // PATTERN-DEBT scip-cache-commits-discarded-generation: a discarded
+        // pass must be tagged, not silently indistinguishable from a clean
+        // "ran and genuinely found nothing" pass -- callers rely on this to
+        // decide whether it's safe to persist a cache key.
+        assert!(
+            stats.discarded_stale_generation,
+            "a graph-generation mismatch must set discarded_stale_generation"
+        );
         assert_eq!(
-            super::ingest_occurrences_with_proof_context(&conn, &[], true, Some(&context)).unwrap(),
-            super::IngestStats::default()
+            stats,
+            super::IngestStats {
+                discarded_stale_generation: true,
+                ..Default::default()
+            },
+            "every other field must still be zero -- no DB row may be touched when the \
+             generation fence rejects the pass"
         );
     }
 

@@ -266,7 +266,21 @@ save_state() {
   # them, silently zeroing the tally.
   acquire_state_lock
   local prev='{}'
-  [ -f "$state_file" ] && prev=$(cat "$state_file" 2>/dev/null || echo '{}')
+  if [ -f "$state_file" ]; then
+    prev=$(cat "$state_file" 2>/dev/null || echo '{}')
+    # Self-heal a corrupted/empty state file instead of perpetuating it:
+    # bash's `>` redirect below truncates $state_file the instant the `jq
+    # -n` command starts, BEFORE jq has produced any output -- so if that
+    # jq call ever fails (bad $1/$2/$3 JSON, OOM, killed mid-run) the file
+    # is left at 0 bytes with nothing written back. Every later
+    # save_state/bump call then reads that empty file into $prev, which is
+    # NOT valid JSON, so --argjson/<<< again fails the exact same way —
+    # once corrupted, permanently corrupted for the rest of the session
+    # (confirmed live: a real session's state file was still 0 bytes after
+    # 200+ tool calls). Validating $prev here and falling back to '{}' on
+    # a parse failure makes the very next successful call recover instead.
+    jq -e . >/dev/null 2>&1 <<<"$prev" || prev='{}'
+  fi
   jq -n --argjson prev "$prev" --argjson ecf "$1" --argjson nd "$2" --argjson nc "$3" \
     '$prev + {edit_context_files: $ecf, needs_diff_impact: $nd, nudge_counts: $nc}' \
     >"$state_file" 2>/dev/null || true
@@ -279,7 +293,12 @@ save_state() {
 bump() {
   acquire_state_lock
   local prev='{}'
-  [ -f "$state_file" ] && prev=$(cat "$state_file" 2>/dev/null || echo '{}')
+  if [ -f "$state_file" ]; then
+    prev=$(cat "$state_file" 2>/dev/null || echo '{}')
+    # Same self-heal as save_state — see its comment for the corruption
+    # mechanism this guards against.
+    jq -e . >/dev/null 2>&1 <<<"$prev" || prev='{}'
+  fi
   jq -c --arg k "$1" '.[$k] = ((.[$k] // 0) + 1)' <<<"$prev" >"$state_file" 2>/dev/null || true
   release_state_lock
 }
@@ -465,6 +484,18 @@ maybe_nudge_session_context() {
   acquire_state_lock
   local prev
   prev=$(cat "$state_file" 2>/dev/null || echo '{}')
+  # Same self-heal as save_state/bump (see save_state's comment for the
+  # corruption mechanism): this function is its own independent
+  # read-modify-write path on $state_file, so it needs its own guard, not
+  # just save_state's/bump's -- a corrupted/empty $prev here used to make
+  # `n=$(jq -r ... <<<"$prev")` fail silently (empty $n), which bash's
+  # arithmetic then read as 0, so `$((n % SESSION_CONTEXT_REMINDER_EVERY))
+  # -eq 0` was ALWAYS true -- the "possibly_stuck" reminder fired on every
+  # single call instead of every Nth one, and the write right after it
+  # re-truncated $state_file to empty again on every call, permanently
+  # undoing save_state's/bump's own fix moments after either one ran (this
+  # function runs last in every dispatch branch).
+  jq -e . >/dev/null 2>&1 <<<"$prev" || prev='{}'
   if [ "$tool_name" = "mcp__calm__session_context" ]; then
     if [ "$(jq -r '.since_session_context // 0' <<<"$prev")" != "0" ]; then
       jq -c '.since_session_context = 0' <<<"$prev" >"$state_file" 2>/dev/null || true

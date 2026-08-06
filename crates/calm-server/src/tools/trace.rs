@@ -602,18 +602,23 @@ impl CalmServer {
             let mut hits: Vec<ReferenceHit> = Vec::new();
             // Dedup key: (path, line) for a line-precise hit; a file-level
             // hit (an import edge, which carries no line number) keys on
-            // (path, None).
+            // (path, None). PATTERN-DEBT reference-impact-file-wide-import-
+            // suppression, fixed 2026-08-06: this used to also maintain an
+            // `import_hit_files` set and drop EVERY textual grep hit in a
+            // file once it had any import-edge hit -- correct for the
+            // import statement's own line (which a bare-name grep also
+            // matches, duplicating the import hit), but wrong for any
+            // OTHER line in that same file with an independent textual
+            // reference (reflection/string lookup, a decorator, a config
+            // key) -- that second, genuinely different reference silently
+            // never reached `hits` at all. An import edge carries no line
+            // number, so there is no reliable way to suppress *only* its
+            // own line; not suppressing by file at all means the import
+            // statement's line may now also surface as its own
+            // `textual_only` hit alongside the existing `must_change`
+            // import hit -- harmless duplication (both are true statements
+            // about that line) versus the prior silent data loss.
             let mut seen: std::collections::HashSet<(String, Option<i64>)> =
-                std::collections::HashSet::new();
-            // Files with a file-level import-edge hit (no line number) --
-            // used below to suppress a textual grep hit that's really just
-            // re-finding that same import statement. Deliberately NOT
-            // built from `seen` as a whole (which also holds line-precise
-            // call-edge hits): a file can have a real call edge at one
-            // line AND an unrelated textual reference at another line --
-            // the latter must still surface, not get suppressed just
-            // because the file already appears elsewhere in `seen`.
-            let mut import_hit_files: std::collections::HashSet<String> =
                 std::collections::HashSet::new();
 
             // 1. Call edges -- same query shape `callers` uses, but
@@ -694,7 +699,6 @@ impl CalmServer {
                     if !seen.insert((from_path.clone(), None)) {
                         continue;
                     }
-                    import_hit_files.insert(from_path.clone());
                     hits.push(ReferenceHit {
                         path: from_path,
                         line: None,
@@ -733,9 +737,6 @@ impl CalmServer {
                                 .is_some_and(|l| l >= c.line_start && l <= c.line_end)
                         {
                             continue; // the definition site itself
-                        }
-                        if import_hit_files.contains(&r.path) {
-                            continue; // already flagged (file-level) via an import edge
                         }
                         if !seen.insert((r.path.clone(), r.line_start)) {
                             continue;
@@ -804,6 +805,34 @@ impl CalmServer {
             })
         }))
     }
+    /// Weakest-link confidence across one `path` route — same principle
+    /// `EdgeConfidence::rank` already uses for coreness/edit gating
+    /// (`formal` > `resolved` > `inferred` > `textual` > `ambiguous`/
+    /// `unresolved`, the bottom two deliberately tied). Fixes PATTERN-DEBT
+    /// path-exists-collapses-ambiguous-confidence: `bidirectional_bfs_path`
+    /// happily traverses `ambiguous` edges (anything not yet
+    /// `ruled_out_by_scip`), and its `exists: Some(true)` says only "a
+    /// route exists in the graph", never whether any hop along it was a
+    /// genuine single-candidate match. A route can be all `ambiguous` hops
+    /// and still surface as `exists: true` with today's confidence-blind
+    /// `routes: Vec<Vec<String>>` — this computes what `path()` uses below
+    /// to tell a caller "possible" from "confirmed" instead of collapsing
+    /// both into the same bare symbol list. A route made of a single
+    /// trivial self-step (`from_symbol == to_symbol`, no real edge at all
+    /// — see `bidirectional_bfs_path`'s early return) has no
+    /// `edge_confidence` to rank at all; reaching a node trivially is
+    /// certain by construction, so that case reports `formal`, not an
+    /// arbitrary/misleadingly-low default.
+    fn weakest_route_confidence(route: &[calm_core::graph::path::PathStep]) -> &'static str {
+        route
+            .iter()
+            .filter_map(|step| step.edge_confidence.as_deref())
+            .filter_map(calm_core::types::EdgeConfidence::parse)
+            .min_by_key(calm_core::types::EdgeConfidence::rank)
+            .unwrap_or(calm_core::types::EdgeConfidence::Formal)
+            .as_str()
+    }
+
     #[tool(
         name = "path",
         description = "USE WHEN: you need to trace if and how symbol A can reach symbol B through call chain. Bidirectional BFS — cycles terminate cleanly. path is DIRECTED: A→B ≠ B→A. terminated_by=null + exists=true/false → certain result.",
@@ -865,17 +894,38 @@ impl CalmServer {
                 )
             };
 
-            let (routes, exists, terminated_by) = match result {
-                Ok(r) => (
-                    r.routes
-                        .into_iter()
-                        .map(|path| path.into_iter().map(|step| step.symbol).collect())
-                        .collect::<Vec<Vec<String>>>(),
-                    r.exists,
-                    r.terminated_by.map(TerminatedByOutput::from),
-                ),
-                Err(_) => (vec![], None, None),
+            let (routes, route_confidence, exists, terminated_by) = match result {
+                Ok(r) => {
+                    let route_confidence: Vec<String> = r
+                        .routes
+                        .iter()
+                        .map(|route| Self::weakest_route_confidence(route).to_string())
+                        .collect();
+                    (
+                        r.routes
+                            .into_iter()
+                            .map(|path| path.into_iter().map(|step| step.symbol).collect())
+                            .collect::<Vec<Vec<String>>>(),
+                        route_confidence,
+                        r.exists,
+                        r.terminated_by.map(TerminatedByOutput::from),
+                    )
+                }
+                Err(_) => (vec![], vec![], None, None),
             };
+
+            // PATTERN-DEBT path-exists-collapses-ambiguous-confidence:
+            // `exists: true` alone doesn't say whether that's backed by a
+            // real, single-candidate chain or purely by fan-out edges the
+            // graph never resolved to one target — `certain` is the
+            // explicit signal for that, `true` only when at least one
+            // returned route's weakest hop is not ambiguous/unresolved.
+            let certain = exists == Some(true)
+                && route_confidence.iter().any(|c| {
+                    calm_core::types::EdgeConfidence::parse(c)
+                        .map(|ec| ec.rank() > 0)
+                        .unwrap_or(true)
+                });
 
             let count = routes.len();
             let sn = if matches!(&terminated_by, Some(TerminatedByOutput::Timeout)) {
@@ -884,8 +934,14 @@ impl CalmServer {
                 let new_hops = requested_hops + 4;
                 suggested_with_args("path", "Path may exceed hop limit — retry with larger max_hops, or check the reverse direction",
                     serde_json::json!({"max_hops": new_hops, "from_symbol": p.to_symbol, "to_symbol": p.from_symbol}))
-            } else if exists == Some(true) {
+            } else if certain {
                 suggested("source", "Read meeting node implementation")
+            } else if exists == Some(true) {
+                suggested_with_args(
+                    "callers",
+                    "Every route relies on an ambiguous/unresolved edge — this is a possible path, not a confirmed one; verify manually before treating it as fact",
+                    serde_json::json!({"symbol": to.qualified_name}),
+                )
             } else {
                 None
             };
@@ -893,8 +949,10 @@ impl CalmServer {
                 from_symbol: p.from_symbol,
                 to_symbol: p.to_symbol,
                 routes,
+                route_confidence,
                 route_count: count,
                 exists,
+                certain,
                 terminated_by,
                 hops_clamped,
                 suggested_next: self.filter_sn(sn),
@@ -1214,8 +1272,21 @@ pub(crate) struct PathOutput {
     pub(crate) from_symbol: String,
     pub(crate) to_symbol: String,
     pub(crate) routes: Vec<Vec<String>>,
+    /// Weakest-hop `EdgeConfidence` per entry in `routes`, same index —
+    /// `"formal"`/`"resolved"`/`"inferred"`/`"textual"` name a real,
+    /// single-candidate chain; `"ambiguous"`/`"unresolved"` mean that route
+    /// rests on at least one unproven, multi-candidate hop. See `certain`.
+    pub(crate) route_confidence: Vec<String>,
     pub(crate) route_count: usize,
     pub(crate) exists: Option<bool>,
+    /// `true` only when `exists` is `true` AND at least one route in
+    /// `routes` is NOT resting on an ambiguous/unresolved hop end to end —
+    /// i.e. there is a real, single-candidate chain from `from_symbol` to
+    /// `to_symbol`, not merely a possibility the graph never ruled out.
+    /// `exists: true, certain: false` means every route found is only a
+    /// possible path — treat it as a lead to verify with `callers`, not as
+    /// a proven fact (PATTERN-DEBT path-exists-collapses-ambiguous-confidence).
+    pub(crate) certain: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) terminated_by: Option<TerminatedByOutput>,
     pub(crate) hops_clamped: bool,

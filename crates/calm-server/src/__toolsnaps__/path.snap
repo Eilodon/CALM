@@ -226,6 +226,13 @@
           }
         }
       },
+      "route_confidence": {
+        "description": "Weakest-hop `EdgeConfidence` per entry in `routes`, same index —\n`\"formal\"`/`\"resolved\"`/`\"inferred\"`/`\"textual\"` name a real,\nsingle-candidate chain; `\"ambiguous\"`/`\"unresolved\"` mean that route\nrests on at least one unproven, multi-candidate hop. See `certain`.",
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
       "route_count": {
         "type": "integer",
         "format": "uint",
@@ -236,6 +243,10 @@
           "boolean",
           "null"
         ]
+      },
+      "certain": {
+        "description": "`true` only when `exists` is `true` AND at least one route in\n`routes` is NOT resting on an ambiguous/unresolved hop end to end —\ni.e. there is a real, single-candidate chain from `from_symbol` to\n`to_symbol`, not merely a possibility the graph never ruled out.\n`exists: true, certain: false` means every route found is only a\npossible path — treat it as a lead to verify with `callers`, not as\na proven fact (PATTERN-DEBT path-exists-collapses-ambiguous-confidence).",
+        "type": "boolean"
       },
       "terminated_by": {
         "anyOf": [

@@ -94,17 +94,23 @@ fi
 #    must still unlock that file for a later native Edit, by falling back to
 #    a read-only lookup against .calm/index.db mirroring resolve_symbol's own
 #    "exactly one row named X" criterion. Uses a real symbol from this repo
-#    (crates/calm-server/src/tools/common.rs::resolve_symbol_candidates) so
+#    (crates/calm-server/src/tools/common.rs::apply_personalization_boost) so
 #    the DB lookup has something real to find -- this is the exact regression
 #    a prior session hit editing crates/calm-cli/src/main.rs (see memory
-#    calm-two-tooling-bugs-root-cause-2026-07-14).
+#    calm-two-tooling-bugs-root-cause-2026-07-14). NOTE 2026-08-06: this used
+#    to reference resolve_symbol_candidates, but that symbol moved to
+#    outcome.rs in the 2026-07-28 hotspot split and this fixture was never
+#    updated -- it was silently testing "does the DB fallback correctly
+#    resolve to wherever the symbol REALLY is" (outcome.rs) while asserting
+#    the OLD location (common.rs), which fails now that the two disagree.
+#    apply_personalization_boost is verified to still live in common.rs.
 run_hook_symbol_only() {
   jq -nc --arg session "$session_id_test" --arg tool "$1" --arg symbol "$2" \
     '{session_id: $session, tool_name: $tool, tool_input: {symbol: $symbol}}' \
     | bash .claude/hooks/calm-nudge.sh
 }
 if [ -f .calm/index.db ]; then
-  run_hook_symbol_only "mcp__calm__edit_context" "resolve_symbol_candidates" >/dev/null
+  run_hook_symbol_only "mcp__calm__edit_context" "apply_personalization_boost" >/dev/null
   out=$(run_hook "Edit" "crates/calm-server/src/tools/common.rs")
   if echo "$out" | jq -e '.hookSpecificOutput.permissionDecision == "deny"' >/dev/null 2>&1; then
     fail "expected allow for common.rs after edit_context(symbol-only) resolved it via the DB fallback, got deny: $out"

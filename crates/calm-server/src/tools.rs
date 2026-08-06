@@ -25,6 +25,7 @@ mod outcome;
 mod patterndebt;
 mod recover;
 mod scip;
+mod session_state;
 mod security;
 mod testgap;
 mod toolset;
@@ -235,6 +236,39 @@ type CoChangeCache = Arc<
     >,
 >;
 
+/// Audit 9.1: RAII guard removing this connection's `active_sessions`
+/// entry when the LAST clone of the `CalmServer` `for_connection()`
+/// produced is dropped. `daemon.rs::ConnectionGuard` already does this for
+/// the unix-socket daemon, tied to that connection's own handling future —
+/// but the HTTP transport (`http.rs::serve_http`)'s per-session factory
+/// calls `for_connection()` the exact same way with no equivalent: every
+/// HTTP session that connected and later disconnected left its
+/// `SessionSummary` in `active_sessions` forever, visible to every other
+/// connection via `session_context.other_active_sessions` and growing
+/// unboundedly over the daemon's lifetime for repeated HTTP session churn
+/// (`rmcp`'s `LocalSessionManager` manages the MCP session lifecycle
+/// itself, but never touches CALM's own registry). Held behind `Arc` in a
+/// new `CalmServer` field (not a bare struct held by some connection-
+/// future, which doesn't exist as a single trackable object for this
+/// transport) so it survives exactly as long as every internal clone
+/// rmcp/axum make while dispatching that session's requests — `Arc`'s own
+/// reference counting is what turns "whichever specific clone happens to
+/// be dropped last" into "the whole session is truly gone". Harmless,
+/// redundant-but-not-conflicting double-removal on the daemon path (a
+/// second `HashMap::remove` on an already-absent key is a no-op).
+struct SessionRegistryGuard {
+    session_id: u64,
+    active_sessions: Arc<Mutex<std::collections::HashMap<u64, SessionSummary>>>,
+}
+
+impl Drop for SessionRegistryGuard {
+    fn drop(&mut self) {
+        if let Ok(mut sessions) = self.active_sessions.lock() {
+            sessions.remove(&self.session_id);
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct CalmServer {
     project_root: PathBuf,
@@ -362,6 +396,15 @@ pub struct CalmServer {
     /// `for_connection` (like `session_log`/`oriented`) so one session's
     /// narrowing never leaks onto another on a shared daemon.
     enabled_toolsets: Arc<RwLock<Option<std::collections::BTreeSet<String>>>>,
+    // Audit 9.1: never read directly (see `SessionRegistryGuard`'s own doc
+    // comment) -- exists purely so its `Drop` fires when the last clone of
+    // a `for_connection`-produced instance goes away. `None` for the
+    // daemon-shared template instance and bare non-daemon/test-constructed
+    // ones (`session_id == 0`, nothing to clean up). Still participates in
+    // `#[derive(Clone)]` like every other field, which is exactly what
+    // keeps the guard alive across per-request clones within one session.
+    #[allow(dead_code)]
+    _session_guard: Option<Arc<SessionRegistryGuard>>,
 }
 impl CalmServer {
     /// Merges every module's `#[tool_router]`-generated router into one —
@@ -2101,6 +2144,66 @@ mod tests {
         assert_ne!(
             v["suggested_next"]["tool"], "indexing_status",
             "a deleted file resolves nothing by waiting — suggested_next must not point at indexing_status for it"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Audit 5.1: unlike ghost.md (markdown, whose ATX-heading symbols never
+    /// have real callers — see `diff_impact`'s own comment at the
+    /// `unverifiable_deletions` push site), a deleted REAL source file (a
+    /// call-graph language) whose `file_index` row is already gone — the
+    /// state reindexing settles into once the deletion has converged — must
+    /// not silently report "low" just because there's nothing left in the
+    /// index to prove otherwise.
+    #[test]
+    fn diff_impact_deleted_source_file_with_no_index_row_reports_unknown_not_low() {
+        let dir = std::env::temp_dir().join(format!(
+            "ci_diff_impact_deleted_source_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        // No prior indexing/write of hub.py at all -- reproduces the
+        // post-convergence end state directly (once a real reindex has
+        // processed a deletion, the file_index row for it is gone, which
+        // reads identically to "never indexed" from diff_impact's own
+        // read-only vantage).
+        let diff = "diff --git a/hub.py b/hub.py\n\
+                     deleted file mode 100644\n\
+                     --- a/hub.py\n\
+                     +++ /dev/null\n\
+                     @@ -1,2 +0,0 @@\n\
+                     -def widely_called():\n\
+                     -    pass\n";
+
+        let output = server.diff_impact(rmcp::handler::server::wrapper::Parameters(
+            DiffImpactParams {
+                diff: Some(diff.to_string()),
+                staged: None,
+                commits: None,
+            },
+        ));
+        let v = jv(output);
+
+        assert_eq!(
+            v["unindexed_files"],
+            serde_json::json!([{"path": "hub.py", "reason": "deleted"}])
+        );
+        assert_eq!(
+            v["aggregate_risk"], "unknown",
+            "a deleted real-source file with no surviving index evidence must not default to \
+             low just because affected_symbols came back empty"
+        );
+        assert_ne!(
+            v["suggested_next"]["tool"], "indexing_status",
+            "waiting for indexing never resolves a deletion's uncertainty"
+        );
+        assert_eq!(
+            v["suggested_next"]["tool"], "search",
+            "should point at a concrete manual check instead"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -3898,6 +4001,18 @@ mod tests {
                 calm_core::maintenance::MaintenanceKind::ScipRefresh,
             )
             .unwrap();
+            // Audit 3.4: `mark_running` now claims a lease that's only
+            // reaped once expired (a live sibling process's still-running
+            // job must survive a second process's startup reconciliation).
+            // This test stands in for "the owning process crashed and
+            // enough wall-clock time passed", so backdate the lease the
+            // same way `maintenance::tests::expire_lease` does, rather than
+            // asserting on a lease that (correctly, now) hasn't expired yet.
+            conn.execute(
+                "UPDATE maintenance_jobs SET lease_expires_at = -1.0 WHERE dedupe_key = 'scip_refresh'",
+                [],
+            )
+            .unwrap();
             // `_server`/`conn` drop here -- standing in for the process exiting
             // before ever reaching mark_completed/txn::advance(Done).
         }
@@ -4230,6 +4345,52 @@ mod tests {
         assert!(
             sessions.contains_key(&id_b),
             "conn_b's own entry must exist"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+
+    /// Audit 9.1: dropping the LAST clone of a `for_connection()`-produced
+    /// instance must remove its `active_sessions` entry -- this is what
+    /// `daemon.rs::ConnectionGuard` already did for the unix-socket daemon
+    /// (tied to that connection's own handling future), but the HTTP
+    /// transport had nothing equivalent, so every HTTP session leaked a
+    /// phantom `SessionSummary` forever. `SessionRegistryGuard` fixes this
+    /// generically (works for either transport) by tying cleanup to the
+    /// `CalmServer` clone's own `Arc`-refcounted lifetime instead.
+    #[test]
+    fn dropping_the_last_clone_of_a_connection_removes_its_active_sessions_entry() {
+        let dir = std::env::temp_dir().join(format!(
+            "ci_session_guard_cleanup_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let shared = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        let conn = shared.for_connection();
+        let (registry, id) = conn.session_registry_handle();
+        assert!(
+            registry.lock().unwrap().contains_key(&id),
+            "for_connection must register its entry immediately"
+        );
+
+        // Simulate a per-request clone (what rmcp/axum do internally while
+        // dispatching a session's requests) outliving briefly, then being
+        // dropped -- the entry must survive as long as ANY clone (`conn`
+        // itself) is still alive.
+        let request_clone = conn.clone();
+        drop(request_clone);
+        assert!(
+            registry.lock().unwrap().contains_key(&id),
+            "dropping one of several clones must not remove the entry while others are alive"
+        );
+
+        drop(conn);
+        assert!(
+            !registry.lock().unwrap().contains_key(&id),
+            "dropping the LAST clone must remove this connection's active_sessions entry"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -4738,6 +4899,104 @@ mod tests {
         );
 
         assert_eq!(v["hops_clamped"], true);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn path_reports_uncertain_when_every_route_is_ambiguous() {
+        let dir = std::env::temp_dir().join(format!("ci_path_ambiguous_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        {
+            let conn = server.db();
+            for (qname, name, path) in [("mod.a", "a", "src/a.rs"), ("mod.b", "b", "src/b.rs")] {
+                conn.execute(
+                    "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                    rusqlite::params![qname, name, "function", "rust", path, 1i64, 2i64, "fn x()", "", name, 0i64, 0i64, 0i64],
+                )
+                .unwrap();
+            }
+            // The ONLY edge from a to b is ambiguous fan-out (index-time,
+            // never ruled out by SCIP) -- a real route exists in the graph,
+            // but it is not backed by a single-candidate resolution.
+            conn.execute(
+                "INSERT INTO call_edges (from_symbol, to_symbol, edge_confidence) VALUES ('mod.a', 'mod.b', 'ambiguous')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let v = jv(
+            server.path(rmcp::handler::server::wrapper::Parameters(PathParams {
+                from_symbol: "a".into(),
+                to_symbol: "b".into(),
+                from_path: None,
+                to_path: None,
+                from_line: None,
+                to_line: None,
+                max_hops: None,
+            })),
+        );
+
+        assert_eq!(v["exists"], true, "a route through the ambiguous edge is still findable");
+        assert_eq!(
+            v["certain"], false,
+            "an all-ambiguous route must not be reported as certain -- PATTERN-DEBT \
+             path-exists-collapses-ambiguous-confidence"
+        );
+        assert_eq!(v["route_confidence"], serde_json::json!(["ambiguous"]));
+        assert_ne!(
+            v["suggested_next"]["tool"], "source",
+            "an uncertain result must not point straight at reading source as if the path were proven"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn path_reports_certain_when_a_route_is_confirmed() {
+        let dir = std::env::temp_dir().join(format!("ci_path_certain_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        {
+            let conn = server.db();
+            for (qname, name, path) in [("mod.a", "a", "src/a.rs"), ("mod.b", "b", "src/b.rs")] {
+                conn.execute(
+                    "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                    rusqlite::params![qname, name, "function", "rust", path, 1i64, 2i64, "fn x()", "", name, 0i64, 0i64, 0i64],
+                )
+                .unwrap();
+            }
+            conn.execute(
+                "INSERT INTO call_edges (from_symbol, to_symbol, edge_confidence) VALUES ('mod.a', 'mod.b', 'resolved')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let v = jv(
+            server.path(rmcp::handler::server::wrapper::Parameters(PathParams {
+                from_symbol: "a".into(),
+                to_symbol: "b".into(),
+                from_path: None,
+                to_path: None,
+                from_line: None,
+                to_line: None,
+                max_hops: None,
+            })),
+        );
+
+        assert_eq!(v["exists"], true);
+        assert_eq!(v["certain"], true, "a resolved (single-candidate) edge must be certain");
+        assert_eq!(v["route_confidence"], serde_json::json!(["resolved"]));
+        assert_eq!(v["suggested_next"]["tool"], "source");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -6145,9 +6404,13 @@ mod tests {
         );
         assert_eq!(v["review_count"], 1, "fanout.js ambiguous call edge: {v}");
         assert_eq!(
-            v["textual_only_count"], 1,
-            "only notes.md should be left over -- reexport.js's own setCharset \
-             mentions are already covered by the import edge: {v}"
+            v["textual_only_count"], 2,
+            "notes.md AND reexport.js's own re-export line (module.exports.setCharset = \
+             utils.setCharset;) both surface -- PATTERN-DEBT \
+             reference-impact-file-wide-import-suppression, fixed 2026-08-06: reexport.js's \
+             line is a real, line-specific reference a rename must also touch, which the \
+             import edge's file-level (no-line) must_change hit cannot convey on its own, so \
+             it must NOT be silently dropped just because the file already has an import hit: {v}"
         );
 
         let refs = v["references"].as_array().unwrap();
@@ -6166,8 +6429,9 @@ mod tests {
             .collect();
         assert_eq!(
             textual_only,
-            vec!["notes.md"],
-            "utils.js's own definition line must never appear as a reference: {v}"
+            vec!["notes.md", "reexport.js"],
+            "utils.js's own definition line must never appear as a reference, and \
+             reexport.js's re-export line must now surface alongside notes.md: {v}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -6229,6 +6493,71 @@ mod tests {
                 && r["line"] == 2
                 && r["classification"] == "textual_only"),
             "expected a textual_only hit at caller.js:2: {v}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reference_impact_keeps_a_textual_hit_in_a_file_that_also_has_an_import_edge() {
+        // Regression for PATTERN-DEBT reference-impact-file-wide-import-
+        // suppression: `import_hit_files` used to suppress EVERY textual
+        // grep hit in a file once that file had ANY import-edge hit, not
+        // just the import statement's own line -- a file that imports the
+        // symbol AND independently mentions it again elsewhere (a second
+        // textual reference, e.g. a comment or config key) silently lost
+        // that second reference entirely.
+        let dir = std::env::temp_dir()
+            .join(format!("ci_ref_impact_import_same_file_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("def.js"), "function widgetInit() { return 1; }\n").unwrap();
+        std::fs::write(
+            dir.join("caller.js"),
+            "import { widgetInit } from './def.js';\n// widgetInit is also referenced here, unrelated to the import above\n",
+        )
+        .unwrap();
+
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('def.js::widgetInit', 'widgetInit', 'function', 'javascript', 'def.js', 1, 1, 'function widgetInit() {', '', 'widgetInit', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO import_edges (from_path, to_path, module_name, symbols_used)
+                 VALUES ('caller.js', 'def.js', './def.js', '[\"widgetInit\"]')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let v = jv(
+            server.reference_impact(rmcp::handler::server::wrapper::Parameters(
+                ReferenceImpactParams {
+                    symbol: "widgetInit".into(),
+                    path: None,
+                    line: None,
+                },
+            )),
+        );
+
+        assert_eq!(v["must_change_count"], 1, "the import edge hit: {v}");
+        assert_eq!(
+            v["textual_only_count"], 2,
+            "both textual mentions (the import line itself AND the unrelated line 2 \
+             reference) must surface, not be silently dropped because the file already \
+             has an import-edge hit: {v}"
+        );
+        let refs = v["references"].as_array().unwrap();
+        assert!(
+            refs.iter().any(|r| r["path"] == "caller.js"
+                && r["line"] == 2
+                && r["classification"] == "textual_only"),
+            "expected the unrelated second mention at caller.js:2 to survive: {v}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -7723,6 +8052,59 @@ mod tests {
         let notes = v["notes"].as_array().unwrap();
         assert_eq!(notes.len(), 1, "upsert must not create a duplicate row");
         assert_eq!(notes[0]["content"], "second version");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+
+    /// Audit 8.4: note upsert and ref replacement now share one transaction
+    /// -- forcing `store_refs` to fail (by dropping its table out from
+    /// under an in-progress `remember` call) must roll back the note write
+    /// too, not leave new content paired with a table-doesn't-exist error
+    /// and stale refs. Confirms both the tool-level error AND that the OLD
+    /// content survives untouched.
+    #[test]
+    fn remember_rolls_back_the_note_write_when_storing_refs_fails() {
+        let (dir, server) = test_server("remember_atomic_rollback");
+
+        let first = server.remember(rmcp::handler::server::wrapper::Parameters(RememberParams {
+            topic: "gotcha".into(),
+            content: "first version".into(),
+        }));
+        assert!(
+            jv(first)["error"].is_null(),
+            "setup: the first remember call must succeed"
+        );
+
+        {
+            let conn = calm_core::db::conn::open_state_writer(&server.state_db_path).unwrap();
+            conn.execute("DROP TABLE project_memory_refs", [])
+                .unwrap();
+        }
+
+        let second = server.remember(rmcp::handler::server::wrapper::Parameters(RememberParams {
+            topic: "gotcha".into(),
+            content: "second version".into(),
+        }));
+        let v = jv(second);
+        assert_eq!(
+            v["error"]["code"], "WRITE_FAILED",
+            "storing refs must fail loudly once its table is gone: {v:?}"
+        );
+
+        let conn = calm_core::db::conn::open_state_writer(&server.state_db_path).unwrap();
+        let content: String = conn
+            .query_row(
+                "SELECT content FROM project_memory WHERE topic = 'gotcha'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            content, "first version",
+            "the note upsert must have rolled back with the failed ref write, not left \
+             'second version' committed on its own: {content:?}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -11933,6 +12315,97 @@ mod tests {
             recalled["notes"].as_array().unwrap().len(),
             1,
             "response: {recalled}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn related_notes_fails_closed_when_mac_key_is_unavailable() {
+        // Regression for PATTERN-DEBT ambient-memory-fails-open-on-mac-key-
+        // error: related_notes used to treat a key-load failure as "can't
+        // verify, but don't drop for that reason alone" -- fail-OPEN for
+        // the exact passive/ambient channel this feature exists to
+        // protect. A missing/unreadable key means ZERO ability to verify
+        // ANY candidate, strictly worse than one note's real MAC mismatch
+        // (which already failed closed) -- it must fail at least as
+        // closed, not more open.
+        let (dir, server) = test_server("related_notes_mac_key_unavailable");
+        std::fs::write(dir.join("a.py"), "def foo():\n    return 1\n").unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.py::foo', 'foo', 'function', 'python', 'a.py', 1, 2, '', '', 'foo', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+            insert_note_ref(&server.state_db(), "a-note", "A note about a.py", "a.py");
+        }
+
+        // Block `.calm/` from ever being (re)creatable as a directory --
+        // forces load_or_create_mac_key to fail with a real I/O error,
+        // simulating a permissions/disk issue rather than "key file
+        // doesn't exist yet" (which load_or_create_mac_key already handles
+        // by generating a fresh key, not by erroring).
+        let _ = std::fs::remove_dir_all(dir.join(".calm"));
+        std::fs::write(dir.join(".calm"), b"blocked").unwrap();
+
+        let conn = server.db();
+        let notes = server.related_notes(&conn, "a.py", "foo", false);
+        assert!(
+            notes.is_empty(),
+            "MAC key unavailable must fail-closed for the ambient surface, not surface an \
+             unverifiable note: got {} note(s)",
+            notes.len()
+        );
+
+        let _ = std::fs::remove_file(dir.join(".calm"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn related_notes_treats_an_incomplete_decode_scan_as_unsafe_to_surface() {
+        // Regression for PATTERN-DEBT decode-scan-incomplete-lost-outside-
+        // scan_text: related_notes used to gate ambient surfacing through
+        // `injection_warning`, which wraps `detect_injection_patterns`
+        // (plain hit labels only) -- a scan that hit its decode budget
+        // with candidates still untried looks IDENTICAL to a genuinely
+        // clean one through that wrapper, since neither carries any hit
+        // label. `scan_text` (crates/calm-server/src/tools/security.rs)
+        // is honest about this distinction via `decode_scan_exhausted`;
+        // this ambient/passive surface must be at least as careful.
+        let (dir, server) = test_server("related_notes_decode_scan_exhausted");
+        std::fs::write(dir.join("a.py"), "def foo():\n    return 1\n").unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.py::foo', 'foo', 'function', 'python', 'a.py', 1, 2, '', '', 'foo', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+            // Same fixture shape as sanitize.rs's own
+            // exhausted_flag_set_when_budget_hit test: 450 hex-looking
+            // 40-char tokens exceed MAX_DECODE_TRIES (none of them decode
+            // to an actual injection pattern, so `hits` stays empty --
+            // this is specifically the "clean labels, but the scan never
+            // finished" case that used to slip through).
+            let mut content = String::new();
+            for i in 0..450u32 {
+                content.push_str(&format!("{i:040x} "));
+            }
+            insert_note_ref(&server.state_db(), "hex-heavy-note", &content, "a.py");
+        }
+
+        let conn = server.db();
+        let notes = server.related_notes(&conn, "a.py", "foo", false);
+        assert!(
+            notes.is_empty(),
+            "a note whose decode scan hit its budget before finishing must not \
+             ambient-surface just because no hit label happened to be found yet: got {} \
+             note(s)",
+            notes.len()
         );
 
         let _ = std::fs::remove_dir_all(&dir);

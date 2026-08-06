@@ -15,6 +15,16 @@ pub(crate) use crate::tools::toolset::*;
 // (2026-07-28 hotspot split), re-exported so `common::…` refs and every
 // `use super::common::*;` glob keep resolving unchanged.
 pub(crate) use crate::tools::{detail::*, outcome::*};
+// NOTE: `session_state` (2026-08-06 hotspot split, second round) is
+// deliberately NOT re-exported here like the three modules above -- it
+// contains only `impl CalmServer` methods (plus one private associated
+// const), and Rust resolves `self.method()`/`Self::CONST` against ALL of a
+// type's inherent impl blocks crate-wide regardless of which module defines
+// them, without needing a `use` for the defining module at all. A `pub(crate)
+// use crate::tools::session_state::*;` here would have nothing to actually
+// re-export and rustc correctly flags it `unused_imports` -- unlike
+// `detail`/`outcome`/`toolset`, which hold free functions/types that DO need
+// a `use` to be nameable elsewhere.
 
 impl CalmServer {
     pub fn new(project_root: PathBuf, db_path: PathBuf) -> anyhow::Result<Self> {
@@ -142,6 +152,9 @@ impl CalmServer {
             enabled_toolsets: Arc::new(RwLock::new(None)),
             preset,
             tool_router,
+            // `session_id == 0` on this template instance -- nothing for a
+            // guard to ever remove (see `SessionRegistryGuard`'s doc comment).
+            _session_guard: None,
         })
     }
     /// Builds a fresh per-connection `CalmServer` from a daemon-shared
@@ -193,6 +206,15 @@ impl CalmServer {
             oriented: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             // Fresh per connection — see field doc. NOT inherited via `..self.clone()`.
             enabled_toolsets: Arc::new(RwLock::new(None)),
+            // Audit 9.1: fresh guard per connection, keyed to THIS
+            // connection's own session_id -- inheriting one via
+            // `..self.clone()` would either share the daemon template's
+            // `None` (no cleanup at all) or, worse, a PRIOR connection's
+            // guard (removing the wrong entry when dropped).
+            _session_guard: Some(Arc::new(SessionRegistryGuard {
+                session_id,
+                active_sessions: Arc::clone(&self.active_sessions),
+            })),
             ..self.clone()
         }
     }
@@ -566,107 +588,6 @@ impl CalmServer {
             .unwrap_or_default()
     }
 
-    /// Tool names that already satisfy the session-start orientation gate
-    /// (`CalmServer::call_tool`, `Config.orientation`) on their own — calling
-    /// any of these IS the orientation, so the gate never needs to inject
-    /// into, or block around, a call to one of them.
-    const ORIENTATION_ADJACENT_TOOLS: &'static [&'static str] =
-        &["repo_overview", "indexing_status", "session_context"];
-
-    /// Whether `name` is one of `ORIENTATION_ADJACENT_TOOLS`.
-    pub(crate) fn is_orientation_adjacent(name: &str) -> bool {
-        Self::ORIENTATION_ADJACENT_TOOLS.contains(&name)
-    }
-
-    /// Whether the active (preset-scoped) `tool_router` registers at least
-    /// one orientation-adjacent tool. `"block"` mode's only escape hatch is
-    /// calling one of them — a preset that excludes the whole `orient`
-    /// toolset entirely (e.g. `--preset "security"` alone, or any composed
-    /// spec that subtracts it, like `"full,-orient"`) registers none of
-    /// them, so a literal block there would refuse every call for the rest
-    /// of the connection with no way out at all.
-    pub(crate) fn orientation_escape_hatch_available(&self) -> bool {
-        self.tool_router
-            .list_all()
-            .iter()
-            .any(|t| Self::is_orientation_adjacent(t.name.as_ref()))
-    }
-
-    /// `Config.orientation.mode`, downgraded from `Block` to `Inject` when
-    /// `orientation_escape_hatch_available()` is false — see
-    /// `calm_core::config::OrientationMode::Block`'s own doc comment for why
-    /// a literal block with no escape hatch would deadlock the connection.
-    pub(crate) fn effective_orientation_mode(&self) -> calm_core::config::OrientationMode {
-        let mode = self.config().orientation.mode;
-        if mode == calm_core::config::OrientationMode::Block
-            && !self.orientation_escape_hatch_available()
-        {
-            calm_core::config::OrientationMode::Inject
-        } else {
-            mode
-        }
-    }
-
-    /// Content merged into the first non-orientation-adjacent tool response
-    /// of a session under `"inject"` mode — deliberately compact (mirrors
-    /// `repo_overview`'s `compact:true` shape), since the full
-    /// `repo_overview` response remains one real tool call away for an
-    /// agent that wants more.
-    pub(crate) fn orientation_injection_text(&self) -> String {
-        serde_json::json!({
-            "_calm_orientation": {
-                "note": "Auto-attached: this session hasn't called repo_overview yet. \
-                         Call it (or the calm_workflow prompt) for the full 8-stage workflow.",
-                "indexing_phase": self.phase_str(),
-                "embeddings_status": self.embed_status_str(),
-            }
-        })
-        .to_string()
-    }
-
-    /// `{"error": {code, message, recoverable}}`-shaped `ORIENTATION_REQUIRED`
-    /// refusal for `"block"` mode — same envelope every other tool-level
-    /// error in this server uses (see `error_detail`), so existing
-    /// client-side error handling doesn't need a special case for this one.
-    pub(crate) fn orientation_required_message(&self) -> String {
-        serde_json::to_string(&ErrorOutput {
-            error: error_detail(
-                "ORIENTATION_REQUIRED",
-                "call repo_overview first this session (session-start orientation gate, \
-                 [orientation] mode=\"block\" in .calm/config.json) — every other tool is \
-                 refused until then",
-                true,
-            ),
-        })
-        .unwrap_or_default()
-    }
-
-    /// Content merged into a tool response when this connection has written
-    /// files (`written_files_snapshot`) that haven't had `diff_impact` run
-    /// on them since — surfaced on every response while pending, not just
-    /// when `session_context` is asked. Always advisory: `diff_impact`-
-    /// before-commit can never be a hard server-side gate at all (an MCP
-    /// server has no visibility into a client's own native Bash/Edit tool
-    /// calls, e.g. `git commit`), so this only makes an already-real signal
-    /// (`session_context.pending_diff_impact`) harder to miss, on every
-    /// client uniformly, instead of adding new enforcement.
-    pub(crate) fn pending_diff_impact_reminder_text(&self) -> Option<String> {
-        let files = self.written_files_snapshot();
-        if files.is_empty() {
-            return None;
-        }
-        Some(
-            serde_json::json!({
-                "_calm_pending_diff_impact": {
-                    "note": "Files written this session have not had diff_impact run on \
-                             them yet — call diff_impact before commit/push.",
-                    "files": files,
-                }
-            })
-            .to_string(),
-        )
-    }
-
     /// Clears the written-files set — `diff_impact` calls this only from its
     /// single success point (audit F6, previously called unconditionally at
     /// entry). A *failed* call (bad input, git failure, DB error) proves
@@ -729,40 +650,6 @@ impl CalmServer {
     }
 
     /// A handle the background indexer uses to advance the phase as it works.
-    pub fn phase_handle(&self) -> Arc<RwLock<IndexingPhase>> {
-        Arc::clone(&self.phase)
-    }
-
-    /// A handle the background indexer uses to publish an error message
-    /// when `phase` transitions to `Failed` (see `IndexingPhase::Failed`).
-    pub fn last_index_error_handle(&self) -> Arc<RwLock<Option<String>>> {
-        Arc::clone(&self.last_index_error)
-    }
-    /// Shared handle to `last_graph_mode` so the file watcher (which has no
-    /// `CalmServer`) can record which rebuild path each incremental reindex
-    /// took — mirrors `last_index_error_handle`. See `run_watch_loop`.
-    pub fn last_graph_mode_handle(&self) -> Arc<RwLock<Option<String>>> {
-        Arc::clone(&self.last_graph_mode)
-    }
-
-    /// Shared watcher-health handle for the background supervisor. Unlike
-    /// `phase`, it describes observation/reconciliation health, not whether a
-    /// prior index build finished successfully.
-    pub(crate) fn watcher_health_handle(&self) -> crate::watch_supervisor::WatcherHealthHandle {
-        Arc::clone(&self.watcher_health)
-    }
-    /// Handles the background indexer uses to publish the loaded model + status.
-    pub fn embedder_handle(&self) -> Arc<RwLock<Option<Arc<Embedder>>>> {
-        Arc::clone(&self.embedder)
-    }
-    pub fn embed_status_handle(&self) -> Arc<RwLock<EmbedStatus>> {
-        self.embed_status.clone()
-    }
-
-    pub fn coverage_handle(&self) -> Arc<RwLock<calm_core::analysis::coverage::CoverageData>> {
-        self.coverage.clone()
-    }
-
     /// The loaded embedder, if semantic search is ready.
     pub(crate) fn embedder(&self) -> Option<Arc<Embedder>> {
         self.embedder.read_ok().clone()
@@ -841,13 +728,6 @@ impl CalmServer {
         });
     }
 
-    pub fn last_embed_error_handle(&self) -> Arc<RwLock<Option<String>>> {
-        self.last_embed_error.clone()
-    }
-
-    pub fn owns_indexer_lock_handle(&self) -> Arc<RwLock<bool>> {
-        self.owns_indexer_lock.clone()
-    }
     pub(crate) fn current_phase(&self) -> IndexingPhase {
         *self.phase.read_ok()
     }
@@ -942,37 +822,69 @@ impl CalmServer {
         // "mismatch" explicitly and lets the agent judge), a note that
         // fails MAC verification is dropped here rather than surfaced —
         // silently trusting a possibly-forged note into a passive channel
-        // is the exact risk this feature exists to close. `None` (key
-        // unreadable) degrades to treating every candidate as unverifiable
-        // — NOT the same as verified, so nothing here gets dropped for that
-        // reason alone; only an explicit MAC mismatch drops a note.
-        let mac_key = calm_core::memory::load_or_create_mac_key(&self.project_root).ok();
+        // is the exact risk this feature exists to close.
+        //
+        // PATTERN-DEBT ambient-memory-fails-open-on-mac-key-error, fixed
+        // 2026-08-06: this used to treat a key-load failure (`None`) as
+        // "can't verify, but don't drop for that reason alone" -- fail-OPEN
+        // for the specific channel this feature exists to protect. An
+        // explicit MAC mismatch (real tampering evidence) already fails
+        // closed for that one note; a missing/unreadable key is a STRICTLY
+        // WORSE situation (zero ability to verify ANY candidate, not just
+        // one) and must fail at least as closed, not more open. Now the
+        // whole ambient surface is skipped for this call when the key is
+        // unavailable, exactly like the pre-existing `notes_for_path`
+        // lookup-failure branch above -- explicit `recall()` still works
+        // and reports "unverified" as before, since that's an active,
+        // agent-initiated request where the existing Stage-3 "untrusted
+        // source" wariness already applies, unlike this passive one.
+        let mac_key = match calm_core::memory::load_or_create_mac_key(&self.project_root) {
+            Ok(key) => key,
+            Err(e) => {
+                tracing::warn!(
+                    "related_notes: MAC key unavailable ({e}) — fail-closed, skipping ambient \
+                     note surfacing entirely rather than risking an unverifiable note reaching \
+                     a passive channel"
+                );
+                return Vec::new();
+            }
+        };
 
         let mut out = Vec::with_capacity(CAP);
         for (topic, content, content_mac) in candidates {
             if out.len() >= CAP {
                 break;
             }
-            if let Some(key) = &mac_key {
-                let integrity = calm_core::memory::verify_integrity(
-                    key,
-                    &topic,
-                    &content,
-                    content_mac.as_deref(),
+            let integrity = calm_core::memory::verify_integrity(
+                &mac_key,
+                &topic,
+                &content,
+                content_mac.as_deref(),
+            );
+            if integrity == "mismatch" {
+                tracing::warn!(
+                    "related_notes: dropping topic {topic:?} — content_mac mismatch \
+                     (possible out-of-band edit)"
                 );
-                if integrity == "mismatch" {
-                    tracing::warn!(
-                        "related_notes: dropping topic {topic:?} — content_mac mismatch \
-                         (possible out-of-band edit)"
-                    );
-                    continue;
-                }
+                continue;
             }
             let mentions_symbol = !symbol_name.is_empty() && content.contains(symbol_name);
             if is_hub && !mentions_symbol {
                 continue;
             }
-            if injection_warning(&content).is_some() {
+            // PATTERN-DEBT decode-scan-incomplete-lost-outside-scan_text,
+            // fixed 2026-08-06: `injection_warning` wraps
+            // `detect_injection_patterns` (plain labels only), which
+            // itself discards `detect_injection_patterns_ext`'s
+            // `decode_scan_exhausted` flag -- a scan that hit its
+            // decode budget with candidates still untried looks
+            // identical to a genuinely clean one through that wrapper.
+            // `scan_text` is honest about this (it calls `_ext` directly
+            // and returns the flag); this ambient/passive surface must be
+            // at least as careful, not less -- an incomplete scan is
+            // treated the same as a real hit here, not as "clean".
+            let scan = calm_core::sanitize::detect_injection_patterns_ext(&content);
+            if !scan.hits.is_empty() || scan.decode_scan_exhausted {
                 continue;
             }
             let staleness =

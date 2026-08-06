@@ -796,43 +796,72 @@ impl CalmServer {
                     .iter()
                     .map(|tx_id| (tx_id.as_str(), to, "system", reason.as_str()))
                     .collect();
-                let first_results = calm_core::txn::advance_many(&conn, &first_pass);
-                for (tx_id, result) in shadow_tx_ids.iter().zip(first_results.iter()) {
-                    if let Err(e) = result {
-                        tracing::warn!(
-                            "shadow txn::advance to {to:?} failed (non-blocking) for {tx_id}: {e}"
-                        );
-                    }
-                }
-                if to == calm_core::txn::TxState::IndexCommitted {
-                    let done_tx_ids: Vec<&str> = shadow_tx_ids
-                        .iter()
-                        .zip(first_results.iter())
-                        .filter(|(_, r)| r.is_ok())
-                        .map(|(tx_id, _)| tx_id.as_str())
-                        .collect();
-                    if !done_tx_ids.is_empty() {
-                        let done_pass: Vec<(&str, calm_core::txn::TxState, &str, &str)> =
-                            done_tx_ids
-                                .iter()
-                                .map(|tx_id| {
-                                    (
-                                        *tx_id,
-                                        calm_core::txn::TxState::Done,
-                                        "system",
-                                        "base index committed, disk+index consistent",
-                                    )
-                                })
-                                .collect();
-                        let done_results = calm_core::txn::advance_many(&conn, &done_pass);
-                        for (tx_id, result) in done_tx_ids.iter().zip(done_results.iter()) {
+                // PATTERN-DEBT advance-many-swallows-commit-failure, fixed
+                // 2026-08-06: advance_many now returns Result<Vec<...>, ...>
+                // -- an outer Err here means NONE of first_pass's tx_ids
+                // durably reached `to`, so none of them may feed done_pass
+                // below (they'd be advancing FileCommitted->Done on tx_ids
+                // whose IndexCommitted step was never actually durable).
+                match calm_core::txn::advance_many(&conn, &first_pass) {
+                    Ok(first_results) => {
+                        for (tx_id, result) in shadow_tx_ids.iter().zip(first_results.iter()) {
                             if let Err(e) = result {
                                 tracing::warn!(
-                                    "shadow txn::advance to Done failed (non-blocking) for \
-                                     {tx_id}: {e}"
+                                    "shadow txn::advance to {to:?} failed (non-blocking) for {tx_id}: {e}"
                                 );
                             }
                         }
+                        if to == calm_core::txn::TxState::IndexCommitted {
+                            let done_tx_ids: Vec<&str> = shadow_tx_ids
+                                .iter()
+                                .zip(first_results.iter())
+                                .filter(|(_, r)| r.is_ok())
+                                .map(|(tx_id, _)| tx_id.as_str())
+                                .collect();
+                            if !done_tx_ids.is_empty() {
+                                let done_pass: Vec<(&str, calm_core::txn::TxState, &str, &str)> =
+                                    done_tx_ids
+                                        .iter()
+                                        .map(|tx_id| {
+                                            (
+                                                *tx_id,
+                                                calm_core::txn::TxState::Done,
+                                                "system",
+                                                "base index committed, disk+index consistent",
+                                            )
+                                        })
+                                        .collect();
+                                match calm_core::txn::advance_many(&conn, &done_pass) {
+                                    Ok(done_results) => {
+                                        for (tx_id, result) in
+                                            done_tx_ids.iter().zip(done_results.iter())
+                                        {
+                                            if let Err(e) = result {
+                                                tracing::warn!(
+                                                    "shadow txn::advance to Done failed \
+                                                     (non-blocking) for {tx_id}: {e}"
+                                                );
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "shadow txn::advance_many batch to Done failed \
+                                             (non-blocking) for all {} tx_id(s) -- none of them \
+                                             are durably Done: {e}",
+                                            done_tx_ids.len()
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "shadow txn::advance_many batch to {to:?} failed (non-blocking) for \
+                             all {} tx_id(s) -- none of them are durably {to:?}: {e}",
+                            shadow_tx_ids.len()
+                        );
                     }
                 }
             }
@@ -1019,8 +1048,31 @@ impl CalmServer {
             .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("");
-        let parse_status = match calm_core::edit::validate_syntax_diff(&original, &new_content, ext)
-        {
+        // Audit 5.4: validate_syntax_diff now scopes its error-span check to
+        // the actually-edited region instead of a bare file-wide count.
+        // `outcome.results` is already sorted ascending by (original)
+        // `start_line`; a running `shift` converts each hunk's OLD-file
+        // `end_line` into its true position in the FINAL (all-hunks-
+        // applied) file, since only hunks ABOVE a given one (lower
+        // start_line, spliced in first per apply_hunks' bottom-up order)
+        // can move it -- hunks below never shift anything above them.
+        let mut touched_old_lines: Vec<(i64, i64)> = Vec::with_capacity(outcome.results.len());
+        let mut touched_new_lines: Vec<(i64, i64)> = Vec::with_capacity(outcome.results.len());
+        let mut shift: i64 = 0;
+        for r in &outcome.results {
+            let (start_line, end_line, new_end_line) =
+                (r.start_line as i64, r.end_line as i64, r.new_end_line as i64);
+            touched_old_lines.push((start_line, end_line));
+            touched_new_lines.push((start_line + shift, new_end_line + shift));
+            shift += new_end_line - end_line;
+        }
+        let parse_status = match calm_core::edit::validate_syntax_diff(
+            &original,
+            &new_content,
+            ext,
+            &touched_old_lines,
+            &touched_new_lines,
+        ) {
             Some(true) => "clean",
             Some(false) => {
                 // Show the ORIGINAL boundary line(s) so a pre-existing
@@ -1743,8 +1795,18 @@ impl CalmServer {
                                     calm_core::maintenance::MaintenanceKind::ScipRefresh,
                                 );
                             }
-                            crate::scip_overlay::run_all_coalesced(&root, &db);
-                            if let Ok(conn) = calm_core::db::conn::open_state_writer(&state_db) {
+                            // Audit 3.3: only the thread that actually LED the
+                            // coalesced pass (see `run_all_coalesced`'s doc
+                            // comment) may report completion. A thread that
+                            // merely deferred to an already-in-flight leader
+                            // did no real work of its own -- letting it call
+                            // mark_completed here would mark the durable row
+                            // 'done' while the real leader (covering this
+                            // exact trigger via its rerun loop) might still be
+                            // mid-pass, exactly the race this outbox exists to
+                            // prevent.
+                            let led = crate::scip_overlay::run_all_coalesced(&root, &db);
+                            if led && let Ok(conn) = calm_core::db::conn::open_state_writer(&state_db) {
                                 let _ = calm_core::maintenance::mark_completed(
                                     &conn,
                                     calm_core::maintenance::MaintenanceKind::ScipRefresh,
@@ -2645,6 +2707,7 @@ pub(crate) fn compute_touch_risk(
             }) && calm_core::analysis::diff_impact::is_signature_semantically_changed(
                 &row.signature,
                 &new_sig_text,
+                &row.language,
             ) {
                 signature_touch = Some(row.qualified_name.clone());
             }

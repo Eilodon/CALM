@@ -36,8 +36,31 @@ jobs:
   # end, not just that `cargo test` passes against the Rust source directly.
   # continue-on-error: shadow mode while this is new (matches this repo's
   # own rollout convention for new gates -- elicit_hub_confirm, verification,
-  # etc. all default off/observe-only at first) -- promote to blocking once
-  # it's run clean across enough real PRs.
+  # etc. all default off/observe-only at first).
+  #
+  # Audit 11.4 (2026-08-06): reviewed this job's run history before
+  # considering promotion. Found two real infra failure modes, not false
+  # positives from the guard's own risk analysis -- neither is "the gate
+  # doing its job":
+  #   1. `error: unrecognized subcommand 'guard'` -- ran against a commit
+  #      from before this job's build-from-source+alias steps existed
+  #      (older npm-install-only version of this job). Self-resolved by
+  #      the current job definition; not expected to recur.
+  #   2. `fatal: origin/main...HEAD: no merge base` -- action.yml's
+  #      shallow-fetch fix only fetched the base ref at depth=1, sharing no
+  #      history with this checkout's own depth=1 HEAD. Fixed in the same
+  #      commit as this comment (action.yml's "Resolve review scope" step
+  #      now fetches depth=100 + falls back to `--unshallow`).
+  # Promotion criteria (remove `continue-on-error` once ALL of these hold):
+  #   - 10 consecutive PRs where this job actually ran (not skipped) with
+  #     zero infra-category failures (subcommand/merge-base/install/
+  #     timeout) -- a real "aggregate_risk >= fail-on" block is NOT an
+  #     infra failure and doesn't reset this count.
+  #   - At least one of those 10 was a PR this job correctly blocked or
+  #     would have blocked (fail-on triggered), confirmed by manual review
+  #     to be a genuine high-risk change, not a false positive.
+  #   - No open false-positive report against calm guard's risk model
+  #     older than 7 days.
   calm-guard-dogfood:
     runs-on: ubuntu-latest
     timeout-minutes: 15

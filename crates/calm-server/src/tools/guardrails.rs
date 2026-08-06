@@ -519,6 +519,23 @@ impl CalmServer {
             // intermediate -- avoids a serialize-then-deserialize round trip on every call,
             // and a typo'd map key silently dropping a symbol instead of failing to compile.
             let mut affected: Vec<AffectedSymbolOutput> = Vec::new();
+            // Audit 5.1: a file whose `file_index` row is gone AND whose
+            // extension the indexer would normally extract symbols from
+            // (`language_for_extension(ext).is_some()`) reads identically to
+            // "never indexed" once reindexing has already cleaned up after
+            // the deletion -- `reason == "deleted"` below hits the SAME
+            // `continue` as a file that never had any symbols, contributing
+            // zero `affected_symbols` and never touching `pending_scan_paths`.
+            // With nothing else in the diff, `compute_aggregate_risk` then
+            // falls through to its `unwrap_or("low")` default -- silently
+            // reporting "low" for a deletion whose actual former caller
+            // count this tool has no way left to check, not because it's
+            // known to be low. Tracked separately from `pending_scan_paths`
+            // (which means "wait for indexing, it resolves itself" -- a
+            // deletion never resolves that way, see the suggested_next
+            // branch below) so aggregate_risk becomes "unknown" without
+            // wrongly pointing an agent at `indexing_status`.
+            let mut unverifiable_deletions: Vec<String> = Vec::new();
 
             // READ-only: open a dedicated read connection (SINGLE_WRITER enforcement)
             {
@@ -576,6 +593,30 @@ impl CalmServer {
                                 // unrecognized extension) still correctly reports
                                 // "out_of_scope", not "deleted".
                                 if !self.project_root.join(path).exists() {
+                                    // Audit 5.1: only a REAL call-graph source
+                                    // extension makes this deletion's blast
+                                    // radius genuinely unverifiable -- not
+                                    // `is_recognized_unparsed_extension`'s
+                                    // path-only-tracked config/lockfiles
+                                    // (never had symbols), and not markdown/
+                                    // sql either: both are real entries in
+                                    // `language_for_extension` but are its
+                                    // two explicitly "standalone, not
+                                    // tree-sitter" fallback arms -- markdown
+                                    // symbols are ATX headings
+                                    // (`extract_markdown_symbols`) that never
+                                    // participate in `call_edges`, so their
+                                    // `caller_count` is always 0 and there is
+                                    // no blast radius to lose in the first
+                                    // place. Matches `language_for_extension`'s
+                                    // own two-tier structure deliberately, so
+                                    // this stays in sync if a language moves
+                                    // between tiers.
+                                    let has_real_call_graph = calm_core::indexer::lang_constants::language_for_extension(ext)
+                                        .is_some_and(|lang| lang != "markdown" && lang != "sql");
+                                    if has_real_call_graph {
+                                        unverifiable_deletions.push(fd.path.clone());
+                                    }
                                     Some("deleted")
                                 } else {
                                     Some("pending_scan")
@@ -596,13 +637,15 @@ impl CalmServer {
                     }
 
                     let mut stmt = match conn.prepare(
-                        "SELECT qualified_name, name, kind, line_start, line_end, caller_count, signature
+                        "SELECT qualified_name, name, kind, line_start, line_end, caller_count, signature, language
                          FROM symbols WHERE path = ?1",
                     ) {
                         Ok(s) => s,
                         Err(e) => return db_error(e),
                     };
-                    let rows: Vec<(String, String, String, i64, i64, i64, String)> = match stmt
+                    // (qualified_name, name, kind, line_start, line_end, caller_count, signature, language)
+                    type SymbolOverlapRow = (String, String, String, i64, i64, i64, String, String);
+                    let rows: Vec<SymbolOverlapRow> = match stmt
                         .query_map(rusqlite::params![fd.path], |row| {
                             Ok((
                                 row.get(0)?,
@@ -612,14 +655,23 @@ impl CalmServer {
                                 row.get(4)?,
                                 row.get(5)?,
                                 row.get(6)?,
+                                row.get(7)?,
                             ))
                         }) {
                         Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
                         Err(e) => return db_error(e),
                     };
 
-                    for (qualified_name, name, kind, line_start, line_end, caller_count, signature) in
-                        rows
+                    for (
+                        qualified_name,
+                        name,
+                        kind,
+                        line_start,
+                        line_end,
+                        caller_count,
+                        signature,
+                        language,
+                    ) in rows
                     {
                         let overlaps = fd
                             .hunks
@@ -668,7 +720,7 @@ impl CalmServer {
                                         (line_start, sig_end),
                                     );
                                 calm_core::analysis::diff_impact::is_signature_semantically_changed(
-                                    &old_text, &new_text,
+                                    &old_text, &new_text, &language,
                                 )
                             };
 
@@ -708,9 +760,22 @@ impl CalmServer {
                 .filter(|f| f.reason == "pending_scan")
                 .map(|f| f.path.clone())
                 .collect();
+            // Audit 5.1: `compute_aggregate_risk` treats any non-empty second
+            // argument as "cannot verify, report unknown" -- exactly the
+            // posture an unverifiable deletion needs too, so it's folded
+            // into the same call rather than adding a third parameter to a
+            // widely-tested, otherwise-unrelated function. Kept as a
+            // separate Vec upstream (not merged into `pending_scan_paths`
+            // itself) purely so the `suggested_next` branch below can still
+            // tell the two causes of "unknown" apart.
+            let unknown_gating_paths: Vec<String> = pending_scan_paths
+                .iter()
+                .cloned()
+                .chain(unverifiable_deletions.iter().cloned())
+                .collect();
             let aggregate_risk = calm_core::analysis::diff_impact::compute_aggregate_risk(
                 &affected,
-                &pending_scan_paths,
+                &unknown_gating_paths,
             );
             const MAX_AFFECTED_SYMBOLS: usize = 20;
             calm_core::analysis::diff_impact::sort_affected_symbols(
@@ -732,6 +797,24 @@ impl CalmServer {
 
             let sn = if !pending_scan_paths.is_empty() {
                 suggested("indexing_status", "Wait for index before treating as safe")
+            } else if let Some(path) = unverifiable_deletions.first() {
+                // Audit 5.1: unlike pending_scan, waiting never resolves
+                // this -- the file and its old symbols are gone from the
+                // index for good. Point at a concrete manual check instead
+                // of the generic "unknown" fallback below.
+                suggested_with_args(
+                    "search",
+                    "A deleted file's blast radius could not be verified from the index \
+                     (its old symbols/callers are no longer in the graph) — grep for \
+                     lingering references to it before merging",
+                    serde_json::json!({
+                        "query": std::path::Path::new(path)
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or(path),
+                        "kind": "grep",
+                    }),
+                )
             } else if aggregate_risk == "critical" || aggregate_risk == "high" {
                 affected_symbols.first().map(|s| SuggestedNext {
                     tool: "callers".into(),

@@ -418,14 +418,25 @@ pub fn validate_syntax(new_content: &str, extension: &str) -> Option<bool> {
     Some(!tree.root_node().has_error())
 }
 
-/// Counts tree-sitter `ERROR`/`MISSING` nodes in a parsed tree.
-fn count_parse_errors(node: tree_sitter::Node) -> usize {
-    let mut count = usize::from(node.is_error() || node.is_missing());
+/// Byte range of every ERROR/MISSING node in `node`'s subtree, converted to
+/// 1-indexed inclusive LINE ranges (tree-sitter positions are 0-indexed
+/// rows) so they can be compared against the caller's own line-based hunk
+/// coordinates without a byte-offset round trip.
+fn collect_error_line_ranges(node: tree_sitter::Node, out: &mut Vec<(i64, i64)>) {
+    if node.is_error() || node.is_missing() {
+        let start = node.start_position().row as i64 + 1;
+        let end = (node.end_position().row as i64 + 1).max(start);
+        out.push((start, end));
+    }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        count += count_parse_errors(child);
+        collect_error_line_ranges(child, out);
     }
-    count
+}
+
+/// True if line range `r` intersects any zone in `zones`.
+fn intersects_any(r: &(i64, i64), zones: &[(i64, i64)]) -> bool {
+    zones.iter().any(|&(zs, ze)| !(r.1 < zs || r.0 > ze))
 }
 
 /// Root-cause fix for a real false-positive found 2026-07-14: `validate_syntax`
@@ -444,29 +455,94 @@ fn count_parse_errors(node: tree_sitter::Node) -> usize {
 /// workspace `Cargo.toml` comments) depend on; jumping it to unlock a newer
 /// `tree-sitter-rust` risks an ABI cliff across all of them.
 ///
-/// `validate_syntax_diff` fixes this at the right layer instead: an edit is
-/// only rejected if it introduces MORE parse-error nodes than the file
-/// already had, never for errors that pre-date this write. A hunk that
-/// actually breaks syntax (mismatched brace/paren/quote) always adds at
-/// least one new error node relative to the original, so real breakage is
-/// still caught — only pre-existing grammar-coverage gaps stop being
-/// mistaken for edit-introduced ones.
+/// Audit 5.4: comparing bare error-node COUNTS (`new_errors <=
+/// original_errors`) doesn't actually prove "no new error" — a hunk that
+/// coincidentally fixes one pre-existing error while introducing a
+/// DIFFERENT one nearby keeps the same total and silently passed. Now
+/// compares SPANS: any error node whose line range intersects the edited
+/// region (`touched_new_lines`, each widened by a small resync margin — an
+/// unmatched delimiter can misparse a few lines past the actual edit before
+/// the grammar recovers) rejects outright, regardless of the old count —
+/// there's no valid "it was already broken exactly there" excuse for text
+/// this call just wrote. Errors OUTSIDE the touched region still use a
+/// count comparison (scoped to `touched_old_lines` on the original side),
+/// same spirit as before, so a pre-existing error elsewhere in the file
+/// that simply shifted line numbers (the edit changed the file's total
+/// line count) still correctly reads as "already there", not "new".
 ///
-/// `Some(true)` = clean, or no more errors than `original` already had.
-/// `Some(false)` = this edit strictly increased the error-node count.
+/// `touched_old_lines`/`touched_new_lines`: the edited hunks' line ranges
+/// in the ORIGINAL and resulting NEW file respectively (1-indexed,
+/// inclusive) — e.g. from `apply_hunks`' `HunkResult::{start_line,
+/// end_line}` (old) and a cumulative-shift-adjusted `new_end_line` (new).
+/// Empty is treated as "nothing known to be touched" (no zone rejection,
+/// falls back to the old global-count comparison) rather than an error —
+/// defensive for any future caller that hasn't threaded hunk positions
+/// through yet.
+///
+/// `Some(true)` = clean, or no more errors than `original` already had
+/// outside the touched region, and none inside it.
+/// `Some(false)` = this edit introduced an error intersecting the touched
+/// region, or strictly increased the outside-region error count.
 /// `None` = `extension` has no recognized grammar — callers must treat this
 /// as "allow the write", same convention as `validate_syntax`.
-pub fn validate_syntax_diff(original: &str, new_content: &str, extension: &str) -> Option<bool> {
+pub fn validate_syntax_diff(
+    original: &str,
+    new_content: &str,
+    extension: &str,
+    touched_old_lines: &[(i64, i64)],
+    touched_new_lines: &[(i64, i64)],
+) -> Option<bool> {
     let language = language_for_extension(extension)?;
-    let new_errors =
-        parse_tree(new_content, language).map(|t| count_parse_errors(t.root_node()))?;
-    if new_errors == 0 {
+    let new_tree = parse_tree(new_content, language)?;
+    let mut new_errors = Vec::new();
+    collect_error_line_ranges(new_tree.root_node(), &mut new_errors);
+    if new_errors.is_empty() {
         return Some(true);
     }
-    let original_errors = parse_tree(original, language)
-        .map(|t| count_parse_errors(t.root_node()))
-        .unwrap_or(0);
-    Some(new_errors <= original_errors)
+
+    // Audit 5.4: a small margin, not the touched range alone -- tree-sitter
+    // often attributes a resync-recovery error node to the line immediately
+    // adjacent to the actual unmatched construct rather than the exact
+    // touched line. Deliberately narrow (1, not e.g. 3): real code usually
+    // has enough spacing between unrelated symbols that a wider margin
+    // would start swallowing genuinely distant, unrelated pre-existing
+    // errors into "must be caused by this edit".
+    const RESYNC_MARGIN: i64 = 1;
+    let new_zone: Vec<(i64, i64)> = touched_new_lines
+        .iter()
+        .map(|&(s, e)| (s - RESYNC_MARGIN, e + RESYNC_MARGIN))
+        .collect();
+    if !new_zone.is_empty() && new_errors.iter().any(|r| intersects_any(r, &new_zone)) {
+        return Some(false);
+    }
+
+    let original_errors_all = parse_tree(original, language).map(|t| {
+        let mut v = Vec::new();
+        collect_error_line_ranges(t.root_node(), &mut v);
+        v
+    });
+    let Some(original_errors) = original_errors_all else {
+        // No parseable original tree to compare against -- fall back to
+        // the pre-fix global comparison (against zero, since there's no
+        // baseline) rather than guessing.
+        return Some(new_errors.is_empty());
+    };
+
+    if new_zone.is_empty() {
+        // No hunk position info supplied -- preserve the old, coarser
+        // global-count behavior exactly.
+        return Some(new_errors.len() <= original_errors.len());
+    }
+    let old_zone: Vec<(i64, i64)> = touched_old_lines
+        .iter()
+        .map(|&(s, e)| (s - RESYNC_MARGIN, e + RESYNC_MARGIN))
+        .collect();
+    let new_outside = new_errors.iter().filter(|r| !intersects_any(r, &new_zone)).count();
+    let original_outside = original_errors
+        .iter()
+        .filter(|r| !intersects_any(r, &old_zone))
+        .count();
+    Some(new_outside <= original_outside)
 }
 
 /// Write `content` to `path` atomically: write to a temp file in the same
@@ -1026,6 +1102,90 @@ mod tests {
     fn test_validate_syntax_detects_error_node() {
         assert_eq!(validate_syntax("def f():\n    pass\n", "py"), Some(true));
         assert_eq!(validate_syntax("def f(:\n    pass\n", "py"), Some(false));
+    }
+
+
+    /// Audit 5.4 core regression: the OLD `new_errors <= original_errors`
+    /// count comparison is gameable -- an edit that leaves the TOUCHED line
+    /// just as broken as before (a different invalid construct, not a fix)
+    /// still passes if an unrelated pre-existing error elsewhere keeps the
+    /// total count identical. Two broken functions; the edit touches only
+    /// `g`'s line and replaces it with a DIFFERENT still-broken line, while
+    /// `f`'s pre-existing error is untouched -- total count stays at 2
+    /// either way, but the touched line itself is still broken.
+    #[test]
+    fn test_validate_syntax_diff_rejects_a_new_error_in_the_touched_region_even_at_equal_count() {
+        let original = "def f(:\n    pass\n\ndef g(:\n    pass\n";
+        let new_content = "def f(:\n    pass\n\ndef h(:\n    pass\n";
+        // Sanity: both have exactly 2 errors (f's and g's/h's) -- the old
+        // count-only check would see 2 <= 2 and pass.
+        assert_eq!(
+            validate_syntax_diff(original, new_content, "py", &[], &[]),
+            Some(true),
+            "sanity check: old global-count behavior (no hunk positions) must still pass"
+        );
+        // The edit touched line 4 (old) / line 4 (new, same line count) --
+        // still broken there, so must now be rejected.
+        assert_eq!(
+            validate_syntax_diff(original, new_content, "py", &[(4, 4)], &[(4, 4)]),
+            Some(false),
+            "an error surviving inside the touched region must reject, even at equal total count"
+        );
+    }
+
+    /// Audit 5.4 (no regression): editing one broken function to be clean
+    /// while a DIFFERENT, untouched broken function elsewhere is left alone
+    /// must still pass -- the fix must not become overly conservative.
+    #[test]
+    fn test_validate_syntax_diff_still_passes_when_touched_region_is_genuinely_fixed() {
+        let original = "def f(:\n    pass\n\ndef g(:\n    pass\n";
+        let new_content = "def f(:\n    pass\n\ndef g():\n    pass\n";
+        assert_eq!(
+            validate_syntax_diff(original, new_content, "py", &[(4, 4)], &[(4, 4)]),
+            Some(true),
+            "a genuinely fixed touched region with an untouched pre-existing error elsewhere \
+             must still pass"
+        );
+    }
+
+    /// Audit 5.4: a brand new error strictly OUTSIDE the touched region
+    /// (and its resync margin) still uses the count comparison, and a
+    /// strict increase there must still reject -- the span check narrows
+    /// what's rejected outright, it doesn't just turn the whole function
+    /// into "was the touched region clean".
+    #[test]
+    fn test_validate_syntax_diff_rejects_new_error_outside_touched_region_when_count_increases() {
+        let original = "def f():\n    pass\n\ndef g():\n    pass\n";
+        // Touch line 4 (a clean edit, g stays valid) but ALSO corrupt f's
+        // untouched line 1 in the same new_content -- simulates a caller
+        // passing a new_content that changed more than the hunk it
+        // declared (or a second, undeclared change slipping in).
+        let new_content = "def f(:\n    pass\n\ndef g():\n    pass\n";
+        assert_eq!(
+            validate_syntax_diff(original, new_content, "py", &[(4, 4)], &[(4, 4)]),
+            Some(false),
+            "a new error outside the touched region that increases the outside count must \
+             still reject"
+        );
+    }
+
+    /// Audit 5.4: empty `touched_*_lines` (a caller with no hunk-position
+    /// info yet) preserves the original coarse global-count behavior
+    /// exactly, rather than becoming stricter or panicking.
+    #[test]
+    fn test_validate_syntax_diff_empty_touched_lines_falls_back_to_global_count() {
+        assert_eq!(
+            validate_syntax_diff("def f():\n    pass\n", "def f(:\n    pass\n", "py", &[], &[]),
+            Some(false),
+            "introducing an error with zero pre-existing errors must still reject under the \
+             fallback path"
+        );
+        assert_eq!(
+            validate_syntax_diff("def f(:\n    pass\n", "def f():\n    pass\n", "py", &[], &[]),
+            Some(true),
+            "fixing the only error with zero hunk-position info must still pass under the \
+             fallback path"
+        );
     }
 
     #[test]

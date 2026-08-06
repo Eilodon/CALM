@@ -28,10 +28,6 @@ impl CalmServer {
                 ));
             }
 
-            let conn = match self.state_write_conn() {
-                Ok(c) => c,
-                Err(e) => return db_error(e),
-            };
             let now = utc_now_iso8601();
             // Plan 3 §3.5(d): computed even if the key has to be generated
             // on this very call (lazy — see `load_or_create_mac_key`'s doc
@@ -53,7 +49,33 @@ impl CalmServer {
             // a future session's context.
             let content_warning = calm_core::sanitize::injection_warning(content);
             let quarantined = content_warning.is_some();
-            let result = conn.execute(
+            // Audit 8.4: filesystem hashing (real I/O — walking refs and
+            // stat'ing/hashing each one) happens BEFORE the transaction
+            // opens below, not inside it — holding a DB write lock across
+            // that I/O would serialize every other `state.db` writer for
+            // however long it takes, for no benefit (nothing here reads
+            // back DB state to decide what to hash).
+            let ignore_patterns = self.config().ignore;
+            let refs = calm_core::memory::capture_refs(&self.project_root, &ignore_patterns, content);
+            let refs_captured = refs.len();
+
+            let mut conn = match self.state_write_conn() {
+                Ok(c) => c,
+                Err(e) => return db_error(e),
+            };
+            // Audit 8.4: note upsert and ref replacement used to be two
+            // separate implicit auto-commit statements/groups on the same
+            // connection -- a crash between them (or `store_refs`' own
+            // internal DELETE-then-N-INSERTs failing partway) could leave
+            // new content paired with stale or partial refs, and `recall`
+            // would report a freshness snapshot that doesn't correspond to
+            // the content it's actually next to. One transaction now: both
+            // succeed or neither does.
+            let tx = match conn.transaction() {
+                Ok(t) => t,
+                Err(e) => return db_error(e),
+            };
+            let result = tx.execute(
                 "INSERT INTO project_memory (topic, content, content_mac, quarantined, created_at, updated_at) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?5) \
                  ON CONFLICT(topic) DO UPDATE SET content = excluded.content, content_mac = excluded.content_mac, \
@@ -67,15 +89,19 @@ impl CalmServer {
                     false,
                 ));
             }
-
-            // Best-effort: capture which real files this note references, so
-            // a later `recall` can tell if they've changed since — a failure
-            // here shouldn't fail the note itself, which is already saved.
-            let ignore_patterns = self.config().ignore;
-            let refs = calm_core::memory::capture_refs(&self.project_root, &ignore_patterns, content);
-            let refs_captured = refs.len();
-            if let Err(e) = calm_core::memory::store_refs(&conn, topic, &refs) {
-                tracing::error!("remember: failed to store refs for topic {topic}: {e}");
+            if let Err(e) = calm_core::memory::store_refs(&tx, topic, &refs) {
+                return ToolOutcome::error(error_detail(
+                    "WRITE_FAILED",
+                    &format!("failed to store refs for topic {topic}: {e}"),
+                    false,
+                ));
+            }
+            if let Err(e) = tx.commit() {
+                return ToolOutcome::error(error_detail(
+                    "WRITE_FAILED",
+                    &format!("commit failed: {e}"),
+                    false,
+                ));
             }
 
             ToolOutcome::success(RememberOutput {

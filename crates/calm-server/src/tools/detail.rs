@@ -461,8 +461,16 @@ pub(crate) fn transitive_bfs(
     let start = std::time::Instant::now();
     let deadline = std::time::Duration::from_millis(timeout_ms);
 
-    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
-    visited.insert(start_qualified_name.to_string());
+    // Audit 3.7: a flat `HashSet<String>` here would permanently poison a
+    // node the first time it's SEEN, even via a non-expandable `ambiguous`
+    // edge — a later encounter of the SAME node through a confirmed edge
+    // would then find it already "visited" and silently drop, losing
+    // everything reachable behind it. The value tracks whether the
+    // recorded sighting was expandable, so a later confirmed encounter can
+    // still promote a blocked node into the next frontier (it just never
+    // re-emits a second `TransitiveEntry` for a node already reported).
+    let mut visited: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+    visited.insert(start_qualified_name.to_string(), true);
     let mut frontier = vec![start_qualified_name.to_string()];
     let mut results = Vec::new();
     let mut depth = 0usize;
@@ -485,25 +493,43 @@ pub(crate) fn transitive_bfs(
             });
             let Ok(rows) = rows else { continue };
             for (sym_name, sym_path, edge_confidence) in rows.filter_map(|r| r.ok()) {
-                if visited.insert(sym_name.clone()) {
-                    // An `ambiguous` edge is index-time fan-out (one call site,
-                    // one edge per same-named symbol). Reported, because the
-                    // caller still wants to see it — but never expanded: each
-                    // such hop would multiply the frontier by the fan-out width,
-                    // and confidence is not transitive, so anything found behind
-                    // one inherits its uncertainty while presenting its own
-                    // edge's confidence. Measured on real corpora before this
-                    // guard: a depth-3 query returned up to 47% of a whole repo.
-                    let expandable =
-                        edge_confidence != calm_core::types::EdgeConfidence::Ambiguous.as_str();
-                    results.push(TransitiveEntry {
-                        symbol: sym_name.clone(),
-                        path: sym_path,
-                        depth: depth as i64,
-                        edge_confidence,
-                    });
-                    if expandable {
+                // An `ambiguous` edge is index-time fan-out (one call site,
+                // one edge per same-named symbol). Reported, because the
+                // caller still wants to see it — but never expanded on its
+                // own: each such hop would multiply the frontier by the
+                // fan-out width, and confidence is not transitive, so
+                // anything found behind one inherits its uncertainty while
+                // presenting its own edge's confidence. Measured on real
+                // corpora before this guard: a depth-3 query returned up to
+                // 47% of a whole repo.
+                let expandable =
+                    edge_confidence != calm_core::types::EdgeConfidence::Ambiguous.as_str();
+
+                match visited.get(&sym_name).copied() {
+                    None => {
+                        visited.insert(sym_name.clone(), expandable);
+                        results.push(TransitiveEntry {
+                            symbol: sym_name.clone(),
+                            path: sym_path,
+                            depth: depth as i64,
+                            edge_confidence,
+                        });
+                        if expandable {
+                            next_frontier.push(sym_name);
+                        }
+                    }
+                    Some(false) if expandable => {
+                        // Previously seen only via an ambiguous edge and
+                        // blocked from expansion — this confirmed encounter
+                        // promotes it (SeenAmbiguous -> SeenExpandable). The
+                        // node was already reported once; don't duplicate
+                        // the entry, just unblock traversal behind it.
+                        visited.insert(sym_name.clone(), true);
                         next_frontier.push(sym_name);
+                    }
+                    _ => {
+                        // Already recorded as expandable (or re-seen as
+                        // ambiguous with nothing new to offer) — skip.
                     }
                 }
             }
@@ -999,6 +1025,43 @@ mod transitive_bfs_tests {
         assert!(
             names.contains(&"deep"),
             "confident chain was cut short: {names:?}"
+        );
+    }
+
+    /// Audit 3.7 regression: a node first seen (and blocked from expansion)
+    /// via an ambiguous edge must still be expandable once a LATER, confirmed
+    /// encounter of the SAME node arrives via a different path — a flat
+    /// `visited: HashSet` would permanently poison it on the first sighting
+    /// regardless of confidence, silently dropping everything reachable
+    /// behind it. Structured across depths (not row order within one SQL
+    /// query) so the ordering is deterministic:
+    ///   depth 1: target <- fanout (ambiguous, blocked) ; target <- via (resolved)
+    ///   depth 2: via <- fanout (resolved)  — same node, now confirmed
+    ///   depth 3: fanout <- behind_fanout (resolved) — only reachable if the
+    ///            depth-2 confirmed encounter was allowed to promote `fanout`
+    ///            into the frontier.
+    #[test]
+    fn confirmed_encounter_unpoisons_a_node_first_seen_via_an_ambiguous_edge() {
+        let conn = test_conn();
+        edge(&conn, "fanout", "target", "ambiguous", 0);
+        edge(&conn, "via", "target", "resolved", 0);
+        edge(&conn, "fanout", "via", "resolved", 0);
+        edge(&conn, "behind_fanout", "fanout", "resolved", 0);
+
+        let (entries, _) = transitive_bfs(&conn, "target", EdgeDirection::Callers, 3, 5_000);
+        let names: Vec<&str> = entries.iter().map(|e| e.symbol.as_str()).collect();
+
+        assert!(names.contains(&"fanout"), "{names:?}");
+        assert!(names.contains(&"via"), "{names:?}");
+        assert!(
+            names.contains(&"behind_fanout"),
+            "a confirmed re-encounter of an ambiguous-blocked node must still \
+             unblock traversal behind it: {names:?}"
+        );
+        assert_eq!(
+            names.iter().filter(|n| **n == "fanout").count(),
+            1,
+            "promoting a node to expandable must not re-emit a duplicate entry: {names:?}"
         );
     }
 }

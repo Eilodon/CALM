@@ -71,7 +71,16 @@ pub fn get_git_diff(
     commits: Option<&str>,
     timeout_secs: u64,
 ) -> (Option<String>, Option<String>) {
-    let cmd_args: Vec<String> = if staged {
+    // Audit 5.2: without this, git C-quotes any path containing a space,
+    // tab, or non-ASCII byte (wrapping it in `"..."` with backslash/octal
+    // escapes) — `parse_diff_git_header`/`parse_unified_diff`'s `+++`
+    // handling would then mis-split or mis-strip it. This makes git emit
+    // raw, unquoted UTF-8 paths for every internal invocation instead, so
+    // the common case never needs the unquoting fallback those two
+    // functions still carry for caller-supplied raw diffs (the `diff`
+    // param bypasses this function entirely and can't be forced this way).
+    let mut cmd_args: Vec<String> = vec!["-c".into(), "core.quotePath=false".into()];
+    cmd_args.extend(if staged {
         vec!["diff".into(), "--cached".into(), "-M".into()]
     } else if let Some(range) = commits {
         vec!["diff".into(), "-M".into(), range.into()]
@@ -82,7 +91,7 @@ pub fn get_git_diff(
         // (this branch returned a hard error instead), contradicting the
         // tool's own schema description.
         vec!["diff".into(), "-M".into()]
-    };
+    });
 
     match run_with_timeout("git", cmd_args, project_root, timeout_secs) {
         Ok(output) if output.status.success() => (
@@ -164,7 +173,13 @@ pub fn parse_unified_diff(diff_text: &str) -> Vec<FileDiff> {
             if let Some(f) = current.as_mut() {
                 let rest = rest.trim();
                 if rest != "/dev/null" {
-                    f.path = rest.strip_prefix("b/").unwrap_or(rest).to_string();
+                    // Audit 5.2: same quoting as the `diff --git` header --
+                    // a `+++ "b/file with space.rs"` line needs unescaping
+                    // before the `b/` prefix strip, or the surrounding
+                    // quotes and any backslash/octal escapes leak into
+                    // `f.path` verbatim.
+                    let unquoted = unquote_git_path(rest);
+                    f.path = unquoted.strip_prefix("b/").unwrap_or(&unquoted).to_string();
                 }
             }
         } else if let Some((new_start, new_end)) =
@@ -202,15 +217,112 @@ pub fn parse_unified_diff(diff_text: &str) -> Vec<FileDiff> {
     files
 }
 
+/// Audit 5.2: Git C-quotes a path (wraps it in `"..."` with `\\`/`\"`/`\t`/
+/// `\n`/octal-byte escapes) whenever it contains a space, tab, double quote,
+/// backslash, or non-ASCII byte — `core.quotePath` defaults to `true`. A
+/// bare `.find(" b/")` (the old implementation) doesn't match when the a-
+/// path is quoted (there's a `"` between the space and `b`, e.g. `"a/file
+/// with space.rs" "b/file with space.rs"`), so it fell through to
+/// `split_whitespace().last()`, which splits INSIDE the quoted b-path and
+/// returns garbage like `space.rs"`. This handles both quoted paths
+/// properly (delegating to `unquote_git_path`) and the common unquoted case
+/// unchanged.
 fn parse_diff_git_header(rest: &str) -> String {
-    if let Some(idx) = rest.find(" b/") {
-        rest[idx + 3..].trim().to_string()
+    let after_a = if let Some(quoted_a_and_rest) = rest.strip_prefix('"') {
+        match find_unescaped_quote(quoted_a_and_rest) {
+            // `end` is the closing quote's index within `quoted_a_and_rest`
+            // (i.e. 1 past the opening quote in `rest`); the byte right
+            // after that closing quote in `rest` is at `end + 2`.
+            Some(end) => rest.get(end + 2..).unwrap_or("").trim_start(),
+            // Malformed (unterminated quote) -- fall back to the whole
+            // thing rather than panicking or silently returning empty.
+            None => return unquote_git_path(rest.trim()),
+        }
     } else {
-        rest.split_whitespace()
-            .last()
-            .map(|s| s.strip_prefix("b/").unwrap_or(s).to_string())
-            .unwrap_or_default()
+        match rest.split_once(' ') {
+            // A bare (unquoted) path can't itself contain a space -- by
+            // construction the first space is exactly the a/b separator.
+            Some((_, after)) => after,
+            None => return rest.trim().to_string(),
+        }
+    };
+    let b_path = unquote_git_path(after_a.trim());
+    b_path.strip_prefix("b/").unwrap_or(&b_path).to_string()
+}
+
+/// Returns the index (within `s`) of the first unescaped `"`, treating any
+/// `\X` pair as a single escaped unit to skip over (so `\"` inside a quoted
+/// path never looks like the closing quote). `None` if `s` has no
+/// unescaped closing quote at all (malformed input).
+fn find_unescaped_quote(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2,
+            b'"' => return Some(i),
+            _ => i += 1,
+        }
     }
+    None
+}
+
+/// If `s` is a Git C-quoted path (`"..."` with backslash/octal escapes),
+/// returns the unescaped path; otherwise returns `s` unchanged (the common,
+/// already-plain case). Handles the escapes `core.quotePath`'s quoting
+/// actually produces: `\"`, `\\`, `\t`, `\n`, and `\NNN` 3-digit octal for
+/// any byte >= 0x80 (non-ASCII) or other bytes it deems unsafe to emit raw.
+/// An unrecognized `\X` escape is kept literally (both characters) rather
+/// than silently dropping the backslash.
+fn unquote_git_path(s: &str) -> String {
+    let Some(inner) = s.strip_prefix('"').and_then(|s| s.strip_suffix('"')) else {
+        return s.to_string();
+    };
+    let bytes = inner.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'\\' || i + 1 >= bytes.len() {
+            out.push(bytes[i]);
+            i += 1;
+            continue;
+        }
+        match bytes[i + 1] {
+            b'"' => {
+                out.push(b'"');
+                i += 2;
+            }
+            b'\\' => {
+                out.push(b'\\');
+                i += 2;
+            }
+            b't' => {
+                out.push(b'\t');
+                i += 2;
+            }
+            b'n' => {
+                out.push(b'\n');
+                i += 2;
+            }
+            d1 @ b'0'..=b'7'
+                if i + 3 < bytes.len()
+                    && (b'0'..=b'7').contains(&bytes[i + 2])
+                    && (b'0'..=b'7').contains(&bytes[i + 3]) =>
+            {
+                let val = (d1 - b'0') * 64 + (bytes[i + 2] - b'0') * 8 + (bytes[i + 3] - b'0');
+                out.push(val);
+                i += 4;
+            }
+            other => {
+                // Unrecognized escape -- keep both characters literally
+                // rather than losing the backslash.
+                out.push(b'\\');
+                out.push(other);
+                i += 2;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Parses the new-file `+start,len` range out of a hunk header tail (the part
@@ -251,11 +363,42 @@ pub fn is_signature_changed(signature_range: (i64, i64), added_lines: &HashSet<i
 static PARAM_NAME: std::sync::LazyLock<regex::Regex> =
     std::sync::LazyLock::new(|| regex::Regex::new(r"\b[A-Za-z_][A-Za-z0-9_]*\s*:").unwrap());
 
-/// Collapses whitespace runs and strips parameter names (see `PARAM_NAME`)
-/// so two signature snippets that differ only in naming or formatting
-/// normalize to the same string.
-fn normalize_signature_text(text: &str) -> String {
-    let stripped = PARAM_NAME.replace_all(text, ":");
+/// Swift only: matches a TWO-identifier parameter (`label name:` or `_
+/// name:`) — capturing the leading `(`/`,` delimiter, the label, and the
+/// trailing colon separately from the internal name sitting between the
+/// two identifiers, so replacement can drop just that internal name.
+/// Anchored on `(`/`,` immediately before the label so it can't match
+/// inside an unrelated type expression — "delimiter, identifier,
+/// whitespace, identifier, colon" only occurs in a real Swift parameter
+/// list. Audit 5.3: Swift's ONE-identifier shorthand (`x: Int`, no label
+/// token before it) deliberately does NOT match this — there `x` is both
+/// the external label callers write (`f(x: 1)`) and the internal name, so
+/// it must be preserved, not stripped, unlike the second identifier here.
+static SWIFT_INTERNAL_PARAM_NAME: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"([(,]\s*)([A-Za-z_][A-Za-z0-9_]*)\s+[A-Za-z_][A-Za-z0-9_]*(\s*:)")
+            .unwrap()
+    });
+
+/// Collapses whitespace runs and, per-language, strips exactly the
+/// parameter-name text that's never observable to a caller (see
+/// `PARAM_NAME`'s doc comment for the default/positional-only case).
+///
+/// Audit 5.3: three languages need something other than that default:
+/// - Python keyword arguments and Kotlin named arguments make EVERY
+///   declared parameter name part of the call contract (`f(dim=1)`/
+///   `f(dim = 1)` breaks if `dim` is renamed) — nothing is safe to strip.
+/// - Swift splits the two identifiers a parameter can have: the first
+///   (external label, or `x` in the one-identifier shorthand where it
+///   doubles as both) is call-observable and must be preserved; only a
+///   SECOND identifier (the purely-internal name in `label x: Int`) is
+///   safe to drop — see `SWIFT_INTERNAL_PARAM_NAME`.
+fn normalize_signature_text(text: &str, language: &str) -> String {
+    let stripped: std::borrow::Cow<'_, str> = match language {
+        "python" | "kotlin" => std::borrow::Cow::Borrowed(text),
+        "swift" => SWIFT_INTERNAL_PARAM_NAME.replace_all(text, "$1$2$3"),
+        _ => PARAM_NAME.replace_all(text, ":"),
+    };
     stripped.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
@@ -270,8 +413,12 @@ fn normalize_signature_text(text: &str) -> String {
 /// commas single-line form doesn't have — a real textual difference this
 /// intentionally leaves as "changed" rather than trying to be a real
 /// parser).
-pub fn is_signature_semantically_changed(old_text: &str, new_text: &str) -> bool {
-    normalize_signature_text(old_text) != normalize_signature_text(new_text)
+///
+/// `language` (the `symbols.language` column, e.g. `"python"`, `"rust"`)
+/// selects the normalization above -- see
+/// `language_uses_param_identifier_as_call_contract`.
+pub fn is_signature_semantically_changed(old_text: &str, new_text: &str, language: &str) -> bool {
+    normalize_signature_text(old_text, language) != normalize_signature_text(new_text, language)
 }
 
 /// Reconstructs old and new text for `signature_range`, for
@@ -547,44 +694,135 @@ mod tests {
         assert!(
             !is_signature_semantically_changed(
                 "pub fn f(_dim: usize) -> Result<()> {",
-                "pub fn f(dim: usize) -> Result<()> {"
+                "pub fn f(dim: usize) -> Result<()> {",
+                "rust"
             ),
             "renaming a parameter must not count as a signature change"
         );
         assert!(
             !is_signature_semantically_changed(
                 "pub fn f(dim:    usize)   ->   Result<()> {",
-                "pub fn f(dim: usize) -> Result<()> {"
+                "pub fn f(dim: usize) -> Result<()> {",
+                "rust"
             ),
             "whitespace-only reformatting must not count as a signature change"
         );
         assert!(
             is_signature_semantically_changed(
                 "pub fn f(dim: usize) -> Result<()> {",
-                "pub fn f(dim: u64) -> Result<()> {"
+                "pub fn f(dim: u64) -> Result<()> {",
+                "rust"
             ),
             "a real type change must count as a signature change"
         );
         assert!(
             is_signature_semantically_changed(
                 "pub fn f(dim: usize) -> Result<()> {",
-                "pub fn f(dim: usize, extra: bool) -> Result<()> {"
+                "pub fn f(dim: usize, extra: bool) -> Result<()> {",
+                "rust"
             ),
             "adding a parameter must count as a signature change"
         );
         assert!(
             is_signature_semantically_changed(
                 "pub fn f(a: usize, b: String) -> Result<()> {",
-                "pub fn f(b: String, a: usize) -> Result<()> {"
+                "pub fn f(b: String, a: usize) -> Result<()> {",
+                "rust"
             ),
             "reordering parameters must count as a signature change (breaks positional callers)"
         );
         assert!(
             is_signature_semantically_changed(
                 "pub fn f(dim: usize) -> Result<()> {",
-                "pub fn f(dim: usize) -> Result<i64> {"
+                "pub fn f(dim: usize) -> Result<i64> {",
+                "rust"
             ),
             "a return-type change must count as a signature change"
+        );
+    }
+
+    /// Audit 5.3: Python keyword arguments make a parameter's own name part
+    /// of the call contract (`f(dim=1)` breaks if `dim` is renamed) —
+    /// unlike Rust, this must register as a real signature change.
+    #[test]
+    fn test_is_signature_semantically_changed_python_keyword_arg_rename_is_a_real_change() {
+        assert!(
+            is_signature_semantically_changed(
+                "def f(dim: int) -> None:",
+                "def f(size: int) -> None:",
+                "python"
+            ),
+            "renaming a Python parameter breaks keyword-argument callers — must count as changed"
+        );
+        // Contrast: a real type-only change must still be caught too (not
+        // a regression introduced by preserving identifiers).
+        assert!(
+            is_signature_semantically_changed(
+                "def f(dim: int) -> None:",
+                "def f(dim: str) -> None:",
+                "python"
+            ),
+            "a real type change must still count as a signature change for Python"
+        );
+        // Whitespace-only reformatting must still be absorbed.
+        assert!(
+            !is_signature_semantically_changed(
+                "def f(dim:   int) ->   None:",
+                "def f(dim: int) -> None:",
+                "python"
+            ),
+            "whitespace-only reformatting must not count as a signature change"
+        );
+    }
+
+    /// Audit 5.3: Kotlin named arguments have the same call-contract
+    /// property as Python's keyword arguments.
+    #[test]
+    fn test_is_signature_semantically_changed_kotlin_named_arg_rename_is_a_real_change() {
+        assert!(
+            is_signature_semantically_changed(
+                "fun f(dim: Int): Unit",
+                "fun f(size: Int): Unit",
+                "kotlin"
+            ),
+            "renaming a Kotlin parameter breaks named-argument callers — must count as changed"
+        );
+    }
+
+    /// Audit 5.3: Swift's one-identifier shorthand (`func f(x: Int)`) makes
+    /// `x` BOTH the external label callers use (`f(x: 1)`) and the internal
+    /// name — renaming it breaks every call site, unlike Rust/Go/Java where
+    /// the identifier before `:` is purely internal.
+    #[test]
+    fn test_is_signature_semantically_changed_swift_one_identifier_label_rename_is_a_real_change()
+    {
+        assert!(
+            is_signature_semantically_changed(
+                "func f(dim: Int) -> Void",
+                "func f(size: Int) -> Void",
+                "swift"
+            ),
+            "renaming Swift's one-identifier shorthand changes the external label — must count \
+             as changed"
+        );
+    }
+
+    /// Audit 5.3 (already-correct case, confirmed not regressed): Swift's
+    /// TWO-identifier form separates the external label (first identifier,
+    /// call-observable) from the internal name (second identifier, purely
+    /// declaration-local) — renaming just the internal name must NOT count
+    /// as a signature change, exactly like Rust's `_dim`/`dim`.
+    #[test]
+    fn test_is_signature_semantically_changed_swift_two_identifier_internal_rename_is_not_a_change()
+    {
+        assert!(
+            !is_signature_semantically_changed(
+                "func f(label dim: Int) -> Void",
+                "func f(label size: Int) -> Void",
+                "swift"
+            ),
+            "renaming only the internal name in Swift's `label name:` form keeps the external \
+             label (\"label\") unchanged — must not count as a signature change"
         );
     }
 
@@ -606,7 +844,7 @@ mod tests {
         .join("\n");
         let files = parse_unified_diff(&diff);
         let (old_text, new_text) = signature_text_before_after(&files[0], (1, 1));
-        assert!(!is_signature_semantically_changed(&old_text, &new_text));
+        assert!(!is_signature_semantically_changed(&old_text, &new_text, "rust"));
 
         // Contrast: a same-shaped diff that actually changes the type must
         // resolve to "changed".
@@ -623,7 +861,7 @@ mod tests {
         .join("\n");
         let files = parse_unified_diff(&diff);
         let (old_text, new_text) = signature_text_before_after(&files[0], (1, 1));
-        assert!(is_signature_semantically_changed(&old_text, &new_text));
+        assert!(is_signature_semantically_changed(&old_text, &new_text, "rust"));
     }
 
     #[test]
@@ -991,6 +1229,70 @@ mod tests {
         let files = parse_unified_diff(diff);
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].path, "src/renamed.rs");
+    }
+
+
+    /// Audit 5.2: Git C-quotes a path containing a space (core.quotePath
+    /// defaults to true) — both the `diff --git "a/..." "b/..."` header and
+    /// the `--- "a/..."` / `+++ "b/..."` lines. The old `.find(" b/")`
+    /// implementation didn't match a quoted a-path (a `"` sits between the
+    /// space and `b`) and fell through to a whitespace split that cut the
+    /// b-path apart, e.g. producing `space.rs"` instead of the real path.
+    #[test]
+    fn test_parse_unified_diff_quoted_path_with_space() {
+        let diff = "diff --git \"a/file with space.rs\" \"b/file with space.rs\"\n\
+                     --- \"a/file with space.rs\"\n\
+                     +++ \"b/file with space.rs\"\n\
+                     @@ -1,1 +1,2 @@\n\
+                      context\n\
+                     +added\n";
+        let files = parse_unified_diff(diff);
+        assert_eq!(files.len(), 1);
+        assert_eq!(
+            files[0].path, "file with space.rs",
+            "quoted path must be unescaped and unwrapped, not split mid-string: {:?}",
+            files[0].path
+        );
+    }
+
+    /// Audit 5.2: non-ASCII bytes in a path are C-quoted as 3-digit octal
+    /// escapes (`café.rs` -> `caf\303\251.rs`, the UTF-8 bytes for `é`).
+    #[test]
+    fn test_parse_unified_diff_quoted_path_with_octal_escaped_non_ascii() {
+        let diff = "diff --git \"a/caf\\303\\251.rs\" \"b/caf\\303\\251.rs\"\n\
+                     --- \"a/caf\\303\\251.rs\"\n\
+                     +++ \"b/caf\\303\\251.rs\"\n\
+                     @@ -1,1 +1,2 @@\n\
+                      context\n\
+                     +added\n";
+        let files = parse_unified_diff(diff);
+        assert_eq!(files.len(), 1);
+        assert_eq!(
+            files[0].path, "café.rs",
+            "octal-escaped UTF-8 bytes must decode back to the real path: {:?}",
+            files[0].path
+        );
+    }
+
+    /// Audit 5.2: a literal double quote or backslash inside a path is
+    /// itself escaped (`\"`, `\\`) — must round-trip back to the raw
+    /// character, not stay escaped or drop the backslash.
+    #[test]
+    fn test_parse_unified_diff_quoted_path_with_escaped_quote_and_backslash() {
+        let diff = "diff --git \"a/we\\\"ird\\\\name.rs\" \"b/we\\\"ird\\\\name.rs\"\n\
+                     --- \"a/we\\\"ird\\\\name.rs\"\n\
+                     +++ \"b/we\\\"ird\\\\name.rs\"\n\
+                     @@ -1,1 +1,2 @@\n\
+                      context\n\
+                     +added\n";
+        let files = parse_unified_diff(diff);
+        assert_eq!(files.len(), 1);
+        assert_eq!(
+            files[0].path,
+            "we\"ird\\name.rs",
+            "escaped quote/backslash must round-trip to the literal characters: {:?}",
+            files[0].path
+        );
     }
 
     #[test]
