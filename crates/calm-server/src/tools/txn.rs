@@ -250,8 +250,10 @@ impl CalmServer {
                         // no real work of its own and must not report success
                         // here; the caller sees this as a request that's
                         // "covered by the in-flight pass", not a failure.
-                        let led =
-                            crate::scip_overlay::run_all_coalesced(&self.project_root, &self.db_path);
+                        let led = crate::scip_overlay::run_all_coalesced(
+                            &self.project_root,
+                            &self.db_path,
+                        );
                         if led {
                             Ok(())
                         } else {

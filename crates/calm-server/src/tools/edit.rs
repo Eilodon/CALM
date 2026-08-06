@@ -1060,8 +1060,11 @@ impl CalmServer {
         let mut touched_new_lines: Vec<(i64, i64)> = Vec::with_capacity(outcome.results.len());
         let mut shift: i64 = 0;
         for r in &outcome.results {
-            let (start_line, end_line, new_end_line) =
-                (r.start_line as i64, r.end_line as i64, r.new_end_line as i64);
+            let (start_line, end_line, new_end_line) = (
+                r.start_line as i64,
+                r.end_line as i64,
+                r.new_end_line as i64,
+            );
             touched_old_lines.push((start_line, end_line));
             touched_new_lines.push((start_line + shift, new_end_line + shift));
             shift += new_end_line - end_line;
@@ -1806,7 +1809,9 @@ impl CalmServer {
                             // mid-pass, exactly the race this outbox exists to
                             // prevent.
                             let led = crate::scip_overlay::run_all_coalesced(&root, &db);
-                            if led && let Ok(conn) = calm_core::db::conn::open_state_writer(&state_db) {
+                            if led
+                                && let Ok(conn) = calm_core::db::conn::open_state_writer(&state_db)
+                            {
                                 let _ = calm_core::maintenance::mark_completed(
                                     &conn,
                                     calm_core::maintenance::MaintenanceKind::ScipRefresh,

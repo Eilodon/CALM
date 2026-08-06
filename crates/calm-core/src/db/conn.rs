@@ -80,7 +80,10 @@ mod tests {
     fn writer_connections_enforce_foreign_keys_by_default() {
         let dir = tempfile::tempdir().unwrap();
         for (label, conn) in [
-            ("open_writer", open_writer(&dir.path().join("index.db")).unwrap()),
+            (
+                "open_writer",
+                open_writer(&dir.path().join("index.db")).unwrap(),
+            ),
             (
                 "open_state_writer",
                 open_state_writer(&dir.path().join("state.db")).unwrap(),

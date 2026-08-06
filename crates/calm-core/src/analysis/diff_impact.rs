@@ -794,8 +794,7 @@ mod tests {
     /// name — renaming it breaks every call site, unlike Rust/Go/Java where
     /// the identifier before `:` is purely internal.
     #[test]
-    fn test_is_signature_semantically_changed_swift_one_identifier_label_rename_is_a_real_change()
-    {
+    fn test_is_signature_semantically_changed_swift_one_identifier_label_rename_is_a_real_change() {
         assert!(
             is_signature_semantically_changed(
                 "func f(dim: Int) -> Void",
@@ -844,7 +843,9 @@ mod tests {
         .join("\n");
         let files = parse_unified_diff(&diff);
         let (old_text, new_text) = signature_text_before_after(&files[0], (1, 1));
-        assert!(!is_signature_semantically_changed(&old_text, &new_text, "rust"));
+        assert!(!is_signature_semantically_changed(
+            &old_text, &new_text, "rust"
+        ));
 
         // Contrast: a same-shaped diff that actually changes the type must
         // resolve to "changed".
@@ -861,7 +862,9 @@ mod tests {
         .join("\n");
         let files = parse_unified_diff(&diff);
         let (old_text, new_text) = signature_text_before_after(&files[0], (1, 1));
-        assert!(is_signature_semantically_changed(&old_text, &new_text, "rust"));
+        assert!(is_signature_semantically_changed(
+            &old_text, &new_text, "rust"
+        ));
     }
 
     #[test]
@@ -1231,7 +1234,6 @@ mod tests {
         assert_eq!(files[0].path, "src/renamed.rs");
     }
 
-
     /// Audit 5.2: Git C-quotes a path containing a space (core.quotePath
     /// defaults to true) — both the `diff --git "a/..." "b/..."` header and
     /// the `--- "a/..."` / `+++ "b/..."` lines. The old `.find(" b/")`
@@ -1288,8 +1290,7 @@ mod tests {
         let files = parse_unified_diff(diff);
         assert_eq!(files.len(), 1);
         assert_eq!(
-            files[0].path,
-            "we\"ird\\name.rs",
+            files[0].path, "we\"ird\\name.rs",
             "escaped quote/backslash must round-trip to the literal characters: {:?}",
             files[0].path
         );

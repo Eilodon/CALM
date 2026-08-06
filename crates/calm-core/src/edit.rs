@@ -537,7 +537,10 @@ pub fn validate_syntax_diff(
         .iter()
         .map(|&(s, e)| (s - RESYNC_MARGIN, e + RESYNC_MARGIN))
         .collect();
-    let new_outside = new_errors.iter().filter(|r| !intersects_any(r, &new_zone)).count();
+    let new_outside = new_errors
+        .iter()
+        .filter(|r| !intersects_any(r, &new_zone))
+        .count();
     let original_outside = original_errors
         .iter()
         .filter(|r| !intersects_any(r, &old_zone))
@@ -1104,7 +1107,6 @@ mod tests {
         assert_eq!(validate_syntax("def f(:\n    pass\n", "py"), Some(false));
     }
 
-
     /// Audit 5.4 core regression: the OLD `new_errors <= original_errors`
     /// count comparison is gameable -- an edit that leaves the TOUCHED line
     /// just as broken as before (a different invalid construct, not a fix)
@@ -1175,13 +1177,25 @@ mod tests {
     #[test]
     fn test_validate_syntax_diff_empty_touched_lines_falls_back_to_global_count() {
         assert_eq!(
-            validate_syntax_diff("def f():\n    pass\n", "def f(:\n    pass\n", "py", &[], &[]),
+            validate_syntax_diff(
+                "def f():\n    pass\n",
+                "def f(:\n    pass\n",
+                "py",
+                &[],
+                &[]
+            ),
             Some(false),
             "introducing an error with zero pre-existing errors must still reject under the \
              fallback path"
         );
         assert_eq!(
-            validate_syntax_diff("def f(:\n    pass\n", "def f():\n    pass\n", "py", &[], &[]),
+            validate_syntax_diff(
+                "def f(:\n    pass\n",
+                "def f():\n    pass\n",
+                "py",
+                &[],
+                &[]
+            ),
             Some(true),
             "fixing the only error with zero hunk-position info must still pass under the \
              fallback path"

@@ -115,7 +115,13 @@ const MAINTENANCE_LEASE_TTL_SECS: f64 = 300.0;
 /// two owner strings for a security decision).
 fn process_owner_id() -> &'static str {
     static OWNER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    OWNER.get_or_init(|| format!("PID-{}-{:x}", std::process::id(), (now_epoch_secs() * 1e6) as u64))
+    OWNER.get_or_init(|| {
+        format!(
+            "PID-{}-{:x}",
+            std::process::id(),
+            (now_epoch_secs() * 1e6) as u64
+        )
+    })
 }
 
 /// job_id doesn't need to be unpredictable or globally unique across
@@ -377,11 +383,19 @@ pub fn reconcile_stale_at_startup(conn: &Connection) -> rusqlite::Result<Vec<Mai
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (job_id, kind_str, state_str, triggered_by_tx_id, attempts, last_error, last_completed_at) =
-                row?;
-            let (Some(kind), Some(state)) =
-                (MaintenanceKind::parse(&kind_str), JobState::parse(&state_str))
-            else {
+            let (
+                job_id,
+                kind_str,
+                state_str,
+                triggered_by_tx_id,
+                attempts,
+                last_error,
+                last_completed_at,
+            ) = row?;
+            let (Some(kind), Some(state)) = (
+                MaintenanceKind::parse(&kind_str),
+                JobState::parse(&state_str),
+            ) else {
                 continue;
             };
             out.push(MaintenanceJob {
@@ -586,7 +600,7 @@ mod tests {
         assert!(embed.last_completed_at.is_none());
     }
 
-/// Backdates `dedupe_key`'s lease so it reads as already-expired, standing
+    /// Backdates `dedupe_key`'s lease so it reads as already-expired, standing
     /// in for "enough wall-clock time passed since the crash that the lease
     /// this process claimed via `mark_running` is no longer current."
     fn expire_lease(conn: &Connection, kind: MaintenanceKind) {
@@ -707,7 +721,11 @@ mod tests {
         // embed_pending pass -- reports its own completion. Must not
         // silently no-op just because the row already reads 'done'.
         std::thread::sleep(std::time::Duration::from_millis(5));
-        let result = mark_completed(&conn, MaintenanceKind::EmbedRefresh, Err("second pass failed"));
+        let result = mark_completed(
+            &conn,
+            MaintenanceKind::EmbedRefresh,
+            Err("second pass failed"),
+        );
         assert!(result.is_ok());
 
         let (state, last_error, last_completed_at): (String, Option<String>, f64) = conn

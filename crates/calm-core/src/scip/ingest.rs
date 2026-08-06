@@ -1909,8 +1909,7 @@ mod tests {
         let context = super::ExternalProofContext::new("scip:test", "provider", "context")
             .at_graph_generation(0);
         let stats =
-            super::ingest_occurrences_with_proof_context(&conn, &[], true, Some(&context))
-                .unwrap();
+            super::ingest_occurrences_with_proof_context(&conn, &[], true, Some(&context)).unwrap();
         // PATTERN-DEBT scip-cache-commits-discarded-generation: a discarded
         // pass must be tagged, not silently indistinguishable from a clean
         // "ran and genuinely found nothing" pass -- callers rely on this to

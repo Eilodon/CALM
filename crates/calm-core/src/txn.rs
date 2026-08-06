@@ -904,7 +904,13 @@ mod tests {
             std::thread::spawn(move || {
                 let conn = crate::db::conn::open_state_writer(&db_path).unwrap();
                 barrier.wait();
-                advance(&conn, &tx_id, TxState::Failed, "system", "cargo check failed")
+                advance(
+                    &conn,
+                    &tx_id,
+                    TxState::Failed,
+                    "system",
+                    "cargo check failed",
+                )
             })
         };
 
@@ -959,7 +965,9 @@ mod tests {
         let tx_id = {
             let conn = crate::db::conn::open_state_writer(&db_path).unwrap();
             crate::db::schema::init_state_db(&conn).unwrap();
-            begin(&conn, "proj", "f.rs", "base", "proposed").unwrap().tx_id
+            begin(&conn, "proj", "f.rs", "base", "proposed")
+                .unwrap()
+                .tx_id
         };
 
         // Holds the RESERVED lock for the whole test -- advance_many's own

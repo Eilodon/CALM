@@ -25,8 +25,8 @@ mod outcome;
 mod patterndebt;
 mod recover;
 mod scip;
-mod session_state;
 mod security;
+mod session_state;
 mod testgap;
 mod toolset;
 mod trace;
@@ -4350,7 +4350,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-
     /// Audit 9.1: dropping the LAST clone of a `for_connection()`-produced
     /// instance must remove its `active_sessions` entry -- this is what
     /// `daemon.rs::ConnectionGuard` already did for the unix-socket daemon
@@ -4361,10 +4360,8 @@ mod tests {
     /// `CalmServer` clone's own `Arc`-refcounted lifetime instead.
     #[test]
     fn dropping_the_last_clone_of_a_connection_removes_its_active_sessions_entry() {
-        let dir = std::env::temp_dir().join(format!(
-            "ci_session_guard_cleanup_{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("ci_session_guard_cleanup_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let shared = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
@@ -4942,7 +4939,10 @@ mod tests {
             })),
         );
 
-        assert_eq!(v["exists"], true, "a route through the ambiguous edge is still findable");
+        assert_eq!(
+            v["exists"], true,
+            "a route through the ambiguous edge is still findable"
+        );
         assert_eq!(
             v["certain"], false,
             "an all-ambiguous route must not be reported as certain -- PATTERN-DEBT \
@@ -4994,7 +4994,10 @@ mod tests {
         );
 
         assert_eq!(v["exists"], true);
-        assert_eq!(v["certain"], true, "a resolved (single-candidate) edge must be certain");
+        assert_eq!(
+            v["certain"], true,
+            "a resolved (single-candidate) edge must be certain"
+        );
         assert_eq!(v["route_confidence"], serde_json::json!(["resolved"]));
         assert_eq!(v["suggested_next"]["tool"], "source");
 
@@ -6507,8 +6510,10 @@ mod tests {
         // symbol AND independently mentions it again elsewhere (a second
         // textual reference, e.g. a comment or config key) silently lost
         // that second reference entirely.
-        let dir = std::env::temp_dir()
-            .join(format!("ci_ref_impact_import_same_file_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "ci_ref_impact_import_same_file_{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("def.js"), "function widgetInit() { return 1; }\n").unwrap();
@@ -8056,7 +8061,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-
     /// Audit 8.4: note upsert and ref replacement now share one transaction
     /// -- forcing `store_refs` to fail (by dropping its table out from
     /// under an in-progress `remember` call) must roll back the note write
@@ -8078,8 +8082,7 @@ mod tests {
 
         {
             let conn = calm_core::db::conn::open_state_writer(&server.state_db_path).unwrap();
-            conn.execute("DROP TABLE project_memory_refs", [])
-                .unwrap();
+            conn.execute("DROP TABLE project_memory_refs", []).unwrap();
         }
 
         let second = server.remember(rmcp::handler::server::wrapper::Parameters(RememberParams {
