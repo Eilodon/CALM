@@ -6,6 +6,8 @@ git tags in [Releases](https://github.com/Eilodon/CALM/releases).
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-08-06
+
 ### Added
 - Opt-in WS-6 first-slice verification (`docs/plans/2026-08-03-ws6-verification-pipeline-execution-plan.md`): `[verification] rust_check_on_write` (default off) routes a `.rs` write through the durable transaction's `VERIFY_PENDING` state instead of straight to `Done`; new `verify_change(tx_id)` tool runs `cargo check` scoped to the nearest Cargo package and advances the transaction to `Done`/`Failed` -- a failed check does not revert the file already written to disk
 - `plugins/calm/.claude-plugin/plugin.json`'s `version` is now checked against `Cargo.toml`'s (`scripts/check-doc-truth.sh`) so the Claude Code plugin manifest can't silently drift from the release it bundles again
