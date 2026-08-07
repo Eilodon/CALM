@@ -1,10 +1,11 @@
 ---
 title: "state.db rewiring — wiring calm-server's real call sites to the already-built durable-state split"
 date: 2026-08-05
-status: "RESEARCH + DESIGN COMPLETE, not yet implemented. Follow-up execution doc to the
-  storage-layer foundation landed in PR #58 (\"Claude/durability verification gaps jwav0c\").
-  A functional regression was found during this pass (see §0) that raises the priority above
-  what KNOWN_LIMITATIONS.md's framing (\"a separate follow-up\") suggests."
+status: "IMPLEMENTED — landed in PR #59 (\"Claude/calm server rewiring plan no80rd\") and
+  shipped in the 0.6.0 release (2026-08-06); see CHANGELOG.md's [0.6.0] entry. The gap this
+  plan closed (\"Durable state and the rebuildable index share one SQLite file at runtime\")
+  is no longer listed in KNOWN_LIMITATIONS.md. This header previously read \"RESEARCH +
+  DESIGN COMPLETE, not yet implemented\" — stale as of the same-day merge."
 scope: rewires every real calm-server/calm-cli call site that reads or writes a durable table
   (edit_transactions, tx_events, audit_ledger, maintenance_jobs, project_memory,
   project_memory_refs) to go through state.db (db::conn::open_state_writer,
