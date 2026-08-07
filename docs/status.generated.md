@@ -70,6 +70,7 @@ writes are reviewed):
 
 - `default`
 - `embeddings`
+- `index-bundles`
 - `lang-c`
 - `lang-cpp`
 - `lang-csharp`
