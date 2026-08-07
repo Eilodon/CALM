@@ -68,8 +68,12 @@ fn calm_index_cli_upgrades_a_real_edge_on_the_fixture() {
         )
         .unwrap();
     assert_eq!(
-        conf, "formal",
+        conf,
+        "formal",
         "expected the CLI's one-shot `calm index` to run the SCIP overlay \
-         and upgrade this edge to formal, same as the background indexer does"
+         and upgrade this edge to formal, same as the background indexer does \
+         -- child stdout={}\nchild stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
 }

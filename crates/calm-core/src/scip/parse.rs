@@ -11,27 +11,51 @@ pub enum EncodingProvenance {
     /// The SCIP document declared a non-`Unspecified` encoding — the
     /// producing indexer followed the protocol.
     Declared,
-    /// The document left `position_encoding` unset; this provider is one of
-    /// the languages SCIP's own spec (`scip.proto`'s
-    /// `Document.position_encoding` doc comment) documents a convention for,
-    /// so that convention was applied as a fallback instead of failing
-    /// closed. See `effective_encoding`.
+    /// The document left `position_encoding` unset; this provider is one
+    /// CALM has real evidence for (either SCIP's own documented spec
+    /// convention, or a specific indexer's real source verified by hand),
+    /// so a guessed encoding was applied as a fallback instead of failing
+    /// closed. See `effective_encoding` for exactly which providers and
+    /// which kind of evidence backs each.
     Fallback,
     /// The document left `position_encoding` unset and no fallback applies
     /// (unknown/generic provider) — `start_byte`/`end_byte` stay `None`.
     Unresolved,
 }
 
-/// SCIP's own documented convention for indexers that omit
-/// `Document.position_encoding` (`scip-0.9.0/src/generated/scip.rs`'s doc
-/// comment on that field, itself a transcription of `scip.proto`): JVM/.NET/
-/// JS/TS indexers should emit UTF-16, Python UTF-32, Go/Rust/C++ UTF-8. This
-/// is an evidence CONTRACT scoped to exactly those verified languages, never
-/// a global fallback — a provider outside this table keeps failing closed,
-/// including any future/unknown provider. A `declared` encoding (anything
-/// other than `Unspecified`) always wins outright: the indexer's own
-/// self-report has protocol precedence over a guess derived from its
-/// implementation language.
+/// Fallback position-encoding table for indexers that omit
+/// `Document.position_encoding`. This is an evidence CONTRACT — a provider
+/// outside this table keeps failing closed, including any future/unknown
+/// provider — but it's backed by two distinct kinds of evidence, both
+/// treated identically at runtime (guessed, not declared; see
+/// `EncodingProvenance::Fallback` and its defense-in-depth cross-check in
+/// `parse_index`'s `guessed_alt_byte_range`):
+///
+/// - `python` / `javascript`+`java`+`csharp` / `rust`+`go`+`c`: SCIP's own
+///   documented convention (`scip-0.9.0/src/generated/scip.rs`'s doc
+///   comment on `Document.position_encoding`, itself a transcription of
+///   `scip.proto`): Python -> UTF-32, JVM/.NET/JS/TS -> UTF-16,
+///   Go/Rust/C++ -> UTF-8.
+/// - `ruby`: NOT part of that spec table (see
+///   `effective_encoding_unknown_or_unverified_provider_stays_fail_closed`
+///   for what still fails closed), but independently verified against
+///   `scip-ruby`'s real source (github.com/sourcegraph/scip-ruby,
+///   `scip_indexer/SCIPIndexer.cc`): it sets
+///   `Metadata.text_document_encoding` to UTF-8 but never calls
+///   `set_position_encoding` anywhere in the codebase (0 hits repo-wide,
+///   verified via GitHub code search 2026-08-07) — Sorbet's underlying
+///   `core::Loc`/`Range` machinery is byte-oriented like the C/C++-family
+///   indexers above, so UTF-8 is a verified guess, not a spec-table one.
+///   Root-caused from the nightly regression in
+///   `ruby_overlay_upgrades_ambiguous_case_when_calls_on_the_multi_lang_
+///   fixture` that started at D4 (7672f52, 2026-08-01): before this entry,
+///   every scip-ruby occurrence had no byte span at all (`Unresolved`), so
+///   `IngestStats::upgraded` stayed 0.
+///
+/// A `declared` encoding (anything other than `Unspecified`) always wins
+/// outright regardless of the above: the indexer's own self-report has
+/// protocol precedence over any guess derived from its implementation
+/// language.
 fn effective_encoding(
     declared: scip::types::PositionEncoding,
     provider_lang: &str,
@@ -45,7 +69,11 @@ fn effective_encoding(
         "javascript" | "java" | "csharp" => {
             Some(PositionEncoding::UTF16CodeUnitOffsetFromLineStart)
         }
+        // scip.proto's own documented convention (see doc comment above).
         "rust" | "go" | "c" => Some(PositionEncoding::UTF8CodeUnitOffsetFromLineStart),
+        // Not spec-documented -- verified against scip-ruby's real source
+        // instead (see doc comment above).
+        "ruby" => Some(PositionEncoding::UTF8CodeUnitOffsetFromLineStart),
         _ => None,
     };
     match fallback {
@@ -470,13 +498,36 @@ mod tests {
     }
 
     #[test]
+    fn effective_encoding_ruby_fallback_is_utf8_verified_from_scip_ruby_source() {
+        use scip::types::PositionEncoding::*;
+        // Ruby isn't in scip.proto's documented convention table (see the
+        // test above), so this fallback rests on different evidence:
+        // scip-ruby's real source (sourcegraph/scip-ruby, scip_indexer/
+        // SCIPIndexer.cc) declares `text_document_encoding = UTF8` but never
+        // calls `set_position_encoding` anywhere in the repo (0 hits via
+        // GitHub code search, verified 2026-08-07) -- so its ranges are
+        // left Unspecified and byte-oriented like the C/C++-family
+        // indexers, matching the same UTF-8 guess used for rust/go/c above.
+        // Root-caused from the `ruby_overlay_upgrades_ambiguous_case_when_
+        // calls_on_the_multi_lang_fixture` nightly regression that started
+        // at D4 (7672f52, 2026-08-01): before this fallback existed, every
+        // scip-ruby occurrence had no byte span at all, so
+        // `IngestStats::upgraded` stayed 0.
+        let (encoding, provenance) = effective_encoding(UnspecifiedPositionEncoding, "ruby");
+        assert_eq!(encoding, UTF8CodeUnitOffsetFromLineStart);
+        assert_eq!(provenance, EncodingProvenance::Fallback);
+    }
+
+    #[test]
     fn effective_encoding_unknown_or_unverified_provider_stays_fail_closed() {
         use scip::types::PositionEncoding::*;
-        // PHP/Ruby are real providers but NOT in SCIP's documented
-        // encoding-convention table — this is an evidence CONTRACT scoped to
-        // spec-verified languages, not a global fallback, so they (and any
-        // future/unknown provider) must keep failing closed.
-        for lang in ["php", "ruby", "some-future-language", ""] {
+        // PHP is a real provider but has no verified encoding evidence
+        // (neither in SCIP's documented spec table nor independently
+        // confirmed against its real indexer source the way ruby was — see
+        // `effective_encoding`'s doc comment) — this is an evidence
+        // CONTRACT, not a global fallback, so it (and any future/unknown
+        // provider) must keep failing closed.
+        for lang in ["php", "some-future-language", ""] {
             let (encoding, provenance) = effective_encoding(UnspecifiedPositionEncoding, lang);
             assert_eq!(encoding, UnspecifiedPositionEncoding, "lang={lang}");
             assert_eq!(provenance, EncodingProvenance::Unresolved, "lang={lang}");

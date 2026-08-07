@@ -104,6 +104,14 @@ tokio = { workspace = true, optional = true }
 [dev-dependencies]
 tempfile = "3"
 proptest = "1"
+# Only for the nightly real-indexer `#[ignore]`d tests in scip/mod.rs --
+# without a subscriber installed, cargo test's lib harness leaves every
+# `tracing::warn!`/`info!` in the whole crate a silent no-op, which is
+# exactly how run_overlay_for_with_catalog's real subprocess-failure reason
+# (already captured with a real stderr tail by runner.rs's `run_indexer`)
+# was vanishing from nightly CI logs instead of explaining why e.g.
+# scip-python/scip-js failed. See `init_test_tracing` in scip/mod.rs.
+tracing-subscriber = { workspace = true }
 
 [features]
 # Semantic embeddings: pure-Rust static code embeddings (model2vec-rs).

@@ -375,6 +375,7 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+ "tracing-subscriber",
  "tract-onnx",
  "tree-sitter",
  "tree-sitter-bash",

@@ -979,6 +979,32 @@ pub struct OverlayStatus {
 mod tests {
     use super::*;
 
+    /// Call at the top of every nightly real-indexer `#[ignore]`d test below.
+    /// `cargo test`'s lib harness installs no `tracing` subscriber by
+    /// default (only `calm-cli`'s/`calm-server`'s real `main()` does), so
+    /// every `tracing::warn!`/`info!` in the whole crate is normally a
+    /// silent no-op during tests -- including `run_overlay_for_with_catalog`'s
+    /// `tracing::warn!("SCIP overlay ({}) run failed, keeping syntactic
+    /// graph: {e}", ...)`, whose `{e}` already carries a real stderr tail
+    /// from the failed subprocess (`runner.rs`'s `run_indexer`). Without this,
+    /// that real reason vanishes and a nightly CI failure shows only the
+    /// generic `assert!(stats.upgraded > 0)` message with zero diagnostic
+    /// value -- root-caused 2026-08-07 chasing scip-python/scip-js nightly
+    /// failures that reproduced on a live GitHub Actions re-run but not
+    /// locally, with no way to see why. `with_test_writer()` routes output
+    /// through cargo test's own per-test capture (shown only on failure,
+    /// like `println!`); `try_init().ok()` makes repeat calls from multiple
+    /// tests in the same process safe (first one wins, rest are no-ops).
+    fn init_test_tracing() {
+        let _ = tracing_subscriber::fmt()
+            .with_test_writer()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+            )
+            .try_init();
+    }
+
     #[test]
     fn provider_cache_key_tracks_shared_typescript_context_without_cross_language_churn() {
         let root = tempfile::tempdir().unwrap();
@@ -1365,6 +1391,7 @@ mod tests {
     #[test]
     #[ignore]
     fn overlay_upgrades_a_real_edge_on_the_fixture() {
+        init_test_tracing();
         let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/rust_workspace");
         let mut conn = Connection::open_in_memory().unwrap();
@@ -1409,6 +1436,7 @@ mod tests {
     #[test]
     #[ignore]
     fn go_overlay_upgrades_a_real_edge_on_the_multi_lang_fixture() {
+        init_test_tracing();
         let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/multi_lang_workspace/go");
         let mut conn = Connection::open_in_memory().unwrap();
@@ -1557,6 +1585,7 @@ mod tests {
     #[test]
     #[ignore]
     fn go_workspace_overlay_upgrades_edges_in_both_member_modules() {
+        init_test_tracing();
         let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/go_workspace");
         let mut conn = Connection::open_in_memory().unwrap();
@@ -1606,6 +1635,7 @@ mod tests {
     #[test]
     #[ignore]
     fn python_overlay_upgrades_a_real_edge_on_the_multi_lang_fixture() {
+        init_test_tracing();
         let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/multi_lang_workspace/python");
         let mut conn = Connection::open_in_memory().unwrap();
@@ -1647,6 +1677,7 @@ mod tests {
     #[test]
     #[ignore]
     fn js_overlay_upgrades_a_real_edge_on_the_multi_lang_fixture() {
+        init_test_tracing();
         let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/multi_lang_workspace/js");
         let mut conn = Connection::open_in_memory().unwrap();
@@ -1692,6 +1723,7 @@ mod tests {
     #[test]
     #[ignore]
     fn java_overlay_upgrades_a_real_edge_on_the_multi_lang_fixture() {
+        init_test_tracing();
         let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/multi_lang_workspace/java");
         let mut conn = Connection::open_in_memory().unwrap();
@@ -1753,6 +1785,7 @@ mod tests {
     #[test]
     #[ignore]
     fn kotlin_overlay_upgrades_ambiguous_smart_cast_calls_on_the_multi_lang_fixture() {
+        init_test_tracing();
         let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/multi_lang_workspace/kotlin");
         let mut conn = Connection::open_in_memory().unwrap();
@@ -1876,6 +1909,7 @@ mod tests {
     #[test]
     #[ignore]
     fn ruby_overlay_upgrades_ambiguous_case_when_calls_on_the_multi_lang_fixture() {
+        init_test_tracing();
         let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/multi_lang_workspace/ruby");
         let mut conn = Connection::open_in_memory().unwrap();
@@ -1979,6 +2013,7 @@ mod tests {
     #[test]
     #[ignore]
     fn csharp_overlay_upgrades_a_real_edge_on_the_multi_lang_fixture() {
+        init_test_tracing();
         let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/multi_lang_workspace/csharp");
         let mut conn = Connection::open_in_memory().unwrap();
@@ -2047,6 +2082,7 @@ mod tests {
     #[test]
     #[ignore]
     fn php_overlay_upgrades_a_real_edge_on_the_multi_lang_fixture() {
+        init_test_tracing();
         let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/multi_lang_workspace/php");
         // Composer-managed `vendor/` is gitignored and not committed (see
@@ -2132,6 +2168,7 @@ mod tests {
     #[test]
     #[ignore]
     fn clang_overlay_upgrades_a_real_edge_on_the_c_fixture() {
+        init_test_tracing();
         let src_fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/multi_lang_workspace/c");
         let tmp = tempfile::tempdir().unwrap();
