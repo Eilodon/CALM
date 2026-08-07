@@ -7,6 +7,81 @@ use super::*;
 /// that lint. Used by `understand`'s single-symbol callers query.
 type EdgeRow = (String, String, String, String, Option<i64>, Option<String>);
 
+/// Shared by `symbol_info` and `understand` -- fetches Tier 1 semantic
+/// facts (2026-08-07 roadmap T1: extends/implements + explicit-throw/
+/// write-field) for one symbol. Fails soft (empty, not an error) on any
+/// query problem -- this enrichment must never break either tool. See
+/// `SymbolInfoOutput`'s own doc comment for the "None means none found,
+/// not an empty array" contract these feed into.
+fn fetch_semantic_facts(
+    conn: &rusqlite::Connection,
+    qualified_name: &str,
+) -> (Option<Vec<TypeRelationOutput>>, Option<Vec<EffectOutput>>) {
+    let type_relations: Vec<TypeRelationOutput> = conn
+        .prepare(
+            "SELECT relation_kind, target_text, to_symbol, confidence \
+             FROM type_relations WHERE from_symbol = ?1 ORDER BY id",
+        )
+        .and_then(|mut stmt| {
+            stmt.query_map([qualified_name], |r| {
+                Ok(TypeRelationOutput {
+                    relation_kind: r.get(0)?,
+                    target_text: r.get(1)?,
+                    to_symbol: r.get(2)?,
+                    confidence: r.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .unwrap_or_default();
+
+    let effects: Vec<EffectOutput> = conn
+        .prepare(
+            "SELECT effect_kind, target_text, line \
+             FROM symbol_effects WHERE symbol_qn = ?1 ORDER BY line",
+        )
+        .and_then(|mut stmt| {
+            stmt.query_map([qualified_name], |r| {
+                Ok(EffectOutput {
+                    effect_kind: r.get(0)?,
+                    target_text: r.get(1)?,
+                    line: r.get(2)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .unwrap_or_default();
+
+    (
+        (!type_relations.is_empty()).then_some(type_relations),
+        (!effects.is_empty()).then_some(effects),
+    )
+}
+
+/// Tier 2 semantic fact (2026-08-07 roadmap T2): fetches the Architecture
+/// Digest for one symbol. `None` when no row exists (this symbol's kind
+/// isn't digestable, or no graph rebuild has run yet since it was added --
+/// see `graph::digest`'s module doc comment for why "row exists" is the
+/// only freshness signal needed in v1: every rebuild recomputes every
+/// digest unconditionally, so a present row is always current).
+fn fetch_architecture_digest(
+    conn: &rusqlite::Connection,
+    qualified_name: &str,
+) -> Option<ArchitectureDigestOutput> {
+    conn.query_row(
+        "SELECT rendered_text, recursive_component, truncated FROM symbol_digests WHERE symbol_qn = ?1",
+        [qualified_name],
+        |r| {
+            Ok(ArchitectureDigestOutput {
+                rendered_text: r.get(0)?,
+                recursive_component: r.get::<_, i64>(1)? != 0,
+                truncated: r.get::<_, i64>(2)? != 0,
+            })
+        },
+    )
+    .ok()
+}
+
 /// `(other_symbol, batch_symbol, other_path, edge_confidence, edge_kind,
 /// line, formal_source)` -- same reasoning as `EdgeRow`, one extra column
 /// since `symbols_batch` groups rows by the requested symbol afterward.
@@ -66,6 +141,14 @@ impl CalmServer {
                         suggested_with_args("source", "Read implementation", serde_json::json!({"target": c.name}))
                     };
                     out.health = Some(health);
+                    // Tier 1 semantic facts (2026-08-07 roadmap T1) --
+                    // advisory-only, never gates or ranks anything. Fails
+                    // soft (empty, not an error) on any query problem --
+                    // this enrichment must never break the whole tool.
+                    let (type_relations, effects) = fetch_semantic_facts(&conn, &c.qualified_name);
+                    out.type_relations = type_relations;
+                    out.effects = effects;
+
                     ResolvedOutcome::success(out)
                 }
             }
@@ -361,7 +444,7 @@ impl CalmServer {
 
             // Carries `language` alongside `SymbolInfoOutput` (which doesn't have
             // a language field) so `SourceOutput.language` below isn't stubbed.
-            let symbol_info: Option<(SymbolInfoOutput, String)> = top.as_ref().and_then(|t| {
+            let mut symbol_info: Option<(SymbolInfoOutput, String)> = top.as_ref().and_then(|t| {
                 conn
                     .query_row(
                         "SELECT name, qualified_name, kind, path, line_start, line_end, signature, docstring, caller_count, is_hub, language
@@ -394,6 +477,8 @@ impl CalmServer {
                                     coreness: None,
                                     health: None,
                                     suggested_next: None,
+                                    type_relations: None,
+                                    effects: None,
                                 },
                                 row.get::<_, String>(10).unwrap_or_default(),
                             ))
@@ -401,6 +486,20 @@ impl CalmServer {
                     )
                     .ok()
             });
+            // Tier 1 semantic facts (2026-08-07 roadmap T1) -- see
+            // `fetch_semantic_facts`'s doc comment. Computed AFTER the
+            // query_row above (not inside its closure) since both borrow
+            // `conn` and rusqlite doesn't allow a nested prepare() while
+            // one row-mapping call is still in flight.
+            if let Some((info, _)) = symbol_info.as_mut() {
+                let (tr, ef) = fetch_semantic_facts(&conn, &info.qualified_name);
+                info.type_relations = tr;
+                info.effects = ef;
+            }
+            // Tier 2 semantic fact (2026-08-07 roadmap T2).
+            let architecture_digest = symbol_info
+                .as_ref()
+                .and_then(|(info, _)| fetch_architecture_digest(&conn, &info.qualified_name));
 
             if let Some((info, _)) = symbol_info.as_ref() {
                 self.track_symbol(&info.qualified_name);
@@ -503,6 +602,7 @@ impl CalmServer {
                 callers_summary: callers,
                 edges_ready: Some(self.edges_ready()),
                 suggested_next: self.filter_sn(sn),
+                architecture_digest,
             })
         }))
     }
@@ -1093,6 +1193,11 @@ pub(crate) struct UnderstandOutput {
     pub(crate) edges_ready: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) suggested_next: Option<SuggestedNext>,
+    /// Tier 2 semantic fact (2026-08-07 roadmap T2). `None` when this
+    /// symbol has no digest row yet — never a fabricated summary; see
+    /// `ArchitectureDigestOutput`'s doc comment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) architecture_digest: Option<ArchitectureDigestOutput>,
 }
 
 // ---------------------------------------------------------------------------

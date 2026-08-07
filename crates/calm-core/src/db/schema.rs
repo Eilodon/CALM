@@ -279,7 +279,80 @@ CREATE TABLE IF NOT EXISTS pattern_debt (
     last_checked_at        TEXT,
     last_checked_count     INTEGER
 );
-CREATE INDEX IF NOT EXISTS idx_pattern_debt_topic ON pattern_debt(topic);";
+CREATE INDEX IF NOT EXISTS idx_pattern_debt_topic ON pattern_debt(topic);
+
+-- Tier 1 semantic facts (2026-08-07 roadmap, docs/plans/2026-08-07-
+-- pecorino-adoption-roadmap.md T1): extends/implements extracted directly
+-- from tree-sitter syntax (indexer::semantic_facts). Same rebuild lifecycle
+-- as call_sites/import_edges -- DELETE-by-path then re-INSERT on every
+-- reindex of the owning file (see pipeline::remove_file_rows/persist_file),
+-- so unlike external_proofs this needs no source_hash of its own: it is
+-- always exactly as fresh as the file's last index pass.
+--
+-- from_symbol is the class/struct/trait's OWN qualified_name (a real row in
+-- `symbols`) -- resolved either by exact (bare_name, def_line) lookup, or
+-- for Rust's `impl Trait for Type` (which never gets its own `symbols` row
+-- -- see semantic_facts.rs's module doc comment) by same-file bare-name
+-- fallback. target_text is always the raw syntactic text of the base/
+-- interface/trait; to_symbol is populated only when that text resolves to
+-- a symbol in the SAME file (same-file-only resolution in v1, no cross-file
+-- global pass yet) -- NULL otherwise, with confidence dropping to
+-- 'textual'. Never guessed: a relation whose target can't be resolved is
+-- still recorded (to_symbol NULL), never silently dropped or fabricated.
+CREATE TABLE IF NOT EXISTS type_relations (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    from_symbol     TEXT NOT NULL,
+    relation_kind   TEXT NOT NULL CHECK (relation_kind IN ('extends', 'implements')),
+    target_text     TEXT NOT NULL,
+    to_symbol       TEXT,
+    confidence      TEXT NOT NULL CHECK (confidence IN ('resolved', 'textual')),
+    evidence_source TEXT NOT NULL DEFAULT 'ast',
+    source_path     TEXT NOT NULL,
+    line            INTEGER NOT NULL,
+    UNIQUE(from_symbol, relation_kind, target_text, line)
+);
+CREATE INDEX IF NOT EXISTS idx_type_relations_from ON type_relations(from_symbol);
+CREATE INDEX IF NOT EXISTS idx_type_relations_path ON type_relations(source_path);
+
+-- Tier 1 semantic facts, effect half: explicit throws and direct
+-- self/this-field writes, extracted the same conservative way (see
+-- semantic_facts.rs's module doc comment for exactly what is and isn't
+-- captured per language and why). symbol_qn is the enclosing function/
+-- method's OWN qualified_name, resolved the identical two-phase way
+-- call_sites.enclosing_qn already is. Same rebuild lifecycle as
+-- type_relations above -- no source_hash needed.
+CREATE TABLE IF NOT EXISTS symbol_effects (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol_qn       TEXT NOT NULL,
+    effect_kind     TEXT NOT NULL CHECK (effect_kind IN ('explicit_throw', 'write_field')),
+    target_text     TEXT NOT NULL,
+    confidence      TEXT NOT NULL DEFAULT 'syntax_exact',
+    source_path     TEXT NOT NULL,
+    line            INTEGER NOT NULL,
+    UNIQUE(symbol_qn, effect_kind, target_text, line)
+);
+CREATE INDEX IF NOT EXISTS idx_symbol_effects_symbol ON symbol_effects(symbol_qn);
+CREATE INDEX IF NOT EXISTS idx_symbol_effects_path ON symbol_effects(source_path);
+
+-- Tier 2 semantic fact (2026-08-07 roadmap T2): Architecture Digest --
+-- deterministic, factual (never LLM-generated) per-symbol summary. Full
+-- DELETE-then-reinsert on EVERY graph rebuild (graph::digest::compute_digests,
+-- called from the same place coreness/hub/churn already are) -- no
+-- selective invalidation, so a PRESENT row is always current as of the
+-- last successful rebuild; a missing row just means this symbol's kind
+-- isn't digestable or no rebuild has run yet. `graph_generation` is a pure
+-- observability breadcrumb (never compared for correctness -- see
+-- graph/digest.rs's module doc comment for why generation-fencing was
+-- deliberately dropped from the original roadmap sketch).
+CREATE TABLE IF NOT EXISTS symbol_digests (
+    symbol_qn            TEXT PRIMARY KEY,
+    facts_json           TEXT NOT NULL,
+    rendered_text        TEXT NOT NULL,
+    recursive_component  INTEGER NOT NULL DEFAULT 0,
+    graph_generation     INTEGER NOT NULL DEFAULT 0,
+    truncated            INTEGER NOT NULL DEFAULT 0
+);
+";
 
 /// Durable state (project memory, edit-transaction journal, audit ledger,
 /// maintenance outbox) lives in a SEPARATE file (`state.db`, see

@@ -181,6 +181,26 @@
                 "type": "null"
               }
             ]
+          },
+          "type_relations": {
+            "description": "Tier 1 semantic facts (2026-08-07 roadmap T1) — `extends`/\n`implements` extracted directly from syntax. `None` (not an empty\narray) when this symbol has no relations, so a caller can tell\n\"checked, has none\" apart from \"not populated\" if that distinction\never matters. See `indexer::semantic_facts` for exactly what's\ncaptured per language and why some things are deliberately absent.",
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/$defs/TypeRelationOutput"
+            }
+          },
+          "effects": {
+            "description": "Tier 1 semantic facts, effect half — explicit throws and direct\nself/this-field writes. Same \"None means none found\" contract as\n`type_relations` above.",
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/$defs/EffectOutput"
+            }
           }
         },
         "required": [
@@ -280,6 +300,52 @@
         "required": [
           "tool",
           "reason"
+        ]
+      },
+      "TypeRelationOutput": {
+        "type": "object",
+        "properties": {
+          "relation_kind": {
+            "type": "string"
+          },
+          "target_text": {
+            "type": "string"
+          },
+          "to_symbol": {
+            "description": "Populated only when `target_text` resolved to a real symbol in the\nSAME file (v1 has no cross-file global resolution pass yet — see\n`db::schema`'s `type_relations` table comment). `confidence` drops\nto `\"textual\"`, not an error, when this is `None`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "confidence": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "relation_kind",
+          "target_text",
+          "confidence"
+        ]
+      },
+      "EffectOutput": {
+        "type": "object",
+        "properties": {
+          "effect_kind": {
+            "type": "string"
+          },
+          "target_text": {
+            "type": "string"
+          },
+          "line": {
+            "type": "integer",
+            "format": "int64"
+          }
+        },
+        "required": [
+          "effect_kind",
+          "target_text",
+          "line"
         ]
       },
       "FileOverviewOutput": {

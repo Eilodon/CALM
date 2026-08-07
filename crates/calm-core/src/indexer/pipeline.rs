@@ -244,6 +244,8 @@ fn remove_file_rows(tx: &rusqlite::Transaction, rel: &str) -> rusqlite::Result<(
     tx.execute("DELETE FROM import_edges WHERE from_path = ?1", [rel])?;
     tx.execute("DELETE FROM file_index WHERE path = ?1", [rel])?;
     tx.execute("DELETE FROM code_chunks WHERE path = ?1", [rel])?;
+    tx.execute("DELETE FROM type_relations WHERE source_path = ?1", [rel])?;
+    tx.execute("DELETE FROM symbol_effects WHERE source_path = ?1", [rel])?;
     Ok(())
 }
 
@@ -321,6 +323,14 @@ struct ExtractedFile {
     /// else here — and left empty otherwise, since nothing would ever embed
     /// or query them.
     chunks: Vec<CodeChunk>,
+    /// Tier 1 semantic facts (2026-08-07 roadmap T1) -- see
+    /// `indexer::semantic_facts`'s module doc comment for exactly what's
+    /// captured per language. Always empty for the SQL/markdown/shallow
+    /// branches below (none of them run `semantic_facts`'s tree-sitter
+    /// walk), same "empty, not an error" posture `import_edges`/`call_sites`
+    /// already have on those branches.
+    type_relations: Vec<crate::indexer::edges::TypeRelationData>,
+    effects: Vec<crate::indexer::edges::SymbolEffectData>,
 }
 
 /// One file's `(rel_path, language, hash, mtime, extracted_data)` from a
@@ -429,6 +439,8 @@ fn extract_file_data(
             call_sites,
             symbol_count,
             chunks,
+            type_relations: Vec::new(),
+            effects: Vec::new(),
         };
     }
 
@@ -446,6 +458,8 @@ fn extract_file_data(
             call_sites: Vec::new(),
             symbol_count,
             chunks,
+            type_relations: Vec::new(),
+            effects: Vec::new(),
         };
     }
 
@@ -461,6 +475,8 @@ fn extract_file_data(
             call_sites: Vec::new(),
             symbol_count,
             chunks,
+            type_relations: Vec::new(),
+            effects: Vec::new(),
         };
     };
 
@@ -745,6 +761,93 @@ fn extract_file_data(
         }
     }
 
+    // Tier 1 semantic facts (2026-08-07 roadmap T1): extends/implements +
+    // explicit-throw/write-field, extracted via a second lightweight walk
+    // over the SAME already-parsed `tree` (see `indexer::semantic_facts`'s
+    // module doc comment for exactly what's captured per language and why).
+    // `class_qn_by_name`: bare name -> qualified_name for every class-like
+    // symbol this file defines -- used for (a) Rust's `impl Trait for Type`
+    // relation, whose `from_symbol` can't use the (name, line) exact match
+    // every other language gets (an impl block never gets its own `symbols`
+    // row -- see semantic_facts.rs's module doc comment), and (b) same-file
+    // `to_symbol` resolution for every language's relation target text.
+    let class_qn_by_name: HashMap<String, String> = syms
+        .iter()
+        .filter(|s| {
+            matches!(
+                s.kind,
+                crate::types::SymbolKind::Class
+                    | crate::types::SymbolKind::Struct
+                    | crate::types::SymbolKind::Trait
+                    | crate::types::SymbolKind::Interface
+                    | crate::types::SymbolKind::Enum
+            )
+        })
+        .map(|s| (s.name.clone(), s.qualified_name.clone()))
+        .collect();
+
+    let raw_relations =
+        crate::indexer::semantic_facts::extract_type_relations_from_tree(&tree, source, lang);
+    let mut type_relations = Vec::with_capacity(raw_relations.len());
+    for rt in raw_relations {
+        // Exact (bare_name, def_line) match first (works for Java/TS/JS/
+        // Python, whose class node IS what's being walked); same-file
+        // by-name fallback second (Rust's impl-block case, and a safety net
+        // for anything else). Dropped -- never guessed -- if neither
+        // resolves, e.g. an `impl Trait for` a type declared in another
+        // file/crate (rare in idiomatic Rust, out of scope for a
+        // same-file-only resolver -- see db::schema's table comment).
+        let Some(from_symbol) = qn_by_loc
+            .get(&(rt.class_name.clone(), rt.class_line))
+            .cloned()
+            .or_else(|| class_qn_by_name.get(&rt.class_name).cloned())
+        else {
+            continue;
+        };
+        // Same-file-only resolution in v1 (no cross-file global pass yet).
+        // `target_text` can be a dotted/qualified name ("module.Base"),
+        // which a bare-name lookup naturally won't match -- falls to
+        // `textual`, not wrong.
+        let to_symbol = class_qn_by_name.get(&rt.target_text).cloned();
+        let confidence = if to_symbol.is_some() {
+            "resolved"
+        } else {
+            "textual"
+        };
+        type_relations.push(crate::indexer::edges::TypeRelationData {
+            from_symbol,
+            relation_kind: rt.relation_kind,
+            target_text: rt.target_text,
+            to_symbol,
+            confidence,
+            source_path: rel.to_string(),
+            line: rt.class_line as i64,
+        });
+    }
+
+    let raw_effects = crate::indexer::semantic_facts::extract_effects_from_tree(&tree, source, lang);
+    let mut effects = Vec::with_capacity(raw_effects.len());
+    for re in raw_effects {
+        // Same exact (bare_name, def_line) resolution call_sites' own
+        // `enc_qn` already uses above -- the enclosing-function tracking in
+        // `semantic_facts::walk_effects` mirrors `walk_calls` exactly, so
+        // this is guaranteed to hit the same qualified_name a call site
+        // inside the same function would resolve to.
+        let Some(symbol_qn) = qn_by_loc
+            .get(&(re.enclosing_name.clone(), re.enclosing_line))
+            .cloned()
+        else {
+            continue;
+        };
+        effects.push(crate::indexer::edges::SymbolEffectData {
+            symbol_qn,
+            effect_kind: re.effect_kind,
+            target_text: re.target_text,
+            source_path: rel.to_string(),
+            line: re.line as i64,
+        });
+    }
+
     let chunks = chunk_pending(source, &syms);
 
     ExtractedFile {
@@ -753,6 +856,8 @@ fn extract_file_data(
         call_sites,
         symbol_count,
         chunks,
+        type_relations,
+        effects,
     }
 }
 
@@ -823,6 +928,8 @@ fn persist_file(
         );
     }
     insert_code_chunks_batch(tx, rel, file_hash, &extracted.chunks)?;
+    crate::indexer::edges::insert_type_relations_batch(tx, &extracted.type_relations)?;
+    crate::indexer::edges::insert_symbol_effects_batch(tx, &extracted.effects)?;
     Ok(())
 }
 
@@ -1352,6 +1459,7 @@ fn rebuild_graph(
     crate::graph::hub::update_is_hub_flags(tx, hub_config)?;
     crate::graph::boundary::update_boundary_ambiguous_flags(tx)?;
     crate::graph::churn::update_churn_scores(tx, project_root, churn_since)?;
+    crate::graph::digest::compute_digests(tx)?;
     Ok(())
 }
 
@@ -1541,6 +1649,7 @@ pub fn incremental_graph_update(
     crate::graph::hub::update_is_hub_flags(tx, hub_config)?;
     crate::graph::boundary::update_boundary_ambiguous_flags(tx)?;
     crate::graph::churn::update_churn_scores(tx, project_root, churn_since)?;
+    crate::graph::digest::compute_digests(tx)?;
 
     Ok(IncrementalOutcome::Applied)
 }
@@ -2973,6 +3082,120 @@ mod tests {
         assert_eq!(
             data.symbol_count, 1,
             "the <module> pseudo-caller must never become a real indexed symbol: {symbol_names:?}"
+        );
+    }
+
+    #[test]
+    fn extract_file_data_resolves_java_type_relations_and_effects() {
+        let source = "class Foo extends Base implements Baz {\n    int x;\n    void m(int v) {\n        this.x = v;\n        if (v < 0) { throw new InvalidToken(); }\n    }\n}\n";
+        let formal = crate::resolver::formal::FormalResolver::new();
+        let data = extract_file_data("Foo.java", "java", source, &[], &formal);
+
+        assert_eq!(data.type_relations.len(), 2, "{:?}", {
+            data.type_relations
+                .iter()
+                .map(|r| (r.from_symbol.as_str(), r.relation_kind, r.target_text.as_str()))
+                .collect::<Vec<_>>()
+        });
+        let extends = data
+            .type_relations
+            .iter()
+            .find(|r| r.relation_kind == "extends")
+            .expect("extends relation missing");
+        assert_eq!(extends.from_symbol, "Foo.java::Foo");
+        assert_eq!(extends.target_text, "Base");
+        // Base is not declared in this file -- same-file-only resolution
+        // in v1 must leave it textual/unresolved, never guessed.
+        assert_eq!(extends.to_symbol, None);
+        assert_eq!(extends.confidence, "textual");
+
+        let implements = data
+            .type_relations
+            .iter()
+            .find(|r| r.relation_kind == "implements")
+            .expect("implements relation missing");
+        assert_eq!(implements.target_text, "Baz");
+
+        assert_eq!(data.effects.len(), 2, "{:?}", {
+            data.effects
+                .iter()
+                .map(|e| (e.symbol_qn.as_str(), e.effect_kind, e.target_text.as_str()))
+                .collect::<Vec<_>>()
+        });
+        let write = data
+            .effects
+            .iter()
+            .find(|e| e.effect_kind == "write_field")
+            .expect("write_field effect missing");
+        assert_eq!(write.symbol_qn, "Foo.java::Foo::m");
+        assert_eq!(write.target_text, "x");
+        let throw = data
+            .effects
+            .iter()
+            .find(|e| e.effect_kind == "explicit_throw")
+            .expect("explicit_throw effect missing");
+        assert_eq!(throw.symbol_qn, "Foo.java::Foo::m");
+        assert_eq!(throw.target_text, "InvalidToken");
+    }
+
+    #[test]
+    fn extract_file_data_resolves_type_relation_to_symbol_when_same_file() {
+        // Baz IS declared in this same file -- to_symbol must resolve and
+        // confidence must upgrade to "resolved".
+        let source = "interface Baz {}\nclass Foo implements Baz {}\n";
+        let formal = crate::resolver::formal::FormalResolver::new();
+        let data = extract_file_data("Foo.ts", "typescript", source, &[], &formal);
+
+        assert_eq!(data.type_relations.len(), 1);
+        let rel = &data.type_relations[0];
+        assert_eq!(rel.relation_kind, "implements");
+        assert_eq!(rel.target_text, "Baz");
+        assert_eq!(rel.to_symbol.as_deref(), Some("Foo.ts::Baz"));
+        assert_eq!(rel.confidence, "resolved");
+    }
+
+    #[test]
+    fn extract_file_data_resolves_rust_impl_trait_by_same_file_name_fallback() {
+        // The struct's own definition line is NOT the impl block's line --
+        // this only passes if the by-name fallback (not the exact (name,
+        // line) lookup every other language gets) actually fires.
+        let source = "trait Bar {\n    fn m(&self);\n}\n\nstruct Foo {\n    x: i32,\n}\n\nimpl Bar for Foo {\n    fn m(&self) {}\n}\n";
+        let formal = crate::resolver::formal::FormalResolver::new();
+        let data = extract_file_data("lib.rs", "rust", source, &[], &formal);
+
+        assert_eq!(data.type_relations.len(), 1, "{:?}", {
+            data.type_relations
+                .iter()
+                .map(|r| (r.from_symbol.as_str(), r.relation_kind, r.target_text.as_str()))
+                .collect::<Vec<_>>()
+        });
+        let rel = &data.type_relations[0];
+        assert_eq!(rel.relation_kind, "implements");
+        assert_eq!(rel.from_symbol, "lib.rs::Foo");
+        assert_eq!(rel.target_text, "Bar");
+        assert_eq!(rel.to_symbol.as_deref(), Some("lib.rs::Bar"));
+        assert_eq!(rel.confidence, "resolved");
+    }
+
+    #[test]
+    fn extract_file_data_python_bases_and_write_effects() {
+        let source = "class Foo(Base):\n    def __init__(self):\n        self.count = 0\n    def bump(self):\n        self.count += 1\n";
+        let formal = crate::resolver::formal::FormalResolver::new();
+        let data = extract_file_data("foo.py", "python", source, &[], &formal);
+
+        assert_eq!(data.type_relations.len(), 1);
+        assert_eq!(data.type_relations[0].from_symbol, "foo.py::Foo");
+        assert_eq!(data.type_relations[0].target_text, "Base");
+
+        let writes: Vec<&str> = data
+            .effects
+            .iter()
+            .map(|e| e.symbol_qn.as_str())
+            .collect();
+        assert_eq!(
+            writes,
+            vec!["foo.py::Foo::__init__", "foo.py::Foo::bump"],
+            "both self.count writes (init and augmented-assign) must attribute to their own enclosing method"
         );
     }
 
@@ -6788,6 +7011,8 @@ impl StructB {
             call_sites: vec![make_dup(), make_dup()],
             symbol_count: 0,
             chunks: vec![],
+            type_relations: vec![],
+            effects: vec![],
         };
         persist_file(&tx, "a.rs", "irrelevant-hash", &extracted)
             .expect("a duplicate-identity call site must be ignored, not crash the transaction");

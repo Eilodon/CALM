@@ -363,6 +363,8 @@ impl CalmServer {
                                     coreness: None,
                                     health: None,
                                     suggested_next: None,
+                                    type_relations: None,
+                                    effects: None,
                                 })
                             },
                         )

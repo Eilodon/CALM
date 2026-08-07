@@ -71,6 +71,98 @@
           "rejected"
         ]
       },
+      "SemanticFactsStatusOutput": {
+        "type": "object",
+        "properties": {
+          "type_relations_total": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "type_relations_resolved": {
+            "description": "`target_text` resolved to a real symbol in the same file — see\n`db::schema`'s `type_relations` table comment.",
+            "type": "integer",
+            "format": "int64"
+          },
+          "type_relations_textual": {
+            "description": "`target_text` recorded but not resolved (cross-file, or no matching\nsame-file class) — still a real fact, just not yet linkable.",
+            "type": "integer",
+            "format": "int64"
+          },
+          "explicit_throws": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "write_fields": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "by_language": {
+            "description": "Per-language breakdown, only languages with at least one fact of\neither kind. Lets an agent tell \"this language is under-covered\"\napart from \"the repo just has none of this language\" — see\n`indexer::semantic_facts`'s module doc comment for the per-language\nscope cuts (e.g. Go has none of these fact kinds at all).",
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/SemanticFactsLanguageCountOutput"
+            }
+          }
+        },
+        "required": [
+          "type_relations_total",
+          "type_relations_resolved",
+          "type_relations_textual",
+          "explicit_throws",
+          "write_fields",
+          "by_language"
+        ]
+      },
+      "SemanticFactsLanguageCountOutput": {
+        "type": "object",
+        "properties": {
+          "language": {
+            "type": "string"
+          },
+          "type_relations": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "explicit_throws": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "write_fields": {
+            "type": "integer",
+            "format": "int64"
+          }
+        },
+        "required": [
+          "language",
+          "type_relations",
+          "explicit_throws",
+          "write_fields"
+        ]
+      },
+      "ArchitectureDigestStatusOutput": {
+        "type": "object",
+        "properties": {
+          "symbols_with_digest": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "recursive_symbols": {
+            "description": "Participates in a call cycle (Tarjan SCC over `Formal`/`Resolved`\nedges, or a direct self-loop) — see `graph::digest::compute_recursive_symbols`.",
+            "type": "integer",
+            "format": "int64"
+          },
+          "truncated_digests": {
+            "description": "Digest's callee/effect lists were capped (`MAX_CALLEES_SHOWN` etc in\n`graph::digest`) — `rendered_text` is a real subset for these, not\nthe full picture.",
+            "type": "integer",
+            "format": "int64"
+          }
+        },
+        "required": [
+          "symbols_with_digest",
+          "recursive_symbols",
+          "truncated_digests"
+        ]
+      },
       "IdentityMigrationStatusOutput": {
         "type": "object",
         "properties": {
@@ -441,6 +533,14 @@
       "external_proofs": {
         "description": "D4 proof freshness, grouped by persisted evidence state. A formal edge\nis only current external proof when its corresponding record is fresh.",
         "$ref": "#/$defs/ExternalProofStatusOutput"
+      },
+      "semantic_facts": {
+        "description": "Tier 1 semantic facts (2026-08-07 roadmap T1) coverage — extends/\nimplements, explicit throws, field writes — see\n`indexer::semantic_facts`'s module doc comment for exactly what is\nand isn't captured per language. All-zero (not absent) on a repo\nwith no supported languages, same \"checked, found none\" contract\n`SymbolInfoOutput.type_relations`/`.effects` already use.",
+        "$ref": "#/$defs/SemanticFactsStatusOutput"
+      },
+      "architecture_digest": {
+        "description": "Tier 2 Architecture Digest (2026-08-07 roadmap T2) coverage — see\n`graph::digest`'s module doc comment. Compare `symbols_with_digest`\nagainst `symbols_indexed` to see how much of the graph currently\nhas a rendered digest (only `function`/`method`/`class`/`struct`/\n`trait`/`interface`/`constructor` kinds are digestable).",
+        "$ref": "#/$defs/ArchitectureDigestStatusOutput"
       },
       "identity_migration": {
         "description": "Diagnostic state of the one-transaction CallSite identity migration.\nAbsent until a legacy database actually requires that migration.",

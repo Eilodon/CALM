@@ -5112,6 +5112,122 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn understand_surfaces_architecture_digest_and_t1_facts() {
+        let dir = std::env::temp_dir().join(format!("ci_understand_digest_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("foo.py"), "def foo():\n    pass\n").unwrap();
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                rusqlite::params![
+                    "foo.py::foo", "foo", "function", "python", "foo.py", 1i64, 2i64, "def foo()",
+                    "", "foo", 0i64, 0i64, 0i64
+                ],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO type_relations (from_symbol, relation_kind, target_text, confidence, source_path, line) \
+                 VALUES ('foo.py::foo', 'extends', 'Base', 'textual', 'foo.py', 1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO symbol_effects (symbol_qn, effect_kind, target_text, source_path, line) \
+                 VALUES ('foo.py::foo', 'explicit_throw', 'ValueError', 'foo.py', 1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO symbol_digests (symbol_qn, facts_json, rendered_text, recursive_component, graph_generation, truncated) \
+                 VALUES ('foo.py::foo', '{}', 'function foo. Throws: ValueError.', 0, 1, 0)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let v = jv(
+            server.understand(rmcp::handler::server::wrapper::Parameters(
+                UnderstandParams {
+                    query: "foo".into(),
+                    kind: None,
+                },
+            )),
+        );
+
+        // T1 gap fix: understand's OWN row-mapper (separate code path from
+        // symbol_info's) must also surface type_relations/effects now.
+        assert_eq!(
+            v["symbol"]["type_relations"],
+            serde_json::json!([{
+                "relation_kind": "extends",
+                "target_text": "Base",
+                "confidence": "textual",
+            }]),
+            "understand must surface T1 type_relations too, not just symbol_info: {v}"
+        );
+        assert_eq!(
+            v["symbol"]["effects"],
+            serde_json::json!([{"effect_kind": "explicit_throw", "target_text": "ValueError", "line": 1}]),
+            "understand must surface T1 effects too, not just symbol_info: {v}"
+        );
+
+        // T2: architecture_digest is top-level on UnderstandOutput, NOT
+        // nested under `symbol` (per the roadmap's "fold into understand"
+        // design, kept as its own field since it isn't part of
+        // SymbolInfoOutput / symbol_info's own contract).
+        assert_eq!(
+            v["architecture_digest"]["rendered_text"],
+            "function foo. Throws: ValueError."
+        );
+        assert_eq!(v["architecture_digest"]["recursive_component"], false);
+        assert_eq!(v["architecture_digest"]["truncated"], false);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn understand_omits_architecture_digest_when_no_digest_row_exists() {
+        let dir = std::env::temp_dir().join(format!("ci_understand_nodigest_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("bar.py"), "def bar():\n    pass\n").unwrap();
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                rusqlite::params![
+                    "bar.py::bar", "bar", "function", "python", "bar.py", 1i64, 2i64, "def bar()",
+                    "", "bar", 0i64, 0i64, 0i64
+                ],
+            )
+            .unwrap();
+            // No symbol_digests row inserted -- e.g. no rebuild has run yet.
+        }
+
+        let v = jv(
+            server.understand(rmcp::handler::server::wrapper::Parameters(
+                UnderstandParams {
+                    query: "bar".into(),
+                    kind: None,
+                },
+            )),
+        );
+
+        assert!(
+            v.get("architecture_digest").is_none(),
+            "must be omitted (None), never a fabricated summary, when no digest row exists: {v}"
+        );
+    }
+
     /// Regression for Task 14 (schema drift): `file_overview` used to omit
     /// `caller_count`/`is_hub`/`signature` per symbol entirely.
     #[test]
@@ -6739,6 +6855,70 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+
+    #[test]
+    fn indexing_status_surfaces_semantic_facts_and_architecture_digest_coverage() {
+        let dir = std::env::temp_dir().join(format!("ci_idxstatus_t1t2_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end) \
+                 VALUES ('a.py::Foo::m', 'm', 'method', 'python', 'a.py', 1, 2)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO type_relations (from_symbol, relation_kind, target_text, confidence, source_path, line) \
+                 VALUES ('a.py::Foo::m', 'implements', 'SomeIface', 'textual', 'a.py', 1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO symbol_effects (symbol_qn, effect_kind, target_text, source_path, line) \
+                 VALUES ('a.py::Foo::m', 'write_field', 'x', 'a.py', 1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO symbol_effects (symbol_qn, effect_kind, target_text, source_path, line) \
+                 VALUES ('a.py::Foo::m', 'explicit_throw', 'ValueError', 'a.py', 2)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO symbol_digests (symbol_qn, facts_json, rendered_text, recursive_component, truncated) \
+                 VALUES ('a.py::Foo::m', '{}', 'method m.', 1, 0)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let v = jv(
+            server.indexing_status(rmcp::handler::server::wrapper::Parameters(
+                IndexingStatusParams {
+                    retry_embeddings: false,
+                },
+            )),
+        );
+        assert_eq!(v["semantic_facts"]["type_relations_total"], 1);
+        assert_eq!(v["semantic_facts"]["type_relations_textual"], 1);
+        assert_eq!(v["semantic_facts"]["type_relations_resolved"], 0);
+        assert_eq!(v["semantic_facts"]["explicit_throws"], 1);
+        assert_eq!(v["semantic_facts"]["write_fields"], 1);
+        assert_eq!(v["semantic_facts"]["by_language"][0]["language"], "python");
+        assert_eq!(v["semantic_facts"]["by_language"][0]["type_relations"], 1);
+        assert_eq!(v["semantic_facts"]["by_language"][0]["explicit_throws"], 1);
+        assert_eq!(v["semantic_facts"]["by_language"][0]["write_fields"], 1);
+        assert_eq!(v["architecture_digest"]["symbols_with_digest"], 1);
+        assert_eq!(v["architecture_digest"]["recursive_symbols"], 1);
+        assert_eq!(v["architecture_digest"]["truncated_digests"], 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     // ADR-A1: `formal_resolution_timeouts` surfaces
     // `calm_core::indexer::pipeline::formal_resolution_timeout_count()` so a
@@ -6922,6 +7102,111 @@ mod tests {
             v["coreness"],
             serde_json::json!(3),
             "coreness must be 3 when edges_ready and DB value is 3, got: {v}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn symbol_info_surfaces_type_relations_and_effects() {
+        let dir = std::env::temp_dir().join(format!("ci_semfacts_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (name, qualified_name, kind, language, path,
+                 line_start, line_end, signature, docstring, name_tokens,
+                 caller_count, is_hub, is_entry_point)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                rusqlite::params![
+                    "Foo", "a.py::Foo", "class", "python", "a.py", 1i64, 5i64, "class Foo(Base):",
+                    "", "foo", 0i64, 0i64, 0i64
+                ],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO type_relations (from_symbol, relation_kind, target_text, to_symbol, confidence, source_path, line)
+                 VALUES ('a.py::Foo', 'extends', 'Base', NULL, 'textual', 'a.py', 1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO symbol_effects (symbol_qn, effect_kind, target_text, source_path, line)
+                 VALUES ('a.py::Foo::m', 'write_field', 'x', 'a.py', 3)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let v = jv(server.symbol_info(rmcp::handler::server::wrapper::Parameters(
+            SymbolInfoParams {
+                symbol: "Foo".into(),
+                path: None,
+                line: None,
+            },
+        )));
+
+        assert_eq!(
+            v["type_relations"],
+            serde_json::json!([{
+                "relation_kind": "extends",
+                "target_text": "Base",
+                "confidence": "textual",
+            }]),
+            "type_relations must surface the extends fact with to_symbol omitted (unresolved), got: {v}"
+        );
+
+        // Effects belong to a DIFFERENT symbol (a.py::Foo::m, the method,
+        // not a.py::Foo, the class) -- symbol_info for "Foo" itself must
+        // NOT show them, proving the query is scoped by exact qualified_name.
+        assert!(
+            v.get("effects").is_none(),
+            "effects for a different symbol_qn must not leak into this symbol's output, got: {v}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn symbol_info_omits_type_relations_and_effects_when_none_found() {
+        let dir = std::env::temp_dir().join(format!("ci_semfacts_none_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (name, qualified_name, kind, language, path,
+                 line_start, line_end, signature, docstring, name_tokens,
+                 caller_count, is_hub, is_entry_point)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                rusqlite::params![
+                    "plain_fn", "a.py::plain_fn", "function", "python", "a.py", 1i64, 2i64,
+                    "def plain_fn():", "", "plain fn", 0i64, 0i64, 0i64
+                ],
+            )
+            .unwrap();
+        }
+
+        let v = jv(server.symbol_info(rmcp::handler::server::wrapper::Parameters(
+            SymbolInfoParams {
+                symbol: "plain_fn".into(),
+                path: None,
+                line: None,
+            },
+        )));
+
+        assert!(
+            v.get("type_relations").is_none(),
+            "must be omitted (None), not an empty array, when nothing is found: {v}"
+        );
+        assert!(
+            v.get("effects").is_none(),
+            "must be omitted (None), not an empty array, when nothing is found: {v}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

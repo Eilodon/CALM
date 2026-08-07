@@ -61,6 +61,90 @@ impl CalmServer {
                     }
                 }
             }
+            // Tier 1/2 semantic-fact coverage (2026-08-07 roadmap) -- same
+            // additive GROUP BY pattern as external_proofs above. Absent
+            // rows read as zero (Default), never fabricated.
+            let mut semantic_facts = SemanticFactsStatusOutput::default();
+            if let Ok(mut stmt) =
+                conn.prepare("SELECT confidence, COUNT(*) FROM type_relations GROUP BY confidence")
+                && let Ok(rows) = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+            {
+                for row in rows.flatten() {
+                    semantic_facts.type_relations_total += row.1;
+                    match row.0.as_str() {
+                        "resolved" => semantic_facts.type_relations_resolved = row.1,
+                        "textual" => semantic_facts.type_relations_textual = row.1,
+                        _ => {}
+                    }
+                }
+            }
+            if let Ok(mut stmt) =
+                conn.prepare("SELECT effect_kind, COUNT(*) FROM symbol_effects GROUP BY effect_kind")
+                && let Ok(rows) = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+            {
+                for row in rows.flatten() {
+                    match row.0.as_str() {
+                        "explicit_throw" => semantic_facts.explicit_throws = row.1,
+                        "write_field" => semantic_facts.write_fields = row.1,
+                        _ => {}
+                    }
+                }
+            }
+            {
+                let mut by_language: std::collections::BTreeMap<String, (i64, i64, i64)> =
+                    std::collections::BTreeMap::new();
+                if let Ok(mut stmt) = conn.prepare(
+                    "SELECT s.language, COUNT(*) FROM type_relations tr \
+                     JOIN symbols s ON s.qualified_name = tr.from_symbol GROUP BY s.language",
+                ) && let Ok(rows) =
+                    stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+                {
+                    for row in rows.flatten() {
+                        by_language.entry(row.0).or_default().0 += row.1;
+                    }
+                }
+                if let Ok(mut stmt) = conn.prepare(
+                    "SELECT s.language, se.effect_kind, COUNT(*) FROM symbol_effects se \
+                     JOIN symbols s ON s.qualified_name = se.symbol_qn GROUP BY s.language, se.effect_kind",
+                ) && let Ok(rows) = stmt.query_map([], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+                }) {
+                    for row in rows.flatten() {
+                        let entry = by_language.entry(row.0).or_default();
+                        match row.1.as_str() {
+                            "explicit_throw" => entry.1 += row.2,
+                            "write_field" => entry.2 += row.2,
+                            _ => {}
+                        }
+                    }
+                }
+                semantic_facts.by_language = by_language
+                    .into_iter()
+                    .map(|(language, (type_relations, explicit_throws, write_fields))| {
+                        SemanticFactsLanguageCountOutput {
+                            language,
+                            type_relations,
+                            explicit_throws,
+                            write_fields,
+                        }
+                    })
+                    .collect();
+            }
+            let architecture_digest = conn
+                .query_row(
+                    "SELECT COUNT(*), COALESCE(SUM(recursive_component), 0), COALESCE(SUM(truncated), 0) \
+                     FROM symbol_digests",
+                    [],
+                    |r| {
+                        Ok(ArchitectureDigestStatusOutput {
+                            symbols_with_digest: r.get(0)?,
+                            recursive_symbols: r.get(1)?,
+                            truncated_digests: r.get(2)?,
+                        })
+                    },
+                )
+                .unwrap_or_default();
+
             let identity_migration = conn
                 .query_row(
                     "SELECT target_version, status, started_at, completed_at, failed_at, failure_reason,
@@ -179,6 +263,8 @@ impl CalmServer {
                 edges_ready: self.edges_ready(),
                 last_updated: last_updated.map(epoch_to_iso8601),
                 external_proofs,
+                semantic_facts,
+                architecture_digest,
                 identity_migration,
                 graph_mode: self.last_graph_mode.read_ok().clone(),
                 watcher,
@@ -707,6 +793,19 @@ pub(crate) struct IndexingStatusOutput {
     /// D4 proof freshness, grouped by persisted evidence state. A formal edge
     /// is only current external proof when its corresponding record is fresh.
     pub(crate) external_proofs: ExternalProofStatusOutput,
+    /// Tier 1 semantic facts (2026-08-07 roadmap T1) coverage — extends/
+    /// implements, explicit throws, field writes — see
+    /// `indexer::semantic_facts`'s module doc comment for exactly what is
+    /// and isn't captured per language. All-zero (not absent) on a repo
+    /// with no supported languages, same "checked, found none" contract
+    /// `SymbolInfoOutput.type_relations`/`.effects` already use.
+    pub(crate) semantic_facts: SemanticFactsStatusOutput,
+    /// Tier 2 Architecture Digest (2026-08-07 roadmap T2) coverage — see
+    /// `graph::digest`'s module doc comment. Compare `symbols_with_digest`
+    /// against `symbols_indexed` to see how much of the graph currently
+    /// has a rendered digest (only `function`/`method`/`class`/`struct`/
+    /// `trait`/`interface`/`constructor` kinds are digestable).
+    pub(crate) architecture_digest: ArchitectureDigestStatusOutput,
     /// Diagnostic state of the one-transaction CallSite identity migration.
     /// Absent until a legacy database actually requires that migration.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -855,6 +954,45 @@ pub(crate) struct ExternalProofStatusOutput {
     pub(crate) legacy: u64,
     pub(crate) unverified: u64,
     pub(crate) rejected: u64,
+}
+
+#[derive(Default, Serialize, JsonSchema)]
+pub(crate) struct SemanticFactsStatusOutput {
+    pub(crate) type_relations_total: i64,
+    /// `target_text` resolved to a real symbol in the same file — see
+    /// `db::schema`'s `type_relations` table comment.
+    pub(crate) type_relations_resolved: i64,
+    /// `target_text` recorded but not resolved (cross-file, or no matching
+    /// same-file class) — still a real fact, just not yet linkable.
+    pub(crate) type_relations_textual: i64,
+    pub(crate) explicit_throws: i64,
+    pub(crate) write_fields: i64,
+    /// Per-language breakdown, only languages with at least one fact of
+    /// either kind. Lets an agent tell "this language is under-covered"
+    /// apart from "the repo just has none of this language" — see
+    /// `indexer::semantic_facts`'s module doc comment for the per-language
+    /// scope cuts (e.g. Go has none of these fact kinds at all).
+    pub(crate) by_language: Vec<SemanticFactsLanguageCountOutput>,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub(crate) struct SemanticFactsLanguageCountOutput {
+    pub(crate) language: String,
+    pub(crate) type_relations: i64,
+    pub(crate) explicit_throws: i64,
+    pub(crate) write_fields: i64,
+}
+
+#[derive(Default, Serialize, JsonSchema)]
+pub(crate) struct ArchitectureDigestStatusOutput {
+    pub(crate) symbols_with_digest: i64,
+    /// Participates in a call cycle (Tarjan SCC over `Formal`/`Resolved`
+    /// edges, or a direct self-loop) — see `graph::digest::compute_recursive_symbols`.
+    pub(crate) recursive_symbols: i64,
+    /// Digest's callee/effect lists were capped (`MAX_CALLEES_SHOWN` etc in
+    /// `graph::digest`) — `rendered_text` is a real subset for these, not
+    /// the full picture.
+    pub(crate) truncated_digests: i64,
 }
 
 #[derive(Serialize, JsonSchema)]

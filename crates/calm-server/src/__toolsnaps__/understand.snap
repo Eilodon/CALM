@@ -111,6 +111,26 @@
                 "type": "null"
               }
             ]
+          },
+          "type_relations": {
+            "description": "Tier 1 semantic facts (2026-08-07 roadmap T1) — `extends`/\n`implements` extracted directly from syntax. `None` (not an empty\narray) when this symbol has no relations, so a caller can tell\n\"checked, has none\" apart from \"not populated\" if that distinction\never matters. See `indexer::semantic_facts` for exactly what's\ncaptured per language and why some things are deliberately absent.",
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/$defs/TypeRelationOutput"
+            }
+          },
+          "effects": {
+            "description": "Tier 1 semantic facts, effect half — explicit throws and direct\nself/this-field writes. Same \"None means none found\" contract as\n`type_relations` above.",
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/$defs/EffectOutput"
+            }
           }
         },
         "required": [
@@ -210,6 +230,52 @@
         "required": [
           "tool",
           "reason"
+        ]
+      },
+      "TypeRelationOutput": {
+        "type": "object",
+        "properties": {
+          "relation_kind": {
+            "type": "string"
+          },
+          "target_text": {
+            "type": "string"
+          },
+          "to_symbol": {
+            "description": "Populated only when `target_text` resolved to a real symbol in the\nSAME file (v1 has no cross-file global resolution pass yet — see\n`db::schema`'s `type_relations` table comment). `confidence` drops\nto `\"textual\"`, not an error, when this is `None`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "confidence": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "relation_kind",
+          "target_text",
+          "confidence"
+        ]
+      },
+      "EffectOutput": {
+        "type": "object",
+        "properties": {
+          "effect_kind": {
+            "type": "string"
+          },
+          "target_text": {
+            "type": "string"
+          },
+          "line": {
+            "type": "integer",
+            "format": "int64"
+          }
+        },
+        "required": [
+          "effect_kind",
+          "target_text",
+          "line"
         ]
       },
       "SourceOutput": {
@@ -365,6 +431,28 @@
           "edge_confidence",
           "edge_kind"
         ]
+      },
+      "ArchitectureDigestOutput": {
+        "description": "Tier 2 semantic fact (2026-08-07 roadmap T2) — deterministic, factual\n(NEVER LLM-generated) per-symbol summary. See `graph::digest`'s module\ndoc comment for exactly what is and isn't captured. `understand`-only\n(not `symbol_info`) — see the roadmap's own \"fold into understand, not\na new tool\" decision.",
+        "type": "object",
+        "properties": {
+          "rendered_text": {
+            "type": "string"
+          },
+          "recursive_component": {
+            "description": "This symbol participates in a call cycle among `Formal`/`Resolved`-\nconfidence edges (Tarjan SCC, or a direct self-loop).",
+            "type": "boolean"
+          },
+          "truncated": {
+            "description": "`true` when the underlying facts (callees/effects) were capped —\n`rendered_text` is a real subset, not the full picture, for a very\nhigh-fan-out symbol.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "rendered_text",
+          "recursive_component",
+          "truncated"
+        ]
       }
     },
     "properties": {
@@ -414,6 +502,17 @@
         "anyOf": [
           {
             "$ref": "#/$defs/SuggestedNext"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "architecture_digest": {
+        "description": "Tier 2 semantic fact (2026-08-07 roadmap T2). `None` when this\nsymbol has no digest row yet — never a fabricated summary; see\n`ArchitectureDigestOutput`'s doc comment.",
+        "anyOf": [
+          {
+            "$ref": "#/$defs/ArchitectureDigestOutput"
           },
           {
             "type": "null"

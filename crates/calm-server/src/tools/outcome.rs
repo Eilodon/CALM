@@ -453,6 +453,8 @@ impl CandidateRow {
             coreness: None, // set by handler based on edges_ready
             health: None,
             suggested_next: None,
+            type_relations: None, // set by symbol_info's handler when populated
+            effects: None,
         }
     }
 

@@ -96,6 +96,78 @@ pub fn insert_import_edges_batch(tx: &Transaction, edges: &[ImportEdge]) -> rusq
     Ok(())
 }
 
+/// One resolved `extends`/`implements` fact, ready to persist into
+/// `type_relations` -- see `db::schema`'s table comment and
+/// `indexer::semantic_facts::RawTypeRelation` (the pre-resolution shape
+/// this is built from in `pipeline::extract_file_data`).
+pub struct TypeRelationData {
+    pub from_symbol: String,
+    pub relation_kind: &'static str,
+    pub target_text: String,
+    pub to_symbol: Option<String>,
+    pub confidence: &'static str,
+    pub source_path: String,
+    pub line: i64,
+}
+
+/// One resolved `explicit_throw`/`write_field` fact, ready to persist into
+/// `symbol_effects` -- see `db::schema`'s table comment and
+/// `indexer::semantic_facts::RawEffect`.
+pub struct SymbolEffectData {
+    pub symbol_qn: String,
+    pub effect_kind: &'static str,
+    pub target_text: String,
+    pub source_path: String,
+    pub line: i64,
+}
+
+/// OR IGNORE: same idiom as `insert_import_edges_batch` above -- a
+/// structurally-identical duplicate (same `UNIQUE(from_symbol,
+/// relation_kind, target_text, line)`) collapses instead of aborting the
+/// whole file's transaction.
+pub fn insert_type_relations_batch(
+    tx: &Transaction,
+    relations: &[TypeRelationData],
+) -> rusqlite::Result<()> {
+    let mut stmt = tx.prepare(
+        "INSERT OR IGNORE INTO type_relations (from_symbol, relation_kind, target_text, to_symbol, confidence, source_path, line)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+    )?;
+    for r in relations {
+        stmt.execute(rusqlite::params![
+            r.from_symbol,
+            r.relation_kind,
+            r.target_text,
+            r.to_symbol,
+            r.confidence,
+            r.source_path,
+            r.line,
+        ])?;
+    }
+    Ok(())
+}
+
+/// Same OR IGNORE idiom as `insert_type_relations_batch` above.
+pub fn insert_symbol_effects_batch(
+    tx: &Transaction,
+    effects: &[SymbolEffectData],
+) -> rusqlite::Result<()> {
+    let mut stmt = tx.prepare(
+        "INSERT OR IGNORE INTO symbol_effects (symbol_qn, effect_kind, target_text, source_path, line)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+    )?;
+    for e in effects {
+        stmt.execute(rusqlite::params![
+            e.symbol_qn,
+            e.effect_kind,
+            e.target_text,
+            e.source_path,
+            e.line,
+        ])?;
+    }
+    Ok(())
+}
+
 /// Persist one file's Layer-2 semantic-search code chunks (see
 /// `indexer::chunker`). `path`/`file_hash` are shared by every row since a
 /// file is always chunked and persisted as a unit.

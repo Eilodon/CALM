@@ -12,4 +12,5 @@ pub mod pipeline;
 pub mod psr4;
 pub mod pysyspath;
 pub mod refresh;
+pub mod semantic_facts;
 pub mod sql;

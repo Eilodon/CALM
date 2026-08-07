@@ -254,7 +254,7 @@ fn is_definition_macro_call(
     lc.definition_macro_names.contains(&target_text)
 }
 
-fn resolve_name_node<'a>(
+pub(crate) fn resolve_name_node<'a>(
     node: tree_sitter::Node<'a>,
     source: &str,
     lc: &crate::indexer::lang_constants::LangConstants,

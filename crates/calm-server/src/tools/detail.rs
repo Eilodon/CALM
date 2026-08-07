@@ -294,6 +294,56 @@ pub(crate) struct SymbolInfoOutput {
     pub(crate) health: Option<HealthOutput>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) suggested_next: Option<SuggestedNext>,
+    /// Tier 1 semantic facts (2026-08-07 roadmap T1) — `extends`/
+    /// `implements` extracted directly from syntax. `None` (not an empty
+    /// array) when this symbol has no relations, so a caller can tell
+    /// "checked, has none" apart from "not populated" if that distinction
+    /// ever matters. See `indexer::semantic_facts` for exactly what's
+    /// captured per language and why some things are deliberately absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) type_relations: Option<Vec<TypeRelationOutput>>,
+    /// Tier 1 semantic facts, effect half — explicit throws and direct
+    /// self/this-field writes. Same "None means none found" contract as
+    /// `type_relations` above.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) effects: Option<Vec<EffectOutput>>,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub(crate) struct TypeRelationOutput {
+    pub(crate) relation_kind: String,
+    pub(crate) target_text: String,
+    /// Populated only when `target_text` resolved to a real symbol in the
+    /// SAME file (v1 has no cross-file global resolution pass yet — see
+    /// `db::schema`'s `type_relations` table comment). `confidence` drops
+    /// to `"textual"`, not an error, when this is `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) to_symbol: Option<String>,
+    pub(crate) confidence: String,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub(crate) struct EffectOutput {
+    pub(crate) effect_kind: String,
+    pub(crate) target_text: String,
+    pub(crate) line: i64,
+}
+
+/// Tier 2 semantic fact (2026-08-07 roadmap T2) — deterministic, factual
+/// (NEVER LLM-generated) per-symbol summary. See `graph::digest`'s module
+/// doc comment for exactly what is and isn't captured. `understand`-only
+/// (not `symbol_info`) — see the roadmap's own "fold into understand, not
+/// a new tool" decision.
+#[derive(Serialize, JsonSchema)]
+pub(crate) struct ArchitectureDigestOutput {
+    pub(crate) rendered_text: String,
+    /// This symbol participates in a call cycle among `Formal`/`Resolved`-
+    /// confidence edges (Tarjan SCC, or a direct self-loop).
+    pub(crate) recursive_component: bool,
+    /// `true` when the underlying facts (callees/effects) were capped —
+    /// `rendered_text` is a real subset, not the full picture, for a very
+    /// high-fan-out symbol.
+    pub(crate) truncated: bool,
 }
 
 #[derive(Serialize, JsonSchema)]
