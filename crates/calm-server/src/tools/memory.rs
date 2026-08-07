@@ -321,9 +321,10 @@ pub(crate) struct RememberOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) content_warning: Option<String>,
     /// `true` iff `content_warning` fired -- this note was still saved (see
-    /// that field's own comment), but `recall` will exclude it from
-    /// default topic/query/list-all results until a caller explicitly
-    /// passes `include_quarantined: true`.
+    /// that field's own comment), but `recall` excludes it from its broad
+    /// paths (a `query` FTS search, or a no-args list-all) until a caller
+    /// passes `include_quarantined: true`. An exact-`topic` lookup is a
+    /// deliberate, targeted ask and always returns it regardless.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub(crate) quarantined: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -347,12 +348,14 @@ pub(crate) struct RecallParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) query: Option<String>,
     /// `false` (default): a note `remember` quarantined (its content
-    /// looked prompt-injection-shaped) is excluded from results, whether
-    /// fetched by exact `topic`, `query`, or listed by default. Pass
-    /// `true` to deliberately include quarantined notes too -- e.g. to
-    /// review/clean them up. Every returned note still carries its own
-    /// `content_warning`/`quarantined` fields regardless of this flag, so
-    /// the caller always knows what it's looking at.
+    /// looked prompt-injection-shaped) is excluded from the broad recall
+    /// paths -- a `query` FTS search, and a no-args list-all. An exact
+    /// `topic` lookup is a deliberate, targeted ask and always returns the
+    /// note regardless of this flag (mirroring `edit_context`'s own
+    /// related-notes gate). Pass `true` to also include quarantined notes
+    /// in the broad paths -- e.g. to review/clean them up. Every returned
+    /// note still carries its own `content_warning`/`quarantined` fields
+    /// regardless of this flag, so the caller always knows what it's looking at.
     #[serde(default)]
     pub(crate) include_quarantined: bool,
 }

@@ -199,14 +199,20 @@ fn test_hotspot_parity() {
     let (conn, _project_root, fixtures_dir) = setup_test_db();
 
     let config = calm_core::config::HotspotsConfig::default();
-    // same arguments as generate_oracle.py
+    // min_churn=2 exercises the churn-gated ranking path, which is the
+    // algorithm this frozen oracle (`expected_hotspot.json`) pins down. NOT
+    // min_churn=0: since the audit-7.1 fix, min_churn=0 deliberately seeds
+    // candidates from the complexity index (surfacing zero-churn "stable
+    // legacy debt"), a Rust-side behavior covered by
+    // hotspot::tests::test_min_churn_zero_surfaces_zero_churn_complexity_debt
+    // rather than by this parity fixture.
     let rust_hotspots = calm_core::analysis::hotspot::compute_hotspots(
         &fixtures_dir,
         &conn,
         &config,
         10,
         "1 year",
-        0,
+        2,
         false,
     );
 
