@@ -119,7 +119,12 @@ pub fn compute_package_dependencies(
     Ok(())
 }
 
-fn dep(name: &str, version: Option<&str>, ecosystem: &'static str, kind: &'static str) -> RawPackageDependency {
+fn dep(
+    name: &str,
+    version: Option<&str>,
+    ecosystem: &'static str,
+    kind: &'static str,
+) -> RawPackageDependency {
     RawPackageDependency {
         manifest_path: String::new(), // filled in by scan_project
         ecosystem,
@@ -358,7 +363,10 @@ tempfile = "3"
 "#,
         );
         assert_eq!(
-            deps.iter().map(|d| (d.name.as_str(), d.version_spec.as_deref(), d.kind)).collect::<Vec<_>>().len(),
+            deps.iter()
+                .map(|d| (d.name.as_str(), d.version_spec.as_deref(), d.kind))
+                .collect::<Vec<_>>()
+                .len(),
             4
         );
         let serde = deps.iter().find(|d| d.name == "serde").unwrap();
@@ -367,7 +375,10 @@ tempfile = "3"
         let rusqlite = deps.iter().find(|d| d.name == "rusqlite").unwrap();
         assert_eq!(rusqlite.version_spec.as_deref(), Some("0.31"));
         let local = deps.iter().find(|d| d.name == "local-crate").unwrap();
-        assert_eq!(local.version_spec, None, "no version key present -- must not fabricate one");
+        assert_eq!(
+            local.version_spec, None,
+            "no version key present -- must not fabricate one"
+        );
         let tempfile = deps.iter().find(|d| d.name == "tempfile").unwrap();
         assert_eq!(tempfile.kind, "dev");
     }
@@ -405,8 +416,14 @@ rusqlite = { version = "0.31", features = ["bundled"] }
         assert_eq!(react.version_spec.as_deref(), Some("^18.0.0"));
         assert_eq!(react.kind, "runtime");
         assert!(deps.iter().any(|d| d.name == "jest" && d.kind == "dev"));
-        assert!(deps.iter().any(|d| d.name == "react-dom" && d.kind == "peer"));
-        assert!(deps.iter().any(|d| d.name == "fsevents" && d.kind == "optional"));
+        assert!(
+            deps.iter()
+                .any(|d| d.name == "react-dom" && d.kind == "peer")
+        );
+        assert!(
+            deps.iter()
+                .any(|d| d.name == "fsevents" && d.kind == "optional")
+        );
     }
 
     #[test]
@@ -414,9 +431,23 @@ rusqlite = { version = "0.31", features = ["bundled"] }
         let deps = parse_go_mod(
             "module example.com/x\n\ngo 1.21\n\nrequire github.com/foo/bar v1.2.3\n\nrequire (\n\tgithub.com/baz/qux v0.1.0\n\tgithub.com/indirect/pkg v2.0.0 // indirect\n)\n",
         );
-        assert_eq!(names(&deps), vec!["github.com/foo/bar", "github.com/baz/qux", "github.com/indirect/pkg"]);
-        let indirect = deps.iter().find(|d| d.name == "github.com/indirect/pkg").unwrap();
-        assert_eq!(indirect.version_spec.as_deref(), Some("v2.0.0"), "indirect comment must not leak into the version");
+        assert_eq!(
+            names(&deps),
+            vec![
+                "github.com/foo/bar",
+                "github.com/baz/qux",
+                "github.com/indirect/pkg"
+            ]
+        );
+        let indirect = deps
+            .iter()
+            .find(|d| d.name == "github.com/indirect/pkg")
+            .unwrap();
+        assert_eq!(
+            indirect.version_spec.as_deref(),
+            Some("v2.0.0"),
+            "indirect comment must not leak into the version"
+        );
     }
 
     #[test]
@@ -446,10 +477,22 @@ fastapi = "^0.100"
 pytest = "^7.0"
 "#,
         );
-        assert!(deps.iter().any(|d| d.name == "requests" && d.version_spec.as_deref() == Some(">=2.0")));
-        assert!(deps.iter().any(|d| d.name == "click" && d.version_spec.is_none()));
-        assert!(deps.iter().any(|d| d.name == "fastapi" && d.kind == "runtime"));
-        assert!(!deps.iter().any(|d| d.name == "python"), "python version constraint is not a dependency");
+        assert!(
+            deps.iter()
+                .any(|d| d.name == "requests" && d.version_spec.as_deref() == Some(">=2.0"))
+        );
+        assert!(
+            deps.iter()
+                .any(|d| d.name == "click" && d.version_spec.is_none())
+        );
+        assert!(
+            deps.iter()
+                .any(|d| d.name == "fastapi" && d.kind == "runtime")
+        );
+        assert!(
+            !deps.iter().any(|d| d.name == "python"),
+            "python version constraint is not a dependency"
+        );
         assert!(deps.iter().any(|d| d.name == "pytest" && d.kind == "dev"));
     }
 
@@ -481,8 +524,14 @@ pytest = "^7.0"
         .unwrap();
 
         let deps = scan_project(dir.path(), &[]);
-        assert!(deps.iter().any(|d| d.name == "serde" && d.manifest_path == "Cargo.toml"));
-        assert!(deps.iter().any(|d| d.name == "react" && d.manifest_path == "package.json"));
+        assert!(
+            deps.iter()
+                .any(|d| d.name == "serde" && d.manifest_path == "Cargo.toml")
+        );
+        assert!(
+            deps.iter()
+                .any(|d| d.name == "react" && d.manifest_path == "package.json")
+        );
         assert!(
             !deps.iter().any(|d| d.name == "should-not-appear"),
             "node_modules must be skipped by the built-in IGNORE_DIRS walker gate: {deps:?}"
@@ -502,7 +551,9 @@ pytest = "^7.0"
 
         compute_package_dependencies(&conn, dir.path(), &[]).unwrap();
         let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM package_dependencies", [], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM package_dependencies", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(count, 1);
 
@@ -512,8 +563,13 @@ pytest = "^7.0"
         std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
         compute_package_dependencies(&conn, dir.path(), &[]).unwrap();
         let count_after: i64 = conn
-            .query_row("SELECT COUNT(*) FROM package_dependencies", [], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM package_dependencies", [], |r| {
+                r.get(0)
+            })
             .unwrap();
-        assert_eq!(count_after, 0, "removed dependency's stale row must not survive a recompute");
+        assert_eq!(
+            count_after, 0,
+            "removed dependency's stale row must not survive a recompute"
+        );
     }
 }

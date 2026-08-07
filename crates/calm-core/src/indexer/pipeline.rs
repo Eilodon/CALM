@@ -825,7 +825,8 @@ fn extract_file_data(
         });
     }
 
-    let raw_effects = crate::indexer::semantic_facts::extract_effects_from_tree(&tree, source, lang);
+    let raw_effects =
+        crate::indexer::semantic_facts::extract_effects_from_tree(&tree, source, lang);
     let mut effects = Vec::with_capacity(raw_effects.len());
     for re in raw_effects {
         // Same exact (bare_name, def_line) resolution call_sites' own
@@ -3096,7 +3097,13 @@ mod tests {
         assert_eq!(data.type_relations.len(), 2, "{:?}", {
             data.type_relations
                 .iter()
-                .map(|r| (r.from_symbol.as_str(), r.relation_kind, r.target_text.as_str()))
+                .map(|r| {
+                    (
+                        r.from_symbol.as_str(),
+                        r.relation_kind,
+                        r.target_text.as_str(),
+                    )
+                })
                 .collect::<Vec<_>>()
         });
         let extends = data
@@ -3168,7 +3175,13 @@ mod tests {
         assert_eq!(data.type_relations.len(), 1, "{:?}", {
             data.type_relations
                 .iter()
-                .map(|r| (r.from_symbol.as_str(), r.relation_kind, r.target_text.as_str()))
+                .map(|r| {
+                    (
+                        r.from_symbol.as_str(),
+                        r.relation_kind,
+                        r.target_text.as_str(),
+                    )
+                })
                 .collect::<Vec<_>>()
         });
         let rel = &data.type_relations[0];
@@ -3189,11 +3202,7 @@ mod tests {
         assert_eq!(data.type_relations[0].from_symbol, "foo.py::Foo");
         assert_eq!(data.type_relations[0].target_text, "Base");
 
-        let writes: Vec<&str> = data
-            .effects
-            .iter()
-            .map(|e| e.symbol_qn.as_str())
-            .collect();
+        let writes: Vec<&str> = data.effects.iter().map(|e| e.symbol_qn.as_str()).collect();
         assert_eq!(
             writes,
             vec!["foo.py::Foo::__init__", "foo.py::Foo::bump"],

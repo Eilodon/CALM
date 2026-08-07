@@ -1150,7 +1150,10 @@ async fn main() -> Result<()> {
         }
         #[cfg(feature = "index-bundles")]
         Commands::Bundle { action } => match action {
-            BundleAction::Export { project_root, output } => {
+            BundleAction::Export {
+                project_root,
+                output,
+            } => {
                 let root = std::fs::canonicalize(&project_root)?;
                 let db_path = calm_server::default_db_path(&root);
                 let config = calm_core::config::load_config_or_warn(&root);
@@ -1168,7 +1171,10 @@ async fn main() -> Result<()> {
                 let manifest = calm_core::bundle::inspect_bundle(&archive)?;
                 println!("{}", serde_json::to_string_pretty(&manifest)?);
             }
-            BundleAction::Import { archive, project_root } => {
+            BundleAction::Import {
+                archive,
+                project_root,
+            } => {
                 let root = std::fs::canonicalize(&project_root)?;
                 let db_path = calm_server::default_db_path(&root);
                 let config = calm_core::config::load_config_or_warn(&root);
@@ -1187,7 +1193,9 @@ async fn main() -> Result<()> {
                     );
                 }
                 if !report.commit_matches {
-                    println!("  (imported as a seed, not an exact match for this repo's current HEAD)");
+                    println!(
+                        "  (imported as a seed, not an exact match for this repo's current HEAD)"
+                    );
                 }
             }
         },

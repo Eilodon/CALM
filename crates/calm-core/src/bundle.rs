@@ -173,10 +173,7 @@ pub fn export_bundle(
 
     {
         let src = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        src.execute(
-            "VACUUM INTO ?1",
-            [snapshot_path.to_string_lossy().as_ref()],
-        )?;
+        src.execute("VACUUM INTO ?1", [snapshot_path.to_string_lossy().as_ref()])?;
     }
 
     // Re-open the FRESH snapshot for integrity_check and stats -- verifies
@@ -236,10 +233,7 @@ pub fn export_bundle(
         MANIFEST_FILE_NAME,
         manifest_json.as_slice(),
     )?;
-    tar_builder
-        .into_inner()?
-        .finish()?
-        .flush()?;
+    tar_builder.into_inner()?.finish()?.flush()?;
 
     Ok(manifest)
 }
@@ -304,7 +298,8 @@ pub fn import_bundle(
     }
 
     {
-        let snap = Connection::open_with_flags(&extracted_db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let snap =
+            Connection::open_with_flags(&extracted_db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         check_integrity(&snap)?;
     }
 
@@ -437,21 +432,19 @@ mod tests {
 
         let config = Config::default();
         let archive_path = src_dir.path().join("bundle.tar.gz");
-        let manifest =
-            export_bundle(&db_path, src_dir.path(), &config, &archive_path).unwrap();
+        let manifest = export_bundle(&db_path, src_dir.path(), &config, &archive_path).unwrap();
         assert_eq!(manifest.symbol_count, 1);
         assert_eq!(manifest.file_count, 1);
         assert!(archive_path.exists());
 
         let dest_dir = tempfile::tempdir().unwrap();
         let dest_db_path = dest_dir.path().join("index.db");
-        let report =
-            import_bundle(&archive_path, dest_dir.path(), &dest_db_path, &config).unwrap();
+        let report = import_bundle(&archive_path, dest_dir.path(), &dest_db_path, &config).unwrap();
         assert_eq!(report.manifest.symbol_count, 1);
         assert!(dest_db_path.exists());
 
-        let conn = Connection::open_with_flags(&dest_db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .unwrap();
+        let conn =
+            Connection::open_with_flags(&dest_db_path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0))
             .unwrap();
@@ -501,17 +494,33 @@ mod tests {
             manifest_header.set_mode(0o644);
             manifest_header.set_cksum();
             builder
-                .append_data(&mut manifest_header, MANIFEST_FILE_NAME, manifest_json.as_slice())
+                .append_data(
+                    &mut manifest_header,
+                    MANIFEST_FILE_NAME,
+                    manifest_json.as_slice(),
+                )
                 .unwrap();
-            builder.into_inner().unwrap().finish().unwrap().flush().unwrap();
+            builder
+                .into_inner()
+                .unwrap()
+                .finish()
+                .unwrap()
+                .flush()
+                .unwrap();
         }
 
         let dest_dir = tempfile::tempdir().unwrap();
         let dest_db_path = dest_dir.path().join("index.db");
-        let err = import_bundle(&tampered_path, dest_dir.path(), &dest_db_path, &config)
-            .unwrap_err();
-        assert!(matches!(err, BundleError::ChecksumMismatch { .. }), "{err:?}");
-        assert!(!dest_db_path.exists(), "a failed import must not touch the destination at all");
+        let err =
+            import_bundle(&tampered_path, dest_dir.path(), &dest_db_path, &config).unwrap_err();
+        assert!(
+            matches!(err, BundleError::ChecksumMismatch { .. }),
+            "{err:?}"
+        );
+        assert!(
+            !dest_db_path.exists(),
+            "a failed import must not touch the destination at all"
+        );
     }
 
     #[test]
@@ -546,15 +555,24 @@ mod tests {
             manifest_header.set_mode(0o644);
             manifest_header.set_cksum();
             builder
-                .append_data(&mut manifest_header, MANIFEST_FILE_NAME, manifest_json.as_slice())
+                .append_data(
+                    &mut manifest_header,
+                    MANIFEST_FILE_NAME,
+                    manifest_json.as_slice(),
+                )
                 .unwrap();
-            builder.into_inner().unwrap().finish().unwrap().flush().unwrap();
+            builder
+                .into_inner()
+                .unwrap()
+                .finish()
+                .unwrap()
+                .flush()
+                .unwrap();
         }
 
         let dest_dir = tempfile::tempdir().unwrap();
         let dest_db_path = dest_dir.path().join("index.db");
-        let err = import_bundle(&bumped_path, dest_dir.path(), &dest_db_path, &config)
-            .unwrap_err();
+        let err = import_bundle(&bumped_path, dest_dir.path(), &dest_db_path, &config).unwrap_err();
         assert!(matches!(err, BundleError::SchemaTooNew { .. }), "{err:?}");
     }
 
@@ -618,16 +636,29 @@ mod tests {
             manifest_header.set_mode(0o644);
             manifest_header.set_cksum();
             builder
-                .append_data(&mut manifest_header, MANIFEST_FILE_NAME, manifest_json.as_slice())
+                .append_data(
+                    &mut manifest_header,
+                    MANIFEST_FILE_NAME,
+                    manifest_json.as_slice(),
+                )
                 .unwrap();
-            builder.into_inner().unwrap().finish().unwrap().flush().unwrap();
+            builder
+                .into_inner()
+                .unwrap()
+                .finish()
+                .unwrap()
+                .flush()
+                .unwrap();
         }
 
         let dest_dir = tempfile::tempdir().unwrap();
         let dest_db_path = dest_dir.path().join("index.db");
-        let err = import_bundle(&archive_path, dest_dir.path(), &dest_db_path, &config)
-            .unwrap_err();
-        assert!(matches!(err, BundleError::IntegrityCheckFailed(_)), "{err:?}");
+        let err =
+            import_bundle(&archive_path, dest_dir.path(), &dest_db_path, &config).unwrap_err();
+        assert!(
+            matches!(err, BundleError::IntegrityCheckFailed(_)),
+            "{err:?}"
+        );
         assert!(!dest_db_path.exists());
     }
 
@@ -643,8 +674,7 @@ mod tests {
 
         let dest_dir = tempfile::tempdir().unwrap();
         let dest_db_path = dest_dir.path().join("index.db");
-        let report =
-            import_bundle(&archive_path, dest_dir.path(), &dest_db_path, &config).unwrap();
+        let report = import_bundle(&archive_path, dest_dir.path(), &dest_db_path, &config).unwrap();
         // Both sides have no git commit -> commit_matches is conservatively
         // false (never assume equality from two absences), which forces a
         // full reindex recommendation.

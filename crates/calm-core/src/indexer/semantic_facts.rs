@@ -76,7 +76,10 @@ pub fn extract_type_relations_from_tree(
     // Only languages with real extends/implements-shaped syntax are
     // dispatched — every other language is a guaranteed no-op walk, same
     // early-out shape as `extract_file_aliases_from_tree`'s language gate.
-    if !matches!(language, "java" | "typescript" | "javascript" | "python" | "rust") {
+    if !matches!(
+        language,
+        "java" | "typescript" | "javascript" | "python" | "rust"
+    ) {
         return Vec::new();
     }
     let mut out = Vec::new();
@@ -288,11 +291,21 @@ pub fn extract_effects_from_tree(tree: &Tree, source: &str, language: &str) -> V
     let Some(spec) = crate::indexer::lang_constants::find_spec(language) else {
         return Vec::new();
     };
-    if !matches!(language, "rust" | "python" | "java" | "typescript" | "javascript") {
+    if !matches!(
+        language,
+        "rust" | "python" | "java" | "typescript" | "javascript"
+    ) {
         return Vec::new();
     }
     let mut out = Vec::new();
-    walk_effects(tree.root_node(), source, language, &spec.constants, None, &mut out);
+    walk_effects(
+        tree.root_node(),
+        source,
+        language,
+        &spec.constants,
+        None,
+        &mut out,
+    );
     out
 }
 
@@ -359,7 +372,10 @@ fn detect_effect(node: Node, source: &str, language: &str) -> Option<(&'static s
 /// (non-mut) method writing `self.x` is a compile error, so the Rust
 /// compiler itself is the soundness guarantee here, not this extractor.
 fn detect_rust_write(node: Node, source: &str) -> Option<(&'static str, String)> {
-    if !matches!(node.kind(), "assignment_expression" | "compound_assignment_expr") {
+    if !matches!(
+        node.kind(),
+        "assignment_expression" | "compound_assignment_expr"
+    ) {
         return None;
     }
     let left = node.child_by_field_name("left")?;
@@ -589,10 +605,7 @@ mod tests {
 
     #[test]
     fn python_multiple_bases_and_metaclass_excluded() {
-        let rs = relations(
-            "python",
-            "class Foo(Bar, Baz, metaclass=Meta):\n    pass\n",
-        );
+        let rs = relations("python", "class Foo(Bar, Baz, metaclass=Meta):\n    pass\n");
         assert_eq!(
             rs,
             vec![
@@ -618,11 +631,7 @@ mod tests {
 
     #[test]
     fn rust_inherent_impl_has_no_relation() {
-        assert!(relations(
-            "rust",
-            "struct Foo;\nimpl Foo { fn m(&self) {} }\n"
-        )
-        .is_empty());
+        assert!(relations("rust", "struct Foo;\nimpl Foo { fn m(&self) {} }\n").is_empty());
     }
 
     #[test]
@@ -676,11 +685,13 @@ mod tests {
         // `raise e` -- `e` is a caught-exception variable, not an
         // exception TYPE reference. Capturing it would mislabel the
         // variable's name as if it were a resolved exception class.
-        assert!(effects(
-            "python",
-            "def f():\n    try:\n        pass\n    except Exception as e:\n        raise e\n"
-        )
-        .is_empty());
+        assert!(
+            effects(
+                "python",
+                "def f():\n    try:\n        pass\n    except Exception as e:\n        raise e\n"
+            )
+            .is_empty()
+        );
     }
 
     #[test]
@@ -693,11 +704,13 @@ mod tests {
 
     #[test]
     fn python_bare_reraise_is_skipped() {
-        assert!(effects(
-            "python",
-            "def f():\n    try:\n        pass\n    except Exception:\n        raise\n"
-        )
-        .is_empty());
+        assert!(
+            effects(
+                "python",
+                "def f():\n    try:\n        pass\n    except Exception:\n        raise\n"
+            )
+            .is_empty()
+        );
     }
 
     #[test]
@@ -717,7 +730,10 @@ mod tests {
             "java",
             "class Foo { void m() { throw new InvalidToken(); } void n(Exception e) { throw e; } }",
         );
-        assert_eq!(es, vec![("m".into(), "explicit_throw", "InvalidToken".into())]);
+        assert_eq!(
+            es,
+            vec![("m".into(), "explicit_throw", "InvalidToken".into())]
+        );
     }
 
     #[test]
@@ -738,21 +754,16 @@ mod tests {
 
     #[test]
     fn javascript_write_field() {
-        let es = effects("javascript", "class Foo {\n  m(v) {\n    this.x = v;\n  }\n}\n");
+        let es = effects(
+            "javascript",
+            "class Foo {\n  m(v) {\n    this.x = v;\n  }\n}\n",
+        );
         assert_eq!(es, vec![("m".into(), "write_field", "x".into())]);
     }
 
     #[test]
     fn go_and_rust_throw_are_out_of_scope() {
-        assert!(effects(
-            "go",
-            "package main\nfunc f() { panic(\"x\") }\n"
-        )
-        .is_empty());
-        assert!(effects(
-            "rust",
-            "fn f() { panic!(\"x\"); }\n"
-        )
-        .is_empty());
+        assert!(effects("go", "package main\nfunc f() { panic(\"x\") }\n").is_empty());
+        assert!(effects("rust", "fn f() { panic!(\"x\"); }\n").is_empty());
     }
 }

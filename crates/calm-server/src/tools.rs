@@ -5193,7 +5193,8 @@ mod tests {
 
     #[test]
     fn understand_omits_architecture_digest_when_no_digest_row_exists() {
-        let dir = std::env::temp_dir().join(format!("ci_understand_nodigest_{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("ci_understand_nodigest_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("bar.py"), "def bar():\n    pass\n").unwrap();
@@ -6855,7 +6856,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-
     #[test]
     fn indexing_status_surfaces_semantic_facts_and_architecture_digest_coverage() {
         let dir = std::env::temp_dir().join(format!("ci_idxstatus_t1t2_{}", std::process::id()));
@@ -7122,8 +7122,19 @@ mod tests {
                  caller_count, is_hub, is_entry_point)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 rusqlite::params![
-                    "Foo", "a.py::Foo", "class", "python", "a.py", 1i64, 5i64, "class Foo(Base):",
-                    "", "foo", 0i64, 0i64, 0i64
+                    "Foo",
+                    "a.py::Foo",
+                    "class",
+                    "python",
+                    "a.py",
+                    1i64,
+                    5i64,
+                    "class Foo(Base):",
+                    "",
+                    "foo",
+                    0i64,
+                    0i64,
+                    0i64
                 ],
             )
             .unwrap();
@@ -7141,13 +7152,15 @@ mod tests {
             .unwrap();
         }
 
-        let v = jv(server.symbol_info(rmcp::handler::server::wrapper::Parameters(
-            SymbolInfoParams {
-                symbol: "Foo".into(),
-                path: None,
-                line: None,
-            },
-        )));
+        let v = jv(
+            server.symbol_info(rmcp::handler::server::wrapper::Parameters(
+                SymbolInfoParams {
+                    symbol: "Foo".into(),
+                    path: None,
+                    line: None,
+                },
+            )),
+        );
 
         assert_eq!(
             v["type_relations"],
@@ -7185,20 +7198,33 @@ mod tests {
                  caller_count, is_hub, is_entry_point)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 rusqlite::params![
-                    "plain_fn", "a.py::plain_fn", "function", "python", "a.py", 1i64, 2i64,
-                    "def plain_fn():", "", "plain fn", 0i64, 0i64, 0i64
+                    "plain_fn",
+                    "a.py::plain_fn",
+                    "function",
+                    "python",
+                    "a.py",
+                    1i64,
+                    2i64,
+                    "def plain_fn():",
+                    "",
+                    "plain fn",
+                    0i64,
+                    0i64,
+                    0i64
                 ],
             )
             .unwrap();
         }
 
-        let v = jv(server.symbol_info(rmcp::handler::server::wrapper::Parameters(
-            SymbolInfoParams {
-                symbol: "plain_fn".into(),
-                path: None,
-                line: None,
-            },
-        )));
+        let v = jv(
+            server.symbol_info(rmcp::handler::server::wrapper::Parameters(
+                SymbolInfoParams {
+                    symbol: "plain_fn".into(),
+                    path: None,
+                    line: None,
+                },
+            )),
+        );
 
         assert!(
             v.get("type_relations").is_none(),

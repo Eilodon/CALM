@@ -344,7 +344,10 @@ pub fn compute_digests(conn: &Connection) -> rusqlite::Result<()> {
     {
         let mut stmt = conn.prepare("SELECT qualified_name, name_tokens FROM symbols")?;
         let iter = stmt.query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?.unwrap_or_default()))
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+            ))
         })?;
         for row in iter {
             let (qn, tokens) = row?;
@@ -406,8 +409,9 @@ pub fn compute_digests(conn: &Connection) -> rusqlite::Result<()> {
 
     let mut effects_by_symbol: HashMap<String, Vec<EffectFact>> = HashMap::new();
     {
-        let mut stmt =
-            conn.prepare("SELECT symbol_qn, effect_kind, target_text FROM symbol_effects ORDER BY line")?;
+        let mut stmt = conn.prepare(
+            "SELECT symbol_qn, effect_kind, target_text FROM symbol_effects ORDER BY line",
+        )?;
         let iter = stmt.query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
@@ -417,13 +421,10 @@ pub fn compute_digests(conn: &Connection) -> rusqlite::Result<()> {
         })?;
         for row in iter {
             let (qn, kind, target) = row?;
-            effects_by_symbol
-                .entry(qn)
-                .or_default()
-                .push(EffectFact {
-                    effect_kind: kind,
-                    target_text: target,
-                });
+            effects_by_symbol.entry(qn).or_default().push(EffectFact {
+                effect_kind: kind,
+                target_text: target,
+            });
         }
     }
 
@@ -461,7 +462,10 @@ pub fn compute_digests(conn: &Connection) -> rusqlite::Result<()> {
         let possible_truncated = possible.len() > MAX_POSSIBLE_CALLEES_SHOWN;
         possible.truncate(MAX_POSSIBLE_CALLEES_SHOWN);
 
-        let type_relations = type_relations_by_from.get(&row.qn).cloned().unwrap_or_default();
+        let type_relations = type_relations_by_from
+            .get(&row.qn)
+            .cloned()
+            .unwrap_or_default();
 
         let mut effects = effects_by_symbol.get(&row.qn).cloned().unwrap_or_default();
         let effects_truncated = effects.len() > MAX_EFFECTS_SHOWN;
@@ -669,14 +673,32 @@ mod tests {
             signature: "fn refresh_session(token, store) -> User".to_string(),
             complexity: 7,
             confirmed_callees: vec![
-                CalleeFact { name: "verify_token".to_string(), role_tags: vec!["verify".to_string(), "token".to_string()] },
-                CalleeFact { name: "load_session".to_string(), role_tags: vec![] },
+                CalleeFact {
+                    name: "verify_token".to_string(),
+                    role_tags: vec!["verify".to_string(), "token".to_string()],
+                },
+                CalleeFact {
+                    name: "load_session".to_string(),
+                    role_tags: vec![],
+                },
             ],
-            possible_callees: vec![CalleeFact { name: "emit_event".to_string(), role_tags: vec!["emit".to_string()] }],
-            type_relations: vec![TypeRelationFact { relation_kind: "implements".to_string(), target_text: "SessionRefresher".to_string() }],
+            possible_callees: vec![CalleeFact {
+                name: "emit_event".to_string(),
+                role_tags: vec!["emit".to_string()],
+            }],
+            type_relations: vec![TypeRelationFact {
+                relation_kind: "implements".to_string(),
+                target_text: "SessionRefresher".to_string(),
+            }],
             effects: vec![
-                EffectFact { effect_kind: "write_field".to_string(), target_text: "last_refresh".to_string() },
-                EffectFact { effect_kind: "explicit_throw".to_string(), target_text: "ExpiredToken".to_string() },
+                EffectFact {
+                    effect_kind: "write_field".to_string(),
+                    target_text: "last_refresh".to_string(),
+                },
+                EffectFact {
+                    effect_kind: "explicit_throw".to_string(),
+                    target_text: "ExpiredToken".to_string(),
+                },
             ],
             recursive_component: false,
             truncated: false,
@@ -748,7 +770,8 @@ mod tests {
             "INSERT INTO symbol_effects (symbol_qn, effect_kind, target_text, source_path, line) \
              VALUES ('a.py::Foo::m', 'write_field', 'x', 'a.py', 1)",
             [],
-        ).unwrap();
+        )
+        .unwrap();
 
         compute_digests(&conn).unwrap();
 
