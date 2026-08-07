@@ -1460,6 +1460,7 @@ fn rebuild_graph(
     crate::graph::boundary::update_boundary_ambiguous_flags(tx)?;
     crate::graph::churn::update_churn_scores(tx, project_root, churn_since)?;
     crate::graph::digest::compute_digests(tx)?;
+    crate::indexer::package_deps::compute_package_dependencies(tx, project_root, &[])?;
     Ok(())
 }
 
@@ -1650,6 +1651,7 @@ pub fn incremental_graph_update(
     crate::graph::boundary::update_boundary_ambiguous_flags(tx)?;
     crate::graph::churn::update_churn_scores(tx, project_root, churn_since)?;
     crate::graph::digest::compute_digests(tx)?;
+    crate::indexer::package_deps::compute_package_dependencies(tx, project_root, &[])?;
 
     Ok(IncrementalOutcome::Applied)
 }

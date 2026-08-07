@@ -130,6 +130,26 @@ impl CalmServer {
                     })
                     .collect();
             }
+            // T4a Package Dependency Graph (2026-08-07 roadmap) -- same
+            // additive GROUP BY pattern as semantic_facts above.
+            let mut package_dependencies = PackageDependenciesStatusOutput::default();
+            if let Ok(mut stmt) = conn.prepare(
+                "SELECT ecosystem, COUNT(*), COUNT(DISTINCT manifest_path) \
+                 FROM package_dependencies GROUP BY ecosystem",
+            ) && let Ok(rows) = stmt.query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
+            }) {
+                let mut manifests_total = 0i64;
+                for row in rows.flatten() {
+                    package_dependencies.total += row.1;
+                    manifests_total += row.2;
+                    package_dependencies
+                        .by_ecosystem
+                        .push(PackageEcosystemCountOutput { ecosystem: row.0, count: row.1 });
+                }
+                package_dependencies.manifests = manifests_total;
+            }
+
             let architecture_digest = conn
                 .query_row(
                     "SELECT COUNT(*), COALESCE(SUM(recursive_component), 0), COALESCE(SUM(truncated), 0) \
@@ -265,6 +285,7 @@ impl CalmServer {
                 external_proofs,
                 semantic_facts,
                 architecture_digest,
+                package_dependencies,
                 identity_migration,
                 graph_mode: self.last_graph_mode.read_ok().clone(),
                 watcher,
@@ -806,6 +827,12 @@ pub(crate) struct IndexingStatusOutput {
     /// has a rendered digest (only `function`/`method`/`class`/`struct`/
     /// `trait`/`interface`/`constructor` kinds are digestable).
     pub(crate) architecture_digest: ArchitectureDigestStatusOutput,
+    /// T4a Package Dependency Graph (2026-08-07 roadmap, TIER 4 first
+    /// stage) — DECLARED external dependencies parsed from manifest files
+    /// (Cargo.toml/package.json/go.mod/requirements.txt/pyproject.toml).
+    /// See `indexer::package_deps`'s module doc comment for exactly what
+    /// is and isn't covered (notably: no Java pom.xml/build.gradle yet).
+    pub(crate) package_dependencies: PackageDependenciesStatusOutput,
     /// Diagnostic state of the one-transaction CallSite identity migration.
     /// Absent until a legacy database actually requires that migration.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -993,6 +1020,24 @@ pub(crate) struct ArchitectureDigestStatusOutput {
     /// `graph::digest`) — `rendered_text` is a real subset for these, not
     /// the full picture.
     pub(crate) truncated_digests: i64,
+}
+
+#[derive(Default, Serialize, JsonSchema)]
+pub(crate) struct PackageDependenciesStatusOutput {
+    pub(crate) total: i64,
+    /// Distinct manifest files this scan found and successfully parsed.
+    pub(crate) manifests: i64,
+    /// Only ecosystems with at least one dependency found — an absent
+    /// ecosystem means either the project has no manifest of that kind,
+    /// or (Java) that ecosystem isn't covered yet at all, see
+    /// `indexer::package_deps`'s module doc comment.
+    pub(crate) by_ecosystem: Vec<PackageEcosystemCountOutput>,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub(crate) struct PackageEcosystemCountOutput {
+    pub(crate) ecosystem: String,
+    pub(crate) count: i64,
 }
 
 #[derive(Serialize, JsonSchema)]

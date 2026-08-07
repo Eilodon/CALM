@@ -7,6 +7,7 @@ pub mod go_module;
 pub mod imports;
 pub mod jvm_package;
 pub mod lang_constants;
+pub mod package_deps;
 pub mod parser;
 pub mod pipeline;
 pub mod psr4;

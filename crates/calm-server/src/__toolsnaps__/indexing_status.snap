@@ -163,6 +163,48 @@
           "truncated_digests"
         ]
       },
+      "PackageDependenciesStatusOutput": {
+        "type": "object",
+        "properties": {
+          "total": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "manifests": {
+            "description": "Distinct manifest files this scan found and successfully parsed.",
+            "type": "integer",
+            "format": "int64"
+          },
+          "by_ecosystem": {
+            "description": "Only ecosystems with at least one dependency found — an absent\necosystem means either the project has no manifest of that kind,\nor (Java) that ecosystem isn't covered yet at all, see\n`indexer::package_deps`'s module doc comment.",
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/PackageEcosystemCountOutput"
+            }
+          }
+        },
+        "required": [
+          "total",
+          "manifests",
+          "by_ecosystem"
+        ]
+      },
+      "PackageEcosystemCountOutput": {
+        "type": "object",
+        "properties": {
+          "ecosystem": {
+            "type": "string"
+          },
+          "count": {
+            "type": "integer",
+            "format": "int64"
+          }
+        },
+        "required": [
+          "ecosystem",
+          "count"
+        ]
+      },
       "IdentityMigrationStatusOutput": {
         "type": "object",
         "properties": {
@@ -541,6 +583,10 @@
       "architecture_digest": {
         "description": "Tier 2 Architecture Digest (2026-08-07 roadmap T2) coverage — see\n`graph::digest`'s module doc comment. Compare `symbols_with_digest`\nagainst `symbols_indexed` to see how much of the graph currently\nhas a rendered digest (only `function`/`method`/`class`/`struct`/\n`trait`/`interface`/`constructor` kinds are digestable).",
         "$ref": "#/$defs/ArchitectureDigestStatusOutput"
+      },
+      "package_dependencies": {
+        "description": "T4a Package Dependency Graph (2026-08-07 roadmap, TIER 4 first\nstage) — DECLARED external dependencies parsed from manifest files\n(Cargo.toml/package.json/go.mod/requirements.txt/pyproject.toml).\nSee `indexer::package_deps`'s module doc comment for exactly what\nis and isn't covered (notably: no Java pom.xml/build.gradle yet).",
+        "$ref": "#/$defs/PackageDependenciesStatusOutput"
       },
       "identity_migration": {
         "description": "Diagnostic state of the one-transaction CallSite identity migration.\nAbsent until a legacy database actually requires that migration.",

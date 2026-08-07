@@ -352,6 +352,27 @@ CREATE TABLE IF NOT EXISTS symbol_digests (
     graph_generation     INTEGER NOT NULL DEFAULT 0,
     truncated            INTEGER NOT NULL DEFAULT 0
 );
+
+-- T4a Package Dependency Graph (2026-08-07 roadmap, TIER 4 first stage):
+-- DECLARED external dependencies parsed straight from manifest files
+-- (Cargo.toml/package.json/go.mod/requirements.txt/pyproject.toml -- see
+-- indexer::package_deps's module doc comment for exactly what is and
+-- isn't covered). Full DELETE-then-reinsert on every graph rebuild, same
+-- posture as symbol_digests above -- manifests are small and cheap to
+-- re-scan; no incremental invalidation needed. version_spec is the raw
+-- declared string verbatim (never range-parsed), NULL when the manifest
+-- genuinely declares no version (e.g. Cargo `{ workspace = true }`).
+CREATE TABLE IF NOT EXISTS package_dependencies (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    manifest_path    TEXT NOT NULL,
+    ecosystem        TEXT NOT NULL CHECK (ecosystem IN ('cargo', 'npm', 'go', 'pypi')),
+    dependency_name  TEXT NOT NULL,
+    version_spec     TEXT,
+    dependency_kind  TEXT NOT NULL CHECK (dependency_kind IN ('runtime', 'dev', 'build', 'peer', 'optional')),
+    UNIQUE(manifest_path, ecosystem, dependency_name, dependency_kind)
+);
+CREATE INDEX IF NOT EXISTS idx_package_dependencies_manifest ON package_dependencies(manifest_path);
+CREATE INDEX IF NOT EXISTS idx_package_dependencies_name ON package_dependencies(dependency_name);
 ";
 
 /// Durable state (project memory, edit-transaction journal, audit ledger,
