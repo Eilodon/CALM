@@ -100,6 +100,18 @@ protobuf = { version = "=3.7.2", optional = true }
 tempfile = { version = "3", optional = true }
 lsp-types = { version = "0.97", optional = true }
 tokio = { workspace = true, optional = true }
+# T3 Verified Index Bundles (2026-08-07 pecorino-adoption-roadmap.md) --
+# `.tar.gz` not the roadmap sketch's `.tar.zst`: `zstd`'s Rust binding
+# wraps the C libzstd (via `zstd-sys`, needs a C compiler), the exact
+# problem class (`onig`/`esaxx-rs`/`sqlite-vec`) this workspace has
+# repeatedly hit and removed on musl cross-compiles -- see the
+# `tokenizers`/`tract-onnx` comment block above. `flate2` with the
+# `rust_backend` feature (`miniz_oxide`) and `tar` are both pure Rust, zero
+# new C dependency, at the cost of a slightly worse compression ratio than
+# zstd -- an acceptable trade for an operational export/import tool that
+# is not a hot path.
+tar = { version = "0.4", optional = true }
+flate2 = { version = "1", optional = true, default-features = false, features = ["rust_backend"] }
 
 [dev-dependencies]
 tempfile = "3"
@@ -216,3 +228,8 @@ scip-overlay = ["dep:scip", "dep:protobuf", "dep:tempfile"]
 # (`scip/ingest.rs`) instead of duplicating them — `crate::scip` doesn't
 # compile without that feature.
 lsp-overlay = ["dep:lsp-types", "dep:tokio", "scip-overlay"]
+# T3 Verified Index Bundles -- opt-in, NOT in `default` yet (new, unproven
+# capability, same posture onnx-embeddings/lang-kotlin shipped with
+# initially). See the `tar`/`flate2` dependency comment above for why
+# `.tar.gz` instead of the roadmap sketch's `.tar.zst`.
+index-bundles = ["dep:tar", "dep:flate2", "dep:tempfile"]

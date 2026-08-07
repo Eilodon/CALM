@@ -86,3 +86,7 @@ http = ["calm-server/http"]
 # Without this passthrough the feature is unreachable from the shipped `calm`
 # binary entirely (caught in the 2026-07-10 review).
 lsp-overlay  = ["calm-core/lsp-overlay",  "calm-server/lsp-overlay"]
+# T3 Verified Index Bundles passthrough -- no calm-server involvement (pure
+# calm-core export/import + this crate's CLI subcommand), unlike most other
+# passthroughs above.
+index-bundles = ["calm-core/index-bundles"]

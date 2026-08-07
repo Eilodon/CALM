@@ -1,4 +1,6 @@
 pub mod analysis;
+#[cfg(feature = "index-bundles")]
+pub mod bundle;
 pub mod config;
 pub mod db;
 pub mod digest;

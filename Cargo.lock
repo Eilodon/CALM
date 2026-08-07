@@ -350,6 +350,7 @@ name = "calm-core"
 version = "0.6.0"
 dependencies = [
  "anyhow",
+ "flate2",
  "fs4",
  "globset",
  "hmac 0.12.1",
@@ -369,6 +370,7 @@ dependencies = [
  "sha2 0.10.9",
  "sqlparser",
  "stack-graphs",
+ "tar",
  "tempfile",
  "thiserror 2.0.18",
  "tokenizers 0.23.1",

@@ -304,6 +304,47 @@ enum Commands {
         #[arg(long, default_value = ".")]
         project_root: PathBuf,
     },
+    /// T3 Verified Index Bundles (2026-08-07 pecorino-adoption-roadmap.md):
+    /// export/import/inspect a checksummed `index.db` snapshot for onboarding
+    /// a large repo without a cold reindex, or seeding CI. NEVER includes
+    /// `state.db` (project memory, edit-transaction journal, audit ledger,
+    /// HMAC keys) -- see `calm_core::bundle`'s module doc comment for the
+    /// full verify-then-activate design.
+    #[cfg(feature = "index-bundles")]
+    Bundle {
+        #[command(subcommand)]
+        action: BundleAction,
+    },
+}
+
+#[cfg(feature = "index-bundles")]
+#[derive(Subcommand)]
+enum BundleAction {
+    /// Export a verified snapshot of this project's index.db
+    Export {
+        /// Project root directory
+        #[arg(long, default_value = ".")]
+        project_root: PathBuf,
+        /// Output archive path, e.g. calm-index.tar.gz
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Import a bundle, atomically activating it as this project's index.db.
+    /// A live daemon does NOT hot-reload this -- restart/reconnect it
+    /// separately to pick up the new file (see `calm_core::bundle`'s doc
+    /// comment).
+    Import {
+        /// Path to the .tar.gz archive produced by `calm bundle export`
+        archive: PathBuf,
+        /// Project root directory to import into
+        #[arg(long, default_value = ".")]
+        project_root: PathBuf,
+    },
+    /// Print a bundle's manifest without touching this project's index.db
+    Inspect {
+        /// Path to the .tar.gz archive
+        archive: PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -1107,6 +1148,49 @@ async fn main() -> Result<()> {
             let code = calm_core::hooks_check::run(std::io::stdin(), std::io::stderr(), &root);
             std::process::exit(code);
         }
+        #[cfg(feature = "index-bundles")]
+        Commands::Bundle { action } => match action {
+            BundleAction::Export { project_root, output } => {
+                let root = std::fs::canonicalize(&project_root)?;
+                let db_path = calm_server::default_db_path(&root);
+                let config = calm_core::config::load_config_or_warn(&root);
+                let manifest = calm_core::bundle::export_bundle(&db_path, &root, &config, &output)?;
+                println!(
+                    "Exported {} ({} symbols, {} files, calm {}, schema v{}).",
+                    output.display(),
+                    manifest.symbol_count,
+                    manifest.file_count,
+                    manifest.calm_version,
+                    manifest.schema_version
+                );
+            }
+            BundleAction::Inspect { archive } => {
+                let manifest = calm_core::bundle::inspect_bundle(&archive)?;
+                println!("{}", serde_json::to_string_pretty(&manifest)?);
+            }
+            BundleAction::Import { archive, project_root } => {
+                let root = std::fs::canonicalize(&project_root)?;
+                let db_path = calm_server::default_db_path(&root);
+                let config = calm_core::config::load_config_or_warn(&root);
+                let report = calm_core::bundle::import_bundle(&archive, &root, &db_path, &config)?;
+                println!("Imported bundle into {}.", report.activated_path.display());
+                println!(
+                    "  git commit matches: {}, config matches: {}",
+                    report.commit_matches, report.config_matches
+                );
+                if report.force_full_reindex {
+                    println!(
+                        "  NOTE: bundle's git commit or calm_version differs from this repo/binary \
+                         -- run `calm index --project-root {}` to fully refresh before trusting \
+                         this index.",
+                        root.display()
+                    );
+                }
+                if !report.commit_matches {
+                    println!("  (imported as a seed, not an exact match for this repo's current HEAD)");
+                }
+            }
+        },
     }
 
     Ok(())
