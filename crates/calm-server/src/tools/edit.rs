@@ -3700,6 +3700,139 @@ mod elicit_tests {
         }
     }
 
+    // --- classify_gate: the pure, structural half of the write-gate refusal
+    // decision. Its own doc comment pins it as the single source of truth that
+    // edit_lines_impl_gated / edit_symbol_flow both route through; these cover
+    // which TIER a touch lands in (the session-state half -- edit_context
+    // freshness, grounded reason -- is exercised by decide_mrtr_answer above
+    // and the hub_mrtr_* round-trips). Regression cover for issue #63. ---
+
+    #[test]
+    fn classify_gate_no_gate_for_a_plain_low_risk_non_hub_touch() {
+        let c = classify_gate(false, Some("low"), None, false, false, None);
+        assert!(!c.will_block_without_confirm);
+        assert_eq!(c.requirement, GateRequirement::None);
+        assert!(c.why.is_none());
+        // A None risk is treated the same as a low one.
+        let c_none = classify_gate(false, None, None, false, false, None);
+        assert_eq!(c_none.requirement, GateRequirement::None);
+    }
+
+    #[test]
+    fn classify_gate_hub_needs_the_full_three_layer_gate() {
+        let c = classify_gate(true, Some("medium"), None, false, false, None);
+        assert!(c.will_block_without_confirm);
+        assert_eq!(
+            c.requirement,
+            GateRequirement::EditContextConfirmGroundedReason
+        );
+        assert_eq!(c.why.as_deref(), Some("a hub symbol (is_hub=true)"));
+    }
+
+    #[test]
+    fn classify_gate_bridge_downgrade_drops_a_hub_to_confirm_only() {
+        // Bridge-only hub, risk <= medium, all callers confidently resolved:
+        // confirm:true alone is enough -- no edit_context/grounded reason.
+        let c = classify_gate(true, Some("medium"), None, true, false, None);
+        assert!(c.will_block_without_confirm);
+        assert_eq!(c.requirement, GateRequirement::ConfirmOnly);
+        assert_eq!(c.requirement.as_str(), "confirm");
+    }
+
+    #[test]
+    fn classify_gate_high_risk_by_caller_count_names_the_ten_caller_reason() {
+        let c = classify_gate(false, Some("high"), None, false, false, None);
+        assert!(c.will_block_without_confirm);
+        assert_eq!(
+            c.requirement,
+            GateRequirement::EditContextConfirmGroundedReason
+        );
+        assert_eq!(c.why.as_deref(), Some("a high-risk symbol (>10 callers)"));
+    }
+
+    #[test]
+    fn classify_gate_high_risk_via_risk_rule_uses_the_rule_reason_not_caller_count() {
+        // A risk_rules path-floor match reaches "high" without >10 callers --
+        // the message must not misattribute the gate to caller count.
+        let rule = "path matches risk_rules floor {glob: \"**/auth/**\", minimum: \"high\"}";
+        let c = classify_gate(false, Some("high"), None, false, false, Some(rule));
+        assert_eq!(c.why.as_deref(), Some(rule));
+        assert_ne!(c.why.as_deref(), Some("a high-risk symbol (>10 callers)"));
+    }
+
+    #[test]
+    fn classify_gate_each_uncertain_zero_caller_reason_gates_with_its_own_message() {
+        let entry = classify_gate(
+            false,
+            Some("low"),
+            Some(UncertainZeroCallerReason::EntryPoint),
+            false,
+            false,
+            None,
+        );
+        let test_only = classify_gate(
+            false,
+            Some("low"),
+            Some(UncertainZeroCallerReason::TestOnly),
+            false,
+            false,
+            None,
+        );
+        let low_conf = classify_gate(
+            false,
+            Some("low"),
+            Some(UncertainZeroCallerReason::LowConfidence),
+            false,
+            false,
+            None,
+        );
+        for c in [&entry, &test_only, &low_conf] {
+            assert!(c.will_block_without_confirm);
+            assert_eq!(
+                c.requirement,
+                GateRequirement::EditContextConfirmGroundedReason
+            );
+        }
+        // Each reason names its own distinct cause, not a generic default.
+        assert!(entry.why.as_deref().unwrap().contains("entry point"));
+        assert!(test_only.why.as_deref().unwrap().contains("test-only"));
+        assert!(
+            low_conf
+                .why
+                .as_deref()
+                .unwrap()
+                .contains("dead-code heuristic")
+        );
+        assert_ne!(entry.why, test_only.why);
+        assert_ne!(test_only.why, low_conf.why);
+    }
+
+    #[test]
+    fn classify_gate_always_require_edit_context_gates_even_a_plain_symbol() {
+        // The config forces the gate on every touch regardless of risk/hub.
+        let c = classify_gate(false, None, None, false, true, None);
+        assert!(c.will_block_without_confirm);
+        assert_eq!(
+            c.requirement,
+            GateRequirement::EditContextConfirmGroundedReason
+        );
+        assert!(
+            c.why
+                .as_deref()
+                .unwrap()
+                .contains("always_require_edit_context")
+        );
+    }
+
+    #[test]
+    fn classify_gate_bridge_downgrade_flag_alone_never_creates_a_gate() {
+        // bridge_downgrade_eligible only DOWNGRADES an already-firing gate; on
+        // its own (no hub, low risk, no uncertainty, no force) there is no gate.
+        let c = classify_gate(false, Some("low"), None, true, false, None);
+        assert!(!c.will_block_without_confirm);
+        assert_eq!(c.requirement, GateRequirement::None);
+    }
+
     fn mrtr_test_server(name: &str) -> (std::path::PathBuf, CalmServer) {
         let dir = std::env::temp_dir().join(format!("ci_mrtr_{name}_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);

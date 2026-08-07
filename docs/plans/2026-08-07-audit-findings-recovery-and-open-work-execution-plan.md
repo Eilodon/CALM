@@ -262,8 +262,7 @@ an MCP tool) hard-block all `.rs` source edits; docs/shell/toml edits stayed ava
 **Confirmed + fixed once the MCP reconnected mid-pass:**
 - **8.1** ([#62](https://github.com/Eilodon/CALM/issues/62), fixed) — the two `memory.rs` doc comments (`RecallParams::include_quarantined` + the `quarantined` field) rewritten to match the code + guarantee catalog; `recall`/`remember` toolsnaps regenerated. Docs-only, no behavior change.
 
-**Filed as an issue (test coverage, not attempted this pass):**
-- **§2.2** → [#63](https://github.com/Eilodon/CALM/issues/63) — write-gate refusal-branch tests.
+**Fixed ([#63](https://github.com/Eilodon/CALM/issues/63)):** write-gate refusal-branch coverage. Added 8 direct tests for `classify_gate` (`edit.rs`) — the pure function its own doc comment pins as the single source of truth for the gate decision that `edit_lines_impl_gated`/`edit_symbol_flow` both route through: no-gate baseline, hub→full-gate, bridge-downgrade→confirm-only, high-risk-by-caller-count, high-risk-via-risk-rule (reason not misattributed), each `UncertainZeroCallerReason` variant's distinct message, `always_require_edit_context` forcing, and the bridge-downgrade flag not creating a gate on its own. Combined with the existing `decide_mrtr_answer`/`map_elicit_outcome` decline tests, the refusal-decision surface is now covered. (A full end-to-end test that drives `edit_lines_impl_gated` to each error *code* through an indexed hub — the wiring below the decision — remains a possible follow-up; the decision logic itself is the higher-value gap and is now closed.)
 
 **Deferred / needs-design / needs-a-watcher → filed as issues:**
 - **§2.1** dogfood shadow-mode promotion → [#64](https://github.com/Eilodon/CALM/issues/64)
