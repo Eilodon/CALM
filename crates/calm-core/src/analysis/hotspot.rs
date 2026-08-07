@@ -100,8 +100,19 @@ pub fn compute_hotspots(
     // Step 2: Complexity from index
     let complexity_map = collect_complexity(conn);
 
-    // Step 3: Merge + normalize
-    let candidates: HashMap<String, ChurnInfo> = if git_available {
+    // Step 3: Merge + normalize.
+    //
+    // `min_churn == 0` is the documented "stable legacy debt" escape hatch:
+    // surface high-complexity files regardless of how little they've churned.
+    // A truly zero-churn file is absent from `churn_map` entirely (git never
+    // lists it for the window), so when churn is NOT acting as a gate we seed
+    // candidates from the complexity index and fold in whatever churn each
+    // file does have -- otherwise `min_churn=0` could only ever reach files
+    // with >=1 commit, silently never surfacing the zero-churn debt the
+    // parameter promises. Mirrors `compute_absolute_hotspot_risk`'s own
+    // complexity-seeded fold.
+    let churn_is_gate = git_available && min_churn > 0;
+    let candidates: HashMap<String, ChurnInfo> = if churn_is_gate {
         churn_map
             .into_iter()
             .filter(|(path, data)| {
@@ -109,18 +120,19 @@ pub fn compute_hotspots(
             })
             .collect()
     } else {
+        // git unavailable, OR min_churn == 0: every complexity-indexed file is
+        // a candidate, carrying its real churn from `churn_map` if git gave us
+        // any (0 when the file never churned in the window).
         complexity_map
             .keys()
             .map(|path| {
-                (
-                    path.clone(),
-                    ChurnInfo {
-                        commit_count: 0,
-                        bot_commit_count: 0,
-                        authors: HashSet::new(),
-                        last_changed: None,
-                    },
-                )
+                let churn = churn_map.get(path).cloned().unwrap_or(ChurnInfo {
+                    commit_count: 0,
+                    bot_commit_count: 0,
+                    authors: HashSet::new(),
+                    last_changed: None,
+                });
+                (path.clone(), churn)
             })
             .collect()
     };
@@ -171,13 +183,14 @@ pub fn compute_hotspots(
         .iter()
         .filter_map(|(path, churn)| {
             let cm = complexity_map.get(path)?;
-            // Computed unconditionally (not just when `git_available`) so
-            // callers can see the churn share even when it didn't factor
-            // into `hotspot_score` — 0.0 uniformly when git is unavailable,
-            // since every candidate's `commit_count` is 0 in that branch.
+            // Computed unconditionally (not just when churn gates ranking) so
+            // callers can see each file's real churn share even when it didn't
+            // factor into `hotspot_score` -- the score falls back to complexity
+            // alone when git is unavailable or `min_churn == 0` (see
+            // `churn_is_gate`), but the churn itself is still reported.
             let norm_churn = churn_scores.get(path.as_str()).copied().unwrap_or(0.0) / max_churn;
             let norm_compl = compl_scores.get(path.as_str()).copied().unwrap_or(0.0) / max_compl;
-            let score = if git_available {
+            let score = if churn_is_gate {
                 norm_churn * norm_compl
             } else {
                 norm_compl
@@ -566,6 +579,67 @@ mod tests {
         assert_eq!(output.hotspots.len(), 1);
         assert_eq!(output.hotspots[0].path, "hot.py");
         assert_eq!(output.hotspots[0].churn.commit_count, 2);
+    }
+
+    #[test]
+    fn test_min_churn_zero_surfaces_zero_churn_complexity_debt() {
+        // Regression (audit 7.1): `min_churn=0` is documented to surface
+        // high-complexity files with little OR NO recent churn ("stable legacy
+        // debt"). A truly zero-churn file is absent from git's churn map, so it
+        // must be seeded from the complexity index and ranked by complexity
+        // alone -- otherwise the churn*complexity product zeroes it out and the
+        // documented parameter silently returns nothing for such files.
+        let dir = tempfile::tempdir().unwrap();
+        run_git(dir.path(), &["init", "-q"]);
+        run_git(dir.path(), &["config", "user.email", "test@example.com"]);
+        run_git(dir.path(), &["config", "user.name", "Test"]);
+        std::fs::write(dir.path().join("hot.py"), "def foo():\n    pass\n").unwrap();
+        run_git(dir.path(), &["add", "hot.py"]);
+        run_git(dir.path(), &["commit", "-q", "-m", "init"]);
+        std::fs::write(dir.path().join("hot.py"), "def foo():\n    return 1\n").unwrap();
+        run_git(dir.path(), &["commit", "-q", "-am", "update"]);
+
+        let conn = setup_db();
+        // Churned file (2 commits above).
+        insert_symbol(&conn, "hot.foo", "hot.py", 3, false, 1);
+        // High-complexity file NEVER committed -> zero churn, absent from the
+        // git churn map, present only in the complexity index.
+        insert_symbol(&conn, "stable.func1", "stable.py", 10, true, 5);
+        insert_symbol(&conn, "stable.func2", "stable.py", 4, false, 3);
+
+        let config = HotspotsConfig::default();
+
+        // min_churn = 0: churn is not a gate; the zero-churn complexity file
+        // must appear, ranked by complexity.
+        let output = compute_hotspots(dir.path(), &conn, &config, 10, "1 year", 0, false);
+        assert!(output.git_available);
+        assert_eq!(output.hotspot_method, "git+index");
+        assert!(
+            output.hotspots.iter().any(|h| h.path == "stable.py"),
+            "min_churn=0 should surface the zero-churn high-complexity file; got {:?}",
+            output
+                .hotspots
+                .iter()
+                .map(|h| h.path.clone())
+                .collect::<Vec<_>>()
+        );
+        // Its reported churn is a real zero, not fabricated.
+        let stable = output
+            .hotspots
+            .iter()
+            .find(|h| h.path == "stable.py")
+            .unwrap();
+        assert_eq!(stable.churn.commit_count, 0);
+
+        // min_churn = 2: churn gates again; the zero-churn file is correctly
+        // excluded, so the fix didn't loosen the normal churn-gated path.
+        let gated = compute_hotspots(dir.path(), &conn, &config, 10, "1 year", 2, false);
+        assert!(gated.git_available);
+        assert!(
+            !gated.hotspots.iter().any(|h| h.path == "stable.py"),
+            "min_churn=2 must still exclude the zero-churn file"
+        );
+        assert!(gated.hotspots.iter().any(|h| h.path == "hot.py"));
     }
 
     #[test]

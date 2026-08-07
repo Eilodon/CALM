@@ -2,8 +2,10 @@
 title: "Architecture-audit findings — recovery + open-work execution plan"
 date: 2026-08-07
 status: "RESEARCH COMPLETE, execution not started. Headline finding (see §0): the literal
-  '15 remaining findings' from the 28-finding architecture audit are UNRECOVERABLE as a
-  list — they exist nowhere in the repo. This plan therefore reframes the task from
+  '15 remaining findings' were UNRECOVERABLE *from the repo* — no doc, issue, or deleted
+  file — but were RECOVERED out-of-band from the audit session (2026-08-07) and folded in
+  as §7. 'Not in version control' is not the same as 'gone' — which is exactly the
+  fragility §3 exists to fix. This plan therefore reframes the task from
   'finish the remaining findings' to 'recover what is recoverable + stop the knowledge
   loss from recurring', and gives a concrete, prioritized execution sequence for both."
 scope: >
@@ -27,7 +29,12 @@ verified_against: HEAD (af37455, branch claude/memory-docs-spec-review-iw7s4t), 
 
 # Architecture-audit findings — recovery + open-work execution plan
 
-## §0. Headline finding: the "remaining findings" are unrecoverable as a list
+## §0. Headline finding: the "remaining findings" are unrecoverable *from the repo*
+
+> **Update 2026-08-07 (see §7):** the findings were recovered out-of-band from the audit
+> session and folded in below. §0's reasoning stands for the *repo* — they were in no doc,
+> issue, or deleted file — but they were not gone: they survived in one session's context.
+> That is the fragility §3 addresses, demonstrated live.
 
 Commit `da3c14f` ("close 13 real bugs from the architecture audit") is the **only**
 surviving trace of a *"line-by-line verification of a 28-finding external audit against
@@ -171,8 +178,67 @@ Ordered by (leverage ÷ effort), each item independently shippable:
 
 ## §6. What this plan deliberately does NOT do
 
-- It does **not** enumerate 15 specific "remaining findings." They are unrecoverable
-  (§0); inventing them would be fabrication.
+- It does **not** *fabricate* the 15 findings. They were unrecoverable from the repo when
+  this plan was first written (§0); they were later supplied from the audit session and
+  recorded verbatim in §7 rather than invented.
 - It does **not** open GitHub issues or write code — those are execution steps (§5),
   gated on maintainer go-ahead, and the issue-creation ones are outward-facing.
 - It does **not** re-run the full audit blind (§4 explains why that is the wrong shape).
+
+## §7. Recovered findings (folded in 2026-08-07 — from the audit session, not the repo)
+
+§0 concluded the 15 non-fixed findings were "unrecoverable." Correction: they were
+unrecoverable *from the repo* (no doc, issue, or deleted file — all verified), but the
+auditor still held them in the originating session and supplied them on 2026-08-07. "Not
+in version control" is not "gone" — and that gap is exactly what §3 exists to close. They
+are recorded below as the durable artifact the audit should have produced (executing §3).
+Dispositions are the auditor's; two verifiable items were independently confirmed and
+fixed this session (marked ▶).
+
+### Cat 1 — Deliberate trade-offs (self-disclosed; fixing breaks a design decision)
+| ID | Finding | Recorded in |
+|---|---|---|
+| 6.2 | `dependencies` follows a glob re-export exactly 1 hop (A→B→C not traversed); commented as intentional | — |
+| 9.2 | HTTP has a resource floor (16 MiB body, 64 concurrent, bearer), not a real DoS policy; docs say front with a reverse proxy | §1 L5 |
+| 10.2 | path-component-swap TOCTOU (canonicalize↔write race) is outside the current threat model; noted in code | — |
+| 10.3 | `verify_change` = `cargo check` only, single-lang, opt-in, unsandboxed; multi-lang needs an exec-policy abstraction first | §1 L4 |
+| 10.4 | No true multi-file change-set transaction; `batch_status` is observability only | §1 L2 |
+| 10.5 | `reason` default is lexical substring (gameable); `cites` is the exact-match opt-out; full deprecation is breaking | §1 L3 |
+| 12.1 | Indexing-DoS mitigation partial: 8 MiB/file + 5 s parse timeout; no AST-node budget or `.calm/` disk quota | §1 L6 |
+
+### Cat 2 — Needs a large redesign, not a fix (deliberately untouched)
+| ID | Finding |
+|---|---|
+| 4.1 | `formal_source` authority (Stack Graphs vs SCIP vs LSP) treated as equal by graph algos (coreness/hub); audit self-rates this OVERSTATED (formal_source already surfaced with its own etag). Real fix = split scope_resolved / target_exact / proof_generation into a new model |
+| 4.2 | Review token (`edit_context`) binds only the caller-set digest, not the full authority snapshot (graph generation, watcher freshness, provider generation, policy version) — an undefined contract, not a patchable bug. Adjacent to §2.2's write-gate focus, different axis |
+
+### Cat 3 — Meta-tooling / process investment (not a single bug)
+| ID | Finding |
+|---|---|
+| 11.1a ▶ | Stale comments point to a deleted KNOWN_LIMITATIONS section ("share one SQLite file"). CONFIRMED — 2 sites (`conn.rs:40`, `lib.rs:727`), fixed with this addendum |
+| 11.1b | Make KNOWN_LIMITATIONS machine-readable (TOML + `evidence_assertion` CI-checkable) — new system, ≈ §3 |
+| 11.2 | guarantee-catalog (`docs/guarantee-levels.toml`) has format/presence checks but no per-ID contract test (e.g. `guarantee::txn.begin_before_write`) for semantic drift — new test framework |
+
+### Cat 4 — Needs telemetry that doesn't exist yet
+| ID | Finding |
+|---|---|
+| 12.4 | 37-tool surface risks wrong-tool selection; optimizing needs real per-tool usage telemetry — matches the workflow-facade blocker (prior research) |
+| 12.2 | SQLite connection init not consolidated (busy_timeout / WAL / foreign_keys spread across factory + schema bootstrap); unverified whether real or theoretical |
+| 12.3 | Derived metrics (coreness / hotspot risk / dead-code confidence) carry no provenance (graph generation, edge policy version, sample size) |
+
+### Cat 5 — Never verified in the audit (was unknown true/false)
+| ID | Finding |
+|---|---|
+| 7.1 ▶ | Docs say `min_churn=0` surfaces stable complexity debt, but the impl only iterated `churn_map` so zero-churn files never qualified. CONFIRMED A REAL BUG — fixed (impl-fix) with this addendum |
+| 8.1 | quarantine doc contradiction (tool schema vs guarantee catalog on `include_quarantined=false`); semantics fine, wording needs syncing |
+| 7.2 / 7.3 | calibration history short (threshold 0.80 vs observed max ~0.15) + B14 lens framing — "measurement maturity", not a bug |
+
+### Cat 6 — Technical follow-ups flagged outside that batch
+| Finding |
+|---|
+| `indexer/pipeline.rs` is now the largest remaining hotspot (CI `hotspot_risk`) after the common.rs split — own task |
+| `test-calm-nudge.sh` asserts a stale `lib.rs` length (34 vs actual 132 lines); stale fixture, no logic impact |
+
+### Verification results (this session)
+- **7.1 — CONFIRMED, fixed (impl).** `compute_hotspots` (`hotspot.rs`) seeded candidates from `churn_map` when git is available; a zero-churn file is absent from that map, and the `churn × complexity` score would zero it out even if added. Fix: when `min_churn == 0`, seed candidates from the complexity index and rank by complexity alone (mirroring `compute_absolute_hotspot_risk`, which was already correct). Regression test added; `min_churn ≥ 1` behavior unchanged.
+- **11.1a — CONFIRMED, 2 sites (report said 1), fixed.** `conn.rs:40` additionally carried a stale *factual* premise ("share one SQLite file is safe") now that state.db is a separate file. Both comments rewritten to reference the split's rationale in-place. Note: `fitness_report`'s `config_drift` gate reads 0 here because it only catches references to nonexistent *files*, not deleted *sections* within an existing file — this class slips the current gate, which supports 11.1b.

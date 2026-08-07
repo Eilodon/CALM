@@ -723,10 +723,10 @@ pub fn default_db_path(project_root: &std::path::Path) -> PathBuf {
     project_root.join(".calm").join("index.db")
 }
 
-/// Sibling of `default_db_path` for the durable-state split
-/// (`KNOWN_LIMITATIONS.md` "Durable state and the rebuildable index share
-/// one SQLite file at runtime", `docs/plans/2026-08-05-state-db-rewiring-
-/// execution-plan.md`): `project_memory`/`edit_transactions`/`tx_events`/
+/// Sibling of `default_db_path` for the durable-state split (shipped in
+/// 0.6.0 -- see CHANGELOG.md's [0.6.0] entry and
+/// `docs/plans/2026-08-05-state-db-rewiring-execution-plan.md`):
+/// `project_memory`/`edit_transactions`/`tx_events`/
 /// `maintenance_jobs`/`audit_ledger` live here (`db::conn::open_state_writer`,
 /// `PRAGMA synchronous=FULL`), separate from the rebuildable index/call-graph
 /// data in `default_db_path`'s `index.db` (`synchronous=NORMAL`).

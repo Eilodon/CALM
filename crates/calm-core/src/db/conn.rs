@@ -36,9 +36,12 @@ pub fn open_writer(db_path: &Path) -> rusqlite::Result<Connection> {
 /// returning and is durable across a hard crash regardless of what
 /// `synchronous` level any other connection later uses to checkpoint that
 /// WAL frame into the main file -- checkpointing durability and original-
-/// commit durability are independent, so mixing levels across connections
-/// to the same file is safe. See `KNOWN_LIMITATIONS.md` "Durable state and
-/// the rebuildable index share one SQLite file" for the full rationale.
+/// commit durability are independent. That independence is why the
+/// pre-0.6.0 design (durable state and the rebuildable index sharing one
+/// SQLite file at different sync levels) was already safe; since 0.6.0 they
+/// are separate files -- `state.db` here, `index.db` via `open_writer` --
+/// so the question no longer arises. See CHANGELOG.md's [0.6.0] entry and
+/// `docs/plans/2026-08-05-state-db-rewiring-execution-plan.md`.
 pub fn open_state_writer(db_path: &Path) -> rusqlite::Result<Connection> {
     let conn = Connection::open(db_path)?;
     conn.busy_timeout(WRITER_BUSY_TIMEOUT)?;
