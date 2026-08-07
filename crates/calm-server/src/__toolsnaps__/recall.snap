@@ -19,7 +19,7 @@
         ]
       },
       "include_quarantined": {
-        "description": "`false` (default): a note `remember` quarantined (its content\nlooked prompt-injection-shaped) is excluded from results, whether\nfetched by exact `topic`, `query`, or listed by default. Pass\n`true` to deliberately include quarantined notes too -- e.g. to\nreview/clean them up. Every returned note still carries its own\n`content_warning`/`quarantined` fields regardless of this flag, so\nthe caller always knows what it's looking at.",
+        "description": "`false` (default): a note `remember` quarantined (its content\nlooked prompt-injection-shaped) is excluded from the broad recall\npaths -- a `query` FTS search, and a no-args list-all. An exact\n`topic` lookup is a deliberate, targeted ask and always returns the\nnote regardless of this flag (mirroring `edit_context`'s own\nrelated-notes gate). Pass `true` to also include quarantined notes\nin the broad paths -- e.g. to review/clean them up. Every returned\nnote still carries its own `content_warning`/`quarantined` fields\nregardless of this flag, so the caller always knows what it's looking at.",
         "type": "boolean",
         "default": false
       }

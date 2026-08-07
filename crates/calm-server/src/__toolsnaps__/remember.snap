@@ -96,7 +96,7 @@
         ]
       },
       "quarantined": {
-        "description": "`true` iff `content_warning` fired -- this note was still saved (see\nthat field's own comment), but `recall` will exclude it from\ndefault topic/query/list-all results until a caller explicitly\npasses `include_quarantined: true`.",
+        "description": "`true` iff `content_warning` fired -- this note was still saved (see\nthat field's own comment), but `recall` excludes it from its broad\npaths (a `query` FTS search, or a no-args list-all) until a caller\npasses `include_quarantined: true`. An exact-`topic` lookup is a\ndeliberate, targeted ask and always returns it regardless.",
         "type": "boolean"
       },
       "suggested_next": {

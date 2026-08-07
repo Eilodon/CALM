@@ -249,9 +249,21 @@ capture run_hook "Edit" "crates/calm-core/src/never_edit_contexted2.rs"
 echo "$hook_err" | grep -q "tool-discovery step" \
   || fail "expected TOOL_DISCOVERY_HINT in the edit_context deny reason, got: $hook_err"
 
-# 12. Read on a short (<80 line) real indexed source file -> SILENT.
-out=$(run_hook_read_path "$(pwd)/crates/calm-core/src/lib.rs")
-is_silent "$out" || fail "expected silence for a short (34-line) indexed file Read, got: $out"
+# 12. Read on a real indexed source file: the nudge fires iff the file is
+#     "worth a symbol read" (>= 80 lines, READ_WORTH_NUDGE_LINE_THRESHOLD).
+#     Asserted against the file's ACTUAL length so this can't go stale as the
+#     file grows -- the old form hard-coded "34-line lib.rs", which has since
+#     grown past 80 and would now (correctly) nudge, silently breaking this
+#     case (audit Cat-6).
+probe_file="$(pwd)/crates/calm-core/src/lib.rs"
+probe_lines=$(wc -l <"$probe_file" 2>/dev/null || echo 0)
+out=$(run_hook_read_path "$probe_file")
+if [ "${probe_lines:-0}" -lt 80 ]; then
+  is_silent "$out" || fail "expected silence for a short (<80 line) indexed file Read, got: $out"
+else
+  echo "$out" | jq -e '.hookSpecificOutput.additionalContext' >/dev/null 2>&1 \
+    || fail "expected a nudge for a long (>=80 line, ${probe_lines}) indexed file Read, got: $out"
+fi
 
 # 13. Read on a long real indexed source file -> NUDGE.
 out=$(run_hook_read_path "$(pwd)/crates/calm-server/src/tools/edit.rs")

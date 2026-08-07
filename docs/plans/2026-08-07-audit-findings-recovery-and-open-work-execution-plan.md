@@ -223,22 +223,61 @@ fixed this session (marked ▶).
 | ID | Finding |
 |---|---|
 | 12.4 | 37-tool surface risks wrong-tool selection; optimizing needs real per-tool usage telemetry — matches the workflow-facade blocker (prior research) |
-| 12.2 | SQLite connection init not consolidated (busy_timeout / WAL / foreign_keys spread across factory + schema bootstrap); unverified whether real or theoretical |
+| 12.2 ▶ | SQLite connection init "not consolidated". VERIFIED THEORETICAL, not a bug: the spread is correct-by-design — `journal_mode=WAL` is a persistent DB property set once per file at init (`init_db`/`init_state_db`, `schema.rs:458`/`479`, both set it), `synchronous`/`busy_timeout` are per-connection and correctly live in the `open_writer`/`open_state_writer` factories, and `foreign_keys` relies on the bundled-SQLite compile default with an explicit regression test (`conn.rs::writer_connections_enforce_foreign_keys_by_default`). No change made |
 | 12.3 | Derived metrics (coreness / hotspot risk / dead-code confidence) carry no provenance (graph generation, edge policy version, sample size) |
 
 ### Cat 5 — Never verified in the audit (was unknown true/false)
 | ID | Finding |
 |---|---|
 | 7.1 ▶ | Docs say `min_churn=0` surfaces stable complexity debt, but the impl only iterated `churn_map` so zero-churn files never qualified. CONFIRMED A REAL BUG — fixed (impl-fix) with this addendum |
-| 8.1 | quarantine doc contradiction (tool schema vs guarantee catalog on `include_quarantined=false`); semantics fine, wording needs syncing |
+| 8.1 ▶ | quarantine doc contradiction. CONFIRMED this session against the code: `recall`'s exact-`topic` branch (`memory.rs:156-159`) applies NO quarantine filter, so it always returns a quarantined note — matching the guarantee catalog, and contradicting `RecallParams::include_quarantined`'s own doc + the `quarantined` field doc (`memory.rs:323-357`), which wrongly claim an exact `topic` fetch also excludes it. Code is correct; the two `memory.rs` doc comments were wrong. FIXED: both doc comments rewritten (`RecallParams::include_quarantined` + the `quarantined` field) and the `recall`/`remember` toolsnaps regenerated (`UPDATE_TOOLSNAPS=1`). (The CALM MCP had disconnected mid-pass, blocking the `.rs` edit; it reconnected and the fix landed.) |
 | 7.2 / 7.3 | calibration history short (threshold 0.80 vs observed max ~0.15) + B14 lens framing — "measurement maturity", not a bug |
 
 ### Cat 6 — Technical follow-ups flagged outside that batch
 | Finding |
 |---|
 | `indexer/pipeline.rs` is now the largest remaining hotspot (CI `hotspot_risk`) after the common.rs split — own task |
-| `test-calm-nudge.sh` asserts a stale `lib.rs` length (34 vs actual 132 lines); stale fixture, no logic impact |
+| `test-calm-nudge.sh` ▶ asserted a stale `lib.rs` length (34 vs actual 132 lines, now ≥ the 80-line nudge threshold, so its `is_silent` case would fail if run). FIXED: case 12 now asserts against the file's real line count, so it can't go stale as the file grows (non-CI dev test, hence no build impact) |
 
 ### Verification results (this session)
 - **7.1 — CONFIRMED, fixed (impl).** `compute_hotspots` (`hotspot.rs`) seeded candidates from `churn_map` when git is available; a zero-churn file is absent from that map, and the `churn × complexity` score would zero it out even if added. Fix: when `min_churn == 0`, seed candidates from the complexity index and rank by complexity alone (mirroring `compute_absolute_hotspot_risk`, which was already correct). Regression test added; `min_churn ≥ 1` behavior unchanged.
 - **11.1a — CONFIRMED, 2 sites (report said 1), fixed.** `conn.rs:40` additionally carried a stale *factual* premise ("share one SQLite file is safe") now that state.db is a separate file. Both comments rewritten to reference the split's rationale in-place. Note: `fitness_report`'s `config_drift` gate reads 0 here because it only catches references to nonexistent *files*, not deleted *sections* within an existing file — this class slips the current gate, which supports 11.1b.
+
+## §8. Second execution pass (2026-08-07, after the CALM MCP disconnected mid-session)
+
+Triage of every §7 finding into fix-now / issue / no-action, and what actually happened.
+A mid-session CALM MCP disconnect made the edit-gate hook (which requires `edit_context`,
+an MCP tool) hard-block all `.rs` source edits; docs/shell/toml edits stayed available.
+
+**Fixed this session (unblocked):**
+- **7.1, 11.1a** — fixed earlier this session (commit `da56e95`).
+- **test-calm-nudge.sh** (Cat 6) — case 12 now asserts against the file's *real* line count
+  instead of a hard-coded "34-line `lib.rs`" (which had grown to 132, past the 80-line
+  nudge threshold, so `is_silent` would fail if the non-CI dev test were run).
+
+**Verified, no change needed:**
+- **12.2** — SQLite conn-init "not consolidated" is correct-by-design, not a bug (see the
+  §7 Cat-4 row for the evidence). No code touched.
+
+**Confirmed + fixed once the MCP reconnected mid-pass:**
+- **8.1** ([#62](https://github.com/Eilodon/CALM/issues/62), fixed) — the two `memory.rs` doc comments (`RecallParams::include_quarantined` + the `quarantined` field) rewritten to match the code + guarantee catalog; `recall`/`remember` toolsnaps regenerated. Docs-only, no behavior change.
+
+**Filed as an issue (test coverage, not attempted this pass):**
+- **§2.2** → [#63](https://github.com/Eilodon/CALM/issues/63) — write-gate refusal-branch tests.
+
+**Deferred / needs-design / needs-a-watcher → filed as issues:**
+- **§2.1** dogfood shadow-mode promotion → [#64](https://github.com/Eilodon/CALM/issues/64)
+- **4.2** review-token authority-snapshot binding → [#65](https://github.com/Eilodon/CALM/issues/65)
+- **11.2** guarantee-catalog per-ID contract tests → [#66](https://github.com/Eilodon/CALM/issues/66)
+- **Cat 6** `indexer/pipeline.rs` hotspot refactor → [#67](https://github.com/Eilodon/CALM/issues/67)
+
+**Deliberately NOT filed (deliberate trade-off / by-design / measurement maturity —
+recorded in §7; "fixing" would break a design decision):** 6.2 (dependencies 1-hop
+re-export), 9.2/L5 (HTTP resource floor), 10.2 (path TOCTOU), 7.2/7.3 (calibration
+maturity), 4.1 (formal_source weighting — audit self-rated overstated).
+
+**Already in `CONTRIBUTING.md`'s roadmap (captured in §7, not re-filed to avoid duplicating
+the roadmap):** L1 (change-kind risk), L2/10.4 (multi-file txn), L3/10.5 (reason lexical),
+L4/10.3 (sandbox verification), L6/12.1 (indexing-DoS design), L7 (binary rename — product
+decision), 11.1b (machine-readable limitations), 12.3 (metrics provenance), 12.4
+(facade/telemetry).
