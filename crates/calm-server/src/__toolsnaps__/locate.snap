@@ -201,6 +201,13 @@
             "items": {
               "$ref": "#/$defs/EffectOutput"
             }
+          },
+          "content_warning": {
+            "description": "P2 (docs/plans/2026-08-08-derived-artifact-hardening-execution-plan.md):\nset when any `type_relations`/`effects` `target_text`/`to_symbol`\nabove looks injection-shaped -- same trust boundary `source`'s\n`content_warning` covers, applied to syntax-derived facts instead of\na raw file body. Text itself is never mutated.",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [

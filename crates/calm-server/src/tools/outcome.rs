@@ -455,6 +455,7 @@ impl CandidateRow {
             suggested_next: None,
             type_relations: None, // set by symbol_info's handler when populated
             effects: None,
+            content_warning: None, // set by symbol_info's handler when populated
         }
     }
 

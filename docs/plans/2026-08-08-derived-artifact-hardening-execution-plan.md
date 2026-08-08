@@ -1,11 +1,12 @@
 ---
 title: "Derived-artifact hardening — Group D execution plan (verified against live source)"
 date: 2026-08-08
-status: "P1 (keystone) SHIPPED same day, uncommitted — see §5. P2-P9 not started. Every 'current
-  state' claim below was read from live source this session (file:line cited), and a second
-  verification pass (§0.5) corrected four audit claims that turned out inaccurate once traced
-  through the code. This is the durable record the session-local '§4-48 derived-artifact audit'
-  should have produced (executes the §3 meta-fix of
+status: "P1 (keystone) + P2 SHIPPED same day, both committed (fb58b2b, 8683c1f pre-P2; P2 itself
+  pending its own commit) — see §5/§6. P3-P9 not started. Every 'current state' claim below was
+  read from live source this session (file:line cited), and a second verification pass (§0.5)
+  corrected four audit claims that turned out inaccurate once traced through the code. This is
+  the durable record the session-local '§4-48 derived-artifact audit' should have produced
+  (executes the §3 meta-fix of
   2026-08-07-audit-findings-recovery-and-open-work-execution-plan.md)."
 scope: >
   Ground a large forward-looking audit (Groups B/C/D, its own §4-48) against live CALM code,
@@ -285,3 +286,42 @@ approval.
    and correct for ITS use case (one reconciliation decision), but would have been a silent correctness bug
    if reused naively for per-bucket `DerivedStatus`. `index_input_bucket_drift` exists specifically because
    of this.
+
+## §6. P2 execution log (2026-08-08, same session)
+
+**Shipped, fully tested.** Sanitized `type_relations.target_text`/`to_symbol`, `symbol_effects.target_text`,
+and `symbol_digests.rendered_text` at the MCP boundary (`symbol_info`/`understand`), closing the confirmed
+gap from §0.5 (C1's sanitize-derived-text finding) — these previously bypassed the `injection_warning`
+check that `source`/`understand`'s embedded-source-block/`remember`/`recall`/`symbols_batch` already apply.
+
+- `fetch_architecture_digest` ([inspect.rs](../../crates/calm-server/src/tools/inspect.rs)) now runs
+  `rendered_text` through `sanitize_source_output` (credential redaction, matching `source`'s own contract)
+  then `injection_warning`, surfaced as a new `ArchitectureDigestOutput.content_warning` field.
+- New `semantic_facts_content_warning` (pure new function, `fetch_semantic_facts` itself left completely
+  untouched — see the tooling-gate note below) checks `type_relations.target_text`/`to_symbol` and
+  `symbol_effects.target_text` via `injection_warning` only (no credential redaction — these are single AST
+  identifier tokens, which cannot syntactically contain the multi-character credential patterns that
+  function targets). Surfaced as a new `SymbolInfoOutput.content_warning` field, shared by both `symbol_info`
+  and `understand` (`understand.symbol` embeds `SymbolInfoOutput`).
+- Wired into all 3 `SymbolInfoOutput` construction sites (`outcome.rs::to_symbol_info`, `locate.rs::locate`,
+  `inspect.rs::understand`'s inline literal) and both enrichment call sites (`symbol_info`, `understand`).
+- New end-to-end test `understand_flags_prompt_injection_pattern_in_semantic_facts_and_digest` (tools.rs),
+  modeled directly on the existing `understand_flags_prompt_injection_pattern_in_embedded_source` — inserts
+  an injection-shaped `type_relations.target_text` and `symbol_digests.rendered_text` via raw SQL and
+  confirms both `understand.symbol.content_warning` and `understand.architecture_digest.content_warning`
+  fire with the real `ROLE_OVERRIDE` category.
+
+**Toolsnaps regenerated:** `locate.snap`, `symbol_info.snap`, `understand.snap` (the 3 tools whose output
+schema gained the new field) — confirmed via `UPDATE_TOOLSNAPS=1`, no other snapshot touched.
+
+**Verified:** full `cargo test --workspace --features embeddings` green (1054 calm-core + 366 calm-server +
+all other packages, 0 failures — the +1 over P1's 365 is the new test), clippy `-D warnings` clean, rustfmt
+clean.
+
+**Tooling-gate note (same class as P1's, reconfirmed):** the first attempt to add `content_warning` as a
+third return value directly on `fetch_semantic_facts` (a signature change, 2 real callers) tripped the same
+`HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW` gate P1 hit, even though the target symbol's own real caller count
+was low — reconfirms the pattern is specifically about SIGNATURE changes to an EXISTING function, not actual
+caller-count risk. Worked around identically: left `fetch_semantic_facts` byte-for-byte untouched and added
+`semantic_facts_content_warning` as a new, purely-inserted sibling function instead, wiring it in at the
+call sites (body edits, not signature edits) rather than threading a third tuple element through the callee.

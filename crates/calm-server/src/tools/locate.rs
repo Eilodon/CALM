@@ -365,6 +365,7 @@ impl CalmServer {
                                     suggested_next: None,
                                     type_relations: None,
                                     effects: None,
+                                    content_warning: None,
                                 })
                             },
                         )

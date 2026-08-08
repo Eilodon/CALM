@@ -307,6 +307,13 @@ pub(crate) struct SymbolInfoOutput {
     /// `type_relations` above.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) effects: Option<Vec<EffectOutput>>,
+    /// P2 (docs/plans/2026-08-08-derived-artifact-hardening-execution-plan.md):
+    /// set when any `type_relations`/`effects` `target_text`/`to_symbol`
+    /// above looks injection-shaped -- same trust boundary `source`'s
+    /// `content_warning` covers, applied to syntax-derived facts instead of
+    /// a raw file body. Text itself is never mutated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) content_warning: Option<String>,
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -344,6 +351,14 @@ pub(crate) struct ArchitectureDigestOutput {
     /// `rendered_text` is a real subset, not the full picture, for a very
     /// high-fan-out symbol.
     pub(crate) truncated: bool,
+    /// P2 (docs/plans/2026-08-08-derived-artifact-hardening-execution-plan.md):
+    /// set when `rendered_text` (after credential redaction) looks
+    /// injection-shaped -- same trust boundary `source`'s `content_warning`
+    /// covers for a raw file body, applied here since `rendered_text`
+    /// aggregates callee/type/effect identifiers from across the graph and
+    /// is presented as CALM's own analysis, not obviously untrusted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) content_warning: Option<String>,
 }
 
 #[derive(Serialize, JsonSchema)]

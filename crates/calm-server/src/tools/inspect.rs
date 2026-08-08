@@ -58,6 +58,30 @@ fn fetch_semantic_facts(
     )
 }
 
+/// P2 (docs/plans/2026-08-08-derived-artifact-hardening-execution-plan.md):
+/// `target_text`/`to_symbol` are extracted straight from repo syntax (a
+/// base-class name, an exception type, a written field) and surfaced by
+/// `symbol_info`/`understand` as CALM's own analysis, exactly the same
+/// trust boundary `source`'s `content_warning` already covers for raw file
+/// bodies. No `sanitize_source_output` redaction here (unlike `source`/
+/// `fetch_architecture_digest`): these are single AST identifier/type-
+/// reference tokens, which cannot syntactically contain the multi-character
+/// credential patterns that function redacts -- only injection-shaped
+/// PROSE is a real risk for this data shape. A separate function from
+/// `fetch_semantic_facts` (rather than a third return value there) so
+/// callers that already have the fetched `Vec`s in hand can reuse this
+/// without a second DB round trip.
+fn semantic_facts_content_warning(
+    type_relations: &[TypeRelationOutput],
+    effects: &[EffectOutput],
+) -> Option<String> {
+    type_relations
+        .iter()
+        .flat_map(|t| std::iter::once(t.target_text.as_str()).chain(t.to_symbol.as_deref()))
+        .chain(effects.iter().map(|e| e.target_text.as_str()))
+        .find_map(injection_warning)
+}
+
 /// Tier 2 semantic fact (2026-08-07 roadmap T2): fetches the Architecture
 /// Digest for one symbol. `None` when no row exists (this symbol's kind
 /// isn't digestable, or no graph rebuild has run yet since it was added --
@@ -71,15 +95,25 @@ fn fetch_architecture_digest(
     conn.query_row(
         "SELECT rendered_text, recursive_component, truncated FROM symbol_digests WHERE symbol_qn = ?1",
         [qualified_name],
-        |r| {
-            Ok(ArchitectureDigestOutput {
-                rendered_text: r.get(0)?,
-                recursive_component: r.get::<_, i64>(1)? != 0,
-                truncated: r.get::<_, i64>(2)? != 0,
-            })
-        },
+        |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? != 0, r.get::<_, i64>(2)? != 0)),
     )
     .ok()
+    .map(|(raw_text, recursive_component, truncated)| {
+        // P2 (docs/plans/2026-08-08-derived-artifact-hardening-execution-plan.md):
+        // `rendered_text` aggregates callee/type/effect identifiers from
+        // across the graph and is presented by `understand` as CALM's own
+        // analysis -- sanitize + injection-detect it the same way `source`
+        // does its raw body (`inspect.rs::source`), rather than trusting it
+        // implicitly just because it's synthesized, not a direct file read.
+        let sanitized = sanitize_source_output(&raw_text);
+        let content_warning = injection_warning(&sanitized);
+        ArchitectureDigestOutput {
+            rendered_text: sanitized,
+            recursive_component,
+            truncated,
+            content_warning,
+        }
+    })
 }
 
 /// `(other_symbol, batch_symbol, other_path, edge_confidence, edge_kind,
@@ -146,6 +180,10 @@ impl CalmServer {
                     // soft (empty, not an error) on any query problem --
                     // this enrichment must never break the whole tool.
                     let (type_relations, effects) = fetch_semantic_facts(&conn, &c.qualified_name);
+                    out.content_warning = semantic_facts_content_warning(
+                        type_relations.as_deref().unwrap_or_default(),
+                        effects.as_deref().unwrap_or_default(),
+                    );
                     out.type_relations = type_relations;
                     out.effects = effects;
 
@@ -479,6 +517,7 @@ impl CalmServer {
                                     suggested_next: None,
                                     type_relations: None,
                                     effects: None,
+                                    content_warning: None,
                                 },
                                 row.get::<_, String>(10).unwrap_or_default(),
                             ))
@@ -493,6 +532,10 @@ impl CalmServer {
             // one row-mapping call is still in flight.
             if let Some((info, _)) = symbol_info.as_mut() {
                 let (tr, ef) = fetch_semantic_facts(&conn, &info.qualified_name);
+                info.content_warning = semantic_facts_content_warning(
+                    tr.as_deref().unwrap_or_default(),
+                    ef.as_deref().unwrap_or_default(),
+                );
                 info.type_relations = tr;
                 info.effects = ef;
             }
