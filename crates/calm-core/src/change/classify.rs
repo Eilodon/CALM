@@ -62,6 +62,45 @@ pub enum ChangeKind {
     Body,
 }
 
+impl ChangeKind {
+    /// Stable lowercase name -- the exact string persisted in
+    /// `change_intents.kind` (CCK-07) and safe to round-trip through
+    /// [`ChangeKind::parse`].
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Add => "add",
+            Self::Delete => "delete",
+            Self::Whitespace => "whitespace",
+            Self::Comment => "comment",
+            Self::DocOnly => "doc_only",
+            Self::Visibility => "visibility",
+            Self::Signature => "signature",
+            Self::Manifest => "manifest",
+            Self::TestOnly => "test_only",
+            Self::Body => "body",
+        }
+    }
+
+    /// Inverse of [`as_str`](Self::as_str); `None` for anything else --
+    /// same "loud unknown, never a silent guess" posture as
+    /// `policy::model::RiskLevel::parse`.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "add" => Some(Self::Add),
+            "delete" => Some(Self::Delete),
+            "whitespace" => Some(Self::Whitespace),
+            "comment" => Some(Self::Comment),
+            "doc_only" => Some(Self::DocOnly),
+            "visibility" => Some(Self::Visibility),
+            "signature" => Some(Self::Signature),
+            "manifest" => Some(Self::Manifest),
+            "test_only" => Some(Self::TestOnly),
+            "body" => Some(Self::Body),
+            _ => None,
+        }
+    }
+}
+
 /// What a caller *declared* they were about to do. Distinct type from
 /// [`ObservedChangeKind`] so the two can never be compared to themselves by
 /// accident -- only [`kinds_mismatch`] compares them, deliberately.
@@ -398,5 +437,30 @@ mod tests {
         let a = classify("a.rs", "rust", Some(old), Some(new));
         let b = classify("a.rs", "rust", Some(old), Some(new));
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn every_change_kind_round_trips_through_as_str_and_parse() {
+        let all = [
+            ChangeKind::Add,
+            ChangeKind::Delete,
+            ChangeKind::Whitespace,
+            ChangeKind::Comment,
+            ChangeKind::DocOnly,
+            ChangeKind::Visibility,
+            ChangeKind::Signature,
+            ChangeKind::Manifest,
+            ChangeKind::TestOnly,
+            ChangeKind::Body,
+        ];
+        for kind in all {
+            assert_eq!(ChangeKind::parse(kind.as_str()), Some(kind));
+        }
+    }
+
+    #[test]
+    fn change_kind_parse_rejects_unknown_strings() {
+        assert_eq!(ChangeKind::parse("not_a_real_kind"), None);
+        assert_eq!(ChangeKind::parse(""), None);
     }
 }

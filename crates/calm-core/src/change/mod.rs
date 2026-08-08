@@ -1,15 +1,19 @@
-//! Change classification for the Master Change-Control Kernel
-//! (docs/plans/2026-08-08-master-change-control-execution-blueprint.md,
-//! CCK-08). `classify` builds the `ObservedChangeKind` half of that PR;
-//! `ChangeIntentKind` is the *declared* half a future caller states up
-//! front (CCK-11's `plan_change`, once CCK-07 gives it somewhere to
-//! persist that declaration) -- both wrap the same [`ChangeKind`] variant
-//! set so they can never silently drift apart, but stay distinct Rust
-//! types so a caller can't compare "what was declared" to itself and call
-//! it a check.
+//! Change intent and classification for the Master Change-Control Kernel
+//! (docs/plans/2026-08-08-master-change-control-execution-blueprint.md).
+//! `classify` (CCK-08) builds the `ObservedChangeKind` half; `intent` +
+//! `store` (CCK-07) are the *declared* half plus its persistence, once
+//! `db::state_migrations`'s v1->v2 step gives it somewhere to live.
+//! `ChangeIntentKind` and `ObservedChangeKind` wrap the same [`ChangeKind`]
+//! variant set so they can never silently drift apart, but stay distinct
+//! Rust types so a caller can't compare "what was declared" to itself and
+//! call it a check.
 
 pub mod classify;
+pub mod intent;
+pub mod store;
 
 pub use classify::{
     kinds_mismatch, ChangeIntentKind, ChangeKind, ObservedChangeInput, ObservedChangeKind,
 };
+pub use intent::{ChangeIntent, ChangeIntentTarget};
+pub use store::{get_change_intent, insert_change_intent};

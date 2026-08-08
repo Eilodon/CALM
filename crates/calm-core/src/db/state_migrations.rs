@@ -29,14 +29,45 @@ pub struct StateMigration {
     pub apply: fn(&Connection) -> rusqlite::Result<()>,
 }
 
-/// Registered migrations, in ascending `from` order. Empty today:
-/// `STATE_DB_SCHEMA_VERSION` is still 1 (CCK-07's v1->v2 bump is the first
-/// real entry), and unlike `index.db`, state.db has no v0->v1 ALTER step to
-/// express here -- `init_state_db`'s idempotent `CREATE TABLE IF NOT
-/// EXISTS` DDL already brings a fresh or unstamped (`user_version == 0`)
-/// file to v1 shape on its own. This registry exists so CCK-07 only has to
-/// add an entry, not build the executor.
-pub const STATE_MIGRATIONS: &[StateMigration] = &[];
+/// Registered migrations, in ascending `from` order.
+pub const STATE_MIGRATIONS: &[StateMigration] = &[StateMigration {
+    from: 1,
+    to: 2,
+    name: "v2_evidence_snapshots_and_change_intents",
+    apply: v1_to_v2_evidence_snapshots_and_change_intents,
+}];
+
+/// v1->v2 (CCK-07): adds `evidence_snapshots`, `change_intents`,
+/// `change_intent_targets`. Unlike `index.db`'s ALTER-style steps, state.db
+/// has no incremental-DDL story of its own (see `init_state_db`'s doc
+/// comment) -- `STATE_SCHEMA_SQL`'s `CREATE TABLE IF NOT EXISTS` statements
+/// already create these tables on every startup, fresh or not, and
+/// `init_state_db_versioned` always runs `init_state_db` *before* this
+/// executor. So by the time this `apply` runs, the tables already exist;
+/// its only real job is the postcondition check CCK-01's contract asks
+/// for -- confirming that assumption instead of silently trusting it, so a
+/// future `STATE_SCHEMA_SQL` edit that accidentally drops one of these
+/// `CREATE TABLE` statements fails loudly here instead of only surfacing
+/// as a confusing "no such table" much later, at first real use.
+fn v1_to_v2_evidence_snapshots_and_change_intents(conn: &Connection) -> rusqlite::Result<()> {
+    for table in ["evidence_snapshots", "change_intents", "change_intent_targets"] {
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+            [table],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            return Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+                Some(format!(
+                    "state.db v1->v2 migration postcondition failed: table {table:?} does not \
+                     exist -- STATE_SCHEMA_SQL should have created it before this step ran"
+                )),
+            ));
+        }
+    }
+    Ok(())
+}
 
 /// A DB stamped 0 (created before `b677a9e`'s downgrade guard existed, or
 /// never opened by a versioned entry point) and one stamped 1 (the only
@@ -222,5 +253,31 @@ mod tests {
         // return Ok(()) while leaving the file two versions behind.
         let migrations: [StateMigration; 0] = [];
         let _ = run_migrations_from(&conn, &migrations, 3);
+    }
+
+    #[test]
+    fn registered_v1_to_v2_migration_creates_the_new_tables_and_stamps_version() {
+        let conn = fresh_conn();
+        conn.pragma_update(None, "user_version", 1).unwrap();
+        migrate_state_db_to_current(&conn).unwrap();
+        assert_eq!(user_version(&conn), super::super::schema::STATE_DB_SCHEMA_VERSION);
+        for table in ["evidence_snapshots", "change_intents", "change_intent_targets"] {
+            let exists: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                    [table],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(exists, "{table} should exist after migrating to current");
+        }
+    }
+
+    #[test]
+    fn unstamped_zero_version_db_reaches_current_via_the_real_registered_migration() {
+        let conn = fresh_conn();
+        assert_eq!(user_version(&conn), 0);
+        migrate_state_db_to_current(&conn).unwrap();
+        assert_eq!(user_version(&conn), super::super::schema::STATE_DB_SCHEMA_VERSION);
     }
 }

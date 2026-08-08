@@ -21,7 +21,10 @@
 // instead: calm-cli `index`/`fitness-check`, calm-server `new_with_preset`
 // (the `calm serve`/daemon bootstrap) and `doctor`.
 pub const INDEX_DB_SCHEMA_VERSION: i64 = 1;
-pub const STATE_DB_SCHEMA_VERSION: i64 = 1;
+// v2 (CCK-07, docs/plans/2026-08-08-master-change-control-execution-blueprint.md):
+// adds evidence_snapshots/change_intents/change_intent_targets. See
+// db/state_migrations.rs's registered v1->v2 step.
+pub const STATE_DB_SCHEMA_VERSION: i64 = 2;
 
 /// Refuses to proceed if `conn`'s stamped `PRAGMA user_version` is HIGHER
 /// than `expected` -- meaning a newer CALM binary already created or
@@ -529,7 +532,48 @@ CREATE TABLE IF NOT EXISTS audit_ledger (
     ts           REAL NOT NULL,
     actor        TEXT NOT NULL,
     payload      TEXT NOT NULL
-);";
+);
+
+-- v2 / CCK-07 (docs/plans/2026-08-08-master-change-control-execution-blueprint.md):
+-- persisted form of authority::snapshot::EvidenceSnapshot (CCK-06), which until
+-- now was compute-only. snapshot_id is that struct's own content-addressed
+-- SNP-sha256 id, so re-persisting an identical snapshot is a harmless
+-- INSERT OR IGNORE, not a duplicate/conflict.
+CREATE TABLE IF NOT EXISTS evidence_snapshots (
+    snapshot_id            TEXT PRIMARY KEY,
+    source_catalog_digest  TEXT NOT NULL,
+    graph_generation       INTEGER NOT NULL,
+    freshness_class        TEXT NOT NULL,
+    created_at             REAL NOT NULL
+);
+
+-- v2 / CCK-07: a declared ChangeIntent (change::intent::ChangeIntent) --
+-- what a caller says it is about to do, bound to the EvidenceSnapshot in
+-- effect when it was declared. `kind` is a change::classify::ChangeKind variant
+-- name (the DECLARED half; change::classify::classify_observed_change
+-- produces the OBSERVED half from the real diff, never persisted here --
+-- cheap to recompute, and persisting it would invite the two to drift).
+CREATE TABLE IF NOT EXISTS change_intents (
+    intent_id     TEXT PRIMARY KEY,
+    kind          TEXT NOT NULL,
+    reason        TEXT NOT NULL,
+    snapshot_id   TEXT NOT NULL REFERENCES evidence_snapshots(snapshot_id),
+    created_at    REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_change_intents_snapshot ON change_intents(snapshot_id);
+
+-- v2 / CCK-07: the file(s) (optionally symbol-scoped) one change_intents row
+-- declares as its target. One-to-many so a single intent can already span
+-- multiple files ahead of Phase 2 (multi-file ChangeSet) actually landing --
+-- the shape is useful the moment CCK-11's plan_change tool exists, not just
+-- once ChangeSet does.
+CREATE TABLE IF NOT EXISTS change_intent_targets (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    intent_id      TEXT NOT NULL REFERENCES change_intents(intent_id) ON DELETE CASCADE,
+    path           TEXT NOT NULL,
+    qualified_name TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_change_intent_targets_intent ON change_intent_targets(intent_id);";
 
 const FTS5_SQL: &str = "
 CREATE VIRTUAL TABLE IF NOT EXISTS fts_exact USING fts5(

@@ -1,10 +1,11 @@
 //! `EvidenceSnapshot` -- CCK-06
 //! (docs/plans/2026-08-08-master-change-control-execution-blueprint.md).
-//! Compute-only for now: no persistence (CCK-07 adds the
-//! `evidence_snapshots` table). A canonical, content-addressed summary of
-//! "what the index currently believes is true" at the moment authority is
-//! about to be minted -- source content plus the non-source inputs that can
-//! change resolution/graph semantics without any source byte changing.
+//! A canonical, content-addressed summary of "what the index currently
+//! believes is true" at the moment authority is about to be minted --
+//! source content plus the non-source inputs that can change
+//! resolution/graph semantics without any source byte changing.
+//! [`EvidenceSnapshot::persist`]/[`EvidenceSnapshot::load`] (CCK-07) are
+//! the only durable part; everything else here is pure computation.
 //!
 //! **Adjustment (blueprint's own note on this PR):** reconciliation
 //! plumbing already exists -- `index_input_drift` (`indexer::refresh`)
@@ -20,7 +21,7 @@
 //! duplicate of the same two paths, not a shared dependency, so this module
 //! never needs `indexer::refresh` to widen visibility on its behalf.
 
-use rusqlite::Connection;
+use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 
 use crate::digest::evidence_digest;
@@ -59,6 +60,26 @@ impl FreshnessClass {
     pub fn is_safe_for_high_risk_authority(self) -> bool {
         matches!(self, Self::Reconciled | Self::Current)
     }
+
+    /// Stable lowercase name persisted in `evidence_snapshots.freshness_class`
+    /// -- round-trips through [`FreshnessClass::parse`].
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Reconciled => "reconciled",
+            Self::Current => "current",
+            Self::Degraded => "degraded",
+        }
+    }
+
+    /// Inverse of [`as_str`](Self::as_str); `None` for anything else.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "reconciled" => Some(Self::Reconciled),
+            "current" => Some(Self::Current),
+            "degraded" => Some(Self::Degraded),
+            _ => None,
+        }
+    }
 }
 
 fn drift_to_freshness(drift: IndexInputDrift) -> FreshnessClass {
@@ -71,8 +92,6 @@ fn drift_to_freshness(drift: IndexInputDrift) -> FreshnessClass {
 }
 
 /// A canonical, content-addressed summary of index state at one moment.
-/// Compute-only: constructing one performs no writes and this struct is not
-/// yet persisted anywhere (CCK-07).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EvidenceSnapshot {
     /// `"SNP-sha256:<hex>"` over every field below plus the graph/package
@@ -132,6 +151,61 @@ impl EvidenceSnapshot {
 
         Ok(Self { snapshot_id, source_catalog_digest, graph_generation, freshness_class })
     }
+
+    /// Persists this snapshot into `evidence_snapshots` (CCK-07,
+    /// `db::state_migrations`'s v1->v2 step) -- `state_conn` is a
+    /// **state.db** connection, distinct from the `conn` (index.db)
+    /// `compute`/`build` read from. `snapshot_id` is content-addressed, so
+    /// re-persisting an identical snapshot is a harmless `INSERT OR
+    /// IGNORE`, not a duplicate/conflict; `created_at` reflects the first
+    /// time this exact snapshot was ever persisted, not this call.
+    pub fn persist(&self, state_conn: &Connection) -> rusqlite::Result<()> {
+        state_conn.execute(
+            "INSERT OR IGNORE INTO evidence_snapshots \
+             (snapshot_id, source_catalog_digest, graph_generation, freshness_class, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                self.snapshot_id,
+                self.source_catalog_digest,
+                self.graph_generation,
+                self.freshness_class.as_str(),
+                now_epoch_secs(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// `Ok(None)` when no row matches. `state_conn` is a state.db
+    /// connection, same as [`persist`](Self::persist).
+    pub fn load(state_conn: &Connection, snapshot_id: &str) -> rusqlite::Result<Option<Self>> {
+        let row: Option<(String, String, i64, String)> = state_conn
+            .query_row(
+                "SELECT snapshot_id, source_catalog_digest, graph_generation, freshness_class \
+                 FROM evidence_snapshots WHERE snapshot_id = ?1",
+                params![snapshot_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        let Some((snapshot_id, source_catalog_digest, graph_generation, freshness_str)) = row else {
+            return Ok(None);
+        };
+        let freshness_class = FreshnessClass::parse(&freshness_str).ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Text,
+                format!("evidence_snapshots.freshness_class {freshness_str:?} is not a known FreshnessClass")
+                    .into(),
+            )
+        })?;
+        Ok(Some(Self { snapshot_id, source_catalog_digest, graph_generation, freshness_class }))
+    }
+}
+
+fn now_epoch_secs() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
 }
 
 /// `evidence_digest` over every `(path, hash)` row in `file_index`, sorted
@@ -201,6 +275,13 @@ mod tests {
 
     fn tmp_project() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
+    }
+
+    fn state_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_state_db(&conn).unwrap();
+        crate::db::state_migrations::migrate_state_db_to_current(&conn).unwrap();
+        conn
     }
 
     #[test]
@@ -292,5 +373,51 @@ mod tests {
         assert!(!FreshnessClass::Degraded.is_safe_for_high_risk_authority());
         assert!(FreshnessClass::Current.is_safe_for_high_risk_authority());
         assert!(FreshnessClass::Reconciled.is_safe_for_high_risk_authority());
+    }
+
+    #[test]
+    fn freshness_class_round_trips_through_as_str_and_parse() {
+        for class in [FreshnessClass::Reconciled, FreshnessClass::Current, FreshnessClass::Degraded] {
+            assert_eq!(FreshnessClass::parse(class.as_str()), Some(class));
+        }
+        assert_eq!(FreshnessClass::parse("not_a_real_class"), None);
+    }
+
+    #[test]
+    fn persist_then_load_round_trips_a_snapshot() {
+        let index_conn = conn_with_file_index(&[("a.rs", "h1")]);
+        let root = tmp_project();
+        let snapshot = EvidenceSnapshot::compute(&index_conn, root.path()).unwrap();
+
+        let state = state_conn();
+        snapshot.persist(&state).unwrap();
+        let loaded = EvidenceSnapshot::load(&state, &snapshot.snapshot_id).unwrap().unwrap();
+        assert_eq!(loaded, snapshot);
+    }
+
+    #[test]
+    fn persisting_the_same_snapshot_twice_is_a_harmless_no_op() {
+        let index_conn = conn_with_file_index(&[("a.rs", "h1")]);
+        let root = tmp_project();
+        let snapshot = EvidenceSnapshot::compute(&index_conn, root.path()).unwrap();
+
+        let state = state_conn();
+        snapshot.persist(&state).unwrap();
+        snapshot.persist(&state).unwrap(); // must not error (INSERT OR IGNORE)
+
+        let count: i64 = state
+            .query_row(
+                "SELECT COUNT(*) FROM evidence_snapshots WHERE snapshot_id = ?1",
+                params![snapshot.snapshot_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn load_returns_none_for_an_unknown_snapshot_id() {
+        let state = state_conn();
+        assert_eq!(EvidenceSnapshot::load(&state, "SNP-does-not-exist").unwrap(), None);
     }
 }
