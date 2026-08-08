@@ -394,11 +394,24 @@ impl CalmServer {
             // when the real caller set drifted since this review, not just
             // whether the call-count freshness window expired.
             let caller_set_digest = Self::caller_set_digest(&caller_qns_full);
+            // PR D (issue #65, docs/plans/2026-08-08-derived-artifact-
+            // hardening-execution-plan.md): graph_generation at review time
+            // -- see EditContextReview::graph_generation's doc comment for
+            // why this is now load-bearing (STALE_GRAPH_AUTHORITY in
+            // edit.rs), not just diagnostic metadata.
+            let graph_generation: i64 = conn
+                .query_row(
+                    "SELECT generation FROM graph_generation_state WHERE id = 1",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
             self.record_edit_context_review(
                 &c.qualified_name,
                 &caller_qns_full,
                 risk.as_ref().map(|r| r.level.as_str()).unwrap_or("unknown"),
                 caller_set_digest,
+                graph_generation,
             );
             self.note_reviewing(&c.qualified_name);
             let trend = calm_core::fitness::compute_trend(

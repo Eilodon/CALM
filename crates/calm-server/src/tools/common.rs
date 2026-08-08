@@ -454,6 +454,7 @@ impl CalmServer {
         caller_qns: &[String],
         risk_level: &str,
         caller_set_digest: String,
+        graph_generation: i64,
     ) {
         if let Ok(mut log) = self.session_log.lock() {
             let at = log.tool_calls;
@@ -464,6 +465,7 @@ impl CalmServer {
                     caller_qns: caller_qns.iter().take(5).cloned().collect(),
                     risk_level: risk_level.to_string(),
                     caller_set_digest,
+                    graph_generation,
                 },
             );
         }

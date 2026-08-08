@@ -172,6 +172,21 @@ pub(crate) struct EditContextReview {
     /// unrelated incremental edit silently changed who actually calls this
     /// symbol (`FRESHNESS_WINDOW_CALLS` alone can't see that).
     caller_set_digest: String,
+    /// PR D (issue #65, docs/plans/2026-08-08-derived-artifact-hardening-
+    /// execution-plan.md): `graph_generation_state.generation` at review
+    /// time. 2026-08-02's WS-2 design (`ws2-review-token-execution-plan.md`
+    /// F1) deliberately kept this diagnostic-only because `incremental_
+    /// graph_update`'s callers didn't bump the counter back then -- VERIFIED
+    /// this session (2026-08-08) that every reindex path (`reindex_changed_
+    /// cancellable`/`reindex_paths`/`rebuild_graph_from_index`/`reindex_all_
+    /// cancellable_with_phase`) now bumps it whenever `!summary.is_noop()`,
+    /// full or incremental, so that objection no longer holds -- this field
+    /// IS now load-bearing (see `STALE_GRAPH_AUTHORITY` in edit.rs). Still
+    /// deliberately narrower than #65's full proposal: watcher-freshness,
+    /// SCIP/stack-graphs provider-generation, and risk-policy-version are
+    /// NOT bound yet (see the plan doc's PR D section for why each is
+    /// deferred, not silently dropped).
+    graph_generation: i64,
 }
 
 struct SessionLog {
@@ -10657,6 +10672,139 @@ mod tests {
             std::fs::read_to_string(dir.join("a.rs")).unwrap(),
             "fn target() {\n    2\n}\n",
             "edit must have applied -- nothing about the caller set changed"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn graph_generation_bump_forces_stale_review_even_when_caller_set_is_unchanged() {
+        // PR D (issue #65, docs/plans/2026-08-08-derived-artifact-hardening-
+        // execution-plan.md): a reindex can rebuild the graph (bumping
+        // graph_generation) without touching THIS symbol's own caller set
+        // at all -- e.g. an unrelated file's manifest/config change forced
+        // a full rebuild, or a different part of the graph shifted. The
+        // caller_set_digest check alone can't see this; graph_generation
+        // must independently gate.
+        let (dir, server) = test_server("graph_generation_stale");
+        std::fs::write(dir.join("a.rs"), "fn target() {\n    1\n}\n").unwrap();
+        let hash = calm_core::edit::range_checksum("fn target() {\n    1\n}\n", 2, 2).unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point, is_test)
+                 VALUES ('a.rs::target', 'target', 'function', 'rust', 'a.rs', 1, 3, '', '', 'target', 1, 1, 0, 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO call_edges (from_symbol, to_symbol, from_path, edge_confidence, call_site_line)
+                 VALUES ('b.rs::caller_fn', 'a.rs::target', 'b.rs', 'resolved', 5)",
+                [],
+            )
+            .unwrap();
+        }
+
+        server.edit_context(rmcp::handler::server::wrapper::Parameters(
+            EditContextParams {
+                symbol: "target".into(),
+                path: None,
+                line: None,
+                if_none_match: None,
+            },
+        ));
+
+        // A reindex happens -- graph_generation bumps -- but the caller set
+        // (call_edges rows for this symbol) is left completely untouched.
+        {
+            let conn = server.db();
+            conn.execute(
+                "UPDATE graph_generation_state SET generation = generation + 1 WHERE id = 1",
+                [],
+            )
+            .unwrap();
+        }
+
+        let out = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
+            EditLinesParams {
+                path: "a.rs".into(),
+                edits: vec![EditHunkParam {
+                    old_text: None,
+                    start_line: 2,
+                    end_line: 2,
+                    expected_hash: Some(hash),
+                    new_text: "    2\n".into(),
+                }],
+                confirm: true,
+                reason: Some("caller_fn already confirmed safe per review".into()),
+                cites: None,
+            },
+        ));
+        let v = jv(out);
+        assert_eq!(v["error"]["code"], "STALE_GRAPH_AUTHORITY", "response: {v}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.rs")).unwrap(),
+            "fn target() {\n    1\n}\n",
+            "must not have written -- the graph was rebuilt since review, even \
+             though this symbol's own caller set never changed"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn graph_generation_unchanged_since_review_does_not_block_edit() {
+        // Negative case for the STALE_GRAPH_AUTHORITY check above -- no
+        // reindex happened between edit_context and edit_lines, so the
+        // edit must proceed exactly as it did before PR D.
+        let (dir, server) = test_server("graph_generation_unchanged");
+        std::fs::write(dir.join("a.rs"), "fn target() {\n    1\n}\n").unwrap();
+        let hash = calm_core::edit::range_checksum("fn target() {\n    1\n}\n", 2, 2).unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point, is_test)
+                 VALUES ('a.rs::target', 'target', 'function', 'rust', 'a.rs', 1, 3, '', '', 'target', 1, 1, 0, 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO call_edges (from_symbol, to_symbol, from_path, edge_confidence, call_site_line)
+                 VALUES ('b.rs::caller_fn', 'a.rs::target', 'b.rs', 'resolved', 5)",
+                [],
+            )
+            .unwrap();
+        }
+
+        server.edit_context(rmcp::handler::server::wrapper::Parameters(
+            EditContextParams {
+                symbol: "target".into(),
+                path: None,
+                line: None,
+                if_none_match: None,
+            },
+        ));
+
+        let out = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
+            EditLinesParams {
+                path: "a.rs".into(),
+                edits: vec![EditHunkParam {
+                    old_text: None,
+                    start_line: 2,
+                    end_line: 2,
+                    expected_hash: Some(hash),
+                    new_text: "    2\n".into(),
+                }],
+                confirm: true,
+                reason: Some("caller_fn already confirmed safe per review".into()),
+                cites: None,
+            },
+        ));
+        let v = jv(out);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.rs")).unwrap(),
+            "fn target() {\n    2\n}\n",
+            "must have applied -- no reindex happened since review: {v}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

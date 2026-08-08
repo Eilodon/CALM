@@ -2,10 +2,11 @@
 title: "Derived-artifact hardening — Group D execution plan (verified against live source)"
 date: 2026-08-08
 status: "P1 + P2 + P3a + P4 (core resolver) + PR A (P4.1 resolver soundness, PR C folded in as a
-  doc-only non-bug closure) + PR B (digest epistemic integrity) SHIPPED same day (committed: fb58b2b,
-  8683c1f, 4fe66bf, 11ac87b, 0154378, d7e2329; PR B pending its own commit) — see §5/§6/§7/§8/§9/§10.
-  P3b (Go writes) and several P4/PR A/PR B sub-items deliberately deferred with documented reasons —
-  see §7/§8/§9/§10. PR D/E/F and P5-P9 not started.
+  doc-only non-bug closure) + PR B (digest epistemic integrity) + PR D (issue #65, graph_generation
+  binding only — 1 of 4 fields, 3 deliberately deferred) SHIPPED same day (committed: fb58b2b,
+  8683c1f, 4fe66bf, 11ac87b, 0154378, d7e2329, 1b914b6; PR D pending its own commit) — see
+  §5/§6/§7/§8/§9/§10/§11. P3b (Go writes) and several P4/PR A/PR B/PR D sub-items deliberately
+  deferred with documented reasons — see §7/§8/§9/§10/§11. PR E/F and P5-P9 not started.
   Every 'current state' claim below was read from live source this session (file:line cited),
   and a second verification pass (§0.5) corrected four audit claims that turned out inaccurate
   once traced through the code. This is the durable record the session-local '§4-48
@@ -605,3 +606,76 @@ column into `TypeRelationFact` to let the renderer eventually distinguish `same_
 sufficient for the hedge/no-hedge decision render_digest actually needs today; adding a field with no
 current reader would be speculative. Promotable later without another schema change (the column
 already exists from PR A).
+
+## §11. PR D (issue #65, Review Authority Snapshot) execution log (2026-08-08, same session)
+
+Issue #65 asks the write-gate's review token to bind more of what a review implicitly trusted, not
+just the caller-set digest: graph generation, watcher freshness, provider (SCIP/stack-graphs)
+generation, and risk-policy version, each with its own distinguishing error code. Per the issue's own
+framing ("định nghĩa rõ review token chứng minh điều gì, rồi mới implement"), the contract was worked
+out before writing code, then implemented for exactly ONE of the four fields this round -- the one
+that turned out to be well-scoped, cheap, and (critically) newly valid.
+
+**A stale prior-session finding, corrected.** Before implementing, re-read
+`docs/plans/2026-08-02-ws2-review-token-execution-plan.md` (the design doc for the CURRENT
+`caller_set_digest`/`STALE_CALLER_SET` mechanism) to see why `graph_generation` wasn't already bound.
+Its finding F1 (2026-08-02): `incremental_graph_update` -- the path every `edit_lines`/`edit_symbol`
+write actually takes by default -- "never touches" `graph_generation_state`, making the counter too
+coarse to gate on; kept diagnostic-only by deliberate design. **Verified this session (2026-08-08,
+reading `reindex_changed_cancellable`/`reindex_paths`/`rebuild_graph_from_index`/
+`reindex_all_cancellable_with_phase` directly, all in `pipeline.rs`) that this is no longer true**:
+every one of those functions now bumps `graph_generation_state.generation` whenever
+`!summary.is_noop()`, whether the reindex went through the full or incremental path. Some later
+session between 2026-08-02 and today closed the F1 gap (this session's own PR C fold-in comments were
+added at exactly these 4 call sites, for an unrelated reason, and directly confirmed this). F1's
+objection to gating on `graph_generation` no longer holds -- this is the same "verify before trusting
+a past design decision" discipline C1-C4/§0.5 applied to the original audit, applied here to a design
+doc instead.
+
+**Shipped: `graph_generation` binding, `STALE_GRAPH_AUTHORITY`.** `EditContextReview` (`tools.rs`)
+gained a `graph_generation: i64` field, captured in `guardrails.rs::edit_context` (a plain `SELECT
+generation FROM graph_generation_state WHERE id = 1` alongside the existing `caller_set_digest`
+computation) and threaded through `record_edit_context_review`. `edit_lines_impl_gated` (`edit.rs`)
+now checks it inside the existing per-touched-symbol freshness loop, nested one level deeper than the
+`caller_set_digest` check: a symbol whose caller set still matches can STILL be stale if the graph was
+rebuilt since review (a rebuild can shift coreness/hub classification without adding or removing that
+symbol's own callers) -- a new `STALE_GRAPH_AUTHORITY` error, same shape as the existing
+`STALE_CALLER_SET` (audit trail log line, refusal message naming the symbol, `Call edit_context(...)
+again` remedy). Fails OPEN (not blocking) if the fresh-generation lookup itself can't open a
+connection -- an infra hiccup on this secondary signal must not block an edit the primary
+(caller-set-digest) check already found current.
+
+**Verified:** 2 new tests
+(`graph_generation_bump_forces_stale_review_even_when_caller_set_is_unchanged`,
+`graph_generation_unchanged_since_review_does_not_block_edit`) -- the first isolates the NEW failure
+mode specifically (bumps `graph_generation_state` directly via SQL, deliberately leaving `call_edges`
+untouched, so `caller_set_digest` still matches and only the new check can catch it), the second is
+the regression guard. Full workspace suite green (`calm-server` 369, up from 367), `cargo clippy
+--workspace --all-targets -D warnings` clean, `cargo fmt --check` clean (via `format_files`). Zero
+MCP-schema/toolsnap surface -- `EditContextReview` is internal session state, never serialized to a
+tool response.
+
+**Deliberately deferred (the other 3 of #65's 4 proposed fields), with reasons, not silently
+dropped:**
+- **Watcher freshness** -- would need a cheap, comparable "as of review, was the index current"
+  signal. `indexing_status`'s `watcher.freshness`/`last_refresh` exist but are point-in-time strings,
+  not a monotonic counter comparable the same way `graph_generation` is -- needs its own small design
+  pass (probably a counter bump on `watch_supervisor.rs`'s reconciliation events), not a `git blame`
+  and a field addition. `graph_generation` already covers the sharpest version of this concern (was
+  the GRAPH current), which is what the write gate actually reasons about.
+- **Provider (SCIP/stack-graphs) generation** -- `call_edges.formal_source`/`evidence_state` exist
+  per-edge, but there is no single "provider generation" counter to bind a snapshot to; the closest
+  analogue (`external_proofs`' own freshness bookkeeping, `scip::ingest.rs`) is a different
+  subsystem this session didn't otherwise touch, and inventing a new counter just for this gate risks
+  being the wrong abstraction without first checking how a formal-evidence-only overlay's own
+  currency is (or should be) tracked elsewhere.
+- **Risk-policy version** -- `config.risk_rules`/`hub_threshold` etc. are config-driven, not
+  versioned; a policy-version bump would need a decision about what counts as a "policy change"
+  (any config edit? Only `risk_rules`? Only fields the gate actually reads?) that's a real design
+  question, not a mechanical port of the other 3 fields' pattern.
+
+Each is a real, scoped follow-up (the taxonomy issue #65 sketches for these -- `REVIEW_POLICY_CHANGED`,
+`STALE_PROVIDER_EVIDENCE` -- was the audit's own elaboration, not yet agreed API; confirmed by reading
+issue #65's actual body, which lists the 4 concept fields but not the specific error-code names).
+Issue #65 stays open, not closed by this round -- `graph_generation` binding is one real field of four,
+not the full snapshot.

@@ -1253,8 +1253,30 @@ impl CalmServer {
                 // instead of a generic "pass confirm:true" that wouldn't help.
                 const FRESHNESS_WINDOW_CALLS: u64 = 200;
                 let now = self.session_tool_calls();
+                // PR D (issue #65, docs/plans/2026-08-08-derived-artifact-
+                // hardening-execution-plan.md): current graph_generation,
+                // fetched once for the whole gate check -- compared per
+                // touched symbol below against what edit_context recorded
+                // at review time (EditContextReview::graph_generation).
+                // Own short-lived read connection -- the outer `conn` that
+                // scopes `fresh_caller_digests` above has already gone out
+                // of scope by this point. `None` (open/query failure) means
+                // "couldn't verify", not "generation is 0" -- treated below
+                // as fail-OPEN for this specific signal (an infra hiccup
+                // must not block an edit the caller-set-digest check, the
+                // load-bearing signal, already found current).
+                let current_graph_generation: Option<i64> =
+                    self.make_read_conn().ok().and_then(|c| {
+                        c.query_row(
+                            "SELECT generation FROM graph_generation_state WHERE id = 1",
+                            [],
+                            |r| r.get(0),
+                        )
+                        .ok()
+                    });
                 let mut missing: Vec<&str> = Vec::new();
                 let mut stale_caller_set: Vec<&str> = Vec::new();
+                let mut stale_graph_authority: Vec<&str> = Vec::new();
                 let mut known_caller_qns: Vec<String> = Vec::new();
                 let mut reviewed_risk_levels: Vec<String> = Vec::new();
                 for t in &pre_touched {
@@ -1273,8 +1295,22 @@ impl CalmServer {
                                 .map(String::as_str)
                                 .unwrap_or_default();
                             if fresh == r.caller_set_digest {
-                                known_caller_qns.extend(r.caller_qns);
-                                reviewed_risk_levels.push(r.risk_level);
+                                // PR D: caller set still matches, but a
+                                // reindex (full or incremental) may have
+                                // rebuilt the graph since review anyway --
+                                // a broader authority change this symbol's
+                                // own narrow caller-set digest can't see
+                                // (a graph rebuild can shift coreness/hub
+                                // classification without adding or removing
+                                // THIS symbol's callers).
+                                let graph_still_current = current_graph_generation
+                                    .is_none_or(|g| g == r.graph_generation);
+                                if graph_still_current {
+                                    known_caller_qns.extend(r.caller_qns);
+                                    reviewed_risk_levels.push(r.risk_level);
+                                } else {
+                                    stale_graph_authority.push(t.qualified_name.as_str());
+                                }
                             } else {
                                 stale_caller_set.push(t.qualified_name.as_str());
                             }
@@ -1335,6 +1371,39 @@ impl CalmServer {
                              accurate. Call edit_context(\"{}\") again to get a fresh review \
                              before editing",
                             stale_caller_set[0], stale_caller_set[0]
+                        ),
+                        true,
+                    ));
+                }
+                // PR D (issue #65): distinguished from both EDIT_CONTEXT_REQUIRED
+                // and STALE_CALLER_SET above -- this symbol's own caller set
+                // still matches, but the graph has been rebuilt (full or
+                // incremental reindex bumped graph_generation) since
+                // edit_context reviewed it. The review's risk/hub
+                // classification was computed against the OLD graph state and
+                // may no longer hold, even though the narrow caller-set check
+                // alone would have passed.
+                if !stale_graph_authority.is_empty() {
+                    tracing::info!(
+                        target: crate::telemetry::AUDIT_TARGET,
+                        session_id = self.session_id,
+                        decision = "denied",
+                        reason_code = "STALE_GRAPH_AUTHORITY",
+                        path,
+                        symbol = stale_graph_authority[0],
+                        risk = risk.as_deref().unwrap_or("none"),
+                        hub_hit,
+                    );
+                    return ToolOutcome::error(error_detail(
+                        "STALE_GRAPH_AUTHORITY",
+                        &format!(
+                            "the graph was rebuilt since edit_context reviewed \"{}\" this \
+                             session (a reindex ran -- full or incremental -- that changed \
+                             graph_generation, even though this symbol's own caller set still \
+                             matches) -- the reviewed risk/hub classification may no longer \
+                             reflect current graph state. Call edit_context(\"{}\") again to get \
+                             a fresh review before editing",
+                            stale_graph_authority[0], stale_graph_authority[0]
                         ),
                         true,
                     ));
