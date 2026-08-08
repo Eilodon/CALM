@@ -22,18 +22,32 @@
 # Every entry needs `evidence`: a file (or file:line) a reader can go check
 # the claim against, same discipline this repo's benchmarks already apply to
 # measured claims.
+#
+# PR E (issue #66): every `level = "enforced"` entry ALSO needs `test` -- a
+# `crate::module::path::test_fn_name` reference to the specific test that
+# exercises the behavior this entry describes, so a semantic regression
+# fails the build the same way a format/presence drift already does. Checked
+# by crates/calm-core/tests/guarantee_contract_coverage.rs: every `enforced`
+# entry must have a non-empty `test` field, and every `test` field must
+# still resolve to a real `fn` somewhere under crates/ (catches a stale
+# reference after a rename, not just a missing one). Not required for
+# non-enforced levels -- advisory/best_effort/optional/provider_dependent/
+# unsupported describe a DELIBERATE absence of a hard guarantee, so there is
+# no single behavior a test could assert holds unconditionally.
 
 [[behavior]]
 id = "edit_context.before_hub_or_high_risk_write"
 level = "enforced"
 summary = "edit_context must have run THIS session for a hub/high-risk symbol before edit_lines/edit_symbol will apply a confirm:true write to it"
 evidence = "crates/calm-server/src/tools/edit.rs (classify_gate, GateRequirement::EditContextConfirmGroundedReason)"
+test = "calm-server::tools::tests::edit_lines_requires_confirm_for_hub_symbol"
 
 [[behavior]]
 id = "txn.begin_before_write"
 level = "enforced"
 summary = "a write is refused outright if the durable transaction journal fails to even start -- no write proceeds with no journal entry at all"
 evidence = "crates/calm-server/src/tools/edit.rs (txn_init_failed, error code TRANSACTION_INIT_FAILED)"
+test = "calm-server::tools::tests::edit_lines_aborts_when_txn_begin_fails"
 
 [[behavior]]
 id = "txn.transition_after_disk_write"
@@ -46,6 +60,7 @@ id = "high_risk_edit.independent_review"
 level = "enforced"
 summary = "a greater-than-10-caller (critical/high-risk) edit without an independent elicitation approval is blocked outright -- a self-attested reason string alone is not sufficient at this risk tier"
 evidence = "crates/calm-server/src/tools/edit.rs (high_risk_needs_independent_review, error code HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW)"
+test = "calm-server::tools::tests::high_risk_edit_off_elicitation_is_blocked_even_with_confirm_and_grounded_reason"
 
 [[behavior]]
 id = "diff_impact.before_commit"
@@ -82,6 +97,7 @@ id = "ledger.hmac_signed_not_plain_hash"
 level = "enforced"
 summary = "audit_ledger's event_hash is HMAC-SHA256(audit.key, payload||prev_hash) for every real on-disk connection, keyed by a 0600 per-project key file separate from the SQLite file it chains -- an actor with only SQLite write access (no audit.key) cannot forge a chain that still passes verify_chain, unlike the earlier plain SHA-256 chain where DB write access alone was sufficient. Falls back to the original unkeyed SHA-256 chain only for a path-less (:memory:) connection, which production code never opens"
 evidence = "crates/calm-core/src/ledger.rs (compute_event_hash, ledger_key_for_conn, load_or_create_ledger_key)"
+test = "calm-core::ledger::tests::real_on_disk_ledger_signs_with_hmac_not_plain_sha256"
 
 [[behavior]]
 id = "edit.risk_rules_path_floor"
@@ -94,6 +110,7 @@ id = "memory.quarantine_excludes_ambient_surfacing"
 level = "enforced"
 summary = "a project_memory note whose content trips sanitize::injection_warning is quarantined at write time and excluded from recall's ambient/broad paths (FTS query search, no-args list-all) by default -- only an explicit recall(include_quarantined=true) or an exact-topic lookup (a deliberate, targeted ask, mirroring edit_context's own related_notes gate) returns it. The note is still saved either way (detection-only), and every returned note still carries its own content_warning/quarantined fields regardless of this filter"
 evidence = "crates/calm-server/src/tools/memory.rs (remember, recall), crates/calm-core/src/db/schema.rs (project_memory.quarantined)"
+test = "calm-server::tools::tests::recall_list_all_excludes_quarantined_notes_by_default"
 
 [[behavior]]
 id = "verification.rust_check_on_write"
@@ -106,15 +123,18 @@ id = "verification.bound_to_proposed_digest"
 level = "enforced"
 summary = "verify_change refuses to run (and never advances the transaction) if the file on disk no longer matches the tx_id's proposed_digest, checked both immediately before and immediately after cargo check runs -- a concurrent write can never get bound to someone else's verification receipt"
 evidence = "crates/calm-server/src/tools/txn.rs (verify_change, VERIFICATION_SNAPSHOT_CHANGED)"
+test = "calm-server::tools::tests::verify_change_refuses_when_disk_no_longer_matches_proposed_digest"
 
 [[behavior]]
 id = "http.remote_bind_forces_read_only_hint_tools_only"
 level = "enforced"
 summary = "any non-loopback `calm serve --http` bind forces the effective preset to remote-safe (every tool with read_only_hint=true, computed live off the tool router) regardless of --preset -- covers every state-mutating/process-executing tool (remember, verify_change, retry_maintenance, scip_refresh, lsp_refresh, set_toolset, pattern_debt_register, edit_lines/edit_symbol/format_files), not just the edit toolset the earlier full,-edit preset excluded"
 evidence = "crates/calm-cli/src/http.rs (resolve_http_launch), crates/calm-server/src/tools/toolset.rs (remote_safe_tool_names, resolve_preset), crates/calm-cli/tests/http_guard.rs"
+test = "calm-cli::http_guard::allow_remote_with_valid_token_forces_a_read_only_preset"
 
 [[behavior]]
 id = "verification.timeout_secs"
 level = "enforced"
 summary = "cargo check is killed if it exceeds config.verification.timeout_secs (default 120s) -- a hung build.rs/proc-macro/registry fetch fails the verification instead of blocking the tool call indefinitely"
 evidence = "crates/calm-core/src/verify.rs (run_cargo_check, DEFAULT_VERIFY_TIMEOUT_SECS), crates/calm-core/src/config.rs (VerificationConfig::timeout_secs)"
+test = "calm-core::verify::tests::run_cargo_check_kills_and_reports_failure_on_timeout"

@@ -3,10 +3,11 @@ title: "Derived-artifact hardening — Group D execution plan (verified against 
 date: 2026-08-08
 status: "P1 + P2 + P3a + P4 (core resolver) + PR A (P4.1 resolver soundness, PR C folded in as a
   doc-only non-bug closure) + PR B (digest epistemic integrity) + PR D (issue #65, graph_generation
-  binding only — 1 of 4 fields, 3 deliberately deferred) SHIPPED same day (committed: fb58b2b,
-  8683c1f, 4fe66bf, 11ac87b, 0154378, d7e2329, 1b914b6; PR D pending its own commit) — see
-  §5/§6/§7/§8/§9/§10/§11. P3b (Go writes) and several P4/PR A/PR B/PR D sub-items deliberately
-  deferred with documented reasons — see §7/§8/§9/§10/§11. PR E/F and P5-P9 not started.
+  binding only — 1 of 4 fields, 3 deliberately deferred) + PR E (issue #66, enforced-level guarantee
+  contract coverage) SHIPPED same day (committed: fb58b2b, 8683c1f, 4fe66bf, 11ac87b, 0154378,
+  d7e2329, 1b914b6, 4b8b401; PR E pending its own commit) — see §5/§6/§7/§8/§9/§10/§11/§12. P3b (Go
+  writes) and several P4/PR A/PR B/PR D sub-items deliberately deferred with documented reasons — see
+  §7/§8/§9/§10/§11. PR F and P5-P9 not started.
   Every 'current state' claim below was read from live source this session (file:line cited),
   and a second verification pass (§0.5) corrected four audit claims that turned out inaccurate
   once traced through the code. This is the durable record the session-local '§4-48
@@ -679,3 +680,59 @@ Each is a real, scoped follow-up (the taxonomy issue #65 sketches for these -- `
 issue #65's actual body, which lists the 4 concept fields but not the specific error-code names).
 Issue #65 stays open, not closed by this round -- `graph_generation` binding is one real field of four,
 not the full snapshot.
+
+## §12. PR E (issue #66, guarantee contract coverage) execution log (2026-08-08, same session)
+
+Issue #66: `docs/guarantee-levels.toml` + `scripts/gen-status.sh --check` already catch
+format/presence drift (a stale entry vs. the rendered `docs/status.generated.md`), but nothing
+asserted that the behavior an `id`'s `level = "enforced"` prose describes is still backed by a real
+test -- a refactor that silently weakened `txn.begin_before_write` would pass CI as long as the TOML
+entry's text stayed put.
+
+**Shipped, scoped to `enforced` only (per the issue's own instruction).** All 8 `level = "enforced"`
+entries in `docs/guarantee-levels.toml` gained a new `test = "crate::module::path::test_fn_name"`
+field, hand-matched to a real, already-existing test covering each (not newly written -- the tests
+already existed, they just weren't linked from the guarantee catalog):
+
+| Guarantee id | Mapped test |
+|---|---|
+| `edit_context.before_hub_or_high_risk_write` | `calm-server::tools::tests::edit_lines_requires_confirm_for_hub_symbol` |
+| `txn.begin_before_write` | `calm-server::tools::tests::edit_lines_aborts_when_txn_begin_fails` |
+| `high_risk_edit.independent_review` | `calm-server::tools::tests::high_risk_edit_off_elicitation_is_blocked_even_with_confirm_and_grounded_reason` |
+| `ledger.hmac_signed_not_plain_hash` | `calm-core::ledger::tests::real_on_disk_ledger_signs_with_hmac_not_plain_sha256` |
+| `memory.quarantine_excludes_ambient_surfacing` | `calm-server::tools::tests::recall_list_all_excludes_quarantined_notes_by_default` |
+| `verification.bound_to_proposed_digest` | `calm-server::tools::tests::verify_change_refuses_when_disk_no_longer_matches_proposed_digest` |
+| `http.remote_bind_forces_read_only_hint_tools_only` | `calm-cli::http_guard::allow_remote_with_valid_token_forces_a_read_only_preset` |
+| `verification.timeout_secs` | `calm-core::verify::tests::run_cargo_check_kills_and_reports_failure_on_timeout` |
+
+New `crates/calm-core/tests/guarantee_contract_coverage.rs`, two tests:
+- `every_enforced_guarantee_has_a_mapped_contract_test` -- parses the TOML (`toml`/`serde`, both
+  already `calm-core` dependencies, same pattern `fitness.rs`'s own TOML-consuming code uses) and
+  fails if any `level = "enforced"` entry has an empty/missing `test` field.
+- `every_mapped_contract_test_reference_still_resolves` -- for every `test` field present, extracts
+  the bare function name (the segment after the last `::`) and greps for a literal `fn <name>(`
+  across every `.rs` file under `crates/` (`ignore::WalkBuilder`, already a `calm-core` dependency,
+  respects `.gitignore` so it never descends into `target/`). Catches a STALE reference -- a mapped
+  test renamed or deleted after the TOML entry was written -- not just a missing one.
+
+Deliberately a substring/existence check, not a semantic re-verification harness: the referenced test
+itself is what actually exercises the behavior every time `cargo test` runs; this mechanism's only job
+is making sure that link can never silently go missing or stale, the same value
+`gen-status.sh --check` already provides for a different kind of drift.
+
+**Verified:** both new tests pass; `scripts/gen-status.sh --check` still reports
+`docs/status.generated.md` up to date (37 tools, unchanged) -- confirms the new `test = ` lines don't
+perturb its awk-based parser, which only ever extracts `id`/`level`/`summary` and silently ignores
+unrecognized keys. Full workspace suite green modulo one confirmed-flaky, unrelated pre-existing test
+(`calm-server::daemon::tests::bind_or_yield_recovers_a_stale_socket` -- failed once under full-suite
+parallel load, passed both in isolation and on a full-suite re-run immediately after; a socket-binding
+test contending with this session's own live CALM daemon, the same class of flake documented for
+`calm-cli`'s `daemon_integration` suite in §9). `cargo clippy --workspace --all-targets -D warnings`
+clean, `cargo fmt --check` clean.
+
+**Deliberately not done:** a registry for `advisory`/`best_effort`/`optional`/`provider_dependent`/
+`unsupported` levels -- each of those describes a deliberate ABSENCE of an unconditional guarantee
+(a best-effort behavior can legitimately fail sometimes; an optional one is off by default), so there
+is no single assertable "this always holds" claim the way an `enforced` entry has. Extending this same
+`test` field convention to those levels, if ever wanted, would need a different verb than "exercises
+the guarantee" -- out of scope for issue #66 as written.
