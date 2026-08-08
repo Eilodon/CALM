@@ -69,7 +69,9 @@ pub fn init_db_versioned(conn: &Connection) -> rusqlite::Result<()> {
 pub fn init_state_db_versioned(conn: &Connection) -> rusqlite::Result<()> {
     refuse_if_schema_newer(conn, STATE_DB_SCHEMA_VERSION, "state.db")?;
     init_state_db(conn)?;
-    conn.pragma_update(None, "user_version", STATE_DB_SCHEMA_VERSION)?;
+    // CCK-01: run any registered forward migrations from the on-disk version
+    // up to STATE_DB_SCHEMA_VERSION, then stamp it (see state_migrations.rs).
+    super::state_migrations::migrate_state_db_to_current(conn)?;
     Ok(())
 }
 
