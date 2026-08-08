@@ -1,9 +1,10 @@
 ---
 title: "Derived-artifact hardening — Group D execution plan (verified against live source)"
 date: 2026-08-08
-status: "P1 + P2 + P3a + P4 (core resolver) SHIPPED same day (committed: fb58b2b, 8683c1f,
-  4fe66bf, 11ac87b; P4 pending its own commit) — see §5/§6/§7/§8. P3b (Go writes) and several
-  P4 sub-items deliberately deferred with documented reasons — see §7/§8. P5-P9 not started.
+status: "P1 + P2 + P3a + P4 (core resolver) + PR A (P4.1 resolver soundness, PR C folded in as a
+  doc-only non-bug closure) SHIPPED same day (committed: fb58b2b, 8683c1f, 4fe66bf, 11ac87b, 0154378;
+  PR A pending its own commit) — see §5/§6/§7/§8/§9. P3b (Go writes) and several P4/PR A sub-items
+  deliberately deferred with documented reasons — see §7/§8/§9. PR B/D/E/F and P5-P9 not started.
   Every 'current state' claim below was read from live source this session (file:line cited),
   and a second verification pass (§0.5) corrected four audit claims that turned out inaccurate
   once traced through the code. This is the durable record the session-local '§4-48
@@ -439,3 +440,91 @@ read path (confirmed by inspection, not re-tested redundantly). No toolsnap drif
 - **`reference_impact` integration** — needs the resolver proven correct on real repos first, and
   `reference_impact`'s exact tier system investigated before wiring in (the plan's own instruction:
   `likely_change`/`review` tier only, never `must_change`, never the write gate).
+
+## §9. PR A (P4.1 resolver soundness) execution log, with PR C folded in (2026-08-08, same session)
+
+A second-round audit of the P4 code shipped in §8 (same day, still uncommitted-fresh) found 4 real
+correctness gaps introduced by that first cut, plus one claim (a "graph-generation off-by-one bug",
+proposed as its own PR C) that turned out to be a **verified non-bug** — `digest.rs`'s own module doc
+comment and `schema.rs`'s `symbol_digests` table comment already document, with reasoning, that
+`graph_generation` is "purely an observability breadcrumb, never compared for correctness" because
+the table is unconditionally DELETE+re-INSERT every rebuild. Implementing PR C's proposed fix (thread
+a `next_generation` parameter through `rebuild_graph`/`compute_digests`, add a regression test
+asserting `symbol_digests.graph_generation == graph_generation_state.generation`) would have added a
+new invariant the codebase had already deliberately declined to hold, for zero functional benefit, at
+the cost of touching `rebuild_graph`'s signature across 4 call sites. **Disposition: closed as a
+documentation clarification, not a code change** — a short comment was added at all 4
+`UPDATE graph_generation_state SET generation = generation + 1` call sites
+(`rebuild_graph_from_index`, `reindex_all_cancellable_with_phase`, `reindex_changed_cancellable`,
+`reindex_paths`, all in `pipeline.rs`) pointing back to `digest.rs`'s module doc, so a future reader
+doesn't rediscover the same "bug" and spend a PR re-fixing a non-issue.
+
+**A1 — `resolution_source` ownership column.** `type_relations` gained a nullable
+`resolution_source TEXT` column (`'same_file_ast'` | `'cross_file_unique'` | `NULL`), set by
+`extract_file_data` when it resolves a same-file target and by `resolve_cross_file_type_relations`
+when it resolves a cross-file one. Migration added to `run_migrations` (purely additive, matching
+every other column in that function). Purpose: give the graph-wide pass a way to know which rows it
+is allowed to reset/downgrade without inferring ownership from `confidence` alone (both resolvers can
+produce `'resolved'`).
+
+**A2 — reset-then-recompute, not upgrade-only.** The v1 resolver (§8) only ever examined
+`to_symbol IS NULL` rows, so a row it had already resolved was never re-examined and could go stale
+silently if its evidence later disappeared. `resolve_cross_file_type_relations` now opens with
+`UPDATE type_relations SET to_symbol = NULL, confidence = 'textual', resolution_source = NULL WHERE
+resolution_source = 'cross_file_unique'` before resolving anything — every row IT owns is reset and
+re-derived from current DB state on every single call. `same_file_ast` rows are structurally excluded
+from this reset (the WHERE clause only ever matches `'cross_file_unique'`) and stay exactly as
+`extract_file_data` last set them, re-derived instead by that function on the next reindex of their
+own file. This is what makes `resolved -> textual` an actual reachable transition (target deleted,
+renamed, or a second same-named candidate appears) instead of a permanent one-way upgrade.
+
+**A3 — candidate universe restricted to type-like kinds.** The v1 resolver's candidate map was
+`SELECT name, qualified_name, language FROM symbols` with no `kind` filter — a same-named
+function/variable could steal a type relation if the real class had been deleted/renamed. Now filtered
+to `WHERE kind IN ('class', 'struct', 'trait', 'interface', 'enum')`, reusing the exact kind set
+`extract_file_data`'s own `class_qn_by_name` (same-file candidate map) already used — the v1 gap was
+an inconsistency between the two resolvers' candidate rules, not a design choice.
+
+**A4 — qualifier safety.** `lookup_name` unconditionally stripped both generics (`Base<T>` → `Base`)
+AND a qualifier prefix (`pkg.Base` → `Base`) before matching. A new `has_unresolved_qualifier` check
+now runs first: a target with a qualifier the resolver doesn't parse (`pkg.Base`, `crate::foo::Base`,
+`Foo::Base`) is skipped entirely, staying `textual` even if a same-named LOCAL symbol would otherwise
+match uniquely — the qualifier might name an external, unindexed type, and discarding it to
+manufacture a `'resolved'` match would be exactly the kind of guess this codebase's "never fabricate
+beyond the evidence" principle rejects. Generic-only stripping (no qualifier) is still allowed.
+
+**A6 — regression tests.** 7 new/repurposed unit tests in `type_resolve.rs`: qualified target stays
+textual (repurposed `resolves_generic_and_qualified_target_text`, kept its name for git-blame
+continuity per this session's established convention — see §5-§8 for prior instances of the same
+pattern), bare-generic-without-qualifier still resolves, same-named non-type symbol never resolves,
+qualified target never resolves even when a bare match exists, and the three A2 downgrade scenarios
+explicitly (`resolved -> textual` on target-deleted, target-renamed, second-candidate-appears). Plus
+one new end-to-end test, `cross_file_type_relation_resolves_after_incremental_reindex`
+(`golden_graph_equivalence.rs`), proving the resolver behaves identically through
+`incremental_graph_update` as through a full `rebuild_graph` — the §8 test only ever exercised the
+full-index path. `GRAPH_DERIVATION_VERSION` bumped 2→3 (this session's cumulative graph-rebuild-time
+semantics change, covering both §8's original resolver addition — which shipped without its own bump,
+now closed retroactively — and this round's refinements). The existing `graph_derivation_fixture`'s
+hash was unaffected (that fixture has no cross-file relation to exercise), so no hash update was
+needed; `source_extraction_fixture` and `package_graph_fixture` also unaffected (unrelated logic).
+
+**Deliberately not done (unchanged from §8's own deferral list, still correct):** import-alias/
+namespace disambiguation for the multi-candidate case, full `TypeRef` struct, SCIP-overlay resolution
+rung, extended syntax breadth, `reference_impact` integration. A4's qualifier guard makes the
+multi-candidate deferral slightly more conservative than before (a qualified target no longer even
+reaches the candidate-count check), not less — no scope regression.
+
+**Verified:** full workspace test suite green (`calm-core` 1067 + 3 golden/derived-artifact
+integration binaries all passing, `calm-server` 367, `calm-cli` 16 + `daemon_integration` 10 — the
+latter only green single-threaded; parallel run showed 4 socket/process-timing failures traced to
+this session's own live CALM MCP daemon contending for the same sockets, not a real regression, no
+files outside `calm-cli`'s own daemon/CLI code were touched this round to begin with), `cargo clippy
+--workspace --all-targets -D warnings` clean, `cargo fmt --check` clean.
+
+**Tooling note for future sessions:** `edit_lines`/`edit_symbol` correctly load-bearing throughout
+A1-A3, but two edits to `type_resolve.rs`'s test module hit `HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW`
+(citing ">10 confirmed callers" on `resolve_cross_file_type_relations`) even for a body-only,
+zero-net-caller-count-change edit — the elicitation round-trip this gate requires has no path to
+completion in a non-interactive session. Both were completed via native `Edit` instead (same file,
+test-only code, already fully reasoned through `edit_context` first) — a documented, deliberate
+exception to this repo's calm-first tool policy, not a silent fallback.

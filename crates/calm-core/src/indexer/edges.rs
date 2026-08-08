@@ -106,6 +106,12 @@ pub struct TypeRelationData {
     pub target_text: String,
     pub to_symbol: Option<String>,
     pub confidence: &'static str,
+    // PR A (docs/plans/2026-08-08-derived-artifact-hardening-execution-plan.md,
+    // P4.1): Some("same_file_ast") when to_symbol was resolved here at
+    // extraction time, None (persisted as SQL NULL) otherwise -- never
+    // cross_file_unique, which only graph::type_resolve ever writes, via
+    // its own UPDATE, not through this insert path.
+    pub resolution_source: Option<&'static str>,
     pub source_path: String,
     pub line: i64,
 }
@@ -134,8 +140,8 @@ pub fn insert_type_relations_batch(
     relations: &[TypeRelationData],
 ) -> rusqlite::Result<()> {
     let mut stmt = tx.prepare(
-        "INSERT OR IGNORE INTO type_relations (from_symbol, relation_kind, target_text, to_symbol, confidence, source_path, line)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT OR IGNORE INTO type_relations (from_symbol, relation_kind, target_text, to_symbol, confidence, resolution_source, source_path, line)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
     )?;
     for r in relations {
         stmt.execute(rusqlite::params![
@@ -144,6 +150,7 @@ pub fn insert_type_relations_batch(
             r.target_text,
             r.to_symbol,
             r.confidence,
+            r.resolution_source,
             r.source_path,
             r.line,
         ])?;

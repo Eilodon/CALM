@@ -1461,6 +1461,46 @@ fn cross_file_type_relation_resolves_after_full_index() {
     assert_eq!(confidence, "resolved");
 }
 
+/// PR A6 (docs/plans/2026-08-08-derived-artifact-hardening-execution-plan.md,
+/// P4.1): the same cross-file resolution proof as the test above, but
+/// through `incremental_graph_update` -- the resolver must behave
+/// identically whether the base class arrives via a fresh index or a later
+/// incremental reindex of a brand-new file, not just a synthetic SQLite
+/// setup (`graph::type_resolve`'s own unit tests) or a full rebuild.
+#[test]
+fn cross_file_type_relation_resolves_after_incremental_reindex() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("ws");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("base.py"), "class BaseService:\n    pass\n").unwrap();
+    enable_incremental_graph(&root);
+    let mut db = index_fresh(&root);
+
+    std::fs::write(
+        root.join("derived.py"),
+        "from base import BaseService\n\n\nclass Service(BaseService):\n    pass\n",
+    )
+    .unwrap();
+    let summary = reindex_continued(&mut db, &root);
+    assert_eq!(summary.graph_mode, GraphMode::Incremental);
+
+    let (to_symbol, confidence): (Option<String>, String) = db
+        .query_row(
+            "SELECT to_symbol, confidence FROM type_relations WHERE from_symbol = 'derived.py::Service'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+
+    assert_eq!(
+        to_symbol.as_deref(),
+        Some("base.py::BaseService"),
+        "a base class in a different file must resolve through \
+         incremental_graph_update too, not just a full rebuild_graph"
+    );
+    assert_eq!(confidence, "resolved");
+}
+
 /// Same bug, `type_relations` half: a base-class relation recorded in
 /// version A must not survive a full reindex into a version B that dropped
 /// the base class entirely, even though the class's own qualified name is

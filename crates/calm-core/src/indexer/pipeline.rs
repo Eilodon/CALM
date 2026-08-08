@@ -809,10 +809,16 @@ fn extract_file_data(
         // which a bare-name lookup naturally won't match -- falls to
         // `textual`, not wrong.
         let to_symbol = class_qn_by_name.get(&rt.target_text).cloned();
-        let confidence = if to_symbol.is_some() {
-            "resolved"
+        // PR A (docs/plans/2026-08-08-derived-artifact-hardening-execution-plan.md,
+        // P4.1): resolution_source labels this row as owned by extraction
+        // ("same_file_ast") so graph::type_resolve's later cross-file pass
+        // never resets/downgrades it -- only rows IT resolved get that
+        // treatment. None (unresolved here) is left for graph::type_resolve
+        // to attempt, not a claim this file's extraction failed permanently.
+        let (confidence, resolution_source) = if to_symbol.is_some() {
+            ("resolved", Some("same_file_ast"))
         } else {
-            "textual"
+            ("textual", None)
         };
         type_relations.push(crate::indexer::edges::TypeRelationData {
             from_symbol,
@@ -820,6 +826,7 @@ fn extract_file_data(
             target_text: rt.target_text,
             to_symbol,
             confidence,
+            resolution_source,
             source_path: rel.to_string(),
             line: rt.class_line as i64,
         });
@@ -1493,6 +1500,15 @@ pub fn rebuild_graph_from_index(
         &maps,
         &config.ignore,
     )?;
+    // Runs AFTER rebuild_graph (whose compute_digests already read+stamped
+    // the PRE-increment generation onto every symbol_digests row) --
+    // verified 2026-08-08 (derived-artifact hardening audit, PR C) that
+    // this off-by-one is deliberate, not a bug: see graph/digest.rs's
+    // module doc comment ("No generation-fencing staleness check") for why
+    // symbol_digests.graph_generation is correct-by-construction on every
+    // full recompute regardless of the number stamped on it, and is never
+    // compared against graph_generation_state.generation for correctness.
+    // Do not "fix" this ordering without re-reading that comment first.
     tx.execute(
         "UPDATE graph_generation_state SET generation = generation + 1 WHERE id = 1",
         [],
@@ -2360,6 +2376,8 @@ fn reindex_all_cancellable_with_phase(
         &maps,
         &ignore_patterns,
     )?;
+    // Deliberate off-by-one vs. symbol_digests.graph_generation -- see
+    // rebuild_graph_from_index's identical UPDATE for the full rationale.
     tx.execute(
         "UPDATE graph_generation_state SET generation = generation + 1 WHERE id = 1",
         [],
@@ -2895,6 +2913,8 @@ pub fn reindex_changed_cancellable(
             )?;
             summary.graph_mode = GraphMode::Full;
         }
+        // Deliberate off-by-one vs. symbol_digests.graph_generation -- see
+        // rebuild_graph_from_index's identical UPDATE for the full rationale.
         tx.execute(
             "UPDATE graph_generation_state SET generation = generation + 1 WHERE id = 1",
             [],
@@ -3052,6 +3072,8 @@ pub fn reindex_paths(
             )?;
             summary.graph_mode = GraphMode::Full;
         }
+        // Deliberate off-by-one vs. symbol_digests.graph_generation -- see
+        // rebuild_graph_from_index's identical UPDATE for the full rationale.
         tx.execute(
             "UPDATE graph_generation_state SET generation = generation + 1 WHERE id = 1",
             [],

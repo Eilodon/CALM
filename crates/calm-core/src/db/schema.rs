@@ -299,6 +299,19 @@ CREATE INDEX IF NOT EXISTS idx_pattern_debt_topic ON pattern_debt(topic);
 -- global pass yet) -- NULL otherwise, with confidence dropping to
 -- 'textual'. Never guessed: a relation whose target can't be resolved is
 -- still recorded (to_symbol NULL), never silently dropped or fabricated.
+--
+-- PR A (docs/plans/2026-08-08-derived-artifact-hardening-execution-plan.md,
+-- P4.1 Type Resolver Soundness): resolution_source records WHICH pass owns
+-- a resolved row -- 'same_file_ast' (extraction, pipeline::extract_file_
+-- data, this table's original resolver) or 'cross_file_unique' (graph::
+-- type_resolve's graph-wide follow-up pass). NULL when to_symbol is NULL
+-- (nothing resolved it yet). Ownership must never be inferred from
+-- confidence alone -- both resolvers can produce 'resolved', but only the
+-- pass that OWNS a row is allowed to reset/downgrade it on the next
+-- rebuild (see type_resolve.rs's module doc comment for why cross-file
+-- rows specifically need this to support 'resolved -> textual' when their
+-- evidence disappears, unlike same_file_ast rows which are re-derived from
+-- scratch by extraction on every reindex of their own file anyway).
 CREATE TABLE IF NOT EXISTS type_relations (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     from_symbol     TEXT NOT NULL,
@@ -307,6 +320,7 @@ CREATE TABLE IF NOT EXISTS type_relations (
     to_symbol       TEXT,
     confidence      TEXT NOT NULL CHECK (confidence IN ('resolved', 'textual')),
     evidence_source TEXT NOT NULL DEFAULT 'ast',
+    resolution_source TEXT,
     source_path     TEXT NOT NULL,
     line            INTEGER NOT NULL,
     UNIQUE(from_symbol, relation_kind, target_text, line)
@@ -917,6 +931,16 @@ fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
         "target_confidence",
         "TEXT NOT NULL DEFAULT 'exact'",
     )?;
+    // PR A (docs/plans/2026-08-08-derived-artifact-hardening-execution-plan.md,
+    // P4.1 Type Resolver Soundness): resolution_source records which pass
+    // (same_file_ast / cross_file_unique) owns a resolved type_relations
+    // row -- see the fresh-install CREATE TABLE comment for the full
+    // rationale. Nullable, no DEFAULT: an upgraded DB's pre-existing
+    // resolved rows genuinely don't know their own owner yet (NULL is
+    // honest here, not a placeholder) -- they self-heal to a labeled value
+    // on the next graph rebuild (cross_file_unique rows) or file reindex
+    // (same_file_ast rows), same as every other column in this function.
+    migrate_add_column(conn, "type_relations", "resolution_source", "TEXT")?;
     Ok(())
 }
 
