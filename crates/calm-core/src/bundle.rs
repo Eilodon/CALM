@@ -34,10 +34,12 @@
 //! needs a C compiler, the exact problem class this workspace has
 //! repeatedly hit and removed on musl cross-compiles.
 //!
-//! **Import-as-seed triggers on ANY git-commit mismatch, not just "tree
-//! doesn't match".** If the bundle's `git_commit` differs from the
-//! importing repo's current HEAD (or either side has none), the bundle is
-//! still activated -- but `ImportReport::force_full_reindex` is set,
+//! **Import-as-seed triggers on ANY git-commit, `calm_version`, or
+//! `config_fingerprint` mismatch, not just "tree doesn't match".** If the
+//! bundle's `git_commit` differs from the importing repo's current HEAD (or
+//! either side has none), or the bundle's languages/ignore rules
+//! (`config_fingerprint`) don't match this project's current config, the
+//! bundle is still activated -- but `ImportReport::force_full_reindex` is set,
 //! telling the caller to run a full reindex afterward rather than trust
 //! incremental reconciliation, which only re-touches files whose content
 //! actually changed and so could never notice "the code that INTERPRETS
@@ -134,9 +136,11 @@ pub struct ImportReport {
     pub manifest: BundleManifest,
     pub commit_matches: bool,
     pub config_matches: bool,
-    /// `true` when EITHER the git commit doesn't match OR `calm_version`
-    /// differs from this binary's own version -- see the module doc
-    /// comment's "Import-as-seed" section for why both trigger this.
+    /// `true` when the git commit doesn't match, OR `calm_version` differs
+    /// from this binary's own version, OR `config_fingerprint` (languages/
+    /// ignore rules) doesn't match this project's current config -- see the
+    /// module doc comment's "Import-as-seed" section for why all three
+    /// trigger this.
     pub force_full_reindex: bool,
     pub activated_path: PathBuf,
 }
@@ -310,7 +314,7 @@ pub fn import_bundle(
     };
     let config_matches = manifest.config_fingerprint == config_fingerprint(config);
     let version_matches = manifest.calm_version == env!("CARGO_PKG_VERSION");
-    let force_full_reindex = !commit_matches || !version_matches;
+    let force_full_reindex = !commit_matches || !version_matches || !config_matches;
 
     // Drop any stale WAL/SHM sidecars belonging to the file about to be
     // replaced -- VACUUM INTO's own output is always a single plain file
@@ -681,6 +685,64 @@ mod tests {
         assert!(!report.commit_matches);
         assert!(report.force_full_reindex);
         assert!(report.config_matches);
+    }
+
+    /// Bug fix 2026-08-08: `force_full_reindex` used to be computed from
+    /// only `commit_matches`/`version_matches`, silently ignoring
+    /// `config_matches` even though `config_fingerprint` was already being
+    /// compared and returned in the same `ImportReport`. Uses a real git
+    /// repo (same commit on both sides) so `commit_matches` is isolated as
+    /// `true`, proving `config_matches` alone now drives the recommendation.
+    #[test]
+    fn import_reports_force_full_reindex_when_only_config_differs() {
+        let src_dir = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(src_dir.path())
+                .output()
+                .unwrap()
+        };
+        run(&["init", "-q"]);
+        run(&[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "--allow-empty",
+            "-q",
+            "-m",
+            "x",
+        ]);
+
+        let db_path = src_dir.path().join("index.db");
+        seed_index_db(&db_path);
+        let export_config = Config::default();
+        let archive_path = src_dir.path().join("bundle.tar.gz");
+        export_bundle(&db_path, src_dir.path(), &export_config, &archive_path).unwrap();
+
+        let dest_db_path = src_dir.path().join("imported.db");
+        let mut import_config = Config::default();
+        import_config
+            .ignore
+            .push("some_custom_ignore_rule".to_string());
+        let report =
+            import_bundle(&archive_path, src_dir.path(), &dest_db_path, &import_config).unwrap();
+
+        assert!(
+            report.commit_matches,
+            "same repo, same HEAD commit on both sides"
+        );
+        assert!(
+            !report.config_matches,
+            "ignore rules differ between export and import config"
+        );
+        assert!(
+            report.force_full_reindex,
+            "a config_fingerprint mismatch alone must force a full reindex \
+             recommendation, even when the commit matches"
+        );
     }
 
     #[test]

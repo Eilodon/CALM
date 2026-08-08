@@ -1403,6 +1403,7 @@ fn rebuild_graph(
     churn_since: &str,
     hub_config: &crate::config::HubThresholdConfig,
     maps: &ResolutionMaps,
+    ignore: &[String],
 ) -> rusqlite::Result<()> {
     let ctx = build_resolution_context(tx, &maps.namespace_map)?;
 
@@ -1461,7 +1462,7 @@ fn rebuild_graph(
     crate::graph::boundary::update_boundary_ambiguous_flags(tx)?;
     crate::graph::churn::update_churn_scores(tx, project_root, churn_since)?;
     crate::graph::digest::compute_digests(tx)?;
-    crate::indexer::package_deps::compute_package_dependencies(tx, project_root, &[])?;
+    crate::indexer::package_deps::compute_package_dependencies(tx, project_root, ignore)?;
     Ok(())
 }
 
@@ -1488,6 +1489,7 @@ pub fn rebuild_graph_from_index(
         &config.hotspots.default_since,
         &config.hub_threshold,
         &maps,
+        &config.ignore,
     )?;
     tx.execute(
         "UPDATE graph_generation_state SET generation = generation + 1 WHERE id = 1",
@@ -1520,6 +1522,7 @@ pub enum IncrementalOutcome {
 /// loaded and (b) how much of `call_edges` gets deleted first; see plan
 /// §3.1 for the proof that `delta_paths` below is sufficient to catch every
 /// input `resolve_sites_to_edges` depends on.
+#[allow(clippy::too_many_arguments)]
 pub fn incremental_graph_update(
     tx: &rusqlite::Transaction,
     project_root: &std::path::Path,
@@ -1528,6 +1531,7 @@ pub fn incremental_graph_update(
     names_delta: &HashSet<String>,
     hub_config: &crate::config::HubThresholdConfig,
     maps: &ResolutionMaps,
+    ignore: &[String],
 ) -> rusqlite::Result<IncrementalOutcome> {
     // Step 1 (plan D1): delta_paths = delta_seed ∪ {from_path of call_sites
     // whose callee_name ∈ names_delta} — a site in an UNCHANGED file that
@@ -1562,7 +1566,7 @@ pub fn incremental_graph_update(
             "delta_paths.len()={} > {MAX_INCREMENTAL_DELTA_PATHS}",
             delta_paths.len()
         );
-        rebuild_graph(tx, project_root, churn_since, hub_config, maps)?;
+        rebuild_graph(tx, project_root, churn_since, hub_config, maps, ignore)?;
         return Ok(IncrementalOutcome::FellBackToFull(reason));
     }
 
@@ -1652,7 +1656,7 @@ pub fn incremental_graph_update(
     crate::graph::boundary::update_boundary_ambiguous_flags(tx)?;
     crate::graph::churn::update_churn_scores(tx, project_root, churn_since)?;
     crate::graph::digest::compute_digests(tx)?;
-    crate::indexer::package_deps::compute_package_dependencies(tx, project_root, &[])?;
+    crate::indexer::package_deps::compute_package_dependencies(tx, project_root, ignore)?;
 
     Ok(IncrementalOutcome::Applied)
 }
@@ -2280,6 +2284,17 @@ fn reindex_all_cancellable_with_phase(
     tx.execute("DELETE FROM symbols", [])?;
     tx.execute("DELETE FROM file_index", [])?;
     tx.execute("DELETE FROM code_chunks", [])?;
+    // Bug fix 2026-08-08: these two were missing from the full-reindex clear
+    // even though `remove_file_rows` (the per-file incremental path) already
+    // clears them. Both tables key off `qualified_name`/`source_path`, not
+    // `symbols.id` (see their schema.rs comments), so a stale row here is not
+    // just orphaned garbage -- it silently re-attaches to whatever symbol the
+    // NEXT full reindex assigns the same qualified name, corrupting T1 facts
+    // and the Architecture Digest built from them for a symbol whose actual
+    // semantics changed. See golden_graph_equivalence.rs for the regression
+    // test locking this in (full-rebuild-on-old-DB must equal fresh-build).
+    tx.execute("DELETE FROM type_relations", [])?;
+    tx.execute("DELETE FROM symbol_effects", [])?;
     // A full baseline invalidates all cached SCIP results. In particular, D4's
     // byte-span identity migration must never let a line-derived cache key skip
     // the first exact overlay pass after rebuilding the graph.
@@ -2340,6 +2355,7 @@ fn reindex_all_cancellable_with_phase(
         &config.hotspots.default_since,
         &config.hub_threshold,
         &maps,
+        &ignore_patterns,
     )?;
     tx.execute(
         "UPDATE graph_generation_state SET generation = generation + 1 WHERE id = 1",
@@ -2858,6 +2874,7 @@ pub fn reindex_changed_cancellable(
                 &summary.names_delta,
                 &config.hub_threshold,
                 &maps,
+                &ignore_patterns,
             )? {
                 IncrementalOutcome::Applied => summary.graph_mode = GraphMode::Incremental,
                 IncrementalOutcome::FellBackToFull(reason) => {
@@ -2871,6 +2888,7 @@ pub fn reindex_changed_cancellable(
                 &config.hotspots.default_since,
                 &config.hub_threshold,
                 &maps,
+                &ignore_patterns,
             )?;
             summary.graph_mode = GraphMode::Full;
         }
@@ -3013,6 +3031,7 @@ pub fn reindex_paths(
                 &summary.names_delta,
                 &config.hub_threshold,
                 &maps,
+                &config.ignore,
             )? {
                 IncrementalOutcome::Applied => summary.graph_mode = GraphMode::Incremental,
                 IncrementalOutcome::FellBackToFull(reason) => {
@@ -3026,6 +3045,7 @@ pub fn reindex_paths(
                 &config.hotspots.default_since,
                 &config.hub_threshold,
                 &maps,
+                &config.ignore,
             )?;
             summary.graph_mode = GraphMode::Full;
         }

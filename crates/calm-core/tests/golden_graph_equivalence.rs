@@ -1371,3 +1371,144 @@ fn names_delta_over_chunk_size_matches_full() {
         "names_delta chunk-boundary: incremental must match full rebuild",
     );
 }
+
+/// Bug fix 2026-08-08: a full reindex used to clear `symbols`/`call_sites`/
+/// etc. but NOT `type_relations`/`symbol_effects` -- see the fix in
+/// `pipeline.rs`'s `reindex_all_cancellable_with_phase`. Both tables key off
+/// `qualified_name` (not `symbols.id`), so a stale fact from a prior full
+/// reindex used to silently coexist with the current fact for any symbol
+/// whose qualified name survived the rebuild -- corrupting T1 facts and the
+/// Architecture Digest built from them. `run_indexing_pipeline` always takes
+/// the full-baseline path (never incremental), so calling it twice on the
+/// same connection with different file content between calls is exactly the
+/// regression scenario.
+#[test]
+fn full_reindex_does_not_leave_stale_semantic_facts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("ws");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        root.join("service.py"),
+        "class Service:\n    def save(self):\n        self.cache = 1\n        raise ValueError(\"boom\")\n",
+    )
+    .unwrap();
+
+    let mut db = index_fresh(&root);
+    let effects_before: i64 = db
+        .query_row("SELECT COUNT(*) FROM symbol_effects", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        effects_before, 2,
+        "fixture must produce exactly 1 throw + 1 write fact to exercise the bug"
+    );
+
+    // Second full reindex (run_indexing_pipeline always takes the
+    // full-baseline path) with the SAME qualified name (`Service::save`
+    // survives) but neither a raise nor a field write in the new source.
+    std::fs::write(
+        root.join("service.py"),
+        "class Service:\n    def save(self):\n        return 1\n",
+    )
+    .unwrap();
+    let phase = std::sync::Arc::new(std::sync::RwLock::new(
+        calm_core::types::IndexingPhase::Scanning,
+    ));
+    calm_core::indexer::pipeline::run_indexing_pipeline(&mut db, &root, phase).unwrap();
+
+    let effects_after: i64 = db
+        .query_row("SELECT COUNT(*) FROM symbol_effects", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        effects_after, 0,
+        "full reindex must not leave stale symbol_effects behind for a symbol \
+         whose qualified name survived the rebuild"
+    );
+}
+
+/// Same bug, `type_relations` half: a base-class relation recorded in
+/// version A must not survive a full reindex into a version B that dropped
+/// the base class entirely, even though the class's own qualified name is
+/// unchanged.
+#[test]
+fn full_reindex_does_not_leave_stale_type_relations() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("ws");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        root.join("service.py"),
+        "class Base:\n    pass\n\nclass Service(Base):\n    pass\n",
+    )
+    .unwrap();
+
+    let mut db = index_fresh(&root);
+    let relations_before: i64 = db
+        .query_row("SELECT COUNT(*) FROM type_relations", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        relations_before, 1,
+        "fixture must produce exactly 1 extends fact to exercise the bug"
+    );
+
+    std::fs::write(root.join("service.py"), "class Service:\n    pass\n").unwrap();
+    let phase = std::sync::Arc::new(std::sync::RwLock::new(
+        calm_core::types::IndexingPhase::Scanning,
+    ));
+    calm_core::indexer::pipeline::run_indexing_pipeline(&mut db, &root, phase).unwrap();
+
+    let relations_after: i64 = db
+        .query_row("SELECT COUNT(*) FROM type_relations", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        relations_after, 0,
+        "full reindex must not leave a stale type_relations row behind for a \
+         symbol whose qualified name survived the rebuild"
+    );
+}
+
+/// Bug fix 2026-08-08: `rebuild_graph`/`incremental_graph_update` used to
+/// call `compute_package_dependencies` with a hardcoded empty ignore list,
+/// so a user's configured `ignore` patterns never applied to package
+/// manifest scanning even though they applied to every other part of
+/// indexing. Both functions now take and forward a real `ignore: &[String]`
+/// parameter sourced from `config.ignore`.
+#[test]
+fn package_dependencies_scan_respects_configured_ignore_rules() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("ws");
+    std::fs::create_dir_all(root.join("vendor")).unwrap();
+    // Written before the first index, same reasoning as
+    // enable_incremental_graph's doc comment: config.json must never appear
+    // as a changed path in a later delta.
+    std::fs::write(root.join("config.json"), r#"{"ignore":["vendor"]}"#).unwrap();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"root_pkg\"\nversion = \"0.1.0\"\n\n[dependencies]\nfoo = \"1\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("vendor/Cargo.toml"),
+        "[package]\nname = \"vendored_pkg\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1\"\n",
+    )
+    .unwrap();
+
+    let db = index_fresh(&root);
+    let names: Vec<String> = {
+        let mut stmt = db
+            .prepare("SELECT dependency_name FROM package_dependencies ORDER BY dependency_name")
+            .unwrap();
+        stmt.query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+
+    assert!(
+        names.iter().any(|n| n == "foo"),
+        "root Cargo.toml's dependency must still be scanned: {names:?}"
+    );
+    assert!(
+        !names.iter().any(|n| n == "serde"),
+        "vendor/ is configured as ignored, so vendor/Cargo.toml's dependency \
+         must not appear: {names:?}"
+    );
+}
