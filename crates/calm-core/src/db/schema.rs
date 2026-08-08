@@ -21,10 +21,11 @@
 // instead: calm-cli `index`/`fitness-check`, calm-server `new_with_preset`
 // (the `calm serve`/daemon bootstrap) and `doctor`.
 pub const INDEX_DB_SCHEMA_VERSION: i64 = 1;
-// v2 (CCK-07, docs/plans/2026-08-08-master-change-control-execution-blueprint.md):
-// adds evidence_snapshots/change_intents/change_intent_targets. See
-// db/state_migrations.rs's registered v1->v2 step.
-pub const STATE_DB_SCHEMA_VERSION: i64 = 2;
+// v2 (CCK-07): adds evidence_snapshots/change_intents/change_intent_targets.
+// v3 (CCK-09, docs/plans/2026-08-08-master-change-control-execution-blueprint.md):
+// adds review_authorities(+targets,+evidence) and edit_transactions.authority_id.
+// See db/state_migrations.rs's registered v1->v2 and v2->v3 steps.
+pub const STATE_DB_SCHEMA_VERSION: i64 = 3;
 
 /// Refuses to proceed if `conn`'s stamped `PRAGMA user_version` is HIGHER
 /// than `expected` -- meaning a newer CALM binary already created or
@@ -468,6 +469,10 @@ CREATE TABLE IF NOT EXISTS edit_transactions (
     base_digest               TEXT NOT NULL,
     proposed_digest           TEXT NOT NULL,
     review_token_id           TEXT,
+    -- v3 / CCK-09: which review_authorities row (if any) authorized this
+    -- write via the new structured path -- NULL for every transaction
+    -- still going through the legacy edit_context+confirm+reason path.
+    authority_id              TEXT,
     state                     TEXT NOT NULL DEFAULT 'PREPARED',
     temp_path                 TEXT,
     graph_generation_before   INTEGER,
@@ -573,7 +578,56 @@ CREATE TABLE IF NOT EXISTS change_intent_targets (
     path           TEXT NOT NULL,
     qualified_name TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_change_intent_targets_intent ON change_intent_targets(intent_id);";
+CREATE INDEX IF NOT EXISTS idx_change_intent_targets_intent ON change_intent_targets(intent_id);
+
+-- v3 / CCK-09 (#65): a signed, single-use, snapshot-bound ReviewAuthority
+-- (authority::review::ReviewAuthority). Durable, structured replacement for
+-- EditContextReview's session-local HashMap entry -- signature is an
+-- HMAC-SHA256 over every other bound column below (see authority/key.rs's
+-- control.key), so tampering with any one of them out of band invalidates
+-- the row instead of silently being trusted. consumed_at NULL means unused;
+-- set exactly once, by the UPDATE ... WHERE consumed_at IS NULL that makes
+-- single-use atomic (see ReviewAuthority::verify_and_consume).
+CREATE TABLE IF NOT EXISTS review_authorities (
+    authority_id       TEXT PRIMARY KEY,
+    intent_id          TEXT NOT NULL REFERENCES change_intents(intent_id),
+    snapshot_id        TEXT NOT NULL REFERENCES evidence_snapshots(snapshot_id),
+    graph_generation   INTEGER NOT NULL,
+    caller_set_digest  TEXT NOT NULL,
+    analysis_version   TEXT NOT NULL,
+    policy_digest      TEXT NOT NULL,
+    principal          TEXT NOT NULL,
+    nonce              TEXT NOT NULL,
+    expires_at         REAL NOT NULL,
+    signature          TEXT NOT NULL,
+    created_at         REAL NOT NULL,
+    consumed_at        REAL
+);
+CREATE INDEX IF NOT EXISTS idx_review_authorities_intent ON review_authorities(intent_id);
+
+-- v3 / CCK-09: mirrors change_intent_targets shape, scoped to the
+-- authority rather than the intent -- a caller may request authority for
+-- only a subset of its intents declared targets.
+CREATE TABLE IF NOT EXISTS review_authority_targets (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    authority_id   TEXT NOT NULL REFERENCES review_authorities(authority_id) ON DELETE CASCADE,
+    path           TEXT NOT NULL,
+    qualified_name TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_review_authority_targets_authority ON review_authority_targets(authority_id);
+
+-- v3 / CCK-09: EAV-style receipt of every bound staleness field, redundant
+-- with review_authorities own typed columns by design -- an auditor or a
+-- future new staleness dimension can read this without needing to know
+-- that table's exact column set, the same spirit CCK-19's verification
+-- receipts are meant to have later in the train.
+CREATE TABLE IF NOT EXISTS review_authority_evidence (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    authority_id  TEXT NOT NULL REFERENCES review_authorities(authority_id) ON DELETE CASCADE,
+    field_name    TEXT NOT NULL,
+    field_value   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_review_authority_evidence_authority ON review_authority_evidence(authority_id);";
 
 const FTS5_SQL: &str = "
 CREATE VIRTUAL TABLE IF NOT EXISTS fts_exact USING fts5(

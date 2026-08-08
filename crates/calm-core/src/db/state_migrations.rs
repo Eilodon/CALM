@@ -30,12 +30,20 @@ pub struct StateMigration {
 }
 
 /// Registered migrations, in ascending `from` order.
-pub const STATE_MIGRATIONS: &[StateMigration] = &[StateMigration {
-    from: 1,
-    to: 2,
-    name: "v2_evidence_snapshots_and_change_intents",
-    apply: v1_to_v2_evidence_snapshots_and_change_intents,
-}];
+pub const STATE_MIGRATIONS: &[StateMigration] = &[
+    StateMigration {
+        from: 1,
+        to: 2,
+        name: "v2_evidence_snapshots_and_change_intents",
+        apply: v1_to_v2_evidence_snapshots_and_change_intents,
+    },
+    StateMigration {
+        from: 2,
+        to: 3,
+        name: "v3_review_authorities",
+        apply: v2_to_v3_review_authorities,
+    },
+];
 
 /// v1->v2 (CCK-07): adds `evidence_snapshots`, `change_intents`,
 /// `change_intent_targets`. Unlike `index.db`'s ALTER-style steps, state.db
@@ -61,6 +69,44 @@ fn v1_to_v2_evidence_snapshots_and_change_intents(conn: &Connection) -> rusqlite
                 rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
                 Some(format!(
                     "state.db v1->v2 migration postcondition failed: table {table:?} does not \
+                     exist -- STATE_SCHEMA_SQL should have created it before this step ran"
+                )),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// v2->v3 (CCK-09, #65): adds `review_authorities`, `review_authority_targets`,
+/// `review_authority_evidence` (same new-table-only, postcondition-check-only
+/// story as v1->v2 -- see that step's doc comment) PLUS a real ALTER TABLE:
+/// `edit_transactions.authority_id` is a new column on an EXISTING table, so
+/// unlike a brand new table, `STATE_SCHEMA_SQL`'s idempotent `CREATE TABLE IF
+/// NOT EXISTS edit_transactions (...)` does NOT retroactively add it to a
+/// file that already has that table from a v1/v2 install. This is CCK-01's
+/// executor's first real ALTER-style step -- mirrors index.db's own
+/// `migrate_add_column` (`db/schema.rs`) idempotency check (`PRAGMA
+/// table_info`) rather than reaching across modules to reuse that private
+/// helper for one column.
+fn v2_to_v3_review_authorities(conn: &Connection) -> rusqlite::Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(edit_transactions)")?;
+    let existing_columns: Vec<String> =
+        stmt.query_map([], |row| row.get::<_, String>(1))?.filter_map(|r| r.ok()).collect();
+    if !existing_columns.iter().any(|c| c == "authority_id") {
+        conn.execute_batch("ALTER TABLE edit_transactions ADD COLUMN authority_id TEXT;")?;
+    }
+
+    for table in ["review_authorities", "review_authority_targets", "review_authority_evidence"] {
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+            [table],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            return Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+                Some(format!(
+                    "state.db v2->v3 migration postcondition failed: table {table:?} does not \
                      exist -- STATE_SCHEMA_SQL should have created it before this step ran"
                 )),
             ));
@@ -277,6 +323,67 @@ mod tests {
     fn unstamped_zero_version_db_reaches_current_via_the_real_registered_migration() {
         let conn = fresh_conn();
         assert_eq!(user_version(&conn), 0);
+        migrate_state_db_to_current(&conn).unwrap();
+        assert_eq!(user_version(&conn), super::super::schema::STATE_DB_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn registered_v2_to_v3_migration_creates_new_tables_and_adds_authority_id_column() {
+        let conn = fresh_conn();
+        conn.pragma_update(None, "user_version", 2).unwrap();
+        migrate_state_db_to_current(&conn).unwrap();
+        assert_eq!(user_version(&conn), super::super::schema::STATE_DB_SCHEMA_VERSION);
+
+        for table in ["review_authorities", "review_authority_targets", "review_authority_evidence"] {
+            let exists: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                    [table],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(exists, "{table} should exist after migrating to current");
+        }
+        let columns: Vec<String> = conn
+            .prepare("PRAGMA table_info(edit_transactions)")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert!(columns.iter().any(|c| c == "authority_id"), "edit_transactions.authority_id should exist");
+    }
+
+    #[test]
+    fn v2_to_v3_alter_table_preserves_existing_edit_transactions_rows() {
+        let conn = fresh_conn();
+        conn.pragma_update(None, "user_version", 2).unwrap();
+        conn.execute(
+            "INSERT INTO edit_transactions \
+             (tx_id, project_id, path, base_digest, proposed_digest, state, created_at, updated_at) \
+             VALUES ('TXN-1', 'proj', 'a.rs', 'base', 'proposed', 'PREPARED', 0.0, 0.0)",
+            [],
+        )
+        .unwrap();
+
+        migrate_state_db_to_current(&conn).unwrap();
+
+        let (path, authority_id): (String, Option<String>) = conn
+            .query_row("SELECT path, authority_id FROM edit_transactions WHERE tx_id = 'TXN-1'", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(path, "a.rs", "pre-existing row must survive the ALTER untouched");
+        assert_eq!(authority_id, None, "a pre-existing row gets NULL for the new column, not an error");
+    }
+
+    #[test]
+    fn v2_to_v3_alter_table_is_idempotent_when_the_column_already_exists() {
+        // Simulates a fresh v0 install jumping straight to v3: init_state_db's
+        // own CREATE TABLE already includes authority_id, so the v2->v3 step's
+        // ALTER TABLE must detect that and skip, not fail with "duplicate
+        // column name".
+        let conn = fresh_conn();
         migrate_state_db_to_current(&conn).unwrap();
         assert_eq!(user_version(&conn), super::super::schema::STATE_DB_SCHEMA_VERSION);
     }
