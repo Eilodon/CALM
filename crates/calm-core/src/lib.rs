@@ -1,4 +1,5 @@
 pub mod analysis;
+pub mod authority;
 #[cfg(feature = "index-bundles")]
 pub mod bundle;
 pub mod config;
