@@ -195,12 +195,34 @@ pub struct CalleeFact {
 pub struct TypeRelationFact {
     pub relation_kind: String,
     pub target_text: String,
+    // PR B (docs/plans/2026-08-08-derived-artifact-hardening-execution-plan.md,
+    // Digest Epistemic Integrity): carried through from type_relations so
+    // render_digest can distinguish a confirmed base/interface from one
+    // extraction/graph::type_resolve never resolved -- never silently
+    // upgrade a textual relation into unhedged prose.
+    pub to_symbol: Option<String>,
+    pub confidence: String,
 }
 
 #[derive(Serialize, Clone)]
 pub struct EffectFact {
     pub effect_kind: String,
     pub target_text: String,
+    // PR B: carried through from symbol_effects (P3a's event/target
+    // confidence split) -- dropping these between T1 and T2 was exactly
+    // the kind of epistemic-metadata loss this plan's own principle
+    // rejects. event_confidence is currently always "exact" (every
+    // extraction site fires only on a real syntactic event); target_confidence
+    // is "none" for a bare raise or an uncertain reference (raise e, raise
+    // factory()) -- see semantic_facts.rs.
+    pub event_confidence: String,
+    pub target_confidence: String,
+    // PR B3: repeated identical (effect_kind, target_text, *_confidence)
+    // facts on the same symbol are deduped to ONE EffectFact before the
+    // MAX_EFFECTS_SHOWN budget cap, so e.g. 5 identical self.cache = ...
+    // writes across a function don't crowd out other distinct facts --
+    // occurrences preserves the count instead of just dropping it.
+    pub occurrences: usize,
 }
 
 /// Everything a digest is rendered from — kept separate from rendering
@@ -240,41 +262,102 @@ pub fn render_digest(facts: &DigestFacts) -> String {
         let callees: Vec<String> = facts.possible_callees.iter().map(format_callee).collect();
         parts.push(format!("Possibly calls: {}.", callees.join(", ")));
     }
-    let extends: Vec<&str> = facts
+    // PR B5: resolved vs textual type relations get separate lines --
+    // "Extends: X." is only ever printed for a CONFIRMED (resolved)
+    // relation; an unresolved one is hedged, never upgraded into unhedged
+    // prose just because it's the only relation of its kind.
+    let extends_resolved: Vec<&str> = facts
         .type_relations
         .iter()
-        .filter(|r| r.relation_kind == "extends")
+        .filter(|r| r.relation_kind == "extends" && r.confidence == "resolved")
         .map(|r| r.target_text.as_str())
         .collect();
-    if !extends.is_empty() {
-        parts.push(format!("Extends: {}.", extends.join(", ")));
+    if !extends_resolved.is_empty() {
+        parts.push(format!("Extends: {}.", extends_resolved.join(", ")));
     }
-    let implements: Vec<&str> = facts
+    let extends_textual: Vec<&str> = facts
         .type_relations
         .iter()
-        .filter(|r| r.relation_kind == "implements")
+        .filter(|r| r.relation_kind == "extends" && r.confidence != "resolved")
         .map(|r| r.target_text.as_str())
         .collect();
-    if !implements.is_empty() {
-        parts.push(format!("Implements: {}.", implements.join(", ")));
+    if !extends_textual.is_empty() {
+        parts.push(format!(
+            "Possibly extends (unresolved): {}.",
+            extends_textual.join(", ")
+        ));
     }
-    let writes: Vec<&str> = facts
+    let implements_resolved: Vec<&str> = facts
+        .type_relations
+        .iter()
+        .filter(|r| r.relation_kind == "implements" && r.confidence == "resolved")
+        .map(|r| r.target_text.as_str())
+        .collect();
+    if !implements_resolved.is_empty() {
+        parts.push(format!("Implements: {}.", implements_resolved.join(", ")));
+    }
+    let implements_textual: Vec<&str> = facts
+        .type_relations
+        .iter()
+        .filter(|r| r.relation_kind == "implements" && r.confidence != "resolved")
+        .map(|r| r.target_text.as_str())
+        .collect();
+    if !implements_textual.is_empty() {
+        parts.push(format!(
+            "Possibly implements (unresolved): {}.",
+            implements_textual.join(", ")
+        ));
+    }
+    let writes: Vec<String> = facts
         .effects
         .iter()
         .filter(|e| e.effect_kind == "write_field")
-        .map(|e| e.target_text.as_str())
+        .map(format_effect_target)
         .collect();
     if !writes.is_empty() {
         parts.push(format!("Writes: {}.", writes.join(", ")));
     }
-    let throws: Vec<&str> = facts
+    // PR B2: a throw's target is only ever printed unhedged when
+    // target_confidence is "exact" -- `raise e`/`raise factory()` (target
+    // text present but not provably an exception TYPE from AST alone) get
+    // a separate hedged line, and a bare `raise` (no target text at all)
+    // becomes its own contentless fact, never "Throws: ." (an empty name
+    // joined into the confident list).
+    let throws: Vec<String> = facts
         .effects
         .iter()
-        .filter(|e| e.effect_kind == "explicit_throw")
-        .map(|e| e.target_text.as_str())
+        .filter(|e| {
+            e.effect_kind == "explicit_throw"
+                && e.target_confidence == "exact"
+                && !e.target_text.is_empty()
+        })
+        .map(format_effect_target)
         .collect();
     if !throws.is_empty() {
         parts.push(format!("Throws: {}.", throws.join(", ")));
+    }
+    let possible_throws: Vec<String> = facts
+        .effects
+        .iter()
+        .filter(|e| {
+            e.effect_kind == "explicit_throw"
+                && e.target_confidence != "exact"
+                && !e.target_text.is_empty()
+        })
+        .map(format_effect_target)
+        .collect();
+    if !possible_throws.is_empty() {
+        parts.push(format!(
+            "Possibly raises (target unresolved): {}.",
+            possible_throws.join(", ")
+        ));
+    }
+    if facts
+        .effects
+        .iter()
+        .any(|e| e.effect_kind == "explicit_throw" && e.target_text.is_empty())
+    {
+        parts.push("Reraises an exception.".to_string());
     }
     if facts.complexity > 1 {
         parts.push(format!("Complexity: {}.", facts.complexity));
@@ -290,6 +373,17 @@ fn format_callee(c: &CalleeFact) -> String {
         c.name.clone()
     } else {
         format!("{} [{}]", c.name, c.role_tags.join(" "))
+    }
+}
+
+// PR B3: renders occurrences > 1 as a "(xN)" suffix so a repeated fact (5
+// identical writes to the same field) is visible as repeated, not silently
+// collapsed into indistinguishable-from-once.
+fn format_effect_target(e: &EffectFact) -> String {
+    if e.occurrences > 1 {
+        format!("{} (x{})", e.target_text, e.occurrences)
+    } else {
+        e.target_text.clone()
     }
 }
 
@@ -313,7 +407,12 @@ fn format_callee(c: &CalleeFact) -> String {
 /// `derived_artifact_versions::graph_derivation_fixture_is_pinned_to_its_version`
 /// (crates/calm-core/tests/derived_artifact_versions.rs) -- bump this AND
 /// that test's expected hash together, in the same commit, never one alone.
-pub const GRAPH_DERIVATION_VERSION: i64 = 3;
+// PR B (Digest Epistemic Integrity, same plan section as PR A above): this
+// bump covers compute_digests's own rendering-logic change directly --
+// confidence-hedged type-relation/throw lines, dedup-with-occurrences for
+// effects, canonical type-relation ordering. The exact case this const's
+// own doc comment above was written for.
+pub const GRAPH_DERIVATION_VERSION: i64 = 4;
 
 /// Recompute every digestable symbol's `symbol_digests` row from current
 /// DB state — see the module doc comment for why this is a full
@@ -408,45 +507,83 @@ pub fn compute_digests(conn: &Connection) -> rusqlite::Result<()> {
 
     let mut type_relations_by_from: HashMap<String, Vec<TypeRelationFact>> = HashMap::new();
     {
-        let mut stmt =
-            conn.prepare("SELECT from_symbol, relation_kind, target_text FROM type_relations")?;
-        let iter = stmt.query_map([], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-            ))
-        })?;
-        for row in iter {
-            let (from, kind, target) = row?;
-            type_relations_by_from
-                .entry(from)
-                .or_default()
-                .push(TypeRelationFact {
-                    relation_kind: kind,
-                    target_text: target,
-                });
-        }
-    }
-
-    let mut effects_by_symbol: HashMap<String, Vec<EffectFact>> = HashMap::new();
-    {
+        // PR B5: to_symbol/confidence carried through so render_digest can
+        // hedge an unresolved relation instead of presenting it as fact.
         let mut stmt = conn.prepare(
-            "SELECT symbol_qn, effect_kind, target_text FROM symbol_effects ORDER BY line",
+            "SELECT from_symbol, relation_kind, target_text, to_symbol, confidence \
+             FROM type_relations",
         )?;
         let iter = stmt.query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
                 r.get::<_, String>(2)?,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, String>(4)?,
             ))
         })?;
         for row in iter {
-            let (qn, kind, target) = row?;
-            effects_by_symbol.entry(qn).or_default().push(EffectFact {
-                effect_kind: kind,
-                target_text: target,
-            });
+            let (from, kind, target, to_symbol, confidence) = row?;
+            type_relations_by_from
+                .entry(from)
+                .or_default()
+                .push(TypeRelationFact {
+                    relation_kind: kind,
+                    target_text: target,
+                    to_symbol,
+                    confidence,
+                });
+        }
+    }
+
+    // PR B1/B3: event_confidence/target_confidence carried through (never
+    // drop epistemic metadata between T1 and T2); repeated identical
+    // (effect_kind, target_text, *_confidence) facts on the same symbol are
+    // deduped to ONE EffectFact with an occurrence count, in first-seen
+    // (line) order, BEFORE the MAX_EFFECTS_SHOWN truncation below runs --
+    // so e.g. 5 identical `self.cache = ...` writes don't crowd the budget.
+    // (effect_kind, target_text, event_confidence, target_confidence) ->
+    // index into that symbol's effects_by_symbol Vec, for O(1) dedup lookup.
+    type EffectDedupKey = (String, String, String, String);
+    let mut effects_by_symbol: HashMap<String, Vec<EffectFact>> = HashMap::new();
+    let mut effect_index_by_symbol: HashMap<String, HashMap<EffectDedupKey, usize>> =
+        HashMap::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT symbol_qn, effect_kind, target_text, event_confidence, target_confidence \
+             FROM symbol_effects ORDER BY line",
+        )?;
+        let iter = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+            ))
+        })?;
+        for row in iter {
+            let (qn, kind, target, event_confidence, target_confidence) = row?;
+            let key = (
+                kind.clone(),
+                target.clone(),
+                event_confidence.clone(),
+                target_confidence.clone(),
+            );
+            let facts = effects_by_symbol.entry(qn.clone()).or_default();
+            let index = effect_index_by_symbol.entry(qn).or_default();
+            if let Some(&i) = index.get(&key) {
+                facts[i].occurrences += 1;
+            } else {
+                index.insert(key, facts.len());
+                facts.push(EffectFact {
+                    effect_kind: kind,
+                    target_text: target,
+                    event_confidence,
+                    target_confidence,
+                    occurrences: 1,
+                });
+            }
         }
     }
 
@@ -484,10 +621,19 @@ pub fn compute_digests(conn: &Connection) -> rusqlite::Result<()> {
         let possible_truncated = possible.len() > MAX_POSSIBLE_CALLEES_SHOWN;
         possible.truncate(MAX_POSSIBLE_CALLEES_SHOWN);
 
-        let type_relations = type_relations_by_from
+        // PR B4: canonical sort + dedup before render -- output must be
+        // stable regardless of DB row-return order (which HashMap grouping
+        // + SQLite don't guarantee canonical across rebuilds).
+        let mut type_relations = type_relations_by_from
             .get(&row.qn)
             .cloned()
             .unwrap_or_default();
+        type_relations.sort_by(|a, b| {
+            (a.relation_kind.as_str(), a.target_text.as_str())
+                .cmp(&(b.relation_kind.as_str(), b.target_text.as_str()))
+        });
+        type_relations
+            .dedup_by(|a, b| a.relation_kind == b.relation_kind && a.target_text == b.target_text);
 
         let mut effects = effects_by_symbol.get(&row.qn).cloned().unwrap_or_default();
         let effects_truncated = effects.len() > MAX_EFFECTS_SHOWN;
@@ -711,15 +857,23 @@ mod tests {
             type_relations: vec![TypeRelationFact {
                 relation_kind: "implements".to_string(),
                 target_text: "SessionRefresher".to_string(),
+                to_symbol: Some("session.py::SessionRefresher".to_string()),
+                confidence: "resolved".to_string(),
             }],
             effects: vec![
                 EffectFact {
                     effect_kind: "write_field".to_string(),
                     target_text: "last_refresh".to_string(),
+                    event_confidence: "exact".to_string(),
+                    target_confidence: "exact".to_string(),
+                    occurrences: 1,
                 },
                 EffectFact {
                     effect_kind: "explicit_throw".to_string(),
                     target_text: "ExpiredToken".to_string(),
+                    event_confidence: "exact".to_string(),
+                    target_confidence: "exact".to_string(),
+                    occurrences: 1,
                 },
             ],
             recursive_component: false,
@@ -840,6 +994,163 @@ mod tests {
         assert_eq!(
             count_after, 0,
             "a deleted symbol's stale digest row must not survive a full recompute"
+        );
+    }
+
+    // PR B2: bare `raise` (no target text) and an uncertain reference
+    // (`raise e`) must never be presented as confirmed exception facts.
+    #[test]
+    fn render_digest_hedges_uncertain_and_bare_throws() {
+        let facts = DigestFacts {
+            name: "handler".to_string(),
+            kind: "function".to_string(),
+            signature: String::new(),
+            complexity: 1,
+            confirmed_callees: vec![],
+            possible_callees: vec![],
+            type_relations: vec![],
+            effects: vec![
+                EffectFact {
+                    effect_kind: "explicit_throw".to_string(),
+                    target_text: String::new(),
+                    event_confidence: "exact".to_string(),
+                    target_confidence: "none".to_string(),
+                    occurrences: 1,
+                },
+                EffectFact {
+                    effect_kind: "explicit_throw".to_string(),
+                    target_text: "e".to_string(),
+                    event_confidence: "exact".to_string(),
+                    target_confidence: "none".to_string(),
+                    occurrences: 1,
+                },
+            ],
+            recursive_component: false,
+            truncated: false,
+        };
+        let text = render_digest(&facts);
+        assert!(
+            !text.contains("Throws: ."),
+            "bare raise must never render as an empty confident throw: {text}"
+        );
+        assert!(
+            !text.contains("Throws: e."),
+            "an uncertain target must never be presented as a confirmed exception type: {text}"
+        );
+        assert!(text.contains("Reraises an exception."), "{text}");
+        assert!(
+            text.contains("Possibly raises (target unresolved): e."),
+            "{text}"
+        );
+    }
+
+    // PR B5: an unresolved (textual) type relation must never render as
+    // unhedged "Extends:"/"Implements:" prose.
+    #[test]
+    fn render_digest_hedges_unresolved_type_relations() {
+        let facts = DigestFacts {
+            name: "Derived".to_string(),
+            kind: "class".to_string(),
+            signature: String::new(),
+            complexity: 1,
+            confirmed_callees: vec![],
+            possible_callees: vec![],
+            type_relations: vec![TypeRelationFact {
+                relation_kind: "extends".to_string(),
+                target_text: "Base".to_string(),
+                to_symbol: None,
+                confidence: "textual".to_string(),
+            }],
+            effects: vec![],
+            recursive_component: false,
+            truncated: false,
+        };
+        let text = render_digest(&facts);
+        assert!(!text.contains("Extends: Base."), "{text}");
+        assert!(
+            text.contains("Possibly extends (unresolved): Base."),
+            "{text}"
+        );
+    }
+
+    // PR B3: an EffectFact with occurrences > 1 renders with a count
+    // suffix, so a repeated fact stays visibly repeated after dedup.
+    #[test]
+    fn render_digest_shows_occurrence_count_for_repeated_writes() {
+        let facts = DigestFacts {
+            name: "save".to_string(),
+            kind: "method".to_string(),
+            signature: String::new(),
+            complexity: 1,
+            confirmed_callees: vec![],
+            possible_callees: vec![],
+            type_relations: vec![],
+            effects: vec![EffectFact {
+                effect_kind: "write_field".to_string(),
+                target_text: "cache".to_string(),
+                event_confidence: "exact".to_string(),
+                target_confidence: "exact".to_string(),
+                occurrences: 5,
+            }],
+            recursive_component: false,
+            truncated: false,
+        };
+        assert!(render_digest(&facts).contains("Writes: cache (x5)."));
+    }
+
+    // PR B3/B4, end-to-end through compute_digests (not just render_digest
+    // against a hand-built DigestFacts): 5 identical writes on the same
+    // line-varying symbol_effects rows must dedupe to one fact with an
+    // occurrence count, and two type_relations rows inserted out of
+    // alphabetical order must render sorted -- canonical output must not
+    // depend on DB insertion/iteration order.
+    #[test]
+    fn compute_digests_dedupes_repeated_effects_and_canonicalizes_type_relations() {
+        let conn = test_conn();
+        conn.execute(
+            "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, name_tokens) \
+             VALUES ('a.py::Foo::save', 'save', 'method', 'python', 'a.py', 1, 10, 'save')",
+            [],
+        )
+        .unwrap();
+        for line in 1..=5 {
+            conn.execute(
+                "INSERT INTO symbol_effects (symbol_qn, effect_kind, target_text, source_path, line) \
+                 VALUES ('a.py::Foo::save', 'write_field', 'cache', 'a.py', ?1)",
+                [line],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO type_relations (from_symbol, relation_kind, target_text, confidence, source_path, line) \
+             VALUES ('a.py::Foo::save', 'implements', 'Zeta', 'textual', 'a.py', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO type_relations (from_symbol, relation_kind, target_text, confidence, source_path, line) \
+             VALUES ('a.py::Foo::save', 'implements', 'Alpha', 'textual', 'a.py', 2)",
+            [],
+        )
+        .unwrap();
+
+        compute_digests(&conn).unwrap();
+
+        let rendered: String = conn
+            .query_row(
+                "SELECT rendered_text FROM symbol_digests WHERE symbol_qn = 'a.py::Foo::save'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            rendered.contains("Writes: cache (x5)."),
+            "5 identical writes must dedupe to one fact with an occurrence count: {rendered}"
+        );
+        assert!(
+            rendered.contains("Possibly implements (unresolved): Alpha, Zeta."),
+            "type relations must render sorted (Alpha before Zeta) regardless of \
+             insertion order: {rendered}"
         );
     }
 }

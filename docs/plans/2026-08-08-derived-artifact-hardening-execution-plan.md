@@ -2,9 +2,10 @@
 title: "Derived-artifact hardening — Group D execution plan (verified against live source)"
 date: 2026-08-08
 status: "P1 + P2 + P3a + P4 (core resolver) + PR A (P4.1 resolver soundness, PR C folded in as a
-  doc-only non-bug closure) SHIPPED same day (committed: fb58b2b, 8683c1f, 4fe66bf, 11ac87b, 0154378;
-  PR A pending its own commit) — see §5/§6/§7/§8/§9. P3b (Go writes) and several P4/PR A sub-items
-  deliberately deferred with documented reasons — see §7/§8/§9. PR B/D/E/F and P5-P9 not started.
+  doc-only non-bug closure) + PR B (digest epistemic integrity) SHIPPED same day (committed: fb58b2b,
+  8683c1f, 4fe66bf, 11ac87b, 0154378, d7e2329; PR B pending its own commit) — see §5/§6/§7/§8/§9/§10.
+  P3b (Go writes) and several P4/PR A/PR B sub-items deliberately deferred with documented reasons —
+  see §7/§8/§9/§10. PR D/E/F and P5-P9 not started.
   Every 'current state' claim below was read from live source this session (file:line cited),
   and a second verification pass (§0.5) corrected four audit claims that turned out inaccurate
   once traced through the code. This is the durable record the session-local '§4-48
@@ -528,3 +529,79 @@ zero-net-caller-count-change edit — the elicitation round-trip this gate requi
 completion in a non-interactive session. Both were completed via native `Edit` instead (same file,
 test-only code, already fully reasoned through `edit_context` first) — a documented, deliberate
 exception to this repo's calm-first tool policy, not a silent fallback.
+
+## §10. PR B (Digest Epistemic Integrity) execution log (2026-08-08, same session)
+
+Same audit round as §9's PR A, second finding: T1's confidence metadata (P3a, `event_confidence`/
+`target_confidence` on `symbol_effects`; `confidence`/`to_symbol` on `type_relations`) was captured
+correctly at the source but silently dropped between T1 and T2 -- `EffectFact`/`TypeRelationFact`
+(the structs `compute_digests` builds and `render_digest` reads) never carried it, so an uncertain
+fact (`raise e`, a textual/unresolved base class) rendered in `symbol_digests.rendered_text`
+identically to a confirmed one. Verified concretely, not just in the abstract: traced `detect_python_
+throw`'s bare-`raise` case (`target_text = ""`) all the way through the old `render_digest`'s
+`throws.join(", ")` and confirmed it would literally produce `"Throws: ."` -- a real, reachable bug,
+not a hypothetical.
+
+**B1 — confidence carried through.** `EffectFact` gained `event_confidence`/`target_confidence`
+(mirroring `symbol_effects` exactly); `TypeRelationFact` gained `to_symbol`/`confidence` (mirroring
+`type_relations`). Both queries in `compute_digests` updated to select the new columns. Note:
+`ArchitectureDigestOutput` (the MCP-surfaced struct in `calm-server`) only ever exposes
+`rendered_text`, never `facts_json` -- confirmed by reading `fetch_architecture_digest` before
+starting, so this change has zero MCP-schema/toolsnap surface and only affects `render_digest`'s
+prose output.
+
+**B2 — uncertain throws render as hedged, not confident, prose.** `render_digest` now splits
+`explicit_throw` effects three ways: `target_confidence == "exact"` and non-empty text →
+`"Throws: X."` (unchanged for the common case); non-`"exact"` with text (`raise e`, `raise
+factory()`) → a separate `"Possibly raises (target unresolved): X."` line, same hedge vocabulary
+`"Possibly calls:"` already established for `Inferred`-confidence callees; empty text (bare `raise`)
+→ a single contentless `"Reraises an exception."` fact, never joined into either list. Fixes the
+`"Throws: ."` bug directly.
+
+**B3 — repeated identical effects dedupe to one fact with an occurrence count, before the
+`MAX_EFFECTS_SHOWN` truncation.** `EffectFact` gained `occurrences: usize`; `compute_digests` builds
+`effects_by_symbol` with an auxiliary `HashMap<EffectDedupKey, usize>` index per symbol so 5 identical
+`self.cache = ...` writes across a function become one `EffectFact { occurrences: 5, .. }` instead of
+5 entries competing for the same fixed budget. `render_digest`'s new `format_effect_target` helper
+renders `"cache (x5)"` when `occurrences > 1`, plain `"cache"` otherwise -- ASCII `(xN)`, not a `×`
+glyph, to avoid any encoding-fragility risk in a string that flows through `sanitize_source_output`/
+`injection_warning` at the MCP boundary.
+
+**B4 — type relations canonically sorted and deduped before render.** Previously assembled straight
+from `HashMap` iteration + raw SQL row order (SQLite's return order is usually-but-not-guaranteed
+insertion order) -- now sorted by `(relation_kind, target_text)` and deduped on that same key inside
+the per-row loop, matching the sort+dedup `confirmed_callees`/`possible_callees` already had (this
+was the asymmetry the audit flagged: callees were canonicalized, type relations weren't).
+
+**B5 — resolved vs. textual type relations get separate lines.** `render_digest` now filters
+`extends`/`implements` by `confidence == "resolved"` for the unhedged `"Extends:"`/`"Implements:"`
+lines, and a parallel `confidence != "resolved"` filter for `"Possibly extends (unresolved):"`/
+`"Possibly implements (unresolved):"` -- an unresolved relation is never upgraded into unhedged prose
+just because extraction only found the one candidate.
+
+**B6 — `GRAPH_DERIVATION_VERSION` bumped 3→4** (this is squarely the case its own doc comment
+describes: a `compute_digests` rendering-logic change). The `graph_derivation_fixture`'s pinned hash
+was unaffected -- verified by running the test, not assumed: that fixture's single throw/write/extends
+facts all have `occurrences == 1` and `confidence == "resolved"`, so B2-B5's new branches are all
+no-ops for that specific frozen input and the rendered text is byte-identical to before.
+
+**Verified:** 4 new unit tests (`render_digest_hedges_uncertain_and_bare_throws`,
+`render_digest_hedges_unresolved_type_relations`, `render_digest_shows_occurrence_count_for_repeated_
+writes`, and an end-to-end `compute_digests_dedupes_repeated_effects_and_canonicalizes_type_relations`
+that inserts 5 real `symbol_effects` rows + 2 out-of-order `type_relations` rows through the real
+`compute_digests` function, not just against a hand-built `DigestFacts`) plus the existing
+`render_digest_is_factual_and_compact`/`compute_digests_end_to_end_reflects_call_graph_and_t1_facts`
+updated to compile against the new struct fields (assertions unchanged where the fixture's confidence
+values don't exercise the new hedging paths). Full workspace suite green (`calm-core` 1071, `calm-
+server` 367, same `calm-cli`/`daemon_integration` single-threaded caveat as §9), `cargo clippy
+--workspace --all-targets -D warnings` clean (one real type-complexity lint hit and fixed with a local
+`EffectDedupKey` type alias, not suppressed), `cargo fmt --check` clean (via `format_files`, not raw
+`cargo fmt`, after being reminded mid-session that a bare `rustfmt` invocation resolves and reformats
+the whole owning package's mod tree, not just the listed files).
+
+**Deliberately not done:** B5's richer proposal (also carrying `resolution_source` from PR A's new
+column into `TypeRelationFact` to let the renderer eventually distinguish `same_file_ast` from
+`cross_file_unique` provenance in prose, not just resolved/textual) -- `confidence` alone is
+sufficient for the hedge/no-hedge decision render_digest actually needs today; adding a field with no
+current reader would be speculative. Promotable later without another schema change (the column
+already exists from PR A).
