@@ -293,6 +293,21 @@ fn format_callee(c: &CalleeFact) -> String {
     }
 }
 
+/// Bumped whenever `compute_digests`'s rendering/rollup logic changes what a
+/// digest contains (facts included, role-tag derivation, truncation). Folded
+/// into `InputCatalog::index_input_snapshot`'s `context_material` bucket
+/// (`indexer::refresh`) alongside `PACKAGE_GRAPH_VERSION` -- both are fully
+/// recomputed by every `rebuild_graph`/`incremental_graph_update` call, so a
+/// `Context`-class drift (graph rebuild, no reparse) is sufficient to pick up
+/// a bump here, unlike `SOURCE_EXTRACTION_VERSION` which needs a full reparse.
+/// See docs/plans/2026-08-08-derived-artifact-hardening-execution-plan.md P1.
+///
+/// A change here is verified by
+/// `derived_artifact_versions::graph_derivation_fixture_is_pinned_to_its_version`
+/// (crates/calm-core/tests/derived_artifact_versions.rs) -- bump this AND
+/// that test's expected hash together, in the same commit, never one alone.
+pub const GRAPH_DERIVATION_VERSION: i64 = 1;
+
 /// Recompute every digestable symbol's `symbol_digests` row from current
 /// DB state — see the module doc comment for why this is a full
 /// DELETE-then-reinsert, not selective invalidation. Call sites: mirrors

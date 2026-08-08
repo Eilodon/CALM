@@ -68,6 +68,24 @@ pub struct RawEffect {
     pub line: usize,
 }
 
+/// Bumped whenever `extract_type_relations_from_tree`/`extract_effects_from_tree`
+/// (or anything they call: `walk_type_relations`, `walk_effects`, the
+/// per-language `detect_*`/`extract_*` helpers below) changes what a fact
+/// contains or which syntax shapes produce one. Folded into
+/// `InputCatalog::index_input_snapshot`'s `config_material` bucket
+/// (`indexer::refresh`), the SAME bucket already used for `ignore` patterns
+/// and global config files -- so a binary upgrade that changes
+/// source-extraction semantics forces a full re-parse of an already-indexed
+/// install instead of the delta indexer silently skipping unchanged source
+/// bytes and leaving stale `type_relations`/`symbol_effects` rows behind.
+/// See docs/plans/2026-08-08-derived-artifact-hardening-execution-plan.md P1.
+///
+/// A change here is verified by
+/// `derived_artifact_versions::source_extraction_fixture_is_pinned_to_its_version`
+/// (crates/calm-core/tests/derived_artifact_versions.rs) -- bump this AND
+/// that test's expected hash together, in the same commit, never one alone.
+pub const SOURCE_EXTRACTION_VERSION: i64 = 1;
+
 pub fn extract_type_relations_from_tree(
     tree: &Tree,
     source: &str,

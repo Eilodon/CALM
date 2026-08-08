@@ -6920,6 +6920,77 @@ mod tests {
     }
 
     #[test]
+    fn indexing_status_surfaces_derived_status_transitions() {
+        // P1 (docs/plans/2026-08-08-derived-artifact-hardening-execution-plan.md):
+        // locks in the three DerivedStatus transitions end-to-end through
+        // the real indexing_status tool output.
+        let dir = std::env::temp_dir().join(format!("ci_idxstatus_derived_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        // Case 1: no file has ever been indexed -- nothing to be stale
+        // relative to yet.
+        let v = jv(
+            server.indexing_status(rmcp::handler::server::wrapper::Parameters(
+                IndexingStatusParams {
+                    retry_embeddings: false,
+                },
+            )),
+        );
+        assert_eq!(v["derived_status"]["overall"], "needs_baseline");
+        assert_eq!(v["derived_status"]["source_facts"], "needs_baseline");
+        assert_eq!(v["derived_status"]["graph_facts"], "needs_baseline");
+
+        // Case 2: a file IS indexed, but the index-input contract was never
+        // persisted (matches any caller that indexes without also running
+        // the real daemon `bootstrap`, which is the only production path
+        // that calls `persist_index_input_snapshot`) -- Stale, not Ready:
+        // there is data now, but nothing has vouched it matches current
+        // inputs.
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO file_index (path, hash, language, last_indexed) \
+                 VALUES ('a.py', 'h', 'python', 0.0)",
+                [],
+            )
+            .unwrap();
+        }
+        let v = jv(
+            server.indexing_status(rmcp::handler::server::wrapper::Parameters(
+                IndexingStatusParams {
+                    retry_embeddings: false,
+                },
+            )),
+        );
+        assert_eq!(v["derived_status"]["overall"], "stale");
+        assert_eq!(v["derived_status"]["source_facts"], "stale");
+        assert_eq!(v["derived_status"]["graph_facts"], "stale");
+
+        // Case 3: persisting the contract for the CURRENT project state
+        // (what `bootstrap` does right after a real index) marks everything
+        // Ready.
+        {
+            let conn = server.db();
+            let catalog = calm_core::indexer::refresh::InputCatalog::for_project(&dir);
+            calm_core::indexer::refresh::persist_index_input_snapshot(&conn, &catalog).unwrap();
+        }
+        let v = jv(
+            server.indexing_status(rmcp::handler::server::wrapper::Parameters(
+                IndexingStatusParams {
+                    retry_embeddings: false,
+                },
+            )),
+        );
+        assert_eq!(v["derived_status"]["overall"], "ready");
+        assert_eq!(v["derived_status"]["source_facts"], "ready");
+        assert_eq!(v["derived_status"]["graph_facts"], "ready");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     // ADR-A1: `formal_resolution_timeouts` surfaces
     // `calm_core::indexer::pipeline::formal_resolution_timeout_count()` so a
     // cancelled formal resolution is no longer invisible. On a fresh process

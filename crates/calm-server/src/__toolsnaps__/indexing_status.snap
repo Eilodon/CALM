@@ -205,6 +205,49 @@
           "count"
         ]
       },
+      "DerivedArtifactStatusOutput": {
+        "description": "Derived-artifact freshness grouped by which reconciliation bucket\nactually invalidates them (see `InputCatalog::index_input_snapshot`) --\nNOT one status per fact type. `type_relations`/`symbol_effects` share one\nfingerprint (`config_material`, needs a full reparse to heal);\n`symbol_digests`/`package_dependencies` share a different one\n(`context_material`, a graph rebuild suffices). Reporting four\nindependently-looking statuses backed by only two real signals would\nimply false precision.",
+        "type": "object",
+        "properties": {
+          "overall": {
+            "description": "Worst-of-both-buckets convenience summary (`Stale` if either bucket\nis `Stale`, else `NeedsBaseline` if either needs one, else `Ready`) --\nfrom `calm_core::indexer::refresh::index_input_drift`'s single 4-way\nresult, for an agent that just wants \"is anything here stale\" without\nreading both fields below.",
+            "$ref": "#/$defs/DerivedStatus"
+          },
+          "source_facts": {
+            "description": "Covers `semantic_facts` (`type_relations` + `symbol_effects`) --\nkeyed by `SOURCE_EXTRACTION_VERSION`.",
+            "$ref": "#/$defs/DerivedStatus"
+          },
+          "graph_facts": {
+            "description": "Covers `architecture_digest` + `package_dependencies` -- keyed by\n`GRAPH_DERIVATION_VERSION` + `PACKAGE_GRAPH_VERSION`.",
+            "$ref": "#/$defs/DerivedStatus"
+          }
+        },
+        "required": [
+          "overall",
+          "source_facts",
+          "graph_facts"
+        ]
+      },
+      "DerivedStatus": {
+        "description": "P1 (docs/plans/2026-08-08-derived-artifact-hardening-execution-plan.md):\nwhether a class of derived rows is trustworthy against the CURRENT\nnon-source inputs (see `calm_core::indexer::refresh::index_input_drift`),\nreplacing the previous ambiguous \"row present or absent\" signal --\nabsence used to mean \"never computed\" OR \"this repo genuinely has none\"\nOR \"stale after a config/logic change\" indistinguishably, and those call\nfor different agent reactions.\n\nOnly the three states backed by a real signal today are modeled.\n`unsupported`/`failed`/`disabled` (part of the original design sketch)\nare deliberately omitted: nothing in the pipeline tracks per-extractor\nfailure or a disable flag yet, and fabricating those from unrelated\nsignals would be worse than leaving them out.",
+        "oneOf": [
+          {
+            "description": "Consistent with current source/config/context inputs as of the last\nsuccessful (re)index -- may still be legitimately EMPTY (a repo with\nzero throws is `Ready` with `explicit_throws: 0`, not `NeedsBaseline`).",
+            "type": "string",
+            "const": "ready"
+          },
+          {
+            "description": "No index has ever run (`file_index` is empty) -- nothing to be stale\nrelative to yet.",
+            "type": "string",
+            "const": "needs_baseline"
+          },
+          {
+            "description": "The persisted `index_input_state` contract disagrees with the\nproject's current config/context files, or predates whichever\n`*_VERSION` const now covers this fact type -- rows may reflect\nextraction/derivation logic older than the running binary.\nSelf-heals on the next incremental reindex/graph rebuild (see\n`index_input_drift`'s doc comment).",
+            "type": "string",
+            "const": "stale"
+          }
+        ]
+      },
       "IdentityMigrationStatusOutput": {
         "type": "object",
         "properties": {
@@ -587,6 +630,10 @@
       "package_dependencies": {
         "description": "T4a Package Dependency Graph (2026-08-07 roadmap, TIER 4 first\nstage) — DECLARED external dependencies parsed from manifest files\n(Cargo.toml/package.json/go.mod/requirements.txt/pyproject.toml).\nSee `indexer::package_deps`'s module doc comment for exactly what\nis and isn't covered (notably: no Java pom.xml/build.gradle yet).",
         "$ref": "#/$defs/PackageDependenciesStatusOutput"
+      },
+      "derived_status": {
+        "description": "P1 (docs/plans/2026-08-08-derived-artifact-hardening-execution-plan.md):\nfreshness of `semantic_facts`/`architecture_digest`/`package_dependencies`\nabove against the CURRENT project inputs -- see `DerivedArtifactStatusOutput`'s\ndoc comment for why this is two grouped statuses, not one per field.",
+        "$ref": "#/$defs/DerivedArtifactStatusOutput"
       },
       "identity_migration": {
         "description": "Diagnostic state of the one-transaction CallSite identity migration.\nAbsent until a legacy database actually requires that migration.",

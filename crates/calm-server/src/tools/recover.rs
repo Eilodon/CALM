@@ -150,6 +150,26 @@ impl CalmServer {
                 package_dependencies.manifests = manifests_total;
             }
 
+            // P1 (docs/plans/2026-08-08-derived-artifact-hardening-execution-plan.md):
+            // derived-artifact freshness against the CURRENT project inputs.
+            let derived_status = {
+                let catalog =
+                    calm_core::indexer::refresh::InputCatalog::for_project(&self.project_root);
+                let overall = derived_status_from_drift(
+                    files,
+                    calm_core::indexer::refresh::index_input_drift(&conn, &catalog)
+                        .unwrap_or(calm_core::indexer::refresh::IndexInputDrift::Unknown),
+                );
+                let buckets = calm_core::indexer::refresh::index_input_bucket_drift(&conn, &catalog)
+                    .ok()
+                    .flatten();
+                DerivedArtifactStatusOutput {
+                    overall,
+                    source_facts: derived_status_from_bucket(files, buckets.map(|(c, _)| c)),
+                    graph_facts: derived_status_from_bucket(files, buckets.map(|(_, g)| g)),
+                }
+            };
+
             let architecture_digest = conn
                 .query_row(
                     "SELECT COUNT(*), COALESCE(SUM(recursive_component), 0), COALESCE(SUM(truncated), 0) \
@@ -286,6 +306,7 @@ impl CalmServer {
                 semantic_facts,
                 architecture_digest,
                 package_dependencies,
+                derived_status,
                 identity_migration,
                 graph_mode: self.last_graph_mode.read_ok().clone(),
                 watcher,
@@ -833,6 +854,11 @@ pub(crate) struct IndexingStatusOutput {
     /// See `indexer::package_deps`'s module doc comment for exactly what
     /// is and isn't covered (notably: no Java pom.xml/build.gradle yet).
     pub(crate) package_dependencies: PackageDependenciesStatusOutput,
+    /// P1 (docs/plans/2026-08-08-derived-artifact-hardening-execution-plan.md):
+    /// freshness of `semantic_facts`/`architecture_digest`/`package_dependencies`
+    /// above against the CURRENT project inputs -- see `DerivedArtifactStatusOutput`'s
+    /// doc comment for why this is two grouped statuses, not one per field.
+    pub(crate) derived_status: DerivedArtifactStatusOutput,
     /// Diagnostic state of the one-transaction CallSite identity migration.
     /// Absent until a legacy database actually requires that migration.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1038,6 +1064,101 @@ pub(crate) struct PackageDependenciesStatusOutput {
 pub(crate) struct PackageEcosystemCountOutput {
     pub(crate) ecosystem: String,
     pub(crate) count: i64,
+}
+
+/// P1 (docs/plans/2026-08-08-derived-artifact-hardening-execution-plan.md):
+/// whether a class of derived rows is trustworthy against the CURRENT
+/// non-source inputs (see `calm_core::indexer::refresh::index_input_drift`),
+/// replacing the previous ambiguous "row present or absent" signal --
+/// absence used to mean "never computed" OR "this repo genuinely has none"
+/// OR "stale after a config/logic change" indistinguishably, and those call
+/// for different agent reactions.
+///
+/// Only the three states backed by a real signal today are modeled.
+/// `unsupported`/`failed`/`disabled` (part of the original design sketch)
+/// are deliberately omitted: nothing in the pipeline tracks per-extractor
+/// failure or a disable flag yet, and fabricating those from unrelated
+/// signals would be worse than leaving them out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum DerivedStatus {
+    /// Consistent with current source/config/context inputs as of the last
+    /// successful (re)index -- may still be legitimately EMPTY (a repo with
+    /// zero throws is `Ready` with `explicit_throws: 0`, not `NeedsBaseline`).
+    Ready,
+    /// No index has ever run (`file_index` is empty) -- nothing to be stale
+    /// relative to yet.
+    NeedsBaseline,
+    /// The persisted `index_input_state` contract disagrees with the
+    /// project's current config/context files, or predates whichever
+    /// `*_VERSION` const now covers this fact type -- rows may reflect
+    /// extraction/derivation logic older than the running binary.
+    /// Self-heals on the next incremental reindex/graph rebuild (see
+    /// `index_input_drift`'s doc comment).
+    Stale,
+}
+
+/// Derived-artifact freshness grouped by which reconciliation bucket
+/// actually invalidates them (see `InputCatalog::index_input_snapshot`) --
+/// NOT one status per fact type. `type_relations`/`symbol_effects` share one
+/// fingerprint (`config_material`, needs a full reparse to heal);
+/// `symbol_digests`/`package_dependencies` share a different one
+/// (`context_material`, a graph rebuild suffices). Reporting four
+/// independently-looking statuses backed by only two real signals would
+/// imply false precision.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub(crate) struct DerivedArtifactStatusOutput {
+    /// Worst-of-both-buckets convenience summary (`Stale` if either bucket
+    /// is `Stale`, else `NeedsBaseline` if either needs one, else `Ready`) --
+    /// from `calm_core::indexer::refresh::index_input_drift`'s single 4-way
+    /// result, for an agent that just wants "is anything here stale" without
+    /// reading both fields below.
+    pub(crate) overall: DerivedStatus,
+    /// Covers `semantic_facts` (`type_relations` + `symbol_effects`) --
+    /// keyed by `SOURCE_EXTRACTION_VERSION`.
+    pub(crate) source_facts: DerivedStatus,
+    /// Covers `architecture_digest` + `package_dependencies` -- keyed by
+    /// `GRAPH_DERIVATION_VERSION` + `PACKAGE_GRAPH_VERSION`.
+    pub(crate) graph_facts: DerivedStatus,
+}
+
+/// Maps one reconciliation bucket's raw match bool (from
+/// `calm_core::indexer::refresh::index_input_bucket_drift`) to the
+/// agent-facing `DerivedStatus`. `bucket_match: None` means the whole
+/// lookup was `Unknown` (no persisted contract row, or a policy-version
+/// mismatch) -- `indexed_files == 0` then disambiguates "never indexed"
+/// (`NeedsBaseline`) from "contract missing/corrupt on an otherwise-
+/// populated index" (`Stale`, since there IS prior data whose
+/// trustworthiness is now in question).
+pub(crate) fn derived_status_from_bucket(
+    indexed_files: i64,
+    bucket_match: Option<bool>,
+) -> DerivedStatus {
+    match bucket_match {
+        None if indexed_files == 0 => DerivedStatus::NeedsBaseline,
+        None => DerivedStatus::Stale,
+        Some(true) => DerivedStatus::Ready,
+        Some(false) => DerivedStatus::Stale,
+    }
+}
+
+/// Maps a raw `IndexInputDrift` (see `indexer::refresh`) to the
+/// agent-facing `DerivedStatus` for one reconciliation bucket.
+/// `indexed_files == 0` disambiguates `Unknown` (no persisted contract row
+/// yet) between "never indexed" and "contract missing/corrupt on an
+/// otherwise-populated index" -- the latter is `Stale`, not `NeedsBaseline`,
+/// since there IS prior data whose trustworthiness is now in question.
+pub(crate) fn derived_status_from_drift(
+    indexed_files: i64,
+    drift: calm_core::indexer::refresh::IndexInputDrift,
+) -> DerivedStatus {
+    use calm_core::indexer::refresh::IndexInputDrift;
+    match drift {
+        IndexInputDrift::Clean => DerivedStatus::Ready,
+        IndexInputDrift::Configuration | IndexInputDrift::Context => DerivedStatus::Stale,
+        IndexInputDrift::Unknown if indexed_files == 0 => DerivedStatus::NeedsBaseline,
+        IndexInputDrift::Unknown => DerivedStatus::Stale,
+    }
 }
 
 #[derive(Serialize, JsonSchema)]

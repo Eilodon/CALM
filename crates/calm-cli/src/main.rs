@@ -541,6 +541,15 @@ async fn main() -> Result<()> {
                         // semantic.dimensions (config, possibly stale) — see
                         // Embedder::load and create_embedding_table's self-heal.
                         calm_core::embedding::create_embedding_table(&conn, embedder.dim())?;
+                        // P1 (docs/plans/2026-08-08-derived-artifact-hardening-execution-plan.md):
+                        // catches a same-dimension MODEL swap that
+                        // heal_dimension_mismatch (dimension-only) cannot --
+                        // must run before anything is embedded below.
+                        calm_core::embedding::heal_embedding_space_mismatch(
+                            &conn,
+                            &semantic.model,
+                            embedder.dim(),
+                        )?;
                         let n = calm_core::embedding::embed_pending(&conn, &embedder)?;
                         calm_core::embedding::create_chunk_embedding_table(&conn, embedder.dim())?;
                         let nc = calm_core::embedding::embed_pending_chunks(&conn, &embedder)?;

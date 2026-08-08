@@ -85,6 +85,22 @@ pub fn scan_project(project_root: &Path, ignore: &[String]) -> Vec<RawPackageDep
     out
 }
 
+/// Bumped whenever a manifest parser's extraction rules change (a new
+/// dependency kind recognized, a new manifest shape supported, a fix to what
+/// counts as a version spec). Folded into `InputCatalog::index_input_snapshot`'s
+/// `context_material` bucket (`indexer::refresh`) alongside
+/// `GRAPH_DERIVATION_VERSION` -- package deps are recomputed by every graph
+/// rebuild (`compute_package_dependencies` is called from both
+/// `pipeline::rebuild_graph` and `pipeline::incremental_graph_update`), never
+/// reparsed from source directly, so a `Context`-class drift is sufficient.
+/// See docs/plans/2026-08-08-derived-artifact-hardening-execution-plan.md P1.
+///
+/// A change here is verified by
+/// `derived_artifact_versions::package_graph_fixture_is_pinned_to_its_version`
+/// (crates/calm-core/tests/derived_artifact_versions.rs) -- bump this AND
+/// that test's expected hash together, in the same commit, never one alone.
+pub const PACKAGE_GRAPH_VERSION: i64 = 1;
+
 /// Full DELETE-then-reinsert into `package_dependencies` -- same posture
 /// as `graph::digest::compute_digests` (manifests are small, re-scanning
 /// on every rebuild is cheap, no selective invalidation needed). Called
@@ -335,6 +351,36 @@ fn parse_pyproject_toml(content: &str) -> Vec<RawPackageDependency> {
             out.push(dep(name, version, "pypi", kind));
         }
     }
+    // Modern Poetry dependency groups (Poetry 1.2+):
+    // `[tool.poetry.group.<name>.dependencies]`. Every group here is
+    // supplementary by definition (the `main` group is `[tool.poetry.dependencies]`
+    // above, never expressed as `group.main`), so all of them map to `dev` --
+    // same posture as the legacy `dev-dependencies` table, and consistent
+    // with this scanner only distinguishing runtime vs. non-runtime, not
+    // Poetry's own free-form group names.
+    if let Some(groups) = doc
+        .get("tool")
+        .and_then(|t| t.get("poetry"))
+        .and_then(|p| p.get("group"))
+        .and_then(|g| g.as_table())
+    {
+        for group in groups.values() {
+            let Some(table) = group.get("dependencies").and_then(|d| d.as_table()) else {
+                continue;
+            };
+            for (name, value) in table {
+                if name == "python" {
+                    continue;
+                }
+                let version = match value {
+                    toml::Value::String(s) => Some(s.as_str()),
+                    toml::Value::Table(t) => t.get("version").and_then(|v| v.as_str()),
+                    _ => None,
+                };
+                out.push(dep(name, version, "pypi", "dev"));
+            }
+        }
+    }
     out
 }
 
@@ -494,6 +540,39 @@ pytest = "^7.0"
             "python version constraint is not a dependency"
         );
         assert!(deps.iter().any(|d| d.name == "pytest" && d.kind == "dev"));
+    }
+
+    #[test]
+    fn pyproject_toml_modern_poetry_dependency_groups() {
+        let deps = parse_pyproject_toml(
+            r#"
+[tool.poetry.dependencies]
+python = "^3.11"
+fastapi = "^0.100"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^7.0"
+
+[tool.poetry.group.docs.dependencies]
+mkdocs = "^1.5"
+"#,
+        );
+        assert!(
+            deps.iter()
+                .any(|d| d.name == "fastapi" && d.kind == "runtime")
+        );
+        assert!(
+            deps.iter().any(|d| d.name == "pytest" && d.kind == "dev"),
+            "modern [tool.poetry.group.dev.dependencies] must be scanned: {deps:?}"
+        );
+        assert!(
+            deps.iter().any(|d| d.name == "mkdocs" && d.kind == "dev"),
+            "an arbitrarily-named group (docs) must still be scanned as dev: {deps:?}"
+        );
+        assert!(
+            !deps.iter().any(|d| d.name == "python"),
+            "python version constraint is not a dependency"
+        );
     }
 
     #[test]

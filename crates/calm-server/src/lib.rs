@@ -666,6 +666,19 @@ pub fn bootstrap_embeddings(
         *last_embed_error.write_ok() = Some(msg);
         return;
     }
+    // P1 (docs/plans/2026-08-08-derived-artifact-hardening-execution-plan.md):
+    // catches a same-dimension MODEL swap that heal_dimension_mismatch
+    // (dimension-only) cannot -- must run after both tables above exist,
+    // before anything is embedded into them.
+    if let Err(e) =
+        calm_core::embedding::heal_embedding_space_mismatch(conn, &semantic.model, model.dim())
+    {
+        let msg = format!("Embedding space marker update failed: {e}");
+        tracing::error!("{msg}");
+        *status.write_ok() = EmbedStatus::Failed;
+        *last_embed_error.write_ok() = Some(msg);
+        return;
+    }
     *status.write_ok() = EmbedStatus::Embedding;
     match calm_core::embedding::embed_pending(conn, model.as_ref()) {
         Ok(n) => tracing::info!("Embedded {n} symbols"),

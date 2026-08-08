@@ -492,6 +492,16 @@ impl InputCatalog {
                 &input_file_fingerprint(&self.root.join(relative)),
             );
         }
+        // P1 (docs/plans/2026-08-08-derived-artifact-hardening-execution-plan.md):
+        // source-extraction logic changes what a reparse of unchanged source
+        // bytes would produce, so it belongs in the SAME bucket as `ignore`/
+        // global config -- a bump here forces the full-reparse path
+        // (`IndexInputDrift::Configuration`), not just a graph rebuild.
+        append_input_fingerprint(
+            &mut config_material,
+            "source_extraction_version",
+            &crate::indexer::semantic_facts::SOURCE_EXTRACTION_VERSION.to_string(),
+        );
 
         let mut context_material =
             format!("index-input-context-v{INDEX_INPUT_STATE_POLICY_VERSION}\n");
@@ -502,6 +512,20 @@ impl InputCatalog {
                 &input_file_fingerprint(&self.root.join(relative)),
             );
         }
+        // P1: graph- and package-derivation logic is fully recomputed by
+        // every graph rebuild (never reparsed from source), so a bump here
+        // only needs the cheaper `IndexInputDrift::Context` path
+        // (`rebuild_graph_from_index`), not a full reparse.
+        append_input_fingerprint(
+            &mut context_material,
+            "graph_derivation_version",
+            &crate::graph::digest::GRAPH_DERIVATION_VERSION.to_string(),
+        );
+        append_input_fingerprint(
+            &mut context_material,
+            "package_graph_version",
+            &crate::indexer::package_deps::PACKAGE_GRAPH_VERSION.to_string(),
+        );
 
         IndexInputSnapshot {
             config_fingerprint: crate::indexer::pipeline::hash_content(&config_material),
@@ -605,6 +629,52 @@ pub fn persist_index_input_snapshot(
         ],
     )?;
     Ok(())
+}
+
+/// Independent per-bucket comparison, standing alongside `index_input_drift`
+/// without touching it -- exposed separately because `type_relations`/
+/// `symbol_effects` (`config_material`) and `symbol_digests`/
+/// `package_dependencies` (`context_material`) need their OWN freshness
+/// signal (P1, docs/plans/2026-08-08-derived-artifact-hardening-execution-plan.md):
+/// `index_input_drift`'s single 4-way result short-circuits on a config
+/// mismatch without checking context -- exactly right for deciding ONE
+/// reconciliation action (a config mismatch already implies "do the more
+/// expensive of the two"), but would wrongly report BOTH buckets stale if
+/// reused naively per-bucket. Deliberately duplicates `index_input_drift`'s
+/// small query rather than refactoring it into a shared helper: that
+/// function has >10 transitive callers across the daemon bootstrap and
+/// watcher-refresh paths, so this repo's own edit-safety gate correctly
+/// treats changing it as needing independent human review, not a same-pass
+/// drive-by refactor -- see the git history around this comment for the
+/// rejected attempt. `None` means "unknown" (no persisted contract row, or
+/// its `policy_version` predates this binary) -- the same gate
+/// `index_input_drift` uses for its own `Unknown` variant.
+pub fn index_input_bucket_drift(
+    conn: &rusqlite::Connection,
+    catalog: &InputCatalog,
+) -> rusqlite::Result<Option<(bool, bool)>> {
+    use rusqlite::OptionalExtension;
+
+    let stored: Option<(i64, String, String)> = conn
+        .query_row(
+            "SELECT policy_version, config_fingerprint, context_fingerprint \
+             FROM index_input_state WHERE id = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((policy_version, config_fingerprint, context_fingerprint)) = stored else {
+        return Ok(None);
+    };
+    if policy_version != INDEX_INPUT_STATE_POLICY_VERSION {
+        return Ok(None);
+    }
+
+    let current = catalog.index_input_snapshot();
+    Ok(Some((
+        config_fingerprint == current.config_fingerprint,
+        context_fingerprint == current.context_fingerprint,
+    )))
 }
 
 /// Compare a persisted index-input contract to the current filesystem.

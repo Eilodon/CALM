@@ -20,6 +20,15 @@ pub const ENABLED: bool = cfg!(feature = "embeddings");
 /// HuggingFace Hub — kept as one constant so the two can't drift apart.
 pub const DEFAULT_MODEL_ID: &str = "minishlab/potion-code-16M";
 
+/// P1 (docs/plans/2026-08-08-derived-artifact-hardening-execution-plan.md):
+/// bumped whenever CALM's OWN embedding-input assembly changes shape --
+/// today that's just `symbol_doc`'s formatting (the text actually fed to
+/// the model). Folded into `heal_embedding_space_mismatch`'s stored marker
+/// alongside the model id, so a change here forces the same re-embed a
+/// model swap does, even though neither the model id nor the vector
+/// dimension changed.
+pub const EMBEDDING_SPACE_VERSION: u32 = 1;
+
 /// The text embedded for a symbol: name + signature + docstring. This is
 /// Layer 1 of semantic search — *symbol identity*. Layer 2 (`code_chunks` /
 /// `code_chunk_vecs`, populated by `indexer::chunker`) embeds the raw code
@@ -580,6 +589,66 @@ mod imp {
         Ok(())
     }
 
+    /// P1: extends the dimension-only self-heal above to catch a
+    /// same-dimension MODEL swap (or a bump to `EMBEDDING_SPACE_VERSION`
+    /// after a change to `symbol_doc`'s formatting), which a stored-vector
+    /// blob-length peek alone cannot distinguish from "nothing changed" --
+    /// two different models can share a dimension. Call once per process
+    /// after both `create_embedding_table`/`create_chunk_embedding_table`
+    /// have run, before embedding anything -- clears BOTH vector tables
+    /// together (they always share one embedding space) rather than being
+    /// threaded through each `create_*_table` call individually, which
+    /// would need `model_id` added to their public signatures and every one
+    /// of their ~15 test call sites updated for a check that only matters
+    /// at the two real production call sites
+    /// (`calm-server::lib::bootstrap_embeddings`, `calm-cli::main`).
+    pub fn heal_embedding_space_mismatch(
+        conn: &Connection,
+        model_id: &str,
+        dim: usize,
+    ) -> rusqlite::Result<()> {
+        use rusqlite::OptionalExtension;
+
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS embedding_space_state (
+                id       INTEGER PRIMARY KEY CHECK (id = 1),
+                model_id TEXT NOT NULL,
+                dim      INTEGER NOT NULL
+            );",
+        )?;
+
+        let current_key = format!("{model_id}#v{EMBEDDING_SPACE_VERSION}");
+        let stored: Option<(String, i64)> = conn
+            .query_row(
+                "SELECT model_id, dim FROM embedding_space_state WHERE id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let matches = matches!(&stored, Some((m, d)) if *m == current_key && *d == dim as i64);
+        if !matches {
+            if stored.is_some() {
+                tracing::warn!(
+                    "embedding space changed (model/formatting/dim) since the last index \
+                     run -- clearing embedding_vecs/code_chunk_vecs to re-embed from scratch"
+                );
+            }
+            // Best-effort: a table that doesn't exist yet (this process's
+            // very first run, before `create_embedding_table`/
+            // `create_chunk_embedding_table`) is not an error here.
+            let _ = conn.execute("DELETE FROM embedding_vecs", []);
+            let _ = conn.execute("DELETE FROM code_chunk_vecs", []);
+            invalidate(symbol_cache(), conn);
+            invalidate(chunk_cache(), conn);
+        }
+        conn.execute(
+            "INSERT INTO embedding_space_state (id, model_id, dim) VALUES (1, ?1, ?2) \
+             ON CONFLICT(id) DO UPDATE SET model_id = excluded.model_id, dim = excluded.dim",
+            rusqlite::params![current_key, dim as i64],
+        )?;
+        Ok(())
+    }
+
     pub fn store_embedding(conn: &Connection, symbol_id: i64, vec: &[f32]) -> rusqlite::Result<()> {
         conn.execute(
             "INSERT OR REPLACE INTO embedding_vecs(symbol_id, embedding) VALUES (?1, ?2)",
@@ -603,7 +672,9 @@ mod imp {
     }
 
     /// Embed every symbol that has no embedding yet; returns how many were added.
+    /// Prunes orphaned vectors first -- see `prune_orphaned_symbol_vecs`.
     pub fn embed_pending(conn: &Connection, embedder: &Embedder) -> rusqlite::Result<usize> {
+        prune_orphaned_symbol_vecs(conn)?;
         let rows: Vec<(i64, String, String, String)> = {
             let mut stmt = conn.prepare(
                 "SELECT id, name, signature, docstring FROM symbols \
@@ -673,6 +744,25 @@ mod imp {
         )?;
         if n > 0 {
             invalidate(chunk_cache(), conn);
+        }
+        Ok(n)
+    }
+
+    /// Delete `embedding_vecs` rows whose `symbol_id` no longer exists in
+    /// `symbols` -- the Layer-1 (symbol) counterpart to
+    /// `prune_orphaned_chunk_vecs`. `symbols.id` is `AUTOINCREMENT`, so
+    /// every reindex (full or per-file) that drops a symbol never reuses its
+    /// id -- without this, the dead vector sits in `embedding_vecs` forever,
+    /// still competing for a KNN top-K slot (`knn`'s subsequent `symbols`
+    /// lookup then fails for that id, silently shrinking the effective K)
+    /// on top of the unbounded disk growth across reindex cycles.
+    pub fn prune_orphaned_symbol_vecs(conn: &Connection) -> rusqlite::Result<usize> {
+        let n = conn.execute(
+            "DELETE FROM embedding_vecs WHERE symbol_id NOT IN (SELECT id FROM symbols)",
+            [],
+        )?;
+        if n > 0 {
+            invalidate(symbol_cache(), conn);
         }
         Ok(n)
     }
@@ -816,6 +906,14 @@ mod imp {
         Ok(())
     }
 
+    pub fn heal_embedding_space_mismatch(
+        _conn: &Connection,
+        _model_id: &str,
+        _dim: usize,
+    ) -> rusqlite::Result<()> {
+        Ok(())
+    }
+
     /// Always `false` — there's no vendored asset to be unusable when the
     /// `embeddings` feature itself is off; `Embedder::load`'s own stub
     /// failure below is what surfaces this build's real limitation.
@@ -847,6 +945,9 @@ mod imp {
     pub fn embed_pending(_c: &Connection, _e: &Embedder) -> rusqlite::Result<usize> {
         Ok(0)
     }
+    pub fn prune_orphaned_symbol_vecs(_c: &Connection) -> rusqlite::Result<usize> {
+        Ok(0)
+    }
     pub fn knn(_c: &Connection, _q: &[f32], _k: usize) -> rusqlite::Result<Vec<(i64, f64)>> {
         Ok(Vec::new())
     }
@@ -873,8 +974,9 @@ mod imp {
 
 pub use imp::{
     Embedder, chunk_at, create_chunk_embedding_table, create_embedding_table,
-    default_vendored_asset_unusable, embed_pending, embed_pending_chunks, knn, knn_chunks,
-    prune_orphaned_chunk_vecs, store_chunk_embedding, store_embedding,
+    default_vendored_asset_unusable, embed_pending, embed_pending_chunks,
+    heal_embedding_space_mismatch, knn, knn_chunks, prune_orphaned_chunk_vecs,
+    prune_orphaned_symbol_vecs, store_chunk_embedding, store_embedding,
 };
 
 #[cfg(test)]
@@ -1002,6 +1104,47 @@ mod tests {
         let hits = knn(&conn, &[1.0, 0.0, 0.0, 0.0, 0.0], 1).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].0, 2);
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn heal_embedding_space_mismatch_clears_on_model_swap_at_same_dimension() {
+        use rusqlite::Connection;
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        create_embedding_table(&conn, 3).unwrap();
+        store_embedding(&conn, 1, &[1.0, 0.0, 0.0]).unwrap();
+        heal_embedding_space_mismatch(&conn, "model-a", 3).unwrap();
+
+        let count_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM embedding_vecs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            count_before, 0,
+            "first-ever call (no persisted marker) must clear to establish a fresh baseline"
+        );
+
+        store_embedding(&conn, 3, &[0.0, 0.0, 1.0]).unwrap();
+        // Same dimension, DIFFERENT model id -- heal_dimension_mismatch alone
+        // (blob-length peek) cannot see this; heal_embedding_space_mismatch
+        // must clear anyway.
+        heal_embedding_space_mismatch(&conn, "model-b", 3).unwrap();
+        let count_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM embedding_vecs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            count_after, 0,
+            "a same-dimension model swap must still clear stale vectors"
+        );
+
+        // Calling again with the model that's now current must be a no-op
+        // (no repeated clearing of freshly-embedded vectors).
+        store_embedding(&conn, 2, &[0.0, 1.0, 0.0]).unwrap();
+        heal_embedding_space_mismatch(&conn, "model-b", 3).unwrap();
+        let count_stable: i64 = conn
+            .query_row("SELECT COUNT(*) FROM embedding_vecs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count_stable, 1, "an unchanged model/dim must not re-clear");
     }
 
     /// Defense in depth for anything that manages to leave a mismatched-
@@ -1194,6 +1337,64 @@ mod tests {
         let hits = knn_chunks(&conn, &[0.0, 1.0, 0.0], 10).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].0, 2);
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn prune_orphaned_symbol_vecs_removes_only_dangling_rows() {
+        use rusqlite::Connection;
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        create_embedding_table(&conn, 3).unwrap();
+
+        // id 2 has a matching symbols row; id 1 is an orphan (e.g. left over
+        // from a symbol deleted by a reindex -- symbols.id is AUTOINCREMENT
+        // so a fresh symbol never reuses id 1).
+        conn.execute(
+            "INSERT INTO symbols (id, qualified_name, name, kind, language, path, line_start, line_end) \
+             VALUES (2, 'a.py::foo', 'foo', 'function', 'python', 'a.py', 1, 1)",
+            [],
+        )
+        .unwrap();
+        store_embedding(&conn, 1, &[1.0, 0.0, 0.0]).unwrap();
+        store_embedding(&conn, 2, &[0.0, 1.0, 0.0]).unwrap();
+
+        let pruned = prune_orphaned_symbol_vecs(&conn).unwrap();
+        assert_eq!(pruned, 1, "exactly the dangling id-1 row must be pruned");
+
+        let hits = knn(&conn, &[0.0, 1.0, 0.0], 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, 2);
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn embed_pending_prunes_orphans_before_embedding_new_symbols() {
+        use rusqlite::Connection;
+        const DIM: usize = 256;
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        create_embedding_table(&conn, DIM).unwrap();
+
+        // Orphan left behind by a prior reindex.
+        store_embedding(&conn, 999, &[1.0; DIM]).unwrap();
+
+        let before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM embedding_vecs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(before, 1, "orphan row must exist before embed_pending runs");
+
+        // No real symbols to embed, but embed_pending must still prune first.
+        let embedder = Embedder::load(DEFAULT_MODEL_ID, DIM).unwrap();
+        embed_pending(&conn, &embedder).unwrap();
+
+        let after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM embedding_vecs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            after, 0,
+            "embed_pending must prune the orphan even with no pending symbols"
+        );
     }
 
     /// KNN latency benchmark: 100k synthetic 256-dim vectors, topK=10, a
