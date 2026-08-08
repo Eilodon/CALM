@@ -5,3 +5,4 @@ pub mod digest;
 pub mod hub;
 pub mod path;
 pub mod tokenize;
+pub mod type_resolve;

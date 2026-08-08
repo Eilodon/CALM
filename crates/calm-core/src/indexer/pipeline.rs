@@ -1462,6 +1462,7 @@ fn rebuild_graph(
     crate::graph::hub::update_is_hub_flags(tx, hub_config)?;
     crate::graph::boundary::update_boundary_ambiguous_flags(tx)?;
     crate::graph::churn::update_churn_scores(tx, project_root, churn_since)?;
+    crate::graph::type_resolve::resolve_cross_file_type_relations(tx)?;
     crate::graph::digest::compute_digests(tx)?;
     crate::indexer::package_deps::compute_package_dependencies(tx, project_root, ignore)?;
     Ok(())
@@ -1656,6 +1657,7 @@ pub fn incremental_graph_update(
     crate::graph::hub::update_is_hub_flags(tx, hub_config)?;
     crate::graph::boundary::update_boundary_ambiguous_flags(tx)?;
     crate::graph::churn::update_churn_scores(tx, project_root, churn_since)?;
+    crate::graph::type_resolve::resolve_cross_file_type_relations(tx)?;
     crate::graph::digest::compute_digests(tx)?;
     crate::indexer::package_deps::compute_package_dependencies(tx, project_root, ignore)?;
 

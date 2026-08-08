@@ -1,13 +1,14 @@
 ---
 title: "Derived-artifact hardening — Group D execution plan (verified against live source)"
 date: 2026-08-08
-status: "P1 (keystone) + P2 + P3a SHIPPED same day (P1/P2 committed: fb58b2b, 8683c1f, 4fe66bf;
-  P3a pending its own commit) — see §5/§6/§7. P3b (Go writes) deliberately deferred, not
-  attempted — see §7. P4-P9 not started. Every 'current state' claim below was read from live
-  source this session (file:line cited), and a second verification pass (§0.5) corrected four
-  audit claims that turned out inaccurate once traced through the code. This is the durable
-  record the session-local '§4-48 derived-artifact audit' should have produced (executes the
-  §3 meta-fix of 2026-08-07-audit-findings-recovery-and-open-work-execution-plan.md)."
+status: "P1 + P2 + P3a + P4 (core resolver) SHIPPED same day (committed: fb58b2b, 8683c1f,
+  4fe66bf, 11ac87b; P4 pending its own commit) — see §5/§6/§7/§8. P3b (Go writes) and several
+  P4 sub-items deliberately deferred with documented reasons — see §7/§8. P5-P9 not started.
+  Every 'current state' claim below was read from live source this session (file:line cited),
+  and a second verification pass (§0.5) corrected four audit claims that turned out inaccurate
+  once traced through the code. This is the durable record the session-local '§4-48
+  derived-artifact audit' should have produced (executes the §3 meta-fix of
+  2026-08-07-audit-findings-recovery-and-open-work-execution-plan.md)."
 scope: >
   Ground a large forward-looking audit (Groups B/C/D, its own §4-48) against live CALM code,
   correct the claims verification disproved, and turn the genuine debt (Group D, D1-D9) into a
@@ -385,3 +386,56 @@ receiver-variable-name correlation... isn't wired here yet — deferred."* Rushi
 epistemic-split work (already a meaningful, self-contained unit) risked a subtly-wrong detector — worse than no
 detector, since a mis-attributed write is a false positive the "never guess" principle this whole plan is built
 on explicitly rejects. Left as its own future slice, not silently dropped from the plan.
+
+## §8. P4 execution log (2026-08-08, same session) — core resolver shipped, deliberately narrowed
+
+**Design deviation from the literal spec (stated up front, not discovered mid-implementation):**
+implemented as a **single-table, lifecycle-differentiated-columns** design instead of physically
+splitting `type_relations` into `type_relation_sites`/`type_relation_edges`. `extract_file_data`
+(indexer, per-file, unchanged) still writes `from_symbol`/`relation_kind`/`target_text` and
+same-file-only `to_symbol`; a new graph-wide pass now OWNS upgrading `to_symbol`/`confidence` for
+whatever extraction left unresolved. This gets the exact same indexer/graph separation the 2-table
+design was after, at zero migration cost, and matches how `symbols`/`call_edges` already mix
+indexer- and graph-owned columns in one table elsewhere in this codebase — a better-precedented
+choice than introducing the repo's first physically-split derived-fact table pair.
+
+**Shipped:** new [`graph/type_resolve.rs`](../../crates/calm-core/src/graph/type_resolve.rs) —
+`resolve_cross_file_type_relations`, a self-contained pass (takes only `&Connection`, matching
+`compute_coreness`/`compute_digests`/`compute_package_dependencies`'s existing signatures — does NOT
+reuse `indexer::pipeline`'s private `ResolutionCtx`, respecting the indexer→graph boundary the
+pecorino roadmap pins) wired into both `rebuild_graph` and `incremental_graph_update` alongside those
+same three passes. Resolution ladder: same-file (existing, untouched) → cross-file same-language
+unique bare-name match (`resolved`) → 0 or >1 candidates stay exactly as extraction left them
+(`textual`, never guessed). `GRAPH_DERIVATION_VERSION` bumped 1→2.
+
+**Verified:** 7 unit tests in `type_resolve.rs` itself (unique match, ambiguous stays textual,
+cross-language never conflated, generic/qualified `target_text` stripped correctly via `lookup_name`,
+same-file rows never re-touched, self-heals on a later rebuild once the target exists) + one real
+end-to-end test (`cross_file_type_relation_resolves_after_full_index`,
+`golden_graph_equivalence.rs`) proving it through the ACTUAL pipeline (`extract_file_data` →
+`rebuild_graph`), not just against a synthetic DB. No MCP-layer code touched — `fetch_semantic_facts`
+already reads whatever's in `type_relations.to_symbol` unconditionally, so cross-file-resolved facts
+surface through `symbol_info`/`understand` automatically, already covered by existing tests on that
+read path (confirmed by inspection, not re-tested redundantly). No toolsnap drift.
+
+**Deliberately deferred from the full P4 spec (see §2's original P4 section for the literal steps):**
+- **Import-alias / namespace disambiguation for the multi-candidate case** — when 2+ same-language
+  candidates share a bare name, this v1 stays honestly `textual` rather than narrowing via the
+  referencing file's own imports. Doing that safely needs the same import-alias machinery call-edge
+  resolution already has, reused carefully without violating the boundary this module's doc comment
+  explains staying clear of. A real, scoped follow-up — not attempted here to avoid rebuilding
+  call-edge-resolution-grade complexity inside what should stay a small, auditable pass.
+- **Full `TypeRef` struct** (`display`/`lookup_name`/`qualifier`/`generic_shape`, publicly reusable) —
+  reduced to the private `lookup_name` helper for v1. Promotable to the richer shape later if/when
+  `reference_impact` integration (below) needs it.
+- **SCIP-overlay resolution rung** — extending SCIP ingest to also validate/upgrade `type_relations`
+  (giving `formal` confidence via real type-checked evidence, matching how `call_edges` already gets
+  SCIP-upgraded) is a separate, comparably-sized integration touching `scip::ingest`, a subsystem not
+  touched this session.
+- **Extended syntax breadth** (Rust supertraits, Java/TS multi-interface `extends`) — orthogonal to
+  and independent of this resolver; whatever `type_relations` rows extraction produces (current 5-lang
+  scope, unchanged by P4) now get cross-file resolution, and extraction breadth can grow later without
+  touching the resolver at all.
+- **`reference_impact` integration** — needs the resolver proven correct on real repos first, and
+  `reference_impact`'s exact tier system investigated before wiring in (the plan's own instruction:
+  `likely_change`/`review` tier only, never `must_change`, never the write gate).

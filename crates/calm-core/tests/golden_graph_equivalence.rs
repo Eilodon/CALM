@@ -1425,6 +1425,42 @@ fn full_reindex_does_not_leave_stale_semantic_facts() {
     );
 }
 
+/// P4 (docs/plans/2026-08-08-derived-artifact-hardening-execution-plan.md):
+/// end-to-end proof of the cross-file type-relation resolver through the
+/// REAL pipeline (extraction -> rebuild_graph), not just
+/// `graph::type_resolve`'s own unit tests against a synthetic DB. A base
+/// class defined in a different file must resolve after a full index run
+/// (extraction alone only resolves same-file targets).
+#[test]
+fn cross_file_type_relation_resolves_after_full_index() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("ws");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("base.py"), "class BaseService:\n    pass\n").unwrap();
+    std::fs::write(
+        root.join("derived.py"),
+        "from base import BaseService\n\n\nclass Service(BaseService):\n    pass\n",
+    )
+    .unwrap();
+
+    let db = index_fresh(&root);
+    let (to_symbol, confidence): (Option<String>, String) = db
+        .query_row(
+            "SELECT to_symbol, confidence FROM type_relations WHERE from_symbol = 'derived.py::Service'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+
+    assert_eq!(
+        to_symbol.as_deref(),
+        Some("base.py::BaseService"),
+        "a base class in a different file must resolve after rebuild_graph's \
+         cross-file resolution pass runs, not stay textual"
+    );
+    assert_eq!(confidence, "resolved");
+}
+
 /// Same bug, `type_relations` half: a base-class relation recorded in
 /// version A must not survive a full reindex into a version B that dropped
 /// the base class entirely, even though the class's own qualified name is

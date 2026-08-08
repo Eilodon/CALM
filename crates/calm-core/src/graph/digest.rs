@@ -306,7 +306,7 @@ fn format_callee(c: &CalleeFact) -> String {
 /// `derived_artifact_versions::graph_derivation_fixture_is_pinned_to_its_version`
 /// (crates/calm-core/tests/derived_artifact_versions.rs) -- bump this AND
 /// that test's expected hash together, in the same commit, never one alone.
-pub const GRAPH_DERIVATION_VERSION: i64 = 1;
+pub const GRAPH_DERIVATION_VERSION: i64 = 2;
 
 /// Recompute every digestable symbol's `symbol_digests` row from current
 /// DB state — see the module doc comment for why this is a full
