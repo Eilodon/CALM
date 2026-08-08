@@ -1,13 +1,13 @@
 ---
 title: "Derived-artifact hardening — Group D execution plan (verified against live source)"
 date: 2026-08-08
-status: "P1 (keystone) + P2 SHIPPED same day, both committed (fb58b2b, 8683c1f pre-P2; P2 itself
-  pending its own commit) — see §5/§6. P3-P9 not started. Every 'current state' claim below was
-  read from live source this session (file:line cited), and a second verification pass (§0.5)
-  corrected four audit claims that turned out inaccurate once traced through the code. This is
-  the durable record the session-local '§4-48 derived-artifact audit' should have produced
-  (executes the §3 meta-fix of
-  2026-08-07-audit-findings-recovery-and-open-work-execution-plan.md)."
+status: "P1 (keystone) + P2 + P3a SHIPPED same day (P1/P2 committed: fb58b2b, 8683c1f, 4fe66bf;
+  P3a pending its own commit) — see §5/§6/§7. P3b (Go writes) deliberately deferred, not
+  attempted — see §7. P4-P9 not started. Every 'current state' claim below was read from live
+  source this session (file:line cited), and a second verification pass (§0.5) corrected four
+  audit claims that turned out inaccurate once traced through the code. This is the durable
+  record the session-local '§4-48 derived-artifact audit' should have produced (executes the
+  §3 meta-fix of 2026-08-07-audit-findings-recovery-and-open-work-execution-plan.md)."
 scope: >
   Ground a large forward-looking audit (Groups B/C/D, its own §4-48) against live CALM code,
   correct the claims verification disproved, and turn the genuine debt (Group D, D1-D9) into a
@@ -325,3 +325,63 @@ was low — reconfirms the pattern is specifically about SIGNATURE changes to an
 caller-count risk. Worked around identically: left `fetch_semantic_facts` byte-for-byte untouched and added
 `semantic_facts_content_warning` as a new, purely-inserted sibling function instead, wiring it in at the
 call sites (body edits, not signature edits) rather than threading a third tuple element through the callee.
+
+## §7. P3 execution log (2026-08-08, same session) — P3a shipped, P3b deferred
+
+**P3a (effects epistemic split) — DONE, fully tested.** Split `symbol_effects.confidence` into
+`event_confidence` (certainty an effect happened — always `"exact"` in v1: every extraction site fires only
+on a real syntactic raise/throw/write node) and `target_confidence` (`"exact"` | `"none"` — certainty about
+WHAT the target is). This **recovers** the 3 facts the pre-P3 code silently dropped:
+
+- `raise e` (bound exception variable) — was `.is_empty()`, now `[("explicit_throw", "e", target_confidence: "none")]`.
+- `raise factory()` (lowercase call, PEP-8 heuristic can't tell it from `raise SomeException()`) — same recovery.
+- Bare `raise` (re-raise) — was silently skipped entirely (no target text at all structurally); now recorded
+  with `target_text: ""`, `target_confidence: "none"` — a real throw event previously invisible.
+
+Java/TS/JS throw detection stayed untouched: those require a real `object_creation_expression`/`new_expression`
+constructor node structurally, so they're always `target_confidence: "exact"` when they fire at all — the
+PEP-8-casing uncertainty is Python-specific, verified by reading `detect_java_throw`/`detect_tsjs_throw`
+before assuming a blanket text-casing classifier would be correct (it would have wrongly downgraded
+legitimately-certain Java/TS/JS facts).
+
+- **Schema:** `symbol_effects` gains `event_confidence`/`target_confidence` columns (fresh-install CREATE TABLE
+  + `migrate_add_column` for existing installs — old `confidence` column left in place on upgraded DBs, matching
+  every other migration in `run_migrations`, which are all purely additive).
+- **`SOURCE_EXTRACTION_VERSION` bumped 1→2** — the first real, live exercise of the P1 mechanism: the
+  drift-guard test (`derived_artifact_versions.rs`) correctly FAILED first (hash mismatch), confirming the
+  guard actually catches an unbumped-looking extraction change, then passed once the expected hash was updated
+  alongside the version bump — proof the P1 keystone works as designed, not just in its own unit tests.
+- **Design choice:** confidence classification lives in `walk_effects` (language + kind aware), not inside each
+  per-language `detect_*` function — keeps the 7 existing detectors' signatures untouched and the uncertain-target
+  logic in one place (`language == "python" && kind == "explicit_throw"`), rather than scattering a
+  `looks_like_exception_reference` call into every detector where it wouldn't even be semantically correct for
+  the structurally-certain languages.
+- **Tests:** all 3 previously-dropping tests now assert recovery (kept their original — now slightly stale —
+  names; see the tooling-gate note below for why); new `symbol_info_surfaces_effect_confidence_split` end-to-end
+  test through the real `symbol_info` MCP output; pre-existing `understand_surfaces_architecture_digest_and_t1_facts`
+  updated for the 2 new JSON fields (a real, expected `assert_eq!` full-object-equality failure caught by the full
+  suite run — not a logic bug, just a test needing the same update every other `EffectOutput`-shaped assertion got).
+- **Verified:** full `cargo test --workspace --features embeddings` green, clippy clean, rustfmt clean, `locate`/
+  `symbol_info`/`understand` toolsnaps regenerated (the 3 tools whose schema gained the 2 new `EffectOutput` fields).
+
+**Tooling-gate note (new variant this phase):** renaming an existing #[test] function name (even with zero real
+callers, body untouched) trips the same `HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW` gate a signature change does —
+confirmed by isolating the change (a body-only edit to the same function succeeded cleanly; the identical edit
+plus a name change did not). This is a NEW data point beyond P1/P2's "signature changes escalate" finding:
+identifier RENAMES specifically escalate too, independent of body content. Workaround: kept the 3 recovered-fact
+tests' original names (now slightly stale relative to their new behavior) and added an explanatory comment in
+each rather than renaming, since renaming carries zero functional value that would justify pushing further into
+a gate designed for exactly this kind of caution.
+
+**P3b (Go receiver-field-write detector) — deliberately deferred, not attempted.** `detect_go_write` would need
+to track the enclosing method's receiver PARAMETER NAME (e.g. `r` in `func (r *Foo) M()`) through `walk_effects`'s
+recursive traversal to correctly attribute `r.X = v` as a receiver-field write — unlike Rust's `self`, a language
+keyword unambiguous regardless of binding, Go's receiver is just a regular identifier that could collide with an
+unrelated local variable of the same name in a different function. This needs real design work (extending the
+`current` tuple `walk_effects` already threads through recursion to also carry `Option<String>` receiver name,
+correctly handling pointer vs. value receivers, and testing against false positives on shadowed/non-receiver
+identifiers) that the module's own doc comment already flags as deliberately not wired: *"Go writes: needs
+receiver-variable-name correlation... isn't wired here yet — deferred."* Rushing this alongside P3a's
+epistemic-split work (already a meaningful, self-contained unit) risked a subtly-wrong detector — worse than no
+detector, since a mis-attributed write is a false positive the "never guess" principle this whole plan is built
+on explicitly rejects. Left as its own future slice, not silently dropped from the plan.

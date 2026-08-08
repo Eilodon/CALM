@@ -65,6 +65,14 @@ pub struct RawEffect {
     pub enclosing_line: usize,
     pub effect_kind: &'static str, // "explicit_throw" | "write_field"
     pub target_text: String,
+    /// P3 (docs/plans/2026-08-08-derived-artifact-hardening-execution-plan.md):
+    /// `"exact"` | `"none"` -- certainty about WHAT `target_text` names.
+    /// Computed in `walk_effects` (language + `effect_kind`-aware), not
+    /// here: only Python's `explicit_throw` detection currently has a
+    /// textual-heuristic uncertain case (`raise e` / `raise factory()` /
+    /// bare `raise`); every other detector is fully structural and always
+    /// `"exact"` when it fires at all.
+    pub target_confidence: &'static str,
     pub line: usize,
 }
 
@@ -84,7 +92,7 @@ pub struct RawEffect {
 /// `derived_artifact_versions::source_extraction_fixture_is_pinned_to_its_version`
 /// (crates/calm-core/tests/derived_artifact_versions.rs) -- bump this AND
 /// that test's expected hash together, in the same commit, never one alone.
-pub const SOURCE_EXTRACTION_VERSION: i64 = 1;
+pub const SOURCE_EXTRACTION_VERSION: i64 = 2;
 
 pub fn extract_type_relations_from_tree(
     tree: &Tree,
@@ -356,11 +364,28 @@ fn walk_effects(
     if let Some((enclosing_name, enclosing_line)) = &current
         && let Some((kind, text)) = detect_effect(node, source, language)
     {
+        // P3 (docs/plans/2026-08-08-derived-artifact-hardening-execution-plan.md):
+        // classified here (language + kind aware), not inside each
+        // per-language `detect_*` function -- only Python's `explicit_throw`
+        // detection is textual-heuristic (`looks_like_exception_reference`);
+        // Java/TS/JS throw detection requires a real constructor node
+        // structurally, so it's always exact when it fires at all, and
+        // `write_field`'s target (the field name) is always exact once
+        // detected, in every language.
+        let target_confidence = if language == "python"
+            && kind == "explicit_throw"
+            && (text.is_empty() || !looks_like_exception_reference(&text))
+        {
+            "none"
+        } else {
+            "exact"
+        };
         out.push(RawEffect {
             enclosing_name: enclosing_name.clone(),
             enclosing_line: *enclosing_line,
             effect_kind: kind,
             target_text: text,
+            target_confidence,
             line: node.start_position().row + 1,
         });
     }
@@ -441,17 +466,29 @@ fn detect_python_throw(node: Node, source: &str) -> Option<(&'static str, String
         return None;
     }
     let mut cursor = node.walk();
-    let first = node.named_children(&mut cursor).next()?;
+    let Some(first) = node.named_children(&mut cursor).next() else {
+        // Bare `raise` (re-raise the currently-handled exception) -- a
+        // real throw EVENT with structurally no target text to capture.
+        // `walk_effects` classifies this `target_confidence: "none"`.
+        return Some(("explicit_throw", String::new()));
+    };
+    // Casing is no longer a FILTER here (P3) -- `raise e`/`raise factory()`
+    // are still real throw events, just ones whose target isn't a resolved
+    // exception TYPE. `walk_effects` runs `looks_like_exception_reference`
+    // on the returned text to classify `target_confidence`, so both the
+    // confident and uncertain cases are recorded, never dropped.
     match first.kind() {
         "call" => {
             let func = first.child_by_field_name("function")?;
-            let text = source[func.byte_range()].trim().to_string();
-            looks_like_exception_reference(&text).then_some(("explicit_throw", text))
+            Some((
+                "explicit_throw",
+                source[func.byte_range()].trim().to_string(),
+            ))
         }
-        "identifier" => {
-            let text = source[first.byte_range()].trim().to_string();
-            looks_like_exception_reference(&text).then_some(("explicit_throw", text))
-        }
+        "identifier" => Some((
+            "explicit_throw",
+            source[first.byte_range()].trim().to_string(),
+        )),
         _ => None,
     }
 }
@@ -566,6 +603,29 @@ mod tests {
         extract_effects_from_tree(&tree, src, lang)
             .into_iter()
             .map(|e| (e.enclosing_name, e.effect_kind, e.target_text))
+            .collect()
+    }
+
+    /// P3 (docs/plans/2026-08-08-derived-artifact-hardening-execution-plan.md):
+    /// same as `effects` but also returns `target_confidence`, for the
+    /// tests that specifically assert on the confidence split. A separate
+    /// helper (rather than widening `effects` itself) so the other tests
+    /// that don't care about confidence stay untouched.
+    fn effects_with_confidence(
+        lang: &str,
+        src: &str,
+    ) -> Vec<(String, &'static str, String, &'static str)> {
+        let tree = parse_tree(src, lang).expect("parse");
+        extract_effects_from_tree(&tree, src, lang)
+            .into_iter()
+            .map(|e| {
+                (
+                    e.enclosing_name,
+                    e.effect_kind,
+                    e.target_text,
+                    e.target_confidence,
+                )
+            })
             .collect()
     }
 
@@ -700,15 +760,13 @@ mod tests {
 
     #[test]
     fn python_reraise_of_bound_variable_is_not_captured() {
-        // `raise e` -- `e` is a caught-exception variable, not an
-        // exception TYPE reference. Capturing it would mislabel the
-        // variable's name as if it were a resolved exception class.
-        assert!(
-            effects(
+        // `raise e` -- P3: still a real throw EVENT, target uncertain.
+        assert_eq!(
+            effects_with_confidence(
                 "python",
                 "def f():\n    try:\n        pass\n    except Exception as e:\n        raise e\n"
-            )
-            .is_empty()
+            ),
+            vec![("f".into(), "explicit_throw", "e".into(), "none")]
         );
     }
 
@@ -716,18 +774,26 @@ mod tests {
     fn python_raise_of_lowercase_factory_call_is_not_captured() {
         // `raise factory()` -- syntactically identical to
         // `raise SomeException()`; only the PEP 8 casing convention lets
-        // us tell them apart without full symbol resolution.
-        assert!(effects("python", "def f():\n    raise factory()\n").is_empty());
+        // us tell them apart without full symbol resolution. P3: recorded
+        // now (target_confidence=none), not dropped -- function name kept
+        // for stability even though the assertion below changed.
+        assert_eq!(
+            effects_with_confidence("python", "def f():\n    raise factory()\n"),
+            vec![("f".into(), "explicit_throw", "factory".into(), "none")]
+        );
     }
 
     #[test]
     fn python_bare_reraise_is_skipped() {
-        assert!(
-            effects(
+        // P3: bare `raise` is now recorded too (empty target_text,
+        // target_confidence=none) instead of dropped -- function name kept
+        // for stability even though the assertion below changed.
+        assert_eq!(
+            effects_with_confidence(
                 "python",
                 "def f():\n    try:\n        pass\n    except Exception:\n        raise\n"
-            )
-            .is_empty()
+            ),
+            vec![("f".into(), "explicit_throw", "".into(), "none")]
         );
     }
 

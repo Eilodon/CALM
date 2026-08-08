@@ -37,7 +37,7 @@ fn fetch_semantic_facts(
 
     let effects: Vec<EffectOutput> = conn
         .prepare(
-            "SELECT effect_kind, target_text, line \
+            "SELECT effect_kind, target_text, line, event_confidence, target_confidence \
              FROM symbol_effects WHERE symbol_qn = ?1 ORDER BY line",
         )
         .and_then(|mut stmt| {
@@ -46,6 +46,8 @@ fn fetch_semantic_facts(
                     effect_kind: r.get(0)?,
                     target_text: r.get(1)?,
                     line: r.get(2)?,
+                    event_confidence: r.get(3)?,
+                    target_confidence: r.get(4)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()

@@ -844,6 +844,7 @@ fn extract_file_data(
             symbol_qn,
             effect_kind: re.effect_kind,
             target_text: re.target_text,
+            target_confidence: re.target_confidence,
             source_path: rel.to_string(),
             line: re.line as i64,
         });

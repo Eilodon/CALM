@@ -277,12 +277,22 @@
           "line": {
             "type": "integer",
             "format": "int64"
+          },
+          "event_confidence": {
+            "description": "P3 (docs/plans/2026-08-08-derived-artifact-hardening-execution-plan.md):\ncertainty THAT the effect happened -- currently always `\"exact\"`\n(every extraction site fires only on a real syntactic raise/throw/\nwrite node); kept as its own field for forward compatibility rather\nthan folded into `target_confidence`, which is a DIFFERENT question\n(certainty about WHAT the target is).",
+            "type": "string"
+          },
+          "target_confidence": {
+            "description": "`\"exact\"` | `\"none\"` -- certainty about what `target_text` names.\n`\"none\"` means the effect definitely happened but the exact target\ncouldn't be determined syntactically (e.g. Python `raise e` where\n`e` is a caught-exception variable, not a resolvable type) -- the\ntext is still the real syntax that was there, just not resolved.",
+            "type": "string"
           }
         },
         "required": [
           "effect_kind",
           "target_text",
-          "line"
+          "line",
+          "event_confidence",
+          "target_confidence"
         ]
       },
       "SourceOutput": {

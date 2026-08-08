@@ -71,17 +71,18 @@ fn source_extraction_snapshot(conn: &Connection) -> String {
         .unwrap();
     let mut effects: Vec<String> = conn
         .prepare(
-            "SELECT symbol_qn, effect_kind, target_text, confidence \
+            "SELECT symbol_qn, effect_kind, target_text, event_confidence, target_confidence \
              FROM symbol_effects ORDER BY symbol_qn, effect_kind, target_text",
         )
         .unwrap()
         .query_map([], |r| {
             Ok(format!(
-                "{}|{}|{}|{}",
+                "{}|{}|{}|{}|{}",
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
                 r.get::<_, String>(2)?,
                 r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
             ))
         })
         .unwrap()
@@ -98,7 +99,7 @@ fn source_extraction_snapshot(conn: &Connection) -> String {
 
 /// Regenerate via: read the assertion failure's "actual hash" and paste it
 /// in below alongside a `SOURCE_EXTRACTION_VERSION` bump.
-const EXPECTED_SOURCE_EXTRACTION_HASH: &str = "1473f45c2586b01e";
+const EXPECTED_SOURCE_EXTRACTION_HASH: &str = "cd8a8816b5c84b00";
 
 #[test]
 fn source_extraction_fixture_is_pinned_to_its_version() {

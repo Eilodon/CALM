@@ -322,13 +322,26 @@ CREATE INDEX IF NOT EXISTS idx_type_relations_path ON type_relations(source_path
 -- call_sites.enclosing_qn already is. Same rebuild lifecycle as
 -- type_relations above -- no source_hash needed.
 CREATE TABLE IF NOT EXISTS symbol_effects (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    symbol_qn       TEXT NOT NULL,
-    effect_kind     TEXT NOT NULL CHECK (effect_kind IN ('explicit_throw', 'write_field')),
-    target_text     TEXT NOT NULL,
-    confidence      TEXT NOT NULL DEFAULT 'syntax_exact',
-    source_path     TEXT NOT NULL,
-    line            INTEGER NOT NULL,
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol_qn          TEXT NOT NULL,
+    effect_kind        TEXT NOT NULL CHECK (effect_kind IN ('explicit_throw', 'write_field')),
+    target_text        TEXT NOT NULL,
+    -- P3 (docs/plans/2026-08-08-derived-artifact-hardening-execution-plan.md):
+    -- split from the old single `confidence` column -- `event_confidence`
+    -- is certainty THAT the effect happened (currently always 'exact': every
+    -- extraction site fires only on a real syntactic raise/throw/write
+    -- node); `target_confidence` is certainty about WHAT the target is
+    -- ('exact' | 'none'). A Python `raise e`/`raise factory()`/bare `raise`
+    -- is a real, certain throw EVENT whose exact exception TYPE isn't
+    -- syntactically knowable without full resolution -- previously dropped
+    -- entirely (see semantic_facts.rs's module doc comment history);
+    -- target_confidence='none' now records the event honestly instead of
+    -- losing it. write_field's target (the field name) is always exact
+    -- once detected, so it's always 'exact' on both dimensions.
+    event_confidence   TEXT NOT NULL DEFAULT 'exact',
+    target_confidence  TEXT NOT NULL DEFAULT 'exact',
+    source_path        TEXT NOT NULL,
+    line               INTEGER NOT NULL,
     UNIQUE(symbol_qn, effect_kind, target_text, line)
 );
 CREATE INDEX IF NOT EXISTS idx_symbol_effects_symbol ON symbol_effects(symbol_qn);
@@ -882,6 +895,27 @@ fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
             OR call_site_identity_version < 2
             OR definition_snapshot IS NULL",
         [],
+    )?;
+    // P3 (docs/plans/2026-08-08-derived-artifact-hardening-execution-plan.md):
+    // splits the old `symbol_effects.confidence` into `event_confidence`/
+    // `target_confidence` (see the fresh-install CREATE TABLE comment for
+    // the semantics). The old `confidence` column is left in place on an
+    // upgraded DB rather than dropped -- every migration in this function
+    // is purely additive, and `symbol_effects` is fully DELETE-then-
+    // reinsert on every reindex of the owning file anyway, so it becomes
+    // dead weight the next time each row's file is touched, not a
+    // permanent liability.
+    migrate_add_column(
+        conn,
+        "symbol_effects",
+        "event_confidence",
+        "TEXT NOT NULL DEFAULT 'exact'",
+    )?;
+    migrate_add_column(
+        conn,
+        "symbol_effects",
+        "target_confidence",
+        "TEXT NOT NULL DEFAULT 'exact'",
     )?;
     Ok(())
 }

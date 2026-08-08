@@ -5173,7 +5173,13 @@ mod tests {
         );
         assert_eq!(
             v["symbol"]["effects"],
-            serde_json::json!([{"effect_kind": "explicit_throw", "target_text": "ValueError", "line": 1}]),
+            serde_json::json!([{
+                "effect_kind": "explicit_throw",
+                "target_text": "ValueError",
+                "line": 1,
+                "event_confidence": "exact",
+                "target_confidence": "exact",
+            }]),
             "understand must surface T1 effects too, not just symbol_info: {v}"
         );
 
@@ -7308,6 +7314,75 @@ mod tests {
         assert!(
             v.get("effects").is_none(),
             "effects for a different symbol_qn must not leak into this symbol's output, got: {v}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn symbol_info_surfaces_effect_confidence_split() {
+        // P3 (docs/plans/2026-08-08-derived-artifact-hardening-execution-plan.md):
+        // event_confidence/target_confidence must round-trip through
+        // symbol_info end-to-end -- a write_field (always exact on both
+        // dimensions) and an explicit_throw with an uncertain target
+        // (the Python `raise e` case, now recorded instead of dropped).
+        let dir = std::env::temp_dir().join(format!("ci_effect_confidence_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (name, qualified_name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('m', 'a.py::Foo::m', 'method', 'python', 'a.py', 1, 4, 'def m(self):', '', 'm', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO symbol_effects (symbol_qn, effect_kind, target_text, target_confidence, source_path, line) \
+                 VALUES ('a.py::Foo::m', 'write_field', 'x', 'exact', 'a.py', 2)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO symbol_effects (symbol_qn, effect_kind, target_text, target_confidence, source_path, line) \
+                 VALUES ('a.py::Foo::m', 'explicit_throw', 'e', 'none', 'a.py', 3)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let v = jv(
+            server.symbol_info(rmcp::handler::server::wrapper::Parameters(
+                SymbolInfoParams {
+                    symbol: "m".into(),
+                    path: None,
+                    line: None,
+                },
+            )),
+        );
+
+        assert_eq!(
+            v["effects"],
+            serde_json::json!([
+                {
+                    "effect_kind": "write_field",
+                    "target_text": "x",
+                    "line": 2,
+                    "event_confidence": "exact",
+                    "target_confidence": "exact",
+                },
+                {
+                    "effect_kind": "explicit_throw",
+                    "target_text": "e",
+                    "line": 3,
+                    "event_confidence": "exact",
+                    "target_confidence": "none",
+                },
+            ]),
+            "effects must surface both event_confidence (always exact today) and \
+             target_confidence (exact for write_field, none for the uncertain throw), got: {v}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

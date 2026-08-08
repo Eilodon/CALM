@@ -334,6 +334,19 @@ pub(crate) struct EffectOutput {
     pub(crate) effect_kind: String,
     pub(crate) target_text: String,
     pub(crate) line: i64,
+    /// P3 (docs/plans/2026-08-08-derived-artifact-hardening-execution-plan.md):
+    /// certainty THAT the effect happened -- currently always `"exact"`
+    /// (every extraction site fires only on a real syntactic raise/throw/
+    /// write node); kept as its own field for forward compatibility rather
+    /// than folded into `target_confidence`, which is a DIFFERENT question
+    /// (certainty about WHAT the target is).
+    pub(crate) event_confidence: String,
+    /// `"exact"` | `"none"` -- certainty about what `target_text` names.
+    /// `"none"` means the effect definitely happened but the exact target
+    /// couldn't be determined syntactically (e.g. Python `raise e` where
+    /// `e` is a caught-exception variable, not a resolvable type) -- the
+    /// text is still the real syntax that was there, just not resolved.
+    pub(crate) target_confidence: String,
 }
 
 /// Tier 2 semantic fact (2026-08-07 roadmap T2) — deterministic, factual

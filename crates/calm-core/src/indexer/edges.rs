@@ -117,6 +117,10 @@ pub struct SymbolEffectData {
     pub symbol_qn: String,
     pub effect_kind: &'static str,
     pub target_text: String,
+    /// P3 (docs/plans/2026-08-08-derived-artifact-hardening-execution-plan.md):
+    /// "exact" | "none" -- see `RawEffect::target_confidence`, which this
+    /// mirrors verbatim.
+    pub target_confidence: &'static str,
     pub source_path: String,
     pub line: i64,
 }
@@ -152,15 +156,21 @@ pub fn insert_symbol_effects_batch(
     tx: &Transaction,
     effects: &[SymbolEffectData],
 ) -> rusqlite::Result<()> {
+    // event_confidence is a literal 'exact' here, not threaded from
+    // SymbolEffectData -- see schema.rs's symbol_effects comment: every
+    // current extraction site fires only on a real syntactic raise/throw/
+    // write node, so the EVENT is always certain in v1. Only
+    // target_confidence varies per-row.
     let mut stmt = tx.prepare(
-        "INSERT OR IGNORE INTO symbol_effects (symbol_qn, effect_kind, target_text, source_path, line)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT OR IGNORE INTO symbol_effects (symbol_qn, effect_kind, target_text, event_confidence, target_confidence, source_path, line)
+         VALUES (?1, ?2, ?3, 'exact', ?4, ?5, ?6)",
     )?;
     for e in effects {
         stmt.execute(rusqlite::params![
             e.symbol_qn,
             e.effect_kind,
             e.target_text,
+            e.target_confidence,
             e.source_path,
             e.line,
         ])?;
