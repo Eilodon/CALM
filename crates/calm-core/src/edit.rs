@@ -76,6 +76,19 @@ pub enum ApplyError {
         end_line: usize,
     },
     OverlappingHunks,
+    /// CCK-04: `new_text` contains `sanitize::REDACTED_MARKER_PREFIX` -- the
+    /// synthetic placeholder `source()`/`understand()`/etc. stamp over a
+    /// detected secret before returning it to a caller. No legitimate write
+    /// should ever contain this literal string, so its presence means an
+    /// agent most likely copied a REDACTED body it was shown and is about to
+    /// write that placeholder back as real content, silently destroying
+    /// whatever secret was really there. Refused unconditionally, before any
+    /// hash check -- a matching `expected_hash` proves the range is
+    /// unchanged since it was read, not that the new content is faithful.
+    LossyRedactedWrite {
+        start_line: usize,
+        end_line: usize,
+    },
 }
 
 impl std::fmt::Display for ApplyError {
@@ -103,6 +116,16 @@ impl std::fmt::Display for ApplyError {
                     "hunks overlap — each call may only touch disjoint ranges"
                 )
             }
+            ApplyError::LossyRedactedWrite {
+                start_line,
+                end_line,
+            } => write!(
+                f,
+                "hunk [{start_line},{end_line}]'s new_text contains a \
+                 \"{}\" placeholder -- refusing to write what looks like a \
+                 redacted secret body back as real content",
+                crate::sanitize::REDACTED_MARKER_PREFIX
+            ),
         }
     }
 }
@@ -202,6 +225,16 @@ pub fn apply_hunks(original: &str, hunks: &[HunkRequest]) -> Result<ApplyOutcome
                 start_line: h.start_line,
                 end_line: h.end_line,
                 file_lines: lines.len(),
+            });
+        }
+        // CCK-04: reject unconditionally, before any hash check -- a
+        // matching expected_hash only proves this range is unchanged since
+        // it was read, never that new_text is a faithful (non-redacted)
+        // replacement for it.
+        if h.new_text.contains(crate::sanitize::REDACTED_MARKER_PREFIX) {
+            return Err(ApplyError::LossyRedactedWrite {
+                start_line: h.start_line,
+                end_line: h.end_line,
             });
         }
     }
@@ -859,6 +892,42 @@ mod tests {
         ];
         let err = apply_hunks(original, &hunks).unwrap_err();
         assert!(matches!(err, ApplyError::OverlappingHunks));
+    }
+
+    #[test]
+    fn test_lossy_redacted_placeholder_write_is_rejected() {
+        // CCK-04 (P0 fix, audit 2026-08-09): reproduces the exact hazard --
+        // an agent copies a REDACTED body sanitize_source_output produced,
+        // edits an unrelated part, and submits the placeholder itself as
+        // new_text. The hash still matches (the range is genuinely
+        // unchanged since it was read), so only this content-level check
+        // stands between that write and a destroyed secret.
+        let original = "API_KEY = \"sk-REAL_SECRET_VALUE\"\n";
+        let hunks = vec![HunkRequest {
+            start_line: 1,
+            end_line: 1,
+            expected_hash: Some(hash_content(original)),
+            new_text: "API_KEY = \"[REDACTED:SECRET_KEY]\"\n".to_string(),
+        }];
+        let err = apply_hunks(original, &hunks).unwrap_err();
+        assert!(matches!(err, ApplyError::LossyRedactedWrite { .. }));
+    }
+
+    #[test]
+    fn test_new_text_that_merely_mentions_redacted_word_is_not_falsely_rejected() {
+        // The check is on the exact synthetic marker string
+        // (REDACTED_MARKER_PREFIX = "[REDACTED:"), not the bare word
+        // "REDACTED" -- legitimate code/comments discussing redaction must
+        // not be blocked.
+        let original = "x = 1\n";
+        let hunks = vec![HunkRequest {
+            start_line: 1,
+            end_line: 1,
+            expected_hash: Some(hash_content(original)),
+            new_text: "# secrets are REDACTED before logging\nx = 1\n".to_string(),
+        }];
+        let outcome = apply_hunks(original, &hunks).unwrap();
+        assert!(outcome.all_applied);
     }
 
     #[test]

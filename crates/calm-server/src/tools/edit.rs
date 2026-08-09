@@ -992,6 +992,9 @@ impl CalmServer {
 
         let outcome = match calm_core::edit::apply_hunks(&original, &hunks) {
             Ok(o) => o,
+            Err(e @ calm_core::edit::ApplyError::LossyRedactedWrite { .. }) => {
+                return ToolOutcome::error(error_detail("LOSSY_WRITE_REJECTED", &e.to_string(), false));
+            }
             Err(e) => {
                 return ToolOutcome::error(error_detail("INVALID_HUNKS", &e.to_string(), false));
             }

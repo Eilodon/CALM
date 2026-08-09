@@ -79,6 +79,16 @@ static CREDENTIAL_SET: LazyLock<regex::RegexSet> = LazyLock::new(|| {
     regex::RegexSet::new(CREDENTIAL_PATTERN_SOURCES.iter().map(|&(src, _)| src)).unwrap()
 });
 
+/// CCK-04: synthetic sentinel prefix `sanitize_source_output` stamps onto every
+/// redacted span (`"{REDACTED_MARKER_PREFIX}{label}]"`) -- exposed so a write
+/// path (`calm_core::edit::apply_hunks`) can detect an agent writing this
+/// literal placeholder back as real content (the lossy read-then-write hazard:
+/// a caller copies the REDACTED body it was shown, edits an unrelated line,
+/// and submits the placeholder itself as `new_text`, silently overwriting the
+/// real secret on disk). No legitimate source is expected to contain this
+/// exact synthetic string.
+pub const REDACTED_MARKER_PREFIX: &str = "[REDACTED:";
+
 pub fn sanitize_source_output(code: &str) -> String {
     let matches = CREDENTIAL_SET.matches(code);
     if !matches.matched_any() {
@@ -89,7 +99,7 @@ pub fn sanitize_source_output(code: &str) -> String {
         let pattern = &CREDENTIAL_PATTERNS[i];
         result = pattern
             .regex
-            .replace_all(&result, format!("[REDACTED:{}]", pattern.label))
+            .replace_all(&result, format!("{REDACTED_MARKER_PREFIX}{}]", pattern.label))
             .into_owned();
     }
     result
