@@ -15,8 +15,81 @@
 //! with the DDL -- the file is left at exactly its pre-step version, never
 //! partially bumped. That is what makes "stamp only after success" cheap
 //! and correct here rather than needing a separate reconciliation pass.
+//!
+//! **CCK-R1** (audit follow-up on this same blueprint): each `apply` step
+//! now runs its own `CREATE TABLE IF NOT EXISTS` DDL directly, rather than
+//! only checking that `STATE_SCHEMA_SQL` already created the tables --
+//! `init_state_db_versioned` still runs `init_state_db`'s idempotent full
+//! schema first for a fresh install, but a genuine pre-v2/pre-v3 file now
+//! gets its missing tables from the migration step itself, not from a
+//! same-process coincidence of call order. See each step's own doc comment.
 
 use rusqlite::Connection;
+
+/// Typed failure for the migration executor -- CCK-R1. Replaces a `panic!`
+/// on a gap in `STATE_MIGRATIONS` with a recoverable error: a
+/// missing-step gap or a failed postcondition check must never crash the
+/// whole process, since both are conditions a caller (or `calm doctor`)
+/// can meaningfully report and recover from.
+#[derive(Debug)]
+pub enum StateMigrationError {
+    /// No registered step starts at `from` on the way to `target` --
+    /// `STATE_MIGRATIONS` has a gap. Distinct from a plain Sqlite error
+    /// because this is a programming/registration bug, not a runtime I/O
+    /// failure -- callers may want to report it differently (e.g. "this
+    /// binary is missing a migration", not "disk error").
+    MissingMigration { from: i64, target: i64 },
+    /// A migration step's own postcondition check failed (e.g. a table
+    /// this step's own DDL should have just created is still missing).
+    PostconditionFailed {
+        migration: &'static str,
+        detail: String,
+    },
+    Sqlite(rusqlite::Error),
+}
+
+impl std::fmt::Display for StateMigrationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingMigration { from, target } => write!(
+                f,
+                "state.db migration executor: no registered step from version {from} \
+                 toward target {target} -- STATE_MIGRATIONS is missing an entry"
+            ),
+            Self::PostconditionFailed { migration, detail } => write!(
+                f,
+                "state.db migration {migration:?} postcondition failed: {detail}"
+            ),
+            Self::Sqlite(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for StateMigrationError {}
+
+impl From<rusqlite::Error> for StateMigrationError {
+    fn from(e: rusqlite::Error) -> Self {
+        Self::Sqlite(e)
+    }
+}
+
+/// Lets existing `rusqlite::Result<()>`-returning callers (e.g.
+/// `init_state_db_versioned`) keep using `?` unchanged -- the typed
+/// variants collapse to a `SqliteFailure` carrying the same message a
+/// caller matching only on `Display` (or `.unwrap()`) already saw before
+/// this type existed; a caller that wants the structured variants back
+/// calls `migrate_state_db_to_current`/`run_migrations_from` directly.
+impl From<StateMigrationError> for rusqlite::Error {
+    fn from(e: StateMigrationError) -> Self {
+        match e {
+            StateMigrationError::Sqlite(inner) => inner,
+            other => rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+                Some(other.to_string()),
+            ),
+        }
+    }
+}
 
 /// One forward step in state.db's schema evolution. `apply` must perform
 /// only the schema change for `from -> to` -- it must NOT touch `PRAGMA
@@ -26,7 +99,7 @@ pub struct StateMigration {
     pub from: i64,
     pub to: i64,
     pub name: &'static str,
-    pub apply: fn(&Connection) -> rusqlite::Result<()>,
+    pub apply: fn(&Connection) -> Result<(), StateMigrationError>,
 }
 
 /// Registered migrations, in ascending `from` order.
@@ -46,18 +119,48 @@ pub const STATE_MIGRATIONS: &[StateMigration] = &[
 ];
 
 /// v1->v2 (CCK-07): adds `evidence_snapshots`, `change_intents`,
-/// `change_intent_targets`. Unlike `index.db`'s ALTER-style steps, state.db
-/// has no incremental-DDL story of its own (see `init_state_db`'s doc
-/// comment) -- `STATE_SCHEMA_SQL`'s `CREATE TABLE IF NOT EXISTS` statements
-/// already create these tables on every startup, fresh or not, and
-/// `init_state_db_versioned` always runs `init_state_db` *before* this
-/// executor. So by the time this `apply` runs, the tables already exist;
-/// its only real job is the postcondition check CCK-01's contract asks
-/// for -- confirming that assumption instead of silently trusting it, so a
-/// future `STATE_SCHEMA_SQL` edit that accidentally drops one of these
-/// `CREATE TABLE` statements fails loudly here instead of only surfacing
-/// as a confusing "no such table" much later, at first real use.
-fn v1_to_v2_evidence_snapshots_and_change_intents(conn: &Connection) -> rusqlite::Result<()> {
+/// `change_intent_targets`. CCK-R1: this step now runs the real `CREATE
+/// TABLE IF NOT EXISTS` DDL itself, rather than only checking the tables
+/// already exist -- on a fresh install (where `init_state_db` already ran
+/// the full current `STATE_SCHEMA_SQL`) this is a harmless no-op re-run;
+/// on a genuine pre-v2 file, this step is now what actually creates the
+/// tables, instead of silently depending on `init_state_db` having done it
+/// first. The DDL below is intentionally a literal duplicate of
+/// `STATE_SCHEMA_SQL`'s copy in `schema.rs` (Rust's `concat!` can't
+/// compose named `&str` consts, so sharing one literal isn't
+/// straightforward) -- `registered_v1_to_v2_migration_matches_a_genuine_
+/// pre_v2_database`'s test below drives this step against a hand-built
+/// pre-v2-shaped database (not one seeded by `init_state_db`), which
+/// proves this step is self-sufficient rather than merely a shared-literal
+/// promise.
+fn v1_to_v2_evidence_snapshots_and_change_intents(
+    conn: &Connection,
+) -> Result<(), StateMigrationError> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS evidence_snapshots (
+            snapshot_id            TEXT PRIMARY KEY,
+            source_catalog_digest  TEXT NOT NULL,
+            graph_generation       INTEGER NOT NULL,
+            freshness_class        TEXT NOT NULL,
+            created_at             REAL NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS change_intents (
+            intent_id     TEXT PRIMARY KEY,
+            kind          TEXT NOT NULL,
+            reason        TEXT NOT NULL,
+            snapshot_id   TEXT NOT NULL REFERENCES evidence_snapshots(snapshot_id),
+            created_at    REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_change_intents_snapshot ON change_intents(snapshot_id);
+        CREATE TABLE IF NOT EXISTS change_intent_targets (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            intent_id      TEXT NOT NULL REFERENCES change_intents(intent_id) ON DELETE CASCADE,
+            path           TEXT NOT NULL,
+            qualified_name TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_change_intent_targets_intent ON change_intent_targets(intent_id);",
+    )?;
+
     for table in [
         "evidence_snapshots",
         "change_intents",
@@ -69,30 +172,27 @@ fn v1_to_v2_evidence_snapshots_and_change_intents(conn: &Connection) -> rusqlite
             |r| r.get(0),
         )?;
         if !exists {
-            return Err(rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
-                Some(format!(
-                    "state.db v1->v2 migration postcondition failed: table {table:?} does not \
-                     exist -- STATE_SCHEMA_SQL should have created it before this step ran"
-                )),
-            ));
+            return Err(StateMigrationError::PostconditionFailed {
+                migration: "v2_evidence_snapshots_and_change_intents",
+                detail: format!("table {table:?} does not exist after this step's own DDL ran"),
+            });
         }
     }
     Ok(())
 }
 
 /// v2->v3 (CCK-09, #65): adds `review_authorities`, `review_authority_targets`,
-/// `review_authority_evidence` (same new-table-only, postcondition-check-only
-/// story as v1->v2 -- see that step's doc comment) PLUS a real ALTER TABLE:
+/// `review_authority_evidence`, PLUS a real ALTER TABLE:
 /// `edit_transactions.authority_id` is a new column on an EXISTING table, so
 /// unlike a brand new table, `STATE_SCHEMA_SQL`'s idempotent `CREATE TABLE IF
 /// NOT EXISTS edit_transactions (...)` does NOT retroactively add it to a
-/// file that already has that table from a v1/v2 install. This is CCK-01's
-/// executor's first real ALTER-style step -- mirrors index.db's own
-/// `migrate_add_column` (`db/schema.rs`) idempotency check (`PRAGMA
+/// file that already has that table from a v1/v2 install. Mirrors index.db's
+/// own `migrate_add_column` (`db/schema.rs`) idempotency check (`PRAGMA
 /// table_info`) rather than reaching across modules to reuse that private
-/// helper for one column.
-fn v2_to_v3_review_authorities(conn: &Connection) -> rusqlite::Result<()> {
+/// helper for one column. CCK-R1: like v1->v2, the 3 new tables are now
+/// created by this step's own DDL (see that step's doc comment for why),
+/// not merely postcondition-checked.
+fn v2_to_v3_review_authorities(conn: &Connection) -> Result<(), StateMigrationError> {
     let mut stmt = conn.prepare("PRAGMA table_info(edit_transactions)")?;
     let existing_columns: Vec<String> = stmt
         .query_map([], |row| row.get::<_, String>(1))?
@@ -101,6 +201,39 @@ fn v2_to_v3_review_authorities(conn: &Connection) -> rusqlite::Result<()> {
     if !existing_columns.iter().any(|c| c == "authority_id") {
         conn.execute_batch("ALTER TABLE edit_transactions ADD COLUMN authority_id TEXT;")?;
     }
+
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS review_authorities (
+            authority_id       TEXT PRIMARY KEY,
+            intent_id          TEXT NOT NULL REFERENCES change_intents(intent_id),
+            snapshot_id        TEXT NOT NULL REFERENCES evidence_snapshots(snapshot_id),
+            graph_generation   INTEGER NOT NULL,
+            caller_set_digest  TEXT NOT NULL,
+            analysis_version   TEXT NOT NULL,
+            policy_digest      TEXT NOT NULL,
+            principal          TEXT NOT NULL,
+            nonce              TEXT NOT NULL,
+            expires_at         REAL NOT NULL,
+            signature          TEXT NOT NULL,
+            created_at         REAL NOT NULL,
+            consumed_at        REAL
+        );
+        CREATE INDEX IF NOT EXISTS idx_review_authorities_intent ON review_authorities(intent_id);
+        CREATE TABLE IF NOT EXISTS review_authority_targets (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            authority_id   TEXT NOT NULL REFERENCES review_authorities(authority_id) ON DELETE CASCADE,
+            path           TEXT NOT NULL,
+            qualified_name TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_review_authority_targets_authority ON review_authority_targets(authority_id);
+        CREATE TABLE IF NOT EXISTS review_authority_evidence (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            authority_id  TEXT NOT NULL REFERENCES review_authorities(authority_id) ON DELETE CASCADE,
+            field_name    TEXT NOT NULL,
+            field_value   TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_review_authority_evidence_authority ON review_authority_evidence(authority_id);",
+    )?;
 
     for table in [
         "review_authorities",
@@ -113,13 +246,10 @@ fn v2_to_v3_review_authorities(conn: &Connection) -> rusqlite::Result<()> {
             |r| r.get(0),
         )?;
         if !exists {
-            return Err(rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
-                Some(format!(
-                    "state.db v2->v3 migration postcondition failed: table {table:?} does not \
-                     exist -- STATE_SCHEMA_SQL should have created it before this step ran"
-                )),
-            ));
+            return Err(StateMigrationError::PostconditionFailed {
+                migration: "v3_review_authorities",
+                detail: format!("table {table:?} does not exist after this step's own DDL ran"),
+            });
         }
     }
     Ok(())
@@ -138,7 +268,7 @@ const BASELINE_VERSION: i64 = 1;
 /// then stamps that target explicitly. Called from `init_state_db_versioned`
 /// between the downgrade-guard refusal and `init_state_db`'s idempotent DDL
 /// having already run -- `apply` fns may assume baseline tables exist.
-pub fn migrate_state_db_to_current(conn: &Connection) -> rusqlite::Result<()> {
+pub fn migrate_state_db_to_current(conn: &Connection) -> Result<(), StateMigrationError> {
     run_migrations_from(
         conn,
         STATE_MIGRATIONS,
@@ -153,7 +283,7 @@ pub(crate) fn run_migrations_from(
     conn: &Connection,
     migrations: &[StateMigration],
     target: i64,
-) -> rusqlite::Result<()> {
+) -> Result<(), StateMigrationError> {
     let on_disk: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     let mut current = if on_disk == 0 {
         BASELINE_VERSION
@@ -162,15 +292,15 @@ pub(crate) fn run_migrations_from(
     };
 
     while current < target {
-        let step = migrations
-            .iter()
-            .find(|m| m.from == current)
-            .unwrap_or_else(|| {
-                panic!(
-                    "state.db migration executor: no registered step from version {current} \
-                 toward target {target} -- STATE_MIGRATIONS is missing an entry"
-                )
-            });
+        let step = match migrations.iter().find(|m| m.from == current) {
+            Some(s) => s,
+            None => {
+                return Err(StateMigrationError::MissingMigration {
+                    from: current,
+                    target,
+                });
+            }
+        };
         debug_assert_eq!(
             step.to,
             step.from + 1,
@@ -181,9 +311,10 @@ pub(crate) fn run_migrations_from(
         );
 
         conn.execute_batch("BEGIN IMMEDIATE")?;
-        let step_result = (|| -> rusqlite::Result<()> {
+        let step_result = (|| -> Result<(), StateMigrationError> {
             (step.apply)(conn)?;
-            conn.pragma_update(None, "user_version", step.to)
+            conn.pragma_update(None, "user_version", step.to)?;
+            Ok(())
         })();
         match step_result {
             Ok(()) => {
@@ -224,6 +355,65 @@ mod tests {
             .unwrap()
     }
 
+    /// A hand-built database using ONLY the tables state.db had at v1 --
+    /// deliberately NOT built by calling `init_state_db` (which always
+    /// creates the FULL current schema, v2/v3 tables included, defeating
+    /// the point of testing an old-shaped file). CCK-R1's whole point is
+    /// that migrations must be self-sufficient against a database that
+    /// genuinely never had `evidence_snapshots`/`change_intents`/
+    /// `review_authorities` etc, not just against a fresh install that
+    /// happens to already have them.
+    fn v1_shaped_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE project_memory (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                topic       TEXT NOT NULL UNIQUE,
+                content     TEXT NOT NULL,
+                created_at  TEXT NOT NULL,
+                updated_at  TEXT NOT NULL
+            );
+            CREATE TABLE edit_transactions (
+                tx_id                   TEXT PRIMARY KEY,
+                project_id              TEXT NOT NULL,
+                path                    TEXT NOT NULL,
+                base_digest             TEXT NOT NULL,
+                proposed_digest         TEXT NOT NULL,
+                review_token_id         TEXT,
+                state                   TEXT NOT NULL DEFAULT 'PREPARED',
+                temp_path               TEXT,
+                graph_generation_before INTEGER,
+                graph_generation_after  INTEGER,
+                created_at              REAL NOT NULL,
+                updated_at              REAL NOT NULL,
+                error_code              TEXT,
+                error_detail            TEXT
+            );
+            CREATE TABLE tx_events (
+                event_id    TEXT PRIMARY KEY,
+                tx_id       TEXT NOT NULL REFERENCES edit_transactions(tx_id) ON DELETE CASCADE,
+                sequence    INTEGER NOT NULL,
+                from_state  TEXT NOT NULL,
+                to_state    TEXT NOT NULL,
+                actor       TEXT NOT NULL,
+                reason      TEXT NOT NULL,
+                occurred_at REAL NOT NULL,
+                UNIQUE(tx_id, sequence)
+            );
+            CREATE TABLE audit_ledger (
+                seq        INTEGER PRIMARY KEY AUTOINCREMENT,
+                prev_hash  TEXT NOT NULL,
+                event_hash TEXT NOT NULL UNIQUE,
+                ts         REAL NOT NULL,
+                actor      TEXT NOT NULL,
+                payload    TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 1).unwrap();
+        conn
+    }
+
     #[test]
     fn unstamped_zero_version_db_becomes_target_with_no_migrations_registered() {
         let conn = fresh_conn();
@@ -262,7 +452,7 @@ mod tests {
         conn.execute_batch("CREATE TABLE probe (id INTEGER PRIMARY KEY)")
             .unwrap();
 
-        fn add_marker_row(conn: &Connection) -> rusqlite::Result<()> {
+        fn add_marker_row(conn: &Connection) -> Result<(), StateMigrationError> {
             conn.execute("INSERT INTO probe (id) VALUES (1)", [])?;
             Ok(())
         }
@@ -288,12 +478,12 @@ mod tests {
         conn.execute_batch("CREATE TABLE probe (id INTEGER PRIMARY KEY)")
             .unwrap();
 
-        fn insert_then_fail(conn: &Connection) -> rusqlite::Result<()> {
+        fn insert_then_fail(conn: &Connection) -> Result<(), StateMigrationError> {
             conn.execute("INSERT INTO probe (id) VALUES (1)", [])?;
-            Err(rusqlite::Error::SqliteFailure(
+            Err(StateMigrationError::Sqlite(rusqlite::Error::SqliteFailure(
                 rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
                 Some("simulated forced failure".to_string()),
-            ))
+            )))
         }
         let migrations = [StateMigration {
             from: 1,
@@ -325,7 +515,7 @@ mod tests {
         conn.execute_batch("CREATE TABLE probe (id INTEGER PRIMARY KEY)")
             .unwrap();
 
-        fn add_marker_row(conn: &Connection) -> rusqlite::Result<()> {
+        fn add_marker_row(conn: &Connection) -> Result<(), StateMigrationError> {
             conn.execute("INSERT OR IGNORE INTO probe (id) VALUES (1)", [])?;
             Ok(())
         }
@@ -351,14 +541,21 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "no registered step from version 1")]
-    fn a_gap_in_the_registered_migration_chain_panics_loudly_instead_of_silently_stalling() {
+    fn a_gap_in_the_registered_migration_chain_returns_a_typed_error_instead_of_panicking() {
         let conn = fresh_conn();
         conn.pragma_update(None, "user_version", 1).unwrap();
         // target 3 with no `from: 1` entry registered -- must not silently
-        // return Ok(()) while leaving the file two versions behind.
+        // return Ok(()) while leaving the file two versions behind, and
+        // (CCK-R1) must not panic either -- a recoverable, typed error.
         let migrations: [StateMigration; 0] = [];
-        let _ = run_migrations_from(&conn, &migrations, 3);
+        let err = run_migrations_from(&conn, &migrations, 3);
+        assert!(matches!(
+            err,
+            Err(StateMigrationError::MissingMigration {
+                from: 1,
+                target: 3
+            })
+        ));
     }
 
     #[test]
@@ -477,5 +674,91 @@ mod tests {
             user_version(&conn),
             super::super::schema::STATE_DB_SCHEMA_VERSION
         );
+    }
+
+    /// CCK-R1's actual regression test: drives the real registered
+    /// migrations against a database that genuinely never had v2/v3
+    /// tables (`v1_shaped_conn`, NOT `init_state_db`) -- proves the
+    /// migration steps create the tables themselves rather than merely
+    /// verifying `init_state_db` already did, and that unrelated
+    /// pre-existing data (project memory, the edit-transaction journal,
+    /// the audit ledger) survives the upgrade untouched.
+    #[test]
+    fn registered_migrations_are_self_sufficient_against_a_genuine_pre_v2_database() {
+        let conn = v1_shaped_conn();
+        conn.execute(
+            "INSERT INTO project_memory (topic, content, created_at, updated_at) \
+             VALUES ('gotcha', 'remember this', 't0', 't0')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO edit_transactions \
+             (tx_id, project_id, path, base_digest, proposed_digest, state, created_at, updated_at) \
+             VALUES ('TXN-old', 'proj', 'a.rs', 'base', 'proposed', 'DONE', 0.0, 0.0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO audit_ledger (prev_hash, event_hash, ts, actor, payload) \
+             VALUES ('genesis', 'h1', 0.0, 'test', '{}')",
+            [],
+        )
+        .unwrap();
+
+        migrate_state_db_to_current(&conn).unwrap();
+
+        assert_eq!(
+            user_version(&conn),
+            super::super::schema::STATE_DB_SCHEMA_VERSION
+        );
+        for table in [
+            "evidence_snapshots",
+            "change_intents",
+            "change_intent_targets",
+            "review_authorities",
+            "review_authority_targets",
+            "review_authority_evidence",
+        ] {
+            let exists: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                    [table],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(
+                exists,
+                "{table} should exist after migrating a genuine pre-v2 database"
+            );
+        }
+
+        let memory_content: String = conn
+            .query_row(
+                "SELECT content FROM project_memory WHERE topic = 'gotcha'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(memory_content, "remember this", "memory rows must survive");
+
+        let (tx_state, authority_id): (String, Option<String>) = conn
+            .query_row(
+                "SELECT state, authority_id FROM edit_transactions WHERE tx_id = 'TXN-old'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(tx_state, "DONE", "edit_transactions rows must survive");
+        assert_eq!(authority_id, None);
+
+        let ledger_payload: String = conn
+            .query_row(
+                "SELECT payload FROM audit_ledger WHERE event_hash = 'h1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(ledger_payload, "{}", "audit ledger rows must survive");
     }
 }
