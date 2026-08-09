@@ -54,11 +54,20 @@ pub enum FreshnessClass {
 }
 
 impl FreshnessClass {
-    /// High-risk authority (CCK-09/CCK-10) must force reconciliation before
-    /// minting against a `Degraded` snapshot -- watcher/index health alone
-    /// is never proof (blueprint's own wording for this PR).
-    pub fn is_safe_for_high_risk_authority(self) -> bool {
-        matches!(self, Self::Reconciled | Self::Current)
+    /// WS2 (audit follow-up): the tiered freshness bar the blueprint
+    /// originally called for -- Low/Medium risk (`required_approver_class`
+    /// other than `Human`) accepts either a cheap fingerprint-based
+    /// `Current` read or a full `Reconciled` re-scan; High risk
+    /// (`Human`-required) accepts nothing short of `Reconciled` --
+    /// watcher/index health alone (`Current`) is never proof for the tier
+    /// where a mistake matters most (blueprint's own wording for this PR).
+    /// `Degraded` fails every tier unconditionally.
+    pub fn meets_bar_for(self, required_approver_class: crate::policy::ApproverClass) -> bool {
+        match self {
+            Self::Degraded => false,
+            Self::Reconciled => true,
+            Self::Current => required_approver_class != crate::policy::ApproverClass::Human,
+        }
     }
 
     /// Stable lowercase name persisted in `evidence_snapshots.freshness_class`
@@ -137,9 +146,9 @@ impl EvidenceSnapshot {
         freshness_class: FreshnessClass,
     ) -> rusqlite::Result<Self> {
         let source_catalog_digest = source_catalog_digest(conn)?;
-        let graph_generation = current_graph_generation(conn);
-        let config_digest = config_digest(project_root);
-        let provider_state_digest = provider_state_digest(conn);
+        let graph_generation = current_graph_generation(conn)?;
+        let config_digest = config_digest(project_root)?;
+        let provider_state_digest = provider_state_digest(conn)?;
 
         let material = format!(
             "evidence-snapshot-v1\n\
@@ -216,7 +225,13 @@ impl EvidenceSnapshot {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
             .optional()?;
-        let Some((snapshot_id, source_catalog_digest, graph_generation, provider_state_digest, freshness_str)) = row
+        let Some((
+            snapshot_id,
+            source_catalog_digest,
+            graph_generation,
+            provider_state_digest,
+            freshness_str,
+        )) = row
         else {
             return Ok(None);
         };
@@ -275,68 +290,89 @@ fn source_catalog_digest(conn: &Connection) -> rusqlite::Result<String> {
 /// deliberately excluded -- including it would flip `snapshot_id` on every
 /// redundant re-run and defeat the "changes iff something real changed"
 /// contract every other digest in this module upholds. A project with no
-/// SCIP/LSP provider ever run (table empty, or absent on an
-/// index.db older than `migrate_add_scip_overlay_state`) still gets a
-/// stable digest of the header alone -- "no provider state" is itself a
-/// value, not an error.
-fn provider_state_digest(conn: &Connection) -> String {
+/// SCIP/LSP provider ever run (table genuinely absent, checked against
+/// `sqlite_master` rather than inferred from a failed `prepare`) still
+/// gets a stable digest of the header alone -- "no provider state" is
+/// itself a value, not an error. WS2 (audit follow-up): a `prepare`/row
+/// failure against a table that DOES exist is a real anomaly (corruption,
+/// lock, permission) and must propagate, not collapse into the same "no
+/// provider state" value a healthy-but-empty table produces.
+fn provider_state_digest(conn: &Connection) -> rusqlite::Result<String> {
     let mut material = String::from("provider-state-v1\n");
-    let mut stmt = match conn.prepare(
+    let table_exists: bool = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'scip_overlay_state'",
+        [],
+        |r| r.get::<_, i64>(0),
+    )? > 0;
+    if !table_exists {
+        return Ok(evidence_digest(material.as_bytes()));
+    }
+    let mut stmt = conn.prepare(
         "SELECT provider, cache_key, upgraded, ruled_out, inserted, match_rate \
          FROM scip_overlay_state ORDER BY provider",
-    ) {
-        Ok(stmt) => stmt,
-        Err(_) => return evidence_digest(material.as_bytes()),
-    };
-    let rows = stmt.query_map([], |r| {
-        let provider: String = r.get(0)?;
-        let cache_key: Option<String> = r.get(1)?;
-        let upgraded: i64 = r.get(2)?;
-        let ruled_out: i64 = r.get(3)?;
-        let inserted: i64 = r.get(4)?;
-        let match_rate: f64 = r.get(5)?;
-        Ok(format!(
-            "{provider}\0{}\0{upgraded}\0{ruled_out}\0{inserted}\0{match_rate}",
-            cache_key.as_deref().unwrap_or("")
-        ))
-    });
-    if let Ok(rows) = rows {
-        for row in rows.flatten() {
-            material.push_str(&row);
-            material.push('\n');
-        }
+    )?;
+    let rows: Vec<String> = stmt
+        .query_map([], |r| {
+            let provider: String = r.get(0)?;
+            let cache_key: Option<String> = r.get(1)?;
+            let upgraded: i64 = r.get(2)?;
+            let ruled_out: i64 = r.get(3)?;
+            let inserted: i64 = r.get(4)?;
+            let match_rate: f64 = r.get(5)?;
+            Ok(format!(
+                "{provider}\0{}\0{upgraded}\0{ruled_out}\0{inserted}\0{match_rate}",
+                cache_key.as_deref().unwrap_or("")
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for row in rows {
+        material.push_str(&row);
+        material.push('\n');
     }
-    evidence_digest(material.as_bytes())
+    Ok(evidence_digest(material.as_bytes()))
 }
 
-/// Mirrors `guardrails.rs::edit_context`'s own read of the same table --
-/// see that call site's doc comment for why 0 (never indexed) is a safe
-/// default rather than an error.
-fn current_graph_generation(conn: &Connection) -> i64 {
+/// WS2 (audit follow-up): distinguishes "never indexed" (no row yet -- a
+/// legitimate, expected state for a fresh project, safe default 0) from a
+/// genuine DB read error (corruption, lock, permission) via `.optional()`
+/// -- previously `.unwrap_or(0)` collapsed both into the same value, so a
+/// read failure silently minted authority against a fabricated
+/// `graph_generation=0` instead of refusing. `guardrails.rs::edit_context`
+/// has its own, separate read of the same table (a different, lower-
+/// stakes context -- not part of a signed `EvidenceSnapshot`) and is
+/// unchanged by this.
+fn current_graph_generation(conn: &Connection) -> rusqlite::Result<i64> {
     conn.query_row(
         "SELECT generation FROM graph_generation_state WHERE id = 1",
         [],
         |r| r.get(0),
     )
-    .unwrap_or(0)
+    .optional()
+    .map(|generation| generation.unwrap_or(0))
 }
 
 /// `evidence_digest` over the concatenated bytes of every file in
 /// [`GLOBAL_CONFIGURATION_PATHS`] that exists, in fixed order -- a missing
 /// file contributes its path with no bytes (present vs. absent still
 /// changes the digest), so deleting a config file is not indistinguishable
-/// from an unchanged one.
-fn config_digest(project_root: &Path) -> String {
+/// from an unchanged one. WS2 (audit follow-up): only a genuinely absent
+/// file (`NotFound`) is treated as "no bytes" -- any other read error
+/// (permission denied, I/O error) propagates instead of being silently
+/// coalesced into the same "absent" value a real DB-corruption/permission
+/// problem should never be indistinguishable from.
+fn config_digest(project_root: &Path) -> rusqlite::Result<String> {
     let mut material = Vec::from(*b"config-digest-v1\n");
     for relative in GLOBAL_CONFIGURATION_PATHS {
         material.extend_from_slice(relative.as_bytes());
         material.push(b'\0');
-        if let Ok(bytes) = std::fs::read(project_root.join(relative)) {
-            material.extend_from_slice(&bytes);
+        match std::fs::read(project_root.join(relative)) {
+            Ok(bytes) => material.extend_from_slice(&bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(e))),
         }
         material.push(b'\n');
     }
-    evidence_digest(&material)
+    Ok(evidence_digest(&material))
 }
 
 #[cfg(test)]
@@ -479,6 +515,7 @@ mod tests {
 
     #[test]
     fn clean_drift_is_current_not_reconciled_or_degraded() {
+        use crate::policy::ApproverClass;
         let conn = conn_with_file_index(&[]);
         let root = tmp_project();
         // No index_input_state row persisted -> index_input_drift reports
@@ -486,23 +523,80 @@ mod tests {
         // Current -- confirms the fail-closed default flows through.
         let snap = EvidenceSnapshot::compute(&conn, root.path()).unwrap();
         assert_eq!(snap.freshness_class, FreshnessClass::Degraded);
-        assert!(!snap.freshness_class.is_safe_for_high_risk_authority());
+        assert!(
+            !snap
+                .freshness_class
+                .meets_bar_for(ApproverClass::SelfReviewed)
+        );
+        assert!(!snap.freshness_class.meets_bar_for(ApproverClass::Human));
     }
 
     #[test]
     fn compute_after_reconciliation_is_always_reconciled_regardless_of_drift() {
+        use crate::policy::ApproverClass;
         let conn = conn_with_file_index(&[]);
         let root = tmp_project();
         let snap = EvidenceSnapshot::compute_after_reconciliation(&conn, root.path()).unwrap();
         assert_eq!(snap.freshness_class, FreshnessClass::Reconciled);
-        assert!(snap.freshness_class.is_safe_for_high_risk_authority());
+        assert!(
+            snap.freshness_class
+                .meets_bar_for(ApproverClass::SelfReviewed)
+        );
+        assert!(snap.freshness_class.meets_bar_for(ApproverClass::Human));
     }
 
     #[test]
-    fn degraded_is_never_silently_treated_as_safe_for_high_risk_authority() {
-        assert!(!FreshnessClass::Degraded.is_safe_for_high_risk_authority());
-        assert!(FreshnessClass::Current.is_safe_for_high_risk_authority());
-        assert!(FreshnessClass::Reconciled.is_safe_for_high_risk_authority());
+    // WS2 (audit follow-up): Degraded fails every tier; Current is enough
+    // for Low/Medium (SelfReviewed) but NOT for High (Human) -- only a
+    // Reconciled snapshot clears the bar for a Human-required change.
+    fn high_risk_requires_reconciled_not_just_current() {
+        use crate::policy::ApproverClass;
+        assert!(!FreshnessClass::Degraded.meets_bar_for(ApproverClass::SelfReviewed));
+        assert!(!FreshnessClass::Degraded.meets_bar_for(ApproverClass::Human));
+        assert!(FreshnessClass::Current.meets_bar_for(ApproverClass::SelfReviewed));
+        assert!(!FreshnessClass::Current.meets_bar_for(ApproverClass::Human));
+        assert!(FreshnessClass::Reconciled.meets_bar_for(ApproverClass::SelfReviewed));
+        assert!(FreshnessClass::Reconciled.meets_bar_for(ApproverClass::Human));
+    }
+
+    #[test]
+    // WS2 (audit follow-up, claim 5): a real DB error reading
+    // graph_generation_state must propagate, not collapse into the same
+    // `0` a legitimate "never indexed" state produces.
+    fn current_graph_generation_error_propagates_instead_of_defaulting_to_zero() {
+        let conn = conn_with_file_index(&[]);
+        let root = tmp_project();
+        conn.execute("DROP TABLE graph_generation_state", [])
+            .unwrap();
+        assert!(EvidenceSnapshot::compute(&conn, root.path()).is_err());
+    }
+
+    #[test]
+    // WS2 (audit follow-up, claim 5): a directory named like a config file
+    // is a genuine read error (EISDIR) -- never "file absent" -- and must
+    // not be silently treated the same as a legitimately missing file.
+    fn config_digest_propagates_a_real_read_error_instead_of_treating_it_as_absent() {
+        let conn = conn_with_file_index(&[]);
+        let root = tmp_project();
+        std::fs::create_dir(root.path().join("config.json")).unwrap();
+        assert!(EvidenceSnapshot::compute(&conn, root.path()).is_err());
+    }
+
+    #[test]
+    // WS2 (audit follow-up, claim 5): scip_overlay_state existing with an
+    // incompatible schema is a real anomaly (corruption/incompatible
+    // migration), not "no provider ever ran" -- must propagate, not
+    // silently digest as if the table were empty.
+    fn provider_state_digest_propagates_a_real_query_error_instead_of_treating_it_as_no_provider_state()
+     {
+        let conn = conn_with_file_index(&[]);
+        let root = tmp_project();
+        conn.execute("DROP TABLE scip_overlay_state", []).unwrap();
+        conn.execute("CREATE TABLE scip_overlay_state (provider TEXT)", [])
+            .unwrap();
+        conn.execute("INSERT INTO scip_overlay_state (provider) VALUES ('x')", [])
+            .unwrap();
+        assert!(EvidenceSnapshot::compute(&conn, root.path()).is_err());
     }
 
     #[test]
@@ -559,7 +653,6 @@ mod tests {
             None
         );
     }
-
 
     #[test]
     fn persisting_a_stronger_freshness_class_upgrades_a_previously_persisted_weaker_one() {

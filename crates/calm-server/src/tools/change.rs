@@ -568,22 +568,14 @@ impl CalmServer {
                         ));
                     }
                 };
-                // CCK-23 (P0 fix, audit 2026-08-09): "No stale evidence may grant
+                // CCK-23/WS2 (audit follow-up): "No stale evidence may grant
                 // authority" was never actually enforced -- this capability
-                // (`is_safe_for_high_risk_authority`) existed with zero production
-                // callers. Refuse to mint against a `Degraded` snapshot outright
-                // (Phase 0: blanket refusal for every risk tier, not just high --
-                // simplest safe interpretation until CCK-26 lands the tiered
-                // Low/Medium=Current|Reconciled vs High=Reconciled+Receipt policy).
-                if !snapshot.freshness_class.is_safe_for_high_risk_authority() {
-                    return ToolOutcome::error(error_detail(
-                        "EVIDENCE_NOT_FRESH",
-                        "index/config drifted since the last reconciliation \
-                         (freshness=Degraded) -- cannot mint a ReviewAuthority against \
-                         stale evidence",
-                        true,
-                    ));
-                }
+                // existed with zero production callers. The actual tiered
+                // check (Degraded refused outright for every tier; High risk
+                // additionally requires Reconciled, not just Current) needs
+                // `policy_decision.required_approver_class`, which isn't
+                // known yet at this point -- see the check right after
+                // `policy_decision` is computed below.
                 let graph_generation: i64 = conn
                     .query_row(
                         "SELECT generation FROM graph_generation_state WHERE id = 1",
@@ -717,6 +709,16 @@ impl CalmServer {
             // is, so refuse to mint here rather than hand out an authority that
             // can only ever be inert for the write it was meant to cover.
             let policy_decision = calm_core::policy::evaluate(&risk_vector, &policy);
+            // Checked BEFORE the freshness tier below (WS2, audit
+            // follow-up): this refusal is unconditional for Human tier
+            // regardless of evidence freshness -- review_change has no real
+            // approval channel at all, so a Human-required change is
+            // refused here whether evidence is Current, Degraded, or (were
+            // it ever reachable from this endpoint) Reconciled. Keeping it
+            // first means the error a caller sees names the actual reason
+            // review_change can never mint this authority, not an
+            // evidence-freshness detail that's beside the point for a tier
+            // this endpoint can never serve anyway.
             if policy_decision.required_approver_class == calm_core::policy::ApproverClass::Human {
                 return ToolOutcome::error(error_detail(
                     "INDEPENDENT_REVIEW_NOT_AVAILABLE_HERE",
@@ -728,6 +730,24 @@ impl CalmServer {
                         policy_decision.aggregate_risk.as_str(),
                         policy_decision.reasons.join("; "),
                     ),
+                    true,
+                ));
+            }
+            // WS2 (audit follow-up): the tiered freshness bar -- Degraded is
+            // refused outright for every tier (unchanged from CCK-23's Phase
+            // 0 blanket refusal). High risk additionally requires Reconciled
+            // rather than merely Current, but that tier is already refused
+            // unconditionally above for this endpoint -- reachable here only
+            // for Low/Medium, where Current already meets the bar, same as
+            // before this check existed.
+            if !snapshot
+                .freshness_class
+                .meets_bar_for(policy_decision.required_approver_class)
+            {
+                return ToolOutcome::error(error_detail(
+                    "EVIDENCE_NOT_FRESH",
+                    "index/config drifted since the last reconciliation (freshness=degraded) \
+                     -- cannot mint a ReviewAuthority against stale evidence",
                     true,
                 ));
             }

@@ -12,8 +12,8 @@ use calm_core::embedding::Embedder;
 use calm_core::sanitize::{injection_warning, sanitize_source_output};
 use calm_core::types::{EmbedStatus, IndexingPhase};
 
-pub(crate) mod common;
 mod change;
+pub(crate) mod common;
 mod detail;
 mod edit;
 mod guardrails;
@@ -5721,7 +5721,8 @@ mod tests {
         // "[REDACTED:...]" placeholder -- a data-loss integrity bug, not
         // something ReviewAuthority can help with (it only proves who may
         // write, not that the content being written is faithful).
-        let dir = std::env::temp_dir().join(format!("ci_source_lossy_write_{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("ci_source_lossy_write_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let original = "def foo():\n    API_KEY = \"sk-REAL_SECRET_VALUE_DO_NOT_LOSE\"\n";
@@ -5760,22 +5761,24 @@ mod tests {
         let etag = src_v["etag"].as_str().unwrap().to_string();
 
         // Agent copies the redacted body it was shown, verbatim, as new_text.
-        let out = jv(server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
-            EditSymbolParams {
-                change_id: None,
-                authority_id: None,
-                symbol: "foo".into(),
-                path: None,
-                line: None,
-                expected_hash: Some(etag),
-                new_text: redacted_body,
-                position: None,
-                confirm: false,
-                reason: None,
-                cites: None,
-                old_text: None,
-            },
-        )));
+        let out = jv(
+            server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
+                EditSymbolParams {
+                    change_id: None,
+                    authority_id: None,
+                    symbol: "foo".into(),
+                    path: None,
+                    line: None,
+                    expected_hash: Some(etag),
+                    new_text: redacted_body,
+                    position: None,
+                    confirm: false,
+                    reason: None,
+                    cites: None,
+                    old_text: None,
+                },
+            )),
+        );
         assert_eq!(
             out["error"]["code"], "LOSSY_WRITE_REJECTED",
             "response: {out}"
@@ -11218,10 +11221,16 @@ mod tests {
             calm_core::indexer::refresh::persist_index_input_snapshot(&conn, &catalog).unwrap();
         }
 
-        // edit_context's auto-mint has no risk check of its own (CCK-23's
-        // fix is deliberately at spend time, not mint time -- see this
-        // module's own review_change doc comment on why) so minting itself
-        // still succeeds here.
+        // WS2 (audit follow-up): edit_context's auto-mint now applies the
+        // same tiered freshness bar review_change does
+        // (FreshnessClass::meets_bar_for) -- a High-risk (Human-tier)
+        // symbol needs Reconciled evidence, not merely Current, so this
+        // fixture (only ever persists a Current snapshot, same as
+        // production's watcher-driven Current state) gets no authority
+        // minted at all. That's fine: CCK-23's real enforcement was always
+        // the spend-time legacy gate below, never possession of this
+        // authority -- so the write must still be refused with or without
+        // one.
         let ctx_out = server.edit_context(rmcp::handler::server::wrapper::Parameters(
             EditContextParams {
                 symbol: "check_token".into(),
@@ -11231,19 +11240,16 @@ mod tests {
             },
         ));
         let ctx_v = serde_json::to_value(&ctx_out.0).unwrap();
-        let change_id = ctx_v["change_id"]
-            .as_str()
-            .expect(&format!("edit_context must mint a change_id: {ctx_v}"))
-            .to_string();
-        let authority_id = ctx_v["authority_id"]
-            .as_str()
-            .expect(&format!("edit_context must mint an authority_id: {ctx_v}"))
-            .to_string();
+        assert!(
+            ctx_v.get("authority_id").is_none(),
+            "a High-risk symbol with only Current (not Reconciled) evidence must not get an \
+             auto-minted authority: {ctx_v}"
+        );
 
         let hash = calm_core::edit::range_checksum(original, 2, 2).unwrap();
         let params = EditLinesParams {
-            change_id: Some(change_id),
-            authority_id: Some(authority_id),
+            change_id: None,
+            authority_id: None,
             path: "auth/login.py".into(),
             edits: vec![EditHunkParam {
                 old_text: None,
