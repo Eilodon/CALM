@@ -143,7 +143,7 @@ required tests, and graduation. PRs marked DONE/PARTIAL are annotated with what 
 - Tests: doc-drift check only (reuse `scripts/gen-status.sh --check` style).
 - Depends: none.
 
-#### CCK-01 — Real forward migrations for `state.db` · **Status: TODO (highest priority — blocks all durable features)**
+#### CCK-01 — Real forward migrations for `state.db` · **Status: DONE — migration executor + fixtures shipped; hardened post-review (self-sufficient migrations, typed error, genuine old-shape fixture test)**
 - **Reframe:** versioning exists (`b677a9e`); the *executor* does not. Mirror index.db's
   `migrate_add_column` helper style.
 - Create `crates/calm-core/src/db/state_migrations.rs` with:
@@ -227,7 +227,7 @@ depends only on the existing gate. (Blueprint's Group A.)
 
 ### PHASE 1 — Evidence-bound, durable authority
 
-#### CCK-06 — `EvidenceSnapshot` (compute-only) · **Status: TODO**
+#### CCK-06 — `EvidenceSnapshot` (compute-only) · **Status: DONE — compute-only snapshot shipped; hardened post-review (fixed `freshness_class` dedup bug)**
 - Create `crates/calm-core/src/authority/{mod,snapshot.rs}`. Compute only; no schema yet.
   `snapshot_id = SNP-SHA256(canonical fields)`; `source_catalog_digest = SHA256(sorted(path\0hash))`
   from `file_index`. `freshness_class ∈ {reconciled, current, degraded}`.
@@ -238,14 +238,14 @@ depends only on the existing gate. (Blueprint's Group A.)
 - Tests: deterministic digest; row-order invariance; graph-generation / provider-state / config
   change each flips the digest; stale/degraded is explicit.
 
-#### CCK-07 — state.db **v2**: Snapshot + ChangeIntent persistence · **Status: TODO (first schema bump through CCK-01)**
+#### CCK-07 — state.db **v2**: Snapshot + ChangeIntent persistence · **Status: DONE — v2 schema + Snapshot/ChangeIntent persistence shipped**
 - Create `change/{mod,intent,store}.rs`. Modify `state_migrations.rs` (add v1→v2), bump
   `STATE_DB_SCHEMA_VERSION` 1→2. Tables: `evidence_snapshots`, `change_intents`,
   `change_intent_targets` (blueprint §5–6 SQL is well-formed; adopt as-is).
 - Required migration fixture: real v1 state.db → v2, old tx replay unchanged, memory/ledger unchanged,
   new intent insert succeeds.
 
-#### CCK-08 — ChangeKind + RiskVector + PolicyEngine (**shadow**) · **Status: TODO**
+#### CCK-08 — ChangeKind + RiskVector + PolicyEngine (**shadow**) · **Status: DONE — shadow ChangeKind/RiskVector/PolicyEngine shipped; hardened post-review (`is_hub`/`uncertain_zero_caller` escalation now matches `classify_gate`); first live caller wired via CCK-11's `plan_change`**
 - Split declared `ChangeIntentKind` from `ObservedChangeKind` (diff/AST classifier). `mismatch` →
   escalation, never silent accept. `RiskVector` (9 axes) with `aggregate_risk` kept for back-compat
   but PolicyEngine reads the vector.
@@ -256,7 +256,7 @@ depends only on the existing gate. (Blueprint's Group A.)
 - Tests: metamorphic diff fixtures (whitespace/comment/body/signature/visibility/delete/add/manifest/
   test-only/declared-doc-vs-observed-code); determinism (same inputs+digest ⇒ byte-identical decision).
 
-#### CCK-09 — state.db **v3**: `ReviewAuthority` (#65) · **Status: TODO minus graph_generation (PR D done)**
+#### CCK-09 — state.db **v3**: `ReviewAuthority` (#65) · **Status: DONE — v3 `ReviewAuthority` shipped; hardened post-review (target-scope-bound signature + atomic mint, `AuthorityTtl` newtype, atomic `control.key` creation, schema tightening)**
 - Create `authority/{review,key}.rs`. Migrate v2→v3, bump 2→3. Tables `review_authorities`(+targets,
   +evidence). Signed (HMAC `.calm/control.key`), single-use nonce, `expires_at`, snapshot+intent+
   policy+risk digests bound. `ALTER TABLE edit_transactions ADD COLUMN authority_id`.
@@ -267,7 +267,7 @@ depends only on the existing gate. (Blueprint's Group A.)
   changed caller set / changed graph generation / changed provider state / changed analysis version /
   changed policy / wrong principal class.
 
-#### CCK-10 — Integrate authority into current edit flow · **Status: TODO**
+#### CCK-10 — Integrate authority into current edit flow · **Status: DONE — authority integrated into `edit_lines`/`edit_symbol`; hardened post-review (fixed `STALE_CALLER_SET` false-positive on doc-commented insertions)**
 - `edit_context` becomes a compat wrapper: synthesize single-symbol ChangeIntent → capture Snapshot →
   compute Policy/Risk → mint ReviewAuthority; output gains `change_id`, `authority_id`,
   `authority_expires_at`. `edit_lines`/`edit_symbol` gain optional `change_id`/`authority_id`; new
@@ -278,7 +278,7 @@ depends only on the existing gate. (Blueprint's Group A.)
   succeeds; consumed exactly once; stale refused.
 - **Closes:** #65.
 
-#### CCK-11 — `plan_change` + `review_change` tools · **Status: TODO (greenfield, §1 row 21)**
+#### CCK-11 — `plan_change` + `review_change` tools · **Status: DONE — `plan_change` + `review_change` tools shipped, `change` toolset registered**
 - Create `tools/change.rs`, `services/change_planner.rs`. `review_change` returns `authority_id` only
   after required human/MRTR approval. No write yet. New `change` toolset, not forced on all presets.
 - Tests: `plan_change` on a declared/observed `ChangeIntentKind` mismatch surfaces the mismatch
