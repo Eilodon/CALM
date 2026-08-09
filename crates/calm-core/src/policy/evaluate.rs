@@ -38,6 +38,11 @@ pub fn evaluate(vector: &RiskVector, policy: &Policy) -> PolicyDecision {
         reasons.push(format!("risk_rules path floor: {}", floor.as_str()));
     }
     if vector.is_hub {
+        // Parity with the legacy `classify_gate` (calm-server/tools/edit.rs):
+        // `hub_hit` alone forces the full independent-review gate there,
+        // regardless of caller-count risk -- this axis must never authorize
+        // weaker than that.
+        level = level.max(RiskLevel::High);
         reasons.push(format!(
             "touches a hub symbol{}",
             vector
@@ -52,6 +57,9 @@ pub fn evaluate(vector: &RiskVector, policy: &Policy) -> PolicyDecision {
         reasons.push("touched symbol's own signature changed meaning".to_string());
     }
     if vector.uncertain_zero_caller {
+        // Parity with `classify_gate`: `uncertain_zero_caller.is_some()`
+        // alone forces the full gate there too, independent of `risk`.
+        level = level.max(RiskLevel::High);
         reasons.push("zero-caller symbol with uncertain dead-code confidence".to_string());
     }
     if vector.kind_mismatch {
@@ -177,5 +185,57 @@ mod tests {
         let a = evaluate(&v, &policy);
         let b = evaluate(&v, &policy);
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn is_hub_alone_escalates_to_high_matching_classify_gates_unconditional_gate() {
+        // Legacy `classify_gate` (calm-server/tools/edit.rs) gates on
+        // `hub_hit` alone, independent of caller-count risk -- this axis
+        // must reach the same conclusion here.
+        let mut v = base_vector();
+        v.is_hub = true;
+        v.hub_kind = Some("degree".to_string());
+        let decision = evaluate(&v, &Policy::default());
+        assert_eq!(decision.aggregate_risk, RiskLevel::High);
+    }
+
+    #[test]
+    fn uncertain_zero_caller_alone_escalates_to_high_matching_classify_gates_unconditional_gate() {
+        // Legacy `classify_gate` gates on `uncertain_zero_caller.is_some()`
+        // alone too, independent of `risk`.
+        let mut v = base_vector();
+        v.uncertain_zero_caller = true;
+        let decision = evaluate(&v, &Policy::default());
+        assert_eq!(decision.aggregate_risk, RiskLevel::High);
+    }
+
+    /// Mirrors `classify_gate`'s own unconditional-gate predicate
+    /// (`hub_hit || risk == Some("high") || uncertain_zero_caller.is_some()
+    /// || force_gate_always`) from `calm-server/tools/edit.rs`, minus
+    /// `force_gate_always` (a config flag `evaluate` doesn't see) --
+    /// `calm-core` cannot depend on `calm-server` to call the real function,
+    /// so this predicate is the parity contract the two must independently
+    /// satisfy. If `classify_gate`'s predicate ever changes, this comment
+    /// and the assertions below must change with it.
+    fn legacy_will_gate(hub_hit: bool, risk_high: bool, uncertain_zero_caller: bool) -> bool {
+        hub_hit || risk_high || uncertain_zero_caller
+    }
+
+    #[test]
+    fn evaluate_never_authorizes_weaker_than_classify_gates_unconditional_axes() {
+        for hub_hit in [false, true] {
+            for uncertain_zero_caller in [false, true] {
+                let mut v = base_vector();
+                v.is_hub = hub_hit;
+                v.uncertain_zero_caller = uncertain_zero_caller;
+                let decision = evaluate(&v, &Policy::default());
+                let legacy_gates = legacy_will_gate(hub_hit, false, uncertain_zero_caller);
+                let evaluate_gates = decision.aggregate_risk == RiskLevel::High;
+                assert!(
+                    evaluate_gates || !legacy_gates,
+                    "classify_gate would gate (hub_hit={hub_hit}, uncertain_zero_caller={uncertain_zero_caller}) but evaluate() did not escalate to High"
+                );
+            }
+        }
     }
 }
