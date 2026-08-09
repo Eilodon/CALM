@@ -61,10 +61,14 @@ pub enum ContainmentMethod {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RootedFsError {
-    Io { detail: String },
+    Io {
+        detail: String,
+    },
     /// `relative` was empty, absolute, or had no file-name component --
     /// never a valid target for any method on this type.
-    InvalidRelativePath { relative: String },
+    InvalidRelativePath {
+        relative: String,
+    },
 }
 
 impl std::fmt::Display for RootedFsError {
@@ -160,12 +164,11 @@ impl RootedFilesystem {
                 relative: relative.to_string(),
             });
         }
-        let file_name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .ok_or_else(|| RootedFsError::InvalidRelativePath {
+        let file_name = path.file_name().and_then(|n| n.to_str()).ok_or_else(|| {
+            RootedFsError::InvalidRelativePath {
                 relative: relative.to_string(),
-            })?;
+            }
+        })?;
         let parent = path.parent().and_then(|p| p.to_str()).unwrap_or("");
         Ok((parent, file_name))
     }
@@ -222,12 +225,23 @@ impl RootedFilesystem {
         {
             use std::os::fd::AsRawFd;
             let dir_fd = self.open_dir_beneath(parent)?;
+            // Preserved verbatim (bypassing umask via `fchmod`, not the
+            // creation `mode` argument) when `name` already exists --
+            // follows a leaf symlink the same way `edit::atomic_write_with`'s
+            // own `std::fs::metadata(path)` does. `None` (no existing
+            // target) leaves the new file at its natural `0o666 & !umask`
+            // default, same as any other fresh create.
+            let original_mode = linux_impl::fstatat_mode(dir_fd.as_raw_fd(), name)?;
             let tmp_name = format!(".{name}.ci-rooted-{}.tmp", write_nonce());
-            let tmp_fd = linux_impl::openat_create_new(dir_fd.as_raw_fd(), &tmp_name)?;
+            let tmp_fd = linux_impl::openat_create_new(dir_fd.as_raw_fd(), &tmp_name, 0o666)?;
             let mut tmp_file = File::from(tmp_fd);
             let write_result = (|| -> io::Result<()> {
                 std::io::Write::write_all(&mut tmp_file, content.as_bytes())?;
-                tmp_file.sync_all()
+                tmp_file.sync_all()?;
+                if let Some(mode) = original_mode {
+                    linux_impl::fchmod_fd(tmp_file.as_raw_fd(), mode)?;
+                }
+                Ok(())
             })();
             drop(tmp_file);
             if let Err(e) = write_result {
@@ -360,15 +374,23 @@ mod linux_impl {
         Ok(unsafe { OwnedFd::from_raw_fd(ret as RawFd) })
     }
 
-    /// Plain `openat(dir_fd, name, O_WRONLY|O_CREAT|O_EXCL)` -- `name` is
-    /// always a bare, `/`-free component (enforced by
+    /// Plain `openat(dir_fd, name, O_WRONLY|O_CREAT|O_EXCL, mode)` -- `name`
+    /// is always a bare, `/`-free component (enforced by
     /// `RootedFilesystem::split_relative`'s caller), and `dir_fd` was
     /// already verified safe by `openat2_raw` before this is ever called,
     /// so a plain (non-`openat2`) create here cannot itself traverse
     /// anywhere new to race on. `O_EXCL` makes a name collision (including
     /// a planted dangling symlink at that exact temp name) a loud
-    /// `EEXIST`, never a silent follow.
-    pub(super) fn openat_create_new(dir_fd: RawFd, name: &str) -> io::Result<OwnedFd> {
+    /// `EEXIST`, never a silent follow. `mode` is subject to the process
+    /// umask same as any other `open(2)` create -- callers that need an
+    /// EXACT mode regardless of umask (e.g. preserving an overwritten
+    /// file's original permissions) must `fchmod` the resulting fd
+    /// afterward rather than rely on this parameter alone.
+    pub(super) fn openat_create_new(
+        dir_fd: RawFd,
+        name: &str,
+        mode: libc::mode_t,
+    ) -> io::Result<OwnedFd> {
         let c_name = CString::new(name)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))?;
         let ret = unsafe {
@@ -376,13 +398,49 @@ mod linux_impl {
                 dir_fd,
                 c_name.as_ptr(),
                 libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
-                0o644,
+                mode,
             )
         };
         if ret < 0 {
             return Err(io::Error::last_os_error());
         }
         Ok(unsafe { OwnedFd::from_raw_fd(ret) })
+    }
+
+    /// `fstatat(dir_fd, name, flags = 0)` -- follows a symlink at `name`
+    /// (matching `std::fs::metadata`'s own follow-symlink semantics, which
+    /// is what `edit::atomic_write_with` already uses to capture a target's
+    /// original permissions before overwriting it). Returns `Ok(None)` for
+    /// "no such file" specifically -- a target that doesn't exist yet is
+    /// not an error here, just "nothing to preserve" -- and propagates
+    /// every other error (permission, I/O, a symlink loop) instead of
+    /// treating it the same way.
+    pub(super) fn fstatat_mode(dir_fd: RawFd, name: &str) -> io::Result<Option<u32>> {
+        let c_name = CString::new(name)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))?;
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        let ret = unsafe { libc::fstatat(dir_fd, c_name.as_ptr(), &mut stat, 0) };
+        if ret < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::NotFound {
+                return Ok(None);
+            }
+            return Err(err);
+        }
+        Ok(Some(stat.st_mode & 0o7777))
+    }
+
+    /// `fchmod(fd, mode)` -- sets permissions on an already-open fd rather
+    /// than a re-resolved path string (staying consistent with this
+    /// module's fd-relative-only discipline), and bypasses the process
+    /// umask the same way `std::fs::set_permissions` does, so an exact
+    /// preserved mode is not silently narrowed by it.
+    pub(super) fn fchmod_fd(fd: RawFd, mode: u32) -> io::Result<()> {
+        let ret = unsafe { libc::fchmod(fd, mode) };
+        if ret < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
     }
 
     /// `renameat(dir_fd, from, dir_fd, to)` -- both `from`/`to` bare names
@@ -467,7 +525,8 @@ mod tests {
         std::fs::create_dir(dir.path().join("src")).unwrap();
         let fs = RootedFilesystem::open(dir.path()).unwrap();
 
-        fs.write_atomic_beneath("src/foo.rs", "fn main() {}").unwrap();
+        fs.write_atomic_beneath("src/foo.rs", "fn main() {}")
+            .unwrap();
         assert_eq!(
             std::fs::read_to_string(dir.path().join("src/foo.rs")).unwrap(),
             "fn main() {}"
@@ -498,6 +557,83 @@ mod tests {
 
         let receipt = fs.write_atomic_beneath("b.txt", "bye").unwrap();
         assert_eq!(receipt.containment, ContainmentMethod::KernelEnforced);
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn write_atomic_beneath_preserves_an_overwritten_files_original_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("a.txt");
+        std::fs::write(&target, "original").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let fs = RootedFilesystem::open(dir.path()).unwrap();
+
+        fs.write_atomic_beneath("a.txt", "overwritten").unwrap();
+
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(
+            mode, 0o600,
+            "overwrite must preserve the target's original permission bits, not fall back \
+             to a hardcoded default"
+        );
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn write_atomic_beneath_preserves_the_executable_bit_on_overwrite() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("run.sh");
+        std::fs::write(&target, "#!/bin/sh\necho old").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let fs = RootedFilesystem::open(dir.path()).unwrap();
+
+        fs.write_atomic_beneath("run.sh", "#!/bin/sh\necho new")
+            .unwrap();
+
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(
+            mode, 0o755,
+            "overwriting an executable file must not clear its exec bit"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "#!/bin/sh\necho new"
+        );
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn write_atomic_beneath_on_a_leaf_symlink_replaces_the_symlink_itself_not_its_target() {
+        // Documents (rather than leaves implicit) the intended semantics:
+        // when the leaf name itself is a symlink, `renameat` over it
+        // replaces the symlink -- exactly like `std::fs::rename` already
+        // does for `edit::atomic_write_with`'s fallback path -- rather than
+        // writing through it into whatever it points at.
+        let dir = tempfile::tempdir().unwrap();
+        let real_target = dir.path().join("real.txt");
+        std::fs::write(&real_target, "untouched").unwrap();
+        let link_path = dir.path().join("link.txt");
+        std::os::unix::fs::symlink(&real_target, &link_path).unwrap();
+        let fs = RootedFilesystem::open(dir.path()).unwrap();
+
+        fs.write_atomic_beneath("link.txt", "via the link").unwrap();
+
+        assert!(
+            !std::fs::symlink_metadata(&link_path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the rename must have replaced the symlink itself with a regular file"
+        );
+        assert_eq!(std::fs::read_to_string(&link_path).unwrap(), "via the link");
+        assert_eq!(
+            std::fs::read_to_string(&real_target).unwrap(),
+            "untouched",
+            "the symlink's old target must be left alone -- the write must not have \
+             followed the symlink"
+        );
     }
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -544,7 +680,11 @@ mod tests {
             let mut toggle = false;
             while !stop2.load(std::sync::atomic::Ordering::Relaxed) {
                 let _ = std::fs::remove_file(&link_path2);
-                let target = if toggle { &outside_target } else { &inside_target };
+                let target = if toggle {
+                    &outside_target
+                } else {
+                    &inside_target
+                };
                 let _ = std::os::unix::fs::symlink(target, &link_path2);
                 toggle = !toggle;
             }

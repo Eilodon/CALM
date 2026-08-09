@@ -718,7 +718,13 @@ impl CalmServer {
                     continue;
                 }
             };
-            if let Err(e) = calm_core::edit::atomic_write(&full_path, &formatted) {
+            if let Err(e) = write_via_configured_backend(
+                &self.project_root,
+                path,
+                &full_path,
+                &formatted,
+                self.config().edit.kernel_enforced_writes,
+            ) {
                 let _ = calm_core::txn::advance(
                     &file_conn,
                     &shadow_tx_id,
@@ -2229,7 +2235,13 @@ impl CalmServer {
             }
         };
 
-        if let Err(e) = calm_core::edit::atomic_write(&full_path, &new_content) {
+        if let Err(e) = write_via_configured_backend(
+            &self.project_root,
+            path,
+            &full_path,
+            &new_content,
+            self.config().edit.kernel_enforced_writes,
+        ) {
             if let Some(tx_id) = &shadow_tx_id {
                 let _ = calm_core::txn::advance(
                     &state_conn,
@@ -3604,6 +3616,33 @@ pub(crate) fn caller_symbol_set(conn: &rusqlite::Connection, qualified_name: &st
     }) {
         Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
         Err(_) => Vec::new(),
+    }
+}
+
+/// Writes `content` to `path` (repo-relative, already resolved to
+/// `full_path` via `resolve_repo_path`) using whichever write path
+/// `[edit].kernel_enforced_writes` (CCK-05B) selects: `atomic_write`'s
+/// plain resolved-path write (default, zero behavior change), or
+/// `fs::rooted::RootedFilesystem::write_atomic_beneath`'s fd-relative
+/// `openat2(RESOLVE_BENEATH)` write on Linux x86_64 (kernel-enforced
+/// containment with no window between `resolve_repo_path`'s check and
+/// this write for a symlink to be swapped in). Both paths keep the exact
+/// same temp-file-then-rename/fsync contract -- opting in only changes
+/// what backs the containment guarantee, not the write's atomicity.
+fn write_via_configured_backend(
+    project_root: &std::path::Path,
+    path: &str,
+    full_path: &std::path::Path,
+    content: &str,
+    kernel_enforced_writes: bool,
+) -> std::io::Result<()> {
+    if kernel_enforced_writes {
+        let fs = calm_core::fs::RootedFilesystem::open(project_root)?;
+        fs.write_atomic_beneath(path, content)
+            .map(|_| ())
+            .map_err(std::io::Error::other)
+    } else {
+        calm_core::edit::atomic_write(full_path, content)
     }
 }
 

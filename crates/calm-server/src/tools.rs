@@ -9224,6 +9224,96 @@ mod tests {
     }
 
     #[test]
+    fn edit_lines_with_kernel_enforced_writes_still_applies_the_edit_correctly() {
+        // CCK-05B cutover: `edit.kernel_enforced_writes` routes the actual
+        // write through `fs::rooted::RootedFilesystem::write_atomic_beneath`
+        // instead of `calm_core::edit::atomic_write`. The observable
+        // contract for a plain, non-hub edit must be identical either way --
+        // this is the same fixture/assertions as
+        // `edit_lines_applies_writes_file_and_reindexes`, just with the flag
+        // flipped on.
+        let dir =
+            std::env::temp_dir().join(format!("ci_kernel_writes_edit_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"edit": {"kernel_enforced_writes": true}}"#,
+        )
+        .unwrap();
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+        std::fs::write(dir.join("a.py"), "def helper():\n    return 1\n").unwrap();
+        let hash = calm_core::edit::range_checksum("def helper():\n    return 1\n", 2, 2).unwrap();
+
+        let out = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
+            EditLinesParams {
+                change_id: None,
+                authority_id: None,
+                path: "a.py".into(),
+                edits: vec![EditHunkParam {
+                    old_text: None,
+                    start_line: 2,
+                    end_line: 2,
+                    expected_hash: Some(hash),
+                    new_text: "    return 2\n".into(),
+                }],
+                confirm: false,
+                reason: None,
+                cites: None,
+            },
+        ));
+        let v = jv(out);
+        assert_eq!(v["applied"], true, "response: {v}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.py")).unwrap(),
+            "def helper():\n    return 2\n"
+        );
+
+        let conn = server.db();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM symbols WHERE qualified_name = 'a.py::helper'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn format_files_with_kernel_enforced_writes_still_formats_correctly() {
+        let dir = std::env::temp_dir().join(format!("ci_kernel_writes_fmt_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"edit": {"kernel_enforced_writes": true}}"#,
+        )
+        .unwrap();
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+        std::fs::write(
+            dir.join("ugly.rs"),
+            "fn   main( ) { let x=1  ;println!(\"{}\",x);}\n",
+        )
+        .unwrap();
+
+        let out = server.format_files(rmcp::handler::server::wrapper::Parameters(
+            FormatFilesParams {
+                paths: vec!["ugly.rs".into()],
+            },
+        ));
+        let v = jv(out);
+        assert_eq!(v["results"][0]["status"], "formatted", "response: {v}");
+
+        let on_disk = std::fs::read_to_string(dir.join("ugly.rs")).unwrap();
+        assert!(on_disk.contains("fn main() {"), "got: {on_disk}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn format_files_reformats_ugly_rust_and_reindexes() {
         let (dir, server) = test_server("format_apply");
         std::fs::write(
