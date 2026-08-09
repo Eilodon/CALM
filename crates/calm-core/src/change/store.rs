@@ -8,7 +8,7 @@
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::change::classify::{ChangeIntentKind, ChangeKind};
-use crate::change::intent::{ChangeIntent, ChangeIntentTarget};
+use crate::change::intent::{ChangeIntent, ChangeIntentTarget, IntentStatus};
 
 /// Inserts `intent` and every one of its `targets` in that order --
 /// `change_intent_targets.intent_id` is a foreign key, so target rows
@@ -31,8 +31,10 @@ pub fn insert_change_intent(
     idempotency_key: Option<&str>,
 ) -> rusqlite::Result<()> {
     conn.execute(
-        "INSERT INTO change_intents (intent_id, kind, reason, snapshot_id, created_at, idempotency_key) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO change_intents \
+         (intent_id, kind, reason, snapshot_id, created_at, idempotency_key, status, \
+          superseded_by_intent_id) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
             intent.intent_id,
             intent.kind.0.as_str(),
@@ -40,6 +42,8 @@ pub fn insert_change_intent(
             intent.snapshot_id,
             intent.created_at,
             idempotency_key,
+            intent.status.as_str(),
+            intent.superseded_by_intent_id,
         ],
     )?;
     for target in &intent.targets {
@@ -81,15 +85,28 @@ pub fn get_change_intent(
     conn: &Connection,
     intent_id: &str,
 ) -> rusqlite::Result<Option<ChangeIntent>> {
-    let row: Option<(String, String, String, String, f64)> = conn
+    let row: Option<(String, String, String, String, f64, String, Option<String>)> = conn
         .query_row(
-            "SELECT intent_id, kind, reason, snapshot_id, created_at \
+            "SELECT intent_id, kind, reason, snapshot_id, created_at, status, \
+                    superseded_by_intent_id \
              FROM change_intents WHERE intent_id = ?1",
             params![intent_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                ))
+            },
         )
         .optional()?;
-    let Some((intent_id, kind_str, reason, snapshot_id, created_at)) = row else {
+    let Some((intent_id, kind_str, reason, snapshot_id, created_at, status_str, superseded_by_intent_id)) =
+        row
+    else {
         return Ok(None);
     };
     let kind = ChangeKind::parse(&kind_str).ok_or_else(|| {
@@ -97,6 +114,13 @@ pub fn get_change_intent(
             0,
             rusqlite::types::Type::Text,
             format!("change_intents.kind {kind_str:?} is not a known ChangeKind").into(),
+        )
+    })?;
+    let status = IntentStatus::parse(&status_str).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Text,
+            format!("change_intents.status {status_str:?} is not a known IntentStatus").into(),
         )
     })?;
 
@@ -119,7 +143,44 @@ pub fn get_change_intent(
         snapshot_id,
         targets,
         created_at,
+        status,
+        superseded_by_intent_id,
     }))
+}
+
+/// CCK-27 (audit follow-up): marks `old_intent_id` `Superseded` by a freshly
+/// declared replacement and inserts that replacement, in the specific
+/// 3-statement order both of `change_intents`' own constraints require:
+///   1. clear `old_intent_id`'s `idempotency_key` -- frees it under the
+///      partial unique index (`WHERE idempotency_key IS NOT NULL`) *before*
+///      `new_intent` tries to claim the same key, with no FK involved yet.
+///   2. insert `new_intent` under `new_idempotency_key` (now unblocked).
+///   3. point `old_intent_id` at `new_intent.intent_id` -- only valid now
+///      that row exists, since `superseded_by_intent_id` is a real FK to
+///      `change_intents(intent_id)`.
+/// Steps 1 and 3 touch the same row but can't be merged into one UPDATE:
+/// merging would set the FK column before its target row exists. Callers
+/// are expected to run this inside their own transaction (same pattern as
+/// `insert_change_intent`'s own doc comment) -- `plan_change` is the one
+/// production caller, invoked in place of a bare `insert_change_intent`
+/// whenever a repeated call detects the intent's snapshot has drifted.
+pub fn supersede_change_intent(
+    conn: &Connection,
+    old_intent_id: &str,
+    new_intent: &ChangeIntent,
+    new_idempotency_key: Option<&str>,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE change_intents SET idempotency_key = NULL WHERE intent_id = ?1",
+        params![old_intent_id],
+    )?;
+    insert_change_intent(conn, new_intent, new_idempotency_key)?;
+    conn.execute(
+        "UPDATE change_intents SET status = 'superseded', superseded_by_intent_id = ?2 \
+         WHERE intent_id = ?1",
+        params![old_intent_id, new_intent.intent_id],
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -273,5 +334,46 @@ mod tests {
             vec![],
         );
         assert!(insert_change_intent(&conn, &intent, None).is_err());
+    }
+
+    #[test]
+    fn a_freshly_inserted_intent_round_trips_as_active_with_no_superseded_by() {
+        let conn = conn();
+        insert_snapshot(&conn, "SNP-f");
+        let intent = ChangeIntent::new(ChangeIntentKind(ChangeKind::Body), "test", "SNP-f", vec![]);
+        insert_change_intent(&conn, &intent, None).unwrap();
+
+        let loaded = get_change_intent(&conn, &intent.intent_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.status, IntentStatus::Active);
+        assert_eq!(loaded.superseded_by_intent_id, None);
+    }
+
+    #[test]
+    fn supersede_marks_the_old_intent_inserts_the_new_one_and_frees_the_idempotency_key() {
+        let conn = conn();
+        insert_snapshot(&conn, "SNP-g1");
+        insert_snapshot(&conn, "SNP-g2");
+        let old = ChangeIntent::new(ChangeIntentKind(ChangeKind::Body), "test", "SNP-g1", vec![]);
+        insert_change_intent(&conn, &old, Some("plan-key-g")).unwrap();
+
+        let new = ChangeIntent::new(ChangeIntentKind(ChangeKind::Body), "test", "SNP-g2", vec![]);
+        supersede_change_intent(&conn, &old.intent_id, &new, Some("plan-key-g")).unwrap();
+
+        let loaded_old = get_change_intent(&conn, &old.intent_id).unwrap().unwrap();
+        assert_eq!(loaded_old.status, IntentStatus::Superseded);
+        assert_eq!(loaded_old.superseded_by_intent_id, Some(new.intent_id.clone()));
+
+        let loaded_new = get_change_intent(&conn, &new.intent_id).unwrap().unwrap();
+        assert_eq!(loaded_new.status, IntentStatus::Active);
+
+        // The key now resolves to the new intent, not the superseded one --
+        // this is the whole point: a repeated plan_change call for the
+        // same kind+targets now sees fresh evidence instead of stale.
+        let found = find_change_intent_by_idempotency_key(&conn, "plan-key-g")
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.intent_id, new.intent_id);
     }
 }

@@ -37,8 +37,12 @@ pub const INDEX_DB_SCHEMA_VERSION: i64 = 1;
 // -- EvidenceSnapshot::snapshot_id now also binds SCIP/LSP provider run state
 // (authority/snapshot.rs::provider_state_digest), so a proof-coverage change
 // with no source/config/graph_generation change still mints a fresh snapshot.
-// See db/state_migrations.rs's registered v1->v2 through v5->v6 steps.
-pub const STATE_DB_SCHEMA_VERSION: i64 = 6;
+// v7 (CCK-27, audit follow-up): adds change_intents.status/superseded_by_intent_id
+// -- plan_change's idempotency dedup can now mark a stale intent superseded
+// (and free its idempotency_key) instead of silently reusing it after
+// evidence has drifted; review_change refuses to mint against one.
+// See db/state_migrations.rs's registered v1->v2 through v6->v7 steps.
+pub const STATE_DB_SCHEMA_VERSION: i64 = 7;
 
 /// Refuses to proceed if `conn`'s stamped `PRAGMA user_version` is HIGHER
 /// than `expected` -- meaning a newer CALM binary already created or
@@ -582,7 +586,9 @@ CREATE TABLE IF NOT EXISTS change_intents (
     reason           TEXT NOT NULL,
     snapshot_id      TEXT NOT NULL REFERENCES evidence_snapshots(snapshot_id),
     created_at       REAL NOT NULL,
-    idempotency_key  TEXT
+    idempotency_key  TEXT,
+    status                   TEXT NOT NULL DEFAULT 'active',
+    superseded_by_intent_id  TEXT REFERENCES change_intents(intent_id)
 );
 CREATE INDEX IF NOT EXISTS idx_change_intents_snapshot ON change_intents(snapshot_id);
 -- CCK-11: plan_change's idempotency contract -- a partial unique index

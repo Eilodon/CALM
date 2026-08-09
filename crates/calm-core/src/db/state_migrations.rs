@@ -134,6 +134,12 @@ pub const STATE_MIGRATIONS: &[StateMigration] = &[
         name: "v6_evidence_snapshot_provider_state",
         apply: v5_to_v6_evidence_snapshot_provider_state,
     },
+    StateMigration {
+        from: 6,
+        to: 7,
+        name: "v7_change_intent_supersede",
+        apply: v6_to_v7_change_intent_supersede,
+    },
 ];
 
 /// v1->v2 (CCK-07): adds `evidence_snapshots`, `change_intents`,
@@ -392,6 +398,54 @@ fn v5_to_v6_evidence_snapshot_provider_state(conn: &Connection) -> Result<(), St
         return Err(StateMigrationError::PostconditionFailed {
             migration: "v6_evidence_snapshot_provider_state",
             detail: "evidence_snapshots.provider_state_digest does not exist after this \
+                      step's own DDL ran"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// v6->v7 (CCK-27, audit follow-up): adds `change_intents.status`/
+/// `superseded_by_intent_id` -- `plan_change`'s idempotency dedup keyed
+/// only on `kind`+`targets` (never `snapshot_id`) meant a repeated call
+/// after source drifted still returned the SAME stale `change_id`, so a
+/// human approving it via `review_change` could be looking at a
+/// declared-vs-observed picture from a snapshot that no longer exists.
+/// `change::store::supersede_change_intent` now marks the old intent row
+/// `superseded` (and frees its `idempotency_key`) whenever `plan_change`
+/// finds drift, and `review_change` refuses to mint against a superseded
+/// intent -- see those symbols' own doc comments.
+fn v6_to_v7_change_intent_supersede(conn: &Connection) -> Result<(), StateMigrationError> {
+    let mut stmt = conn.prepare("PRAGMA table_info(change_intents)")?;
+    let existing_columns: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(|r| r.ok())
+        .collect();
+    let new_columns: &[(&str, &str)] = &[
+        ("status", "TEXT NOT NULL DEFAULT 'active'"),
+        (
+            "superseded_by_intent_id",
+            "TEXT REFERENCES change_intents(intent_id)",
+        ),
+    ];
+    for (name, ddl) in new_columns {
+        if !existing_columns.iter().any(|c| c == name) {
+            conn.execute_batch(&format!("ALTER TABLE change_intents ADD COLUMN {name} {ddl};"))?;
+        }
+    }
+
+    let mut stmt = conn.prepare("PRAGMA table_info(change_intents)")?;
+    let now_has_all = {
+        let cols: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .filter_map(|r| r.ok())
+            .collect();
+        new_columns.iter().all(|(name, _)| cols.iter().any(|c| c == name))
+    };
+    if !now_has_all {
+        return Err(StateMigrationError::PostconditionFailed {
+            migration: "v7_change_intent_supersede",
+            detail: "change_intents is missing status/superseded_by_intent_id after this \
                       step's own DDL ran"
                 .to_string(),
         });
@@ -841,6 +895,30 @@ mod tests {
             columns.iter().any(|c| c == "provider_state_digest"),
             "evidence_snapshots.provider_state_digest should exist"
         );
+    }
+
+    #[test]
+    fn registered_v6_to_v7_migration_adds_change_intent_supersede_columns() {
+        let conn = fresh_conn();
+        conn.pragma_update(None, "user_version", 6).unwrap();
+        migrate_state_db_to_current(&conn).unwrap();
+        assert_eq!(
+            user_version(&conn),
+            super::super::schema::STATE_DB_SCHEMA_VERSION
+        );
+        let columns: Vec<String> = conn
+            .prepare("PRAGMA table_info(change_intents)")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        for expected in ["status", "superseded_by_intent_id"] {
+            assert!(
+                columns.iter().any(|c| c == expected),
+                "change_intents.{expected} should exist"
+            );
+        }
     }
 
     #[test]

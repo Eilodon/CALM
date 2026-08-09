@@ -22,10 +22,25 @@
 //! spendable ONLY if `edit_lines`/`edit_symbol`'s own unconditional
 //! `HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW` check (edit.rs, CCK-23) is
 //! separately satisfied via a real elicitation round-trip -- self-
-//! attestation here is never sufficient on its own for that tier. A real
-//! risk-aware refusal *inside* `review_change` (instead of relying on the
-//! spend-time backstop) needs a real `RiskVector`/`PolicyDecision`, which
-//! is CCK-26's job, not this module's -- see the master blueprint.
+//! attestation here is never sufficient on its own for that tier.
+//!
+//! **CCK-26 (audit follow-up):** `review_change` now also refuses to mint
+//! at all -- `INDEPENDENT_REVIEW_NOT_AVAILABLE_HERE`, no authority handed
+//! out -- when a real `calm_core::policy::evaluate()` decision (built from
+//! a genuine `RiskVector` over the declared targets, not a placeholder)
+//! says the required approver class is `Human`. This is on top of, not a
+//! replacement for, CCK-23's spend-time backstop above: this module's
+//! refusal saves a wasted authority for the common case, edit_lines/
+//! edit_symbol's check is what actually cannot be bypassed.
+//!
+//! **CCK-27 (audit follow-up):** `plan_change`'s idempotency dedup keys on
+//! `kind`+`targets` only, never `snapshot_id` -- a repeated call after
+//! evidence drifted (source/config/graph/provider state) now supersedes
+//! the stale intent (`change::intent::IntentStatus::Superseded`) and mints
+//! a fresh one against current evidence, instead of silently handing back
+//! a `change_id` whose declared picture no longer matches reality.
+//! `review_change` refuses to mint against a superseded intent
+//! (`INTENT_SUPERSEDED`).
 //!
 //! **Known Phase-1 scope limit** (the blueprint's own phasing: CCK-11 is
 //! Phase 1, true multi-file `ChangeSet` staging/commit is Phase 2,
@@ -79,6 +94,14 @@ pub(crate) struct PlanChangeOutput {
     /// `change_id` instead of minting a new one.
     pub(crate) reused: bool,
     pub(crate) snapshot_id: String,
+    /// CCK-27 (audit follow-up): set when this call's declared kind+targets
+    /// matched a prior intent, but evidence had drifted since that intent
+    /// was declared -- that stale intent was marked `superseded` (see
+    /// `change::intent::IntentStatus`) rather than reused, and this
+    /// `change_id` replaces it. `review_change` on the superseded id now
+    /// refuses with `INTENT_SUPERSEDED`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) superseded_change_id: Option<String>,
     /// `true` when at least one target's current uncommitted diff (working
     /// tree vs. `git show HEAD`) doesn't classify as the declared `kind` --
     /// best-effort: silently `false` for a target with no git history, no
@@ -234,7 +257,7 @@ fn check_declared_vs_observed(
 impl CalmServer {
     #[tool(
         name = "plan_change",
-        description = "Declares a ChangeIntent (what you're about to do, and why) as a formal, reviewable record, before writing anything -- returns a change_id to hand to review_change once a human/MRTR approves it. Idempotent: repeated calls with the same kind+targets return the same change_id instead of minting a new one each time. Surfaces (not blocks) a declared-vs-observed kind mismatch when a target's current uncommitted diff doesn't match what you declared. USE WHEN: a change needs formal review/authority rather than the lighter edit_context+confirm+reason gate. NOT FOR: the write itself (edit_lines/edit_symbol still do that) or a single quick low-risk edit (edit_context is enough there).",
+        description = "Declares a ChangeIntent (what you're about to do, and why) as a formal, reviewable record, before writing anything -- returns a change_id to hand to review_change once a human/MRTR approves it. Idempotent ONLY while evidence hasn't drifted: repeated calls with the same kind+targets return the same change_id, but if source/config/graph/provider state changed since the matching intent was declared, that intent is superseded and this call mints a fresh change_id against current evidence instead (superseded_change_id on the response names the one replaced -- review_change on it now refuses with INTENT_SUPERSEDED). Surfaces (not blocks) a declared-vs-observed kind mismatch when a target's current uncommitted diff doesn't match what you declared. USE WHEN: a change needs formal review/authority rather than the lighter edit_context+confirm+reason gate. NOT FOR: the write itself (edit_lines/edit_symbol still do that) or a single quick low-risk edit (edit_context is enough there).",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -278,6 +301,28 @@ impl CalmServer {
                 .collect();
             let idempotency_key = plan_idempotency_key(kind, &targets);
 
+            // CCK-27 (audit follow-up): the snapshot is now computed
+            // unconditionally, up front -- a repeated call needs it too,
+            // to decide whether a prior intent for this exact kind+targets
+            // is still current or has drifted (see below), not just a
+            // fresh call minting one for the first time.
+            let snapshot = {
+                let conn = match self.make_read_conn() {
+                    Ok(c) => c,
+                    Err(e) => return db_error(e),
+                };
+                match calm_core::authority::EvidenceSnapshot::compute(&conn, &self.project_root) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        return ToolOutcome::error(error_detail(
+                            "SNAPSHOT_ERROR",
+                            &e.to_string(),
+                            true,
+                        ));
+                    }
+                }
+            };
+
             let mut state_conn = match calm_core::db::conn::open_state_writer(&self.state_db_path)
             {
                 Ok(c) => c,
@@ -286,31 +331,35 @@ impl CalmServer {
                 }
             };
 
-            let (change_id, snapshot_id, reused) = match calm_core::change::find_change_intent_by_idempotency_key(
+            let existing = match calm_core::change::find_change_intent_by_idempotency_key(
                 &state_conn,
                 &idempotency_key,
             ) {
-                Ok(Some(existing)) => (existing.intent_id, existing.snapshot_id, true),
-                Ok(None) => {
-                    let snapshot = {
-                        let conn = match self.make_read_conn() {
-                            Ok(c) => c,
-                            Err(e) => return db_error(e),
-                        };
-                        match calm_core::authority::EvidenceSnapshot::compute(
-                            &conn,
-                            &self.project_root,
-                        ) {
-                            Ok(s) => s,
-                            Err(e) => {
-                                return ToolOutcome::error(error_detail(
-                                    "SNAPSHOT_ERROR",
-                                    &e.to_string(),
-                                    true,
-                                ));
-                            }
-                        }
-                    };
+                Ok(existing) => existing,
+                Err(e) => {
+                    return ToolOutcome::error(error_detail("STATE_DB_ERROR", &e.to_string(), true));
+                }
+            };
+
+            // CCK-27 (audit follow-up): `find_change_intent_by_idempotency_key`
+            // only ever returns an `Active` intent (`supersede_change_intent`
+            // clears a superseded row's key), so `existing` here is always the
+            // current answer for this kind+targets -- IF its declared
+            // `snapshot_id` still matches evidence right now. When it does,
+            // this is a genuine repeated call: reuse it verbatim, unchanged
+            // from CCK-07's original behavior. When it doesn't, evidence
+            // drifted since that intent was declared -- reusing it would hand
+            // a human reviewing it via `review_change` a `change_id` whose
+            // `kind_mismatch`/`observed_kind` picture no longer reflects
+            // reality, so supersede it and mint a fresh intent against
+            // current evidence instead (`superseded_change_id` on the
+            // response names the one this replaced).
+            let (change_id, snapshot_id, reused, superseded_change_id) =
+                if let Some(existing) = &existing
+                    && existing.snapshot_id == snapshot.snapshot_id
+                {
+                    (existing.intent_id.clone(), existing.snapshot_id.clone(), true, None)
+                } else {
                     let tx = match state_conn.transaction() {
                         Ok(tx) => tx,
                         Err(e) => {
@@ -334,9 +383,21 @@ impl CalmServer {
                         snapshot.snapshot_id.clone(),
                         targets.clone(),
                     );
-                    if let Err(e) =
-                        calm_core::change::insert_change_intent(&tx, &intent, Some(&idempotency_key))
-                    {
+                    let stale_intent_id = existing.map(|e| e.intent_id);
+                    let write_result = match &stale_intent_id {
+                        Some(old_id) => calm_core::change::supersede_change_intent(
+                            &tx,
+                            old_id,
+                            &intent,
+                            Some(&idempotency_key),
+                        ),
+                        None => calm_core::change::insert_change_intent(
+                            &tx,
+                            &intent,
+                            Some(&idempotency_key),
+                        ),
+                    };
+                    if let Err(e) = write_result {
                         return ToolOutcome::error(error_detail(
                             "STATE_DB_ERROR",
                             &e.to_string(),
@@ -350,12 +411,8 @@ impl CalmServer {
                             true,
                         ));
                     }
-                    (intent.intent_id, snapshot.snapshot_id, false)
-                }
-                Err(e) => {
-                    return ToolOutcome::error(error_detail("STATE_DB_ERROR", &e.to_string(), true));
-                }
-            };
+                    (intent.intent_id, snapshot.snapshot_id, false, stale_intent_id)
+                };
 
             let (kind_mismatch, observed_kind, mismatch_notes) =
                 check_declared_vs_observed(&self.project_root, kind, &targets);
@@ -364,6 +421,7 @@ impl CalmServer {
                 change_id,
                 reused,
                 snapshot_id,
+                superseded_change_id,
                 kind_mismatch,
                 observed_kind,
                 mismatch_notes,
@@ -433,6 +491,26 @@ impl CalmServer {
                     }
                 }
             };
+            // CCK-27 (audit follow-up): a superseded intent's declared
+            // snapshot is known-stale (that's what supersession means --
+            // see change::intent::IntentStatus) -- minting against it would
+            // authorize a human/MRTR approval that was never actually given
+            // for current evidence. The replacement intent from the
+            // plan_change call that superseded this one is the one to
+            // review instead.
+            if intent.status == calm_core::change::IntentStatus::Superseded {
+                return ToolOutcome::error(error_detail(
+                    "INTENT_SUPERSEDED",
+                    &format!(
+                        "change_id {} was superseded by {} after evidence drifted -- \
+                         review_change that one instead (re-run plan_change if you no \
+                         longer have it)",
+                        p.change_id,
+                        intent.superseded_by_intent_id.as_deref().unwrap_or("<unknown>"),
+                    ),
+                    false,
+                ));
+            }
             if intent.targets.is_empty() {
                 return ToolOutcome::error(error_detail(
                     "NO_TARGETS",
@@ -722,6 +800,68 @@ mod tests {
         let second_v = serde_json::to_value(&second.0).unwrap();
         assert_eq!(second_v["reused"], true, "response: {second_v}");
         assert_eq!(second_v["change_id"], first_id, "response: {second_v}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn plan_change_supersedes_a_stale_intent_when_evidence_drifts_between_calls() {
+        // CCK-27 (audit follow-up) reproduction: plan_change(body A) -> INT-1@S1;
+        // source drifts to S2 (a reindex/watcher event, simulated here by a
+        // direct file_index insert); plan_change(body A) again must mint
+        // INT-2@S2, not silently hand back the now-stale INT-1 -- and
+        // INT-1 must no longer be reviewable.
+        let (dir, server) = test_server("supersede_on_drift");
+        let index_db_path = dir.join("index.db");
+
+        let first = server.plan_change(rmcp::handler::server::wrapper::Parameters(plan_params(
+            "body",
+            vec![("a.rs", Some("a.rs::f"))],
+        )));
+        let first_v = serde_json::to_value(&first.0).unwrap();
+        assert_eq!(first_v["reused"], false, "response: {first_v}");
+        assert_eq!(first_v["superseded_change_id"], serde_json::Value::Null);
+        let first_id = first_v["change_id"].as_str().unwrap().to_string();
+        let first_snapshot = first_v["snapshot_id"].as_str().unwrap().to_string();
+
+        {
+            let conn = rusqlite::Connection::open(&index_db_path).unwrap();
+            conn.execute(
+                "INSERT INTO file_index (path, hash, last_indexed) VALUES (?1, ?2, 0)",
+                rusqlite::params!["b.rs", "some-hash"],
+            )
+            .unwrap();
+        }
+
+        let second = server.plan_change(rmcp::handler::server::wrapper::Parameters(plan_params(
+            "body",
+            vec![("a.rs", Some("a.rs::f"))],
+        )));
+        let second_v = serde_json::to_value(&second.0).unwrap();
+        assert_eq!(
+            second_v["reused"], false,
+            "a drifted intent must not be silently reused: {second_v}"
+        );
+        let second_id = second_v["change_id"].as_str().unwrap().to_string();
+        assert_ne!(second_id, first_id);
+        assert_eq!(second_v["superseded_change_id"], first_id, "response: {second_v}");
+        assert_ne!(second_v["snapshot_id"].as_str().unwrap(), first_snapshot);
+
+        let review = server.review_change(rmcp::handler::server::wrapper::Parameters(
+            ReviewChangeParams {
+                change_id: first_id,
+                approved: true,
+                approver: None,
+                ttl_secs: None,
+            },
+        ));
+        let review_v = serde_json::to_value(&review.0).unwrap();
+        assert_eq!(review_v["error"]["code"], "INTENT_SUPERSEDED", "response: {review_v}");
+        assert_eq!(
+            review_v["error"]["message"].as_str().unwrap().contains(&second_id),
+            true,
+            "response: {review_v}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

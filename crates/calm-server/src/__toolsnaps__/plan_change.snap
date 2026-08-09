@@ -1,6 +1,6 @@
 {
   "name": "plan_change",
-  "description": "Declares a ChangeIntent (what you're about to do, and why) as a formal, reviewable record, before writing anything -- returns a change_id to hand to review_change once a human/MRTR approves it. Idempotent: repeated calls with the same kind+targets return the same change_id instead of minting a new one each time. Surfaces (not blocks) a declared-vs-observed kind mismatch when a target's current uncommitted diff doesn't match what you declared. USE WHEN: a change needs formal review/authority rather than the lighter edit_context+confirm+reason gate. NOT FOR: the write itself (edit_lines/edit_symbol still do that) or a single quick low-risk edit (edit_context is enough there).",
+  "description": "Declares a ChangeIntent (what you're about to do, and why) as a formal, reviewable record, before writing anything -- returns a change_id to hand to review_change once a human/MRTR approves it. Idempotent ONLY while evidence hasn't drifted: repeated calls with the same kind+targets return the same change_id, but if source/config/graph/provider state changed since the matching intent was declared, that intent is superseded and this call mints a fresh change_id against current evidence instead (superseded_change_id on the response names the one replaced -- review_change on it now refuses with INTENT_SUPERSEDED). Surfaces (not blocks) a declared-vs-observed kind mismatch when a target's current uncommitted diff doesn't match what you declared. USE WHEN: a change needs formal review/authority rather than the lighter edit_context+confirm+reason gate. NOT FOR: the write itself (edit_lines/edit_symbol still do that) or a single quick low-risk edit (edit_context is enough there).",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "$defs": {
@@ -114,6 +114,13 @@
       },
       "snapshot_id": {
         "type": "string"
+      },
+      "superseded_change_id": {
+        "description": "CCK-27 (audit follow-up): set when this call's declared kind+targets\nmatched a prior intent, but evidence had drifted since that intent\nwas declared -- that stale intent was marked `superseded` (see\n`change::intent::IntentStatus`) rather than reused, and this\n`change_id` replaces it. `review_change` on the superseded id now\nrefuses with `INTENT_SUPERSEDED`.",
+        "type": [
+          "string",
+          "null"
+        ]
       },
       "kind_mismatch": {
         "description": "`true` when at least one target's current uncommitted diff (working\ntree vs. `git show HEAD`) doesn't classify as the declared `kind` --\nbest-effort: silently `false` for a target with no git history, no\ndiff yet, or an unreadable file, since there's nothing to compare.",
