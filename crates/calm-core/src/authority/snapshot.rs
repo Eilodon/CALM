@@ -53,6 +53,30 @@ pub enum FreshnessClass {
     Degraded,
 }
 
+impl PartialOrd for FreshnessClass {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for FreshnessClass {
+    /// Strength order, weakest first -- mirrors the ranking `persist`'s
+    /// upsert already encodes in SQL (`CASE ... WHEN 'reconciled' THEN 2
+    /// WHEN 'current' THEN 1 ELSE 0 END`). Spelled out explicitly rather
+    /// than derived: declaration order alone (`Reconciled` listed first,
+    /// as the headline variant for readers) does not match this ranking.
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        fn rank(c: FreshnessClass) -> u8 {
+            match c {
+                FreshnessClass::Degraded => 0,
+                FreshnessClass::Current => 1,
+                FreshnessClass::Reconciled => 2,
+            }
+        }
+        rank(*self).cmp(&rank(*other))
+    }
+}
+
 impl FreshnessClass {
     /// WS2 (audit follow-up): the tiered freshness bar the blueprint
     /// originally called for -- Low/Medium risk (`required_approver_class`
@@ -138,6 +162,29 @@ impl EvidenceSnapshot {
         project_root: &Path,
     ) -> rusqlite::Result<Self> {
         Self::build(conn, project_root, FreshnessClass::Reconciled)
+    }
+
+    /// Same as [`compute`](Self::compute), but also consults the durable
+    /// `evidence_snapshots` table (CCK-07, `state_conn`) for this exact
+    /// content's `snapshot_id` -- if a stronger freshness class was ever
+    /// recorded for identical content (e.g. a past full reconciliation via
+    /// [`compute_after_reconciliation`](Self::compute_after_reconciliation)),
+    /// that's honored here too, not only at persist-time. Safe against
+    /// TOCTOU by construction: `snapshot_id` is content-addressed, so any
+    /// disk change since the recorded snapshot changes the id and the
+    /// lookup simply misses -- there is no timestamp/TTL window to race.
+    pub fn compute_with_recorded_freshness(
+        conn: &Connection,
+        project_root: &Path,
+        state_conn: &Connection,
+    ) -> rusqlite::Result<Self> {
+        let mut snapshot = Self::compute(conn, project_root)?;
+        if let Some(recorded) = Self::load(state_conn, &snapshot.snapshot_id)?
+            && recorded.freshness_class > snapshot.freshness_class
+        {
+            snapshot.freshness_class = recorded.freshness_class;
+        }
+        Ok(snapshot)
     }
 
     fn build(
@@ -703,5 +750,77 @@ mod tests {
             FreshnessClass::Reconciled,
             "a later, weaker observation must never overwrite an already-persisted stronger one"
         );
+    }
+
+    #[test]
+    fn freshness_class_orders_degraded_below_current_below_reconciled() {
+        assert!(FreshnessClass::Degraded < FreshnessClass::Current);
+        assert!(FreshnessClass::Current < FreshnessClass::Reconciled);
+        assert!(FreshnessClass::Degraded < FreshnessClass::Reconciled);
+        assert_eq!(
+            FreshnessClass::Reconciled,
+            FreshnessClass::Current.max(FreshnessClass::Reconciled)
+        );
+    }
+
+    #[test]
+    fn compute_with_recorded_freshness_picks_up_a_past_reconciliation_for_identical_content() {
+        // A real reconciliation happened at some point in the past (e.g. via
+        // WatchSupervisor::refresh after a FullReconciliation cycle) and was
+        // persisted as `Reconciled`. A LATER, separate `compute()` for the
+        // exact same content -- no drift since -- must see that recorded
+        // strength, not just re-derive `Current` from `index_input_drift`
+        // and silently forget the reconciliation ever happened.
+        let index_conn = conn_with_file_index(&[("a.rs", "h1")]);
+        let root = tmp_project();
+        let state = state_conn();
+
+        let reconciled =
+            EvidenceSnapshot::compute_after_reconciliation(&index_conn, root.path()).unwrap();
+        reconciled.persist(&state).unwrap();
+
+        // No index_input_state row is seeded for `index_conn`, so a plain
+        // `compute()` fail-closes to Degraded here -- the strongest possible
+        // check that the recorded snapshot, not the live drift-derived
+        // guess, is what wins.
+        let live = EvidenceSnapshot::compute(&index_conn, root.path()).unwrap();
+        assert_eq!(live.freshness_class, FreshnessClass::Degraded);
+
+        let upgraded =
+            EvidenceSnapshot::compute_with_recorded_freshness(&index_conn, root.path(), &state)
+                .unwrap();
+        assert_eq!(upgraded.snapshot_id, reconciled.snapshot_id);
+        assert_eq!(upgraded.freshness_class, FreshnessClass::Reconciled);
+    }
+
+    #[test]
+    fn compute_with_recorded_freshness_falls_back_to_live_drift_when_content_changed_since() {
+        // The recorded Reconciled snapshot is for OLD content. Current disk
+        // content differs (different file_index hash), so the current
+        // `snapshot_id` differs too -- the lookup must miss and fall back to
+        // the live drift-derived class, never leak the stale Reconciled
+        // forward onto different content (the TOCTOU-safety property).
+        let index_conn = conn_with_file_index(&[("a.rs", "h1")]);
+        let root = tmp_project();
+        let state = state_conn();
+
+        let stale_reconciled =
+            EvidenceSnapshot::compute_after_reconciliation(&index_conn, root.path()).unwrap();
+        stale_reconciled.persist(&state).unwrap();
+
+        // Content changes: a new file_index row flips source_catalog_digest,
+        // and therefore snapshot_id.
+        index_conn
+            .execute(
+                "INSERT INTO file_index (path, hash, last_indexed) VALUES ('b.rs', 'h2', 0)",
+                [],
+            )
+            .unwrap();
+
+        let after_change =
+            EvidenceSnapshot::compute_with_recorded_freshness(&index_conn, root.path(), &state)
+                .unwrap();
+        assert_ne!(after_change.snapshot_id, stale_reconciled.snapshot_id);
+        assert_ne!(after_change.freshness_class, FreshnessClass::Reconciled);
     }
 }

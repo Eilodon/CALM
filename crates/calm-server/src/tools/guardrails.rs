@@ -1243,8 +1243,19 @@ impl CalmServer {
         caller_set_digest: &str,
         graph_generation: i64,
     ) -> Option<MintedAuthorityOutput> {
-        let snapshot =
-            calm_core::authority::EvidenceSnapshot::compute(conn, &self.project_root).ok()?;
+        // WS2b (audit follow-up, gap #1): opened before `compute` so a
+        // past full reconciliation recorded via
+        // `EvidenceSnapshot::compute_after_reconciliation` (see
+        // `WatchSupervisor::refresh`) can upgrade this call's freshness --
+        // otherwise a Human-tier target could never clear the bar below,
+        // since drift-derived `compute` alone never yields `Reconciled`.
+        let mut state_conn = calm_core::db::conn::open_state_writer(&self.state_db_path).ok()?;
+        let snapshot = calm_core::authority::EvidenceSnapshot::compute_with_recorded_freshness(
+            conn,
+            &self.project_root,
+            &state_conn,
+        )
+        .ok()?;
 
         let policy = calm_core::policy::loader::load_policy_or_warn(&self.project_root);
         let policy_digest = policy.digest();
@@ -1295,7 +1306,6 @@ impl CalmServer {
         {
             return None;
         }
-        let mut state_conn = calm_core::db::conn::open_state_writer(&self.state_db_path).ok()?;
         // CCK-R5 (audit follow-up): snapshot persist + intent insert +
         // authority mint (which itself does 3 more inserts) must land as
         // one atomic unit -- a partial write here (e.g. the intent row

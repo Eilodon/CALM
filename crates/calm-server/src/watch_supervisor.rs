@@ -546,6 +546,49 @@ impl WatchSupervisor {
                 )?;
                 *catalog = refreshed_catalog;
             }
+            // WS2b (audit follow-up, gap #1 -- master change-control blueprint):
+            // a full reconciliation just completed end-to-end. Record that as a
+            // `Reconciled` EvidenceSnapshot in state.db so a LATER, separate
+            // mint-time call (a different request/connection entirely) can see
+            // it via `EvidenceSnapshot::compute_with_recorded_freshness` -- this
+            // is the only production call site for
+            // `EvidenceSnapshot::compute_after_reconciliation` (every other
+            // caller is a unit test). Best-effort/fail-open: a persistence
+            // hiccup here must not undo or block an already-successful refresh.
+            if let Some(reason) = outcome.full_reconciliation {
+                match calm_core::db::conn::open_state_writer(&crate::default_state_db_path(
+                    &self.runtime.project_root,
+                )) {
+                    Ok(state_conn) => {
+                        match calm_core::authority::EvidenceSnapshot::compute_after_reconciliation(
+                            &conn,
+                            &self.runtime.project_root,
+                        ) {
+                            Ok(snapshot) => {
+                                if let Err(error) = snapshot.persist(&state_conn) {
+                                    tracing::warn!(
+                                        "could not persist reconciled evidence snapshot \
+                                         (trigger={reason:?}): {error}"
+                                    );
+                                } else {
+                                    tracing::info!(
+                                        "full reconciliation recorded as evidence: \
+                                         snapshot_id={} trigger={reason:?}",
+                                        snapshot.snapshot_id
+                                    );
+                                }
+                            }
+                            Err(error) => tracing::warn!(
+                                "could not compute reconciled evidence snapshot \
+                                 (trigger={reason:?}): {error}"
+                            ),
+                        }
+                    }
+                    Err(error) => tracing::warn!(
+                        "could not open state.db to record reconciliation (trigger={reason:?}): {error}"
+                    ),
+                }
+            }
             if outcome.graph_rebuilt {
                 if let Some(model) = self.runtime.embedder.read_ok().clone() {
                     if let Err(error) = calm_core::embedding::embed_pending(&conn, model.as_ref()) {

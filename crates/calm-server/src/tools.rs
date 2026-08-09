@@ -11370,6 +11370,127 @@ mod tests {
     }
 
     #[test]
+    fn edit_context_mints_human_tier_authority_after_a_recorded_reconciliation_and_spend_persists_a_receipt()
+     {
+        // WS2b (audit follow-up, gap #1 -- master change-control blueprint):
+        // companion to `edit_context_minted_authority_does_not_bypass_high_risk_
+        // independent_review` above, which documents that a Current-only
+        // fixture gets NO authority for a Human-tier symbol. This test proves
+        // the fix: once a full reconciliation is recorded (exactly what
+        // `WatchSupervisor::refresh` now does in production after a
+        // `FullReconciliation` cycle -- see `EvidenceSnapshot::
+        // compute_after_reconciliation`), `edit_context`'s auto-mint DOES clear
+        // the freshness bar, `edit_lines` can spend that authority through a
+        // real (simulated) human-approval round-trip, and the elicitation
+        // `approval_receipts` write in `edit_lines_impl_gated` -- previously
+        // unreachable from any production flow -- actually fires.
+        use super::edit::{ElicitGate, HubAskContext};
+        let (dir, server) = test_server("ws2b_reconciled_evidence_unblocks_human_tier_mint");
+        std::fs::create_dir_all(dir.join("auth")).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"risk_rules": [{"glob": "auth/**", "minimum": "high"}]}"#,
+        )
+        .unwrap();
+        let original = "def check_token():\n    return True\n";
+        std::fs::write(dir.join("auth/login.py"), original).unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+            "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+             VALUES ('auth/login.py::check_token', 'check_token', 'function', 'python', 'auth/login.py', 1, 2, '', '', 'check_token', 2, 0, 0)",
+            [],
+        )
+        .unwrap();
+            let catalog = calm_core::indexer::refresh::InputCatalog::for_project(&dir);
+            calm_core::indexer::refresh::persist_index_input_snapshot(&conn, &catalog).unwrap();
+
+            // The step this test adds over the CCK-23 fixture above: record a
+            // completed full reconciliation for this exact content, the same
+            // way `WatchSupervisor::refresh` does in production.
+            let state_conn = server.state_write_conn().unwrap();
+            let reconciled =
+                calm_core::authority::EvidenceSnapshot::compute_after_reconciliation(&conn, &dir)
+                    .unwrap();
+            reconciled.persist(&state_conn).unwrap();
+        }
+
+        let ctx_out = server.edit_context(rmcp::handler::server::wrapper::Parameters(
+            EditContextParams {
+                symbol: "check_token".into(),
+                path: None,
+                line: None,
+                if_none_match: None,
+            },
+        ));
+        let ctx_v = serde_json::to_value(&ctx_out.0).unwrap();
+        let change_id = ctx_v["change_id"]
+            .as_str()
+            .expect(
+                "a High-risk symbol with a recorded reconciliation must get an auto-minted \
+                 authority (change_id)",
+            )
+            .to_string();
+        let authority_id = ctx_v["authority_id"]
+            .as_str()
+            .expect(
+                "a High-risk symbol with a recorded reconciliation must get an auto-minted \
+                 authority (authority_id)",
+            )
+            .to_string();
+
+        let hash = calm_core::edit::range_checksum(original, 2, 2).unwrap();
+        let params = EditLinesParams {
+            change_id: Some(change_id.clone()),
+            authority_id: Some(authority_id.clone()),
+            path: "auth/login.py".into(),
+            edits: vec![EditHunkParam {
+                old_text: None,
+                start_line: 2,
+                end_line: 2,
+                expected_hash: Some(hash),
+                new_text: "    return False\n".into(),
+            }],
+            confirm: false,
+            reason: None,
+            cites: None,
+        };
+        let mut ask: Option<HubAskContext> = None;
+        // ElicitGate::Approved simulates a human having just approved this
+        // exact call via the real MRTR/legacy elicitation round-trip --
+        // `edit_lines_flow` takes the gate as a direct parameter for tests,
+        // same seam the CCK-23 test above uses with `ElicitGate::Off`.
+        let out = server.edit_lines_flow(&params, ElicitGate::Approved, &mut ask);
+        let v = serde_json::to_value(&out).unwrap();
+        assert!(
+            v.get("error").is_none(),
+            "authority-gated spend with a recorded reconciliation and human approval must succeed: {v}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("auth/login.py")).unwrap(),
+            "def check_token():\n    return False\n",
+            "the authorized write must have landed"
+        );
+
+        let state_conn = server.state_db();
+        let (mechanism, decision): (String, String) = state_conn
+            .query_row(
+                "SELECT mechanism, decision FROM approval_receipts \
+             WHERE change_id = ?1 AND authority_id = ?2",
+                rusqlite::params![change_id, authority_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect(
+                "the elicitation approval-receipt write in edit_lines_impl_gated must have fired \
+             for real -- this is the code path that was provably unreachable before WS2b",
+            );
+        assert_eq!(mechanism, "elicitation");
+        assert_eq!(decision, "approved");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn edit_lines_aborts_when_txn_begin_fails() {
         // WS-1 enforce transition (docs/plans/2026-08-02-ws1-enforce-and-critical-
         // risk-execution-plan.md §2): a txn::begin failure must abort the write
