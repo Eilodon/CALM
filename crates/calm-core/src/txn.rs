@@ -201,42 +201,67 @@ pub fn begin(
     base_digest: &str,
     proposed_digest: &str,
 ) -> Result<EditTransaction, TxnError> {
-    let tx_id = new_tx_id();
-    let now = now_epoch_secs();
     conn.execute_batch("BEGIN IMMEDIATE;")?;
-    let result = (|| -> Result<(), TxnError> {
-        conn.execute(
-            "INSERT INTO edit_transactions \
-             (tx_id, project_id, path, base_digest, proposed_digest, state, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, 'PREPARED', ?6, ?6)",
-            params![tx_id, project_id, path, base_digest, proposed_digest, now],
-        )?;
-        let payload = format!("{tx_id}|created|PREPARED|system|begin|1|{now}");
-        conn.execute(
-            "INSERT INTO tx_events \
-             (event_id, tx_id, sequence, from_state, to_state, actor, reason, occurred_at) \
-             VALUES (?1, ?2, 1, 'created', 'PREPARED', 'system', 'begin', ?3)",
-            params![event_id(&payload), tx_id, now],
-        )?;
-        Ok(())
-    })();
-    match result {
-        Ok(()) => {
+    match begin_internal(conn, project_id, path, base_digest, proposed_digest, None) {
+        Ok(tx) => {
             conn.execute_batch("COMMIT;")?;
-            Ok(EditTransaction {
-                tx_id,
-                project_id: project_id.to_string(),
-                path: path.to_string(),
-                base_digest: base_digest.to_string(),
-                proposed_digest: proposed_digest.to_string(),
-                state: TxState::Prepared,
-            })
+            Ok(tx)
         }
         Err(e) => {
             let _ = conn.execute_batch("ROLLBACK;");
             Err(e)
         }
     }
+}
+
+/// CCK-25: transaction-COMPOSABLE core of `begin` -- does the two INSERTs
+/// only, no `BEGIN`/`COMMIT`/`ROLLBACK` of its own, so a caller that needs
+/// this atomically alongside OTHER statements (specifically
+/// `authority::review::authorize_and_begin_edit`, which must consume a
+/// `ReviewAuthority` and open this transaction as one all-or-nothing unit)
+/// can wrap it in their own outer transaction instead of nesting a second
+/// `BEGIN` inside the first (which SQLite rejects). `begin` above is just
+/// this plus its own transaction boundary, preserving its exact prior
+/// behavior for all of its existing callers.
+pub(crate) fn begin_internal(
+    conn: &Connection,
+    project_id: &str,
+    path: &str,
+    base_digest: &str,
+    proposed_digest: &str,
+    authority_id: Option<&str>,
+) -> Result<EditTransaction, TxnError> {
+    let tx_id = new_tx_id();
+    let now = now_epoch_secs();
+    conn.execute(
+        "INSERT INTO edit_transactions \
+         (tx_id, project_id, path, base_digest, proposed_digest, authority_id, state, created_at, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'PREPARED', ?7, ?7)",
+        params![
+            tx_id,
+            project_id,
+            path,
+            base_digest,
+            proposed_digest,
+            authority_id,
+            now
+        ],
+    )?;
+    let payload = format!("{tx_id}|created|PREPARED|system|begin|1|{now}");
+    conn.execute(
+        "INSERT INTO tx_events \
+         (event_id, tx_id, sequence, from_state, to_state, actor, reason, occurred_at) \
+         VALUES (?1, ?2, 1, 'created', 'PREPARED', 'system', 'begin', ?3)",
+        params![event_id(&payload), tx_id, now],
+    )?;
+    Ok(EditTransaction {
+        tx_id,
+        project_id: project_id.to_string(),
+        path: path.to_string(),
+        base_digest: base_digest.to_string(),
+        proposed_digest: proposed_digest.to_string(),
+        state: TxState::Prepared,
+    })
 }
 
 /// Mirrors a just-written (not yet committed) transition into the tamper-

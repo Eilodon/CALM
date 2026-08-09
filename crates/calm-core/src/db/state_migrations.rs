@@ -116,6 +116,12 @@ pub const STATE_MIGRATIONS: &[StateMigration] = &[
         name: "v3_review_authorities",
         apply: v2_to_v3_review_authorities,
     },
+    StateMigration {
+        from: 3,
+        to: 4,
+        name: "v4_authority_consumed_by_tx_id",
+        apply: v3_to_v4_authority_consumed_by_tx_id,
+    },
 ];
 
 /// v1->v2 (CCK-07): adds `evidence_snapshots`, `change_intents`,
@@ -258,6 +264,42 @@ fn v2_to_v3_review_authorities(conn: &Connection) -> Result<(), StateMigrationEr
                 detail: format!("table {table:?} does not exist after this step's own DDL ran"),
             });
         }
+    }
+    Ok(())
+}
+
+/// v3->v4 (CCK-25, audit follow-up): adds `review_authorities.
+/// consumed_by_tx_id`, a new column on an EXISTING table (same shape as
+/// v2->v3's `edit_transactions.authority_id` ALTER above) -- provenance-
+/// binds a consumed authority to the exact `edit_transactions` row it
+/// authorized, set atomically with `consumed_at` by
+/// `authority::review::authorize_and_begin_edit` instead of the old
+/// two-step (non-atomic) verify_and_consume-then-txn::begin.
+fn v3_to_v4_authority_consumed_by_tx_id(conn: &Connection) -> Result<(), StateMigrationError> {
+    let mut stmt = conn.prepare("PRAGMA table_info(review_authorities)")?;
+    let existing_columns: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(|r| r.ok())
+        .collect();
+    if !existing_columns.iter().any(|c| c == "consumed_by_tx_id") {
+        conn.execute_batch(
+            "ALTER TABLE review_authorities ADD COLUMN consumed_by_tx_id TEXT \
+             REFERENCES edit_transactions(tx_id) ON DELETE SET NULL;",
+        )?;
+    }
+
+    let mut stmt = conn.prepare("PRAGMA table_info(review_authorities)")?;
+    let now_has_column = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(|r| r.ok())
+        .any(|c| c == "consumed_by_tx_id");
+    if !now_has_column {
+        return Err(StateMigrationError::PostconditionFailed {
+            migration: "v4_authority_consumed_by_tx_id",
+            detail: "review_authorities.consumed_by_tx_id does not exist after this step's \
+                      own DDL ran"
+                .to_string(),
+        });
     }
     Ok(())
 }
@@ -631,6 +673,28 @@ mod tests {
         assert!(
             columns.iter().any(|c| c == "authority_id"),
             "edit_transactions.authority_id should exist"
+        );
+    }
+
+    #[test]
+    fn registered_v3_to_v4_migration_adds_consumed_by_tx_id_column() {
+        let conn = fresh_conn();
+        conn.pragma_update(None, "user_version", 3).unwrap();
+        migrate_state_db_to_current(&conn).unwrap();
+        assert_eq!(
+            user_version(&conn),
+            super::super::schema::STATE_DB_SCHEMA_VERSION
+        );
+        let columns: Vec<String> = conn
+            .prepare("PRAGMA table_info(review_authorities)")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert!(
+            columns.iter().any(|c| c == "consumed_by_tx_id"),
+            "review_authorities.consumed_by_tx_id should exist"
         );
     }
 

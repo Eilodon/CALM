@@ -24,8 +24,14 @@ pub const INDEX_DB_SCHEMA_VERSION: i64 = 1;
 // v2 (CCK-07): adds evidence_snapshots/change_intents/change_intent_targets.
 // v3 (CCK-09, docs/plans/2026-08-08-master-change-control-execution-blueprint.md):
 // adds review_authorities(+targets,+evidence) and edit_transactions.authority_id.
-// See db/state_migrations.rs's registered v1->v2 and v2->v3 steps.
-pub const STATE_DB_SCHEMA_VERSION: i64 = 3;
+// v4 (CCK-25, audit follow-up on the same blueprint): adds
+// review_authorities.consumed_by_tx_id, provenance-binding a consumed
+// authority to the exact edit_transactions row it authorized (previously
+// the FK existed the other way -- edit_transactions.authority_id -- but
+// nothing ever set it, and authority consume/txn begin were two separate,
+// non-atomic steps).
+// See db/state_migrations.rs's registered v1->v2, v2->v3 and v3->v4 steps.
+pub const STATE_DB_SCHEMA_VERSION: i64 = 4;
 
 /// Refuses to proceed if `conn`'s stamped `PRAGMA user_version` is HIGHER
 /// than `expected` -- meaning a newer CALM binary already created or
@@ -615,7 +621,11 @@ CREATE TABLE IF NOT EXISTS review_authorities (
     expires_at         REAL NOT NULL,
     signature          TEXT NOT NULL,
     created_at         REAL NOT NULL,
-    consumed_at        REAL
+    consumed_at        REAL,
+    -- v4 / CCK-25: which edit_transactions row this authority's single use
+    -- was actually spent on -- set atomically together with consumed_at by
+    -- authority::review::authorize_and_begin_edit, never independently.
+    consumed_by_tx_id  TEXT REFERENCES edit_transactions(tx_id) ON DELETE SET NULL
 );
 CREATE INDEX IF NOT EXISTS idx_review_authorities_intent ON review_authorities(intent_id);
 
