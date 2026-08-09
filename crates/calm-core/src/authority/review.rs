@@ -157,6 +157,14 @@ pub struct MintParams<'a> {
     /// unreasonably long TTL.
     pub ttl_secs: AuthorityTtl,
     pub targets: &'a [ChangeIntentTarget],
+    /// CCK-26 (audit follow-up): the real `PolicyEngine::evaluate()`
+    /// decision that justified this mint -- signed and persisted for
+    /// audit/provenance. NOT YET re-verified fresh at spend time (a
+    /// `target_scope_digest`-style staleness check across these three is a
+    /// natural follow-up, not done in this pass).
+    pub policy_decision_digest: &'a str,
+    pub risk_vector_digest: &'a str,
+    pub required_approver_class: crate::policy::ApproverClass,
 }
 
 /// The current truth to check a stored authority against, at
@@ -269,6 +277,10 @@ pub struct ReviewAuthority {
     pub expires_at: f64,
     pub signature: String,
     pub created_at: f64,
+    /// CCK-26: see [`MintParams`]'s matching fields.
+    pub policy_decision_digest: String,
+    pub risk_vector_digest: String,
+    pub required_approver_class: crate::policy::ApproverClass,
 }
 
 fn now_epoch_secs() -> f64 {
@@ -305,13 +317,18 @@ fn signing_payload(
     target_scope_digest: &str,
     nonce: &str,
     expires_at: f64,
+    policy_decision_digest: &str,
+    risk_vector_digest: &str,
+    required_approver_class: &str,
 ) -> String {
     format!(
         "authority_id={authority_id}\nintent_id={intent_id}\nsnapshot_id={snapshot_id}\n\
          graph_generation={graph_generation}\ncaller_set_digest={caller_set_digest}\n\
          analysis_version={analysis_version}\npolicy_digest={policy_digest}\n\
          principal={principal}\ntarget_scope_digest={target_scope_digest}\n\
-         nonce={nonce}\nexpires_at={expires_at}\n"
+         nonce={nonce}\nexpires_at={expires_at}\n\
+         policy_decision_digest={policy_decision_digest}\nrisk_vector_digest={risk_vector_digest}\n\
+         required_approver_class={required_approver_class}\n"
     )
 }
 
@@ -348,6 +365,9 @@ impl ReviewAuthority {
                 &target_scope_digest,
                 &nonce,
                 expires_at,
+                params.policy_decision_digest,
+                params.risk_vector_digest,
+                params.required_approver_class.as_str(),
             ),
         );
 
@@ -365,6 +385,9 @@ impl ReviewAuthority {
             expires_at,
             signature,
             created_at,
+            policy_decision_digest: params.policy_decision_digest.to_string(),
+            risk_vector_digest: params.risk_vector_digest.to_string(),
+            required_approver_class: params.required_approver_class,
         };
 
         // CCK-R5: snapshot persist + intent insert (by the caller, before
@@ -386,8 +409,9 @@ impl ReviewAuthority {
             "INSERT INTO review_authorities \
              (authority_id, intent_id, snapshot_id, graph_generation, caller_set_digest, \
               analysis_version, policy_digest, principal, target_scope_digest, nonce, \
-              expires_at, signature, created_at, consumed_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, NULL)",
+              expires_at, signature, created_at, consumed_at, \
+              policy_decision_digest, risk_vector_digest, required_approver_class) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, NULL, ?14, ?15, ?16)",
             params![
                 self.authority_id,
                 self.intent_id,
@@ -402,6 +426,9 @@ impl ReviewAuthority {
                 self.expires_at,
                 self.signature,
                 self.created_at,
+                self.policy_decision_digest,
+                self.risk_vector_digest,
+                self.required_approver_class.as_str(),
             ],
         )?;
         for target in targets {
@@ -429,11 +456,15 @@ impl ReviewAuthority {
             String,
             f64,
             String,
+            String,
+            String,
+            String,
         )> = state_conn
             .query_row(
                 "SELECT authority_id, intent_id, snapshot_id, graph_generation, caller_set_digest, \
                  analysis_version, policy_digest, principal, nonce, expires_at, signature, \
-                 created_at, target_scope_digest \
+                 created_at, target_scope_digest, policy_decision_digest, risk_vector_digest, \
+                 required_approver_class \
                  FROM review_authorities WHERE authority_id = ?1",
                 params![authority_id],
                 |r| {
@@ -451,11 +482,14 @@ impl ReviewAuthority {
                         r.get(10)?,
                         r.get(11)?,
                         r.get(12)?,
+                        r.get(13)?,
+                        r.get(14)?,
+                        r.get(15)?,
                     ))
                 },
             )
             .optional()?;
-        Ok(row.map(
+        row.map(
             |(
                 authority_id,
                 intent_id,
@@ -470,22 +504,41 @@ impl ReviewAuthority {
                 signature,
                 created_at,
                 target_scope_digest,
-            )| Self {
-                authority_id,
-                intent_id,
-                snapshot_id,
-                graph_generation,
-                caller_set_digest,
-                analysis_version,
-                policy_digest,
-                principal,
-                target_scope_digest,
-                nonce,
-                expires_at,
-                signature,
-                created_at,
+                policy_decision_digest,
+                risk_vector_digest,
+                required_approver_class,
+            )| {
+                let required_approver_class = crate::policy::ApproverClass::parse(
+                    &required_approver_class,
+                )
+                .ok_or_else(|| {
+                    AuthorityError::Db(rusqlite::Error::InvalidColumnType(
+                        15,
+                        "required_approver_class".to_string(),
+                        rusqlite::types::Type::Text,
+                    ))
+                })?;
+                Ok(Self {
+                    authority_id,
+                    intent_id,
+                    snapshot_id,
+                    graph_generation,
+                    caller_set_digest,
+                    analysis_version,
+                    policy_digest,
+                    principal,
+                    target_scope_digest,
+                    nonce,
+                    expires_at,
+                    signature,
+                    created_at,
+                    policy_decision_digest,
+                    risk_vector_digest,
+                    required_approver_class,
+                })
             },
-        ))
+        )
+        .transpose()
     }
 
     /// Verifies `authority_id` against `current`, then atomically consumes
@@ -499,6 +552,27 @@ impl ReviewAuthority {
     /// attempt would get, which is the correct outcome for both (this
     /// call must not proceed as authorized either way).
     pub fn verify_and_consume(
+        state_conn: &Connection,
+        authority_id: &str,
+        current: &CurrentState,
+    ) -> Result<(), AuthorityError> {
+        Self::verify_only(state_conn, authority_id, current)?;
+        Self::consume(state_conn, authority_id, None)
+    }
+
+    /// CCK-25: every check `verify_and_consume` did, MINUS the final
+    /// consume -- split out so `authorize_and_begin_edit` below can run
+    /// verification, `txn::begin_internal`, and `consume` as three steps
+    /// of ONE outer transaction, instead of `verify_and_consume` committing
+    /// its own consume before the caller (previously) got anywhere near
+    /// `txn::begin`. `pub` (not just an internal helper): callers like
+    /// `edit_lines_impl_gated` also use this standalone, read-only, to
+    /// decide whether the legacy gate can be skipped WITHOUT spending the
+    /// authority yet -- only `authorize_and_begin_edit`'s later call, right
+    /// before the durable transaction opens, actually consumes it. Calling
+    /// this alone can never grant permission by itself, so exposing it
+    /// publicly doesn't weaken single-use semantics.
+    pub fn verify_only(
         state_conn: &Connection,
         authority_id: &str,
         current: &CurrentState,
@@ -520,6 +594,9 @@ impl ReviewAuthority {
             &authority.target_scope_digest,
             &authority.nonce,
             authority.expires_at,
+            &authority.policy_decision_digest,
+            &authority.risk_vector_digest,
+            authority.required_approver_class.as_str(),
         );
         if !verify(&key, SIGNING_DOMAIN, &payload, &authority.signature) {
             return Err(AuthorityError::ForgedSignature);
@@ -561,15 +638,114 @@ impl ReviewAuthority {
         if authority.principal != current.principal {
             return Err(AuthorityError::WrongPrincipal);
         }
+        Ok(())
+    }
 
+    /// CCK-25: the atomic single-use consume, split out of
+    /// `verify_and_consume` -- `consumed_by_tx_id` provenance-binds this
+    /// consume to the exact `edit_transactions` row it authorized (`None`
+    /// preserves `verify_and_consume`'s old standalone behavior for its
+    /// existing callers/tests).
+    fn consume(
+        state_conn: &Connection,
+        authority_id: &str,
+        consumed_by_tx_id: Option<&str>,
+    ) -> Result<(), AuthorityError> {
         let consumed_rows = state_conn.execute(
-            "UPDATE review_authorities SET consumed_at = ?1 WHERE authority_id = ?2 AND consumed_at IS NULL",
-            params![now_epoch_secs(), authority_id],
+            "UPDATE review_authorities SET consumed_at = ?1, consumed_by_tx_id = ?2 \
+             WHERE authority_id = ?3 AND consumed_at IS NULL",
+            params![now_epoch_secs(), consumed_by_tx_id, authority_id],
         )?;
         if consumed_rows == 0 {
             return Err(AuthorityError::AlreadyConsumed);
         }
         Ok(())
+    }
+
+    /// CCK-25 (P1 fix, audit 2026-08-09): the write path's actual choke
+    /// point -- verify, open the durable `edit_transactions` row (bound to
+    /// this authority via its new `authority_id` column), and consume the
+    /// authority (bound back via `consumed_by_tx_id`), all inside ONE
+    /// `BEGIN IMMEDIATE`/`COMMIT`. Before this, `verify_and_consume` ran
+    /// (and committed its own consume) hundreds of lines before
+    /// `txn::begin` -- if `txn::begin` then failed, the authority was
+    /// already permanently burned with no durable transaction and no file
+    /// write to show for it (an "orphaned burned authority"). Now either
+    /// all three steps land together, or none do; nothing touches the
+    /// filesystem until this returns `Ok`.
+    pub fn authorize_and_begin_edit(
+        state_conn: &Connection,
+        authority_id: &str,
+        current: &CurrentState,
+        project_id: &str,
+        path: &str,
+        base_digest: &str,
+        proposed_digest: &str,
+    ) -> Result<crate::txn::EditTransaction, AuthorizeEditError> {
+        state_conn.execute_batch("BEGIN IMMEDIATE;")?;
+        let result = (|| -> Result<crate::txn::EditTransaction, AuthorizeEditError> {
+            Self::verify_only(state_conn, authority_id, current)?;
+            let tx = crate::txn::begin_internal(
+                state_conn,
+                project_id,
+                path,
+                base_digest,
+                proposed_digest,
+                Some(authority_id),
+            )?;
+            Self::consume(state_conn, authority_id, Some(&tx.tx_id))?;
+            Ok(tx)
+        })();
+        match result {
+            Ok(tx) => {
+                state_conn.execute_batch("COMMIT;")?;
+                Ok(tx)
+            }
+            Err(e) => {
+                let _ = state_conn.execute_batch("ROLLBACK;");
+                Err(e)
+            }
+        }
+    }
+}
+
+/// CCK-25: the union of what can fail inside `authorize_and_begin_edit` --
+/// authority verification/consume, `edit_transactions` insertion, or the
+/// wrapping transaction itself.
+#[derive(Debug)]
+pub enum AuthorizeEditError {
+    Authority(AuthorityError),
+    Txn(crate::txn::TxnError),
+    Db(rusqlite::Error),
+}
+
+impl std::fmt::Display for AuthorizeEditError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Authority(e) => write!(f, "{e}"),
+            Self::Txn(e) => write!(f, "{e}"),
+            Self::Db(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for AuthorizeEditError {}
+
+impl From<AuthorityError> for AuthorizeEditError {
+    fn from(e: AuthorityError) -> Self {
+        Self::Authority(e)
+    }
+}
+
+impl From<crate::txn::TxnError> for AuthorizeEditError {
+    fn from(e: crate::txn::TxnError) -> Self {
+        Self::Txn(e)
+    }
+}
+
+impl From<rusqlite::Error> for AuthorizeEditError {
+    fn from(e: rusqlite::Error) -> Self {
+        Self::Db(e)
     }
 }
 
@@ -644,6 +820,9 @@ mod tests {
             principal: "session:abc",
             ttl_secs: AuthorityTtl::from_secs(300.0).unwrap(),
             targets,
+            policy_decision_digest: "policy-decision-1",
+            risk_vector_digest: "risk-vector-1",
+            required_approver_class: crate::policy::ApproverClass::SelfReviewed,
         }
     }
 
@@ -659,6 +838,120 @@ mod tests {
         let replay =
             ReviewAuthority::verify_and_consume(&conn, &authority.authority_id, &base_current());
         assert_eq!(replay, Err(AuthorityError::AlreadyConsumed));
+    }
+
+    #[test]
+    fn authorize_and_begin_edit_binds_transaction_and_authority_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = real_state_conn(dir.path());
+        seed_intent_and_snapshot(&conn);
+        let authority = ReviewAuthority::mint(&conn, mint_params(&[])).unwrap();
+
+        let tx = ReviewAuthority::authorize_and_begin_edit(
+            &conn,
+            &authority.authority_id,
+            &base_current(),
+            "proj",
+            "f.rs",
+            "base-digest",
+            "proposed-digest",
+        )
+        .unwrap();
+
+        let bound_authority_id: Option<String> = conn
+            .query_row(
+                "SELECT authority_id FROM edit_transactions WHERE tx_id = ?1",
+                params![tx.tx_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            bound_authority_id.as_deref(),
+            Some(authority.authority_id.as_str()),
+            "edit_transactions.authority_id must be set, not left NULL"
+        );
+
+        let bound_tx_id: Option<String> = conn
+            .query_row(
+                "SELECT consumed_by_tx_id FROM review_authorities WHERE authority_id = ?1",
+                params![authority.authority_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            bound_tx_id.as_deref(),
+            Some(tx.tx_id.as_str()),
+            "review_authorities.consumed_by_tx_id must point back at the same tx_id"
+        );
+    }
+
+    #[test]
+    fn authorize_and_begin_edit_rolls_back_the_transaction_insert_when_consume_fails() {
+        // Deterministic substitute for a crash between "authority verified /
+        // edit_transactions row inserted" and "authority consumed" (same
+        // technique as txn::begin_is_atomic_with_its_seq_1_event): force the
+        // consume step specifically to fail (by consuming the authority
+        // first, so a second attempt hits AlreadyConsumed) and assert the
+        // edit_transactions row that begin_internal already inserted inside
+        // that same not-yet-committed transaction did NOT survive.
+        let dir = tempfile::tempdir().unwrap();
+        let conn = real_state_conn(dir.path());
+        seed_intent_and_snapshot(&conn);
+        let authority = ReviewAuthority::mint(&conn, mint_params(&[])).unwrap();
+
+        let tx1 = ReviewAuthority::authorize_and_begin_edit(
+            &conn,
+            &authority.authority_id,
+            &base_current(),
+            "proj",
+            "f.rs",
+            "base-1",
+            "proposed-1",
+        )
+        .unwrap();
+
+        let count_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM edit_transactions", [], |r| r.get(0))
+            .unwrap();
+
+        // Same (now-consumed) authority again -- verify_only still passes
+        // (signature/expiry/fields are all still valid), begin_internal
+        // inserts a SECOND edit_transactions row, then consume fails with
+        // AlreadyConsumed -- the whole transaction must roll back, taking
+        // that second INSERT with it.
+        let err = ReviewAuthority::authorize_and_begin_edit(
+            &conn,
+            &authority.authority_id,
+            &base_current(),
+            "proj",
+            "f.rs",
+            "base-2",
+            "proposed-2",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, AuthorizeEditError::Authority(AuthorityError::AlreadyConsumed)),
+            "expected AlreadyConsumed, got {err:?}"
+        );
+
+        let count_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM edit_transactions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            count_before, count_after,
+            "the second call's edit_transactions insert must have been rolled back, \
+             not left behind as an orphan alongside the still-failed authority spend"
+        );
+        // The first, successful spend must still be intact -- rollback of
+        // the second attempt must not have touched it.
+        let still_bound: Option<String> = conn
+            .query_row(
+                "SELECT consumed_by_tx_id FROM review_authorities WHERE authority_id = ?1",
+                params![authority.authority_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(still_bound.as_deref(), Some(tx1.tx_id.as_str()));
     }
 
     #[test]
@@ -734,6 +1027,9 @@ mod tests {
             &authority.target_scope_digest,
             &authority.nonce,
             past_expiry,
+            &authority.policy_decision_digest,
+            &authority.risk_vector_digest,
+            authority.required_approver_class.as_str(),
         );
         let resigned = sign(&key, SIGNING_DOMAIN, &payload);
         conn.execute(
@@ -861,6 +1157,9 @@ mod tests {
             &authority.target_scope_digest,
             &authority.nonce,
             authority.expires_at,
+            &authority.policy_decision_digest,
+            &authority.risk_vector_digest,
+            authority.required_approver_class.as_str(),
         );
         let resigned = sign(&key, SIGNING_DOMAIN, &payload);
         conn.execute(

@@ -171,8 +171,11 @@ const MANIFEST_BASENAMES: &[&str] = &[
 /// question ("is this file a dependency manifest at all, anywhere in the
 /// tree") for change classification, not cache invalidation, so a
 /// workspace member's `Cargo.toml` counts here even though it wouldn't for
-/// that cache.
-fn is_manifest_path(path: &str) -> bool {
+/// that cache. `pub` (CCK-26): `review_change` uses this directly to fill
+/// in `RiskVector::touches_manifest` from a `ChangeIntent`'s declared
+/// targets, cheaply and without needing a live diff the way
+/// `classify_observed_change` does.
+pub fn is_manifest_path(path: &str) -> bool {
     let basename = Path::new(path)
         .file_name()
         .and_then(|n| n.to_str())

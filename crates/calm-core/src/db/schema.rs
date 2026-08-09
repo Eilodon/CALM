@@ -24,8 +24,25 @@ pub const INDEX_DB_SCHEMA_VERSION: i64 = 1;
 // v2 (CCK-07): adds evidence_snapshots/change_intents/change_intent_targets.
 // v3 (CCK-09, docs/plans/2026-08-08-master-change-control-execution-blueprint.md):
 // adds review_authorities(+targets,+evidence) and edit_transactions.authority_id.
-// See db/state_migrations.rs's registered v1->v2 and v2->v3 steps.
-pub const STATE_DB_SCHEMA_VERSION: i64 = 3;
+// v4 (CCK-25, audit follow-up on the same blueprint): adds
+// review_authorities.consumed_by_tx_id, provenance-binding a consumed
+// authority to the exact edit_transactions row it authorized (previously
+// the FK existed the other way -- edit_transactions.authority_id -- but
+// nothing ever set it, and authority consume/txn begin were two separate,
+// non-atomic steps).
+// v5 (CCK-26, audit follow-up): adds review_authorities.policy_decision_digest/
+// risk_vector_digest/required_approver_class -- a real PolicyEngine::evaluate()
+// decision, not just a policy-config digest, now backs each authority.
+// v6 (CCK-26, same audit follow-up): adds evidence_snapshots.provider_state_digest
+// -- EvidenceSnapshot::snapshot_id now also binds SCIP/LSP provider run state
+// (authority/snapshot.rs::provider_state_digest), so a proof-coverage change
+// with no source/config/graph_generation change still mints a fresh snapshot.
+// v7 (CCK-27, audit follow-up): adds change_intents.status/superseded_by_intent_id
+// -- plan_change's idempotency dedup can now mark a stale intent superseded
+// (and free its idempotency_key) instead of silently reusing it after
+// evidence has drifted; review_change refuses to mint against one.
+// See db/state_migrations.rs's registered v1->v2 through v6->v7 steps.
+pub const STATE_DB_SCHEMA_VERSION: i64 = 7;
 
 /// Refuses to proceed if `conn`'s stamped `PRAGMA user_version` is HIGHER
 /// than `expected` -- meaning a newer CALM binary already created or
@@ -70,12 +87,51 @@ pub fn init_db_versioned(conn: &Connection) -> rusqlite::Result<()> {
 
 /// `init_state_db`'s counterpart to `init_db_versioned` -- see that
 /// function's doc comment.
+///
+/// CCK-28 (audit follow-up): a genuinely empty file gets the CURRENT full
+/// schema (`init_state_db`) directly, DDL and version stamp wrapped in one
+/// transaction so a crash between them can never leave a file with the
+/// current physical schema but an old (or unstamped) `user_version`. A
+/// pre-existing file instead goes straight to `migrate_state_db_to_current`
+/// WITHOUT running `init_state_db` first -- every prior version of this
+/// function ran the full current-schema DDL unconditionally before
+/// migrating, which only stayed safe by accident: every statement in it
+/// happens to be `IF NOT EXISTS`/idempotent today, but a future migration
+/// step needing something schema-version-dependent to NOT already exist
+/// (e.g. `CREATE INDEX ... ON t(new_column)` before the ALTER that adds
+/// `new_column`) would silently break under "current schema always runs
+/// first." Each registered step is independently self-sufficient (creates
+/// whatever it needs, not just ALTERs an assumed-present table) precisely
+/// so it never depends on that ordering -- see
+/// `state_migrations.rs`'s own `registered_migrations_are_self_sufficient_
+/// against_a_genuine_pre_v2_database` test.
 pub fn init_state_db_versioned(conn: &Connection) -> rusqlite::Result<()> {
     refuse_if_schema_newer(conn, STATE_DB_SCHEMA_VERSION, "state.db")?;
-    init_state_db(conn)?;
-    // CCK-01: run any registered forward migrations from the on-disk version
-    // up to STATE_DB_SCHEMA_VERSION, then stamp it (see state_migrations.rs).
-    super::state_migrations::migrate_state_db_to_current(conn)?;
+    let is_empty: bool = conn.query_row(
+        "SELECT NOT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table')",
+        [],
+        |r| r.get(0),
+    )?;
+    if is_empty {
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| -> rusqlite::Result<()> {
+            init_state_db(conn)?;
+            conn.pragma_update(None, "user_version", STATE_DB_SCHEMA_VERSION)?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => conn.execute_batch("COMMIT")?,
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(e);
+            }
+        }
+    } else {
+        // CCK-01: run any registered forward migrations from the on-disk
+        // version up to STATE_DB_SCHEMA_VERSION, then stamp it (see
+        // state_migrations.rs) -- already atomic per-step on its own.
+        super::state_migrations::migrate_state_db_to_current(conn)?;
+    }
     Ok(())
 }
 
@@ -552,6 +608,7 @@ CREATE TABLE IF NOT EXISTS evidence_snapshots (
     snapshot_id            TEXT PRIMARY KEY,
     source_catalog_digest  TEXT NOT NULL,
     graph_generation       INTEGER NOT NULL,
+    provider_state_digest  TEXT NOT NULL DEFAULT '',
     freshness_class        TEXT NOT NULL,
     created_at             REAL NOT NULL
 );
@@ -568,7 +625,9 @@ CREATE TABLE IF NOT EXISTS change_intents (
     reason           TEXT NOT NULL,
     snapshot_id      TEXT NOT NULL REFERENCES evidence_snapshots(snapshot_id),
     created_at       REAL NOT NULL,
-    idempotency_key  TEXT
+    idempotency_key  TEXT,
+    status                   TEXT NOT NULL DEFAULT 'active',
+    superseded_by_intent_id  TEXT REFERENCES change_intents(intent_id)
 );
 CREATE INDEX IF NOT EXISTS idx_change_intents_snapshot ON change_intents(snapshot_id);
 -- CCK-11: plan_change's idempotency contract -- a partial unique index
@@ -615,7 +674,21 @@ CREATE TABLE IF NOT EXISTS review_authorities (
     expires_at         REAL NOT NULL,
     signature          TEXT NOT NULL,
     created_at         REAL NOT NULL,
-    consumed_at        REAL
+    consumed_at        REAL,
+    -- v4 / CCK-25: which edit_transactions row this authority's single use
+    -- was actually spent on -- set atomically together with consumed_at by
+    -- authority::review::authorize_and_begin_edit, never independently.
+    consumed_by_tx_id  TEXT REFERENCES edit_transactions(tx_id) ON DELETE SET NULL,
+    -- v5 / CCK-26 (audit follow-up): what a REAL PolicyEngine::evaluate()
+    -- run actually decided for this authority, not just a policy-config
+    -- digest -- policy_decision_digest/risk_vector_digest are audit/
+    -- provenance (bound+signed, not yet re-verified fresh at spend time --
+    -- that staleness check is a follow-up, same shape as target_scope_digest's).
+    -- required_approver_class is what review_change actually gates minting
+    -- on: 'human' cannot be satisfied by self-attested approved:true alone.
+    policy_decision_digest  TEXT NOT NULL DEFAULT '',
+    risk_vector_digest      TEXT NOT NULL DEFAULT '',
+    required_approver_class TEXT NOT NULL DEFAULT 'self_reviewed'
 );
 CREATE INDEX IF NOT EXISTS idx_review_authorities_intent ON review_authorities(intent_id);
 
@@ -1344,6 +1417,76 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(stamped_again, STATE_DB_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn init_state_db_versioned_migrates_a_non_empty_pre_v2_db_instead_of_bootstrapping_over_it() {
+        // CCK-28 (audit follow-up): the real production entry point, not
+        // `migrate_state_db_to_current` directly -- proves
+        // `init_state_db_versioned`'s own is_empty branch selection routes
+        // a pre-existing (but unstamped) file straight to the migration
+        // chain rather than running the current full-schema DDL first. A
+        // pre-v2 install only ever had `project_memory` from this table
+        // set -- everything else this migrates in is new.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE project_memory (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                topic       TEXT NOT NULL UNIQUE,
+                content     TEXT NOT NULL,
+                created_at  TEXT NOT NULL,
+                updated_at  TEXT NOT NULL
+            );
+            CREATE TABLE edit_transactions (
+                tx_id            TEXT PRIMARY KEY,
+                project_id       TEXT NOT NULL,
+                path             TEXT NOT NULL,
+                base_digest      TEXT NOT NULL,
+                proposed_digest  TEXT NOT NULL,
+                state            TEXT NOT NULL DEFAULT 'PREPARED',
+                created_at       REAL NOT NULL,
+                updated_at       REAL NOT NULL
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO project_memory (topic, content, created_at, updated_at) \
+             VALUES ('gotcha', 'remember this', 't0', 't0')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0,
+            "must start unstamped, same as every real pre-versioning install"
+        );
+
+        init_state_db_versioned(&conn).unwrap();
+
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            STATE_DB_SCHEMA_VERSION
+        );
+        for table in ["evidence_snapshots", "change_intents", "review_authorities"] {
+            let exists: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                    [table],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(exists, "{table} should exist after migrating this fixture");
+        }
+        let memory_content: String = conn
+            .query_row(
+                "SELECT content FROM project_memory WHERE topic = 'gotcha'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(memory_content, "remember this", "pre-existing rows must survive");
     }
 
     #[test]

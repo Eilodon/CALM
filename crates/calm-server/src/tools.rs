@@ -5709,6 +5709,86 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn source_then_edit_symbol_with_the_redacted_body_is_rejected_not_a_secret_overwrite() {
+        // CCK-04 (P0 fix, audit 2026-08-09): end-to-end reproduction of the
+        // exact hazard -- source() returns a REDACTED body with an etag
+        // computed from the RAW (unredacted) disk content. If an agent
+        // copies that redacted body verbatim and submits it as new_text
+        // with the returned etag as expected_hash, the hash still matches
+        // (nothing else changed the range), so without this fix the write
+        // would silently overwrite the real secret with the literal
+        // "[REDACTED:...]" placeholder -- a data-loss integrity bug, not
+        // something ReviewAuthority can help with (it only proves who may
+        // write, not that the content being written is faithful).
+        let dir = std::env::temp_dir().join(format!("ci_source_lossy_write_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let original = "def foo():\n    API_KEY = \"sk-REAL_SECRET_VALUE_DO_NOT_LOSE\"\n";
+        std::fs::write(dir.join("a.py"), original).unwrap();
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.py::foo', 'foo', 'function', 'python', 'a.py', 1, 2, 'def foo():', '', 'foo', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let src_v = jv(
+            server.source(rmcp::handler::server::wrapper::Parameters(SourceParams {
+                symbol: Some("foo".into()),
+                path: None,
+                line: None,
+                end_line: None,
+                include_metadata: false,
+                line_numbers: false,
+                if_none_match: None,
+            })),
+        );
+        let redacted_body = src_v["source"].as_str().unwrap().to_string();
+        assert!(
+            redacted_body.contains("[REDACTED:"),
+            "source() must have redacted the secret: {redacted_body}"
+        );
+        assert!(
+            !redacted_body.contains("REAL_SECRET_VALUE_DO_NOT_LOSE"),
+            "the real secret must not appear in source()'s response: {redacted_body}"
+        );
+        let etag = src_v["etag"].as_str().unwrap().to_string();
+
+        // Agent copies the redacted body it was shown, verbatim, as new_text.
+        let out = jv(server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
+            EditSymbolParams {
+                change_id: None,
+                authority_id: None,
+                symbol: "foo".into(),
+                path: None,
+                line: None,
+                expected_hash: Some(etag),
+                new_text: redacted_body,
+                position: None,
+                confirm: false,
+                reason: None,
+                cites: None,
+                old_text: None,
+            },
+        )));
+        assert_eq!(
+            out["error"]["code"], "LOSSY_WRITE_REJECTED",
+            "response: {out}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.py")).unwrap(),
+            original,
+            "the real secret on disk must survive the rejected write"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 1C: range mode reads a raw `[line, end_line]` window with no symbol —
     /// for module-level / between-symbol code that no symbol range covers.
     #[test]
@@ -10042,8 +10122,14 @@ mod tests {
                 },
             )),
         );
+        // CCK-23 (P0 fix, audit 2026-08-09): HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW now
+        // fires unconditionally, ahead of EDIT_CONTEXT_REQUIRED -- a risk_rules-escalated
+        // "high" touch needs independent review regardless of whether edit_context was
+        // ever called, so this is strictly more precise than the old EDIT_CONTEXT_REQUIRED
+        // (which would have been immediately followed by this same refusal anyway once
+        // edit_context was called, since ElicitGate::Off never satisfies it).
         assert_eq!(
-            out["error"]["code"], "EDIT_CONTEXT_REQUIRED",
+            out["error"]["code"], "HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW",
             "a risk_rules-escalated path must gate the write even though caller_count=2 \
              alone never would: response {out}"
         );
@@ -11043,6 +11129,16 @@ mod tests {
             )
             .unwrap();
         }
+        {
+            // CCK-23: edit_context's auto-mint now refuses to mint against a
+            // Degraded snapshot (index_input_state fail-closes to Unknown/
+            // Degraded when never persisted) -- mirror the real production
+            // path (daemon bootstrap / watch_supervisor refresh) so this
+            // test fixture reflects a reconciled repo, not an untouched one.
+            let conn = server.db();
+            let catalog = calm_core::indexer::refresh::InputCatalog::for_project(&dir);
+            calm_core::indexer::refresh::persist_index_input_snapshot(&conn, &catalog).unwrap();
+        }
 
         let ctx_out = server.edit_context(rmcp::handler::server::wrapper::Parameters(
             EditContextParams {
@@ -11085,6 +11181,93 @@ mod tests {
                 .unwrap()
                 .contains("# freshly inserted above helper"),
             "the insertion must have actually landed on disk"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_context_minted_authority_does_not_bypass_high_risk_independent_review() {
+        // CCK-23 (P0 regression test, audit 2026-08-09): before this fix, a
+        // valid ReviewAuthority (auto-minted by edit_context with zero
+        // approval input) let edit_lines/edit_symbol skip the ENTIRE legacy
+        // gate -- including HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW -- so a
+        // high-risk write could land with no independent human/MRTR review
+        // at all. This must now be refused even though the authority itself
+        // verifies cleanly (right intent, right snapshot, right target
+        // scope): possessing a valid authority is not independent review.
+        use super::edit::{ElicitGate, HubAskContext};
+        let (dir, server) = test_server("cck23_authority_does_not_bypass_high_risk_review");
+        std::fs::create_dir_all(dir.join("auth")).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"risk_rules": [{"glob": "auth/**", "minimum": "high"}]}"#,
+        )
+        .unwrap();
+        let original = "def check_token():\n    return True\n";
+        std::fs::write(dir.join("auth/login.py"), original).unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('auth/login.py::check_token', 'check_token', 'function', 'python', 'auth/login.py', 1, 2, '', '', 'check_token', 2, 0, 0)",
+                [],
+            )
+            .unwrap();
+            let catalog = calm_core::indexer::refresh::InputCatalog::for_project(&dir);
+            calm_core::indexer::refresh::persist_index_input_snapshot(&conn, &catalog).unwrap();
+        }
+
+        // edit_context's auto-mint has no risk check of its own (CCK-23's
+        // fix is deliberately at spend time, not mint time -- see this
+        // module's own review_change doc comment on why) so minting itself
+        // still succeeds here.
+        let ctx_out = server.edit_context(rmcp::handler::server::wrapper::Parameters(
+            EditContextParams {
+                symbol: "check_token".into(),
+                path: None,
+                line: None,
+                if_none_match: None,
+            },
+        ));
+        let ctx_v = serde_json::to_value(&ctx_out.0).unwrap();
+        let change_id = ctx_v["change_id"]
+            .as_str()
+            .expect(&format!("edit_context must mint a change_id: {ctx_v}"))
+            .to_string();
+        let authority_id = ctx_v["authority_id"]
+            .as_str()
+            .expect(&format!("edit_context must mint an authority_id: {ctx_v}"))
+            .to_string();
+
+        let hash = calm_core::edit::range_checksum(original, 2, 2).unwrap();
+        let params = EditLinesParams {
+            change_id: Some(change_id),
+            authority_id: Some(authority_id),
+            path: "auth/login.py".into(),
+            edits: vec![EditHunkParam {
+                old_text: None,
+                start_line: 2,
+                end_line: 2,
+                expected_hash: Some(hash),
+                new_text: "    return False\n".into(),
+            }],
+            confirm: false,
+            reason: None,
+            cites: None,
+        };
+        let mut ask: Option<HubAskContext> = None;
+        let out = server.edit_lines_flow(&params, ElicitGate::Off, &mut ask);
+        let v = serde_json::to_value(&out).unwrap();
+        assert_eq!(
+            v["error"]["code"], "HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW",
+            "a spent-but-not-independently-reviewed authority must not bypass the \
+             high-risk gate: response {v}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("auth/login.py")).unwrap(),
+            original,
+            "the bypassed write must not have touched disk"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

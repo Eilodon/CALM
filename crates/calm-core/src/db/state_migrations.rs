@@ -116,6 +116,30 @@ pub const STATE_MIGRATIONS: &[StateMigration] = &[
         name: "v3_review_authorities",
         apply: v2_to_v3_review_authorities,
     },
+    StateMigration {
+        from: 3,
+        to: 4,
+        name: "v4_authority_consumed_by_tx_id",
+        apply: v3_to_v4_authority_consumed_by_tx_id,
+    },
+    StateMigration {
+        from: 4,
+        to: 5,
+        name: "v5_authority_policy_decision",
+        apply: v4_to_v5_authority_policy_decision,
+    },
+    StateMigration {
+        from: 5,
+        to: 6,
+        name: "v6_evidence_snapshot_provider_state",
+        apply: v5_to_v6_evidence_snapshot_provider_state,
+    },
+    StateMigration {
+        from: 6,
+        to: 7,
+        name: "v7_change_intent_supersede",
+        apply: v6_to_v7_change_intent_supersede,
+    },
 ];
 
 /// v1->v2 (CCK-07): adds `evidence_snapshots`, `change_intents`,
@@ -258,6 +282,173 @@ fn v2_to_v3_review_authorities(conn: &Connection) -> Result<(), StateMigrationEr
                 detail: format!("table {table:?} does not exist after this step's own DDL ran"),
             });
         }
+    }
+    Ok(())
+}
+
+/// v3->v4 (CCK-25, audit follow-up): adds `review_authorities.
+/// consumed_by_tx_id`, a new column on an EXISTING table (same shape as
+/// v2->v3's `edit_transactions.authority_id` ALTER above) -- provenance-
+/// binds a consumed authority to the exact `edit_transactions` row it
+/// authorized, set atomically with `consumed_at` by
+/// `authority::review::authorize_and_begin_edit` instead of the old
+/// two-step (non-atomic) verify_and_consume-then-txn::begin.
+fn v3_to_v4_authority_consumed_by_tx_id(conn: &Connection) -> Result<(), StateMigrationError> {
+    let mut stmt = conn.prepare("PRAGMA table_info(review_authorities)")?;
+    let existing_columns: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(|r| r.ok())
+        .collect();
+    if !existing_columns.iter().any(|c| c == "consumed_by_tx_id") {
+        conn.execute_batch(
+            "ALTER TABLE review_authorities ADD COLUMN consumed_by_tx_id TEXT \
+             REFERENCES edit_transactions(tx_id) ON DELETE SET NULL;",
+        )?;
+    }
+
+    let mut stmt = conn.prepare("PRAGMA table_info(review_authorities)")?;
+    let now_has_column = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(|r| r.ok())
+        .any(|c| c == "consumed_by_tx_id");
+    if !now_has_column {
+        return Err(StateMigrationError::PostconditionFailed {
+            migration: "v4_authority_consumed_by_tx_id",
+            detail: "review_authorities.consumed_by_tx_id does not exist after this step's \
+                      own DDL ran"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// v4->v5 (CCK-26, audit follow-up): adds `review_authorities.
+/// policy_decision_digest`/`risk_vector_digest`/`required_approver_class` --
+/// same shape as v3->v4's ALTER above. A real `PolicyEngine::evaluate()`
+/// decision (not just a policy-config digest) now backs each authority;
+/// `required_approver_class` is what `review_change` gates minting on for
+/// a `Human`-required change.
+fn v4_to_v5_authority_policy_decision(conn: &Connection) -> Result<(), StateMigrationError> {
+    let mut stmt = conn.prepare("PRAGMA table_info(review_authorities)")?;
+    let existing_columns: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(|r| r.ok())
+        .collect();
+    let new_columns: &[(&str, &str)] = &[
+        ("policy_decision_digest", "TEXT NOT NULL DEFAULT ''"),
+        ("risk_vector_digest", "TEXT NOT NULL DEFAULT ''"),
+        (
+            "required_approver_class",
+            "TEXT NOT NULL DEFAULT 'self_reviewed'",
+        ),
+    ];
+    for (name, ddl) in new_columns {
+        if !existing_columns.iter().any(|c| c == name) {
+            conn.execute_batch(&format!(
+                "ALTER TABLE review_authorities ADD COLUMN {name} {ddl};"
+            ))?;
+        }
+    }
+
+    let mut stmt = conn.prepare("PRAGMA table_info(review_authorities)")?;
+    let now_has_all = {
+        let cols: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .filter_map(|r| r.ok())
+            .collect();
+        new_columns.iter().all(|(name, _)| cols.iter().any(|c| c == name))
+    };
+    if !now_has_all {
+        return Err(StateMigrationError::PostconditionFailed {
+            migration: "v5_authority_policy_decision",
+            detail: "review_authorities is missing one or more of \
+                      policy_decision_digest/risk_vector_digest/required_approver_class \
+                      after this step's own DDL ran"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// v5->v6 (CCK-26, same audit follow-up): adds
+/// `evidence_snapshots.provider_state_digest` -- same ALTER-loop shape as
+/// v4->v5. `authority::snapshot::EvidenceSnapshot::snapshot_id` now also
+/// binds SCIP/LSP provider run state (`scip_overlay_state`), so a
+/// proof-coverage change with no source/config/graph_generation change
+/// still mints a fresh snapshot; this column is where that digest is
+/// persisted alongside the other three snapshot_id inputs.
+fn v5_to_v6_evidence_snapshot_provider_state(conn: &Connection) -> Result<(), StateMigrationError> {
+    let mut stmt = conn.prepare("PRAGMA table_info(evidence_snapshots)")?;
+    let existing_columns: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(|r| r.ok())
+        .collect();
+    if !existing_columns.iter().any(|c| c == "provider_state_digest") {
+        conn.execute_batch(
+            "ALTER TABLE evidence_snapshots ADD COLUMN provider_state_digest TEXT NOT NULL DEFAULT '';",
+        )?;
+    }
+
+    let mut stmt = conn.prepare("PRAGMA table_info(evidence_snapshots)")?;
+    let now_has_column = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(|r| r.ok())
+        .any(|c| c == "provider_state_digest");
+    if !now_has_column {
+        return Err(StateMigrationError::PostconditionFailed {
+            migration: "v6_evidence_snapshot_provider_state",
+            detail: "evidence_snapshots.provider_state_digest does not exist after this \
+                      step's own DDL ran"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// v6->v7 (CCK-27, audit follow-up): adds `change_intents.status`/
+/// `superseded_by_intent_id` -- `plan_change`'s idempotency dedup keyed
+/// only on `kind`+`targets` (never `snapshot_id`) meant a repeated call
+/// after source drifted still returned the SAME stale `change_id`, so a
+/// human approving it via `review_change` could be looking at a
+/// declared-vs-observed picture from a snapshot that no longer exists.
+/// `change::store::supersede_change_intent` now marks the old intent row
+/// `superseded` (and frees its `idempotency_key`) whenever `plan_change`
+/// finds drift, and `review_change` refuses to mint against a superseded
+/// intent -- see those symbols' own doc comments.
+fn v6_to_v7_change_intent_supersede(conn: &Connection) -> Result<(), StateMigrationError> {
+    let mut stmt = conn.prepare("PRAGMA table_info(change_intents)")?;
+    let existing_columns: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(|r| r.ok())
+        .collect();
+    let new_columns: &[(&str, &str)] = &[
+        ("status", "TEXT NOT NULL DEFAULT 'active'"),
+        (
+            "superseded_by_intent_id",
+            "TEXT REFERENCES change_intents(intent_id)",
+        ),
+    ];
+    for (name, ddl) in new_columns {
+        if !existing_columns.iter().any(|c| c == name) {
+            conn.execute_batch(&format!("ALTER TABLE change_intents ADD COLUMN {name} {ddl};"))?;
+        }
+    }
+
+    let mut stmt = conn.prepare("PRAGMA table_info(change_intents)")?;
+    let now_has_all = {
+        let cols: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .filter_map(|r| r.ok())
+            .collect();
+        new_columns.iter().all(|(name, _)| cols.iter().any(|c| c == name))
+    };
+    if !now_has_all {
+        return Err(StateMigrationError::PostconditionFailed {
+            migration: "v7_change_intent_supersede",
+            detail: "change_intents is missing status/superseded_by_intent_id after this \
+                      step's own DDL ran"
+                .to_string(),
+        });
     }
     Ok(())
 }
@@ -632,6 +823,102 @@ mod tests {
             columns.iter().any(|c| c == "authority_id"),
             "edit_transactions.authority_id should exist"
         );
+    }
+
+    #[test]
+    fn registered_v3_to_v4_migration_adds_consumed_by_tx_id_column() {
+        let conn = fresh_conn();
+        conn.pragma_update(None, "user_version", 3).unwrap();
+        migrate_state_db_to_current(&conn).unwrap();
+        assert_eq!(
+            user_version(&conn),
+            super::super::schema::STATE_DB_SCHEMA_VERSION
+        );
+        let columns: Vec<String> = conn
+            .prepare("PRAGMA table_info(review_authorities)")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert!(
+            columns.iter().any(|c| c == "consumed_by_tx_id"),
+            "review_authorities.consumed_by_tx_id should exist"
+        );
+    }
+
+    #[test]
+    fn registered_v4_to_v5_migration_adds_policy_decision_columns() {
+        let conn = fresh_conn();
+        conn.pragma_update(None, "user_version", 4).unwrap();
+        migrate_state_db_to_current(&conn).unwrap();
+        assert_eq!(
+            user_version(&conn),
+            super::super::schema::STATE_DB_SCHEMA_VERSION
+        );
+        let columns: Vec<String> = conn
+            .prepare("PRAGMA table_info(review_authorities)")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        for expected in [
+            "policy_decision_digest",
+            "risk_vector_digest",
+            "required_approver_class",
+        ] {
+            assert!(
+                columns.iter().any(|c| c == expected),
+                "review_authorities.{expected} should exist"
+            );
+        }
+    }
+
+    #[test]
+    fn registered_v5_to_v6_migration_adds_provider_state_digest_column() {
+        let conn = fresh_conn();
+        conn.pragma_update(None, "user_version", 5).unwrap();
+        migrate_state_db_to_current(&conn).unwrap();
+        assert_eq!(
+            user_version(&conn),
+            super::super::schema::STATE_DB_SCHEMA_VERSION
+        );
+        let columns: Vec<String> = conn
+            .prepare("PRAGMA table_info(evidence_snapshots)")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert!(
+            columns.iter().any(|c| c == "provider_state_digest"),
+            "evidence_snapshots.provider_state_digest should exist"
+        );
+    }
+
+    #[test]
+    fn registered_v6_to_v7_migration_adds_change_intent_supersede_columns() {
+        let conn = fresh_conn();
+        conn.pragma_update(None, "user_version", 6).unwrap();
+        migrate_state_db_to_current(&conn).unwrap();
+        assert_eq!(
+            user_version(&conn),
+            super::super::schema::STATE_DB_SCHEMA_VERSION
+        );
+        let columns: Vec<String> = conn
+            .prepare("PRAGMA table_info(change_intents)")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        for expected in ["status", "superseded_by_intent_id"] {
+            assert!(
+                columns.iter().any(|c| c == expected),
+                "change_intents.{expected} should exist"
+            );
+        }
     }
 
     #[test]

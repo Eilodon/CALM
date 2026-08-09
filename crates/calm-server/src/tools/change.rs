@@ -9,14 +9,38 @@
 //! caller says it's about to do, and why) without writing anything or
 //! minting authority. `review_change` is the ONLY place in this pair that
 //! calls `ReviewAuthority::mint` -- and refuses to do so
-//! (`APPROVAL_REQUIRED`) unless `approved: true` is explicitly set, the
-//! blueprint's "review_change returns authority_id only after required
-//! human/MRTR approval" invariant. Whether that flag was set because a
-//! human answered a chat prompt, an MRTR elicitation round-trip completed,
-//! or some other out-of-band process approved it is a client-side
-//! concern -- CALM's contract is the refusal, not the mechanism, matching
-//! how `edit_lines`/`edit_symbol`'s own lighter `confirm: bool` gate
-//! already works one tier down.
+//! (`APPROVAL_REQUIRED`) unless `approved: true` is explicitly set.
+//!
+//! **CCK-23 correction (audit 2026-08-09):** `approved: true` here is
+//! CLIENT SELF-ATTESTATION, not a server-verified human/MRTR round-trip --
+//! whether a human actually looked at this is entirely a client-side
+//! concern this module cannot see or verify, matching how `edit_lines`/
+//! `edit_symbol`'s own lighter `confirm: bool` gate already works one tier
+//! down. That's an acceptable bar for low/medium-risk changes (self-review
+//! is a legitimate approver class), but it is NOT independent review for a
+//! high-risk touch. The authority this mints for a high-risk target is
+//! spendable ONLY if `edit_lines`/`edit_symbol`'s own unconditional
+//! `HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW` check (edit.rs, CCK-23) is
+//! separately satisfied via a real elicitation round-trip -- self-
+//! attestation here is never sufficient on its own for that tier.
+//!
+//! **CCK-26 (audit follow-up):** `review_change` now also refuses to mint
+//! at all -- `INDEPENDENT_REVIEW_NOT_AVAILABLE_HERE`, no authority handed
+//! out -- when a real `calm_core::policy::evaluate()` decision (built from
+//! a genuine `RiskVector` over the declared targets, not a placeholder)
+//! says the required approver class is `Human`. This is on top of, not a
+//! replacement for, CCK-23's spend-time backstop above: this module's
+//! refusal saves a wasted authority for the common case, edit_lines/
+//! edit_symbol's check is what actually cannot be bypassed.
+//!
+//! **CCK-27 (audit follow-up):** `plan_change`'s idempotency dedup keys on
+//! `kind`+`targets` only, never `snapshot_id` -- a repeated call after
+//! evidence drifted (source/config/graph/provider state) now supersedes
+//! the stale intent (`change::intent::IntentStatus::Superseded`) and mints
+//! a fresh one against current evidence, instead of silently handing back
+//! a `change_id` whose declared picture no longer matches reality.
+//! `review_change` refuses to mint against a superseded intent
+//! (`INTENT_SUPERSEDED`).
 //!
 //! **Known Phase-1 scope limit** (the blueprint's own phasing: CCK-11 is
 //! Phase 1, true multi-file `ChangeSet` staging/commit is Phase 2,
@@ -34,6 +58,7 @@
 
 use super::common::*;
 use super::*;
+use rusqlite::OptionalExtension;
 
 /// One file (optionally symbol-scoped) target of a `plan_change` call --
 /// wire shape for `calm_core::change::ChangeIntentTarget`.
@@ -69,6 +94,14 @@ pub(crate) struct PlanChangeOutput {
     /// `change_id` instead of minting a new one.
     pub(crate) reused: bool,
     pub(crate) snapshot_id: String,
+    /// CCK-27 (audit follow-up): set when this call's declared kind+targets
+    /// matched a prior intent, but evidence had drifted since that intent
+    /// was declared -- that stale intent was marked `superseded` (see
+    /// `change::intent::IntentStatus`) rather than reused, and this
+    /// `change_id` replaces it. `review_change` on the superseded id now
+    /// refuses with `INTENT_SUPERSEDED`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) superseded_change_id: Option<String>,
     /// `true` when at least one target's current uncommitted diff (working
     /// tree vs. `git show HEAD`) doesn't classify as the declared `kind` --
     /// best-effort: silently `false` for a target with no git history, no
@@ -87,10 +120,12 @@ pub(crate) struct PlanChangeOutput {
 #[derive(Deserialize, JsonSchema)]
 pub(crate) struct ReviewChangeParams {
     pub(crate) change_id: String,
-    /// The required human/MRTR approval signal -- `review_change` NEVER
-    /// mints an authority unless this is explicitly `true` (omitted or
-    /// `false` both refuse with `APPROVAL_REQUIRED`). See this module's own
-    /// doc comment for what "approval" means here.
+    /// Client self-attestation, not a server-verified approval -- `review_change`
+    /// NEVER mints an authority unless this is explicitly `true` (omitted or
+    /// `false` both refuse with `APPROVAL_REQUIRED`). Adequate for low/medium-risk
+    /// changes only: for a high-risk target, edit_lines/edit_symbol separately
+    /// require real independent review regardless of this flag. See this module's
+    /// own doc comment for what "approval" means here.
     #[serde(default)]
     pub(crate) approved: bool,
     /// Free text audit trail of who/what approved -- like `reason`
@@ -222,7 +257,7 @@ fn check_declared_vs_observed(
 impl CalmServer {
     #[tool(
         name = "plan_change",
-        description = "Declares a ChangeIntent (what you're about to do, and why) as a formal, reviewable record, before writing anything -- returns a change_id to hand to review_change once a human/MRTR approves it. Idempotent: repeated calls with the same kind+targets return the same change_id instead of minting a new one each time. Surfaces (not blocks) a declared-vs-observed kind mismatch when a target's current uncommitted diff doesn't match what you declared. USE WHEN: a change needs formal review/authority rather than the lighter edit_context+confirm+reason gate. NOT FOR: the write itself (edit_lines/edit_symbol still do that) or a single quick low-risk edit (edit_context is enough there).",
+        description = "Declares a ChangeIntent (what you're about to do, and why) as a formal, reviewable record, before writing anything -- returns a change_id to hand to review_change once a human/MRTR approves it. Idempotent ONLY while evidence hasn't drifted: repeated calls with the same kind+targets return the same change_id, but if source/config/graph/provider state changed since the matching intent was declared, that intent is superseded and this call mints a fresh change_id against current evidence instead (superseded_change_id on the response names the one replaced -- review_change on it now refuses with INTENT_SUPERSEDED). Surfaces (not blocks) a declared-vs-observed kind mismatch when a target's current uncommitted diff doesn't match what you declared. USE WHEN: a change needs formal review/authority rather than the lighter edit_context+confirm+reason gate. NOT FOR: the write itself (edit_lines/edit_symbol still do that) or a single quick low-risk edit (edit_context is enough there).",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -266,6 +301,28 @@ impl CalmServer {
                 .collect();
             let idempotency_key = plan_idempotency_key(kind, &targets);
 
+            // CCK-27 (audit follow-up): the snapshot is now computed
+            // unconditionally, up front -- a repeated call needs it too,
+            // to decide whether a prior intent for this exact kind+targets
+            // is still current or has drifted (see below), not just a
+            // fresh call minting one for the first time.
+            let snapshot = {
+                let conn = match self.make_read_conn() {
+                    Ok(c) => c,
+                    Err(e) => return db_error(e),
+                };
+                match calm_core::authority::EvidenceSnapshot::compute(&conn, &self.project_root) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        return ToolOutcome::error(error_detail(
+                            "SNAPSHOT_ERROR",
+                            &e.to_string(),
+                            true,
+                        ));
+                    }
+                }
+            };
+
             let mut state_conn = match calm_core::db::conn::open_state_writer(&self.state_db_path)
             {
                 Ok(c) => c,
@@ -274,31 +331,35 @@ impl CalmServer {
                 }
             };
 
-            let (change_id, snapshot_id, reused) = match calm_core::change::find_change_intent_by_idempotency_key(
+            let existing = match calm_core::change::find_change_intent_by_idempotency_key(
                 &state_conn,
                 &idempotency_key,
             ) {
-                Ok(Some(existing)) => (existing.intent_id, existing.snapshot_id, true),
-                Ok(None) => {
-                    let snapshot = {
-                        let conn = match self.make_read_conn() {
-                            Ok(c) => c,
-                            Err(e) => return db_error(e),
-                        };
-                        match calm_core::authority::EvidenceSnapshot::compute(
-                            &conn,
-                            &self.project_root,
-                        ) {
-                            Ok(s) => s,
-                            Err(e) => {
-                                return ToolOutcome::error(error_detail(
-                                    "SNAPSHOT_ERROR",
-                                    &e.to_string(),
-                                    true,
-                                ));
-                            }
-                        }
-                    };
+                Ok(existing) => existing,
+                Err(e) => {
+                    return ToolOutcome::error(error_detail("STATE_DB_ERROR", &e.to_string(), true));
+                }
+            };
+
+            // CCK-27 (audit follow-up): `find_change_intent_by_idempotency_key`
+            // only ever returns an `Active` intent (`supersede_change_intent`
+            // clears a superseded row's key), so `existing` here is always the
+            // current answer for this kind+targets -- IF its declared
+            // `snapshot_id` still matches evidence right now. When it does,
+            // this is a genuine repeated call: reuse it verbatim, unchanged
+            // from CCK-07's original behavior. When it doesn't, evidence
+            // drifted since that intent was declared -- reusing it would hand
+            // a human reviewing it via `review_change` a `change_id` whose
+            // `kind_mismatch`/`observed_kind` picture no longer reflects
+            // reality, so supersede it and mint a fresh intent against
+            // current evidence instead (`superseded_change_id` on the
+            // response names the one this replaced).
+            let (change_id, snapshot_id, reused, superseded_change_id) =
+                if let Some(existing) = &existing
+                    && existing.snapshot_id == snapshot.snapshot_id
+                {
+                    (existing.intent_id.clone(), existing.snapshot_id.clone(), true, None)
+                } else {
                     let tx = match state_conn.transaction() {
                         Ok(tx) => tx,
                         Err(e) => {
@@ -322,9 +383,21 @@ impl CalmServer {
                         snapshot.snapshot_id.clone(),
                         targets.clone(),
                     );
-                    if let Err(e) =
-                        calm_core::change::insert_change_intent(&tx, &intent, Some(&idempotency_key))
-                    {
+                    let stale_intent_id = existing.map(|e| e.intent_id);
+                    let write_result = match &stale_intent_id {
+                        Some(old_id) => calm_core::change::supersede_change_intent(
+                            &tx,
+                            old_id,
+                            &intent,
+                            Some(&idempotency_key),
+                        ),
+                        None => calm_core::change::insert_change_intent(
+                            &tx,
+                            &intent,
+                            Some(&idempotency_key),
+                        ),
+                    };
+                    if let Err(e) = write_result {
                         return ToolOutcome::error(error_detail(
                             "STATE_DB_ERROR",
                             &e.to_string(),
@@ -338,12 +411,8 @@ impl CalmServer {
                             true,
                         ));
                     }
-                    (intent.intent_id, snapshot.snapshot_id, false)
-                }
-                Err(e) => {
-                    return ToolOutcome::error(error_detail("STATE_DB_ERROR", &e.to_string(), true));
-                }
-            };
+                    (intent.intent_id, snapshot.snapshot_id, false, stale_intent_id)
+                };
 
             let (kind_mismatch, observed_kind, mismatch_notes) =
                 check_declared_vs_observed(&self.project_root, kind, &targets);
@@ -352,6 +421,7 @@ impl CalmServer {
                 change_id,
                 reused,
                 snapshot_id,
+                superseded_change_id,
                 kind_mismatch,
                 observed_kind,
                 mismatch_notes,
@@ -365,7 +435,7 @@ impl CalmServer {
 
     #[tool(
         name = "review_change",
-        description = "Mints a ReviewAuthority for a change_id from plan_change -- ONLY when approved:true (the required human/MRTR approval step; omitted or false always refuses with APPROVAL_REQUIRED, never mints). Pass the returned authority_id alongside change_id to edit_lines/edit_symbol to spend it in one write. USE WHEN: a plan_change'd intent has been reviewed and approved. NOT FOR: minting without a real approval, or a multi-file change that needs independent per-file authorization (Phase 2 ChangeSet territory -- see this module's own doc comment).",
+        description = "Mints a ReviewAuthority for a change_id from plan_change -- ONLY when approved:true (omitted or false always refuses with APPROVAL_REQUIRED, never mints). approved:true is CLIENT SELF-ATTESTATION (not server-verified human/MRTR proof) -- adequate for low/medium-risk changes, but for a high-risk target the resulting authority is only spendable if edit_lines/edit_symbol's own independent-review check is separately satisfied via a real elicitation round-trip. Pass the returned authority_id alongside change_id to edit_lines/edit_symbol to spend it in one write. USE WHEN: a plan_change'd intent has been reviewed and approved. NOT FOR: minting without a real approval, or a multi-file change that needs independent per-file authorization (Phase 2 ChangeSet territory -- see this module's own doc comment).",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -381,9 +451,11 @@ impl CalmServer {
             if !p.approved {
                 return ToolOutcome::error(error_detail(
                     "APPROVAL_REQUIRED",
-                    "review_change never mints an authority without an explicit human/MRTR \
-                     approval -- pass approved:true only after that approval has actually \
-                     happened",
+                    "review_change never mints an authority without approved:true -- this is \
+                     self-attestation the caller must only set after a real approval \
+                     happened (CALM cannot verify the mechanism from here; see this \
+                     module's own doc comment). For a high-risk target, this alone is not \
+                     independent review -- edit_lines/edit_symbol separately enforce that.",
                     true,
                 ));
             }
@@ -419,6 +491,26 @@ impl CalmServer {
                     }
                 }
             };
+            // CCK-27 (audit follow-up): a superseded intent's declared
+            // snapshot is known-stale (that's what supersession means --
+            // see change::intent::IntentStatus) -- minting against it would
+            // authorize a human/MRTR approval that was never actually given
+            // for current evidence. The replacement intent from the
+            // plan_change call that superseded this one is the one to
+            // review instead.
+            if intent.status == calm_core::change::IntentStatus::Superseded {
+                return ToolOutcome::error(error_detail(
+                    "INTENT_SUPERSEDED",
+                    &format!(
+                        "change_id {} was superseded by {} after evidence drifted -- \
+                         review_change that one instead (re-run plan_change if you no \
+                         longer have it)",
+                        p.change_id,
+                        intent.superseded_by_intent_id.as_deref().unwrap_or("<unknown>"),
+                    ),
+                    false,
+                ));
+            }
             if intent.targets.is_empty() {
                 return ToolOutcome::error(error_detail(
                     "NO_TARGETS",
@@ -427,7 +519,7 @@ impl CalmServer {
                 ));
             }
 
-            let (snapshot, graph_generation, caller_set_digest) = {
+            let (snapshot, graph_generation, caller_set_digest, risk_vector) = {
                 let conn = match self.make_read_conn() {
                     Ok(c) => c,
                     Err(e) => return db_error(e),
@@ -445,6 +537,22 @@ impl CalmServer {
                         ));
                     }
                 };
+                // CCK-23 (P0 fix, audit 2026-08-09): "No stale evidence may grant
+                // authority" was never actually enforced -- this capability
+                // (`is_safe_for_high_risk_authority`) existed with zero production
+                // callers. Refuse to mint against a `Degraded` snapshot outright
+                // (Phase 0: blanket refusal for every risk tier, not just high --
+                // simplest safe interpretation until CCK-26 lands the tiered
+                // Low/Medium=Current|Reconciled vs High=Reconciled+Receipt policy).
+                if !snapshot.freshness_class.is_safe_for_high_risk_authority() {
+                    return ToolOutcome::error(error_detail(
+                        "EVIDENCE_NOT_FRESH",
+                        "index/config drifted since the last reconciliation \
+                         (freshness=Degraded) -- cannot mint a ReviewAuthority against \
+                         stale evidence",
+                        true,
+                    ));
+                }
                 let graph_generation: i64 = conn
                     .query_row(
                         "SELECT generation FROM graph_generation_state WHERE id = 1",
@@ -460,19 +568,106 @@ impl CalmServer {
                 // limit that still applies).
                 let mut caller_qns: std::collections::BTreeSet<String> =
                     std::collections::BTreeSet::new();
+                // CCK-26 (audit follow-up): a real RiskVector, built from every
+                // declared target -- caller_count_level/is_hub/hub_kind straight
+                // from `symbols`, risk_rule_floor from this project's
+                // config.risk_rules, the same signals classify_gate's own
+                // compute_touch_risk uses for the legacy write gate.
+                // signature_changed/uncertain_zero_caller/touches_uncovered_code
+                // are NOT wired in this pass (no live diff / coverage data
+                // available at review_change time) -- documented gap, default
+                // false, never risk-elevated by their absence here.
+                let mut caller_count_level = calm_core::policy::RiskLevel::Low;
+                let mut is_hub = false;
+                let mut hub_kind: Option<String> = None;
+                let mut risk_rule_floor: Option<calm_core::policy::RiskLevel> = None;
                 for t in &intent.targets {
                     if let Some(qn) = &t.qualified_name {
                         caller_qns.extend(super::edit::caller_symbol_set(&conn, qn));
+                        if let Ok(Some((caller_count, sym_is_hub, sym_hub_kind))) = conn
+                            .query_row(
+                                "SELECT caller_count, is_hub, hub_kind FROM symbols \
+                                 WHERE qualified_name = ?1",
+                                rusqlite::params![qn],
+                                |r| {
+                                    Ok((
+                                        r.get::<_, i64>(0)?,
+                                        r.get::<_, bool>(1)?,
+                                        r.get::<_, Option<String>>(2)?,
+                                    ))
+                                },
+                            )
+                            .optional()
+                        {
+                            if let Some(level) = calm_core::policy::RiskLevel::parse(
+                                super::detail::risk_level_from_caller_count(caller_count),
+                            ) {
+                                caller_count_level = caller_count_level.max(level);
+                            }
+                            if sym_is_hub {
+                                is_hub = true;
+                                if hub_kind.is_none() {
+                                    hub_kind = sym_hub_kind;
+                                }
+                            }
+                        }
+                    }
+                    if let Some((level_str, _glob)) =
+                        calm_core::config::risk_floor_for_path(&self.config().risk_rules, &t.path)
+                        && let Some(level) = calm_core::policy::RiskLevel::parse(level_str)
+                    {
+                        risk_rule_floor = Some(risk_rule_floor.map_or(level, |cur| cur.max(level)));
                     }
                 }
                 let caller_set_digest =
                     Self::caller_set_digest(&caller_qns.into_iter().collect::<Vec<_>>());
-                (snapshot, graph_generation, caller_set_digest)
+                let (kind_mismatch, _observed, _notes) =
+                    check_declared_vs_observed(&self.project_root, intent.kind.0, &intent.targets);
+                let touches_manifest = intent
+                    .targets
+                    .iter()
+                    .any(|t| calm_core::change::classify::is_manifest_path(&t.path));
+                let risk_vector = calm_core::policy::RiskVector {
+                    caller_count_level,
+                    is_hub,
+                    hub_kind,
+                    signature_changed: false,
+                    uncertain_zero_caller: false,
+                    risk_rule_floor,
+                    kind_mismatch,
+                    touches_manifest,
+                    touches_uncovered_code: false,
+                };
+                (snapshot, graph_generation, caller_set_digest, risk_vector)
             };
 
             let policy = calm_core::policy::loader::load_policy_or_warn(&self.project_root);
             let policy_digest = policy.digest();
             let principal = format!("session:{}", self.session_id);
+
+            // CCK-26 (audit follow-up): a REAL PolicyEngine::evaluate() decision,
+            // not just a policy-config digest. For a Human-required change,
+            // review_change's approved:true self-attestation (already confirmed
+            // true above -- this handler never reaches here otherwise) is not
+            // independent review -- only edit_lines/edit_symbol's own
+            // unconditional HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW check (CCK-23)
+            // is, so refuse to mint here rather than hand out an authority that
+            // can only ever be inert for the write it was meant to cover.
+            let policy_decision = calm_core::policy::evaluate(&risk_vector, &policy);
+            if policy_decision.required_approver_class == calm_core::policy::ApproverClass::Human {
+                return ToolOutcome::error(error_detail(
+                    "INDEPENDENT_REVIEW_NOT_AVAILABLE_HERE",
+                    &format!(
+                        "this change is \"{}\" risk ({}) -- review_change's approved:true \
+                         self-attestation is not independent review at this tier. Spend this \
+                         change via edit_lines/edit_symbol with [edit] elicit_hub_confirm \
+                         enabled, which performs the actual human/MRTR round-trip",
+                        policy_decision.aggregate_risk.as_str(),
+                        policy_decision.reasons.join("; "),
+                    ),
+                    true,
+                ));
+            }
 
             let mut state_conn = match calm_core::db::conn::open_state_writer(&self.state_db_path)
             {
@@ -490,6 +685,8 @@ impl CalmServer {
             if let Err(e) = snapshot.persist(&tx) {
                 return ToolOutcome::error(error_detail("STATE_DB_ERROR", &e.to_string(), true));
             }
+            let policy_decision_digest = policy_decision.digest();
+            let risk_vector_digest = risk_vector.digest();
             let authority = match calm_core::authority::ReviewAuthority::mint(
                 &tx,
                 calm_core::authority::MintParams {
@@ -501,6 +698,9 @@ impl CalmServer {
                     principal: &principal,
                     ttl_secs: ttl,
                     targets: &intent.targets,
+                    policy_decision_digest: &policy_decision_digest,
+                    risk_vector_digest: &risk_vector_digest,
+                    required_approver_class: policy_decision.required_approver_class,
                 },
             ) {
                 Ok(a) => a,
@@ -605,6 +805,68 @@ mod tests {
     }
 
     #[test]
+    fn plan_change_supersedes_a_stale_intent_when_evidence_drifts_between_calls() {
+        // CCK-27 (audit follow-up) reproduction: plan_change(body A) -> INT-1@S1;
+        // source drifts to S2 (a reindex/watcher event, simulated here by a
+        // direct file_index insert); plan_change(body A) again must mint
+        // INT-2@S2, not silently hand back the now-stale INT-1 -- and
+        // INT-1 must no longer be reviewable.
+        let (dir, server) = test_server("supersede_on_drift");
+        let index_db_path = dir.join("index.db");
+
+        let first = server.plan_change(rmcp::handler::server::wrapper::Parameters(plan_params(
+            "body",
+            vec![("a.rs", Some("a.rs::f"))],
+        )));
+        let first_v = serde_json::to_value(&first.0).unwrap();
+        assert_eq!(first_v["reused"], false, "response: {first_v}");
+        assert_eq!(first_v["superseded_change_id"], serde_json::Value::Null);
+        let first_id = first_v["change_id"].as_str().unwrap().to_string();
+        let first_snapshot = first_v["snapshot_id"].as_str().unwrap().to_string();
+
+        {
+            let conn = rusqlite::Connection::open(&index_db_path).unwrap();
+            conn.execute(
+                "INSERT INTO file_index (path, hash, last_indexed) VALUES (?1, ?2, 0)",
+                rusqlite::params!["b.rs", "some-hash"],
+            )
+            .unwrap();
+        }
+
+        let second = server.plan_change(rmcp::handler::server::wrapper::Parameters(plan_params(
+            "body",
+            vec![("a.rs", Some("a.rs::f"))],
+        )));
+        let second_v = serde_json::to_value(&second.0).unwrap();
+        assert_eq!(
+            second_v["reused"], false,
+            "a drifted intent must not be silently reused: {second_v}"
+        );
+        let second_id = second_v["change_id"].as_str().unwrap().to_string();
+        assert_ne!(second_id, first_id);
+        assert_eq!(second_v["superseded_change_id"], first_id, "response: {second_v}");
+        assert_ne!(second_v["snapshot_id"].as_str().unwrap(), first_snapshot);
+
+        let review = server.review_change(rmcp::handler::server::wrapper::Parameters(
+            ReviewChangeParams {
+                change_id: first_id,
+                approved: true,
+                approver: None,
+                ttl_secs: None,
+            },
+        ));
+        let review_v = serde_json::to_value(&review.0).unwrap();
+        assert_eq!(review_v["error"]["code"], "INTENT_SUPERSEDED", "response: {review_v}");
+        assert_eq!(
+            review_v["error"]["message"].as_str().unwrap().contains(&second_id),
+            true,
+            "response: {review_v}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn plan_change_surfaces_a_declared_vs_observed_kind_mismatch() {
         let (dir, server) = test_server("kind_mismatch");
         std::process::Command::new("git")
@@ -702,6 +964,16 @@ mod tests {
             )
             .unwrap();
         }
+        {
+            // CCK-23: review_change now refuses to mint against a Degraded
+            // snapshot (index_input_state fail-closes to Unknown/Degraded
+            // when never persisted) -- mirror the real production path
+            // (daemon bootstrap / watch_supervisor refresh) so this test
+            // fixture reflects a reconciled repo, not an untouched one.
+            let conn = server.db();
+            let catalog = calm_core::indexer::refresh::InputCatalog::for_project(&dir);
+            calm_core::indexer::refresh::persist_index_input_snapshot(&conn, &catalog).unwrap();
+        }
 
         let plan = server.plan_change(rmcp::handler::server::wrapper::Parameters(plan_params(
             "body",
@@ -747,6 +1019,68 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dir.join("a.py")).unwrap(),
             "def helper():\n    return 2\n"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn review_change_refuses_self_attestation_for_a_high_risk_target() {
+        // CCK-26 (audit follow-up): completes what CCK-23 deferred --
+        // review_change itself now runs a real RiskVector -> PolicyDecision
+        // and refuses to mint when the required approver class is Human,
+        // rather than only relying on edit_lines/edit_symbol's spend-time
+        // backstop. Uses the same risk_rules-escalation technique as
+        // edit_lines_gates_a_low_fan_in_symbol_whose_path_matches_a_risk_rule
+        // (tools.rs) to force "high" risk independent of caller_count.
+        let (dir, server) = test_server("review_change_refuses_human_required");
+        std::fs::create_dir_all(dir.join("auth")).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"risk_rules": [{"glob": "auth/**", "minimum": "high"}]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("auth/login.py"),
+            "def check_token():\n    return True\n",
+        )
+        .unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('auth/login.py::check_token', 'check_token', 'function', 'python', 'auth/login.py', 1, 2, '', '', 'check_token', 2, 0, 0)",
+                [],
+            )
+            .unwrap();
+            let catalog = calm_core::indexer::refresh::InputCatalog::for_project(&dir);
+            calm_core::indexer::refresh::persist_index_input_snapshot(&conn, &catalog).unwrap();
+        }
+
+        let plan = server.plan_change(rmcp::handler::server::wrapper::Parameters(plan_params(
+            "body",
+            vec![("auth/login.py", Some("auth/login.py::check_token"))],
+        )));
+        let plan_v = serde_json::to_value(&plan.0).unwrap();
+        let change_id = plan_v["change_id"].as_str().unwrap().to_string();
+
+        let review = server.review_change(rmcp::handler::server::wrapper::Parameters(
+            ReviewChangeParams {
+                change_id,
+                approved: true,
+                approver: Some("alice".to_string()),
+                ttl_secs: None,
+            },
+        ));
+        let review_v = serde_json::to_value(&review.0).unwrap();
+        assert_eq!(
+            review_v["error"]["code"], "INDEPENDENT_REVIEW_NOT_AVAILABLE_HERE",
+            "a risk_rules-escalated high-risk target must refuse self-attestation: \
+             response {review_v}"
+        );
+        assert!(
+            review_v.get("authority_id").is_none(),
+            "no authority should have been minted: {review_v}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

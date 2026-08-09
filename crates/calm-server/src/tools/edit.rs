@@ -992,6 +992,9 @@ impl CalmServer {
 
         let outcome = match calm_core::edit::apply_hunks(&original, &hunks) {
             Ok(o) => o,
+            Err(e @ calm_core::edit::ApplyError::LossyRedactedWrite { .. }) => {
+                return ToolOutcome::error(error_detail("LOSSY_WRITE_REJECTED", &e.to_string(), false));
+            }
             Err(e) => {
                 return ToolOutcome::error(error_detail("INVALID_HUNKS", &e.to_string(), false));
             }
@@ -1344,7 +1347,18 @@ impl CalmServer {
                         ));
                     }
                 };
-                match calm_core::authority::ReviewAuthority::verify_and_consume(
+                // CCK-25 (P1 fix, audit 2026-08-09): read-only check here --
+                // does NOT consume. Consuming this early (the old
+                // verify_and_consume call) meant the authority was already
+                // permanently burned by the time ANY of the legacy-gate/
+                // elicitation logic below could still refuse the write (the
+                // CCK-23 high-risk check included) or before txn::begin even
+                // ran -- an "orphaned burned authority" with nothing to show
+                // for it. The real, atomic verify+begin+consume now happens
+                // in authorize_and_begin_edit, immediately before the durable
+                // transaction opens (see below) -- this is purely "is it
+                // valid enough to skip the legacy gate", re-checked there.
+                match calm_core::authority::ReviewAuthority::verify_only(
                     &state_conn,
                     authority_id,
                     &current,
@@ -1354,7 +1368,10 @@ impl CalmServer {
                             target: crate::telemetry::AUDIT_TARGET,
                             session_id = self.session_id,
                             decision = "authorized",
-                            reason_code = "AUTHORITY_CONSUMED",
+                            // CCK-25: not yet consumed at this point -- see
+                            // authorize_and_begin_edit below for the actual
+                            // single-use spend.
+                            reason_code = "AUTHORITY_VERIFIED",
                             path,
                             change_id,
                             authority_id,
@@ -1400,6 +1417,42 @@ impl CalmServer {
                 ));
             }
         };
+        // CCK-23 (P0 fix, audit 2026-08-09): a valid ReviewAuthority proves WHAT was
+        // touched (target-scope/snapshot/graph-generation bound, cryptographically
+        // signed) but proves nothing about WHO reviewed it -- minting today has no
+        // independent-approval input (edit_context auto-mints with none; review_change
+        // accepts a bare client-supplied `approved: bool`). HIGH_RISK_REQUIRES_
+        // INDEPENDENT_REVIEW is a different invariant than the legacy reason/confirm/
+        // cites gate authority correctly supersedes (invariant #3, CCK-10) -- it
+        // specifically requires a human decision (`ElicitGate::Ask|Approved`, the
+        // MRTR/legacy elicitation round-trip), which no authority encodes yet. So this
+        // check runs UNCONDITIONALLY, even when `authority_already_validated` is true
+        // -- an authority is never a substitute for it, only `reason`/`confirm`/`cites`
+        // are. (The equivalent check further below, inside the legacy-gate block, is
+        // now unreachable when this one already returned -- left in place deliberately
+        // for minimal diff; dead by construction, not a correctness gap.)
+        let high_risk_needs_independent_review = risk.as_deref() == Some("high")
+            && !matches!(gate, ElicitGate::Ask | ElicitGate::Approved);
+        if high_risk_needs_independent_review {
+            tracing::info!(
+                target: crate::telemetry::AUDIT_TARGET,
+                session_id = self.session_id,
+                decision = "denied",
+                reason_code = "HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW",
+                path,
+                risk = risk.as_deref().unwrap_or("none"),
+                hub_hit,
+                authority_already_validated,
+            );
+            return ToolOutcome::error(error_detail(
+                "HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW",
+                "this symbol is \"high\" risk -- neither a spent ReviewAuthority nor a \
+                 cited reason is independent review at this tier. Enable [edit] \
+                 elicit_hub_confirm and get human approval via the elicitation \
+                 round-trip before treating this as safe to edit",
+                true,
+            ));
+        }
         if !authority_already_validated && gate_classification.will_block_without_confirm {
             let why = gate_classification.why.unwrap_or_default();
 
@@ -1890,15 +1943,123 @@ impl CalmServer {
         };
         let base_digest = calm_core::digest::evidence_digest(original.as_bytes());
         let proposed_digest = calm_core::digest::evidence_digest(new_content.as_bytes());
-        let shadow_tx_id: Option<String> = match calm_core::txn::begin(
-            &state_conn,
-            &project_id,
-            path,
-            &base_digest,
-            &proposed_digest,
-        ) {
-            Ok(tx) => Some(tx.tx_id),
-            Err(e) => return txn_init_failed(e.to_string()),
+        // CCK-25 (P1 fix, audit 2026-08-09): when an authority was supplied,
+        // this is the one place it's actually spent -- verify (re-checked
+        // fresh, since time has passed since the earlier read-only check
+        // above) + open this durable transaction + consume, atomically. If
+        // ANY of the three fails, none of them stick: no burned authority
+        // with no transaction to show for it.
+        let shadow_tx_id: Option<String> = if let (Some(change_id), Some(authority_id)) =
+            (change_id, authority_id)
+        {
+            let snapshot_id = self
+                .make_read_conn()
+                .ok()
+                .and_then(|c| {
+                    calm_core::authority::EvidenceSnapshot::compute(&c, &self.project_root).ok()
+                })
+                .map(|s| s.snapshot_id)
+                .unwrap_or_default();
+            let current_graph_generation: i64 = self
+                .make_read_conn()
+                .ok()
+                .and_then(|c| {
+                    c.query_row(
+                        "SELECT generation FROM graph_generation_state WHERE id = 1",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .ok()
+                })
+                .unwrap_or(0);
+            let primary_touched_qn: Option<&str> = pre_touched
+                .first()
+                .map(|t| t.qualified_name.as_str())
+                .or(anchor_qualified_name);
+            let touched_caller_set_digest = primary_touched_qn
+                .and_then(|qn| fresh_caller_digests.get(qn))
+                .cloned()
+                .unwrap_or_default();
+            let policy = calm_core::policy::loader::load_policy_or_warn(&self.project_root);
+            let policy_digest = policy.digest();
+            let principal = format!("session:{}", self.session_id);
+            let mut current_targets: Vec<calm_core::change::ChangeIntentTarget> = pre_touched
+                .iter()
+                .map(|t| calm_core::change::ChangeIntentTarget {
+                    path: path.to_string(),
+                    qualified_name: Some(t.qualified_name.clone()),
+                })
+                .collect();
+            if let Some(anchor) = anchor_qualified_name {
+                let already_present = current_targets
+                    .iter()
+                    .any(|t| t.qualified_name.as_deref() == Some(anchor));
+                if !already_present {
+                    current_targets.push(calm_core::change::ChangeIntentTarget {
+                        path: path.to_string(),
+                        qualified_name: Some(anchor.to_string()),
+                    });
+                }
+            }
+            let current = calm_core::authority::CurrentState {
+                intent_id: change_id,
+                snapshot_id: &snapshot_id,
+                graph_generation: current_graph_generation,
+                caller_set_digest: &touched_caller_set_digest,
+                policy_digest: &policy_digest,
+                principal: &principal,
+                targets: &current_targets,
+            };
+            match calm_core::authority::ReviewAuthority::authorize_and_begin_edit(
+                &state_conn,
+                authority_id,
+                &current,
+                &project_id,
+                path,
+                &base_digest,
+                &proposed_digest,
+            ) {
+                Ok(tx) => Some(tx.tx_id),
+                Err(e) => {
+                    use calm_core::authority::AuthorityError as AE;
+                    use calm_core::authority::AuthorizeEditError as AEE;
+                    let reason_code = match &e {
+                        AEE::Authority(AE::NotFound) => "AUTHORITY_NOT_FOUND",
+                        AEE::Authority(AE::ForgedSignature) => "AUTHORITY_FORGED_SIGNATURE",
+                        AEE::Authority(AE::Expired) => "AUTHORITY_EXPIRED",
+                        AEE::Authority(AE::AlreadyConsumed) => "AUTHORITY_ALREADY_CONSUMED",
+                        AEE::Authority(AE::WrongIntent) => "AUTHORITY_WRONG_INTENT",
+                        AEE::Authority(AE::WrongTargetScope) => "AUTHORITY_WRONG_TARGET_SCOPE",
+                        AEE::Authority(AE::StaleSnapshot) => "AUTHORITY_STALE_SNAPSHOT",
+                        AEE::Authority(AE::StaleGraphGeneration) => "STALE_GRAPH_AUTHORITY",
+                        AEE::Authority(AE::StaleCallerSet) => "STALE_CALLER_SET",
+                        AEE::Authority(AE::StaleAnalysisVersion) => {
+                            "AUTHORITY_STALE_ANALYSIS_VERSION"
+                        }
+                        AEE::Authority(AE::StalePolicy) => "AUTHORITY_STALE_POLICY",
+                        AEE::Authority(AE::WrongPrincipal) => "AUTHORITY_WRONG_PRINCIPAL",
+                        AEE::Authority(AE::Db(_)) | AEE::Txn(_) | AEE::Db(_) => {
+                            return txn_init_failed(e.to_string());
+                        }
+                    };
+                    tracing::info!(
+                        target: crate::telemetry::AUDIT_TARGET,
+                        session_id = self.session_id,
+                        decision = "denied",
+                        reason_code,
+                        path,
+                        change_id,
+                        authority_id,
+                    );
+                    return ToolOutcome::error(error_detail(reason_code, &e.to_string(), true));
+                }
+            }
+        } else {
+            match calm_core::txn::begin(&state_conn, &project_id, path, &base_digest, &proposed_digest)
+            {
+                Ok(tx) => Some(tx.tx_id),
+                Err(e) => return txn_init_failed(e.to_string()),
+            }
         };
 
         if let Err(e) = calm_core::edit::atomic_write(&full_path, &new_content) {

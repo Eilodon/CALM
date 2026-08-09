@@ -19,6 +19,66 @@ use crate::policy::model::{RiskLevel, RiskVector};
 pub struct PolicyDecision {
     pub aggregate_risk: RiskLevel,
     pub reasons: Vec<String>,
+    /// CCK-26 (audit follow-up on the master blueprint): who must approve a
+    /// change at this risk level, derived deterministically from
+    /// `aggregate_risk` -- `evaluate` computing this (not the caller
+    /// guessing it separately) is what makes it possible for
+    /// `ReviewAuthority` to bind a `required_approver_class` that's
+    /// actually backed by a real risk evaluation, not just a policy config
+    /// digest.
+    pub required_approver_class: ApproverClass,
+}
+
+/// Who must approve a change at a given risk level. `SelfReviewed` --
+/// `review_change`'s existing `approved: bool` self-attestation is
+/// sufficient. `Human` -- self-attestation is NOT sufficient; only a real
+/// elicitation round-trip (`ElicitGate::Ask -> Approved`, same MRTR/legacy
+/// mechanism the write-path gate already uses) counts.
+/// `TrustedPolicyService` reserved for a future automated-approver
+/// integration (e.g. a CI policy bot) -- not producible by `evaluate` yet,
+/// included now so `ReviewAuthority`'s bound field doesn't need to widen
+/// again when that lands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApproverClass {
+    SelfReviewed,
+    Human,
+    TrustedPolicyService,
+}
+
+impl ApproverClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SelfReviewed => "self_reviewed",
+            Self::Human => "human",
+            Self::TrustedPolicyService => "trusted_policy_service",
+        }
+    }
+
+    /// Inverse of [`Self::as_str`] -- CCK-26: round-trips the value stored
+    /// in `review_authorities.required_approver_class`. `None` for
+    /// anything else, so a caller can propagate "not a class this scale
+    /// understands" instead of guessing (mirrors `RiskLevel::parse`).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "self_reviewed" => Some(Self::SelfReviewed),
+            "human" => Some(Self::Human),
+            "trusted_policy_service" => Some(Self::TrustedPolicyService),
+            _ => None,
+        }
+    }
+
+    /// Low/medium risk: self-review is an adequate approver class. High
+    /// risk: nothing short of a human counts -- mirrors
+    /// `edit_lines`/`edit_symbol`'s own unconditional
+    /// `HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW` check (CCK-23), so the two
+    /// gates agree on where the line is.
+    fn from_risk(level: RiskLevel) -> Self {
+        match level {
+            RiskLevel::Low | RiskLevel::Medium => Self::SelfReviewed,
+            RiskLevel::High => Self::Human,
+        }
+    }
 }
 
 /// Folds every axis of `vector` into one [`PolicyDecision`], starting from
@@ -87,6 +147,33 @@ pub fn evaluate(vector: &RiskVector, policy: &Policy) -> PolicyDecision {
     PolicyDecision {
         aggregate_risk: level,
         reasons,
+        required_approver_class: ApproverClass::from_risk(level),
+    }
+}
+
+impl PolicyDecision {
+    /// Canonical digest bound into `ReviewAuthority` (CCK-26) -- changes if
+    /// and only if the decision itself (risk level, reasons, or required
+    /// approver) changes, so `verify_and_consume` can detect a decision
+    /// that's drifted since mint time the same way it already detects a
+    /// drifted snapshot/policy-config digest.
+    pub fn digest(&self) -> String {
+        let material = serde_json::to_string(self)
+            .unwrap_or_else(|_| format!("{:?}", self));
+        crate::digest::evidence_digest(format!("policy-decision-v1\n{material}").as_bytes())
+    }
+}
+
+impl RiskVector {
+    /// Canonical digest bound into `ReviewAuthority` (CCK-26) -- the raw
+    /// signal inputs `evaluate` folded into the `PolicyDecision` above.
+    /// Bound separately (not just the decision) so a future policy-config
+    /// change that alters HOW a given vector is judged is still
+    /// distinguishable from the underlying facts about the touch changing.
+    pub fn digest(&self) -> String {
+        let material = serde_json::to_string(self)
+            .unwrap_or_else(|_| format!("{:?}", self));
+        crate::digest::evidence_digest(format!("risk-vector-v1\n{material}").as_bytes())
     }
 }
 
@@ -185,6 +272,44 @@ mod tests {
         let a = evaluate(&v, &policy);
         let b = evaluate(&v, &policy);
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn required_approver_class_is_human_for_high_risk_self_reviewed_otherwise() {
+        let policy = Policy::default();
+        let mut low = base_vector();
+        low.caller_count_level = RiskLevel::Low;
+        assert_eq!(
+            evaluate(&low, &policy).required_approver_class,
+            ApproverClass::SelfReviewed
+        );
+
+        let mut high = base_vector();
+        high.is_hub = true;
+        assert_eq!(
+            evaluate(&high, &policy).required_approver_class,
+            ApproverClass::Human
+        );
+    }
+
+    #[test]
+    fn policy_decision_digest_changes_when_the_decision_changes() {
+        let policy = Policy::default();
+        let low = evaluate(&base_vector(), &policy);
+        let mut hub_vector = base_vector();
+        hub_vector.is_hub = true;
+        let high = evaluate(&hub_vector, &policy);
+        assert_ne!(low.digest(), high.digest());
+        assert_eq!(low.digest(), evaluate(&base_vector(), &policy).digest());
+    }
+
+    #[test]
+    fn risk_vector_digest_changes_when_the_vector_changes() {
+        let a = base_vector();
+        let mut b = base_vector();
+        b.touches_manifest = true;
+        assert_ne!(a.digest(), b.digest());
+        assert_eq!(a.digest(), base_vector().digest());
     }
 
     #[test]

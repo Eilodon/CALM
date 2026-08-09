@@ -1245,6 +1245,13 @@ impl CalmServer {
     ) -> Option<MintedAuthorityOutput> {
         let snapshot =
             calm_core::authority::EvidenceSnapshot::compute(conn, &self.project_root).ok()?;
+        // CCK-23 (P0 fix, audit 2026-08-09): mirror the same freshness gate
+        // review_change now applies -- see that function's comment for why.
+        // Fail-open here means `None` (no authority), matching this function's
+        // existing fail-open contract on every other error, not a hard tool error.
+        if !snapshot.freshness_class.is_safe_for_high_risk_authority() {
+            return None;
+        }
         let mut state_conn = calm_core::db::conn::open_state_writer(&self.state_db_path).ok()?;
         // CCK-R5 (audit follow-up): snapshot persist + intent insert +
         // authority mint (which itself does 3 more inserts) must land as
@@ -1275,6 +1282,36 @@ impl CalmServer {
         let authority_ttl = calm_core::authority::AuthorityTtl::from_secs(1800.0)
             .expect("30 minutes is within AuthorityTtl's valid range");
 
+        // CCK-26 (audit follow-up): a real (if minimal -- single candidate,
+        // no manifest/kind-mismatch signal available at edit_context time)
+        // RiskVector, so this auto-minted authority carries an honest
+        // required_approver_class rather than always claiming SelfReviewed.
+        // Not itself a gate here (edit_context has no approval channel and
+        // is deliberately fail-open) -- CCK-23's spend-time check is what
+        // actually enforces HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW regardless
+        // of what this authority claims.
+        let risk_vector = calm_core::policy::RiskVector {
+            caller_count_level: calm_core::policy::RiskLevel::parse(
+                super::detail::risk_level_from_caller_count(c.caller_count),
+            )
+            .unwrap_or(calm_core::policy::RiskLevel::Low),
+            is_hub: c.is_hub,
+            hub_kind: None,
+            signature_changed: false,
+            uncertain_zero_caller: false,
+            risk_rule_floor: calm_core::config::risk_floor_for_path(
+                &self.config().risk_rules,
+                &c.path,
+            )
+            .and_then(|(level, _glob)| calm_core::policy::RiskLevel::parse(level)),
+            kind_mismatch: false,
+            touches_manifest: calm_core::change::classify::is_manifest_path(&c.path),
+            touches_uncovered_code: false,
+        };
+        let policy_decision = calm_core::policy::evaluate(&risk_vector, &policy);
+        let policy_decision_digest = policy_decision.digest();
+        let risk_vector_digest = risk_vector.digest();
+
         let authority = calm_core::authority::ReviewAuthority::mint(
             &tx,
             calm_core::authority::MintParams {
@@ -1286,6 +1323,9 @@ impl CalmServer {
                 principal: &principal,
                 ttl_secs: authority_ttl,
                 targets: &[target],
+                policy_decision_digest: &policy_decision_digest,
+                risk_vector_digest: &risk_vector_digest,
+                required_approver_class: policy_decision.required_approver_class,
             },
         )
         .ok()?;

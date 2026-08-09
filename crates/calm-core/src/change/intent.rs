@@ -24,6 +24,39 @@ pub struct ChangeIntentTarget {
     pub qualified_name: Option<String>,
 }
 
+/// CCK-27 (audit follow-up): whether a `ChangeIntent` is still the current
+/// answer for its declared kind+targets. `plan_change`'s idempotency dedup
+/// keys only on `kind`+`targets`, never `snapshot_id` -- a repeated call
+/// after evidence drifted (source, config, graph, provider state) used to
+/// silently keep returning the same, now-stale, intent. `Superseded` makes
+/// that drift a durable, queryable fact instead of a silent one:
+/// `change::store::supersede_change_intent` sets it (and frees the old
+/// row's `idempotency_key` so a fresh intent can claim it), and
+/// `review_change` refuses to mint against a `Superseded` intent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IntentStatus {
+    Active,
+    Superseded,
+}
+
+impl IntentStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Superseded => "superseded",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "active" => Some(Self::Active),
+            "superseded" => Some(Self::Superseded),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChangeIntent {
     /// `"INT-<hex nanos>-<hex counter>-<pid>"` -- same best-effort-unique,
@@ -38,6 +71,12 @@ pub struct ChangeIntent {
     pub snapshot_id: String,
     pub targets: Vec<ChangeIntentTarget>,
     pub created_at: f64,
+    /// `Active` for every freshly-minted intent (see [`ChangeIntent::new`]);
+    /// only `change::store::supersede_change_intent` ever moves it to
+    /// `Superseded`.
+    pub status: IntentStatus,
+    /// The intent that superseded this one, if `status` is `Superseded`.
+    pub superseded_by_intent_id: Option<String>,
 }
 
 fn now_epoch_secs() -> f64 {
@@ -78,6 +117,8 @@ impl ChangeIntent {
             snapshot_id: snapshot_id.into(),
             targets,
             created_at: now_epoch_secs(),
+            status: IntentStatus::Active,
+            superseded_by_intent_id: None,
         }
     }
 }

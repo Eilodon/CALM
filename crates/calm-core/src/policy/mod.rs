@@ -11,6 +11,6 @@ pub mod evaluate;
 pub mod loader;
 pub mod model;
 
-pub use evaluate::{PolicyDecision, evaluate};
+pub use evaluate::{ApproverClass, PolicyDecision, evaluate};
 pub use loader::{Policy, load_policy};
 pub use model::{RiskLevel, RiskVector};
