@@ -536,6 +536,27 @@
           }
         ]
       },
+      "change_id": {
+        "description": "CCK-10 (#65): `ChangeIntent::intent_id` for the authority minted by\nthis call, if minting succeeded (fail-open — absent on any minting\nerror, never blocks the mandatory pre-edit fields above). Pass\nalongside `authority_id` to `edit_lines`/`edit_symbol` to use the\nauthority-validated write path instead of `confirm`/`reason`/`cites`.",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "authority_id": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "authority_expires_at": {
+        "description": "Unix seconds — the minted authority is refused (single-use, TTL-\nbound) after this even if every bound field still matches.",
+        "type": [
+          "number",
+          "null"
+        ],
+        "format": "double"
+      },
       "caveat": {
         "description": "Advisory hint on an empty/not-found result. Never set alongside a\npopulated `success` unless a tool opts in via `with_caveat` (e.g.\n`callers` on zero direct callers).",
         "anyOf": [

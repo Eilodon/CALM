@@ -1,0 +1,155 @@
+{
+  "name": "plan_change",
+  "description": "Declares a ChangeIntent (what you're about to do, and why) as a formal, reviewable record, before writing anything -- returns a change_id to hand to review_change once a human/MRTR approves it. Idempotent: repeated calls with the same kind+targets return the same change_id instead of minting a new one each time. Surfaces (not blocks) a declared-vs-observed kind mismatch when a target's current uncommitted diff doesn't match what you declared. USE WHEN: a change needs formal review/authority rather than the lighter edit_context+confirm+reason gate. NOT FOR: the write itself (edit_lines/edit_symbol still do that) or a single quick low-risk edit (edit_context is enough there).",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$defs": {
+      "ChangeTargetParam": {
+        "description": "One file (optionally symbol-scoped) target of a `plan_change` call --\nwire shape for `calm_core::change::ChangeIntentTarget`.",
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "qualified_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "path"
+        ]
+      }
+    },
+    "type": "object",
+    "properties": {
+      "kind": {
+        "description": "Declared `change::classify::ChangeKind` name: `\"add\"`, `\"delete\"`,\n`\"whitespace\"`, `\"comment\"`, `\"doc_only\"`, `\"visibility\"`,\n`\"signature\"`, `\"manifest\"`, `\"test_only\"`, or `\"body\"`.",
+        "type": "string"
+      },
+      "reason": {
+        "description": "Free text for a human/reviewer -- never compared or matched against\nto authorize anything (invariant #3); `kind` is the only field\nchecked against reality (see `kind_mismatch` on the response).",
+        "type": "string"
+      },
+      "targets": {
+        "description": "At least one target. Order doesn't matter for idempotency (see\n`plan_change`'s own doc comment) or for the minted authority's\n`target_scope_digest`, both of which sort before hashing.",
+        "type": "array",
+        "items": {
+          "$ref": "#/$defs/ChangeTargetParam"
+        }
+      }
+    },
+    "required": [
+      "kind",
+      "reason",
+      "targets"
+    ]
+  },
+  "outputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$defs": {
+      "ErrorDetail": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "recoverable": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "recoverable"
+        ]
+      },
+      "SuggestedNext": {
+        "type": "object",
+        "properties": {
+          "tool": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "args": true,
+          "gate": {
+            "description": "Plan 3 §3.5(b): `Some(true)` iff skipping `tool` is actually\nhook-enforced (currently only the edit_context/edit_lines/edit_symbol\n→ diff_impact hints set this, via `suggested_gated`) — every other\nhint is left unset (`None`), meaning advisory-only. Lets an agent\ntell \"you'll be blocked if you skip this\" apart from \"you probably\nwant this next\" without re-deriving it from AGENTS.md prose each time.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "tool",
+          "reason"
+        ]
+      }
+    },
+    "properties": {
+      "error": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/ErrorDetail"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "change_id": {
+        "description": "Pass this to `review_change` once a human/MRTR approves it.",
+        "type": "string"
+      },
+      "reused": {
+        "description": "`true` when this call matched a prior `plan_change` call's declared\n`kind`+`targets` exactly and returned that intent's existing\n`change_id` instead of minting a new one.",
+        "type": "boolean"
+      },
+      "snapshot_id": {
+        "type": "string"
+      },
+      "kind_mismatch": {
+        "description": "`true` when at least one target's current uncommitted diff (working\ntree vs. `git show HEAD`) doesn't classify as the declared `kind` --\nbest-effort: silently `false` for a target with no git history, no\ndiff yet, or an unreadable file, since there's nothing to compare.",
+        "type": "boolean"
+      },
+      "observed_kind": {
+        "description": "The first mismatching target's actually-observed kind, if any.",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "mismatch_notes": {
+        "description": "One human-readable line per mismatching target.",
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "suggested_next": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/SuggestedNext"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "type": "object"
+  },
+  "annotations": {
+    "readOnlyHint": false,
+    "destructiveHint": false,
+    "idempotentHint": true,
+    "openWorldHint": false
+  }
+}

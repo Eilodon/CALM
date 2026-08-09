@@ -74,6 +74,19 @@
           "string",
           "null"
         ]
+      },
+      "change_id": {
+        "description": "CCK-10 (#65): `change_id`+`authority_id` from a matching `edit_context`\nresponse (or `review_change`, once CCK-11 lands) route this edit\nthrough the authority-validated path instead of `confirm`/`reason`/\n`cites` — both must be present together (`INVALID_AUTHORITY_PARAMS`\notherwise). On this path `reason` is explanation only, never a\npermission signal (invariant #3) — the authority is the permission.",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "authority_id": {
+        "type": [
+          "string",
+          "null"
+        ]
       }
     },
     "required": [

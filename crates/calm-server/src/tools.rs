@@ -13,6 +13,7 @@ use calm_core::sanitize::{injection_warning, sanitize_source_output};
 use calm_core::types::{EmbedStatus, IndexingPhase};
 
 pub(crate) mod common;
+mod change;
 mod detail;
 mod edit;
 mod guardrails;
@@ -440,6 +441,7 @@ impl CalmServer {
         router.merge(Self::edit_tool_router());
         router.merge(Self::patterndebt_tool_router());
         router.merge(Self::txn_tool_router());
+        router.merge(Self::change_tool_router());
         router
     }
 
@@ -8965,6 +8967,8 @@ mod tests {
 
         let out = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
             EditLinesParams {
+                change_id: None,
+                authority_id: None,
                 path: "a.py".into(),
                 edits: vec![EditHunkParam {
                     old_text: None,
@@ -8999,6 +9003,8 @@ mod tests {
 
         let out = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
             EditLinesParams {
+                change_id: None,
+                authority_id: None,
                 path: "a.py".into(),
                 edits: vec![EditHunkParam {
                     old_text: None,
@@ -9032,6 +9038,8 @@ mod tests {
 
         let out = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
             EditLinesParams {
+                change_id: None,
+                authority_id: None,
                 path: "a.py".into(),
                 edits: vec![EditHunkParam {
                     old_text: None,
@@ -9107,6 +9115,8 @@ mod tests {
 
         let out = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
             EditLinesParams {
+                change_id: None,
+                authority_id: None,
                 path: "a.py".into(),
                 edits: vec![EditHunkParam {
                     old_text: None,
@@ -9181,6 +9191,8 @@ mod tests {
         let hash = calm_core::edit::range_checksum("def helper():\n    return 1\n", 2, 2).unwrap();
         let out = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
             EditLinesParams {
+                change_id: None,
+                authority_id: None,
                 path: "a.py".into(),
                 edits: vec![EditHunkParam {
                     old_text: None,
@@ -9210,6 +9222,8 @@ mod tests {
         let hash2 = calm_core::edit::range_checksum("def other():\n    return 1\n", 1, 2).unwrap();
         let out2 = server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
             EditSymbolParams {
+                change_id: None,
+                authority_id: None,
                 symbol: "other".into(),
                 path: None,
                 line: None,
@@ -9447,6 +9461,8 @@ mod tests {
         let hash = calm_core::edit::range_checksum("def helper():\n    return 1\n", 2, 2).unwrap();
         let out = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
             EditLinesParams {
+                change_id: None,
+                authority_id: None,
                 path: "a.py".into(),
                 edits: vec![EditHunkParam {
                     old_text: None,
@@ -9488,6 +9504,8 @@ mod tests {
 
         server.edit_lines(rmcp::handler::server::wrapper::Parameters(
             EditLinesParams {
+                change_id: None,
+                authority_id: None,
                 path: "a.py".into(),
                 edits: vec![EditHunkParam {
                     old_text: None,
@@ -9636,6 +9654,8 @@ mod tests {
 
         let out = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
             EditLinesParams {
+                change_id: None,
+                authority_id: None,
                 path: "a.py".into(),
                 edits: vec![EditHunkParam {
                     old_text: None,
@@ -9679,6 +9699,8 @@ mod tests {
 
         let out = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
             EditLinesParams {
+                change_id: None,
+                authority_id: None,
                 path: traversal_path,
                 edits: vec![EditHunkParam {
                     old_text: None,
@@ -9724,6 +9746,8 @@ mod tests {
 
         let out = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
             EditLinesParams {
+                change_id: None,
+                authority_id: None,
                 path: "link.txt".into(),
                 edits: vec![EditHunkParam {
                     old_text: None,
@@ -10002,6 +10026,8 @@ mod tests {
         let out = jv(
             server.edit_lines(rmcp::handler::server::wrapper::Parameters(
                 EditLinesParams {
+                    change_id: None,
+                    authority_id: None,
                     path: "auth/login.py".into(),
                     edits: vec![EditHunkParam {
                         old_text: None,
@@ -10048,6 +10074,8 @@ mod tests {
         // session, so confirm:true + a plausible reason still isn't enough.
         let never_reviewed = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
             EditLinesParams {
+                change_id: None,
+                authority_id: None,
                 path: "a.py".into(),
                 edits: vec![EditHunkParam {
                     old_text: None,
@@ -10081,6 +10109,8 @@ mod tests {
         // Layer 2 -- confirm still required even after edit_context ran.
         let no_confirm = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
             EditLinesParams {
+                change_id: None,
+                authority_id: None,
                 path: "a.py".into(),
                 edits: vec![EditHunkParam {
                     old_text: None,
@@ -10103,6 +10133,8 @@ mod tests {
         // nothing).
         let blank_reason = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
             EditLinesParams {
+                change_id: None,
+                authority_id: None,
                 path: "a.py".into(),
                 edits: vec![EditHunkParam {
                     old_text: None,
@@ -10122,6 +10154,8 @@ mod tests {
         // All three layers satisfied.
         let with_all = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
             EditLinesParams {
+                change_id: None,
+                authority_id: None,
                 path: "a.py".into(),
                 edits: vec![EditHunkParam {
                     old_text: None,
@@ -10191,6 +10225,8 @@ mod tests {
         let hash = calm_core::edit::range_checksum("def helper():\n    return 1\n", 2, 2).unwrap();
         let no_confirm = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
             EditLinesParams {
+                change_id: None,
+                authority_id: None,
                 path: "a.py".into(),
                 edits: vec![EditHunkParam {
                     old_text: None,
@@ -10254,6 +10290,8 @@ mod tests {
         let hash = calm_core::edit::range_checksum("def helper():\n    return 1\n", 2, 2).unwrap();
         let no_confirm = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
             EditLinesParams {
+                change_id: None,
+                authority_id: None,
                 path: "a.py".into(),
                 edits: vec![EditHunkParam {
                     old_text: None,
@@ -10302,6 +10340,8 @@ mod tests {
         // session, so confirm:true + a plausible reason still isn't enough.
         let never_reviewed = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
             EditLinesParams {
+                change_id: None,
+                authority_id: None,
                 path: "a.py".into(),
                 edits: vec![EditHunkParam {
                     old_text: None,
@@ -10337,6 +10377,8 @@ mod tests {
         // hub/high-caller one.
         let no_confirm = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
             EditLinesParams {
+                change_id: None,
+                authority_id: None,
                 path: "a.py".into(),
                 edits: vec![EditHunkParam {
                     old_text: None,
@@ -10365,6 +10407,8 @@ mod tests {
         // cite" fallback still requires *some* non-empty reason).
         let blank_reason = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
             EditLinesParams {
+                change_id: None,
+                authority_id: None,
                 path: "a.py".into(),
                 edits: vec![EditHunkParam {
                     old_text: None,
@@ -10384,6 +10428,8 @@ mod tests {
         // All three layers satisfied.
         let with_all = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
             EditLinesParams {
+                change_id: None,
+                authority_id: None,
                 path: "a.py".into(),
                 edits: vec![EditHunkParam {
                     old_text: None,
@@ -10450,6 +10496,8 @@ mod tests {
         // trust.
         let out = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
             EditLinesParams {
+                change_id: None,
+                authority_id: None,
                 path: "a.cobol".into(),
                 edits: vec![EditHunkParam {
                     old_text: None,
@@ -10504,6 +10552,8 @@ mod tests {
             },
         ));
         let params = EditLinesParams {
+            change_id: None,
+            authority_id: None,
             path: "a.cobol".into(),
             edits: vec![EditHunkParam {
                 old_text: None,
@@ -10589,6 +10639,8 @@ mod tests {
 
         let out = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
             EditLinesParams {
+                change_id: None,
+                authority_id: None,
                 path: "a.rs".into(),
                 edits: vec![EditHunkParam {
                     old_text: None,
@@ -10650,6 +10702,8 @@ mod tests {
 
         let out = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
             EditLinesParams {
+                change_id: None,
+                authority_id: None,
                 path: "a.rs".into(),
                 edits: vec![EditHunkParam {
                     old_text: None,
@@ -10727,6 +10781,8 @@ mod tests {
 
         let out = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
             EditLinesParams {
+                change_id: None,
+                authority_id: None,
                 path: "a.rs".into(),
                 edits: vec![EditHunkParam {
                     old_text: None,
@@ -10787,6 +10843,8 @@ mod tests {
 
         let out = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
             EditLinesParams {
+                change_id: None,
+                authority_id: None,
                 path: "a.rs".into(),
                 edits: vec![EditHunkParam {
                     old_text: None,
@@ -10854,6 +10912,8 @@ mod tests {
         let out = jv(
             server.edit_lines(rmcp::handler::server::wrapper::Parameters(
                 EditLinesParams {
+                    change_id: None,
+                    authority_id: None,
                     path: "a.py".into(),
                     edits: vec![EditHunkParam {
                         old_text: None,
@@ -10918,6 +10978,8 @@ mod tests {
         ));
         let hash = calm_core::edit::range_checksum("def helper():\n    return 1\n", 2, 2).unwrap();
         let params = EditLinesParams {
+            change_id: None,
+            authority_id: None,
             path: "a.py".into(),
             edits: vec![EditHunkParam {
                 old_text: None,
@@ -10953,6 +11015,82 @@ mod tests {
     }
 
     #[test]
+    fn position_before_insertion_on_a_doc_commented_symbol_verifies_its_minted_authority() {
+        // CCK-R5.9 (audit follow-up): edit_symbol(position="before") on a
+        // symbol with a leading doc comment anchors ABOVE that comment
+        // (insertion_hunk_for), a line OUTSIDE the symbol's own indexed
+        // [line_start, line_end] -- compute_touch_risk's line-range overlap
+        // used to miss the symbol entirely, so the authority-verify branch
+        // fell back to an empty caller_set_digest/target set that could
+        // never match what edit_context minted, failing every such
+        // insertion with a false STALE_CALLER_SET even seconds after a
+        // fresh, valid mint. This exercises the real end-to-end path:
+        // edit_context mints an authority for `helper`, then a
+        // position="before" edit_symbol call spends it.
+        use super::edit::{ElicitGate, HubAskContext};
+        let (dir, server) = test_server("before_insert_doc_comment_authority");
+        std::fs::write(
+            dir.join("a.py"),
+            "def other():\n    pass\n\n# A helper used by process_order.\ndef helper():\n    return 1\n",
+        )
+        .unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.py::helper', 'helper', 'function', 'python', 'a.py', 5, 6, '', '', 'helper', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let ctx_out = server.edit_context(rmcp::handler::server::wrapper::Parameters(
+            EditContextParams {
+                symbol: "helper".into(),
+                path: None,
+                line: None,
+                if_none_match: None,
+            },
+        ));
+        let ctx_v = serde_json::to_value(&ctx_out.0).unwrap();
+        let change_id = ctx_v["change_id"]
+            .as_str()
+            .expect("edit_context must mint a change_id")
+            .to_string();
+        let authority_id = ctx_v["authority_id"]
+            .as_str()
+            .expect("edit_context must mint an authority_id")
+            .to_string();
+
+        let params = EditSymbolParams {
+            change_id: Some(change_id),
+            authority_id: Some(authority_id),
+            symbol: "helper".into(),
+            path: None,
+            line: None,
+            expected_hash: None,
+            new_text: "# freshly inserted above helper\n".into(),
+            position: Some("before".into()),
+            confirm: false,
+            reason: None,
+            cites: None,
+            old_text: None,
+        };
+        let mut ask: Option<HubAskContext> = None;
+        let out = server.edit_symbol_flow(&params, ElicitGate::Off, &mut ask);
+        let v = serde_json::to_value(&out).unwrap();
+        assert_eq!(v["applied"], true, "response: {v}");
+        assert!(
+            std::fs::read_to_string(dir.join("a.py"))
+                .unwrap()
+                .contains("# freshly inserted above helper"),
+            "the insertion must have actually landed on disk"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn edit_lines_aborts_when_txn_begin_fails() {
         // WS-1 enforce transition (docs/plans/2026-08-02-ws1-enforce-and-critical-
         // risk-execution-plan.md §2): a txn::begin failure must abort the write
@@ -10977,6 +11115,8 @@ mod tests {
         let out = jv(
             server.edit_lines(rmcp::handler::server::wrapper::Parameters(
                 EditLinesParams {
+                    change_id: None,
+                    authority_id: None,
                     path: "a.py".into(),
                     edits: vec![EditHunkParam {
                         old_text: None,
@@ -11081,6 +11221,8 @@ mod tests {
         let hash = calm_core::edit::range_checksum(original, 2, 2).unwrap();
 
         let out = jv(server.edit_lines(Parameters(EditLinesParams {
+            change_id: None,
+            authority_id: None,
             path: "src/lib.rs".into(),
             edits: vec![EditHunkParam {
                 old_text: None,
@@ -11126,6 +11268,8 @@ mod tests {
         let hash = calm_core::edit::range_checksum(original, 2, 2).unwrap();
 
         let out = jv(server.edit_lines(Parameters(EditLinesParams {
+            change_id: None,
+            authority_id: None,
             path: "src/lib.rs".into(),
             edits: vec![EditHunkParam {
                 old_text: None,
@@ -11182,6 +11326,8 @@ mod tests {
         let broken_line = "    \"not a number\"\n";
 
         let out = jv(server.edit_lines(Parameters(EditLinesParams {
+            change_id: None,
+            authority_id: None,
             path: "src/lib.rs".into(),
             edits: vec![EditHunkParam {
                 old_text: None,
@@ -11244,6 +11390,8 @@ mod tests {
         let hash = calm_core::edit::range_checksum(original, 2, 2).unwrap();
 
         let out = jv(server.edit_lines(Parameters(EditLinesParams {
+            change_id: None,
+            authority_id: None,
             path: "src/lib.rs".into(),
             edits: vec![EditHunkParam {
                 old_text: None,
@@ -11320,6 +11468,8 @@ mod tests {
 
         let outcome = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
             EditLinesParams {
+                change_id: None,
+                authority_id: None,
                 path: "a.py".into(),
                 edits: vec![EditHunkParam {
                     old_text: None,
@@ -11367,6 +11517,8 @@ mod tests {
 
         let outcome = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
             EditLinesParams {
+                change_id: None,
+                authority_id: None,
                 path: "a.py".into(),
                 edits: vec![EditHunkParam {
                     old_text: None,
@@ -11421,6 +11573,8 @@ mod tests {
 
         let no_confirm = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
             EditLinesParams {
+                change_id: None,
+                authority_id: None,
                 path: "a.py".into(),
                 edits: vec![EditHunkParam {
                     old_text: None,
@@ -11462,6 +11616,8 @@ mod tests {
             .unwrap();
         }
         let params = |reason: &str| EditLinesParams {
+            change_id: None,
+            authority_id: None,
             path: "a.py".into(),
             edits: vec![EditHunkParam {
                 old_text: None,
@@ -11535,6 +11691,8 @@ mod tests {
         let mut ask: Option<HubAskContext> = None;
         let out = server.edit_lines_flow(
             &EditLinesParams {
+                change_id: None,
+                authority_id: None,
                 path: "b.py".into(),
                 edits: vec![EditHunkParam {
                     old_text: None,
@@ -11587,6 +11745,8 @@ mod tests {
         // confirm still required even for the lighter tier.
         let no_confirm = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
             EditLinesParams {
+                change_id: None,
+                authority_id: None,
                 path: "a.py".into(),
                 edits: vec![EditHunkParam {
                     old_text: None,
@@ -11608,6 +11768,8 @@ mod tests {
         // REASON_NOT_GROUNDED entirely.
         let with_confirm_only = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
             EditLinesParams {
+                change_id: None,
+                authority_id: None,
                 path: "a.py".into(),
                 edits: vec![EditHunkParam {
                     old_text: None,
@@ -11680,6 +11842,8 @@ mod tests {
         // row sitting in call_edges, same as the sibling test's assertion.
         let with_confirm_only = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
             EditLinesParams {
+                change_id: None,
+                authority_id: None,
                 path: "a.py".into(),
                 edits: vec![EditHunkParam {
                     old_text: None,
@@ -11739,6 +11903,8 @@ mod tests {
         let v = jv(
             server.edit_lines(rmcp::handler::server::wrapper::Parameters(
                 EditLinesParams {
+                    change_id: None,
+                    authority_id: None,
                     path: "a.py".into(),
                     edits: vec![EditHunkParam {
                         old_text: None,
@@ -11772,6 +11938,8 @@ mod tests {
 
         let out = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
             EditLinesParams {
+                change_id: None,
+                authority_id: None,
                 path: "m.py".into(),
                 edits: vec![
                     EditHunkParam {
@@ -11821,6 +11989,8 @@ mod tests {
 
         let out = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
             EditLinesParams {
+                change_id: None,
+                authority_id: None,
                 path: "f.rs".into(),
                 edits: vec![EditHunkParam {
                     start_line: 1,
@@ -11855,6 +12025,8 @@ mod tests {
 
         let out = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
             EditLinesParams {
+                change_id: None,
+                authority_id: None,
                 path: "f.rs".into(),
                 edits: vec![EditHunkParam {
                     start_line: 1,
@@ -11894,6 +12066,8 @@ mod tests {
 
         let out = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
             EditLinesParams {
+                change_id: None,
+                authority_id: None,
                 path: "f.rs".into(),
                 edits: vec![EditHunkParam {
                     start_line: 1,
@@ -11927,6 +12101,8 @@ mod tests {
 
         let out = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
             EditLinesParams {
+                change_id: None,
+                authority_id: None,
                 path: "f.rs".into(),
                 edits: vec![EditHunkParam {
                     start_line: 5,
@@ -11969,6 +12145,8 @@ mod tests {
 
         let out = server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
             EditSymbolParams {
+                change_id: None,
+                authority_id: None,
                 symbol: "helper".into(),
                 path: None,
                 line: None,
@@ -12014,6 +12192,8 @@ mod tests {
 
         let out = server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
             EditSymbolParams {
+                change_id: None,
+                authority_id: None,
                 symbol: "a".into(),
                 path: Some("f.rs".into()),
                 line: None,
@@ -12053,6 +12233,8 @@ mod tests {
 
         let out = server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
             EditSymbolParams {
+                change_id: None,
+                authority_id: None,
                 symbol: "a".into(),
                 path: Some("f.rs".into()),
                 line: None,
@@ -12095,6 +12277,8 @@ mod tests {
 
         let out = server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
             EditSymbolParams {
+                change_id: None,
+                authority_id: None,
                 symbol: "a".into(),
                 path: Some("f.rs".into()),
                 line: None,
@@ -12141,6 +12325,8 @@ mod tests {
 
         let out = server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
             EditSymbolParams {
+                change_id: None,
+                authority_id: None,
                 symbol: "a".into(),
                 path: Some("f.rs".into()),
                 line: None,
@@ -12181,6 +12367,8 @@ mod tests {
 
         let out = server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
             EditSymbolParams {
+                change_id: None,
+                authority_id: None,
                 symbol: "helper".into(),
                 path: None,
                 line: None,
@@ -12221,6 +12409,8 @@ mod tests {
 
         let out = server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
             EditSymbolParams {
+                change_id: None,
+                authority_id: None,
                 symbol: "helper".into(),
                 path: None,
                 line: None,
@@ -12270,6 +12460,8 @@ mod tests {
 
         let out = server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
             EditSymbolParams {
+                change_id: None,
+                authority_id: None,
                 symbol: "helper".into(),
                 path: None,
                 line: None,
@@ -12329,6 +12521,8 @@ mod tests {
 
         let out = server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
             EditSymbolParams {
+                change_id: None,
+                authority_id: None,
                 symbol: "helper".into(),
                 path: None,
                 line: None,
@@ -12372,6 +12566,8 @@ mod tests {
 
         let out = server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
             EditSymbolParams {
+                change_id: None,
+                authority_id: None,
                 symbol: "helper".into(),
                 path: None,
                 line: None,
@@ -12415,6 +12611,8 @@ mod tests {
 
         let out = server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
             EditSymbolParams {
+                change_id: None,
+                authority_id: None,
                 symbol: "a".into(),
                 path: Some("f.rs".into()),
                 line: None,
@@ -12441,6 +12639,8 @@ mod tests {
 
         let out = server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
             EditSymbolParams {
+                change_id: None,
+                authority_id: None,
                 symbol: "".into(),
                 path: Some("f.rs".into()),
                 line: None,
@@ -12470,6 +12670,8 @@ mod tests {
 
         let out = server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
             EditSymbolParams {
+                change_id: None,
+                authority_id: None,
                 symbol: "".into(),
                 path: Some("f.rs".into()),
                 line: None,
@@ -12499,6 +12701,8 @@ mod tests {
 
         let out = server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
             EditSymbolParams {
+                change_id: None,
+                authority_id: None,
                 symbol: "".into(),
                 path: None,
                 line: None,
@@ -12525,6 +12729,8 @@ mod tests {
         // preview a lone `}` line — line 4 is byte-identical
         let out = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
             EditLinesParams {
+                change_id: None,
+                authority_id: None,
                 path: "a.rs".into(),
                 edits: vec![EditHunkParam {
                     old_text: None,
@@ -12562,6 +12768,8 @@ mod tests {
 
         let out = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
             EditLinesParams {
+                change_id: None,
+                authority_id: None,
                 path: "a.py".into(),
                 edits: vec![EditHunkParam {
                     old_text: None,
@@ -13150,6 +13358,8 @@ mod tests {
         let generic = jv(
             server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
                 EditSymbolParams {
+                    change_id: None,
+                    authority_id: None,
                     symbol: "helper".into(),
                     path: None,
                     line: None,
@@ -13176,6 +13386,8 @@ mod tests {
         let grounded = jv(
             server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
                 EditSymbolParams {
+                    change_id: None,
+                    authority_id: None,
                     symbol: "helper".into(),
                     path: None,
                     line: None,
@@ -13241,6 +13453,8 @@ mod tests {
         let false_positive = jv(
             server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
                 EditSymbolParams {
+                    change_id: None,
+                    authority_id: None,
                     symbol: "helper".into(),
                     path: None,
                     line: None,
@@ -13263,6 +13477,8 @@ mod tests {
         let grounded = jv(
             server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
                 EditSymbolParams {
+                    change_id: None,
+                    authority_id: None,
                     symbol: "helper".into(),
                     path: None,
                     line: None,
@@ -13317,6 +13533,8 @@ mod tests {
         let out = jv(
             server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
                 EditSymbolParams {
+                    change_id: None,
+                    authority_id: None,
                     symbol: "helper".into(),
                     path: None,
                     line: None,
@@ -13373,6 +13591,8 @@ mod tests {
         let out = jv(
             server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
                 EditSymbolParams {
+                    change_id: None,
+                    authority_id: None,
                     symbol: "helper".into(),
                     path: None,
                     line: None,
@@ -13432,6 +13652,8 @@ mod tests {
         let out = jv(
             server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
                 EditSymbolParams {
+                    change_id: None,
+                    authority_id: None,
                     symbol: "helper".into(),
                     path: None,
                     line: None,
@@ -13493,6 +13715,8 @@ mod tests {
         let boundary = jv(
             server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
                 EditSymbolParams {
+                    change_id: None,
+                    authority_id: None,
                     symbol: "helper".into(),
                     path: None,
                     line: None,
@@ -13516,6 +13740,8 @@ mod tests {
         let grounded = jv(
             server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
                 EditSymbolParams {
+                    change_id: None,
+                    authority_id: None,
                     symbol: "helper".into(),
                     path: None,
                     line: None,
@@ -13579,6 +13805,8 @@ mod tests {
         let bare_denied = jv(
             server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
                 EditSymbolParams {
+                    change_id: None,
+                    authority_id: None,
                     symbol: "helper".into(),
                     path: None,
                     line: None,
@@ -13601,6 +13829,8 @@ mod tests {
         let full_qn_passes = jv(
             server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
                 EditSymbolParams {
+                    change_id: None,
+                    authority_id: None,
                     symbol: "helper".into(),
                     path: None,
                     line: None,
@@ -13662,6 +13892,8 @@ mod tests {
         let from_b = jv(
             conn_b.edit_lines(rmcp::handler::server::wrapper::Parameters(
                 EditLinesParams {
+                    change_id: None,
+                    authority_id: None,
                     path: "a.py".into(),
                     edits: vec![EditHunkParam {
                         old_text: None,
@@ -13685,6 +13917,8 @@ mod tests {
         let from_a = jv(
             conn_a.edit_lines(rmcp::handler::server::wrapper::Parameters(
                 EditLinesParams {
+                    change_id: None,
+                    authority_id: None,
                     path: "a.py".into(),
                     edits: vec![EditHunkParam {
                         old_text: None,

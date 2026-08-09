@@ -25,7 +25,7 @@ inputs:
 ## §0. Executive verdict
 
 The source blueprint's **architecture is sound and its factual grounding is unusually accurate** —
-17 of 19 load-bearing "current state" claims verified byte-for-byte against live source. It is *not*
+19 of 21 load-bearing "current state" claims verified byte-for-byte against live source (1 outdated, 1 partial — both corrected below; see §1 for the full 21-row count). It is *not*
 a rewrite proposal; it is an evolution of primitives CALM already has. Adopt it, with three
 corrections and one structural change:
 
@@ -41,7 +41,7 @@ corrections and one structural change:
      benchmark kill-criterion (C≈B) remains.
 
 2. **One claim is partial:** `#65` — PR D already bound `graph_generation` into the review as a hard
-   gate (`STALE_GRAPH_AUTHORITY`, `crates/calm-server/src/tools/edit.rs:400,1391`). That is **1 of the
+   gate (`STALE_GRAPH_AUTHORITY`, `crates/calm-server/src/tools/guardrails.rs:400`, `crates/calm-server/src/tools/edit.rs:1391`). That is **1 of the
    ~9 staleness fields** the blueprint's §12 lists. The authority *snapshot* (the other 8 fields, plus
    persistence, single-use, signature) is still greenfield. Keep PR-CCK-09, minus graph_generation.
 
@@ -70,7 +70,7 @@ Legend: ✅ CONFIRMED · ⚠️ OUTDATED · 🟡 PARTIAL/NEEDS-ADJUST
 | 1 | state.db is schema **v1**; no ALTER migration path; forward = re-run idempotent `IF NOT EXISTS` DDL | ✅ | `db/schema.rs:24,34,69-74` |
 | 2 | `init_state_db_versioned` refuses newer DB, else stamps version | ✅ | `db/schema.rs:35-53,69-74` |
 | 3 | `EditContextReview` is **session-local**, binds caller-set digest + call-count freshness | ✅ | in-mem `Arc<Mutex<HashMap<u64,SessionSummary>>>` `tools/common.rs:230,451`; digest `tools/guardrails.rs:396`; no state.db INSERT anywhere |
-| 4 | `#65` open: review binds only caller-set digest, not full authority snapshot | 🟡 | Issue **OPEN**; but PR D bound `graph_generation` too → `STALE_GRAPH_AUTHORITY` `tools/edit.rs:400,1391`. 1/9 §12 fields done |
+| 4 | `#65` open: review binds only caller-set digest, not full authority snapshot | 🟡 | Issue **OPEN**; but PR D bound `graph_generation` too → `STALE_GRAPH_AUTHORITY` `tools/guardrails.rs:400`, `tools/edit.rs:1391`. 1/9 §12 fields done |
 | 5 | `#66` open: catalog checks presence/doc drift, doesn't map enforced→behavior test | ⚠️ | Issue **OPEN**, but PR E maps every enforced entry → `test` fn + asserts fn exists `crates/calm-core/tests/guarantee_contract_coverage.rs`; `docs/guarantee-levels.toml` uses `test=` not `contract_test=` |
 | 6 | `sanitize_source_output(&str) -> String`; `source()` etags raw, redacts body, can still suggest whole-symbol edit on raw etag | ✅ | `sanitize.rs:82` |
 | 7 | `path_policy.rs` symlink check is **textual, not TOCTOU-safe**; `openat2(RESOLVE_BENEATH)` is a documented follow-up | ✅ | `path_policy.rs:28-34` |
@@ -143,7 +143,7 @@ required tests, and graduation. PRs marked DONE/PARTIAL are annotated with what 
 - Tests: doc-drift check only (reuse `scripts/gen-status.sh --check` style).
 - Depends: none.
 
-#### CCK-01 — Real forward migrations for `state.db` · **Status: TODO (highest priority — blocks all durable features)**
+#### CCK-01 — Real forward migrations for `state.db` · **Status: DONE — migration executor + fixtures shipped; hardened post-review (self-sufficient migrations, typed error, genuine old-shape fixture test)**
 - **Reframe:** versioning exists (`b677a9e`); the *executor* does not. Mirror index.db's
   `migrate_add_column` helper style.
 - Create `crates/calm-core/src/db/state_migrations.rs` with:
@@ -227,25 +227,25 @@ depends only on the existing gate. (Blueprint's Group A.)
 
 ### PHASE 1 — Evidence-bound, durable authority
 
-#### CCK-06 — `EvidenceSnapshot` (compute-only) · **Status: TODO**
+#### CCK-06 — `EvidenceSnapshot` (compute-only) · **Status: DONE — compute-only snapshot shipped; hardened post-review (fixed `freshness_class` dedup bug)**
 - Create `crates/calm-core/src/authority/{mod,snapshot.rs}`. Compute only; no schema yet.
   `snapshot_id = SNP-SHA256(canonical fields)`; `source_catalog_digest = SHA256(sorted(path\0hash))`
   from `file_index`. `freshness_class ∈ {reconciled, current, degraded}`.
 - **Adjustment (from derived plan C1):** reconciliation plumbing already exists —
   `index_input_state` + `index_input_drift()` + `INDEX_INPUT_STATE_POLICY_VERSION` drive startup
-  reconcile (`lib.rs:312`, `refresh.rs:315`). Snapshot's `freshness_class` should *read* that state,
+  reconcile (`crates/calm-server/src/lib.rs:292`, `refresh.rs:315`). Snapshot's `freshness_class` should *read* that state,
   not reinvent it. High-risk authority must force reconciliation; watcher health alone is not proof.
 - Tests: deterministic digest; row-order invariance; graph-generation / provider-state / config
   change each flips the digest; stale/degraded is explicit.
 
-#### CCK-07 — state.db **v2**: Snapshot + ChangeIntent persistence · **Status: TODO (first schema bump through CCK-01)**
+#### CCK-07 — state.db **v2**: Snapshot + ChangeIntent persistence · **Status: DONE — v2 schema + Snapshot/ChangeIntent persistence shipped**
 - Create `change/{mod,intent,store}.rs`. Modify `state_migrations.rs` (add v1→v2), bump
   `STATE_DB_SCHEMA_VERSION` 1→2. Tables: `evidence_snapshots`, `change_intents`,
   `change_intent_targets` (blueprint §5–6 SQL is well-formed; adopt as-is).
 - Required migration fixture: real v1 state.db → v2, old tx replay unchanged, memory/ledger unchanged,
   new intent insert succeeds.
 
-#### CCK-08 — ChangeKind + RiskVector + PolicyEngine (**shadow**) · **Status: TODO**
+#### CCK-08 — ChangeKind + RiskVector + PolicyEngine (**shadow**) · **Status: DONE — shadow ChangeKind/RiskVector/PolicyEngine shipped; hardened post-review (`is_hub`/`uncertain_zero_caller` escalation now matches `classify_gate`); first live caller wired via CCK-11's `plan_change`**
 - Split declared `ChangeIntentKind` from `ObservedChangeKind` (diff/AST classifier). `mismatch` →
   escalation, never silent accept. `RiskVector` (9 axes) with `aggregate_risk` kept for back-compat
   but PolicyEngine reads the vector.
@@ -256,7 +256,7 @@ depends only on the existing gate. (Blueprint's Group A.)
 - Tests: metamorphic diff fixtures (whitespace/comment/body/signature/visibility/delete/add/manifest/
   test-only/declared-doc-vs-observed-code); determinism (same inputs+digest ⇒ byte-identical decision).
 
-#### CCK-09 — state.db **v3**: `ReviewAuthority` (#65) · **Status: TODO minus graph_generation (PR D done)**
+#### CCK-09 — state.db **v3**: `ReviewAuthority` (#65) · **Status: DONE — v3 `ReviewAuthority` shipped; hardened post-review (target-scope-bound signature + atomic mint, `AuthorityTtl` newtype, atomic `control.key` creation, schema tightening)**
 - Create `authority/{review,key}.rs`. Migrate v2→v3, bump 2→3. Tables `review_authorities`(+targets,
   +evidence). Signed (HMAC `.calm/control.key`), single-use nonce, `expires_at`, snapshot+intent+
   policy+risk digests bound. `ALTER TABLE edit_transactions ADD COLUMN authority_id`.
@@ -267,7 +267,7 @@ depends only on the existing gate. (Blueprint's Group A.)
   changed caller set / changed graph generation / changed provider state / changed analysis version /
   changed policy / wrong principal class.
 
-#### CCK-10 — Integrate authority into current edit flow · **Status: TODO**
+#### CCK-10 — Integrate authority into current edit flow · **Status: DONE — authority integrated into `edit_lines`/`edit_symbol`; hardened post-review (fixed `STALE_CALLER_SET` false-positive on doc-commented insertions)**
 - `edit_context` becomes a compat wrapper: synthesize single-symbol ChangeIntent → capture Snapshot →
   compute Policy/Risk → mint ReviewAuthority; output gains `change_id`, `authority_id`,
   `authority_expires_at`. `edit_lines`/`edit_symbol` gain optional `change_id`/`authority_id`; new
@@ -278,15 +278,32 @@ depends only on the existing gate. (Blueprint's Group A.)
   succeeds; consumed exactly once; stale refused.
 - **Closes:** #65.
 
-#### CCK-11 — `plan_change` + `review_change` tools · **Status: TODO (greenfield, §1 row 21)**
+#### CCK-11 — `plan_change` + `review_change` tools · **Status: DONE — `plan_change` + `review_change` tools shipped, `change` toolset registered**
 - Create `tools/change.rs`, `services/change_planner.rs`. `review_change` returns `authority_id` only
   after required human/MRTR approval. No write yet. New `change` toolset, not forced on all presets.
+- Tests: `plan_change` on a declared/observed `ChangeIntentKind` mismatch surfaces the mismatch
+  instead of silently accepting it; `review_change` refuses to mint `authority_id` without the
+  required human/MRTR approval step; repeated `plan_change` calls for the same intent are idempotent
+  (same `change_id`); the `change` toolset is absent from a preset that doesn't opt into it.
+- Depends: CCK-10 (needs a live authority-minting path — `review_change` calls into it directly).
 
 #### CCK-12 — Authority dogfood promotion · **Status: TODO (config, not architecture)**
 - CALM self-repo runs `authority_mode = required`; external users keep compat during an observation
   window. Collect: stale-reject rate, human-veto rate, false-block reports, legacy-fallback usage.
   Flip external default to `structured` only after Phase-1 graduation. (Mirror the #64 shadow→enforce
   promotion pattern already used for calm-guard-dogfood.)
+
+**Dependency graph — Phase 1:** CCK-06 (compute-only, no schema) and CCK-08 (shadow risk engine) have
+no dependency on each other or on a schema bump — both can start right after CCK-00 and run in
+parallel. CCK-07 (state.db v2) needs CCK-01's migration executor to exist, not CCK-06 — it can also
+start as soon as CCK-01 lands, in parallel with CCK-06/08. CCK-09 (state.db v3) needs CCK-07 (a v2
+schema to migrate from) and CCK-06's `EvidenceSnapshot` shape (the authority object binds snapshot
+digests) — sequence CCK-07 → CCK-09, with CCK-06 ready before CCK-09 starts. CCK-10 (wire authority
+into the edit flow) needs both CCK-09 (the authority object) and CCK-08 (the risk gate deciding which
+touches require one). CCK-11 needs CCK-10's minting path. CCK-12 is a config flip that needs CCK-10
+live in production long enough to collect dogfood metrics — last in sequence, not a code dependency.
+Net ordering: {CCK-06, CCK-08} parallel first → CCK-07 once CCK-01 lands → CCK-09 after CCK-07 →
+CCK-10 after CCK-09 and CCK-08 → CCK-11 → CCK-12.
 
 **PHASE 1 BENCHMARK GATE — `benchmarks/b15_change_reliability/`** (3 arms: native / legacy CALM /
 ChangeIntent+Authority). **Graduation:** 0 stale-authority unsafe accepts · 0 forged/replayed accepts ·
@@ -297,14 +314,66 @@ usage declining in dogfood. Only then is structured authority the default.
 
 ### PHASE 2 — Multi-file ChangeSet
 
-CCK-13 state.db **v4** (ChangeSet + staging schema; no repo mutation) → CCK-14 prepare/stage (resolve,
-read, hash, syntax-check, stage to `.calm/staging/<id>/`, fsync; no source write) → CCK-15 commit
-coordinator (composes existing per-file `EditTransaction`; one graph reindex after all files) →
-CCK-16 crash-injection matrix (kill at every state × file boundary; canonical fixture 10 files × each
-boundary × 100 runs; add CI job `changeset-crash-injection`) → CCK-17 recovery API (`RecoveryAction`,
-`repair_consistency`; **no automatic recovery choice**; unsafe restore → `MANUAL_RECOVERY_REQUIRED`) →
-CCK-18 `apply_change`/`change_status` facade (supersede `batch_status`/`edit_transaction_status` for the
-new workflow; old tools stay expert/compat).
+#### CCK-13 — state.db **v4**: ChangeSet + staging schema · **Status: TODO**
+- Create `change/changeset.rs`. Modify `state_migrations.rs` (add v3→v4), bump
+  `STATE_DB_SCHEMA_VERSION` 3→4. Tables: `change_sets` (id, intent/authority refs, status),
+  `changeset_files` (per-file target path, base digest, staged digest, status). Schema only — no
+  repo mutation, no staging-directory writes yet (that's CCK-14).
+- Tests: v3→v4 migration fixture round-trips existing `change_intents`/`review_authorities` rows
+  unchanged; fresh v4 init is idempotent; `change_sets`/`changeset_files` reject an unknown
+  `authority_id` foreign key.
+- Depends: CCK-09 (state.db v3 must exist before a v4 migration can run against it).
+
+#### CCK-14 — Prepare/stage a ChangeSet · **Status: TODO**
+- Create `change/stage.rs`. For every file in a `ChangeSet`: resolve target path, read current
+  content, hash it, syntax-check the proposed replacement, write staged content to
+  `.calm/staging/<id>/<path>`, fsync. No write to the real source tree at this stage — `commit`
+  (CCK-15) is the only step allowed to touch tracked files.
+- Tests: a syntax error in any one file aborts staging for the whole set before any file is touched;
+  staged digests match what `commit` later reads; re-staging an already-staged set is idempotent;
+  a disk-full failure mid-stage leaves no partial `.calm/staging/<id>/` directory behind.
+- Depends: CCK-13 (needs the `change_sets`/`changeset_files` schema to record staging state against).
+
+#### CCK-15 — Commit coordinator · **Status: TODO**
+- Create `change/commit.rs`. Composes the existing per-file `EditTransaction` (`txn.rs`) — does not
+  replace it (see §2's kept invariant). Applies every staged file's `EditTransaction` in sequence,
+  then triggers exactly one graph reindex after all files land, not one per file.
+- Tests: an N-file ChangeSet produces exactly one reindex, not N; a mid-commit crash leaves the
+  ChangeSet in a state CCK-16's matrix can classify (never silently "done"); a base-digest mismatch
+  on any one staged file aborts the whole commit before any file is written, not partway through.
+- Depends: CCK-14 (needs staged content to commit from).
+
+#### CCK-16 — Crash-injection matrix · **Status: TODO**
+- Create `crates/calm-core/tests/changeset_crash_injection.rs`. Kill the process at every state × file
+  boundary in the commit sequence; canonical fixture is 10 files × every boundary × 100 runs. Add CI
+  job `changeset-crash-injection` so this runs on every PR touching `change/`, not only at release.
+- Tests: every crash point resolves to exactly one of `APPLIED` / `PARTIALLY_APPLIED` / `NOT_APPLIED`
+  — never an undetectable or ambiguous state; a `PARTIALLY_APPLIED` result is always distinguishable
+  from `APPLIED` via `change_status` (CCK-18).
+- Depends: CCK-15 (needs a real commit coordinator to inject crashes into).
+
+#### CCK-17 — Recovery API · **Status: TODO**
+- Create `change/recovery.rs`: `RecoveryAction` enum + `repair_consistency` tool. Deliberately **no
+  automatic recovery choice** — a state that isn't safe to auto-resolve returns
+  `MANUAL_RECOVERY_REQUIRED` rather than guessing forward or rolling back on the caller's behalf.
+- Tests: every `PARTIALLY_APPLIED` state CCK-16's matrix can produce maps to a defined
+  `RecoveryAction` or an explicit `MANUAL_RECOVERY_REQUIRED`; `repair_consistency` is idempotent
+  (calling it twice on an already-recovered ChangeSet is a no-op, not an error).
+- Depends: CCK-16 (needs the crash taxonomy to know what recovery actions must cover).
+
+#### CCK-18 — `apply_change`/`change_status` facade · **Status: TODO**
+- Add to `tools/change.rs` (extends CCK-11's toolset). Supersedes `batch_status`/
+  `edit_transaction_status` for the ChangeSet workflow; both old tools stay available, expert/compat,
+  for the single-file path.
+- Tests: `change_status` on a `PARTIALLY_APPLIED` ChangeSet surfaces it as such, not folded into a
+  generic error; `apply_change` on an already-applied ChangeSet is idempotent; old
+  `batch_status`/`edit_transaction_status` behavior is unchanged for callers not using ChangeSet.
+- Depends: CCK-15 (commit coordinator) and CCK-17 (recovery surface `change_status` reports through).
+
+**Dependency graph — Phase 2:** strictly sequential — CCK-13 → CCK-14 → CCK-15 → CCK-16 → CCK-17 →
+CCK-18 — each stage produces the state the next one needs (schema → staging → commit → crash taxonomy
+→ recovery → facade). No parallelization inside this phase; CCK-16's crash-injection matrix is the
+phase's real gate and should not slip to the end of a sprint just because it "only" adds tests.
 
 **Non-negotiable state-machine rule:** `PARTIALLY_APPLIED` is a *legitimate, explicit* state, not a
 failed implementation. Forbidden outcomes anywhere: unknown / maybe-written / assume-rolled-back.
@@ -317,14 +386,55 @@ full-reindex graph · task-correctness ≥ legacy.
 
 ### PHASE 3 — Verification infrastructure
 
-CCK-19 `ExecutionBroker` (may run in parallel after CCK-05; malicious fixtures: fork-bomb, stdout/stderr
-flood, network attempt, out-of-scratch write, forbidden read, timeout) → CCK-20 state.db **v5** + move
-`verify.rs`→`verification/adapters/rust.rs` (delete `verify.rs` after a re-export transition; keep
-`verification.timeout_secs` + `verification.bound_to_proposed_digest` guarantees passing) →
-CCK-21A/B/C Go/TS/Python adapters (all via broker; no `Command::new` outside broker; "unsupported/
-unavailable" is a valid state — do not invent a test command) → CCK-22 test-impact evidence
-(coverage-derived; unknown coverage broadens, never silently narrows). Rename `verify_change(tx_id)` →
-`run_verification(change_id, profile?)`, keep `verify_change` as a deprecated alias removed before v1.
+#### CCK-19 — `ExecutionBroker` · **Status: TODO (may start in parallel with Phase 1/2, right after CCK-05)**
+- Create `crates/calm-core/src/verification/{mod,broker}.rs`. Single chokepoint every verification
+  command must route through — no adapter (CCK-20/21) may call `Command::new` outside it.
+- Tests (malicious-fixture matrix, each must be *contained*, not just eventually killed): fork-bomb,
+  stdout/stderr flood, network attempt (denied under default policy), out-of-scratch-directory write,
+  forbidden read (outside repo/scratch), timeout.
+- Depends: CCK-05 (`RootedFilesystem`/containment primitives the broker's sandboxing builds on) —
+  does not need CCK-06..18, so it can be built in parallel with all of Phase 1/2.
+
+#### CCK-20 — state.db **v5** + Rust adapter · **Status: TODO**
+- Modify `state_migrations.rs` (v4→v5, bump `STATE_DB_SCHEMA_VERSION`). Move `verify.rs` →
+  `verification/adapters/rust.rs`, routed through the CCK-19 broker; keep the old `verify.rs` path as
+  a re-export compat shim, hard-deleted only in a later cleanup PR. The `verification.timeout_secs`
+  and `verification.bound_to_proposed_digest` guarantee-contract tests (`docs/guarantee-levels.toml`)
+  must keep resolving through the move — the file move must not silently orphan their `test =`
+  pointers.
+- Tests: CCK-02's guarantee-coverage check still resolves both contracts to the moved fn; the old
+  `verify_change(tx_id)` compat alias still round-trips through the broker end-to-end.
+- Depends: CCK-19 (broker must exist to route the Rust adapter through) and a v4 schema (end of
+  Phase 2) to migrate from — CCK-20 is the first Phase-3 PR that needs Phase 2 finished.
+
+#### CCK-21A/B/C — Go/TS/Python adapters · **Status: TODO**
+- Create `verification/adapters/{go,typescript,python}.rs`, one PR per language (21A/21B/21C), all
+  routed through the CCK-19 broker — no adapter gets its own `Command::new`. "Unsupported/unavailable"
+  (toolchain not installed, no test command configured) is a valid, explicit result — never invent or
+  guess a command to force one.
+- Tests per adapter: a CI lint asserting no `Command::new` outside `verification/broker.rs` in that
+  adapter's module; the unsupported-toolchain case returns the explicit unavailable state, not an
+  error and not a false pass.
+- Depends: CCK-19 (broker) and CCK-20 (establishes the adapter module layout the other three follow).
+  21A/21B/21C are parallel with each other once CCK-20 lands.
+
+#### CCK-22 — Test-impact evidence · **Status: TODO**
+- Coverage-derived selected-test evidence. Unknown coverage must *broaden* the selected set, never
+  silently narrow it — an adapter that can't report coverage falls back to "run everything relevant,"
+  not "run nothing and call it clean." Rename `verify_change(tx_id)` → `run_verification(change_id,
+  profile?)` at this point (once ChangeSet's `change_id` exists from Phase 2); keep `verify_change` as
+  a deprecated alias removed only before a v1 release.
+- Tests: an adapter with unknown coverage selects a superset, verified against a fixture where the
+  "true" minimal set is known; `run_verification` accepts a Phase-2 `change_id` and a bare single-file
+  `tx_id` both.
+- Depends: CCK-20/21 (needs adapters producing real coverage data) and CCK-18 (needs `change_id` to
+  exist for the rename to make sense).
+
+**Dependency graph — Phase 3:** CCK-19 is the only Phase-3 PR with no Phase-1/2 dependency — start it
+right after CCK-05, in parallel with everything else. CCK-20 needs both CCK-19 and Phase 2's v4
+schema, so Phase 3 cannot fully land before Phase 2 finishes even though CCK-19 itself starts much
+earlier. CCK-21A/B/C run in parallel with each other after CCK-20. CCK-22 is last, needing real
+coverage data out of the adapters.
 
 - **Adjustment (broker × cargo network):** high-assurance default is `network=deny`, but a cold
   `cargo check` needs the registry. The Rust adapter must run against a pre-populated/vendored cargo
@@ -419,7 +529,7 @@ pulled forward and merged immediately — it is the fastest open-issue close wit
 
 ## §7. Bottom line
 
-- **Accuracy of the source blueprint: excellent** — 17/19 primitive claims byte-exact; the 2 misses
+- **Accuracy of the source blueprint: excellent** — 19/21 primitive claims byte-exact; the 2 misses (1 outdated, 1 partial)
   are same-day races with the PR A–E train, not analytical errors.
 - **Architecture: adopt as-is.** The evolution-not-rewrite thesis is correct and the invariants are
   worth enforcing via the PR template today.

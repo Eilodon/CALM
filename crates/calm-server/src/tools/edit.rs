@@ -208,6 +208,9 @@ impl CalmServer {
                 None,
                 gate,
                 ask_out,
+                p.change_id.as_deref(),
+                p.authority_id.as_deref(),
+                None,
             )
         })
     }
@@ -308,7 +311,7 @@ impl CalmServer {
 
     /// Sync body of `edit_symbol` — extracted so the async tool wrapper can
     /// run it twice (Ask, then Approved) around the elicitation await.
-    fn edit_symbol_flow(
+    pub(crate) fn edit_symbol_flow(
         &self,
         p: &EditSymbolParams,
         gate: ElicitGate,
@@ -382,6 +385,9 @@ impl CalmServer {
                         None,
                         gate,
                         ask_out,
+                        p.change_id.as_deref(),
+                        p.authority_id.as_deref(),
+                        None,
                     )
                     .into_resolved();
             }
@@ -524,6 +530,9 @@ impl CalmServer {
                 insertion_note,
                 gate,
                 ask_out,
+                p.change_id.as_deref(),
+                p.authority_id.as_deref(),
+                Some(c.qualified_name.as_str()),
             )
             .into_resolved()
         })
@@ -896,6 +905,7 @@ impl CalmServer {
     /// `index_stale: true` — the disk write already happened, and reporting
     /// it as an error made agents re-apply edits that had in fact landed.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn edit_lines_impl_gated(
         &self,
         path: &str,
@@ -907,6 +917,23 @@ impl CalmServer {
         extra_note: Option<String>,
         gate: ElicitGate,
         ask_out: &mut Option<HubAskContext>,
+        // CCK-10 (#65): both Some routes this call through the
+        // authority-validated path instead of confirm/reason/cites.
+        change_id: Option<&str>,
+        authority_id: Option<&str>,
+        // CCK-R5.9 (audit follow-up): the symbol edit_symbol actually
+        // resolved for this edit, when one exists (None for raw edit_lines
+        // and for top_of_file/end_of_file, which never resolve a symbol).
+        // A position="before" insertion on a symbol with a leading doc
+        // comment anchors ABOVE that comment (see insertion_hunk_for's own
+        // doc comment) -- a line OUTSIDE the symbol's own indexed
+        // [line_start, line_end], so compute_touch_risk's line-range
+        // overlap below can miss the symbol entirely even though the
+        // caller explicitly reviewed and was authorized for it. This hint
+        // lets the authority-verify branch fall back to it instead of
+        // failing every such insertion with a false STALE_CALLER_SET/
+        // WRONG_TARGET_SCOPE.
+        anchor_qualified_name: Option<&str>,
     ) -> ToolOutcome<EditLinesOutput> {
         // In-process guard: serializes the whole read -> hash-check -> write
         // -> reindex sequence within this one `calm serve` process. rmcp
@@ -1180,7 +1207,7 @@ impl CalmServer {
             // never derived from `touched`'s own risk fields, so it can
             // never accidentally agree with a stale review just because
             // both happened to read the same risk classification.
-            let fresh_caller_digests: std::collections::HashMap<String, String> = touched
+            let mut fresh_caller_digests: std::collections::HashMap<String, String> = touched
                 .iter()
                 .map(|t| {
                     let live_callers = caller_symbol_set(&conn, &t.qualified_name);
@@ -1190,6 +1217,20 @@ impl CalmServer {
                     )
                 })
                 .collect();
+            // CCK-R5.9 (audit follow-up): a position="before" insertion on a
+            // symbol with a leading doc comment anchors ABOVE that comment
+            // (insertion_hunk_for), a line OUTSIDE the symbol's own indexed
+            // range -- `touched` (from compute_touch_risk's line-range
+            // overlap) can miss it entirely even though it's the exact
+            // symbol edit_context was called for. Backfill its fresh caller
+            // digest here too so the authority-verify branch below always
+            // has one to compare against, not just when the line-range
+            // overlap happened to catch it.
+            if let Some(anchor) = anchor_qualified_name {
+                fresh_caller_digests.entry(anchor.to_string()).or_insert_with(|| {
+                    Self::caller_set_digest(&caller_symbol_set(&conn, anchor))
+                });
+            }
             (
                 risk,
                 hub_hit,
@@ -1215,7 +1256,151 @@ impl CalmServer {
             force_gate_always,
             risk_rule_reason.as_deref(),
         );
-        if gate_classification.will_block_without_confirm {
+        // CCK-10 (#65): both present routes this call through the
+        // authority-validated path -- verified (or refused) here, BEFORE
+        // the legacy confirm/reason/cites gate below is even evaluated.
+        // Invariant #3: the authority is the permission; a `reason` (if
+        // also supplied alongside it) is never consulted on this path.
+        let authority_already_validated = match (change_id, authority_id) {
+            (Some(change_id), Some(authority_id)) => {
+                let snapshot_id = self
+                    .make_read_conn()
+                    .ok()
+                    .and_then(|c| {
+                        calm_core::authority::EvidenceSnapshot::compute(&c, &self.project_root).ok()
+                    })
+                    .map(|s| s.snapshot_id)
+                    .unwrap_or_default();
+                let current_graph_generation: i64 = self
+                    .make_read_conn()
+                    .ok()
+                    .and_then(|c| {
+                        c.query_row(
+                            "SELECT generation FROM graph_generation_state WHERE id = 1",
+                            [],
+                            |r| r.get(0),
+                        )
+                        .ok()
+                    })
+                    .unwrap_or(0);
+                // CCK-R5.9 (audit follow-up): fall back to
+                // anchor_qualified_name when pre_touched didn't catch the
+                // symbol (the doc-comment-anchored "before" insertion case
+                // -- see this function's own doc comment for
+                // anchor_qualified_name).
+                let primary_touched_qn: Option<&str> = pre_touched
+                    .first()
+                    .map(|t| t.qualified_name.as_str())
+                    .or(anchor_qualified_name);
+                let touched_caller_set_digest = primary_touched_qn
+                    .and_then(|qn| fresh_caller_digests.get(qn))
+                    .cloned()
+                    .unwrap_or_default();
+                let policy = calm_core::policy::loader::load_policy_or_warn(&self.project_root);
+                let policy_digest = policy.digest();
+                let principal = format!("session:{}", self.session_id);
+                // CCK-R5 (audit follow-up): EVERY symbol this edit actually
+                // touches, not just the first -- verify_and_consume's own
+                // target_scope_digest check is what makes a multi-hunk edit
+                // that reaches outside the authorized scope fail closed,
+                // instead of silently validating only against
+                // pre_touched[0] while the rest go unchecked.
+                let mut current_targets: Vec<calm_core::change::ChangeIntentTarget> = pre_touched
+                    .iter()
+                    .map(|t| calm_core::change::ChangeIntentTarget {
+                        path: path.to_string(),
+                        qualified_name: Some(t.qualified_name.clone()),
+                    })
+                    .collect();
+                // CCK-R5.9: union in the anchor symbol too, for the same
+                // doc-comment-anchored-insertion reason as above.
+                if let Some(anchor) = anchor_qualified_name {
+                    let already_present = current_targets
+                        .iter()
+                        .any(|t| t.qualified_name.as_deref() == Some(anchor));
+                    if !already_present {
+                        current_targets.push(calm_core::change::ChangeIntentTarget {
+                            path: path.to_string(),
+                            qualified_name: Some(anchor.to_string()),
+                        });
+                    }
+                }
+                let current = calm_core::authority::CurrentState {
+                    intent_id: change_id,
+                    snapshot_id: &snapshot_id,
+                    graph_generation: current_graph_generation,
+                    caller_set_digest: &touched_caller_set_digest,
+                    policy_digest: &policy_digest,
+                    principal: &principal,
+                    targets: &current_targets,
+                };
+                let state_conn = match calm_core::db::conn::open_state_writer(&self.state_db_path) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        return ToolOutcome::error(error_detail(
+                            "AUTHORITY_DB_ERROR",
+                            &format!("could not open state.db to verify authority: {e}"),
+                            true,
+                        ));
+                    }
+                };
+                match calm_core::authority::ReviewAuthority::verify_and_consume(
+                    &state_conn,
+                    authority_id,
+                    &current,
+                ) {
+                    Ok(()) => {
+                        tracing::info!(
+                            target: crate::telemetry::AUDIT_TARGET,
+                            session_id = self.session_id,
+                            decision = "authorized",
+                            reason_code = "AUTHORITY_CONSUMED",
+                            path,
+                            change_id,
+                            authority_id,
+                        );
+                        true
+                    }
+                    Err(e) => {
+                        use calm_core::authority::AuthorityError as AE;
+                        let reason_code = match &e {
+                            AE::NotFound => "AUTHORITY_NOT_FOUND",
+                            AE::ForgedSignature => "AUTHORITY_FORGED_SIGNATURE",
+                            AE::Expired => "AUTHORITY_EXPIRED",
+                            AE::AlreadyConsumed => "AUTHORITY_ALREADY_CONSUMED",
+                            AE::WrongIntent => "AUTHORITY_WRONG_INTENT",
+                            AE::WrongTargetScope => "AUTHORITY_WRONG_TARGET_SCOPE",
+                            AE::StaleSnapshot => "AUTHORITY_STALE_SNAPSHOT",
+                            AE::StaleGraphGeneration => "STALE_GRAPH_AUTHORITY",
+                            AE::StaleCallerSet => "STALE_CALLER_SET",
+                            AE::StaleAnalysisVersion => "AUTHORITY_STALE_ANALYSIS_VERSION",
+                            AE::StalePolicy => "AUTHORITY_STALE_POLICY",
+                            AE::WrongPrincipal => "AUTHORITY_WRONG_PRINCIPAL",
+                            AE::Db(_) => "AUTHORITY_DB_ERROR",
+                        };
+                        tracing::info!(
+                            target: crate::telemetry::AUDIT_TARGET,
+                            session_id = self.session_id,
+                            decision = "denied",
+                            reason_code,
+                            path,
+                            change_id,
+                            authority_id,
+                        );
+                        return ToolOutcome::error(error_detail(reason_code, &e.to_string(), true));
+                    }
+                }
+            }
+            (None, None) => false,
+            _ => {
+                return ToolOutcome::error(error_detail(
+                    "INVALID_AUTHORITY_PARAMS",
+                    "change_id and authority_id must both be set together, or both omitted",
+                    false,
+                ));
+            }
+        };
+        if !authority_already_validated && gate_classification.will_block_without_confirm {
             let why = gate_classification.why.unwrap_or_default();
 
             if matches!(
@@ -3121,7 +3306,7 @@ pub(crate) fn caller_symbol_set(conn: &rusqlite::Connection, qualified_name: &st
 /// `path` exactly as supplied here — an unvalidated traversal/symlink
 /// escape at this layer is still an informed-consent bypass one level
 /// down, regardless of what the host displays.
-fn resolve_repo_path(
+pub(crate) fn resolve_repo_path(
     project_root: &std::path::Path,
     path: &str,
 ) -> Result<std::path::PathBuf, ErrorDetail> {
@@ -3450,6 +3635,16 @@ pub(crate) struct EditLinesParams {
     /// bridge-hub tier and when the symbol has no known callers.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) cites: Option<String>,
+    /// CCK-10 (#65): `change_id`+`authority_id` from a matching `edit_context`
+    /// response (or `review_change`, once CCK-11 lands) route this edit
+    /// through the authority-validated path instead of `confirm`/`reason`/
+    /// `cites` — both must be present together (`INVALID_AUTHORITY_PARAMS`
+    /// otherwise). On this path `reason` is explanation only, never a
+    /// permission signal (invariant #3) — the authority is the permission.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) change_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) authority_id: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -3513,6 +3708,12 @@ pub(crate) struct EditSymbolParams {
     /// `position` is not `"replace"`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) old_text: Option<String>,
+    /// See `EditLinesParams::change_id`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) change_id: Option<String>,
+    /// See `EditLinesParams::authority_id`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) authority_id: Option<String>,
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -3712,6 +3913,8 @@ mod elicit_tests {
             confirm: true,
             reason: Some("r".into()),
             cites: None,
+            change_id: None,
+            authority_id: None,
         }
     }
 

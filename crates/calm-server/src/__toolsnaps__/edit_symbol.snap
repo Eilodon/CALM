@@ -71,6 +71,20 @@
           "string",
           "null"
         ]
+      },
+      "change_id": {
+        "description": "See `EditLinesParams::change_id`.",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "authority_id": {
+        "description": "See `EditLinesParams::authority_id`.",
+        "type": [
+          "string",
+          "null"
+        ]
       }
     }
   },

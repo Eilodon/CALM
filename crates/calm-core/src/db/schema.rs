@@ -21,7 +21,11 @@
 // instead: calm-cli `index`/`fitness-check`, calm-server `new_with_preset`
 // (the `calm serve`/daemon bootstrap) and `doctor`.
 pub const INDEX_DB_SCHEMA_VERSION: i64 = 1;
-pub const STATE_DB_SCHEMA_VERSION: i64 = 1;
+// v2 (CCK-07): adds evidence_snapshots/change_intents/change_intent_targets.
+// v3 (CCK-09, docs/plans/2026-08-08-master-change-control-execution-blueprint.md):
+// adds review_authorities(+targets,+evidence) and edit_transactions.authority_id.
+// See db/state_migrations.rs's registered v1->v2 and v2->v3 steps.
+pub const STATE_DB_SCHEMA_VERSION: i64 = 3;
 
 /// Refuses to proceed if `conn`'s stamped `PRAGMA user_version` is HIGHER
 /// than `expected` -- meaning a newer CALM binary already created or
@@ -69,7 +73,9 @@ pub fn init_db_versioned(conn: &Connection) -> rusqlite::Result<()> {
 pub fn init_state_db_versioned(conn: &Connection) -> rusqlite::Result<()> {
     refuse_if_schema_newer(conn, STATE_DB_SCHEMA_VERSION, "state.db")?;
     init_state_db(conn)?;
-    conn.pragma_update(None, "user_version", STATE_DB_SCHEMA_VERSION)?;
+    // CCK-01: run any registered forward migrations from the on-disk version
+    // up to STATE_DB_SCHEMA_VERSION, then stamp it (see state_migrations.rs).
+    super::state_migrations::migrate_state_db_to_current(conn)?;
     Ok(())
 }
 
@@ -463,6 +469,14 @@ CREATE TABLE IF NOT EXISTS edit_transactions (
     base_digest               TEXT NOT NULL,
     proposed_digest           TEXT NOT NULL,
     review_token_id           TEXT,
+    -- v3 / CCK-09: which review_authorities row (if any) authorized this
+    -- write via the new structured path -- NULL for every transaction
+    -- still going through the legacy edit_context+confirm+reason path.
+    -- CCK-R6 (audit follow-up): a real FK, not just a comment -- ON
+    -- DELETE SET NULL rather than CASCADE, since this journal row must
+    -- outlive a future retention/GC pass over review_authorities; only
+    -- the link goes away, never the durable transaction record itself.
+    authority_id              TEXT REFERENCES review_authorities(authority_id) ON DELETE SET NULL,
     state                     TEXT NOT NULL DEFAULT 'PREPARED',
     temp_path                 TEXT,
     graph_generation_before   INTEGER,
@@ -527,7 +541,96 @@ CREATE TABLE IF NOT EXISTS audit_ledger (
     ts           REAL NOT NULL,
     actor        TEXT NOT NULL,
     payload      TEXT NOT NULL
-);";
+);
+
+-- v2 / CCK-07 (docs/plans/2026-08-08-master-change-control-execution-blueprint.md):
+-- persisted form of authority::snapshot::EvidenceSnapshot (CCK-06), which until
+-- now was compute-only. snapshot_id is that struct's own content-addressed
+-- SNP-sha256 id, so re-persisting an identical snapshot is a harmless
+-- INSERT OR IGNORE, not a duplicate/conflict.
+CREATE TABLE IF NOT EXISTS evidence_snapshots (
+    snapshot_id            TEXT PRIMARY KEY,
+    source_catalog_digest  TEXT NOT NULL,
+    graph_generation       INTEGER NOT NULL,
+    freshness_class        TEXT NOT NULL,
+    created_at             REAL NOT NULL
+);
+
+-- v2 / CCK-07: a declared ChangeIntent (change::intent::ChangeIntent) --
+-- what a caller says it is about to do, bound to the EvidenceSnapshot in
+-- effect when it was declared. `kind` is a change::classify::ChangeKind variant
+-- name (the DECLARED half; change::classify::classify_observed_change
+-- produces the OBSERVED half from the real diff, never persisted here --
+-- cheap to recompute, and persisting it would invite the two to drift).
+CREATE TABLE IF NOT EXISTS change_intents (
+    intent_id        TEXT PRIMARY KEY,
+    kind             TEXT NOT NULL,
+    reason           TEXT NOT NULL,
+    snapshot_id      TEXT NOT NULL REFERENCES evidence_snapshots(snapshot_id),
+    created_at       REAL NOT NULL,
+    idempotency_key  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_change_intents_snapshot ON change_intents(snapshot_id);
+-- CCK-11: plan_change's idempotency contract -- a partial unique index
+-- (not a plain UNIQUE column) because the pre-existing CCK-07 caller
+-- (mint_review_authority_for_edit_context's single-symbol compat wrapper)
+-- never sets this and must keep inserting NULLs freely; SQLite already
+-- treats distinct NULLs as never conflicting under a plain UNIQUE
+-- constraint, but the partial WHERE clause makes that non-enforcement
+-- explicit rather than relying on that default behavior implicitly.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_change_intents_idempotency ON change_intents(idempotency_key) WHERE idempotency_key IS NOT NULL;
+
+-- v2 / CCK-07: the file(s) (optionally symbol-scoped) one change_intents row
+-- declares as its target. One-to-many so a single intent can already span
+-- multiple files ahead of Phase 2 (multi-file ChangeSet) actually landing --
+-- the shape is useful the moment CCK-11's plan_change tool exists, not just
+-- once ChangeSet does.
+CREATE TABLE IF NOT EXISTS change_intent_targets (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    intent_id      TEXT NOT NULL REFERENCES change_intents(intent_id) ON DELETE CASCADE,
+    path           TEXT NOT NULL,
+    qualified_name TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_change_intent_targets_intent ON change_intent_targets(intent_id);
+
+-- v3 / CCK-09 (#65): a signed, single-use, snapshot-bound ReviewAuthority
+-- (authority::review::ReviewAuthority). Durable, structured replacement for
+-- EditContextReview's session-local HashMap entry -- signature is an
+-- HMAC-SHA256 over every other bound column below (see authority/key.rs's
+-- control.key), so tampering with any one of them out of band invalidates
+-- the row instead of silently being trusted. consumed_at NULL means unused;
+-- set exactly once, by the UPDATE ... WHERE consumed_at IS NULL that makes
+-- single-use atomic (see ReviewAuthority::verify_and_consume).
+CREATE TABLE IF NOT EXISTS review_authorities (
+    authority_id       TEXT PRIMARY KEY,
+    intent_id          TEXT NOT NULL REFERENCES change_intents(intent_id),
+    snapshot_id        TEXT NOT NULL REFERENCES evidence_snapshots(snapshot_id),
+    graph_generation   INTEGER NOT NULL,
+    caller_set_digest  TEXT NOT NULL,
+    analysis_version   TEXT NOT NULL,
+    policy_digest      TEXT NOT NULL,
+    principal          TEXT NOT NULL,
+    target_scope_digest TEXT NOT NULL DEFAULT '',
+    nonce              TEXT NOT NULL,
+    expires_at         REAL NOT NULL,
+    signature          TEXT NOT NULL,
+    created_at         REAL NOT NULL,
+    consumed_at        REAL
+);
+CREATE INDEX IF NOT EXISTS idx_review_authorities_intent ON review_authorities(intent_id);
+
+-- v3 / CCK-09: mirrors change_intent_targets shape, scoped to the
+-- authority rather than the intent -- a caller may request authority for
+-- only a subset of its intents declared targets.
+CREATE TABLE IF NOT EXISTS review_authority_targets (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    authority_id   TEXT NOT NULL REFERENCES review_authorities(authority_id) ON DELETE CASCADE,
+    path           TEXT NOT NULL,
+    qualified_name TEXT,
+    UNIQUE(authority_id, path, qualified_name)
+);
+CREATE INDEX IF NOT EXISTS idx_review_authority_targets_authority ON review_authority_targets(authority_id);
+";
 
 const FTS5_SQL: &str = "
 CREATE VIRTUAL TABLE IF NOT EXISTS fts_exact USING fts5(
@@ -1241,6 +1344,92 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(stamped_again, STATE_DB_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn edit_transactions_authority_id_carries_a_real_foreign_key() {
+        // CCK-R6 (audit follow-up): the comment on this column used to be
+        // the only thing tying it to review_authorities -- now it's a real
+        // FK, checked the same way call_site_identity_schema_uses_byte_
+        // spans_and_edge_foreign_key checks call_edges.call_site_id above.
+        let conn = Connection::open_in_memory().unwrap();
+        init_state_db_versioned(&conn).unwrap();
+
+        let foreign_keys: Vec<(String, String, String, String)> = conn
+            .prepare("PRAGMA foreign_key_list(edit_transactions)")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get(2)?, row.get(3)?, row.get(4)?, row.get(6)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(
+            foreign_keys.iter().any(|(table, from, to, on_delete)| {
+                table == "review_authorities"
+                    && from == "authority_id"
+                    && to == "authority_id"
+                    && on_delete == "SET NULL"
+            }),
+            "edit_transactions.authority_id must carry a database foreign-key \
+             relationship to review_authorities with ON DELETE SET NULL, got {foreign_keys:?}"
+        );
+    }
+
+    #[test]
+    fn deleting_a_review_authority_clears_but_does_not_cascade_the_edit_transaction() {
+        // The durable edit-transaction journal must outlive a future
+        // retention/GC pass over review_authorities -- only the "which
+        // authority approved this" link should go away.
+        let conn = Connection::open_in_memory().unwrap();
+        init_state_db_versioned(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO evidence_snapshots \
+             (snapshot_id, source_catalog_digest, graph_generation, freshness_class, created_at) \
+             VALUES ('SNP-1', 'digest-1', 1, 'current', 0.0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO change_intents (intent_id, kind, reason, snapshot_id, created_at) \
+             VALUES ('INT-1', 'body', 'test fixture', 'SNP-1', 0.0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO review_authorities \
+             (authority_id, intent_id, snapshot_id, graph_generation, caller_set_digest, \
+              analysis_version, policy_digest, principal, target_scope_digest, nonce, \
+              expires_at, signature, created_at, consumed_at) \
+             VALUES ('AUTH-1', 'INT-1', 'SNP-1', 1, 'callers', 'av', 'pd', 'session:x', '', \
+              'nonce', 1.0, 'sig', 0.0, NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO edit_transactions \
+             (tx_id, project_id, path, base_digest, proposed_digest, authority_id, state, \
+              created_at, updated_at) \
+             VALUES ('TXN-1', 'proj', 'a.rs', 'base', 'proposed', 'AUTH-1', 'PREPARED', 0.0, 0.0)",
+            [],
+        )
+        .unwrap();
+
+        conn.execute("DELETE FROM review_authorities WHERE authority_id = 'AUTH-1'", [])
+            .unwrap();
+
+        let (path, authority_id): (String, Option<String>) = conn
+            .query_row(
+                "SELECT path, authority_id FROM edit_transactions WHERE tx_id = 'TXN-1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(path, "a.rs", "the transaction journal row must survive");
+        assert_eq!(
+            authority_id, None,
+            "only the dangling authority_id link should be cleared"
+        );
     }
 
     #[test]
