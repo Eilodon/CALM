@@ -165,10 +165,26 @@ impl EvidenceSnapshot {
     /// IGNORE`, not a duplicate/conflict; `created_at` reflects the first
     /// time this exact snapshot was ever persisted, not this call.
     pub fn persist(&self, state_conn: &Connection) -> rusqlite::Result<()> {
+        // CCK-R2 (audit follow-up, docs/plans/2026-08-08-master-change-
+        // control-execution-blueprint.md): `freshness_class` is NOT part of
+        // the `snapshot_id` hash (deliberately -- it's an observation ABOUT
+        // the snapshot's content, not part of the content itself), so two
+        // `EvidenceSnapshot` values with different freshness can share a
+        // `snapshot_id`. A plain `INSERT OR IGNORE` let whichever one was
+        // persisted FIRST win forever -- a `Current` snapshot persisted
+        // before a `Reconciled` one for the same content would silently
+        // swallow the stronger, later observation. This upsert instead only
+        // ever moves `freshness_class` toward stronger (`reconciled` >
+        // `current` > `degraded`), never weaker and never silently dropped.
         state_conn.execute(
-            "INSERT OR IGNORE INTO evidence_snapshots \
+            "INSERT INTO evidence_snapshots \
              (snapshot_id, source_catalog_digest, graph_generation, freshness_class, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+             VALUES (?1, ?2, ?3, ?4, ?5) \
+             ON CONFLICT(snapshot_id) DO UPDATE SET freshness_class = excluded.freshness_class \
+             WHERE (CASE excluded.freshness_class \
+                        WHEN 'reconciled' THEN 2 WHEN 'current' THEN 1 ELSE 0 END) \
+                 > (CASE evidence_snapshots.freshness_class \
+                        WHEN 'reconciled' THEN 2 WHEN 'current' THEN 1 ELSE 0 END)",
             params![
                 self.snapshot_id,
                 self.source_catalog_digest,
@@ -435,7 +451,7 @@ mod tests {
 
         let state = state_conn();
         snapshot.persist(&state).unwrap();
-        snapshot.persist(&state).unwrap(); // must not error (INSERT OR IGNORE)
+        snapshot.persist(&state).unwrap(); // must not error (identical freshness -- no-op upsert)
 
         let count: i64 = state
             .query_row(
@@ -453,6 +469,58 @@ mod tests {
         assert_eq!(
             EvidenceSnapshot::load(&state, "SNP-does-not-exist").unwrap(),
             None
+        );
+    }
+
+
+    #[test]
+    fn persisting_a_stronger_freshness_class_upgrades_a_previously_persisted_weaker_one() {
+        let index_conn = conn_with_file_index(&[("a.rs", "h1")]);
+        let root = tmp_project();
+        let state = state_conn();
+
+        // Same underlying content -- freshness_class alone differs, so both
+        // computations share one snapshot_id (it is deliberately not part
+        // of the digest -- see the module doc comment). No index_input_state
+        // row is seeded, so `compute` fail-closes to Degraded (weakest) --
+        // persisted first, it must not permanently mask a later, stronger
+        // Reconciled for the same content.
+        let degraded = EvidenceSnapshot::compute(&index_conn, root.path()).unwrap();
+        assert_eq!(degraded.freshness_class, FreshnessClass::Degraded);
+        degraded.persist(&state).unwrap();
+
+        let reconciled =
+            EvidenceSnapshot::compute_after_reconciliation(&index_conn, root.path()).unwrap();
+        assert_eq!(reconciled.snapshot_id, degraded.snapshot_id);
+        reconciled.persist(&state).unwrap();
+
+        let loaded = EvidenceSnapshot::load(&state, &degraded.snapshot_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.freshness_class, FreshnessClass::Reconciled);
+    }
+
+    #[test]
+    fn persisting_a_weaker_freshness_class_never_downgrades_a_previously_persisted_stronger_one() {
+        let index_conn = conn_with_file_index(&[("a.rs", "h1")]);
+        let root = tmp_project();
+        let state = state_conn();
+
+        let reconciled =
+            EvidenceSnapshot::compute_after_reconciliation(&index_conn, root.path()).unwrap();
+        reconciled.persist(&state).unwrap();
+
+        let current = EvidenceSnapshot::compute(&index_conn, root.path()).unwrap();
+        assert_eq!(current.snapshot_id, reconciled.snapshot_id);
+        current.persist(&state).unwrap();
+
+        let loaded = EvidenceSnapshot::load(&state, &reconciled.snapshot_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            loaded.freshness_class,
+            FreshnessClass::Reconciled,
+            "a later, weaker observation must never overwrite an already-persisted stronger one"
         );
     }
 }
