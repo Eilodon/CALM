@@ -1245,6 +1245,13 @@ impl CalmServer {
     ) -> Option<MintedAuthorityOutput> {
         let snapshot =
             calm_core::authority::EvidenceSnapshot::compute(conn, &self.project_root).ok()?;
+        // CCK-23 (P0 fix, audit 2026-08-09): mirror the same freshness gate
+        // review_change now applies -- see that function's comment for why.
+        // Fail-open here means `None` (no authority), matching this function's
+        // existing fail-open contract on every other error, not a hard tool error.
+        if !snapshot.freshness_class.is_safe_for_high_risk_authority() {
+            return None;
+        }
         let mut state_conn = calm_core::db::conn::open_state_writer(&self.state_db_path).ok()?;
         // CCK-R5 (audit follow-up): snapshot persist + intent insert +
         // authority mint (which itself does 3 more inserts) must land as

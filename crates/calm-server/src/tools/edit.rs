@@ -1400,6 +1400,42 @@ impl CalmServer {
                 ));
             }
         };
+        // CCK-23 (P0 fix, audit 2026-08-09): a valid ReviewAuthority proves WHAT was
+        // touched (target-scope/snapshot/graph-generation bound, cryptographically
+        // signed) but proves nothing about WHO reviewed it -- minting today has no
+        // independent-approval input (edit_context auto-mints with none; review_change
+        // accepts a bare client-supplied `approved: bool`). HIGH_RISK_REQUIRES_
+        // INDEPENDENT_REVIEW is a different invariant than the legacy reason/confirm/
+        // cites gate authority correctly supersedes (invariant #3, CCK-10) -- it
+        // specifically requires a human decision (`ElicitGate::Ask|Approved`, the
+        // MRTR/legacy elicitation round-trip), which no authority encodes yet. So this
+        // check runs UNCONDITIONALLY, even when `authority_already_validated` is true
+        // -- an authority is never a substitute for it, only `reason`/`confirm`/`cites`
+        // are. (The equivalent check further below, inside the legacy-gate block, is
+        // now unreachable when this one already returned -- left in place deliberately
+        // for minimal diff; dead by construction, not a correctness gap.)
+        let high_risk_needs_independent_review = risk.as_deref() == Some("high")
+            && !matches!(gate, ElicitGate::Ask | ElicitGate::Approved);
+        if high_risk_needs_independent_review {
+            tracing::info!(
+                target: crate::telemetry::AUDIT_TARGET,
+                session_id = self.session_id,
+                decision = "denied",
+                reason_code = "HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW",
+                path,
+                risk = risk.as_deref().unwrap_or("none"),
+                hub_hit,
+                authority_already_validated,
+            );
+            return ToolOutcome::error(error_detail(
+                "HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW",
+                "this symbol is \"high\" risk -- neither a spent ReviewAuthority nor a \
+                 cited reason is independent review at this tier. Enable [edit] \
+                 elicit_hub_confirm and get human approval via the elicitation \
+                 round-trip before treating this as safe to edit",
+                true,
+            ));
+        }
         if !authority_already_validated && gate_classification.will_block_without_confirm {
             let why = gate_classification.why.unwrap_or_default();
 

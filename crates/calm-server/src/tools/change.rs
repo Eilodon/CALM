@@ -9,14 +9,23 @@
 //! caller says it's about to do, and why) without writing anything or
 //! minting authority. `review_change` is the ONLY place in this pair that
 //! calls `ReviewAuthority::mint` -- and refuses to do so
-//! (`APPROVAL_REQUIRED`) unless `approved: true` is explicitly set, the
-//! blueprint's "review_change returns authority_id only after required
-//! human/MRTR approval" invariant. Whether that flag was set because a
-//! human answered a chat prompt, an MRTR elicitation round-trip completed,
-//! or some other out-of-band process approved it is a client-side
-//! concern -- CALM's contract is the refusal, not the mechanism, matching
-//! how `edit_lines`/`edit_symbol`'s own lighter `confirm: bool` gate
-//! already works one tier down.
+//! (`APPROVAL_REQUIRED`) unless `approved: true` is explicitly set.
+//!
+//! **CCK-23 correction (audit 2026-08-09):** `approved: true` here is
+//! CLIENT SELF-ATTESTATION, not a server-verified human/MRTR round-trip --
+//! whether a human actually looked at this is entirely a client-side
+//! concern this module cannot see or verify, matching how `edit_lines`/
+//! `edit_symbol`'s own lighter `confirm: bool` gate already works one tier
+//! down. That's an acceptable bar for low/medium-risk changes (self-review
+//! is a legitimate approver class), but it is NOT independent review for a
+//! high-risk touch. The authority this mints for a high-risk target is
+//! spendable ONLY if `edit_lines`/`edit_symbol`'s own unconditional
+//! `HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW` check (edit.rs, CCK-23) is
+//! separately satisfied via a real elicitation round-trip -- self-
+//! attestation here is never sufficient on its own for that tier. A real
+//! risk-aware refusal *inside* `review_change` (instead of relying on the
+//! spend-time backstop) needs a real `RiskVector`/`PolicyDecision`, which
+//! is CCK-26's job, not this module's -- see the master blueprint.
 //!
 //! **Known Phase-1 scope limit** (the blueprint's own phasing: CCK-11 is
 //! Phase 1, true multi-file `ChangeSet` staging/commit is Phase 2,
@@ -87,10 +96,12 @@ pub(crate) struct PlanChangeOutput {
 #[derive(Deserialize, JsonSchema)]
 pub(crate) struct ReviewChangeParams {
     pub(crate) change_id: String,
-    /// The required human/MRTR approval signal -- `review_change` NEVER
-    /// mints an authority unless this is explicitly `true` (omitted or
-    /// `false` both refuse with `APPROVAL_REQUIRED`). See this module's own
-    /// doc comment for what "approval" means here.
+    /// Client self-attestation, not a server-verified approval -- `review_change`
+    /// NEVER mints an authority unless this is explicitly `true` (omitted or
+    /// `false` both refuse with `APPROVAL_REQUIRED`). Adequate for low/medium-risk
+    /// changes only: for a high-risk target, edit_lines/edit_symbol separately
+    /// require real independent review regardless of this flag. See this module's
+    /// own doc comment for what "approval" means here.
     #[serde(default)]
     pub(crate) approved: bool,
     /// Free text audit trail of who/what approved -- like `reason`
@@ -365,7 +376,7 @@ impl CalmServer {
 
     #[tool(
         name = "review_change",
-        description = "Mints a ReviewAuthority for a change_id from plan_change -- ONLY when approved:true (the required human/MRTR approval step; omitted or false always refuses with APPROVAL_REQUIRED, never mints). Pass the returned authority_id alongside change_id to edit_lines/edit_symbol to spend it in one write. USE WHEN: a plan_change'd intent has been reviewed and approved. NOT FOR: minting without a real approval, or a multi-file change that needs independent per-file authorization (Phase 2 ChangeSet territory -- see this module's own doc comment).",
+        description = "Mints a ReviewAuthority for a change_id from plan_change -- ONLY when approved:true (omitted or false always refuses with APPROVAL_REQUIRED, never mints). approved:true is CLIENT SELF-ATTESTATION (not server-verified human/MRTR proof) -- adequate for low/medium-risk changes, but for a high-risk target the resulting authority is only spendable if edit_lines/edit_symbol's own independent-review check is separately satisfied via a real elicitation round-trip. Pass the returned authority_id alongside change_id to edit_lines/edit_symbol to spend it in one write. USE WHEN: a plan_change'd intent has been reviewed and approved. NOT FOR: minting without a real approval, or a multi-file change that needs independent per-file authorization (Phase 2 ChangeSet territory -- see this module's own doc comment).",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -381,9 +392,11 @@ impl CalmServer {
             if !p.approved {
                 return ToolOutcome::error(error_detail(
                     "APPROVAL_REQUIRED",
-                    "review_change never mints an authority without an explicit human/MRTR \
-                     approval -- pass approved:true only after that approval has actually \
-                     happened",
+                    "review_change never mints an authority without approved:true -- this is \
+                     self-attestation the caller must only set after a real approval \
+                     happened (CALM cannot verify the mechanism from here; see this \
+                     module's own doc comment). For a high-risk target, this alone is not \
+                     independent review -- edit_lines/edit_symbol separately enforce that.",
                     true,
                 ));
             }
@@ -445,6 +458,22 @@ impl CalmServer {
                         ));
                     }
                 };
+                // CCK-23 (P0 fix, audit 2026-08-09): "No stale evidence may grant
+                // authority" was never actually enforced -- this capability
+                // (`is_safe_for_high_risk_authority`) existed with zero production
+                // callers. Refuse to mint against a `Degraded` snapshot outright
+                // (Phase 0: blanket refusal for every risk tier, not just high --
+                // simplest safe interpretation until CCK-26 lands the tiered
+                // Low/Medium=Current|Reconciled vs High=Reconciled+Receipt policy).
+                if !snapshot.freshness_class.is_safe_for_high_risk_authority() {
+                    return ToolOutcome::error(error_detail(
+                        "EVIDENCE_NOT_FRESH",
+                        "index/config drifted since the last reconciliation \
+                         (freshness=Degraded) -- cannot mint a ReviewAuthority against \
+                         stale evidence",
+                        true,
+                    ));
+                }
                 let graph_generation: i64 = conn
                     .query_row(
                         "SELECT generation FROM graph_generation_state WHERE id = 1",
@@ -701,6 +730,16 @@ mod tests {
                 [],
             )
             .unwrap();
+        }
+        {
+            // CCK-23: review_change now refuses to mint against a Degraded
+            // snapshot (index_input_state fail-closes to Unknown/Degraded
+            // when never persisted) -- mirror the real production path
+            // (daemon bootstrap / watch_supervisor refresh) so this test
+            // fixture reflects a reconciled repo, not an untouched one.
+            let conn = server.db();
+            let catalog = calm_core::indexer::refresh::InputCatalog::for_project(&dir);
+            calm_core::indexer::refresh::persist_index_input_snapshot(&conn, &catalog).unwrap();
         }
 
         let plan = server.plan_change(rmcp::handler::server::wrapper::Parameters(plan_params(
