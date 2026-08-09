@@ -149,6 +149,12 @@ pub const STATE_MIGRATIONS: &[StateMigration] = &[
         name: "v8_approval_receipts",
         apply: v7_to_v8_approval_receipts,
     },
+    StateMigration {
+        from: 8,
+        to: 9,
+        name: "v9_approval_receipt_signature",
+        apply: v8_to_v9_approval_receipt_signature,
+    },
 ];
 
 /// v1->v2 (CCK-07): adds `evidence_snapshots`, `change_intents`,
@@ -504,6 +510,124 @@ fn v7_to_v8_approval_receipts(conn: &Connection) -> Result<(), StateMigrationErr
         return Err(StateMigrationError::PostconditionFailed {
             migration: "v8_approval_receipts",
             detail: "approval_receipts does not exist after this step's own DDL ran".to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// v8->v9 (WS3 follow-up): adds `approval_receipts.signature` -- an
+/// HMAC-SHA256 (`control.key`, domain `"approval-receipt-v1"`) over every
+/// other column on the row, so a receipt can be verified as genuinely
+/// written by `insert_approval_receipt` rather than hand-inserted (e.g. by
+/// an attacker with raw state.db write access trying to make an audit
+/// trail look clean). NOT bound into `ReviewAuthority`'s own signed
+/// payload -- see `authority::receipt`'s module doc comment for why that
+/// ordering is structurally impossible (a receipt is always written
+/// strictly after the authority it references already exists, for both
+/// approval mechanisms).
+///
+/// Nullable, and best-effort at both migration and insert time, matching
+/// receipt-writing's existing fail-open posture (a signing hiccup must
+/// never block or invalidate an already-legitimate approval) -- most
+/// notably, a `:memory:` state connection genuinely has no `control.key`
+/// (see `authority::key::control_key_for_conn`'s own doc comment), so
+/// every existing unsigned-receipt test fixture keeps working unchanged.
+///
+/// Backfills every pre-existing row too, not just new ones: every column a
+/// signature covers is already stored on each row, so a real `control.key`
+/// (the common case for any real install) can sign them retroactively
+/// rather than leaving every receipt written before this migration
+/// permanently unsigned.
+fn v8_to_v9_approval_receipt_signature(conn: &Connection) -> Result<(), StateMigrationError> {
+    let mut stmt = conn.prepare("PRAGMA table_info(approval_receipts)")?;
+    let existing_columns: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(|r| r.ok())
+        .collect();
+    if !existing_columns.iter().any(|c| c == "signature") {
+        conn.execute_batch("ALTER TABLE approval_receipts ADD COLUMN signature TEXT;")?;
+    }
+
+    if let Ok(Some(key)) = crate::authority::key::control_key_for_conn(conn) {
+        #[allow(clippy::type_complexity)]
+        let rows: Vec<(
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+            String,
+            String,
+            String,
+            f64,
+            Option<String>,
+        )> = {
+            let mut select = conn.prepare(
+                "SELECT receipt_id, change_id, authority_id, subject_digest, approved_by, \
+                 mechanism, decision, approved_at, tx_id FROM approval_receipts \
+                 WHERE signature IS NULL",
+            )?;
+            select
+                .query_map([], |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                        r.get(8)?,
+                    ))
+                })?
+                .filter_map(|r| r.ok())
+                .collect()
+        };
+        for (
+            receipt_id,
+            change_id,
+            authority_id,
+            subject_digest,
+            approved_by,
+            mechanism,
+            decision,
+            approved_at,
+            tx_id,
+        ) in rows
+        {
+            let payload = crate::authority::receipt::signing_payload(
+                &receipt_id,
+                change_id.as_deref(),
+                authority_id.as_deref(),
+                &subject_digest,
+                &approved_by,
+                &mechanism,
+                &decision,
+                approved_at,
+                tx_id.as_deref(),
+            );
+            let signature = crate::authority::key::sign(
+                &key,
+                crate::authority::receipt::SIGNING_DOMAIN,
+                &payload,
+            );
+            conn.execute(
+                "UPDATE approval_receipts SET signature = ?1 WHERE receipt_id = ?2",
+                rusqlite::params![signature, receipt_id],
+            )?;
+        }
+    }
+
+    let mut stmt = conn.prepare("PRAGMA table_info(approval_receipts)")?;
+    let now_has_column = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(|r| r.ok())
+        .any(|c| c == "signature");
+    if !now_has_column {
+        return Err(StateMigrationError::PostconditionFailed {
+            migration: "v9_approval_receipt_signature",
+            detail: "approval_receipts.signature does not exist after this step's own DDL ran"
+                .to_string(),
         });
     }
     Ok(())
@@ -972,6 +1096,57 @@ mod tests {
                 "change_intents.{expected} should exist"
             );
         }
+    }
+
+    #[test]
+    fn registered_v8_to_v9_migration_backfills_signatures_for_pre_existing_receipts() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join(".calm").join("state.db");
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        let conn = Connection::open(&db_path).unwrap();
+        init_state_db(&conn).unwrap();
+        conn.pragma_update(None, "user_version", 8).unwrap();
+
+        // A row exactly as v8's own DDL would have inserted it -- no
+        // `signature` column supplied, so it lands NULL, simulating a
+        // receipt written before this migration ever ran.
+        conn.execute(
+            "INSERT INTO approval_receipts \
+             (receipt_id, change_id, authority_id, subject_digest, approved_by, mechanism, \
+              decision, approved_at, tx_id) \
+             VALUES ('RCPT-pre-migration', NULL, NULL, 'digest-1', 'session:abc', \
+                     'self_attested', 'approved', 123.0, NULL)",
+            [],
+        )
+        .unwrap();
+
+        migrate_state_db_to_current(&conn).unwrap();
+        assert_eq!(
+            user_version(&conn),
+            super::super::schema::STATE_DB_SCHEMA_VERSION
+        );
+
+        let signature: Option<String> = conn
+            .query_row(
+                "SELECT signature FROM approval_receipts WHERE receipt_id = 'RCPT-pre-migration'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            signature
+                .as_deref()
+                .is_some_and(|s| s.starts_with("hmac-sha256:")),
+            "pre-existing row should have been backfilled with a real signature, got {signature:?}"
+        );
+        assert_eq!(
+            crate::authority::receipt::verify_approval_receipt_signature(
+                &conn,
+                "RCPT-pre-migration"
+            )
+            .unwrap(),
+            Some(true)
+        );
     }
 
     #[test]

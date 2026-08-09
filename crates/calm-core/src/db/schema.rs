@@ -45,8 +45,11 @@ pub const INDEX_DB_SCHEMA_VERSION: i64 = 1;
 // that a ReviewAuthority's required_approver_class was actually satisfied
 // (self-attestation at mint for SelfReviewed, a real MRTR/legacy
 // elicitation round-trip at spend for Human), not just signed as a claim.
-// See db/state_migrations.rs's registered v1->v2 through v7->v8 steps.
-pub const STATE_DB_SCHEMA_VERSION: i64 = 8;
+// v9 (WS3 follow-up): adds approval_receipts.signature -- an HMAC over the
+// receipt row itself, so it can be verified as genuinely written by
+// insert_approval_receipt rather than hand-inserted. See
+// db/state_migrations.rs's registered v1->v2 through v8->v9 steps.
+pub const STATE_DB_SCHEMA_VERSION: i64 = 9;
 
 /// Refuses to proceed if `conn`'s stamped `PRAGMA user_version` is HIGHER
 /// than `expected` -- meaning a newer CALM binary already created or
@@ -728,7 +731,8 @@ CREATE TABLE IF NOT EXISTS approval_receipts (
     mechanism      TEXT NOT NULL,
     decision       TEXT NOT NULL,
     approved_at    REAL NOT NULL,
-    tx_id          TEXT REFERENCES edit_transactions(tx_id) ON DELETE SET NULL
+    tx_id          TEXT REFERENCES edit_transactions(tx_id) ON DELETE SET NULL,
+    signature      TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_approval_receipts_change ON approval_receipts(change_id);
 CREATE INDEX IF NOT EXISTS idx_approval_receipts_authority ON approval_receipts(authority_id);
