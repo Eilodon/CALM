@@ -99,7 +99,10 @@ pub fn sanitize_source_output(code: &str) -> String {
         let pattern = &CREDENTIAL_PATTERNS[i];
         result = pattern
             .regex
-            .replace_all(&result, format!("{REDACTED_MARKER_PREFIX}{}]", pattern.label))
+            .replace_all(
+                &result,
+                format!("{REDACTED_MARKER_PREFIX}{}]", pattern.label),
+            )
             .into_owned();
     }
     result

@@ -976,12 +976,11 @@ mod tests {
             review_v["error"]["code"], "INTENT_SUPERSEDED",
             "response: {review_v}"
         );
-        assert_eq!(
+        assert!(
             review_v["error"]["message"]
                 .as_str()
                 .unwrap()
                 .contains(&second_id),
-            true,
             "response: {review_v}"
         );
 
@@ -1115,7 +1114,7 @@ mod tests {
         let review_v = serde_json::to_value(&review.0).unwrap();
         let authority_id = review_v["authority_id"]
             .as_str()
-            .expect(&format!("review_change must mint: {review_v}"))
+            .unwrap_or_else(|| panic!("review_change must mint: {review_v}"))
             .to_string();
 
         let hash = calm_core::edit::range_checksum("def helper():\n    return 1\n", 2, 2).unwrap();

@@ -438,7 +438,9 @@ mod preset_registry_tests {
         let resolved = resolve_preset("change").unwrap().unwrap();
         assert_eq!(
             resolved,
-            change_tools.into_iter().collect::<std::collections::BTreeSet<_>>()
+            change_tools
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>()
         );
     }
 

@@ -236,10 +236,10 @@ const VISIBILITY_KEYWORDS: &[&str] = &[
 fn strip_leading_visibility_keyword(line: &str) -> &str {
     let t = line.trim_start();
     for kw in VISIBILITY_KEYWORDS {
-        if let Some(rest) = t.strip_prefix(kw) {
-            if rest.starts_with(char::is_whitespace) || rest.is_empty() {
-                return rest.trim_start();
-            }
+        if let Some(rest) = t.strip_prefix(kw)
+            && (rest.starts_with(char::is_whitespace) || rest.is_empty())
+        {
+            return rest.trim_start();
         }
     }
     t
@@ -308,10 +308,10 @@ fn classify_inner(input: &ObservedChangeInput) -> ChangeKind {
         return ChangeKind::Comment;
     }
 
-    if let (Some(old_sig), Some(new_sig)) = (input.old_signature, input.new_signature) {
-        if is_signature_semantically_changed(old_sig, new_sig, lang) {
-            return ChangeKind::Signature;
-        }
+    if let (Some(old_sig), Some(new_sig)) = (input.old_signature, input.new_signature)
+        && is_signature_semantically_changed(old_sig, new_sig, lang)
+    {
+        return ChangeKind::Signature;
     }
 
     if code_ignoring_leading_visibility(old, lang) == code_ignoring_leading_visibility(new, lang) {

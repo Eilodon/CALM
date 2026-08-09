@@ -158,8 +158,7 @@ impl PolicyDecision {
     /// that's drifted since mint time the same way it already detects a
     /// drifted snapshot/policy-config digest.
     pub fn digest(&self) -> String {
-        let material = serde_json::to_string(self)
-            .unwrap_or_else(|_| format!("{:?}", self));
+        let material = serde_json::to_string(self).unwrap_or_else(|_| format!("{:?}", self));
         crate::digest::evidence_digest(format!("policy-decision-v1\n{material}").as_bytes())
     }
 }
@@ -171,8 +170,7 @@ impl RiskVector {
     /// change that alters HOW a given vector is judged is still
     /// distinguishable from the underlying facts about the touch changing.
     pub fn digest(&self) -> String {
-        let material = serde_json::to_string(self)
-            .unwrap_or_else(|_| format!("{:?}", self));
+        let material = serde_json::to_string(self).unwrap_or_else(|_| format!("{:?}", self));
         crate::digest::evidence_digest(format!("risk-vector-v1\n{material}").as_bytes())
     }
 }

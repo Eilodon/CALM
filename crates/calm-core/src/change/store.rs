@@ -10,6 +10,10 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::change::classify::{ChangeIntentKind, ChangeKind};
 use crate::change::intent::{ChangeIntent, ChangeIntentTarget, IntentStatus};
 
+/// Raw row shape for `change_intents`: (intent_id, kind, reason,
+/// snapshot_id, created_at, status, superseded_by_intent_id).
+type ChangeIntentRow = (String, String, String, String, f64, String, Option<String>);
+
 /// Inserts `intent` and every one of its `targets` in that order --
 /// `change_intent_targets.intent_id` is a foreign key, so target rows
 /// would violate it if inserted first. Not wrapped in an explicit
@@ -85,7 +89,7 @@ pub fn get_change_intent(
     conn: &Connection,
     intent_id: &str,
 ) -> rusqlite::Result<Option<ChangeIntent>> {
-    let row: Option<(String, String, String, String, f64, String, Option<String>)> = conn
+    let row: Option<ChangeIntentRow> = conn
         .query_row(
             "SELECT intent_id, kind, reason, snapshot_id, created_at, status, \
                     superseded_by_intent_id \
@@ -104,8 +108,15 @@ pub fn get_change_intent(
             },
         )
         .optional()?;
-    let Some((intent_id, kind_str, reason, snapshot_id, created_at, status_str, superseded_by_intent_id)) =
-        row
+    let Some((
+        intent_id,
+        kind_str,
+        reason,
+        snapshot_id,
+        created_at,
+        status_str,
+        superseded_by_intent_id,
+    )) = row
     else {
         return Ok(None);
     };
@@ -158,6 +169,7 @@ pub fn get_change_intent(
 ///   3. point `old_intent_id` at `new_intent.intent_id` -- only valid now
 ///      that row exists, since `superseded_by_intent_id` is a real FK to
 ///      `change_intents(intent_id)`.
+///
 /// Steps 1 and 3 touch the same row but can't be merged into one UPDATE:
 /// merging would set the FK column before its target row exists. Callers
 /// are expected to run this inside their own transaction (same pattern as
@@ -288,8 +300,12 @@ mod tests {
         // key -- that would defeat the whole point of plan_change's
         // repeated-call dedup (two different intents both claiming to be
         // "the" answer for one key).
-        let other =
-            ChangeIntent::new(ChangeIntentKind(ChangeKind::Signature), "other", "SNP-e", vec![]);
+        let other = ChangeIntent::new(
+            ChangeIntentKind(ChangeKind::Signature),
+            "other",
+            "SNP-e",
+            vec![],
+        );
         assert!(insert_change_intent(&conn, &other, Some("plan-key-1")).is_err());
     }
 
@@ -363,7 +379,10 @@ mod tests {
 
         let loaded_old = get_change_intent(&conn, &old.intent_id).unwrap().unwrap();
         assert_eq!(loaded_old.status, IntentStatus::Superseded);
-        assert_eq!(loaded_old.superseded_by_intent_id, Some(new.intent_id.clone()));
+        assert_eq!(
+            loaded_old.superseded_by_intent_id,
+            Some(new.intent_id.clone())
+        );
 
         let loaded_new = get_change_intent(&conn, &new.intent_id).unwrap().unwrap();
         assert_eq!(loaded_new.status, IntentStatus::Active);

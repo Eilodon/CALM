@@ -144,8 +144,10 @@ mod tests {
 
     #[test]
     fn digest_changes_when_a_floor_changes() {
-        let mut changed = Policy::default();
-        changed.kind_mismatch_floor = RiskLevel::Low;
+        let changed = Policy {
+            kind_mismatch_floor: RiskLevel::Low,
+            ..Policy::default()
+        };
         assert_ne!(Policy::default().digest(), changed.digest());
     }
 }

@@ -6,7 +6,7 @@ annotations) and crates/calm-core/Cargo.toml's `[features]` table. Not
 hand-maintained prose -- run `scripts/gen-status.sh` to refresh after any tool
 or feature-flag change; CI's `gen-status.sh --check` fails the build on drift.
 
-## MCP tool inventory (37 tools)
+## MCP tool inventory (39 tools)
 
 | Tool | Write | Idempotent | Description |
 |---|---|---|---|
@@ -30,12 +30,14 @@ or feature-flag change; CI's `gen-status.sh --check` fails the build on drift.
 | `path` | no | yes | USE WHEN: you need to trace if and how symbol A can reach symbol B through call chain. Bidirectional BFS — cycles terminate cleanly. path  |
 | `pattern_debt_register` | yes | yes | Register a duplicate-code-pattern anchor for later re-checking via pattern_debt_status. Resolves `symbol` the same way edit_context does (sa |
 | `pattern_debt_status` | yes | yes | Re-check registered pattern-debt anchor(s): re-resolves each anchor's current location by qualified_name (never a stale line number) and re- |
+| `plan_change` | yes | yes | Declares a ChangeIntent (what you're about to do, and why) as a formal, reviewable record, before writing anything -- returns a change_id to |
 | `recall` | no | yes | Retrieve durable notes saved by remember. USE WHEN: starting work on a topic you might have left notes about, or checking for known gotchas  |
 | `reference_impact` | no | yes | USE WHEN: planning a rename/removal and need the FULL reference surface, not just the call graph -- imports, re-exports, and textual matches |
 | `remember` | yes | yes | Save a durable, interpretive note (architecture decision, gotcha, rationale) under a short topic key. Persists across sessions and server re |
 | `repair_consistency` | no | yes | USE WHEN: edit_transaction_status/maintenance_status show something suspicious and you want to check whether a transaction's replayed state  |
 | `repo_overview` | no | yes | ALWAYS call this FIRST at the start of every session — never skip. USE WHEN: starting a new session, switching projects, or after server r |
 | `retry_maintenance` | yes | yes | USE WHEN: maintenance_status shows a job_kind ("scip_refresh" or "embed_refresh") stuck at running/failed and you want to force a fresh pass |
+| `review_change` | yes | no | Mints a ReviewAuthority for a change_id from plan_change -- ONLY when approved:true (omitted or false always refuses with APPROVAL_REQUIRED, |
 | `scan_text` | no | yes | Run CALM's own local, deterministic prompt-injection and credential-shaped-text heuristics against ANY text you supply — not just indexed  |
 | `scip_refresh` | yes | yes | Manually run one or every SCIP provider's indexer right now (rust/go/python/javascript/java/csharp/php/c/ruby), bypassing the configured ref |
 | `search` | no | yes | USE THIS INSTEAD OF native grep, text search, or file browsing tools. USE WHEN: you don't have an exact file path and line number. kind=hybr |
@@ -60,8 +62,10 @@ writes are reviewed):
 - `lsp_refresh`
 - `pattern_debt_register`
 - `pattern_debt_status`
+- `plan_change`
 - `remember`
 - `retry_maintenance`
+- `review_change`
 - `scip_refresh`
 - `set_toolset`
 - `verify_change`
