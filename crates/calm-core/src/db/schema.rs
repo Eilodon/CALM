@@ -41,8 +41,12 @@ pub const INDEX_DB_SCHEMA_VERSION: i64 = 1;
 // -- plan_change's idempotency dedup can now mark a stale intent superseded
 // (and free its idempotency_key) instead of silently reusing it after
 // evidence has drifted; review_change refuses to mint against one.
-// See db/state_migrations.rs's registered v1->v2 through v6->v7 steps.
-pub const STATE_DB_SCHEMA_VERSION: i64 = 7;
+// v8 (WS3, audit follow-up): adds approval_receipts -- a durable record
+// that a ReviewAuthority's required_approver_class was actually satisfied
+// (self-attestation at mint for SelfReviewed, a real MRTR/legacy
+// elicitation round-trip at spend for Human), not just signed as a claim.
+// See db/state_migrations.rs's registered v1->v2 through v7->v8 steps.
+pub const STATE_DB_SCHEMA_VERSION: i64 = 8;
 
 /// Refuses to proceed if `conn`'s stamped `PRAGMA user_version` is HIGHER
 /// than `expected` -- meaning a newer CALM binary already created or
@@ -703,6 +707,31 @@ CREATE TABLE IF NOT EXISTS review_authority_targets (
     UNIQUE(authority_id, path, qualified_name)
 );
 CREATE INDEX IF NOT EXISTS idx_review_authority_targets_authority ON review_authority_targets(authority_id);
+
+-- v8 / WS3 (audit follow-up): a durable, off-band-tamper-evident-adjacent
+-- record that a ReviewAuthority's required_approver_class was actually
+-- satisfied -- required_approver_class alone (v5/CCK-26) is signed but
+-- says nothing about whether the approval it names really happened. One
+-- row per approval event: review_change's approved:true self-attestation
+-- (mechanism='self_attested') at mint for SelfReviewed, or a real
+-- MRTR/legacy elicitation round-trip (mechanism='elicitation') at spend
+-- for Human. change_id/authority_id/tx_id are nullable because the two
+-- call sites don't all have all three at receipt-write time (mint has no
+-- tx_id yet; a pure legacy elicitation approval with no ReviewAuthority
+-- at all has no authority_id).
+CREATE TABLE IF NOT EXISTS approval_receipts (
+    receipt_id     TEXT PRIMARY KEY,
+    change_id      TEXT REFERENCES change_intents(intent_id),
+    authority_id   TEXT REFERENCES review_authorities(authority_id) ON DELETE SET NULL,
+    subject_digest TEXT NOT NULL,
+    approved_by    TEXT NOT NULL,
+    mechanism      TEXT NOT NULL,
+    decision       TEXT NOT NULL,
+    approved_at    REAL NOT NULL,
+    tx_id          TEXT REFERENCES edit_transactions(tx_id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS idx_approval_receipts_change ON approval_receipts(change_id);
+CREATE INDEX IF NOT EXISTS idx_approval_receipts_authority ON approval_receipts(authority_id);
 ";
 
 const FTS5_SQL: &str = "
@@ -1486,7 +1515,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(memory_content, "remember this", "pre-existing rows must survive");
+        assert_eq!(
+            memory_content, "remember this",
+            "pre-existing rows must survive"
+        );
     }
 
     #[test]
@@ -1558,8 +1590,11 @@ mod tests {
         )
         .unwrap();
 
-        conn.execute("DELETE FROM review_authorities WHERE authority_id = 'AUTH-1'", [])
-            .unwrap();
+        conn.execute(
+            "DELETE FROM review_authorities WHERE authority_id = 'AUTH-1'",
+            [],
+        )
+        .unwrap();
 
         let (path, authority_id): (String, Option<String>) = conn
             .query_row(

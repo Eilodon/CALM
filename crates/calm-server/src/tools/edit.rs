@@ -2146,7 +2146,38 @@ impl CalmServer {
                 &base_digest,
                 &proposed_digest,
             ) {
-                Ok(tx) => Some(tx.tx_id),
+                Ok(tx) => {
+                    // WS3 (audit follow-up): a durable record that a real
+                    // human/MRTR elicitation round-trip actually approved
+                    // THIS spend -- required_approver_class=Human (v5/
+                    // CCK-26) is signed onto the authority, but until now
+                    // nothing persisted that the approval it names really
+                    // happened. Best-effort/fail-open: the authority was
+                    // already atomically verified and consumed above: a
+                    // receipt-write failure here must not retroactively
+                    // undo an already-legitimate, already-spent edit (same
+                    // posture as the other best-effort audit writes in this
+                    // function).
+                    if matches!(gate, ElicitGate::Approved)
+                        && let Err(e) = calm_core::authority::insert_approval_receipt(
+                            &state_conn,
+                            &calm_core::authority::ApprovalReceipt {
+                                change_id: Some(change_id),
+                                authority_id: Some(authority_id),
+                                subject_digest: &proposed_digest,
+                                approved_by: &principal,
+                                mechanism: "elicitation",
+                                tx_id: Some(&tx.tx_id),
+                            },
+                        )
+                    {
+                        tracing::warn!(
+                            "could not persist approval receipt for tx {}: {e}",
+                            tx.tx_id
+                        );
+                    }
+                    Some(tx.tx_id)
+                }
                 Err(e) => {
                     use calm_core::authority::AuthorityError as AE;
                     use calm_core::authority::AuthorizeEditError as AEE;

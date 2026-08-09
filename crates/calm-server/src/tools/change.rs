@@ -798,6 +798,28 @@ impl CalmServer {
                     return ToolOutcome::error(error_detail("MINT_FAILED", &e.to_string(), true));
                 }
             };
+            // WS3 (audit follow-up): a durable record that this authority's
+            // required_approver_class was actually satisfied -- for
+            // SelfReviewed, that's exactly the approved:true self-
+            // attestation this handler already required above (checked at
+            // the top of this function, long before minting was even
+            // attempted). For Human, review_change never reaches this point
+            // at all (refused earlier as INDEPENDENT_REVIEW_NOT_AVAILABLE_HERE),
+            // so every receipt written here is genuinely self_attested,
+            // never a Human-tier claim in disguise.
+            if let Err(e) = calm_core::authority::insert_approval_receipt(
+                &tx,
+                &calm_core::authority::ApprovalReceipt {
+                    change_id: Some(&intent.intent_id),
+                    authority_id: Some(&authority.authority_id),
+                    subject_digest: &policy_decision_digest,
+                    approved_by: &principal,
+                    mechanism: "self_attested",
+                    tx_id: None,
+                },
+            ) {
+                return ToolOutcome::error(error_detail("STATE_DB_ERROR", &e.to_string(), true));
+            }
             if let Err(e) = tx.commit() {
                 return ToolOutcome::error(error_detail("STATE_DB_ERROR", &e.to_string(), true));
             }
@@ -1120,6 +1142,70 @@ mod tests {
             std::fs::read_to_string(dir.join("a.py")).unwrap(),
             "def helper():\n    return 2\n"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    // WS3 (audit follow-up): review_change's approved:true self-attestation
+    // must leave a durable approval_receipts row behind, not just the
+    // signed required_approver_class claim on the authority itself.
+    fn review_change_writes_a_self_attested_approval_receipt() {
+        let (dir, server) = test_server("review_change_writes_approval_receipt");
+        std::fs::write(dir.join("a.py"), "def helper():\n    return 1\n").unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.py::helper', 'helper', 'function', 'python', 'a.py', 1, 2, '', '', 'helper', 1, 0, 0)",
+                [],
+            )
+            .unwrap();
+            let catalog = calm_core::indexer::refresh::InputCatalog::for_project(&dir);
+            calm_core::indexer::refresh::persist_index_input_snapshot(&conn, &catalog).unwrap();
+        }
+
+        let plan = server.plan_change(rmcp::handler::server::wrapper::Parameters(plan_params(
+            "body",
+            vec![("a.py", Some("a.py::helper"))],
+        )));
+        let plan_v = serde_json::to_value(&plan.0).unwrap();
+        let change_id = plan_v["change_id"].as_str().unwrap().to_string();
+
+        let review = server.review_change(rmcp::handler::server::wrapper::Parameters(
+            ReviewChangeParams {
+                change_id: change_id.clone(),
+                approved: true,
+                approver: Some("alice".to_string()),
+                ttl_secs: None,
+            },
+        ));
+        let review_v = serde_json::to_value(&review.0).unwrap();
+        let authority_id = review_v["authority_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("review_change must mint: {review_v}"))
+            .to_string();
+
+        let state_conn = server.state_db();
+        let (stored_change_id, stored_authority_id, mechanism, decision, approved_by): (
+            String,
+            String,
+            String,
+            String,
+            String,
+        ) = state_conn
+            .query_row(
+                "SELECT change_id, authority_id, mechanism, decision, approved_by \
+                 FROM approval_receipts WHERE authority_id = ?1",
+                rusqlite::params![authority_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap_or_else(|e| panic!("expected exactly one approval_receipts row: {e}"));
+        assert_eq!(stored_change_id, change_id);
+        assert_eq!(stored_authority_id, authority_id);
+        assert_eq!(mechanism, "self_attested");
+        assert_eq!(decision, "approved");
+        assert!(approved_by.starts_with("session:"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
