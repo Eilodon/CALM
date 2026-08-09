@@ -597,6 +597,7 @@ CREATE TABLE IF NOT EXISTS review_authorities (
     analysis_version   TEXT NOT NULL,
     policy_digest      TEXT NOT NULL,
     principal          TEXT NOT NULL,
+    target_scope_digest TEXT NOT NULL DEFAULT '',
     nonce              TEXT NOT NULL,
     expires_at         REAL NOT NULL,
     signature          TEXT NOT NULL,

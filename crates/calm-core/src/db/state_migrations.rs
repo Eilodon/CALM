@@ -212,6 +212,7 @@ fn v2_to_v3_review_authorities(conn: &Connection) -> Result<(), StateMigrationEr
             analysis_version   TEXT NOT NULL,
             policy_digest      TEXT NOT NULL,
             principal          TEXT NOT NULL,
+            target_scope_digest TEXT NOT NULL DEFAULT '',
             nonce              TEXT NOT NULL,
             expires_at         REAL NOT NULL,
             signature          TEXT NOT NULL,

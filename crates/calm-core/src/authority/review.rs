@@ -27,6 +27,14 @@
 //! `caller_set_digest`, `analysis_version`, `policy_digest`, `principal`,
 //! plus the single-use `nonce` and `expires_at` that make the object a
 //! capability rather than a plain record.
+//!
+//! **CCK-R5** (audit follow-up on this same blueprint): adds a 10th bound
+//! field, `target_scope_digest` -- the original 9 never bound WHICH file/
+//! symbol(s) the authority actually covers (`review_authority_targets` was
+//! persisted for audit purposes only, never part of the signed payload),
+//! so an authority minted for one symbol was, structurally, just as valid
+//! for a different one as long as the OTHER 9 fields happened to still
+//! match. See [`target_scope_digest`]'s own doc comment.
 
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -50,9 +58,33 @@ pub fn current_analysis_version() -> String {
     crate::digest::evidence_digest(material.as_bytes())
 }
 
+/// Canonical, content-addressed digest of a target set -- order-independent
+/// (sorted before hashing) so the same set of targets always binds
+/// identically regardless of what order a caller happened to list them in.
+/// CCK-R5 (audit follow-up): bound into the authority's signature via
+/// [`MintParams::targets`]/[`CurrentState::targets`], so an authority
+/// minted for one symbol/file cannot be silently reused (or partially
+/// reused -- see the module doc comment) for a different one.
+/// `edit_lines`/`edit_symbol` compute `current` from EVERY symbol an edit
+/// actually touches, not just the first, so touching anything outside the
+/// authorized scope changes this digest and fails `verify_and_consume`.
+pub fn target_scope_digest(targets: &[ChangeIntentTarget]) -> String {
+    let mut canonical: Vec<String> = targets
+        .iter()
+        .map(|t| format!("{}\u{0}{}", t.path, t.qualified_name.as_deref().unwrap_or("")))
+        .collect();
+    canonical.sort();
+    let material = format!("target-scope-v1\n{}\n", canonical.join("\n"));
+    crate::digest::evidence_digest(material.as_bytes())
+}
+
 /// Everything a caller must supply to [`ReviewAuthority::mint`]. Every
 /// field here becomes a bound, signed value on the minted authority --
 /// see the module doc comment for why there are exactly this many.
+/// `target_scope_digest` is deliberately NOT a separate field here --
+/// `mint` derives it from `targets` itself ([`target_scope_digest`]), so
+/// there is exactly one way to compute it and a caller can never pass a
+/// digest that doesn't actually match the targets it also passed.
 pub struct MintParams<'a> {
     pub intent_id: &'a str,
     pub snapshot_id: &'a str,
@@ -72,7 +104,10 @@ pub struct MintParams<'a> {
 /// values independently (often minutes apart, from different tool calls),
 /// and giving them different types is a small, free reminder of that
 /// rather than inviting a caller to accidentally reuse a stale `MintParams`
-/// as if it were still current.
+/// as if it were still current. `targets` should be every symbol/file the
+/// PROPOSED edit actually touches (CCK-R5) -- not just the one the caller
+/// believes it's editing -- so a touch outside the authorized scope is
+/// caught structurally rather than trusted.
 pub struct CurrentState<'a> {
     pub intent_id: &'a str,
     pub snapshot_id: &'a str,
@@ -80,6 +115,7 @@ pub struct CurrentState<'a> {
     pub caller_set_digest: &'a str,
     pub policy_digest: &'a str,
     pub principal: &'a str,
+    pub targets: &'a [ChangeIntentTarget],
 }
 
 #[derive(Debug, PartialEq)]
@@ -95,6 +131,11 @@ pub enum AuthorityError {
     /// doc comment for why both collapse to the same variant.
     AlreadyConsumed,
     WrongIntent,
+    /// CCK-R5: the touched symbol/file set no longer matches what this
+    /// authority was minted for -- either a different target entirely, or
+    /// the same target plus an extra one a wider edit also happened to
+    /// overlap.
+    WrongTargetScope,
     StaleSnapshot,
     StaleGraphGeneration,
     StaleCallerSet,
@@ -119,6 +160,10 @@ impl std::fmt::Display for AuthorityError {
             Self::WrongIntent => {
                 write!(f, "review authority was not minted for this change intent")
             }
+            Self::WrongTargetScope => write!(
+                f,
+                "the touched symbol/file set does not match what this review authority was minted for"
+            ),
             Self::StaleSnapshot => write!(
                 f,
                 "review authority's bound EvidenceSnapshot no longer matches current index state"
@@ -157,6 +202,7 @@ pub struct ReviewAuthority {
     pub analysis_version: String,
     pub policy_digest: String,
     pub principal: String,
+    pub target_scope_digest: String,
     pub nonce: String,
     pub expires_at: f64,
     pub signature: String,
@@ -184,6 +230,7 @@ fn new_id(prefix: &str) -> String {
 /// Canonical (field-order-fixed) payload every signature is computed over
 /// -- shared by mint (sign) and verify (re-derive and compare), so the two
 /// can never accidentally diverge in field order or formatting.
+#[allow(clippy::too_many_arguments)]
 fn signing_payload(
     authority_id: &str,
     intent_id: &str,
@@ -193,6 +240,7 @@ fn signing_payload(
     analysis_version: &str,
     policy_digest: &str,
     principal: &str,
+    target_scope_digest: &str,
     nonce: &str,
     expires_at: f64,
 ) -> String {
@@ -200,7 +248,8 @@ fn signing_payload(
         "authority_id={authority_id}\nintent_id={intent_id}\nsnapshot_id={snapshot_id}\n\
          graph_generation={graph_generation}\ncaller_set_digest={caller_set_digest}\n\
          analysis_version={analysis_version}\npolicy_digest={policy_digest}\n\
-         principal={principal}\nnonce={nonce}\nexpires_at={expires_at}\n"
+         principal={principal}\ntarget_scope_digest={target_scope_digest}\n\
+         nonce={nonce}\nexpires_at={expires_at}\n"
     )
 }
 
@@ -220,6 +269,7 @@ impl ReviewAuthority {
         let created_at = now_epoch_secs();
         let expires_at = created_at + params.ttl_secs;
         let analysis_version = current_analysis_version();
+        let target_scope_digest = target_scope_digest(params.targets);
 
         let signature = sign(
             &key,
@@ -233,6 +283,7 @@ impl ReviewAuthority {
                 &analysis_version,
                 params.policy_digest,
                 params.principal,
+                &target_scope_digest,
                 &nonce,
                 expires_at,
             ),
@@ -247,12 +298,19 @@ impl ReviewAuthority {
             analysis_version,
             policy_digest: params.policy_digest.to_string(),
             principal: params.principal.to_string(),
+            target_scope_digest,
             nonce,
             expires_at,
             signature,
             created_at,
         };
 
+        // CCK-R5: snapshot persist + intent insert (by the caller, before
+        // this) + this mint are meant to be wrapped in one transaction by
+        // the caller -- see `mint_review_authority_for_edit_context`
+        // (calm-server/src/tools/guardrails.rs) for the actual BEGIN/COMMIT
+        // this module doesn't own itself (it only ever sees `state_conn`,
+        // never opens or commits a transaction on it).
         authority.persist(state_conn, params.targets)?;
         Ok(authority)
     }
@@ -265,9 +323,9 @@ impl ReviewAuthority {
         state_conn.execute(
             "INSERT INTO review_authorities \
              (authority_id, intent_id, snapshot_id, graph_generation, caller_set_digest, \
-              analysis_version, policy_digest, principal, nonce, expires_at, signature, \
-              created_at, consumed_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, NULL)",
+              analysis_version, policy_digest, principal, target_scope_digest, nonce, \
+              expires_at, signature, created_at, consumed_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, NULL)",
             params![
                 self.authority_id,
                 self.intent_id,
@@ -277,6 +335,7 @@ impl ReviewAuthority {
                 self.analysis_version,
                 self.policy_digest,
                 self.principal,
+                self.target_scope_digest,
                 self.nonce,
                 self.expires_at,
                 self.signature,
@@ -297,6 +356,7 @@ impl ReviewAuthority {
             ("analysis_version", self.analysis_version.as_str()),
             ("policy_digest", self.policy_digest.as_str()),
             ("principal", self.principal.as_str()),
+            ("target_scope_digest", self.target_scope_digest.as_str()),
         ] {
             state_conn.execute(
                 "INSERT INTO review_authority_evidence (authority_id, field_name, field_value) VALUES (?1, ?2, ?3)",
@@ -307,31 +367,47 @@ impl ReviewAuthority {
     }
 
     fn load(state_conn: &Connection, authority_id: &str) -> Result<Option<Self>, AuthorityError> {
-        let row: Option<(String, String, String, i64, String, String, String, String, String, f64, String, f64)> =
-            state_conn
-                .query_row(
-                    "SELECT authority_id, intent_id, snapshot_id, graph_generation, caller_set_digest, \
-                     analysis_version, policy_digest, principal, nonce, expires_at, signature, created_at \
-                     FROM review_authorities WHERE authority_id = ?1",
-                    params![authority_id],
-                    |r| {
-                        Ok((
-                            r.get(0)?,
-                            r.get(1)?,
-                            r.get(2)?,
-                            r.get(3)?,
-                            r.get(4)?,
-                            r.get(5)?,
-                            r.get(6)?,
-                            r.get(7)?,
-                            r.get(8)?,
-                            r.get(9)?,
-                            r.get(10)?,
-                            r.get(11)?,
-                        ))
-                    },
-                )
-                .optional()?;
+        #[allow(clippy::type_complexity)]
+        let row: Option<(
+            String,
+            String,
+            String,
+            i64,
+            String,
+            String,
+            String,
+            String,
+            String,
+            f64,
+            String,
+            f64,
+            String,
+        )> = state_conn
+            .query_row(
+                "SELECT authority_id, intent_id, snapshot_id, graph_generation, caller_set_digest, \
+                 analysis_version, policy_digest, principal, nonce, expires_at, signature, \
+                 created_at, target_scope_digest \
+                 FROM review_authorities WHERE authority_id = ?1",
+                params![authority_id],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                        r.get(8)?,
+                        r.get(9)?,
+                        r.get(10)?,
+                        r.get(11)?,
+                        r.get(12)?,
+                    ))
+                },
+            )
+            .optional()?;
         Ok(row.map(
             |(
                 authority_id,
@@ -346,6 +422,7 @@ impl ReviewAuthority {
                 expires_at,
                 signature,
                 created_at,
+                target_scope_digest,
             )| Self {
                 authority_id,
                 intent_id,
@@ -355,6 +432,7 @@ impl ReviewAuthority {
                 analysis_version,
                 policy_digest,
                 principal,
+                target_scope_digest,
                 nonce,
                 expires_at,
                 signature,
@@ -392,6 +470,7 @@ impl ReviewAuthority {
             &authority.analysis_version,
             &authority.policy_digest,
             &authority.principal,
+            &authority.target_scope_digest,
             &authority.nonce,
             authority.expires_at,
         );
@@ -409,6 +488,13 @@ impl ReviewAuthority {
         // STALE_GRAPH_AUTHORITY's own error already has today.
         if authority.intent_id != current.intent_id {
             return Err(AuthorityError::WrongIntent);
+        }
+        // CCK-R5: recomputed from EVERY symbol/file `current.targets` says
+        // the proposed edit actually touches -- not trusted as a
+        // caller-supplied digest, so a caller can't pass a stale or
+        // mismatched one and have it silently accepted.
+        if authority.target_scope_digest != target_scope_digest(current.targets) {
+            return Err(AuthorityError::WrongTargetScope);
         }
         if authority.graph_generation != current.graph_generation {
             return Err(AuthorityError::StaleGraphGeneration);
@@ -486,6 +572,9 @@ mod tests {
         .unwrap();
     }
 
+    /// Every existing test in this module mints/verifies with an empty
+    /// target scope by default (`mint_params(&[])` paired with this) --
+    /// `wrong_target_scope_is_rejected` below is the one that varies it.
     fn base_current() -> CurrentState<'static> {
         CurrentState {
             intent_id: "INT-1",
@@ -494,6 +583,7 @@ mod tests {
             caller_set_digest: "callers-1",
             policy_digest: "policy-1",
             principal: "session:abc",
+            targets: &[],
         }
     }
 
@@ -694,6 +784,7 @@ mod tests {
             "stale-version",
             &authority.policy_digest,
             &authority.principal,
+            &authority.target_scope_digest,
             &authority.nonce,
             authority.expires_at,
         );
@@ -744,7 +835,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(count, 7, "one evidence row per bound field");
+        assert_eq!(count, 8, "one evidence row per bound field");
     }
 
     #[test]
@@ -784,5 +875,94 @@ mod tests {
     #[test]
     fn current_analysis_version_is_deterministic() {
         assert_eq!(current_analysis_version(), current_analysis_version());
+    }
+
+    #[test]
+    fn wrong_target_scope_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = real_state_conn(dir.path());
+        seed_intent_and_snapshot(&conn);
+        let minted_targets = vec![ChangeIntentTarget {
+            path: "a.rs".to_string(),
+            qualified_name: Some("a.rs::f".to_string()),
+        }];
+        let authority = ReviewAuthority::mint(&conn, mint_params(&minted_targets)).unwrap();
+
+        let different_targets = vec![ChangeIntentTarget {
+            path: "b.rs".to_string(),
+            qualified_name: Some("b.rs::g".to_string()),
+        }];
+        let mut current = base_current();
+        current.targets = &different_targets;
+        assert_eq!(
+            ReviewAuthority::verify_and_consume(&conn, &authority.authority_id, &current),
+            Err(AuthorityError::WrongTargetScope)
+        );
+    }
+
+    #[test]
+    fn touching_an_extra_symbol_beyond_the_minted_scope_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = real_state_conn(dir.path());
+        seed_intent_and_snapshot(&conn);
+        let minted_targets = vec![ChangeIntentTarget {
+            path: "a.rs".to_string(),
+            qualified_name: Some("a.rs::f".to_string()),
+        }];
+        let authority = ReviewAuthority::mint(&conn, mint_params(&minted_targets)).unwrap();
+
+        // Same minted target PLUS one more the edit also happened to
+        // overlap -- a superset must not be silently accepted either.
+        let wider_targets = vec![
+            minted_targets[0].clone(),
+            ChangeIntentTarget {
+                path: "a.rs".to_string(),
+                qualified_name: Some("a.rs::g".to_string()),
+            },
+        ];
+        let mut current = base_current();
+        current.targets = &wider_targets;
+        assert_eq!(
+            ReviewAuthority::verify_and_consume(&conn, &authority.authority_id, &current),
+            Err(AuthorityError::WrongTargetScope)
+        );
+    }
+
+    #[test]
+    fn target_scope_digest_is_order_invariant() {
+        let a = ChangeIntentTarget {
+            path: "a.rs".to_string(),
+            qualified_name: Some("a.rs::f".to_string()),
+        };
+        let b = ChangeIntentTarget {
+            path: "b.rs".to_string(),
+            qualified_name: None,
+        };
+        assert_eq!(
+            target_scope_digest(&[a.clone(), b.clone()]),
+            target_scope_digest(&[b, a]),
+        );
+    }
+
+    #[test]
+    fn matching_target_scope_in_a_different_order_still_verifies() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = real_state_conn(dir.path());
+        seed_intent_and_snapshot(&conn);
+        let a = ChangeIntentTarget {
+            path: "a.rs".to_string(),
+            qualified_name: Some("a.rs::f".to_string()),
+        };
+        let b = ChangeIntentTarget {
+            path: "b.rs".to_string(),
+            qualified_name: None,
+        };
+        let minted_targets = vec![a.clone(), b.clone()];
+        let authority = ReviewAuthority::mint(&conn, mint_params(&minted_targets)).unwrap();
+
+        let reordered_targets = vec![b, a];
+        let mut current = base_current();
+        current.targets = &reordered_targets;
+        ReviewAuthority::verify_and_consume(&conn, &authority.authority_id, &current).unwrap();
     }
 }

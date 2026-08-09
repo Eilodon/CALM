@@ -1245,8 +1245,17 @@ impl CalmServer {
     ) -> Option<MintedAuthorityOutput> {
         let snapshot =
             calm_core::authority::EvidenceSnapshot::compute(conn, &self.project_root).ok()?;
-        let state_conn = calm_core::db::conn::open_state_writer(&self.state_db_path).ok()?;
-        snapshot.persist(&state_conn).ok()?;
+        let mut state_conn = calm_core::db::conn::open_state_writer(&self.state_db_path).ok()?;
+        // CCK-R5 (audit follow-up): snapshot persist + intent insert +
+        // authority mint (which itself does 3 more inserts) must land as
+        // one atomic unit -- a partial write here (e.g. the intent row
+        // persisted, then a crash before the authority row exists) would
+        // leave an orphaned change_intents row with no authority ever
+        // bound to it. Every `?` below rolls the whole transaction back on
+        // drop (Transaction's own Drop impl) if we never reach `commit`.
+        let tx = state_conn.transaction().ok()?;
+
+        snapshot.persist(&tx).ok()?;
 
         let target = calm_core::change::ChangeIntentTarget {
             path: c.path.clone(),
@@ -1258,7 +1267,7 @@ impl CalmServer {
             snapshot.snapshot_id.clone(),
             vec![target.clone()],
         );
-        calm_core::change::insert_change_intent(&state_conn, &intent).ok()?;
+        calm_core::change::insert_change_intent(&tx, &intent).ok()?;
 
         let policy = calm_core::policy::loader::load_policy_or_warn(&self.project_root);
         let policy_digest = policy.digest();
@@ -1266,7 +1275,7 @@ impl CalmServer {
         const AUTHORITY_TTL_SECS: f64 = 1800.0;
 
         let authority = calm_core::authority::ReviewAuthority::mint(
-            &state_conn,
+            &tx,
             calm_core::authority::MintParams {
                 intent_id: &intent.intent_id,
                 snapshot_id: &snapshot.snapshot_id,
@@ -1279,6 +1288,8 @@ impl CalmServer {
             },
         )
         .ok()?;
+
+        tx.commit().ok()?;
 
         Some(MintedAuthorityOutput {
             change_id: intent.intent_id,

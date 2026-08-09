@@ -1260,6 +1260,19 @@ impl CalmServer {
                 let policy = calm_core::policy::loader::load_policy_or_warn(&self.project_root);
                 let policy_digest = policy.digest();
                 let principal = format!("session:{}", self.session_id);
+                // CCK-R5 (audit follow-up): EVERY symbol this edit actually
+                // touches, not just the first -- verify_and_consume's own
+                // target_scope_digest check is what makes a multi-hunk edit
+                // that reaches outside the authorized scope fail closed,
+                // instead of silently validating only against
+                // pre_touched[0] while the rest go unchecked.
+                let current_targets: Vec<calm_core::change::ChangeIntentTarget> = pre_touched
+                    .iter()
+                    .map(|t| calm_core::change::ChangeIntentTarget {
+                        path: path.to_string(),
+                        qualified_name: Some(t.qualified_name.clone()),
+                    })
+                    .collect();
                 let current = calm_core::authority::CurrentState {
                     intent_id: change_id,
                     snapshot_id: &snapshot_id,
@@ -1267,6 +1280,7 @@ impl CalmServer {
                     caller_set_digest: &touched_caller_set_digest,
                     policy_digest: &policy_digest,
                     principal: &principal,
+                    targets: &current_targets,
                 };
                 let state_conn = match calm_core::db::conn::open_state_writer(&self.state_db_path) {
                     Ok(c) => c,
@@ -1303,6 +1317,7 @@ impl CalmServer {
                             AE::Expired => "AUTHORITY_EXPIRED",
                             AE::AlreadyConsumed => "AUTHORITY_ALREADY_CONSUMED",
                             AE::WrongIntent => "AUTHORITY_WRONG_INTENT",
+                            AE::WrongTargetScope => "AUTHORITY_WRONG_TARGET_SCOPE",
                             AE::StaleSnapshot => "AUTHORITY_STALE_SNAPSHOT",
                             AE::StaleGraphGeneration => "STALE_GRAPH_AUTHORITY",
                             AE::StaleCallerSet => "STALE_CALLER_SET",
