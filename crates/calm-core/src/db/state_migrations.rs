@@ -122,6 +122,18 @@ pub const STATE_MIGRATIONS: &[StateMigration] = &[
         name: "v4_authority_consumed_by_tx_id",
         apply: v3_to_v4_authority_consumed_by_tx_id,
     },
+    StateMigration {
+        from: 4,
+        to: 5,
+        name: "v5_authority_policy_decision",
+        apply: v4_to_v5_authority_policy_decision,
+    },
+    StateMigration {
+        from: 5,
+        to: 6,
+        name: "v6_evidence_snapshot_provider_state",
+        apply: v5_to_v6_evidence_snapshot_provider_state,
+    },
 ];
 
 /// v1->v2 (CCK-07): adds `evidence_snapshots`, `change_intents`,
@@ -298,6 +310,89 @@ fn v3_to_v4_authority_consumed_by_tx_id(conn: &Connection) -> Result<(), StateMi
             migration: "v4_authority_consumed_by_tx_id",
             detail: "review_authorities.consumed_by_tx_id does not exist after this step's \
                       own DDL ran"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// v4->v5 (CCK-26, audit follow-up): adds `review_authorities.
+/// policy_decision_digest`/`risk_vector_digest`/`required_approver_class` --
+/// same shape as v3->v4's ALTER above. A real `PolicyEngine::evaluate()`
+/// decision (not just a policy-config digest) now backs each authority;
+/// `required_approver_class` is what `review_change` gates minting on for
+/// a `Human`-required change.
+fn v4_to_v5_authority_policy_decision(conn: &Connection) -> Result<(), StateMigrationError> {
+    let mut stmt = conn.prepare("PRAGMA table_info(review_authorities)")?;
+    let existing_columns: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(|r| r.ok())
+        .collect();
+    let new_columns: &[(&str, &str)] = &[
+        ("policy_decision_digest", "TEXT NOT NULL DEFAULT ''"),
+        ("risk_vector_digest", "TEXT NOT NULL DEFAULT ''"),
+        (
+            "required_approver_class",
+            "TEXT NOT NULL DEFAULT 'self_reviewed'",
+        ),
+    ];
+    for (name, ddl) in new_columns {
+        if !existing_columns.iter().any(|c| c == name) {
+            conn.execute_batch(&format!(
+                "ALTER TABLE review_authorities ADD COLUMN {name} {ddl};"
+            ))?;
+        }
+    }
+
+    let mut stmt = conn.prepare("PRAGMA table_info(review_authorities)")?;
+    let now_has_all = {
+        let cols: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .filter_map(|r| r.ok())
+            .collect();
+        new_columns.iter().all(|(name, _)| cols.iter().any(|c| c == name))
+    };
+    if !now_has_all {
+        return Err(StateMigrationError::PostconditionFailed {
+            migration: "v5_authority_policy_decision",
+            detail: "review_authorities is missing one or more of \
+                      policy_decision_digest/risk_vector_digest/required_approver_class \
+                      after this step's own DDL ran"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// v5->v6 (CCK-26, same audit follow-up): adds
+/// `evidence_snapshots.provider_state_digest` -- same ALTER-loop shape as
+/// v4->v5. `authority::snapshot::EvidenceSnapshot::snapshot_id` now also
+/// binds SCIP/LSP provider run state (`scip_overlay_state`), so a
+/// proof-coverage change with no source/config/graph_generation change
+/// still mints a fresh snapshot; this column is where that digest is
+/// persisted alongside the other three snapshot_id inputs.
+fn v5_to_v6_evidence_snapshot_provider_state(conn: &Connection) -> Result<(), StateMigrationError> {
+    let mut stmt = conn.prepare("PRAGMA table_info(evidence_snapshots)")?;
+    let existing_columns: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(|r| r.ok())
+        .collect();
+    if !existing_columns.iter().any(|c| c == "provider_state_digest") {
+        conn.execute_batch(
+            "ALTER TABLE evidence_snapshots ADD COLUMN provider_state_digest TEXT NOT NULL DEFAULT '';",
+        )?;
+    }
+
+    let mut stmt = conn.prepare("PRAGMA table_info(evidence_snapshots)")?;
+    let now_has_column = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(|r| r.ok())
+        .any(|c| c == "provider_state_digest");
+    if !now_has_column {
+        return Err(StateMigrationError::PostconditionFailed {
+            migration: "v6_evidence_snapshot_provider_state",
+            detail: "evidence_snapshots.provider_state_digest does not exist after this \
+                      step's own DDL ran"
                 .to_string(),
         });
     }
@@ -695,6 +790,56 @@ mod tests {
         assert!(
             columns.iter().any(|c| c == "consumed_by_tx_id"),
             "review_authorities.consumed_by_tx_id should exist"
+        );
+    }
+
+    #[test]
+    fn registered_v4_to_v5_migration_adds_policy_decision_columns() {
+        let conn = fresh_conn();
+        conn.pragma_update(None, "user_version", 4).unwrap();
+        migrate_state_db_to_current(&conn).unwrap();
+        assert_eq!(
+            user_version(&conn),
+            super::super::schema::STATE_DB_SCHEMA_VERSION
+        );
+        let columns: Vec<String> = conn
+            .prepare("PRAGMA table_info(review_authorities)")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        for expected in [
+            "policy_decision_digest",
+            "risk_vector_digest",
+            "required_approver_class",
+        ] {
+            assert!(
+                columns.iter().any(|c| c == expected),
+                "review_authorities.{expected} should exist"
+            );
+        }
+    }
+
+    #[test]
+    fn registered_v5_to_v6_migration_adds_provider_state_digest_column() {
+        let conn = fresh_conn();
+        conn.pragma_update(None, "user_version", 5).unwrap();
+        migrate_state_db_to_current(&conn).unwrap();
+        assert_eq!(
+            user_version(&conn),
+            super::super::schema::STATE_DB_SCHEMA_VERSION
+        );
+        let columns: Vec<String> = conn
+            .prepare("PRAGMA table_info(evidence_snapshots)")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert!(
+            columns.iter().any(|c| c == "provider_state_digest"),
+            "evidence_snapshots.provider_state_digest should exist"
         );
     }
 

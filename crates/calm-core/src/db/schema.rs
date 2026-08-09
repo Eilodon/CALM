@@ -30,8 +30,15 @@ pub const INDEX_DB_SCHEMA_VERSION: i64 = 1;
 // the FK existed the other way -- edit_transactions.authority_id -- but
 // nothing ever set it, and authority consume/txn begin were two separate,
 // non-atomic steps).
-// See db/state_migrations.rs's registered v1->v2, v2->v3 and v3->v4 steps.
-pub const STATE_DB_SCHEMA_VERSION: i64 = 4;
+// v5 (CCK-26, audit follow-up): adds review_authorities.policy_decision_digest/
+// risk_vector_digest/required_approver_class -- a real PolicyEngine::evaluate()
+// decision, not just a policy-config digest, now backs each authority.
+// v6 (CCK-26, same audit follow-up): adds evidence_snapshots.provider_state_digest
+// -- EvidenceSnapshot::snapshot_id now also binds SCIP/LSP provider run state
+// (authority/snapshot.rs::provider_state_digest), so a proof-coverage change
+// with no source/config/graph_generation change still mints a fresh snapshot.
+// See db/state_migrations.rs's registered v1->v2 through v5->v6 steps.
+pub const STATE_DB_SCHEMA_VERSION: i64 = 6;
 
 /// Refuses to proceed if `conn`'s stamped `PRAGMA user_version` is HIGHER
 /// than `expected` -- meaning a newer CALM binary already created or
@@ -558,6 +565,7 @@ CREATE TABLE IF NOT EXISTS evidence_snapshots (
     snapshot_id            TEXT PRIMARY KEY,
     source_catalog_digest  TEXT NOT NULL,
     graph_generation       INTEGER NOT NULL,
+    provider_state_digest  TEXT NOT NULL DEFAULT '',
     freshness_class        TEXT NOT NULL,
     created_at             REAL NOT NULL
 );
@@ -625,7 +633,17 @@ CREATE TABLE IF NOT EXISTS review_authorities (
     -- v4 / CCK-25: which edit_transactions row this authority's single use
     -- was actually spent on -- set atomically together with consumed_at by
     -- authority::review::authorize_and_begin_edit, never independently.
-    consumed_by_tx_id  TEXT REFERENCES edit_transactions(tx_id) ON DELETE SET NULL
+    consumed_by_tx_id  TEXT REFERENCES edit_transactions(tx_id) ON DELETE SET NULL,
+    -- v5 / CCK-26 (audit follow-up): what a REAL PolicyEngine::evaluate()
+    -- run actually decided for this authority, not just a policy-config
+    -- digest -- policy_decision_digest/risk_vector_digest are audit/
+    -- provenance (bound+signed, not yet re-verified fresh at spend time --
+    -- that staleness check is a follow-up, same shape as target_scope_digest's).
+    -- required_approver_class is what review_change actually gates minting
+    -- on: 'human' cannot be satisfied by self-attested approved:true alone.
+    policy_decision_digest  TEXT NOT NULL DEFAULT '',
+    risk_vector_digest      TEXT NOT NULL DEFAULT '',
+    required_approver_class TEXT NOT NULL DEFAULT 'self_reviewed'
 );
 CREATE INDEX IF NOT EXISTS idx_review_authorities_intent ON review_authorities(intent_id);
 

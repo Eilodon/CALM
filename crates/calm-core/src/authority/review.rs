@@ -157,6 +157,14 @@ pub struct MintParams<'a> {
     /// unreasonably long TTL.
     pub ttl_secs: AuthorityTtl,
     pub targets: &'a [ChangeIntentTarget],
+    /// CCK-26 (audit follow-up): the real `PolicyEngine::evaluate()`
+    /// decision that justified this mint -- signed and persisted for
+    /// audit/provenance. NOT YET re-verified fresh at spend time (a
+    /// `target_scope_digest`-style staleness check across these three is a
+    /// natural follow-up, not done in this pass).
+    pub policy_decision_digest: &'a str,
+    pub risk_vector_digest: &'a str,
+    pub required_approver_class: crate::policy::ApproverClass,
 }
 
 /// The current truth to check a stored authority against, at
@@ -269,6 +277,10 @@ pub struct ReviewAuthority {
     pub expires_at: f64,
     pub signature: String,
     pub created_at: f64,
+    /// CCK-26: see [`MintParams`]'s matching fields.
+    pub policy_decision_digest: String,
+    pub risk_vector_digest: String,
+    pub required_approver_class: crate::policy::ApproverClass,
 }
 
 fn now_epoch_secs() -> f64 {
@@ -305,13 +317,18 @@ fn signing_payload(
     target_scope_digest: &str,
     nonce: &str,
     expires_at: f64,
+    policy_decision_digest: &str,
+    risk_vector_digest: &str,
+    required_approver_class: &str,
 ) -> String {
     format!(
         "authority_id={authority_id}\nintent_id={intent_id}\nsnapshot_id={snapshot_id}\n\
          graph_generation={graph_generation}\ncaller_set_digest={caller_set_digest}\n\
          analysis_version={analysis_version}\npolicy_digest={policy_digest}\n\
          principal={principal}\ntarget_scope_digest={target_scope_digest}\n\
-         nonce={nonce}\nexpires_at={expires_at}\n"
+         nonce={nonce}\nexpires_at={expires_at}\n\
+         policy_decision_digest={policy_decision_digest}\nrisk_vector_digest={risk_vector_digest}\n\
+         required_approver_class={required_approver_class}\n"
     )
 }
 
@@ -348,6 +365,9 @@ impl ReviewAuthority {
                 &target_scope_digest,
                 &nonce,
                 expires_at,
+                params.policy_decision_digest,
+                params.risk_vector_digest,
+                params.required_approver_class.as_str(),
             ),
         );
 
@@ -365,6 +385,9 @@ impl ReviewAuthority {
             expires_at,
             signature,
             created_at,
+            policy_decision_digest: params.policy_decision_digest.to_string(),
+            risk_vector_digest: params.risk_vector_digest.to_string(),
+            required_approver_class: params.required_approver_class,
         };
 
         // CCK-R5: snapshot persist + intent insert (by the caller, before
@@ -386,8 +409,9 @@ impl ReviewAuthority {
             "INSERT INTO review_authorities \
              (authority_id, intent_id, snapshot_id, graph_generation, caller_set_digest, \
               analysis_version, policy_digest, principal, target_scope_digest, nonce, \
-              expires_at, signature, created_at, consumed_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, NULL)",
+              expires_at, signature, created_at, consumed_at, \
+              policy_decision_digest, risk_vector_digest, required_approver_class) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, NULL, ?14, ?15, ?16)",
             params![
                 self.authority_id,
                 self.intent_id,
@@ -402,6 +426,9 @@ impl ReviewAuthority {
                 self.expires_at,
                 self.signature,
                 self.created_at,
+                self.policy_decision_digest,
+                self.risk_vector_digest,
+                self.required_approver_class.as_str(),
             ],
         )?;
         for target in targets {
@@ -429,11 +456,15 @@ impl ReviewAuthority {
             String,
             f64,
             String,
+            String,
+            String,
+            String,
         )> = state_conn
             .query_row(
                 "SELECT authority_id, intent_id, snapshot_id, graph_generation, caller_set_digest, \
                  analysis_version, policy_digest, principal, nonce, expires_at, signature, \
-                 created_at, target_scope_digest \
+                 created_at, target_scope_digest, policy_decision_digest, risk_vector_digest, \
+                 required_approver_class \
                  FROM review_authorities WHERE authority_id = ?1",
                 params![authority_id],
                 |r| {
@@ -451,11 +482,14 @@ impl ReviewAuthority {
                         r.get(10)?,
                         r.get(11)?,
                         r.get(12)?,
+                        r.get(13)?,
+                        r.get(14)?,
+                        r.get(15)?,
                     ))
                 },
             )
             .optional()?;
-        Ok(row.map(
+        row.map(
             |(
                 authority_id,
                 intent_id,
@@ -470,22 +504,41 @@ impl ReviewAuthority {
                 signature,
                 created_at,
                 target_scope_digest,
-            )| Self {
-                authority_id,
-                intent_id,
-                snapshot_id,
-                graph_generation,
-                caller_set_digest,
-                analysis_version,
-                policy_digest,
-                principal,
-                target_scope_digest,
-                nonce,
-                expires_at,
-                signature,
-                created_at,
+                policy_decision_digest,
+                risk_vector_digest,
+                required_approver_class,
+            )| {
+                let required_approver_class = crate::policy::ApproverClass::parse(
+                    &required_approver_class,
+                )
+                .ok_or_else(|| {
+                    AuthorityError::Db(rusqlite::Error::InvalidColumnType(
+                        15,
+                        "required_approver_class".to_string(),
+                        rusqlite::types::Type::Text,
+                    ))
+                })?;
+                Ok(Self {
+                    authority_id,
+                    intent_id,
+                    snapshot_id,
+                    graph_generation,
+                    caller_set_digest,
+                    analysis_version,
+                    policy_digest,
+                    principal,
+                    target_scope_digest,
+                    nonce,
+                    expires_at,
+                    signature,
+                    created_at,
+                    policy_decision_digest,
+                    risk_vector_digest,
+                    required_approver_class,
+                })
             },
-        ))
+        )
+        .transpose()
     }
 
     /// Verifies `authority_id` against `current`, then atomically consumes
@@ -541,6 +594,9 @@ impl ReviewAuthority {
             &authority.target_scope_digest,
             &authority.nonce,
             authority.expires_at,
+            &authority.policy_decision_digest,
+            &authority.risk_vector_digest,
+            authority.required_approver_class.as_str(),
         );
         if !verify(&key, SIGNING_DOMAIN, &payload, &authority.signature) {
             return Err(AuthorityError::ForgedSignature);
@@ -764,6 +820,9 @@ mod tests {
             principal: "session:abc",
             ttl_secs: AuthorityTtl::from_secs(300.0).unwrap(),
             targets,
+            policy_decision_digest: "policy-decision-1",
+            risk_vector_digest: "risk-vector-1",
+            required_approver_class: crate::policy::ApproverClass::SelfReviewed,
         }
     }
 
@@ -968,6 +1027,9 @@ mod tests {
             &authority.target_scope_digest,
             &authority.nonce,
             past_expiry,
+            &authority.policy_decision_digest,
+            &authority.risk_vector_digest,
+            authority.required_approver_class.as_str(),
         );
         let resigned = sign(&key, SIGNING_DOMAIN, &payload);
         conn.execute(
@@ -1095,6 +1157,9 @@ mod tests {
             &authority.target_scope_digest,
             &authority.nonce,
             authority.expires_at,
+            &authority.policy_decision_digest,
+            &authority.risk_vector_digest,
+            authority.required_approver_class.as_str(),
         );
         let resigned = sign(&key, SIGNING_DOMAIN, &payload);
         conn.execute(

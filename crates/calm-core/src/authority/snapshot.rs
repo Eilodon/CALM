@@ -102,6 +102,9 @@ pub struct EvidenceSnapshot {
     pub source_catalog_digest: String,
     /// Current `graph_generation_state.generation` (0 if never indexed).
     pub graph_generation: i64,
+    /// `evidence_digest` over the sorted `scip_overlay_state` rows -- see
+    /// [`provider_state_digest`] for what it does and does not capture.
+    pub provider_state_digest: String,
     pub freshness_class: FreshnessClass,
 }
 
@@ -136,12 +139,14 @@ impl EvidenceSnapshot {
         let source_catalog_digest = source_catalog_digest(conn)?;
         let graph_generation = current_graph_generation(conn);
         let config_digest = config_digest(project_root);
+        let provider_state_digest = provider_state_digest(conn);
 
         let material = format!(
             "evidence-snapshot-v1\n\
              source_catalog_digest={source_catalog_digest}\n\
              graph_generation={graph_generation}\n\
              config_digest={config_digest}\n\
+             provider_state_digest={provider_state_digest}\n\
              graph_derivation_version={}\n\
              package_graph_version={}\n",
             crate::graph::digest::GRAPH_DERIVATION_VERSION,
@@ -153,6 +158,7 @@ impl EvidenceSnapshot {
             snapshot_id,
             source_catalog_digest,
             graph_generation,
+            provider_state_digest,
             freshness_class,
         })
     }
@@ -178,8 +184,9 @@ impl EvidenceSnapshot {
         // `current` > `degraded`), never weaker and never silently dropped.
         state_conn.execute(
             "INSERT INTO evidence_snapshots \
-             (snapshot_id, source_catalog_digest, graph_generation, freshness_class, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5) \
+             (snapshot_id, source_catalog_digest, graph_generation, provider_state_digest, \
+              freshness_class, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
              ON CONFLICT(snapshot_id) DO UPDATE SET freshness_class = excluded.freshness_class \
              WHERE (CASE excluded.freshness_class \
                         WHEN 'reconciled' THEN 2 WHEN 'current' THEN 1 ELSE 0 END) \
@@ -189,6 +196,7 @@ impl EvidenceSnapshot {
                 self.snapshot_id,
                 self.source_catalog_digest,
                 self.graph_generation,
+                self.provider_state_digest,
                 self.freshness_class.as_str(),
                 now_epoch_secs(),
             ],
@@ -199,15 +207,16 @@ impl EvidenceSnapshot {
     /// `Ok(None)` when no row matches. `state_conn` is a state.db
     /// connection, same as [`persist`](Self::persist).
     pub fn load(state_conn: &Connection, snapshot_id: &str) -> rusqlite::Result<Option<Self>> {
-        let row: Option<(String, String, i64, String)> = state_conn
+        let row: Option<(String, String, i64, String, String)> = state_conn
             .query_row(
-                "SELECT snapshot_id, source_catalog_digest, graph_generation, freshness_class \
+                "SELECT snapshot_id, source_catalog_digest, graph_generation, \
+                        provider_state_digest, freshness_class \
                  FROM evidence_snapshots WHERE snapshot_id = ?1",
                 params![snapshot_id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
             .optional()?;
-        let Some((snapshot_id, source_catalog_digest, graph_generation, freshness_str)) = row
+        let Some((snapshot_id, source_catalog_digest, graph_generation, provider_state_digest, freshness_str)) = row
         else {
             return Ok(None);
         };
@@ -223,6 +232,7 @@ impl EvidenceSnapshot {
             snapshot_id,
             source_catalog_digest,
             graph_generation,
+            provider_state_digest,
             freshness_class,
         }))
     }
@@ -252,6 +262,51 @@ fn source_catalog_digest(conn: &Connection) -> rusqlite::Result<String> {
         material.push('\n');
     }
     Ok(evidence_digest(material.as_bytes()))
+}
+
+/// `evidence_digest` over the sorted `provider\0cache_key\0upgraded\0
+/// ruled_out\0inserted\0match_rate` rows of `scip_overlay_state` -- the
+/// same DB-resident table `scip::state` uses in place of the old
+/// `.calm/<provider>.cache` sidecar files (see that module's doc comment).
+/// This is the "did a SCIP/LSP provider's proof coverage change" half of
+/// the snapshot: a provider that ran again and produced the same
+/// cache_key/counts/match_rate did not change anything this snapshot needs
+/// to attest to, so `last_run_unix` (wall-clock, not content) is
+/// deliberately excluded -- including it would flip `snapshot_id` on every
+/// redundant re-run and defeat the "changes iff something real changed"
+/// contract every other digest in this module upholds. A project with no
+/// SCIP/LSP provider ever run (table empty, or absent on an
+/// index.db older than `migrate_add_scip_overlay_state`) still gets a
+/// stable digest of the header alone -- "no provider state" is itself a
+/// value, not an error.
+fn provider_state_digest(conn: &Connection) -> String {
+    let mut material = String::from("provider-state-v1\n");
+    let mut stmt = match conn.prepare(
+        "SELECT provider, cache_key, upgraded, ruled_out, inserted, match_rate \
+         FROM scip_overlay_state ORDER BY provider",
+    ) {
+        Ok(stmt) => stmt,
+        Err(_) => return evidence_digest(material.as_bytes()),
+    };
+    let rows = stmt.query_map([], |r| {
+        let provider: String = r.get(0)?;
+        let cache_key: Option<String> = r.get(1)?;
+        let upgraded: i64 = r.get(2)?;
+        let ruled_out: i64 = r.get(3)?;
+        let inserted: i64 = r.get(4)?;
+        let match_rate: f64 = r.get(5)?;
+        Ok(format!(
+            "{provider}\0{}\0{upgraded}\0{ruled_out}\0{inserted}\0{match_rate}",
+            cache_key.as_deref().unwrap_or("")
+        ))
+    });
+    if let Ok(rows) = rows {
+        for row in rows.flatten() {
+            material.push_str(&row);
+            material.push('\n');
+        }
+    }
+    evidence_digest(material.as_bytes())
 }
 
 /// Mirrors `guardrails.rs::edit_context`'s own read of the same table --
@@ -355,6 +410,39 @@ mod tests {
         // graph_generation alone must not move source_catalog_digest --
         // that field is keyed only on file_index content.
         assert_eq!(before.source_catalog_digest, after.source_catalog_digest);
+    }
+
+    #[test]
+    fn provider_run_state_change_flips_the_snapshot_id_without_touching_source_catalog() {
+        let conn = conn_with_file_index(&[("a.rs", "h1")]);
+        let root = tmp_project();
+        let before = EvidenceSnapshot::compute(&conn, root.path()).unwrap();
+
+        crate::scip::state::write_state(&conn, "rust", "cache-key-1", 3, 1, 5, 0.9);
+        let after = EvidenceSnapshot::compute(&conn, root.path()).unwrap();
+
+        assert_ne!(before.provider_state_digest, after.provider_state_digest);
+        assert_ne!(before.snapshot_id, after.snapshot_id);
+        // source_catalog_digest is keyed only on file_index content -- a
+        // provider run touches neither the files nor their hashes.
+        assert_eq!(before.source_catalog_digest, after.source_catalog_digest);
+    }
+
+    #[test]
+    fn provider_run_state_re_run_with_identical_results_does_not_flip_the_snapshot_id() {
+        let conn = conn_with_file_index(&[("a.rs", "h1")]);
+        let root = tmp_project();
+        crate::scip::state::write_state(&conn, "rust", "cache-key-1", 3, 1, 5, 0.9);
+        let first = EvidenceSnapshot::compute(&conn, root.path()).unwrap();
+
+        // A redundant re-run producing byte-identical counts/cache_key
+        // (only `last_run_unix` differs) must not be mistaken for new
+        // evidence -- see `provider_state_digest`'s doc comment.
+        crate::scip::state::write_state(&conn, "rust", "cache-key-1", 3, 1, 5, 0.9);
+        let second = EvidenceSnapshot::compute(&conn, root.path()).unwrap();
+
+        assert_eq!(first.provider_state_digest, second.provider_state_digest);
+        assert_eq!(first.snapshot_id, second.snapshot_id);
     }
 
     #[test]

@@ -43,6 +43,7 @@
 
 use super::common::*;
 use super::*;
+use rusqlite::OptionalExtension;
 
 /// One file (optionally symbol-scoped) target of a `plan_change` call --
 /// wire shape for `calm_core::change::ChangeIntentTarget`.
@@ -440,7 +441,7 @@ impl CalmServer {
                 ));
             }
 
-            let (snapshot, graph_generation, caller_set_digest) = {
+            let (snapshot, graph_generation, caller_set_digest, risk_vector) = {
                 let conn = match self.make_read_conn() {
                     Ok(c) => c,
                     Err(e) => return db_error(e),
@@ -489,19 +490,106 @@ impl CalmServer {
                 // limit that still applies).
                 let mut caller_qns: std::collections::BTreeSet<String> =
                     std::collections::BTreeSet::new();
+                // CCK-26 (audit follow-up): a real RiskVector, built from every
+                // declared target -- caller_count_level/is_hub/hub_kind straight
+                // from `symbols`, risk_rule_floor from this project's
+                // config.risk_rules, the same signals classify_gate's own
+                // compute_touch_risk uses for the legacy write gate.
+                // signature_changed/uncertain_zero_caller/touches_uncovered_code
+                // are NOT wired in this pass (no live diff / coverage data
+                // available at review_change time) -- documented gap, default
+                // false, never risk-elevated by their absence here.
+                let mut caller_count_level = calm_core::policy::RiskLevel::Low;
+                let mut is_hub = false;
+                let mut hub_kind: Option<String> = None;
+                let mut risk_rule_floor: Option<calm_core::policy::RiskLevel> = None;
                 for t in &intent.targets {
                     if let Some(qn) = &t.qualified_name {
                         caller_qns.extend(super::edit::caller_symbol_set(&conn, qn));
+                        if let Ok(Some((caller_count, sym_is_hub, sym_hub_kind))) = conn
+                            .query_row(
+                                "SELECT caller_count, is_hub, hub_kind FROM symbols \
+                                 WHERE qualified_name = ?1",
+                                rusqlite::params![qn],
+                                |r| {
+                                    Ok((
+                                        r.get::<_, i64>(0)?,
+                                        r.get::<_, bool>(1)?,
+                                        r.get::<_, Option<String>>(2)?,
+                                    ))
+                                },
+                            )
+                            .optional()
+                        {
+                            if let Some(level) = calm_core::policy::RiskLevel::parse(
+                                super::detail::risk_level_from_caller_count(caller_count),
+                            ) {
+                                caller_count_level = caller_count_level.max(level);
+                            }
+                            if sym_is_hub {
+                                is_hub = true;
+                                if hub_kind.is_none() {
+                                    hub_kind = sym_hub_kind;
+                                }
+                            }
+                        }
+                    }
+                    if let Some((level_str, _glob)) =
+                        calm_core::config::risk_floor_for_path(&self.config().risk_rules, &t.path)
+                        && let Some(level) = calm_core::policy::RiskLevel::parse(level_str)
+                    {
+                        risk_rule_floor = Some(risk_rule_floor.map_or(level, |cur| cur.max(level)));
                     }
                 }
                 let caller_set_digest =
                     Self::caller_set_digest(&caller_qns.into_iter().collect::<Vec<_>>());
-                (snapshot, graph_generation, caller_set_digest)
+                let (kind_mismatch, _observed, _notes) =
+                    check_declared_vs_observed(&self.project_root, intent.kind.0, &intent.targets);
+                let touches_manifest = intent
+                    .targets
+                    .iter()
+                    .any(|t| calm_core::change::classify::is_manifest_path(&t.path));
+                let risk_vector = calm_core::policy::RiskVector {
+                    caller_count_level,
+                    is_hub,
+                    hub_kind,
+                    signature_changed: false,
+                    uncertain_zero_caller: false,
+                    risk_rule_floor,
+                    kind_mismatch,
+                    touches_manifest,
+                    touches_uncovered_code: false,
+                };
+                (snapshot, graph_generation, caller_set_digest, risk_vector)
             };
 
             let policy = calm_core::policy::loader::load_policy_or_warn(&self.project_root);
             let policy_digest = policy.digest();
             let principal = format!("session:{}", self.session_id);
+
+            // CCK-26 (audit follow-up): a REAL PolicyEngine::evaluate() decision,
+            // not just a policy-config digest. For a Human-required change,
+            // review_change's approved:true self-attestation (already confirmed
+            // true above -- this handler never reaches here otherwise) is not
+            // independent review -- only edit_lines/edit_symbol's own
+            // unconditional HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW check (CCK-23)
+            // is, so refuse to mint here rather than hand out an authority that
+            // can only ever be inert for the write it was meant to cover.
+            let policy_decision = calm_core::policy::evaluate(&risk_vector, &policy);
+            if policy_decision.required_approver_class == calm_core::policy::ApproverClass::Human {
+                return ToolOutcome::error(error_detail(
+                    "INDEPENDENT_REVIEW_NOT_AVAILABLE_HERE",
+                    &format!(
+                        "this change is \"{}\" risk ({}) -- review_change's approved:true \
+                         self-attestation is not independent review at this tier. Spend this \
+                         change via edit_lines/edit_symbol with [edit] elicit_hub_confirm \
+                         enabled, which performs the actual human/MRTR round-trip",
+                        policy_decision.aggregate_risk.as_str(),
+                        policy_decision.reasons.join("; "),
+                    ),
+                    true,
+                ));
+            }
 
             let mut state_conn = match calm_core::db::conn::open_state_writer(&self.state_db_path)
             {
@@ -519,6 +607,8 @@ impl CalmServer {
             if let Err(e) = snapshot.persist(&tx) {
                 return ToolOutcome::error(error_detail("STATE_DB_ERROR", &e.to_string(), true));
             }
+            let policy_decision_digest = policy_decision.digest();
+            let risk_vector_digest = risk_vector.digest();
             let authority = match calm_core::authority::ReviewAuthority::mint(
                 &tx,
                 calm_core::authority::MintParams {
@@ -530,6 +620,9 @@ impl CalmServer {
                     principal: &principal,
                     ttl_secs: ttl,
                     targets: &intent.targets,
+                    policy_decision_digest: &policy_decision_digest,
+                    risk_vector_digest: &risk_vector_digest,
+                    required_approver_class: policy_decision.required_approver_class,
                 },
             ) {
                 Ok(a) => a,
@@ -786,6 +879,68 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dir.join("a.py")).unwrap(),
             "def helper():\n    return 2\n"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn review_change_refuses_self_attestation_for_a_high_risk_target() {
+        // CCK-26 (audit follow-up): completes what CCK-23 deferred --
+        // review_change itself now runs a real RiskVector -> PolicyDecision
+        // and refuses to mint when the required approver class is Human,
+        // rather than only relying on edit_lines/edit_symbol's spend-time
+        // backstop. Uses the same risk_rules-escalation technique as
+        // edit_lines_gates_a_low_fan_in_symbol_whose_path_matches_a_risk_rule
+        // (tools.rs) to force "high" risk independent of caller_count.
+        let (dir, server) = test_server("review_change_refuses_human_required");
+        std::fs::create_dir_all(dir.join("auth")).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"risk_rules": [{"glob": "auth/**", "minimum": "high"}]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("auth/login.py"),
+            "def check_token():\n    return True\n",
+        )
+        .unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('auth/login.py::check_token', 'check_token', 'function', 'python', 'auth/login.py', 1, 2, '', '', 'check_token', 2, 0, 0)",
+                [],
+            )
+            .unwrap();
+            let catalog = calm_core::indexer::refresh::InputCatalog::for_project(&dir);
+            calm_core::indexer::refresh::persist_index_input_snapshot(&conn, &catalog).unwrap();
+        }
+
+        let plan = server.plan_change(rmcp::handler::server::wrapper::Parameters(plan_params(
+            "body",
+            vec![("auth/login.py", Some("auth/login.py::check_token"))],
+        )));
+        let plan_v = serde_json::to_value(&plan.0).unwrap();
+        let change_id = plan_v["change_id"].as_str().unwrap().to_string();
+
+        let review = server.review_change(rmcp::handler::server::wrapper::Parameters(
+            ReviewChangeParams {
+                change_id,
+                approved: true,
+                approver: Some("alice".to_string()),
+                ttl_secs: None,
+            },
+        ));
+        let review_v = serde_json::to_value(&review.0).unwrap();
+        assert_eq!(
+            review_v["error"]["code"], "INDEPENDENT_REVIEW_NOT_AVAILABLE_HERE",
+            "a risk_rules-escalated high-risk target must refuse self-attestation: \
+             response {review_v}"
+        );
+        assert!(
+            review_v.get("authority_id").is_none(),
+            "no authority should have been minted: {review_v}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
