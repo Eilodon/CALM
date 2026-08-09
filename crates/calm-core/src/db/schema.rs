@@ -87,12 +87,51 @@ pub fn init_db_versioned(conn: &Connection) -> rusqlite::Result<()> {
 
 /// `init_state_db`'s counterpart to `init_db_versioned` -- see that
 /// function's doc comment.
+///
+/// CCK-28 (audit follow-up): a genuinely empty file gets the CURRENT full
+/// schema (`init_state_db`) directly, DDL and version stamp wrapped in one
+/// transaction so a crash between them can never leave a file with the
+/// current physical schema but an old (or unstamped) `user_version`. A
+/// pre-existing file instead goes straight to `migrate_state_db_to_current`
+/// WITHOUT running `init_state_db` first -- every prior version of this
+/// function ran the full current-schema DDL unconditionally before
+/// migrating, which only stayed safe by accident: every statement in it
+/// happens to be `IF NOT EXISTS`/idempotent today, but a future migration
+/// step needing something schema-version-dependent to NOT already exist
+/// (e.g. `CREATE INDEX ... ON t(new_column)` before the ALTER that adds
+/// `new_column`) would silently break under "current schema always runs
+/// first." Each registered step is independently self-sufficient (creates
+/// whatever it needs, not just ALTERs an assumed-present table) precisely
+/// so it never depends on that ordering -- see
+/// `state_migrations.rs`'s own `registered_migrations_are_self_sufficient_
+/// against_a_genuine_pre_v2_database` test.
 pub fn init_state_db_versioned(conn: &Connection) -> rusqlite::Result<()> {
     refuse_if_schema_newer(conn, STATE_DB_SCHEMA_VERSION, "state.db")?;
-    init_state_db(conn)?;
-    // CCK-01: run any registered forward migrations from the on-disk version
-    // up to STATE_DB_SCHEMA_VERSION, then stamp it (see state_migrations.rs).
-    super::state_migrations::migrate_state_db_to_current(conn)?;
+    let is_empty: bool = conn.query_row(
+        "SELECT NOT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table')",
+        [],
+        |r| r.get(0),
+    )?;
+    if is_empty {
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| -> rusqlite::Result<()> {
+            init_state_db(conn)?;
+            conn.pragma_update(None, "user_version", STATE_DB_SCHEMA_VERSION)?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => conn.execute_batch("COMMIT")?,
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(e);
+            }
+        }
+    } else {
+        // CCK-01: run any registered forward migrations from the on-disk
+        // version up to STATE_DB_SCHEMA_VERSION, then stamp it (see
+        // state_migrations.rs) -- already atomic per-step on its own.
+        super::state_migrations::migrate_state_db_to_current(conn)?;
+    }
     Ok(())
 }
 
@@ -1378,6 +1417,76 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(stamped_again, STATE_DB_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn init_state_db_versioned_migrates_a_non_empty_pre_v2_db_instead_of_bootstrapping_over_it() {
+        // CCK-28 (audit follow-up): the real production entry point, not
+        // `migrate_state_db_to_current` directly -- proves
+        // `init_state_db_versioned`'s own is_empty branch selection routes
+        // a pre-existing (but unstamped) file straight to the migration
+        // chain rather than running the current full-schema DDL first. A
+        // pre-v2 install only ever had `project_memory` from this table
+        // set -- everything else this migrates in is new.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE project_memory (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                topic       TEXT NOT NULL UNIQUE,
+                content     TEXT NOT NULL,
+                created_at  TEXT NOT NULL,
+                updated_at  TEXT NOT NULL
+            );
+            CREATE TABLE edit_transactions (
+                tx_id            TEXT PRIMARY KEY,
+                project_id       TEXT NOT NULL,
+                path             TEXT NOT NULL,
+                base_digest      TEXT NOT NULL,
+                proposed_digest  TEXT NOT NULL,
+                state            TEXT NOT NULL DEFAULT 'PREPARED',
+                created_at       REAL NOT NULL,
+                updated_at       REAL NOT NULL
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO project_memory (topic, content, created_at, updated_at) \
+             VALUES ('gotcha', 'remember this', 't0', 't0')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0,
+            "must start unstamped, same as every real pre-versioning install"
+        );
+
+        init_state_db_versioned(&conn).unwrap();
+
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            STATE_DB_SCHEMA_VERSION
+        );
+        for table in ["evidence_snapshots", "change_intents", "review_authorities"] {
+            let exists: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                    [table],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(exists, "{table} should exist after migrating this fixture");
+        }
+        let memory_content: String = conn
+            .query_row(
+                "SELECT content FROM project_memory WHERE topic = 'gotcha'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(memory_content, "remember this", "pre-existing rows must survive");
     }
 
     #[test]
