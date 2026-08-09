@@ -78,6 +78,65 @@ pub fn target_scope_digest(targets: &[ChangeIntentTarget]) -> String {
     crate::digest::evidence_digest(material.as_bytes())
 }
 
+/// Longest lifetime a [`ReviewAuthority`] may be minted with: 24 hours. A
+/// review authority is meant to cover one edit shortly after its evidence
+/// was gathered (`EvidenceSnapshot`'s own freshness window is much
+/// shorter still), not to become a long-lived standing credential.
+pub const AUTHORITY_TTL_MAX_SECS: f64 = 24.0 * 60.0 * 60.0;
+
+/// Validated lifetime for a minted [`ReviewAuthority`] -- CCK-R5.4 (audit
+/// follow-up): replaces a raw `f64 ttl_secs` a caller could pass as NaN,
+/// infinite, negative (yielding an authority born already-expired, which
+/// `mint()` used to silently accept without complaint), or absurdly long
+/// (a multi-year "review" authority). Validation happens once, at
+/// construction, so everywhere downstream that reads
+/// [`AuthorityTtl::as_secs`] can trust the value without re-checking it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AuthorityTtl(f64);
+
+#[derive(Debug, PartialEq)]
+pub enum AuthorityTtlError {
+    NotFinite,
+    NotPositive,
+    TooLong { secs: f64, max: f64 },
+}
+
+impl std::fmt::Display for AuthorityTtlError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFinite => write!(f, "authority TTL must be a finite number of seconds"),
+            Self::NotPositive => write!(f, "authority TTL must be greater than zero seconds"),
+            Self::TooLong { secs, max } => {
+                write!(f, "authority TTL of {secs}s exceeds the maximum of {max}s")
+            }
+        }
+    }
+}
+
+impl std::error::Error for AuthorityTtlError {}
+
+impl AuthorityTtl {
+    pub fn from_secs(secs: f64) -> Result<Self, AuthorityTtlError> {
+        if !secs.is_finite() {
+            return Err(AuthorityTtlError::NotFinite);
+        }
+        if secs <= 0.0 {
+            return Err(AuthorityTtlError::NotPositive);
+        }
+        if secs > AUTHORITY_TTL_MAX_SECS {
+            return Err(AuthorityTtlError::TooLong {
+                secs,
+                max: AUTHORITY_TTL_MAX_SECS,
+            });
+        }
+        Ok(Self(secs))
+    }
+
+    pub fn as_secs(self) -> f64 {
+        self.0
+    }
+}
+
 /// Everything a caller must supply to [`ReviewAuthority::mint`]. Every
 /// field here becomes a bound, signed value on the minted authority --
 /// see the module doc comment for why there are exactly this many.
@@ -92,8 +151,11 @@ pub struct MintParams<'a> {
     pub caller_set_digest: &'a str,
     pub policy_digest: &'a str,
     pub principal: &'a str,
-    /// Seconds from now until the minted authority expires.
-    pub ttl_secs: f64,
+    /// How long from now until the minted authority expires -- CCK-R5.4:
+    /// validated at construction (see [`AuthorityTtl::from_secs`]), so
+    /// `mint` can never be handed a NaN, infinite, non-positive, or
+    /// unreasonably long TTL.
+    pub ttl_secs: AuthorityTtl,
     pub targets: &'a [ChangeIntentTarget],
 }
 
@@ -267,7 +329,7 @@ impl ReviewAuthority {
         let authority_id = new_id("AUTH");
         let nonce = new_id("NONCE");
         let created_at = now_epoch_secs();
-        let expires_at = created_at + params.ttl_secs;
+        let expires_at = created_at + params.ttl_secs.as_secs();
         let analysis_version = current_analysis_version();
         let target_scope_digest = target_scope_digest(params.targets);
 
@@ -595,7 +657,7 @@ mod tests {
             caller_set_digest: "callers-1",
             policy_digest: "policy-1",
             principal: "session:abc",
-            ttl_secs: 300.0,
+            ttl_secs: AuthorityTtl::from_secs(300.0).unwrap(),
             targets,
         }
     }
@@ -665,9 +727,36 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let conn = real_state_conn(dir.path());
         seed_intent_and_snapshot(&conn);
-        let mut params = mint_params(&[]);
-        params.ttl_secs = -1.0; // already expired the instant it's minted
-        let authority = ReviewAuthority::mint(&conn, params).unwrap();
+        let authority = ReviewAuthority::mint(&conn, mint_params(&[])).unwrap();
+        // AuthorityTtl (CCK-R5.4) rejects a non-positive TTL at construction,
+        // so mint() itself can no longer produce an already-expired
+        // authority -- simulate time having passed instead, by rewriting
+        // expires_at into the past directly on the stored row and
+        // re-deriving its signature over the new value (same pattern
+        // changed_analysis_version_is_rejected uses below for a different
+        // field).
+        let past_expiry = authority.created_at - 1.0;
+        let key = control_key_for_conn(&conn).unwrap().unwrap();
+        let payload = signing_payload(
+            &authority.authority_id,
+            &authority.intent_id,
+            &authority.snapshot_id,
+            authority.graph_generation,
+            &authority.caller_set_digest,
+            &authority.analysis_version,
+            &authority.policy_digest,
+            &authority.principal,
+            &authority.target_scope_digest,
+            &authority.nonce,
+            past_expiry,
+        );
+        let resigned = sign(&key, SIGNING_DOMAIN, &payload);
+        conn.execute(
+            "UPDATE review_authorities SET expires_at = ?1, signature = ?2 WHERE authority_id = ?3",
+            params![past_expiry, resigned, authority.authority_id],
+        )
+        .unwrap();
+
         let err =
             ReviewAuthority::verify_and_consume(&conn, &authority.authority_id, &base_current());
         assert_eq!(err, Err(AuthorityError::Expired));
@@ -964,5 +1053,53 @@ mod tests {
         let mut current = base_current();
         current.targets = &reordered_targets;
         ReviewAuthority::verify_and_consume(&conn, &authority.authority_id, &current).unwrap();
+    }
+
+    #[test]
+    fn authority_ttl_rejects_non_positive_seconds() {
+        assert_eq!(
+            AuthorityTtl::from_secs(0.0),
+            Err(AuthorityTtlError::NotPositive)
+        );
+        assert_eq!(
+            AuthorityTtl::from_secs(-1.0),
+            Err(AuthorityTtlError::NotPositive)
+        );
+    }
+
+    #[test]
+    fn authority_ttl_rejects_non_finite_seconds() {
+        assert_eq!(
+            AuthorityTtl::from_secs(f64::NAN),
+            Err(AuthorityTtlError::NotFinite)
+        );
+        assert_eq!(
+            AuthorityTtl::from_secs(f64::INFINITY),
+            Err(AuthorityTtlError::NotFinite)
+        );
+        assert_eq!(
+            AuthorityTtl::from_secs(f64::NEG_INFINITY),
+            Err(AuthorityTtlError::NotFinite)
+        );
+    }
+
+    #[test]
+    fn authority_ttl_rejects_durations_beyond_the_max() {
+        let too_long = AUTHORITY_TTL_MAX_SECS + 1.0;
+        assert_eq!(
+            AuthorityTtl::from_secs(too_long),
+            Err(AuthorityTtlError::TooLong {
+                secs: too_long,
+                max: AUTHORITY_TTL_MAX_SECS,
+            })
+        );
+        // The max itself is inclusive, not one past it.
+        assert!(AuthorityTtl::from_secs(AUTHORITY_TTL_MAX_SECS).is_ok());
+    }
+
+    #[test]
+    fn authority_ttl_accepts_and_round_trips_a_valid_duration() {
+        let ttl = AuthorityTtl::from_secs(300.0).unwrap();
+        assert_eq!(ttl.as_secs(), 300.0);
     }
 }

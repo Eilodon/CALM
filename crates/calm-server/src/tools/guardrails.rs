@@ -1272,7 +1272,8 @@ impl CalmServer {
         let policy = calm_core::policy::loader::load_policy_or_warn(&self.project_root);
         let policy_digest = policy.digest();
         let principal = format!("session:{}", self.session_id);
-        const AUTHORITY_TTL_SECS: f64 = 1800.0;
+        let authority_ttl = calm_core::authority::AuthorityTtl::from_secs(1800.0)
+            .expect("30 minutes is within AuthorityTtl's valid range");
 
         let authority = calm_core::authority::ReviewAuthority::mint(
             &tx,
@@ -1283,7 +1284,7 @@ impl CalmServer {
                 caller_set_digest,
                 policy_digest: &policy_digest,
                 principal: &principal,
-                ttl_secs: AUTHORITY_TTL_SECS,
+                ttl_secs: authority_ttl,
                 targets: &[target],
             },
         )

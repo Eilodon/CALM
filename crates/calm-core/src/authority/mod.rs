@@ -10,6 +10,7 @@ pub mod review;
 pub mod snapshot;
 
 pub use review::{
-    AuthorityError, CurrentState, MintParams, ReviewAuthority, current_analysis_version,
+    AUTHORITY_TTL_MAX_SECS, AuthorityError, AuthorityTtl, AuthorityTtlError, CurrentState,
+    MintParams, ReviewAuthority, current_analysis_version,
 };
 pub use snapshot::{EvidenceSnapshot, FreshnessClass};
