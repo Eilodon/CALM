@@ -210,6 +210,7 @@ impl CalmServer {
                 ask_out,
                 p.change_id.as_deref(),
                 p.authority_id.as_deref(),
+                None,
             )
         })
     }
@@ -310,7 +311,7 @@ impl CalmServer {
 
     /// Sync body of `edit_symbol` — extracted so the async tool wrapper can
     /// run it twice (Ask, then Approved) around the elicitation await.
-    fn edit_symbol_flow(
+    pub(crate) fn edit_symbol_flow(
         &self,
         p: &EditSymbolParams,
         gate: ElicitGate,
@@ -386,6 +387,7 @@ impl CalmServer {
                         ask_out,
                         p.change_id.as_deref(),
                         p.authority_id.as_deref(),
+                        None,
                     )
                     .into_resolved();
             }
@@ -530,6 +532,7 @@ impl CalmServer {
                 ask_out,
                 p.change_id.as_deref(),
                 p.authority_id.as_deref(),
+                Some(c.qualified_name.as_str()),
             )
             .into_resolved()
         })
@@ -902,6 +905,7 @@ impl CalmServer {
     /// `index_stale: true` — the disk write already happened, and reporting
     /// it as an error made agents re-apply edits that had in fact landed.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn edit_lines_impl_gated(
         &self,
         path: &str,
@@ -917,6 +921,19 @@ impl CalmServer {
         // authority-validated path instead of confirm/reason/cites.
         change_id: Option<&str>,
         authority_id: Option<&str>,
+        // CCK-R5.9 (audit follow-up): the symbol edit_symbol actually
+        // resolved for this edit, when one exists (None for raw edit_lines
+        // and for top_of_file/end_of_file, which never resolve a symbol).
+        // A position="before" insertion on a symbol with a leading doc
+        // comment anchors ABOVE that comment (see insertion_hunk_for's own
+        // doc comment) -- a line OUTSIDE the symbol's own indexed
+        // [line_start, line_end], so compute_touch_risk's line-range
+        // overlap below can miss the symbol entirely even though the
+        // caller explicitly reviewed and was authorized for it. This hint
+        // lets the authority-verify branch fall back to it instead of
+        // failing every such insertion with a false STALE_CALLER_SET/
+        // WRONG_TARGET_SCOPE.
+        anchor_qualified_name: Option<&str>,
     ) -> ToolOutcome<EditLinesOutput> {
         // In-process guard: serializes the whole read -> hash-check -> write
         // -> reindex sequence within this one `calm serve` process. rmcp
@@ -1190,7 +1207,7 @@ impl CalmServer {
             // never derived from `touched`'s own risk fields, so it can
             // never accidentally agree with a stale review just because
             // both happened to read the same risk classification.
-            let fresh_caller_digests: std::collections::HashMap<String, String> = touched
+            let mut fresh_caller_digests: std::collections::HashMap<String, String> = touched
                 .iter()
                 .map(|t| {
                     let live_callers = caller_symbol_set(&conn, &t.qualified_name);
@@ -1200,6 +1217,20 @@ impl CalmServer {
                     )
                 })
                 .collect();
+            // CCK-R5.9 (audit follow-up): a position="before" insertion on a
+            // symbol with a leading doc comment anchors ABOVE that comment
+            // (insertion_hunk_for), a line OUTSIDE the symbol's own indexed
+            // range -- `touched` (from compute_touch_risk's line-range
+            // overlap) can miss it entirely even though it's the exact
+            // symbol edit_context was called for. Backfill its fresh caller
+            // digest here too so the authority-verify branch below always
+            // has one to compare against, not just when the line-range
+            // overlap happened to catch it.
+            if let Some(anchor) = anchor_qualified_name {
+                fresh_caller_digests.entry(anchor.to_string()).or_insert_with(|| {
+                    Self::caller_set_digest(&caller_symbol_set(&conn, anchor))
+                });
+            }
             (
                 risk,
                 hub_hit,
@@ -1252,9 +1283,17 @@ impl CalmServer {
                         .ok()
                     })
                     .unwrap_or(0);
-                let touched_caller_set_digest = pre_touched
+                // CCK-R5.9 (audit follow-up): fall back to
+                // anchor_qualified_name when pre_touched didn't catch the
+                // symbol (the doc-comment-anchored "before" insertion case
+                // -- see this function's own doc comment for
+                // anchor_qualified_name).
+                let primary_touched_qn: Option<&str> = pre_touched
                     .first()
-                    .and_then(|t| fresh_caller_digests.get(t.qualified_name.as_str()))
+                    .map(|t| t.qualified_name.as_str())
+                    .or(anchor_qualified_name);
+                let touched_caller_set_digest = primary_touched_qn
+                    .and_then(|qn| fresh_caller_digests.get(qn))
                     .cloned()
                     .unwrap_or_default();
                 let policy = calm_core::policy::loader::load_policy_or_warn(&self.project_root);
@@ -1266,13 +1305,26 @@ impl CalmServer {
                 // that reaches outside the authorized scope fail closed,
                 // instead of silently validating only against
                 // pre_touched[0] while the rest go unchecked.
-                let current_targets: Vec<calm_core::change::ChangeIntentTarget> = pre_touched
+                let mut current_targets: Vec<calm_core::change::ChangeIntentTarget> = pre_touched
                     .iter()
                     .map(|t| calm_core::change::ChangeIntentTarget {
                         path: path.to_string(),
                         qualified_name: Some(t.qualified_name.clone()),
                     })
                     .collect();
+                // CCK-R5.9: union in the anchor symbol too, for the same
+                // doc-comment-anchored-insertion reason as above.
+                if let Some(anchor) = anchor_qualified_name {
+                    let already_present = current_targets
+                        .iter()
+                        .any(|t| t.qualified_name.as_deref() == Some(anchor));
+                    if !already_present {
+                        current_targets.push(calm_core::change::ChangeIntentTarget {
+                            path: path.to_string(),
+                            qualified_name: Some(anchor.to_string()),
+                        });
+                    }
+                }
                 let current = calm_core::authority::CurrentState {
                     intent_id: change_id,
                     snapshot_id: &snapshot_id,
