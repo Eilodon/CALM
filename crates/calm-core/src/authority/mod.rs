@@ -6,9 +6,11 @@
 //! snapshot-bound authority object #65 asks for, built on top of both.
 
 pub mod key;
+pub mod receipt;
 pub mod review;
 pub mod snapshot;
 
+pub use receipt::{ApprovalReceipt, insert_approval_receipt};
 pub use review::{
     AUTHORITY_TTL_MAX_SECS, AuthorityError, AuthorityTtl, AuthorityTtlError, AuthorizeEditError,
     CurrentState, MintParams, ReviewAuthority, current_analysis_version,

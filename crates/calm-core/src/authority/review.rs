@@ -71,7 +71,13 @@ pub fn current_analysis_version() -> String {
 pub fn target_scope_digest(targets: &[ChangeIntentTarget]) -> String {
     let mut canonical: Vec<String> = targets
         .iter()
-        .map(|t| format!("{}\u{0}{}", t.path, t.qualified_name.as_deref().unwrap_or("")))
+        .map(|t| {
+            format!(
+                "{}\u{0}{}",
+                t.path,
+                t.qualified_name.as_deref().unwrap_or("")
+            )
+        })
         .collect();
     canonical.sort();
     let material = format!("target-scope-v1\n{}\n", canonical.join("\n"));
@@ -186,6 +192,15 @@ pub struct CurrentState<'a> {
     pub policy_digest: &'a str,
     pub principal: &'a str,
     pub targets: &'a [ChangeIntentTarget],
+    /// WS1 (audit follow-up, 2026-08-09): the real `PolicyDecision`/
+    /// `RiskVector` digests computed from the ACTUAL proposed diff at
+    /// spend time -- not the caller-supplied targets alone. Lets
+    /// `verify_only` catch a proposal whose real risk/kind has drifted
+    /// from what was reviewed (e.g. a `doc_only`-reviewed change spent as
+    /// a real body edit), the same way `target_scope_digest` already
+    /// catches a touch outside the reviewed scope.
+    pub policy_decision_digest: &'a str,
+    pub risk_vector_digest: &'a str,
 }
 
 #[derive(Debug, PartialEq)]
@@ -212,6 +227,15 @@ pub enum AuthorityError {
     StaleAnalysisVersion,
     StalePolicy,
     WrongPrincipal,
+    /// WS1: the real `RiskVector` derived from the proposed diff at spend
+    /// time no longer matches what was bound at mint -- e.g. touching more
+    /// (or riskier) code than the reviewed proposal did.
+    StaleRiskVector,
+    /// WS1: the real `PolicyDecision` (aggregate risk / required approver
+    /// class) derived from the proposed diff at spend time no longer
+    /// matches what was bound at mint -- e.g. a `doc_only`-reviewed change
+    /// spent as a real body edit, which escalates required approval.
+    StalePolicyDecision,
     Db(rusqlite::Error),
 }
 
@@ -251,6 +275,14 @@ impl std::fmt::Display for AuthorityError {
             Self::WrongPrincipal => {
                 write!(f, "review authority was minted for a different principal")
             }
+            Self::StaleRiskVector => write!(
+                f,
+                "the proposed change's real risk profile no longer matches what this review authority was minted for"
+            ),
+            Self::StalePolicyDecision => write!(
+                f,
+                "the proposed change's real policy decision no longer matches what this review authority was minted for"
+            ),
             Self::Db(e) => write!(f, "review authority db error: {e}"),
         }
     }
@@ -638,6 +670,19 @@ impl ReviewAuthority {
         if authority.principal != current.principal {
             return Err(AuthorityError::WrongPrincipal);
         }
+        // WS1: the real risk/policy decision for the ACTUAL proposed diff,
+        // recomputed by the caller at spend time (see `CurrentState`'s own
+        // doc comment) -- catches a proposal whose real risk/kind drifted
+        // from what was reviewed at mint time (e.g. a `doc_only`-reviewed
+        // change spent as a real body edit), which `target_scope_digest`
+        // alone cannot: that digest only binds WHICH symbols/files were
+        // touched, never WHAT KIND of change was made to them.
+        if authority.risk_vector_digest != current.risk_vector_digest {
+            return Err(AuthorityError::StaleRiskVector);
+        }
+        if authority.policy_decision_digest != current.policy_decision_digest {
+            return Err(AuthorityError::StalePolicyDecision);
+        }
         Ok(())
     }
 
@@ -807,6 +852,11 @@ mod tests {
             policy_digest: "policy-1",
             principal: "session:abc",
             targets: &[],
+            // Matches mint_params()'s own values below -- WS1: a test that
+            // wants a real mismatch overrides just this field via
+            // `..base_current()`, same pattern every other field here uses.
+            policy_decision_digest: "policy-decision-1",
+            risk_vector_digest: "risk-vector-1",
         }
     }
 
@@ -930,7 +980,10 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            matches!(err, AuthorizeEditError::Authority(AuthorityError::AlreadyConsumed)),
+            matches!(
+                err,
+                AuthorizeEditError::Authority(AuthorityError::AlreadyConsumed)
+            ),
             "expected AlreadyConsumed, got {err:?}"
         );
 
@@ -1110,6 +1163,38 @@ mod tests {
         assert_eq!(
             ReviewAuthority::verify_and_consume(&conn, &authority.authority_id, &current),
             Err(AuthorityError::StalePolicy)
+        );
+    }
+
+    #[test]
+    // WS1 (audit follow-up): mirrors changed_policy_is_rejected exactly,
+    // for the two new mint<->spend risk/policy-decision digest checks --
+    // the core mechanism that closes the "review doc_only, spend a real
+    // body edit on the same symbol" bypass (see StalePolicyDecision below).
+    fn changed_risk_vector_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = real_state_conn(dir.path());
+        seed_intent_and_snapshot(&conn);
+        let authority = ReviewAuthority::mint(&conn, mint_params(&[])).unwrap();
+        let mut current = base_current();
+        current.risk_vector_digest = "risk-vector-2";
+        assert_eq!(
+            ReviewAuthority::verify_and_consume(&conn, &authority.authority_id, &current),
+            Err(AuthorityError::StaleRiskVector)
+        );
+    }
+
+    #[test]
+    fn changed_policy_decision_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = real_state_conn(dir.path());
+        seed_intent_and_snapshot(&conn);
+        let authority = ReviewAuthority::mint(&conn, mint_params(&[])).unwrap();
+        let mut current = base_current();
+        current.policy_decision_digest = "policy-decision-2";
+        assert_eq!(
+            ReviewAuthority::verify_and_consume(&conn, &authority.authority_id, &current),
+            Err(AuthorityError::StalePolicyDecision)
         );
     }
 

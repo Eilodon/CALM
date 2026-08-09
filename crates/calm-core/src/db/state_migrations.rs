@@ -38,7 +38,10 @@ pub enum StateMigrationError {
     /// because this is a programming/registration bug, not a runtime I/O
     /// failure -- callers may want to report it differently (e.g. "this
     /// binary is missing a migration", not "disk error").
-    MissingMigration { from: i64, target: i64 },
+    MissingMigration {
+        from: i64,
+        target: i64,
+    },
     /// A migration step's own postcondition check failed (e.g. a table
     /// this step's own DDL should have just created is still missing).
     PostconditionFailed {
@@ -139,6 +142,12 @@ pub const STATE_MIGRATIONS: &[StateMigration] = &[
         to: 7,
         name: "v7_change_intent_supersede",
         apply: v6_to_v7_change_intent_supersede,
+    },
+    StateMigration {
+        from: 7,
+        to: 8,
+        name: "v8_approval_receipts",
+        apply: v7_to_v8_approval_receipts,
     },
 ];
 
@@ -356,7 +365,9 @@ fn v4_to_v5_authority_policy_decision(conn: &Connection) -> Result<(), StateMigr
             .query_map([], |row| row.get::<_, String>(1))?
             .filter_map(|r| r.ok())
             .collect();
-        new_columns.iter().all(|(name, _)| cols.iter().any(|c| c == name))
+        new_columns
+            .iter()
+            .all(|(name, _)| cols.iter().any(|c| c == name))
     };
     if !now_has_all {
         return Err(StateMigrationError::PostconditionFailed {
@@ -383,7 +394,10 @@ fn v5_to_v6_evidence_snapshot_provider_state(conn: &Connection) -> Result<(), St
         .query_map([], |row| row.get::<_, String>(1))?
         .filter_map(|r| r.ok())
         .collect();
-    if !existing_columns.iter().any(|c| c == "provider_state_digest") {
+    if !existing_columns
+        .iter()
+        .any(|c| c == "provider_state_digest")
+    {
         conn.execute_batch(
             "ALTER TABLE evidence_snapshots ADD COLUMN provider_state_digest TEXT NOT NULL DEFAULT '';",
         )?;
@@ -430,7 +444,9 @@ fn v6_to_v7_change_intent_supersede(conn: &Connection) -> Result<(), StateMigrat
     ];
     for (name, ddl) in new_columns {
         if !existing_columns.iter().any(|c| c == name) {
-            conn.execute_batch(&format!("ALTER TABLE change_intents ADD COLUMN {name} {ddl};"))?;
+            conn.execute_batch(&format!(
+                "ALTER TABLE change_intents ADD COLUMN {name} {ddl};"
+            ))?;
         }
     }
 
@@ -440,7 +456,9 @@ fn v6_to_v7_change_intent_supersede(conn: &Connection) -> Result<(), StateMigrat
             .query_map([], |row| row.get::<_, String>(1))?
             .filter_map(|r| r.ok())
             .collect();
-        new_columns.iter().all(|(name, _)| cols.iter().any(|c| c == name))
+        new_columns
+            .iter()
+            .all(|(name, _)| cols.iter().any(|c| c == name))
     };
     if !now_has_all {
         return Err(StateMigrationError::PostconditionFailed {
@@ -448,6 +466,44 @@ fn v6_to_v7_change_intent_supersede(conn: &Connection) -> Result<(), StateMigrat
             detail: "change_intents is missing status/superseded_by_intent_id after this \
                       step's own DDL ran"
                 .to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// v7->v8 (WS3, audit follow-up): adds `approval_receipts` -- a durable
+/// record that a `ReviewAuthority`'s `required_approver_class` was
+/// actually satisfied (self-attestation at mint for SelfReviewed, a real
+/// MRTR/legacy elicitation round-trip at spend for Human), not just a
+/// signed claim with nothing behind it. New table, so (per CCK-R1's own
+/// precedent) this step's own DDL creates it directly rather than only
+/// postcondition-checking it.
+fn v7_to_v8_approval_receipts(conn: &Connection) -> Result<(), StateMigrationError> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS approval_receipts (
+            receipt_id     TEXT PRIMARY KEY,
+            change_id      TEXT REFERENCES change_intents(intent_id),
+            authority_id   TEXT REFERENCES review_authorities(authority_id) ON DELETE SET NULL,
+            subject_digest TEXT NOT NULL,
+            approved_by    TEXT NOT NULL,
+            mechanism      TEXT NOT NULL,
+            decision       TEXT NOT NULL,
+            approved_at    REAL NOT NULL,
+            tx_id          TEXT REFERENCES edit_transactions(tx_id) ON DELETE SET NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_approval_receipts_change ON approval_receipts(change_id);
+        CREATE INDEX IF NOT EXISTS idx_approval_receipts_authority ON approval_receipts(authority_id);",
+    )?;
+
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='approval_receipts')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !exists {
+        return Err(StateMigrationError::PostconditionFailed {
+            migration: "v8_approval_receipts",
+            detail: "approval_receipts does not exist after this step's own DDL ran".to_string(),
         });
     }
     Ok(())
@@ -749,10 +805,7 @@ mod tests {
         let err = run_migrations_from(&conn, &migrations, 3);
         assert!(matches!(
             err,
-            Err(StateMigrationError::MissingMigration {
-                from: 1,
-                target: 3
-            })
+            Err(StateMigrationError::MissingMigration { from: 1, target: 3 })
         ));
     }
 

@@ -215,6 +215,18 @@ pub struct EditConfig {
     /// own JSON-RPC error response), so unlike a Claude-Code-only hook it
     /// applies identically to every MCP client.
     pub always_require_edit_context: bool,
+    /// CCK-05B cutover flag: routes `edit_lines`/`edit_symbol`/
+    /// `format_files`'s actual write through `fs::rooted::RootedFilesystem`
+    /// (kernel-enforced `openat2(RESOLVE_BENEATH)` containment on Linux
+    /// x86_64, see that module's doc comment) instead of
+    /// `calm_core::edit::atomic_write`'s plain resolved-path write. Default
+    /// `false` — zero behavior change unless opted in, so a project can
+    /// roll this back instantly by flipping it off if the new write path
+    /// ever misbehaves. Every other platform already falls back to the
+    /// same textual containment check `atomic_write` itself relies on
+    /// (`ContainmentMethod::TextualFallback`), so enabling this on a
+    /// non-Linux-x86_64 target changes nothing observable.
+    pub kernel_enforced_writes: bool,
 }
 
 impl Default for EditConfig {
@@ -223,6 +235,7 @@ impl Default for EditConfig {
             elicit_hub_confirm: false,
             elicit_timeout_secs: 120,
             always_require_edit_context: false,
+            kernel_enforced_writes: false,
         }
     }
 }

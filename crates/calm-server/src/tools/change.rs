@@ -166,10 +166,20 @@ fn plan_idempotency_key(
 ) -> String {
     let mut canonical: Vec<String> = targets
         .iter()
-        .map(|t| format!("{}\u{0}{}", t.path, t.qualified_name.as_deref().unwrap_or("")))
+        .map(|t| {
+            format!(
+                "{}\u{0}{}",
+                t.path,
+                t.qualified_name.as_deref().unwrap_or("")
+            )
+        })
         .collect();
     canonical.sort();
-    let material = format!("plan-change-v1\n{}\n{}\n", kind.as_str(), canonical.join("\n"));
+    let material = format!(
+        "plan-change-v1\n{}\n{}\n",
+        kind.as_str(),
+        canonical.join("\n")
+    );
     calm_core::digest::evidence_digest(material.as_bytes())
 }
 
@@ -223,7 +233,8 @@ fn check_declared_vs_observed(
             .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("");
-        let language = calm_core::indexer::lang_constants::language_for_extension(ext).unwrap_or("");
+        let language =
+            calm_core::indexer::lang_constants::language_for_extension(ext).unwrap_or("");
         let observed = calm_core::change::classify::classify_observed_change(
             &calm_core::change::ObservedChangeInput {
                 path: &target.path,
@@ -323,11 +334,14 @@ impl CalmServer {
                 }
             };
 
-            let mut state_conn = match calm_core::db::conn::open_state_writer(&self.state_db_path)
-            {
+            let mut state_conn = match calm_core::db::conn::open_state_writer(&self.state_db_path) {
                 Ok(c) => c,
                 Err(e) => {
-                    return ToolOutcome::error(error_detail("STATE_DB_ERROR", &e.to_string(), true));
+                    return ToolOutcome::error(error_detail(
+                        "STATE_DB_ERROR",
+                        &e.to_string(),
+                        true,
+                    ));
                 }
             };
 
@@ -337,7 +351,11 @@ impl CalmServer {
             ) {
                 Ok(existing) => existing,
                 Err(e) => {
-                    return ToolOutcome::error(error_detail("STATE_DB_ERROR", &e.to_string(), true));
+                    return ToolOutcome::error(error_detail(
+                        "STATE_DB_ERROR",
+                        &e.to_string(),
+                        true,
+                    ));
                 }
             };
 
@@ -354,65 +372,75 @@ impl CalmServer {
             // reality, so supersede it and mint a fresh intent against
             // current evidence instead (`superseded_change_id` on the
             // response names the one this replaced).
-            let (change_id, snapshot_id, reused, superseded_change_id) =
-                if let Some(existing) = &existing
-                    && existing.snapshot_id == snapshot.snapshot_id
-                {
-                    (existing.intent_id.clone(), existing.snapshot_id.clone(), true, None)
-                } else {
-                    let tx = match state_conn.transaction() {
-                        Ok(tx) => tx,
-                        Err(e) => {
-                            return ToolOutcome::error(error_detail(
-                                "STATE_DB_ERROR",
-                                &e.to_string(),
-                                true,
-                            ));
-                        }
-                    };
-                    if let Err(e) = snapshot.persist(&tx) {
+            let (change_id, snapshot_id, reused, superseded_change_id) = if let Some(existing) =
+                &existing
+                && existing.snapshot_id == snapshot.snapshot_id
+            {
+                (
+                    existing.intent_id.clone(),
+                    existing.snapshot_id.clone(),
+                    true,
+                    None,
+                )
+            } else {
+                let tx = match state_conn.transaction() {
+                    Ok(tx) => tx,
+                    Err(e) => {
                         return ToolOutcome::error(error_detail(
                             "STATE_DB_ERROR",
                             &e.to_string(),
                             true,
                         ));
                     }
-                    let intent = calm_core::change::ChangeIntent::new(
-                        calm_core::change::ChangeIntentKind(kind),
-                        p.reason.clone(),
-                        snapshot.snapshot_id.clone(),
-                        targets.clone(),
-                    );
-                    let stale_intent_id = existing.map(|e| e.intent_id);
-                    let write_result = match &stale_intent_id {
-                        Some(old_id) => calm_core::change::supersede_change_intent(
-                            &tx,
-                            old_id,
-                            &intent,
-                            Some(&idempotency_key),
-                        ),
-                        None => calm_core::change::insert_change_intent(
-                            &tx,
-                            &intent,
-                            Some(&idempotency_key),
-                        ),
-                    };
-                    if let Err(e) = write_result {
-                        return ToolOutcome::error(error_detail(
-                            "STATE_DB_ERROR",
-                            &e.to_string(),
-                            true,
-                        ));
-                    }
-                    if let Err(e) = tx.commit() {
-                        return ToolOutcome::error(error_detail(
-                            "STATE_DB_ERROR",
-                            &e.to_string(),
-                            true,
-                        ));
-                    }
-                    (intent.intent_id, snapshot.snapshot_id, false, stale_intent_id)
                 };
+                if let Err(e) = snapshot.persist(&tx) {
+                    return ToolOutcome::error(error_detail(
+                        "STATE_DB_ERROR",
+                        &e.to_string(),
+                        true,
+                    ));
+                }
+                let intent = calm_core::change::ChangeIntent::new(
+                    calm_core::change::ChangeIntentKind(kind),
+                    p.reason.clone(),
+                    snapshot.snapshot_id.clone(),
+                    targets.clone(),
+                );
+                let stale_intent_id = existing.map(|e| e.intent_id);
+                let write_result = match &stale_intent_id {
+                    Some(old_id) => calm_core::change::supersede_change_intent(
+                        &tx,
+                        old_id,
+                        &intent,
+                        Some(&idempotency_key),
+                    ),
+                    None => calm_core::change::insert_change_intent(
+                        &tx,
+                        &intent,
+                        Some(&idempotency_key),
+                    ),
+                };
+                if let Err(e) = write_result {
+                    return ToolOutcome::error(error_detail(
+                        "STATE_DB_ERROR",
+                        &e.to_string(),
+                        true,
+                    ));
+                }
+                if let Err(e) = tx.commit() {
+                    return ToolOutcome::error(error_detail(
+                        "STATE_DB_ERROR",
+                        &e.to_string(),
+                        true,
+                    ));
+                }
+                (
+                    intent.intent_id,
+                    snapshot.snapshot_id,
+                    false,
+                    stale_intent_id,
+                )
+            };
 
             let (kind_mismatch, observed_kind, mismatch_notes) =
                 check_declared_vs_observed(&self.project_root, kind, &targets);
@@ -506,7 +534,10 @@ impl CalmServer {
                          review_change that one instead (re-run plan_change if you no \
                          longer have it)",
                         p.change_id,
-                        intent.superseded_by_intent_id.as_deref().unwrap_or("<unknown>"),
+                        intent
+                            .superseded_by_intent_id
+                            .as_deref()
+                            .unwrap_or("<unknown>"),
                     ),
                     false,
                 ));
@@ -537,22 +568,14 @@ impl CalmServer {
                         ));
                     }
                 };
-                // CCK-23 (P0 fix, audit 2026-08-09): "No stale evidence may grant
+                // CCK-23/WS2 (audit follow-up): "No stale evidence may grant
                 // authority" was never actually enforced -- this capability
-                // (`is_safe_for_high_risk_authority`) existed with zero production
-                // callers. Refuse to mint against a `Degraded` snapshot outright
-                // (Phase 0: blanket refusal for every risk tier, not just high --
-                // simplest safe interpretation until CCK-26 lands the tiered
-                // Low/Medium=Current|Reconciled vs High=Reconciled+Receipt policy).
-                if !snapshot.freshness_class.is_safe_for_high_risk_authority() {
-                    return ToolOutcome::error(error_detail(
-                        "EVIDENCE_NOT_FRESH",
-                        "index/config drifted since the last reconciliation \
-                         (freshness=Degraded) -- cannot mint a ReviewAuthority against \
-                         stale evidence",
-                        true,
-                    ));
-                }
+                // existed with zero production callers. The actual tiered
+                // check (Degraded refused outright for every tier; High risk
+                // additionally requires Reconciled, not just Current) needs
+                // `policy_decision.required_approver_class`, which isn't
+                // known yet at this point -- see the check right after
+                // `policy_decision` is computed below.
                 let graph_generation: i64 = conn
                     .query_row(
                         "SELECT generation FROM graph_generation_state WHERE id = 1",
@@ -568,32 +591,52 @@ impl CalmServer {
                 // limit that still applies).
                 let mut caller_qns: std::collections::BTreeSet<String> =
                     std::collections::BTreeSet::new();
-                // CCK-26 (audit follow-up): a real RiskVector, built from every
-                // declared target -- caller_count_level/is_hub/hub_kind straight
-                // from `symbols`, risk_rule_floor from this project's
-                // config.risk_rules, the same signals classify_gate's own
-                // compute_touch_risk uses for the legacy write gate.
-                // signature_changed/uncertain_zero_caller/touches_uncovered_code
-                // are NOT wired in this pass (no live diff / coverage data
-                // available at review_change time) -- documented gap, default
-                // false, never risk-elevated by their absence here.
+                // CCK-26/WS1 (audit follow-up): a real RiskVector, built from
+                // every declared target -- caller_count_level/is_hub/hub_kind
+                // straight from `symbols`, risk_rule_floor from this project's
+                // config.risk_rules, uncertain_zero_caller from the same
+                // compute_touch_risk classify_gate's own legacy write gate
+                // uses (edit.rs). signature_changed/touches_uncovered_code are
+                // still NOT wired in this pass (no live diff exists yet at
+                // review_change time to detect a real signature change from;
+                // no verified path-format contract yet against
+                // CoverageData::is_covered's absolute-path key -- see WS2) --
+                // documented gap, default false, never risk-elevated by their
+                // absence here.
                 let mut caller_count_level = calm_core::policy::RiskLevel::Low;
                 let mut is_hub = false;
                 let mut hub_kind: Option<String> = None;
                 let mut risk_rule_floor: Option<calm_core::policy::RiskLevel> = None;
+                // WS1 (audit follow-up): real uncertain_zero_caller, wired via
+                // the SAME compute_touch_risk the live edit_lines/edit_symbol
+                // gate uses (edit.rs) -- no live diff exists yet at
+                // review_change time, so each target's own full symbol range
+                // stands in for "the range this change touches" (no
+                // proposed_hunks to detect a signature change from either,
+                // hence `&[]` there -- signature_changed stays false below,
+                // same documented under-approximation as before).
+                let mut uncertain_zero_caller = false;
                 for t in &intent.targets {
                     if let Some(qn) = &t.qualified_name {
                         caller_qns.extend(super::edit::caller_symbol_set(&conn, qn));
-                        if let Ok(Some((caller_count, sym_is_hub, sym_hub_kind))) = conn
+                        if let Ok(Some((
+                            caller_count,
+                            sym_is_hub,
+                            sym_hub_kind,
+                            line_start,
+                            line_end,
+                        ))) = conn
                             .query_row(
-                                "SELECT caller_count, is_hub, hub_kind FROM symbols \
-                                 WHERE qualified_name = ?1",
+                                "SELECT caller_count, is_hub, hub_kind, line_start, line_end \
+                                 FROM symbols WHERE qualified_name = ?1",
                                 rusqlite::params![qn],
                                 |r| {
                                     Ok((
                                         r.get::<_, i64>(0)?,
                                         r.get::<_, bool>(1)?,
                                         r.get::<_, Option<String>>(2)?,
+                                        r.get::<_, i64>(3)?,
+                                        r.get::<_, i64>(4)?,
                                     ))
                                 },
                             )
@@ -609,6 +652,18 @@ impl CalmServer {
                                 if hub_kind.is_none() {
                                     hub_kind = sym_hub_kind;
                                 }
+                            }
+                            if !uncertain_zero_caller {
+                                let (_, _, _, sym_uncertain, _, _) =
+                                    super::edit::compute_touch_risk(
+                                        &conn,
+                                        &t.path,
+                                        &[(line_start, line_end)],
+                                        &self.coverage.read_ok(),
+                                        &self.config().risk_rules,
+                                        &[],
+                                    );
+                                uncertain_zero_caller = sym_uncertain.is_some();
                             }
                         }
                     }
@@ -632,7 +687,7 @@ impl CalmServer {
                     is_hub,
                     hub_kind,
                     signature_changed: false,
-                    uncertain_zero_caller: false,
+                    uncertain_zero_caller,
                     risk_rule_floor,
                     kind_mismatch,
                     touches_manifest,
@@ -654,6 +709,16 @@ impl CalmServer {
             // is, so refuse to mint here rather than hand out an authority that
             // can only ever be inert for the write it was meant to cover.
             let policy_decision = calm_core::policy::evaluate(&risk_vector, &policy);
+            // Checked BEFORE the freshness tier below (WS2, audit
+            // follow-up): this refusal is unconditional for Human tier
+            // regardless of evidence freshness -- review_change has no real
+            // approval channel at all, so a Human-required change is
+            // refused here whether evidence is Current, Degraded, or (were
+            // it ever reachable from this endpoint) Reconciled. Keeping it
+            // first means the error a caller sees names the actual reason
+            // review_change can never mint this authority, not an
+            // evidence-freshness detail that's beside the point for a tier
+            // this endpoint can never serve anyway.
             if policy_decision.required_approver_class == calm_core::policy::ApproverClass::Human {
                 return ToolOutcome::error(error_detail(
                     "INDEPENDENT_REVIEW_NOT_AVAILABLE_HERE",
@@ -668,18 +733,43 @@ impl CalmServer {
                     true,
                 ));
             }
-
-            let mut state_conn = match calm_core::db::conn::open_state_writer(&self.state_db_path)
+            // WS2 (audit follow-up): the tiered freshness bar -- Degraded is
+            // refused outright for every tier (unchanged from CCK-23's Phase
+            // 0 blanket refusal). High risk additionally requires Reconciled
+            // rather than merely Current, but that tier is already refused
+            // unconditionally above for this endpoint -- reachable here only
+            // for Low/Medium, where Current already meets the bar, same as
+            // before this check existed.
+            if !snapshot
+                .freshness_class
+                .meets_bar_for(policy_decision.required_approver_class)
             {
+                return ToolOutcome::error(error_detail(
+                    "EVIDENCE_NOT_FRESH",
+                    "index/config drifted since the last reconciliation (freshness=degraded) \
+                     -- cannot mint a ReviewAuthority against stale evidence",
+                    true,
+                ));
+            }
+
+            let mut state_conn = match calm_core::db::conn::open_state_writer(&self.state_db_path) {
                 Ok(c) => c,
                 Err(e) => {
-                    return ToolOutcome::error(error_detail("STATE_DB_ERROR", &e.to_string(), true));
+                    return ToolOutcome::error(error_detail(
+                        "STATE_DB_ERROR",
+                        &e.to_string(),
+                        true,
+                    ));
                 }
             };
             let tx = match state_conn.transaction() {
                 Ok(tx) => tx,
                 Err(e) => {
-                    return ToolOutcome::error(error_detail("STATE_DB_ERROR", &e.to_string(), true));
+                    return ToolOutcome::error(error_detail(
+                        "STATE_DB_ERROR",
+                        &e.to_string(),
+                        true,
+                    ));
                 }
             };
             if let Err(e) = snapshot.persist(&tx) {
@@ -708,6 +798,28 @@ impl CalmServer {
                     return ToolOutcome::error(error_detail("MINT_FAILED", &e.to_string(), true));
                 }
             };
+            // WS3 (audit follow-up): a durable record that this authority's
+            // required_approver_class was actually satisfied -- for
+            // SelfReviewed, that's exactly the approved:true self-
+            // attestation this handler already required above (checked at
+            // the top of this function, long before minting was even
+            // attempted). For Human, review_change never reaches this point
+            // at all (refused earlier as INDEPENDENT_REVIEW_NOT_AVAILABLE_HERE),
+            // so every receipt written here is genuinely self_attested,
+            // never a Human-tier claim in disguise.
+            if let Err(e) = calm_core::authority::insert_approval_receipt(
+                &tx,
+                &calm_core::authority::ApprovalReceipt {
+                    change_id: Some(&intent.intent_id),
+                    authority_id: Some(&authority.authority_id),
+                    subject_digest: &policy_decision_digest,
+                    approved_by: &principal,
+                    mechanism: "self_attested",
+                    tx_id: None,
+                },
+            ) {
+                return ToolOutcome::error(error_detail("STATE_DB_ERROR", &e.to_string(), true));
+            }
             if let Err(e) = tx.commit() {
                 return ToolOutcome::error(error_detail("STATE_DB_ERROR", &e.to_string(), true));
             }
@@ -789,9 +901,10 @@ mod tests {
     fn repeated_plan_change_calls_are_idempotent() {
         let (dir, server) = test_server("idempotent");
         let params = plan_params("body", vec![("a.rs", Some("a.rs::f"))]);
-        let first = server.plan_change(rmcp::handler::server::wrapper::Parameters(
-            plan_params("body", vec![("a.rs", Some("a.rs::f"))]),
-        ));
+        let first = server.plan_change(rmcp::handler::server::wrapper::Parameters(plan_params(
+            "body",
+            vec![("a.rs", Some("a.rs::f"))],
+        )));
         let first_v = serde_json::to_value(&first.0).unwrap();
         assert_eq!(first_v["reused"], false, "response: {first_v}");
         let first_id = first_v["change_id"].as_str().unwrap().to_string();
@@ -844,7 +957,10 @@ mod tests {
         );
         let second_id = second_v["change_id"].as_str().unwrap().to_string();
         assert_ne!(second_id, first_id);
-        assert_eq!(second_v["superseded_change_id"], first_id, "response: {second_v}");
+        assert_eq!(
+            second_v["superseded_change_id"], first_id,
+            "response: {second_v}"
+        );
         assert_ne!(second_v["snapshot_id"].as_str().unwrap(), first_snapshot);
 
         let review = server.review_change(rmcp::handler::server::wrapper::Parameters(
@@ -856,9 +972,15 @@ mod tests {
             },
         ));
         let review_v = serde_json::to_value(&review.0).unwrap();
-        assert_eq!(review_v["error"]["code"], "INTENT_SUPERSEDED", "response: {review_v}");
         assert_eq!(
-            review_v["error"]["message"].as_str().unwrap().contains(&second_id),
+            review_v["error"]["code"], "INTENT_SUPERSEDED",
+            "response: {review_v}"
+        );
+        assert_eq!(
+            review_v["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains(&second_id),
             true,
             "response: {review_v}"
         );
@@ -1019,6 +1141,348 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dir.join("a.py")).unwrap(),
             "def helper():\n    return 2\n"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    // WS3 (audit follow-up): review_change's approved:true self-attestation
+    // must leave a durable approval_receipts row behind, not just the
+    // signed required_approver_class claim on the authority itself.
+    fn review_change_writes_a_self_attested_approval_receipt() {
+        let (dir, server) = test_server("review_change_writes_approval_receipt");
+        std::fs::write(dir.join("a.py"), "def helper():\n    return 1\n").unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.py::helper', 'helper', 'function', 'python', 'a.py', 1, 2, '', '', 'helper', 1, 0, 0)",
+                [],
+            )
+            .unwrap();
+            let catalog = calm_core::indexer::refresh::InputCatalog::for_project(&dir);
+            calm_core::indexer::refresh::persist_index_input_snapshot(&conn, &catalog).unwrap();
+        }
+
+        let plan = server.plan_change(rmcp::handler::server::wrapper::Parameters(plan_params(
+            "body",
+            vec![("a.py", Some("a.py::helper"))],
+        )));
+        let plan_v = serde_json::to_value(&plan.0).unwrap();
+        let change_id = plan_v["change_id"].as_str().unwrap().to_string();
+
+        let review = server.review_change(rmcp::handler::server::wrapper::Parameters(
+            ReviewChangeParams {
+                change_id: change_id.clone(),
+                approved: true,
+                approver: Some("alice".to_string()),
+                ttl_secs: None,
+            },
+        ));
+        let review_v = serde_json::to_value(&review.0).unwrap();
+        let authority_id = review_v["authority_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("review_change must mint: {review_v}"))
+            .to_string();
+
+        let state_conn = server.state_db();
+        let (stored_change_id, stored_authority_id, mechanism, decision, approved_by): (
+            String,
+            String,
+            String,
+            String,
+            String,
+        ) = state_conn
+            .query_row(
+                "SELECT change_id, authority_id, mechanism, decision, approved_by \
+                 FROM approval_receipts WHERE authority_id = ?1",
+                rusqlite::params![authority_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap_or_else(|e| panic!("expected exactly one approval_receipts row: {e}"));
+        assert_eq!(stored_change_id, change_id);
+        assert_eq!(stored_authority_id, authority_id);
+        assert_eq!(mechanism, "self_attested");
+        assert_eq!(decision, "approved");
+        assert!(approved_by.starts_with("session:"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    // WS1 (audit follow-up, P0 flagship regression): review_change approves
+    // a change DECLARED doc_only, but the actual edit_lines call changes
+    // the function body -- not a doc/comment line. Before WS1,
+    // target/snapshot/caller/policy-config all still matched at spend time,
+    // so the authority verified regardless of what kind of change was
+    // actually spent. Now the real RiskVector/PolicyDecision, recomputed at
+    // spend time from the actual before/after file content, disagrees with
+    // what review_change minted (kind_mismatch flips true), and the spend
+    // is refused.
+    fn review_change_doc_only_then_body_edit_via_edit_lines_is_rejected() {
+        use super::super::edit::ElicitGate;
+        let (dir, server) = test_server("doc_only_then_body_edit");
+        std::fs::write(dir.join("a.py"), "def helper():\n    return 1\n").unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.py::helper', 'helper', 'function', 'python', 'a.py', 1, 2, '', '', 'helper', 1, 0, 0)",
+                [],
+            )
+            .unwrap();
+            let catalog = calm_core::indexer::refresh::InputCatalog::for_project(&dir);
+            calm_core::indexer::refresh::persist_index_input_snapshot(&conn, &catalog).unwrap();
+        }
+
+        let plan = server.plan_change(rmcp::handler::server::wrapper::Parameters(plan_params(
+            "doc_only",
+            vec![("a.py", Some("a.py::helper"))],
+        )));
+        let plan_v = serde_json::to_value(&plan.0).unwrap();
+        let change_id = plan_v["change_id"].as_str().unwrap().to_string();
+
+        let review = server.review_change(rmcp::handler::server::wrapper::Parameters(
+            ReviewChangeParams {
+                change_id: change_id.clone(),
+                approved: true,
+                approver: Some("alice".to_string()),
+                ttl_secs: None,
+            },
+        ));
+        let review_v = serde_json::to_value(&review.0).unwrap();
+        let authority_id = review_v["authority_id"]
+            .as_str()
+            .unwrap_or_else(|| {
+                panic!(
+                    "review_change must mint for a doc_only-declared low-risk change: {review_v}"
+                )
+            })
+            .to_string();
+
+        // The actual spend is a BODY edit (changes the return value), not a
+        // doc/comment change -- exactly what was declared and reviewed.
+        let hash = calm_core::edit::range_checksum("def helper():\n    return 1\n", 2, 2).unwrap();
+        let params = super::super::edit::EditLinesParams {
+            change_id: Some(change_id),
+            authority_id: Some(authority_id),
+            path: "a.py".into(),
+            edits: vec![super::super::edit::EditHunkParam {
+                old_text: None,
+                start_line: 2,
+                end_line: 2,
+                expected_hash: Some(hash),
+                new_text: "    return 2\n".into(),
+            }],
+            confirm: false,
+            reason: None,
+            cites: None,
+        };
+        let mut ask = None;
+        let out = server.edit_lines_flow(&params, ElicitGate::Off, &mut ask);
+        let v = serde_json::to_value(&out).unwrap();
+        assert_ne!(
+            v["applied"], true,
+            "a doc_only-reviewed authority must not authorize a real body edit: {v}"
+        );
+        let code = v["error"]["code"].as_str().unwrap_or_default();
+        assert!(
+            code == "AUTHORITY_STALE_RISK_VECTOR" || code == "AUTHORITY_STALE_POLICY_DECISION",
+            "expected a stale risk/policy-decision refusal, got: {v}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.py")).unwrap(),
+            "def helper():\n    return 1\n",
+            "file must be unchanged after a rejected spend"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    // WS1: regression guard for the fix above -- a doc_only-reviewed
+    // change spent as a REAL doc-only edit (only the docstring text
+    // differs, no code line changes) must still succeed. Proves the new
+    // spend-time RiskVector check doesn't false-positive-block a matching,
+    // legitimate edit.
+    fn review_change_doc_only_then_matching_doc_edit_via_edit_lines_succeeds() {
+        use super::super::edit::ElicitGate;
+        let (dir, server) = test_server("doc_only_then_matching_doc_edit");
+        std::fs::write(
+            dir.join("a.py"),
+            "def helper():\n    \"\"\"old doc\"\"\"\n    return 1\n",
+        )
+        .unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.py::helper', 'helper', 'function', 'python', 'a.py', 1, 3, '', '', 'helper', 1, 0, 0)",
+                [],
+            )
+            .unwrap();
+            let catalog = calm_core::indexer::refresh::InputCatalog::for_project(&dir);
+            calm_core::indexer::refresh::persist_index_input_snapshot(&conn, &catalog).unwrap();
+        }
+
+        let plan = server.plan_change(rmcp::handler::server::wrapper::Parameters(plan_params(
+            "doc_only",
+            vec![("a.py", Some("a.py::helper"))],
+        )));
+        let plan_v = serde_json::to_value(&plan.0).unwrap();
+        let change_id = plan_v["change_id"].as_str().unwrap().to_string();
+
+        let review = server.review_change(rmcp::handler::server::wrapper::Parameters(
+            ReviewChangeParams {
+                change_id: change_id.clone(),
+                approved: true,
+                approver: Some("alice".to_string()),
+                ttl_secs: None,
+            },
+        ));
+        let review_v = serde_json::to_value(&review.0).unwrap();
+        let authority_id = review_v["authority_id"]
+            .as_str()
+            .unwrap_or_else(|| {
+                panic!(
+                    "review_change must mint for a doc_only-declared low-risk change: {review_v}"
+                )
+            })
+            .to_string();
+
+        let original = "def helper():\n    \"\"\"old doc\"\"\"\n    return 1\n";
+        let hash = calm_core::edit::range_checksum(original, 2, 2).unwrap();
+        let params = super::super::edit::EditLinesParams {
+            change_id: Some(change_id),
+            authority_id: Some(authority_id),
+            path: "a.py".into(),
+            edits: vec![super::super::edit::EditHunkParam {
+                old_text: None,
+                start_line: 2,
+                end_line: 2,
+                expected_hash: Some(hash),
+                new_text: "    \"\"\"new doc\"\"\"\n".into(),
+            }],
+            confirm: false,
+            reason: None,
+            cites: None,
+        };
+        let mut ask = None;
+        let out = server.edit_lines_flow(&params, ElicitGate::Off, &mut ask);
+        let v = serde_json::to_value(&out).unwrap();
+        assert_eq!(
+            v["applied"], true,
+            "a matching doc-only edit must be authorized: {v}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.py")).unwrap(),
+            "def helper():\n    \"\"\"new doc\"\"\"\n    return 1\n"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    // WS1 (audit follow-up, claim 7): a multi-target authority's
+    // caller_set_digest is minted as the UNION of every declared target's
+    // callers (review_change). Before this fix, edit_lines' spend-time
+    // digest came from only the first/primary touched symbol -- for an
+    // authority over {foo, bar} with DIFFERENT callers each, spending a
+    // hunk that touches both would almost always fail STALE_CALLER_SET
+    // even though nothing was actually stale. Proves it now matches.
+    fn multi_target_authority_caller_digest_matches_at_mint_and_spend() {
+        use super::super::edit::ElicitGate;
+        let (dir, server) = test_server("multi_target_caller_digest");
+        let original = "def foo():\n    return 1\n\ndef bar():\n    return 2\n";
+        std::fs::write(dir.join("a.py"), original).unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.py::foo', 'foo', 'function', 'python', 'a.py', 1, 2, '', '', 'foo', 1, 0, 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.py::bar', 'bar', 'function', 'python', 'a.py', 4, 5, '', '', 'bar', 1, 0, 0)",
+                [],
+            )
+            .unwrap();
+            // Deliberately DIFFERENT callers for foo vs bar, so their union
+            // differs from either symbol's own individual caller set.
+            conn.execute(
+                "INSERT INTO call_edges (from_symbol, to_symbol, ruled_out_by_scip) \
+                 VALUES ('a.py::caller_a', 'a.py::foo', 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO call_edges (from_symbol, to_symbol, ruled_out_by_scip) \
+                 VALUES ('a.py::caller_b', 'a.py::bar', 0)",
+                [],
+            )
+            .unwrap();
+            let catalog = calm_core::indexer::refresh::InputCatalog::for_project(&dir);
+            calm_core::indexer::refresh::persist_index_input_snapshot(&conn, &catalog).unwrap();
+        }
+
+        let plan = server.plan_change(rmcp::handler::server::wrapper::Parameters(plan_params(
+            "body",
+            vec![("a.py", Some("a.py::foo")), ("a.py", Some("a.py::bar"))],
+        )));
+        let plan_v = serde_json::to_value(&plan.0).unwrap();
+        let change_id = plan_v["change_id"].as_str().unwrap().to_string();
+
+        let review = server.review_change(rmcp::handler::server::wrapper::Parameters(
+            ReviewChangeParams {
+                change_id: change_id.clone(),
+                approved: true,
+                approver: Some("alice".to_string()),
+                ttl_secs: None,
+            },
+        ));
+        let review_v = serde_json::to_value(&review.0).unwrap();
+        let authority_id = review_v["authority_id"]
+            .as_str()
+            .unwrap_or_else(|| {
+                panic!("review_change must mint for a two-target body change: {review_v}")
+            })
+            .to_string();
+
+        let hash_foo = calm_core::edit::range_checksum(original, 2, 2).unwrap();
+        let hash_bar = calm_core::edit::range_checksum(original, 5, 5).unwrap();
+        let params = super::super::edit::EditLinesParams {
+            change_id: Some(change_id),
+            authority_id: Some(authority_id),
+            path: "a.py".into(),
+            edits: vec![
+                super::super::edit::EditHunkParam {
+                    old_text: None,
+                    start_line: 2,
+                    end_line: 2,
+                    expected_hash: Some(hash_foo),
+                    new_text: "    return 10\n".into(),
+                },
+                super::super::edit::EditHunkParam {
+                    old_text: None,
+                    start_line: 5,
+                    end_line: 5,
+                    expected_hash: Some(hash_bar),
+                    new_text: "    return 20\n".into(),
+                },
+            ],
+            confirm: false,
+            reason: None,
+            cites: None,
+        };
+        let mut ask = None;
+        let out = server.edit_lines_flow(&params, ElicitGate::Off, &mut ask);
+        let v = serde_json::to_value(&out).unwrap();
+        assert_eq!(
+            v["applied"], true,
+            "a multi-target authority's union caller digest must match at spend time: {v}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

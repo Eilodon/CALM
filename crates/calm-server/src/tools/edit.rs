@@ -718,7 +718,13 @@ impl CalmServer {
                     continue;
                 }
             };
-            if let Err(e) = calm_core::edit::atomic_write(&full_path, &formatted) {
+            if let Err(e) = write_via_configured_backend(
+                &self.project_root,
+                path,
+                &full_path,
+                &formatted,
+                self.config().edit.kernel_enforced_writes,
+            ) {
                 let _ = calm_core::txn::advance(
                     &file_conn,
                     &shadow_tx_id,
@@ -993,7 +999,11 @@ impl CalmServer {
         let outcome = match calm_core::edit::apply_hunks(&original, &hunks) {
             Ok(o) => o,
             Err(e @ calm_core::edit::ApplyError::LossyRedactedWrite { .. }) => {
-                return ToolOutcome::error(error_detail("LOSSY_WRITE_REJECTED", &e.to_string(), false));
+                return ToolOutcome::error(error_detail(
+                    "LOSSY_WRITE_REJECTED",
+                    &e.to_string(),
+                    false,
+                ));
             }
             Err(e) => {
                 return ToolOutcome::error(error_detail("INVALID_HUNKS", &e.to_string(), false));
@@ -1156,6 +1166,7 @@ impl CalmServer {
             pre_touched,
             fresh_caller_digests,
             risk_rule_reason,
+            union_caller_set_digest,
         ) = {
             let conn = match self.make_read_conn() {
                 Ok(c) => c,
@@ -1210,30 +1221,45 @@ impl CalmServer {
             // never derived from `touched`'s own risk fields, so it can
             // never accidentally agree with a stale review just because
             // both happened to read the same risk classification.
-            let mut fresh_caller_digests: std::collections::HashMap<String, String> = touched
-                .iter()
-                .map(|t| {
-                    let live_callers = caller_symbol_set(&conn, &t.qualified_name);
-                    (
-                        t.qualified_name.clone(),
-                        Self::caller_set_digest(&live_callers),
-                    )
-                })
-                .collect();
+            let mut fresh_caller_digests: std::collections::HashMap<String, String> =
+                std::collections::HashMap::with_capacity(touched.len());
+            // WS1 (audit follow-up, claim 7): union of EVERY touched
+            // symbol's live callers, hashed ONCE -- not just the first/
+            // anchor symbol's own digest. review_change mints
+            // caller_set_digest as this same union across every declared
+            // target, so a legitimate multi-target authority spent on a
+            // hunk touching more than one of them must be checked against
+            // the same union here, or it would almost always fail
+            // StaleCallerSet even with nothing actually stale.
+            let mut union_callers: std::collections::BTreeSet<String> =
+                std::collections::BTreeSet::new();
+            for t in &touched {
+                let live_callers = caller_symbol_set(&conn, &t.qualified_name);
+                fresh_caller_digests.insert(
+                    t.qualified_name.clone(),
+                    Self::caller_set_digest(&live_callers),
+                );
+                union_callers.extend(live_callers);
+            }
             // CCK-R5.9 (audit follow-up): a position="before" insertion on a
             // symbol with a leading doc comment anchors ABOVE that comment
             // (insertion_hunk_for), a line OUTSIDE the symbol's own indexed
             // range -- `touched` (from compute_touch_risk's line-range
             // overlap) can miss it entirely even though it's the exact
             // symbol edit_context was called for. Backfill its fresh caller
-            // digest here too so the authority-verify branch below always
-            // has one to compare against, not just when the line-range
-            // overlap happened to catch it.
+            // digest (and fold it into the union too) here so the
+            // authority-verify branch below always has one to compare
+            // against, not just when the line-range overlap happened to
+            // catch it.
             if let Some(anchor) = anchor_qualified_name {
-                fresh_caller_digests.entry(anchor.to_string()).or_insert_with(|| {
-                    Self::caller_set_digest(&caller_symbol_set(&conn, anchor))
-                });
+                let anchor_callers = caller_symbol_set(&conn, anchor);
+                fresh_caller_digests
+                    .entry(anchor.to_string())
+                    .or_insert_with(|| Self::caller_set_digest(&anchor_callers));
+                union_callers.extend(anchor_callers);
             }
+            let union_caller_set_digest =
+                Self::caller_set_digest(&union_callers.into_iter().collect::<Vec<_>>());
             (
                 risk,
                 hub_hit,
@@ -1243,7 +1269,113 @@ impl CalmServer {
                 touched,
                 fresh_caller_digests,
                 risk_rule_reason,
+                union_caller_set_digest,
             )
+        };
+        // WS1 (audit follow-up): the REAL RiskVector/PolicyDecision for
+        // THIS proposed edit's actual before/after content -- computed once
+        // here (before any further TOCTOU window) from `original`/
+        // `new_content` (captured at the very top of this call) and the
+        // risk signals already derived above, then bound into CurrentState
+        // at both authority-check sites below. Closes the gap where a
+        // `doc_only`-reviewed ReviewAuthority could be spent on a real body
+        // edit of the same symbol: target/snapshot/caller/policy config all
+        // still match, but the real kind_mismatch flips true here, changing
+        // this digest and failing verify_only's new StaleRiskVector/
+        // StalePolicyDecision checks.
+        let spend_risk_digests: Option<(String, String)> = if let (Some(spend_change_id), Some(_)) =
+            (change_id, authority_id)
+        {
+            let caller_count_level = pre_touched
+                .iter()
+                .filter_map(|t| {
+                    calm_core::policy::RiskLevel::parse(
+                        super::detail::risk_level_from_caller_count(t.caller_count),
+                    )
+                })
+                .max()
+                .unwrap_or(calm_core::policy::RiskLevel::Low);
+            let loaded = self
+                .make_state_read_conn()
+                .map_err(|e| e.to_string())
+                .and_then(|state_read_conn| {
+                    calm_core::change::get_change_intent(&state_read_conn, spend_change_id)
+                        .map_err(|e| e.to_string())
+                })
+                .and_then(|opt| {
+                    opt.ok_or_else(|| {
+                        format!("no plan_change intent with change_id {spend_change_id}")
+                    })
+                });
+            match loaded {
+                Ok(intent) => {
+                    let ext = std::path::Path::new(path)
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .unwrap_or("");
+                    let language = calm_core::indexer::lang_constants::language_for_extension(ext)
+                        .unwrap_or("");
+                    let observed = calm_core::change::classify::classify_observed_change(
+                        &calm_core::change::ObservedChangeInput {
+                            path,
+                            language,
+                            is_test: false,
+                            old_text: Some(&original),
+                            new_text: Some(&new_content),
+                            old_signature: None,
+                            new_signature: None,
+                        },
+                    );
+                    // `Body` is the declared-kind fallback both a real
+                    // plan_change(kind="body") caller and, notably,
+                    // guardrails.rs::mint_review_authority_for_edit_context
+                    // ALWAYS use (that compat wrapper has no real
+                    // "declared kind" concept -- it picks Body as a
+                    // generic placeholder, never a human's actual
+                    // claim). Per ChangeKind::Body's own doc comment
+                    // ("the conservative fallback"), nothing can
+                    // meaningfully violate it -- only a declared kind
+                    // NARROWER than reality (e.g. doc_only spent as a
+                    // real body edit) is a real mismatch worth
+                    // escalating over.
+                    let kind_mismatch = intent.kind.0 != calm_core::change::ChangeKind::Body
+                        && calm_core::change::kinds_mismatch(intent.kind, observed);
+                    let touches_manifest = calm_core::change::classify::is_manifest_path(path);
+                    let risk_rule_floor =
+                        calm_core::config::risk_floor_for_path(&self.config().risk_rules, path)
+                            .and_then(|(level_str, _glob)| {
+                                calm_core::policy::RiskLevel::parse(level_str)
+                            });
+                    let risk_vector = calm_core::policy::RiskVector {
+                        caller_count_level,
+                        is_hub: hub_hit,
+                        hub_kind: hub_kind.clone(),
+                        signature_changed: false,
+                        uncertain_zero_caller: uncertain_zero_caller.is_some(),
+                        risk_rule_floor,
+                        kind_mismatch,
+                        touches_manifest,
+                        touches_uncovered_code: false,
+                    };
+                    let policy = calm_core::policy::loader::load_policy_or_warn(&self.project_root);
+                    let policy_decision = calm_core::policy::evaluate(&risk_vector, &policy);
+                    Some((risk_vector.digest(), policy_decision.digest()))
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "could not load ChangeIntent {spend_change_id} to recompute \
+                             spend-time risk: {e}"
+                    );
+                    // Fail closed: a digest that can never legitimately
+                    // match anything ReviewAuthority::mint signed, so a
+                    // lookup failure denies the spend instead of
+                    // silently treating "unknown real risk" as "risk
+                    // unchanged".
+                    Some((format!("UNRESOLVED:{e}"), format!("UNRESOLVED:{e}")))
+                }
+            }
+        } else {
+            None
         };
         // `always_require_edit_context` (Config.edit) widens this gate to
         // every touched symbol regardless of risk -- see OrientationConfig/
@@ -1286,19 +1418,6 @@ impl CalmServer {
                         .ok()
                     })
                     .unwrap_or(0);
-                // CCK-R5.9 (audit follow-up): fall back to
-                // anchor_qualified_name when pre_touched didn't catch the
-                // symbol (the doc-comment-anchored "before" insertion case
-                // -- see this function's own doc comment for
-                // anchor_qualified_name).
-                let primary_touched_qn: Option<&str> = pre_touched
-                    .first()
-                    .map(|t| t.qualified_name.as_str())
-                    .or(anchor_qualified_name);
-                let touched_caller_set_digest = primary_touched_qn
-                    .and_then(|qn| fresh_caller_digests.get(qn))
-                    .cloned()
-                    .unwrap_or_default();
                 let policy = calm_core::policy::loader::load_policy_or_warn(&self.project_root);
                 let policy_digest = policy.digest();
                 let principal = format!("session:{}", self.session_id);
@@ -1328,14 +1447,25 @@ impl CalmServer {
                         });
                     }
                 }
+                let (spend_risk_vector_digest, spend_policy_decision_digest) =
+                    spend_risk_digests.clone().expect(
+                        "spend_risk_digests is Some whenever change_id/authority_id are both Some",
+                    );
                 let current = calm_core::authority::CurrentState {
                     intent_id: change_id,
                     snapshot_id: &snapshot_id,
                     graph_generation: current_graph_generation,
-                    caller_set_digest: &touched_caller_set_digest,
+                    // WS1 (audit follow-up, claim 7): union across every
+                    // touched symbol (see fresh_caller_digests/
+                    // union_caller_set_digest above), not just the first --
+                    // matches review_change's own mint-time union so a
+                    // legitimate multi-target authority verifies correctly.
+                    caller_set_digest: &union_caller_set_digest,
                     policy_digest: &policy_digest,
                     principal: &principal,
                     targets: &current_targets,
+                    policy_decision_digest: &spend_policy_decision_digest,
+                    risk_vector_digest: &spend_risk_vector_digest,
                 };
                 let state_conn = match calm_core::db::conn::open_state_writer(&self.state_db_path) {
                     Ok(c) => c,
@@ -1393,6 +1523,8 @@ impl CalmServer {
                             AE::StaleAnalysisVersion => "AUTHORITY_STALE_ANALYSIS_VERSION",
                             AE::StalePolicy => "AUTHORITY_STALE_POLICY",
                             AE::WrongPrincipal => "AUTHORITY_WRONG_PRINCIPAL",
+                            AE::StaleRiskVector => "AUTHORITY_STALE_RISK_VECTOR",
+                            AE::StalePolicyDecision => "AUTHORITY_STALE_POLICY_DECISION",
                             AE::Db(_) => "AUTHORITY_DB_ERROR",
                         };
                         tracing::info!(
@@ -1972,14 +2104,6 @@ impl CalmServer {
                     .ok()
                 })
                 .unwrap_or(0);
-            let primary_touched_qn: Option<&str> = pre_touched
-                .first()
-                .map(|t| t.qualified_name.as_str())
-                .or(anchor_qualified_name);
-            let touched_caller_set_digest = primary_touched_qn
-                .and_then(|qn| fresh_caller_digests.get(qn))
-                .cloned()
-                .unwrap_or_default();
             let policy = calm_core::policy::loader::load_policy_or_warn(&self.project_root);
             let policy_digest = policy.digest();
             let principal = format!("session:{}", self.session_id);
@@ -2001,14 +2125,23 @@ impl CalmServer {
                     });
                 }
             }
+            let (spend_risk_vector_digest, spend_policy_decision_digest) = spend_risk_digests
+                .clone()
+                .expect("spend_risk_digests is Some whenever change_id/authority_id are both Some");
             let current = calm_core::authority::CurrentState {
                 intent_id: change_id,
                 snapshot_id: &snapshot_id,
                 graph_generation: current_graph_generation,
-                caller_set_digest: &touched_caller_set_digest,
+                // WS1 (audit follow-up, claim 7): union across every touched
+                // symbol, matching review_change's own mint-time union --
+                // see the first authority-check site above for the full
+                // rationale.
+                caller_set_digest: &union_caller_set_digest,
                 policy_digest: &policy_digest,
                 principal: &principal,
                 targets: &current_targets,
+                policy_decision_digest: &spend_policy_decision_digest,
+                risk_vector_digest: &spend_risk_vector_digest,
             };
             match calm_core::authority::ReviewAuthority::authorize_and_begin_edit(
                 &state_conn,
@@ -2019,7 +2152,38 @@ impl CalmServer {
                 &base_digest,
                 &proposed_digest,
             ) {
-                Ok(tx) => Some(tx.tx_id),
+                Ok(tx) => {
+                    // WS3 (audit follow-up): a durable record that a real
+                    // human/MRTR elicitation round-trip actually approved
+                    // THIS spend -- required_approver_class=Human (v5/
+                    // CCK-26) is signed onto the authority, but until now
+                    // nothing persisted that the approval it names really
+                    // happened. Best-effort/fail-open: the authority was
+                    // already atomically verified and consumed above: a
+                    // receipt-write failure here must not retroactively
+                    // undo an already-legitimate, already-spent edit (same
+                    // posture as the other best-effort audit writes in this
+                    // function).
+                    if matches!(gate, ElicitGate::Approved)
+                        && let Err(e) = calm_core::authority::insert_approval_receipt(
+                            &state_conn,
+                            &calm_core::authority::ApprovalReceipt {
+                                change_id: Some(change_id),
+                                authority_id: Some(authority_id),
+                                subject_digest: &proposed_digest,
+                                approved_by: &principal,
+                                mechanism: "elicitation",
+                                tx_id: Some(&tx.tx_id),
+                            },
+                        )
+                    {
+                        tracing::warn!(
+                            "could not persist approval receipt for tx {}: {e}",
+                            tx.tx_id
+                        );
+                    }
+                    Some(tx.tx_id)
+                }
                 Err(e) => {
                     use calm_core::authority::AuthorityError as AE;
                     use calm_core::authority::AuthorizeEditError as AEE;
@@ -2038,6 +2202,10 @@ impl CalmServer {
                         }
                         AEE::Authority(AE::StalePolicy) => "AUTHORITY_STALE_POLICY",
                         AEE::Authority(AE::WrongPrincipal) => "AUTHORITY_WRONG_PRINCIPAL",
+                        AEE::Authority(AE::StaleRiskVector) => "AUTHORITY_STALE_RISK_VECTOR",
+                        AEE::Authority(AE::StalePolicyDecision) => {
+                            "AUTHORITY_STALE_POLICY_DECISION"
+                        }
                         AEE::Authority(AE::Db(_)) | AEE::Txn(_) | AEE::Db(_) => {
                             return txn_init_failed(e.to_string());
                         }
@@ -2055,14 +2223,25 @@ impl CalmServer {
                 }
             }
         } else {
-            match calm_core::txn::begin(&state_conn, &project_id, path, &base_digest, &proposed_digest)
-            {
+            match calm_core::txn::begin(
+                &state_conn,
+                &project_id,
+                path,
+                &base_digest,
+                &proposed_digest,
+            ) {
                 Ok(tx) => Some(tx.tx_id),
                 Err(e) => return txn_init_failed(e.to_string()),
             }
         };
 
-        if let Err(e) = calm_core::edit::atomic_write(&full_path, &new_content) {
+        if let Err(e) = write_via_configured_backend(
+            &self.project_root,
+            path,
+            &full_path,
+            &new_content,
+            self.config().edit.kernel_enforced_writes,
+        ) {
             if let Some(tx_id) = &shadow_tx_id {
                 let _ = calm_core::txn::advance(
                     &state_conn,
@@ -3437,6 +3616,33 @@ pub(crate) fn caller_symbol_set(conn: &rusqlite::Connection, qualified_name: &st
     }) {
         Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
         Err(_) => Vec::new(),
+    }
+}
+
+/// Writes `content` to `path` (repo-relative, already resolved to
+/// `full_path` via `resolve_repo_path`) using whichever write path
+/// `[edit].kernel_enforced_writes` (CCK-05B) selects: `atomic_write`'s
+/// plain resolved-path write (default, zero behavior change), or
+/// `fs::rooted::RootedFilesystem::write_atomic_beneath`'s fd-relative
+/// `openat2(RESOLVE_BENEATH)` write on Linux x86_64 (kernel-enforced
+/// containment with no window between `resolve_repo_path`'s check and
+/// this write for a symlink to be swapped in). Both paths keep the exact
+/// same temp-file-then-rename/fsync contract -- opting in only changes
+/// what backs the containment guarantee, not the write's atomicity.
+fn write_via_configured_backend(
+    project_root: &std::path::Path,
+    path: &str,
+    full_path: &std::path::Path,
+    content: &str,
+    kernel_enforced_writes: bool,
+) -> std::io::Result<()> {
+    if kernel_enforced_writes {
+        let fs = calm_core::fs::RootedFilesystem::open(project_root)?;
+        fs.write_atomic_beneath(path, content)
+            .map(|_| ())
+            .map_err(std::io::Error::other)
+    } else {
+        calm_core::edit::atomic_write(full_path, content)
     }
 }
 
