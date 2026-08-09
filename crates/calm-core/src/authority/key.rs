@@ -21,14 +21,26 @@ type HmacSha256 = Hmac<sha2::Sha256>;
 const CONTROL_KEY_LEN: usize = 32;
 const CONTROL_KEY_FILENAME: &str = "control.key";
 
+/// `Some(key)` only when `key_path` exists and holds exactly
+/// `CONTROL_KEY_LEN` bytes -- any read error (including "not found") or a
+/// short/torn read collapses to `None`, matching the original inline
+/// check's own leniency (this function is the fast path AND the
+/// after-losing-the-create-race retry in [`load_or_create_control_key`],
+/// where a `None` just means "keep waiting/creating", never a hard error).
+fn read_control_key(key_path: &Path) -> Option<[u8; CONTROL_KEY_LEN]> {
+    let bytes = std::fs::read(key_path).ok()?;
+    if bytes.len() != CONTROL_KEY_LEN {
+        return None;
+    }
+    let mut key = [0u8; CONTROL_KEY_LEN];
+    key.copy_from_slice(&bytes);
+    Some(key)
+}
+
 fn load_or_create_control_key(calm_dir: &Path) -> std::io::Result<[u8; CONTROL_KEY_LEN]> {
     let key_path = calm_dir.join(CONTROL_KEY_FILENAME);
 
-    if let Ok(bytes) = std::fs::read(&key_path)
-        && bytes.len() == CONTROL_KEY_LEN
-    {
-        let mut key = [0u8; CONTROL_KEY_LEN];
-        key.copy_from_slice(&bytes);
+    if let Some(key) = read_control_key(&key_path) {
         return Ok(key);
     }
 
@@ -37,13 +49,50 @@ fn load_or_create_control_key(calm_dir: &Path) -> std::io::Result<[u8; CONTROL_K
     rand::rngs::OsRng
         .try_fill_bytes(&mut key)
         .map_err(std::io::Error::other)?;
-    std::fs::write(&key_path, key)?;
-    #[cfg(unix)]
+
+    // CCK-R5.5 (audit follow-up): the old read-then-write here was a
+    // TOCTOU race -- two racing callers could each pass the read above as
+    // "missing", each generate a DIFFERENT random key, and each
+    // unconditionally std::fs::write the file, with the last writer
+    // silently winning on disk. The loser would keep using ITS OWN
+    // generated key in memory (this function's return value) even though
+    // a different key ended up persisted, so every signature it mints
+    // would fail to verify against what's actually stored.
+    // OpenOptions::create_new(true) makes exactly one racing caller win
+    // the create; the rest see AlreadyExists and re-read the winner's
+    // real persisted key instead of trusting their own now-orphaned bytes.
+    use std::io::Write;
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&key_path)
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600));
+        Ok(mut file) => {
+            file.write_all(&key)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+            }
+            Ok(key)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Lost the race. The winner's write_all above is one small
+            // syscall, so a short bounded spin is enough to observe the
+            // finished file instead of a torn read mid-write.
+            for _ in 0..50 {
+                if let Some(key) = read_control_key(&key_path) {
+                    return Ok(key);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            Err(std::io::Error::other(format!(
+                "lost the race to create {} but never observed a complete key file",
+                key_path.display()
+            )))
+        }
+        Err(e) => Err(e),
     }
-    Ok(key)
 }
 
 /// The control key for whatever project `conn` (a **state.db** connection)
@@ -111,6 +160,32 @@ mod tests {
         let a = load_or_create_control_key(dir_a.path()).unwrap();
         let b = load_or_create_control_key(dir_b.path()).unwrap();
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn concurrent_first_time_creation_converges_on_a_single_key() {
+        // CCK-R5.5 (audit follow-up): regression test for the TOCTOU race
+        // the old read-then-write had -- spins up real OS threads racing
+        // load_or_create_control_key against the SAME never-before-seen
+        // directory, so every one of them hits the "file doesn't exist
+        // yet" branch concurrently. Before the create_new(true) fix, each
+        // thread could generate and persist a DIFFERENT key while
+        // returning its own (possibly since-overwritten) bytes; every
+        // thread must now observe the exact same persisted key.
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path().to_path_buf();
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let dir_path = dir_path.clone();
+                std::thread::spawn(move || load_or_create_control_key(&dir_path).unwrap())
+            })
+            .collect();
+        let keys: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let first = keys[0];
+        assert!(
+            keys.iter().all(|k| *k == first),
+            "every racing caller must observe the same persisted key, not its own generated one"
+        );
     }
 
     #[cfg(unix)]
