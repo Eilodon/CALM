@@ -13,7 +13,7 @@ pub mod intent;
 pub mod store;
 
 pub use classify::{
-    kinds_mismatch, ChangeIntentKind, ChangeKind, ObservedChangeInput, ObservedChangeKind,
+    ChangeIntentKind, ChangeKind, ObservedChangeInput, ObservedChangeKind, kinds_mismatch,
 };
 pub use intent::{ChangeIntent, ChangeIntentTarget};
 pub use store::{get_change_intent, insert_change_intent};

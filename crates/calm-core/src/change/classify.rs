@@ -173,8 +173,13 @@ const MANIFEST_BASENAMES: &[&str] = &[
 /// workspace member's `Cargo.toml` counts here even though it wouldn't for
 /// that cache.
 fn is_manifest_path(path: &str) -> bool {
-    let basename = Path::new(path).file_name().and_then(|n| n.to_str()).unwrap_or(path);
-    MANIFEST_BASENAMES.contains(&basename) || basename.ends_with(".csproj") || basename.ends_with(".fsproj")
+    let basename = Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(path);
+    MANIFEST_BASENAMES.contains(&basename)
+        || basename.ends_with(".csproj")
+        || basename.ends_with(".fsproj")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -241,7 +246,10 @@ fn code_ignoring_leading_visibility(text: &str, language: &str) -> String {
     text.lines()
         .filter(|line| classify_line(line, language) == LineKind::Code)
         .map(|line| {
-            strip_leading_visibility_keyword(line).split_whitespace().collect::<Vec<_>>().join(" ")
+            strip_leading_visibility_keyword(line)
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
         })
         .filter(|line| !line.is_empty())
         .collect::<Vec<_>>()
@@ -286,7 +294,9 @@ fn classify_inner(input: &ObservedChangeInput) -> ChangeKind {
     }
 
     let code_and_regular = &[RegularComment, Code][..];
-    if normalized_lines(old, lang, code_and_regular) == normalized_lines(new, lang, code_and_regular) {
+    if normalized_lines(old, lang, code_and_regular)
+        == normalized_lines(new, lang, code_and_regular)
+    {
         return ChangeKind::DocOnly;
     }
 
@@ -335,47 +345,68 @@ mod tests {
 
     #[test]
     fn add_when_old_text_absent() {
-        assert_eq!(classify("a.rs", "rust", None, Some("fn f() {}")), ChangeKind::Add);
+        assert_eq!(
+            classify("a.rs", "rust", None, Some("fn f() {}")),
+            ChangeKind::Add
+        );
     }
 
     #[test]
     fn delete_when_new_text_absent() {
-        assert_eq!(classify("a.rs", "rust", Some("fn f() {}"), None), ChangeKind::Delete);
+        assert_eq!(
+            classify("a.rs", "rust", Some("fn f() {}"), None),
+            ChangeKind::Delete
+        );
     }
 
     #[test]
     fn whitespace_only_reformatting() {
         let old = "fn f() {\n    let x = 1;\n}";
         let new = "fn f() {\n  let x =    1;\n}";
-        assert_eq!(classify("a.rs", "rust", Some(old), Some(new)), ChangeKind::Whitespace);
+        assert_eq!(
+            classify("a.rs", "rust", Some(old), Some(new)),
+            ChangeKind::Whitespace
+        );
     }
 
     #[test]
     fn regular_comment_only_change() {
         let old = "fn f() {\n    // old note\n    let x = 1;\n}";
         let new = "fn f() {\n    // new note, expanded\n    let x = 1;\n}";
-        assert_eq!(classify("a.rs", "rust", Some(old), Some(new)), ChangeKind::Comment);
+        assert_eq!(
+            classify("a.rs", "rust", Some(old), Some(new)),
+            ChangeKind::Comment
+        );
     }
 
     #[test]
     fn doc_comment_only_change() {
         let old = "/// old docs\nfn f() {\n    // keep\n    let x = 1;\n}";
         let new = "/// new, better docs\nfn f() {\n    // keep\n    let x = 1;\n}";
-        assert_eq!(classify("a.rs", "rust", Some(old), Some(new)), ChangeKind::DocOnly);
+        assert_eq!(
+            classify("a.rs", "rust", Some(old), Some(new)),
+            ChangeKind::DocOnly
+        );
     }
 
     #[test]
     fn body_change_when_code_line_differs() {
         let old = "fn f() {\n    let x = 1;\n}";
         let new = "fn f() {\n    let x = 2;\n}";
-        assert_eq!(classify("a.rs", "rust", Some(old), Some(new)), ChangeKind::Body);
+        assert_eq!(
+            classify("a.rs", "rust", Some(old), Some(new)),
+            ChangeKind::Body
+        );
     }
 
     #[test]
     fn visibility_change_alone() {
         let old = "fn helper() {}";
         let new = "pub fn helper() {}";
-        assert_eq!(classify("a.rs", "rust", Some(old), Some(new)), ChangeKind::Visibility);
+        assert_eq!(
+            classify("a.rs", "rust", Some(old), Some(new)),
+            ChangeKind::Visibility
+        );
     }
 
     #[test]
@@ -401,14 +432,24 @@ mod tests {
             ChangeKind::Manifest
         );
         assert_eq!(
-            classify("crates/foo/Cargo.toml", "toml", Some("a = 1"), Some("a = 2")),
+            classify(
+                "crates/foo/Cargo.toml",
+                "toml",
+                Some("a = 1"),
+                Some("a = 2")
+            ),
             ChangeKind::Manifest
         );
     }
 
     #[test]
     fn test_only_when_flagged_regardless_of_content() {
-        let mut i = input("tests/foo_test.rs", "rust", Some("assert!(true);"), Some("assert!(false);"));
+        let mut i = input(
+            "tests/foo_test.rs",
+            "rust",
+            Some("assert!(true);"),
+            Some("assert!(false);"),
+        );
         i.is_test = true;
         assert_eq!(classify_observed_change(&i).0, ChangeKind::TestOnly);
     }
@@ -420,7 +461,10 @@ mod tests {
         let new = "fn f() {\n    let x = 2;\n}";
         let observed = classify_observed_change(&input("a.rs", "rust", Some(old), Some(new)));
         assert_eq!(observed.0, ChangeKind::Body);
-        assert!(kinds_mismatch(declared, observed), "DocOnly declared but real code changed must mismatch");
+        assert!(
+            kinds_mismatch(declared, observed),
+            "DocOnly declared but real code changed must mismatch"
+        );
     }
 
     #[test]

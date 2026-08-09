@@ -22,6 +22,27 @@ pub struct Policy {
     pub uncovered_code_floor: RiskLevel,
 }
 
+impl Policy {
+    /// Stable content digest of this policy's floors -- bound into
+    /// `ReviewAuthority::policy_digest` (CCK-10,
+    /// docs/plans/2026-08-08-master-change-control-execution-blueprint.md):
+    /// an authority minted under one `.calm/policy.toml` is refused
+    /// (`AUTHORITY_STALE_POLICY`) if the policy changes before the edit it
+    /// authorizes actually lands, the same "no stale evidence may grant
+    /// authority" invariant every other bound field already enforces.
+    pub fn digest(&self) -> String {
+        crate::digest::evidence_digest(
+            format!(
+                "policy-v1\nkind_mismatch_floor={}\nmanifest_floor={}\nuncovered_code_floor={}\n",
+                self.kind_mismatch_floor.as_str(),
+                self.manifest_floor.as_str(),
+                self.uncovered_code_floor.as_str(),
+            )
+            .as_bytes(),
+        )
+    }
+}
+
 impl Default for Policy {
     fn default() -> Self {
         Self {
@@ -86,10 +107,18 @@ mod tests {
     fn partial_policy_toml_fills_missing_fields_from_defaults() {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(root.path().join(".calm")).unwrap();
-        std::fs::write(root.path().join(".calm/policy.toml"), "manifest_floor = \"medium\"\n").unwrap();
+        std::fs::write(
+            root.path().join(".calm/policy.toml"),
+            "manifest_floor = \"medium\"\n",
+        )
+        .unwrap();
         let policy = load_policy(root.path()).unwrap();
         assert_eq!(policy.manifest_floor, RiskLevel::Medium);
-        assert_eq!(policy.kind_mismatch_floor, RiskLevel::High, "unset fields keep the default");
+        assert_eq!(
+            policy.kind_mismatch_floor,
+            RiskLevel::High,
+            "unset fields keep the default"
+        );
     }
 
     #[test]
@@ -106,5 +135,17 @@ mod tests {
         std::fs::create_dir_all(root.path().join(".calm")).unwrap();
         std::fs::write(root.path().join(".calm/policy.toml"), "not valid toml {{{").unwrap();
         assert_eq!(load_policy_or_warn(root.path()), Policy::default());
+    }
+
+    #[test]
+    fn digest_is_deterministic_for_the_same_policy() {
+        assert_eq!(Policy::default().digest(), Policy::default().digest());
+    }
+
+    #[test]
+    fn digest_changes_when_a_floor_changes() {
+        let mut changed = Policy::default();
+        changed.kind_mismatch_floor = RiskLevel::Low;
+        assert_ne!(Policy::default().digest(), changed.digest());
     }
 }

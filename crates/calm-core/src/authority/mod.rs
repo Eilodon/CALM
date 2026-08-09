@@ -9,5 +9,7 @@ pub mod key;
 pub mod review;
 pub mod snapshot;
 
-pub use review::{current_analysis_version, AuthorityError, CurrentState, MintParams, ReviewAuthority};
+pub use review::{
+    AuthorityError, CurrentState, MintParams, ReviewAuthority, current_analysis_version,
+};
 pub use snapshot::{EvidenceSnapshot, FreshnessClass};

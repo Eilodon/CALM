@@ -406,6 +406,18 @@ impl CalmServer {
                     |r| r.get(0),
                 )
                 .unwrap_or(0);
+            // CCK-10 (#65): mint a ReviewAuthority for this single-symbol
+            // review -- fail-open (mint_review_authority_for_edit_context
+            // returns None on any error), so a minting hiccup never blocks
+            // this mandatory pre-edit tool's existing fields. Borrowed here
+            // (not moved) so record_edit_context_review below still gets
+            // its own owned copies unchanged.
+            let minted = self.mint_review_authority_for_edit_context(
+                &conn,
+                &c,
+                &caller_set_digest,
+                graph_generation,
+            );
             self.record_edit_context_review(
                 &c.qualified_name,
                 &caller_qns_full,
@@ -450,6 +462,15 @@ impl CalmServer {
                 (callers, callees, callers_truncated, callees_truncated)
             };
 
+            let (change_id, authority_id, authority_expires_at) = match minted {
+                Some(m) => (
+                    Some(m.change_id),
+                    Some(m.authority_id),
+                    Some(m.authority_expires_at),
+                ),
+                None => (None, None, None),
+            };
+
             ResolvedOutcome::success(EditContextOutput {
                 symbol: p.symbol,
                 edges_ready: self.edges_ready(),
@@ -472,6 +493,9 @@ impl CalmServer {
                     "diff_impact",
                     "MANDATORY after changes — verify blast radius",
                 )),
+                change_id,
+                authority_id,
+                authority_expires_at,
             })
         }))
     }
@@ -1041,6 +1065,19 @@ pub(crate) struct EditContextOutput {
     pub(crate) edges_not_modified: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) suggested_next: Option<SuggestedNext>,
+    /// CCK-10 (#65): `ChangeIntent::intent_id` for the authority minted by
+    /// this call, if minting succeeded (fail-open — absent on any minting
+    /// error, never blocks the mandatory pre-edit fields above). Pass
+    /// alongside `authority_id` to `edit_lines`/`edit_symbol` to use the
+    /// authority-validated write path instead of `confirm`/`reason`/`cites`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) change_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) authority_id: Option<String>,
+    /// Unix seconds — the minted authority is refused (single-use, TTL-
+    /// bound) after this even if every bound field still matches.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) authority_expires_at: Option<f64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1173,6 +1210,82 @@ pub(crate) struct DiffImpactOutput {
     pub(crate) note: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) suggested_next: Option<SuggestedNext>,
+}
+
+/// Authority minted for a single-symbol `edit_context` review — CCK-10
+/// (#65, docs/plans/2026-08-08-master-change-control-execution-blueprint.md).
+/// `change_id` is `ChangeIntent::intent_id`; pass both `change_id` and
+/// `authority_id` to `edit_lines`/`edit_symbol` to use the new
+/// authority-validated write path instead of `confirm`/`reason`/`cites`.
+pub(crate) struct MintedAuthorityOutput {
+    pub(crate) change_id: String,
+    pub(crate) authority_id: String,
+    pub(crate) authority_expires_at: f64,
+}
+
+impl CalmServer {
+    /// `edit_context`'s compat-wrapper half (CCK-10): synthesizes a
+    /// single-symbol `ChangeIntent`, captures an `EvidenceSnapshot`,
+    /// computes the current `.calm/policy.toml` digest, and mints a
+    /// `ReviewAuthority` binding all of it plus the caller-set digest and
+    /// graph_generation `edit_context` already computed. Deliberately
+    /// fail-open (`None` on any error, never a `Result` the caller must
+    /// handle) — `edit_context` is the MANDATORY pre-edit tool and must
+    /// keep returning its existing fields even if minting hits an infra
+    /// hiccup (a locked state.db, an unreadable control.key); the OLD
+    /// confirm/reason/cites path stays fully usable either way, since
+    /// `edit_lines_impl_gated` only takes the new authority path when a
+    /// caller explicitly supplies both `change_id` and `authority_id`.
+    pub(crate) fn mint_review_authority_for_edit_context(
+        &self,
+        conn: &rusqlite::Connection,
+        c: &CandidateRow,
+        caller_set_digest: &str,
+        graph_generation: i64,
+    ) -> Option<MintedAuthorityOutput> {
+        let snapshot =
+            calm_core::authority::EvidenceSnapshot::compute(conn, &self.project_root).ok()?;
+        let state_conn = calm_core::db::conn::open_state_writer(&self.state_db_path).ok()?;
+        snapshot.persist(&state_conn).ok()?;
+
+        let target = calm_core::change::ChangeIntentTarget {
+            path: c.path.clone(),
+            qualified_name: Some(c.qualified_name.clone()),
+        };
+        let intent = calm_core::change::ChangeIntent::new(
+            calm_core::change::ChangeIntentKind(calm_core::change::ChangeKind::Body),
+            "edit_context compat wrapper: single-symbol review (CCK-10)",
+            snapshot.snapshot_id.clone(),
+            vec![target.clone()],
+        );
+        calm_core::change::insert_change_intent(&state_conn, &intent).ok()?;
+
+        let policy = calm_core::policy::loader::load_policy_or_warn(&self.project_root);
+        let policy_digest = policy.digest();
+        let principal = format!("session:{}", self.session_id);
+        const AUTHORITY_TTL_SECS: f64 = 1800.0;
+
+        let authority = calm_core::authority::ReviewAuthority::mint(
+            &state_conn,
+            calm_core::authority::MintParams {
+                intent_id: &intent.intent_id,
+                snapshot_id: &snapshot.snapshot_id,
+                graph_generation,
+                caller_set_digest,
+                policy_digest: &policy_digest,
+                principal: &principal,
+                ttl_secs: AUTHORITY_TTL_SECS,
+                targets: &[target],
+            },
+        )
+        .ok()?;
+
+        Some(MintedAuthorityOutput {
+            change_id: intent.intent_id,
+            authority_id: authority.authority_id,
+            authority_expires_at: authority.expires_at,
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------

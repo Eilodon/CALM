@@ -58,7 +58,11 @@ pub const STATE_MIGRATIONS: &[StateMigration] = &[
 /// `CREATE TABLE` statements fails loudly here instead of only surfacing
 /// as a confusing "no such table" much later, at first real use.
 fn v1_to_v2_evidence_snapshots_and_change_intents(conn: &Connection) -> rusqlite::Result<()> {
-    for table in ["evidence_snapshots", "change_intents", "change_intent_targets"] {
+    for table in [
+        "evidence_snapshots",
+        "change_intents",
+        "change_intent_targets",
+    ] {
         let exists: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
             [table],
@@ -90,13 +94,19 @@ fn v1_to_v2_evidence_snapshots_and_change_intents(conn: &Connection) -> rusqlite
 /// helper for one column.
 fn v2_to_v3_review_authorities(conn: &Connection) -> rusqlite::Result<()> {
     let mut stmt = conn.prepare("PRAGMA table_info(edit_transactions)")?;
-    let existing_columns: Vec<String> =
-        stmt.query_map([], |row| row.get::<_, String>(1))?.filter_map(|r| r.ok()).collect();
+    let existing_columns: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(|r| r.ok())
+        .collect();
     if !existing_columns.iter().any(|c| c == "authority_id") {
         conn.execute_batch("ALTER TABLE edit_transactions ADD COLUMN authority_id TEXT;")?;
     }
 
-    for table in ["review_authorities", "review_authority_targets", "review_authority_evidence"] {
+    for table in [
+        "review_authorities",
+        "review_authority_targets",
+        "review_authority_evidence",
+    ] {
         let exists: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
             [table],
@@ -129,7 +139,11 @@ const BASELINE_VERSION: i64 = 1;
 /// between the downgrade-guard refusal and `init_state_db`'s idempotent DDL
 /// having already run -- `apply` fns may assume baseline tables exist.
 pub fn migrate_state_db_to_current(conn: &Connection) -> rusqlite::Result<()> {
-    run_migrations_from(conn, STATE_MIGRATIONS, super::schema::STATE_DB_SCHEMA_VERSION)
+    run_migrations_from(
+        conn,
+        STATE_MIGRATIONS,
+        super::schema::STATE_DB_SCHEMA_VERSION,
+    )
 }
 
 /// `pub(crate)` so integration tests can drive a synthetic migration list
@@ -141,15 +155,22 @@ pub(crate) fn run_migrations_from(
     target: i64,
 ) -> rusqlite::Result<()> {
     let on_disk: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    let mut current = if on_disk == 0 { BASELINE_VERSION } else { on_disk };
+    let mut current = if on_disk == 0 {
+        BASELINE_VERSION
+    } else {
+        on_disk
+    };
 
     while current < target {
-        let step = migrations.iter().find(|m| m.from == current).unwrap_or_else(|| {
-            panic!(
-                "state.db migration executor: no registered step from version {current} \
+        let step = migrations
+            .iter()
+            .find(|m| m.from == current)
+            .unwrap_or_else(|| {
+                panic!(
+                    "state.db migration executor: no registered step from version {current} \
                  toward target {target} -- STATE_MIGRATIONS is missing an entry"
-            )
-        });
+                )
+            });
         debug_assert_eq!(
             step.to,
             step.from + 1,
@@ -199,13 +220,18 @@ mod tests {
     }
 
     fn user_version(conn: &Connection) -> i64 {
-        conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap()
+        conn.query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap()
     }
 
     #[test]
     fn unstamped_zero_version_db_becomes_target_with_no_migrations_registered() {
         let conn = fresh_conn();
-        assert_eq!(user_version(&conn), 0, "fresh in-memory DB starts unstamped");
+        assert_eq!(
+            user_version(&conn),
+            0,
+            "fresh in-memory DB starts unstamped"
+        );
         run_migrations_from(&conn, &[], 1).unwrap();
         assert_eq!(user_version(&conn), 1);
     }
@@ -233,17 +259,25 @@ mod tests {
     fn successful_step_applies_and_stamps_atomically() {
         let conn = fresh_conn();
         conn.pragma_update(None, "user_version", 1).unwrap();
-        conn.execute_batch("CREATE TABLE probe (id INTEGER PRIMARY KEY)").unwrap();
+        conn.execute_batch("CREATE TABLE probe (id INTEGER PRIMARY KEY)")
+            .unwrap();
 
         fn add_marker_row(conn: &Connection) -> rusqlite::Result<()> {
             conn.execute("INSERT INTO probe (id) VALUES (1)", [])?;
             Ok(())
         }
-        let migrations = [StateMigration { from: 1, to: 2, name: "add_marker_row", apply: add_marker_row }];
+        let migrations = [StateMigration {
+            from: 1,
+            to: 2,
+            name: "add_marker_row",
+            apply: add_marker_row,
+        }];
 
         run_migrations_from(&conn, &migrations, 2).unwrap();
         assert_eq!(user_version(&conn), 2);
-        let rows: i64 = conn.query_row("SELECT COUNT(*) FROM probe", [], |r| r.get(0)).unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM probe", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(rows, 1);
     }
 
@@ -251,7 +285,8 @@ mod tests {
     fn forced_failure_in_apply_leaves_user_version_unchanged_and_rolls_back_ddl() {
         let conn = fresh_conn();
         conn.pragma_update(None, "user_version", 1).unwrap();
-        conn.execute_batch("CREATE TABLE probe (id INTEGER PRIMARY KEY)").unwrap();
+        conn.execute_batch("CREATE TABLE probe (id INTEGER PRIMARY KEY)")
+            .unwrap();
 
         fn insert_then_fail(conn: &Connection) -> rusqlite::Result<()> {
             conn.execute("INSERT INTO probe (id) VALUES (1)", [])?;
@@ -260,34 +295,59 @@ mod tests {
                 Some("simulated forced failure".to_string()),
             ))
         }
-        let migrations = [StateMigration { from: 1, to: 2, name: "insert_then_fail", apply: insert_then_fail }];
+        let migrations = [StateMigration {
+            from: 1,
+            to: 2,
+            name: "insert_then_fail",
+            apply: insert_then_fail,
+        }];
 
         let err = run_migrations_from(&conn, &migrations, 2);
         assert!(err.is_err(), "forced apply failure must propagate as Err");
-        assert_eq!(user_version(&conn), 1, "user_version must stay at its pre-step value");
-        let rows: i64 = conn.query_row("SELECT COUNT(*) FROM probe", [], |r| r.get(0)).unwrap();
-        assert_eq!(rows, 0, "the insert inside the failed step must be rolled back too");
+        assert_eq!(
+            user_version(&conn),
+            1,
+            "user_version must stay at its pre-step value"
+        );
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM probe", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            rows, 0,
+            "the insert inside the failed step must be rolled back too"
+        );
     }
 
     #[test]
     fn restart_after_a_completed_migration_is_idempotent() {
         let conn = fresh_conn();
         conn.pragma_update(None, "user_version", 1).unwrap();
-        conn.execute_batch("CREATE TABLE probe (id INTEGER PRIMARY KEY)").unwrap();
+        conn.execute_batch("CREATE TABLE probe (id INTEGER PRIMARY KEY)")
+            .unwrap();
 
         fn add_marker_row(conn: &Connection) -> rusqlite::Result<()> {
             conn.execute("INSERT OR IGNORE INTO probe (id) VALUES (1)", [])?;
             Ok(())
         }
-        let migrations = [StateMigration { from: 1, to: 2, name: "add_marker_row", apply: add_marker_row }];
+        let migrations = [StateMigration {
+            from: 1,
+            to: 2,
+            name: "add_marker_row",
+            apply: add_marker_row,
+        }];
 
         run_migrations_from(&conn, &migrations, 2).unwrap();
         // Simulates a process restart calling the exact same entry point
         // again against an already-migrated file.
         run_migrations_from(&conn, &migrations, 2).unwrap();
         assert_eq!(user_version(&conn), 2);
-        let rows: i64 = conn.query_row("SELECT COUNT(*) FROM probe", [], |r| r.get(0)).unwrap();
-        assert_eq!(rows, 1, "re-running past-target migrations must not re-apply them");
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM probe", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            rows, 1,
+            "re-running past-target migrations must not re-apply them"
+        );
     }
 
     #[test]
@@ -306,8 +366,15 @@ mod tests {
         let conn = fresh_conn();
         conn.pragma_update(None, "user_version", 1).unwrap();
         migrate_state_db_to_current(&conn).unwrap();
-        assert_eq!(user_version(&conn), super::super::schema::STATE_DB_SCHEMA_VERSION);
-        for table in ["evidence_snapshots", "change_intents", "change_intent_targets"] {
+        assert_eq!(
+            user_version(&conn),
+            super::super::schema::STATE_DB_SCHEMA_VERSION
+        );
+        for table in [
+            "evidence_snapshots",
+            "change_intents",
+            "change_intent_targets",
+        ] {
             let exists: bool = conn
                 .query_row(
                     "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
@@ -324,7 +391,10 @@ mod tests {
         let conn = fresh_conn();
         assert_eq!(user_version(&conn), 0);
         migrate_state_db_to_current(&conn).unwrap();
-        assert_eq!(user_version(&conn), super::super::schema::STATE_DB_SCHEMA_VERSION);
+        assert_eq!(
+            user_version(&conn),
+            super::super::schema::STATE_DB_SCHEMA_VERSION
+        );
     }
 
     #[test]
@@ -332,9 +402,16 @@ mod tests {
         let conn = fresh_conn();
         conn.pragma_update(None, "user_version", 2).unwrap();
         migrate_state_db_to_current(&conn).unwrap();
-        assert_eq!(user_version(&conn), super::super::schema::STATE_DB_SCHEMA_VERSION);
+        assert_eq!(
+            user_version(&conn),
+            super::super::schema::STATE_DB_SCHEMA_VERSION
+        );
 
-        for table in ["review_authorities", "review_authority_targets", "review_authority_evidence"] {
+        for table in [
+            "review_authorities",
+            "review_authority_targets",
+            "review_authority_evidence",
+        ] {
             let exists: bool = conn
                 .query_row(
                     "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
@@ -351,7 +428,10 @@ mod tests {
             .unwrap()
             .filter_map(|r| r.ok())
             .collect();
-        assert!(columns.iter().any(|c| c == "authority_id"), "edit_transactions.authority_id should exist");
+        assert!(
+            columns.iter().any(|c| c == "authority_id"),
+            "edit_transactions.authority_id should exist"
+        );
     }
 
     #[test]
@@ -369,12 +449,20 @@ mod tests {
         migrate_state_db_to_current(&conn).unwrap();
 
         let (path, authority_id): (String, Option<String>) = conn
-            .query_row("SELECT path, authority_id FROM edit_transactions WHERE tx_id = 'TXN-1'", [], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
+            .query_row(
+                "SELECT path, authority_id FROM edit_transactions WHERE tx_id = 'TXN-1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
             .unwrap();
-        assert_eq!(path, "a.rs", "pre-existing row must survive the ALTER untouched");
-        assert_eq!(authority_id, None, "a pre-existing row gets NULL for the new column, not an error");
+        assert_eq!(
+            path, "a.rs",
+            "pre-existing row must survive the ALTER untouched"
+        );
+        assert_eq!(
+            authority_id, None,
+            "a pre-existing row gets NULL for the new column, not an error"
+        );
     }
 
     #[test]
@@ -385,6 +473,9 @@ mod tests {
         // column name".
         let conn = fresh_conn();
         migrate_state_db_to_current(&conn).unwrap();
-        assert_eq!(user_version(&conn), super::super::schema::STATE_DB_SCHEMA_VERSION);
+        assert_eq!(
+            user_version(&conn),
+            super::super::schema::STATE_DB_SCHEMA_VERSION
+        );
     }
 }

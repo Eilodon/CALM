@@ -99,11 +99,21 @@ mod tests {
     #[test]
     fn targets_are_preserved_verbatim() {
         let targets = vec![
-            ChangeIntentTarget { path: "a.rs".to_string(), qualified_name: Some("a.rs::f".to_string()) },
-            ChangeIntentTarget { path: "b.rs".to_string(), qualified_name: None },
+            ChangeIntentTarget {
+                path: "a.rs".to_string(),
+                qualified_name: Some("a.rs::f".to_string()),
+            },
+            ChangeIntentTarget {
+                path: "b.rs".to_string(),
+                qualified_name: None,
+            },
         ];
-        let intent =
-            ChangeIntent::new(ChangeIntentKind(ChangeKind::Body), "test", "SNP-x", targets.clone());
+        let intent = ChangeIntent::new(
+            ChangeIntentKind(ChangeKind::Body),
+            "test",
+            "SNP-x",
+            targets.clone(),
+        );
         assert_eq!(intent.targets, targets);
     }
 }

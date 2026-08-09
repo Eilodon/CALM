@@ -40,7 +40,11 @@ pub fn evaluate(vector: &RiskVector, policy: &Policy) -> PolicyDecision {
     if vector.is_hub {
         reasons.push(format!(
             "touches a hub symbol{}",
-            vector.hub_kind.as_deref().map(|k| format!(" ({k})")).unwrap_or_default()
+            vector
+                .hub_kind
+                .as_deref()
+                .map(|k| format!(" ({k})"))
+                .unwrap_or_default()
         ));
     }
     if vector.signature_changed {
@@ -59,7 +63,10 @@ pub fn evaluate(vector: &RiskVector, policy: &Policy) -> PolicyDecision {
     }
     if vector.touches_manifest {
         level = level.max(policy.manifest_floor);
-        reasons.push(format!("touches a dependency manifest (floor: {})", policy.manifest_floor.as_str()));
+        reasons.push(format!(
+            "touches a dependency manifest (floor: {})",
+            policy.manifest_floor.as_str()
+        ));
     }
     if vector.touches_uncovered_code {
         level = level.max(policy.uncovered_code_floor);
@@ -69,7 +76,10 @@ pub fn evaluate(vector: &RiskVector, policy: &Policy) -> PolicyDecision {
         ));
     }
 
-    PolicyDecision { aggregate_risk: level, reasons }
+    PolicyDecision {
+        aggregate_risk: level,
+        reasons,
+    }
 }
 
 #[cfg(test)]
@@ -110,7 +120,10 @@ mod tests {
     fn kind_mismatch_escalates_to_the_policy_configured_floor() {
         let mut v = base_vector();
         v.kind_mismatch = true;
-        let lenient = Policy { kind_mismatch_floor: RiskLevel::Medium, ..Policy::default() };
+        let lenient = Policy {
+            kind_mismatch_floor: RiskLevel::Medium,
+            ..Policy::default()
+        };
         let decision = evaluate(&v, &lenient);
         assert_eq!(decision.aggregate_risk, RiskLevel::Medium);
     }
@@ -126,7 +139,11 @@ mod tests {
             uncovered_code_floor: RiskLevel::Low,
         };
         let decision = evaluate(&v, &permissive);
-        assert_eq!(decision.aggregate_risk, RiskLevel::High, "a low policy floor must not undercut a higher structural risk");
+        assert_eq!(
+            decision.aggregate_risk,
+            RiskLevel::High,
+            "a low policy floor must not undercut a higher structural risk"
+        );
     }
 
     #[test]
@@ -143,8 +160,11 @@ mod tests {
         let mut v = base_vector();
         v.touches_manifest = true;
         v.touches_uncovered_code = true;
-        let policy =
-            Policy { manifest_floor: RiskLevel::Medium, uncovered_code_floor: RiskLevel::High, ..Policy::default() };
+        let policy = Policy {
+            manifest_floor: RiskLevel::Medium,
+            uncovered_code_floor: RiskLevel::High,
+            ..Policy::default()
+        };
         let decision = evaluate(&v, &policy);
         assert_eq!(decision.aggregate_risk, RiskLevel::High);
         assert_eq!(decision.reasons.len(), 2);

@@ -28,7 +28,7 @@
 //! plus the single-use `nonce` and `expires_at` that make the object a
 //! capability rather than a plain record.
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::authority::key::{control_key_for_conn, sign, verify};
 use crate::change::intent::ChangeIntentTarget;
@@ -108,16 +108,34 @@ impl std::fmt::Display for AuthorityError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotFound => write!(f, "no review authority with that id"),
-            Self::ForgedSignature => write!(f, "review authority signature does not match its stored fields"),
+            Self::ForgedSignature => write!(
+                f,
+                "review authority signature does not match its stored fields"
+            ),
             Self::Expired => write!(f, "review authority has expired"),
-            Self::AlreadyConsumed => write!(f, "review authority was already consumed (single-use)"),
-            Self::WrongIntent => write!(f, "review authority was not minted for this change intent"),
-            Self::StaleSnapshot => write!(f, "review authority's bound EvidenceSnapshot no longer matches current index state"),
-            Self::StaleGraphGeneration => write!(f, "STALE_GRAPH_AUTHORITY: graph_generation changed since this authority was minted"),
+            Self::AlreadyConsumed => {
+                write!(f, "review authority was already consumed (single-use)")
+            }
+            Self::WrongIntent => {
+                write!(f, "review authority was not minted for this change intent")
+            }
+            Self::StaleSnapshot => write!(
+                f,
+                "review authority's bound EvidenceSnapshot no longer matches current index state"
+            ),
+            Self::StaleGraphGeneration => write!(
+                f,
+                "STALE_GRAPH_AUTHORITY: graph_generation changed since this authority was minted"
+            ),
             Self::StaleCallerSet => write!(f, "caller set changed since this authority was minted"),
-            Self::StaleAnalysisVersion => write!(f, "analysis version changed since this authority was minted (binary upgraded?)"),
+            Self::StaleAnalysisVersion => write!(
+                f,
+                "analysis version changed since this authority was minted (binary upgraded?)"
+            ),
             Self::StalePolicy => write!(f, "policy changed since this authority was minted"),
-            Self::WrongPrincipal => write!(f, "review authority was minted for a different principal"),
+            Self::WrongPrincipal => {
+                write!(f, "review authority was minted for a different principal")
+            }
             Self::Db(e) => write!(f, "review authority db error: {e}"),
         }
     }
@@ -239,7 +257,11 @@ impl ReviewAuthority {
         Ok(authority)
     }
 
-    fn persist(&self, state_conn: &Connection, targets: &[ChangeIntentTarget]) -> rusqlite::Result<()> {
+    fn persist(
+        &self,
+        state_conn: &Connection,
+        targets: &[ChangeIntentTarget],
+    ) -> rusqlite::Result<()> {
         state_conn.execute(
             "INSERT INTO review_authorities \
              (authority_id, intent_id, snapshot_id, graph_generation, caller_set_digest, \
@@ -421,7 +443,7 @@ impl ReviewAuthority {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::schema::{init_state_db, STATE_DB_SCHEMA_VERSION};
+    use crate::db::schema::{STATE_DB_SCHEMA_VERSION, init_state_db};
     use crate::db::state_migrations::migrate_state_db_to_current;
     use std::path::Path;
 
@@ -435,7 +457,8 @@ mod tests {
         init_state_db(&conn).unwrap();
         migrate_state_db_to_current(&conn).unwrap();
         assert_eq!(
-            conn.query_row::<i64, _, _>("PRAGMA user_version", [], |r| r.get(0)).unwrap(),
+            conn.query_row::<i64, _, _>("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap(),
             STATE_DB_SCHEMA_VERSION
         );
         conn
@@ -494,8 +517,10 @@ mod tests {
         seed_intent_and_snapshot(&conn);
         let authority = ReviewAuthority::mint(&conn, mint_params(&[])).unwrap();
 
-        ReviewAuthority::verify_and_consume(&conn, &authority.authority_id, &base_current()).unwrap();
-        let replay = ReviewAuthority::verify_and_consume(&conn, &authority.authority_id, &base_current());
+        ReviewAuthority::verify_and_consume(&conn, &authority.authority_id, &base_current())
+            .unwrap();
+        let replay =
+            ReviewAuthority::verify_and_consume(&conn, &authority.authority_id, &base_current());
         assert_eq!(replay, Err(AuthorityError::AlreadyConsumed));
     }
 
@@ -504,7 +529,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let conn = real_state_conn(dir.path());
         seed_intent_and_snapshot(&conn);
-        let err = ReviewAuthority::verify_and_consume(&conn, "AUTH-does-not-exist", &base_current());
+        let err =
+            ReviewAuthority::verify_and_consume(&conn, "AUTH-does-not-exist", &base_current());
         assert_eq!(err, Err(AuthorityError::NotFound));
     }
 
@@ -519,7 +545,8 @@ mod tests {
             params![authority.authority_id],
         )
         .unwrap();
-        let err = ReviewAuthority::verify_and_consume(&conn, &authority.authority_id, &base_current());
+        let err =
+            ReviewAuthority::verify_and_consume(&conn, &authority.authority_id, &base_current());
         assert_eq!(err, Err(AuthorityError::ForgedSignature));
     }
 
@@ -538,7 +565,8 @@ mod tests {
             params![authority.authority_id],
         )
         .unwrap();
-        let err = ReviewAuthority::verify_and_consume(&conn, &authority.authority_id, &base_current());
+        let err =
+            ReviewAuthority::verify_and_consume(&conn, &authority.authority_id, &base_current());
         assert_eq!(err, Err(AuthorityError::ForgedSignature));
     }
 
@@ -550,7 +578,8 @@ mod tests {
         let mut params = mint_params(&[]);
         params.ttl_secs = -1.0; // already expired the instant it's minted
         let authority = ReviewAuthority::mint(&conn, params).unwrap();
-        let err = ReviewAuthority::verify_and_consume(&conn, &authority.authority_id, &base_current());
+        let err =
+            ReviewAuthority::verify_and_consume(&conn, &authority.authority_id, &base_current());
         assert_eq!(err, Err(AuthorityError::Expired));
     }
 
@@ -675,7 +704,8 @@ mod tests {
         )
         .unwrap();
 
-        let err = ReviewAuthority::verify_and_consume(&conn, &authority.authority_id, &base_current());
+        let err =
+            ReviewAuthority::verify_and_consume(&conn, &authority.authority_id, &base_current());
         assert_eq!(err, Err(AuthorityError::StaleAnalysisVersion));
     }
 
@@ -684,7 +714,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let conn = real_state_conn(dir.path());
         seed_intent_and_snapshot(&conn);
-        let targets = vec![ChangeIntentTarget { path: "a.rs".to_string(), qualified_name: None }];
+        let targets = vec![ChangeIntentTarget {
+            path: "a.rs".to_string(),
+            qualified_name: None,
+        }];
         let authority = ReviewAuthority::mint(&conn, mint_params(&targets)).unwrap();
 
         let count: i64 = conn
@@ -719,11 +752,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let conn = real_state_conn(dir.path());
         seed_intent_and_snapshot(&conn);
-        let targets = vec![ChangeIntentTarget { path: "a.rs".to_string(), qualified_name: None }];
+        let targets = vec![ChangeIntentTarget {
+            path: "a.rs".to_string(),
+            qualified_name: None,
+        }];
         let authority = ReviewAuthority::mint(&conn, mint_params(&targets)).unwrap();
 
-        conn.execute("DELETE FROM review_authorities WHERE authority_id = ?1", params![authority.authority_id])
-            .unwrap();
+        conn.execute(
+            "DELETE FROM review_authorities WHERE authority_id = ?1",
+            params![authority.authority_id],
+        )
+        .unwrap();
         let targets_left: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM review_authority_targets WHERE authority_id = ?1",

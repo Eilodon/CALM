@@ -5,7 +5,7 @@
 //! (`change::classify::ObservedChangeKind`) is never persisted here --
 //! see `change_intents`'s own doc comment in `STATE_SCHEMA_SQL` for why.
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::change::classify::{ChangeIntentKind, ChangeKind};
 use crate::change::intent::{ChangeIntent, ChangeIntentTarget};
@@ -22,7 +22,13 @@ pub fn insert_change_intent(conn: &Connection, intent: &ChangeIntent) -> rusqlit
     conn.execute(
         "INSERT INTO change_intents (intent_id, kind, reason, snapshot_id, created_at) \
          VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![intent.intent_id, intent.kind.0.as_str(), intent.reason, intent.snapshot_id, intent.created_at],
+        params![
+            intent.intent_id,
+            intent.kind.0.as_str(),
+            intent.reason,
+            intent.snapshot_id,
+            intent.created_at
+        ],
     )?;
     for target in &intent.targets {
         conn.execute(
@@ -37,7 +43,10 @@ pub fn insert_change_intent(conn: &Connection, intent: &ChangeIntent) -> rusqlit
 /// never-existed distinction here, since `change_intents` rows are never
 /// deleted except transitively via a target's `ON DELETE CASCADE` (which
 /// only removes targets, not the intent itself).
-pub fn get_change_intent(conn: &Connection, intent_id: &str) -> rusqlite::Result<Option<ChangeIntent>> {
+pub fn get_change_intent(
+    conn: &Connection,
+    intent_id: &str,
+) -> rusqlite::Result<Option<ChangeIntent>> {
     let row: Option<(String, String, String, String, f64)> = conn
         .query_row(
             "SELECT intent_id, kind, reason, snapshot_id, created_at \
@@ -62,7 +71,10 @@ pub fn get_change_intent(conn: &Connection, intent_id: &str) -> rusqlite::Result
     )?;
     let targets = stmt
         .query_map(params![intent_id], |r| {
-            Ok(ChangeIntentTarget { path: r.get(0)?, qualified_name: r.get(1)? })
+            Ok(ChangeIntentTarget {
+                path: r.get(0)?,
+                qualified_name: r.get(1)?,
+            })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
@@ -101,10 +113,17 @@ mod tests {
     fn round_trips_an_intent_with_no_targets() {
         let conn = conn();
         insert_snapshot(&conn, "SNP-a");
-        let intent = ChangeIntent::new(ChangeIntentKind(ChangeKind::Body), "fixing a bug", "SNP-a", vec![]);
+        let intent = ChangeIntent::new(
+            ChangeIntentKind(ChangeKind::Body),
+            "fixing a bug",
+            "SNP-a",
+            vec![],
+        );
         insert_change_intent(&conn, &intent).unwrap();
 
-        let loaded = get_change_intent(&conn, &intent.intent_id).unwrap().unwrap();
+        let loaded = get_change_intent(&conn, &intent.intent_id)
+            .unwrap()
+            .unwrap();
         assert_eq!(loaded, intent);
     }
 
@@ -113,14 +132,26 @@ mod tests {
         let conn = conn();
         insert_snapshot(&conn, "SNP-b");
         let targets = vec![
-            ChangeIntentTarget { path: "a.rs".to_string(), qualified_name: Some("a.rs::f".to_string()) },
-            ChangeIntentTarget { path: "b.rs".to_string(), qualified_name: None },
+            ChangeIntentTarget {
+                path: "a.rs".to_string(),
+                qualified_name: Some("a.rs::f".to_string()),
+            },
+            ChangeIntentTarget {
+                path: "b.rs".to_string(),
+                qualified_name: None,
+            },
         ];
-        let intent =
-            ChangeIntent::new(ChangeIntentKind(ChangeKind::Signature), "widen an API", "SNP-b", targets);
+        let intent = ChangeIntent::new(
+            ChangeIntentKind(ChangeKind::Signature),
+            "widen an API",
+            "SNP-b",
+            targets,
+        );
         insert_change_intent(&conn, &intent).unwrap();
 
-        let loaded = get_change_intent(&conn, &intent.intent_id).unwrap().unwrap();
+        let loaded = get_change_intent(&conn, &intent.intent_id)
+            .unwrap()
+            .unwrap();
         assert_eq!(loaded.targets, intent.targets);
         assert_eq!(loaded.kind, ChangeIntentKind(ChangeKind::Signature));
     }
@@ -128,18 +159,29 @@ mod tests {
     #[test]
     fn unknown_intent_id_returns_none_not_an_error() {
         let conn = conn();
-        assert_eq!(get_change_intent(&conn, "INT-does-not-exist").unwrap(), None);
+        assert_eq!(
+            get_change_intent(&conn, "INT-does-not-exist").unwrap(),
+            None
+        );
     }
 
     #[test]
     fn deleting_the_intent_cascades_to_its_targets() {
         let conn = conn();
         insert_snapshot(&conn, "SNP-c");
-        let targets = vec![ChangeIntentTarget { path: "a.rs".to_string(), qualified_name: None }];
-        let intent = ChangeIntent::new(ChangeIntentKind(ChangeKind::Body), "test", "SNP-c", targets);
+        let targets = vec![ChangeIntentTarget {
+            path: "a.rs".to_string(),
+            qualified_name: None,
+        }];
+        let intent =
+            ChangeIntent::new(ChangeIntentKind(ChangeKind::Body), "test", "SNP-c", targets);
         insert_change_intent(&conn, &intent).unwrap();
 
-        conn.execute("DELETE FROM change_intents WHERE intent_id = ?1", params![intent.intent_id]).unwrap();
+        conn.execute(
+            "DELETE FROM change_intents WHERE intent_id = ?1",
+            params![intent.intent_id],
+        )
+        .unwrap();
         let remaining: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM change_intent_targets WHERE intent_id = ?1",
@@ -147,14 +189,22 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(remaining, 0, "ON DELETE CASCADE should have removed the target rows too");
+        assert_eq!(
+            remaining, 0,
+            "ON DELETE CASCADE should have removed the target rows too"
+        );
     }
 
     #[test]
     fn insert_rejects_an_intent_whose_snapshot_id_does_not_exist() {
         let conn = conn();
         conn.execute("PRAGMA foreign_keys = ON", []).unwrap();
-        let intent = ChangeIntent::new(ChangeIntentKind(ChangeKind::Body), "test", "SNP-missing", vec![]);
+        let intent = ChangeIntent::new(
+            ChangeIntentKind(ChangeKind::Body),
+            "test",
+            "SNP-missing",
+            vec![],
+        );
         assert!(insert_change_intent(&conn, &intent).is_err());
     }
 }

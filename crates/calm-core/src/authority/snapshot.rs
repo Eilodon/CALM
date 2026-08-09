@@ -21,11 +21,11 @@
 //! duplicate of the same two paths, not a shared dependency, so this module
 //! never needs `indexer::refresh` to widen visibility on its behalf.
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
 
 use crate::digest::evidence_digest;
-use crate::indexer::refresh::{index_input_drift, IndexInputDrift, InputCatalog};
+use crate::indexer::refresh::{IndexInputDrift, InputCatalog, index_input_drift};
 
 /// Mirrors `indexer::refresh`'s private `GLOBAL_CONFIGURATION_PATHS` --
 /// kept as a small, independently-stable duplicate (both are "the global
@@ -149,7 +149,12 @@ impl EvidenceSnapshot {
         );
         let snapshot_id = format!("SNP-{}", evidence_digest(material.as_bytes()));
 
-        Ok(Self { snapshot_id, source_catalog_digest, graph_generation, freshness_class })
+        Ok(Self {
+            snapshot_id,
+            source_catalog_digest,
+            graph_generation,
+            freshness_class,
+        })
     }
 
     /// Persists this snapshot into `evidence_snapshots` (CCK-07,
@@ -186,7 +191,8 @@ impl EvidenceSnapshot {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .optional()?;
-        let Some((snapshot_id, source_catalog_digest, graph_generation, freshness_str)) = row else {
+        let Some((snapshot_id, source_catalog_digest, graph_generation, freshness_str)) = row
+        else {
             return Ok(None);
         };
         let freshness_class = FreshnessClass::parse(&freshness_str).ok_or_else(|| {
@@ -197,7 +203,12 @@ impl EvidenceSnapshot {
                     .into(),
             )
         })?;
-        Ok(Some(Self { snapshot_id, source_catalog_digest, graph_generation, freshness_class }))
+        Ok(Some(Self {
+            snapshot_id,
+            source_catalog_digest,
+            graph_generation,
+            freshness_class,
+        }))
     }
 }
 
@@ -231,9 +242,11 @@ fn source_catalog_digest(conn: &Connection) -> rusqlite::Result<String> {
 /// see that call site's doc comment for why 0 (never indexed) is a safe
 /// default rather than an error.
 fn current_graph_generation(conn: &Connection) -> i64 {
-    conn.query_row("SELECT generation FROM graph_generation_state WHERE id = 1", [], |r| {
-        r.get(0)
-    })
+    conn.query_row(
+        "SELECT generation FROM graph_generation_state WHERE id = 1",
+        [],
+        |r| r.get(0),
+    )
     .unwrap_or(0)
 }
 
@@ -301,7 +314,10 @@ mod tests {
         let root = tmp_project();
         let forward_snap = EvidenceSnapshot::compute(&forward, root.path()).unwrap();
         let backward_snap = EvidenceSnapshot::compute(&backward, root.path()).unwrap();
-        assert_eq!(forward_snap.source_catalog_digest, backward_snap.source_catalog_digest);
+        assert_eq!(
+            forward_snap.source_catalog_digest,
+            backward_snap.source_catalog_digest
+        );
         assert_eq!(forward_snap.snapshot_id, backward_snap.snapshot_id);
     }
 
@@ -312,8 +328,11 @@ mod tests {
         let before = EvidenceSnapshot::compute(&conn, root.path()).unwrap();
         assert_eq!(before.graph_generation, 0);
 
-        conn.execute("UPDATE graph_generation_state SET generation = 7 WHERE id = 1", [])
-            .unwrap();
+        conn.execute(
+            "UPDATE graph_generation_state SET generation = 7 WHERE id = 1",
+            [],
+        )
+        .unwrap();
         let after = EvidenceSnapshot::compute(&conn, root.path()).unwrap();
         assert_eq!(after.graph_generation, 7);
         assert_ne!(before.snapshot_id, after.snapshot_id);
@@ -328,7 +347,11 @@ mod tests {
         let root = tmp_project();
         let before = EvidenceSnapshot::compute(&conn, root.path()).unwrap();
 
-        std::fs::write(root.path().join("config.json"), br#"{"languages":["rust"]}"#).unwrap();
+        std::fs::write(
+            root.path().join("config.json"),
+            br#"{"languages":["rust"]}"#,
+        )
+        .unwrap();
         let after = EvidenceSnapshot::compute(&conn, root.path()).unwrap();
         assert_ne!(before.snapshot_id, after.snapshot_id);
     }
@@ -339,8 +362,11 @@ mod tests {
         let root = tmp_project();
         let before = EvidenceSnapshot::compute(&conn, root.path()).unwrap();
 
-        conn.execute("UPDATE file_index SET hash = 'h1-changed' WHERE path = 'a.rs'", [])
-            .unwrap();
+        conn.execute(
+            "UPDATE file_index SET hash = 'h1-changed' WHERE path = 'a.rs'",
+            [],
+        )
+        .unwrap();
         let after = EvidenceSnapshot::compute(&conn, root.path()).unwrap();
         assert_ne!(before.source_catalog_digest, after.source_catalog_digest);
         assert_ne!(before.snapshot_id, after.snapshot_id);
@@ -377,7 +403,11 @@ mod tests {
 
     #[test]
     fn freshness_class_round_trips_through_as_str_and_parse() {
-        for class in [FreshnessClass::Reconciled, FreshnessClass::Current, FreshnessClass::Degraded] {
+        for class in [
+            FreshnessClass::Reconciled,
+            FreshnessClass::Current,
+            FreshnessClass::Degraded,
+        ] {
             assert_eq!(FreshnessClass::parse(class.as_str()), Some(class));
         }
         assert_eq!(FreshnessClass::parse("not_a_real_class"), None);
@@ -391,7 +421,9 @@ mod tests {
 
         let state = state_conn();
         snapshot.persist(&state).unwrap();
-        let loaded = EvidenceSnapshot::load(&state, &snapshot.snapshot_id).unwrap().unwrap();
+        let loaded = EvidenceSnapshot::load(&state, &snapshot.snapshot_id)
+            .unwrap()
+            .unwrap();
         assert_eq!(loaded, snapshot);
     }
 
@@ -418,6 +450,9 @@ mod tests {
     #[test]
     fn load_returns_none_for_an_unknown_snapshot_id() {
         let state = state_conn();
-        assert_eq!(EvidenceSnapshot::load(&state, "SNP-does-not-exist").unwrap(), None);
+        assert_eq!(
+            EvidenceSnapshot::load(&state, "SNP-does-not-exist").unwrap(),
+            None
+        );
     }
 }

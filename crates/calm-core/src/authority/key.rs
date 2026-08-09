@@ -34,7 +34,9 @@ fn load_or_create_control_key(calm_dir: &Path) -> std::io::Result<[u8; CONTROL_K
 
     std::fs::create_dir_all(calm_dir)?;
     let mut key = [0u8; CONTROL_KEY_LEN];
-    rand::rngs::OsRng.try_fill_bytes(&mut key).map_err(std::io::Error::other)?;
+    rand::rngs::OsRng
+        .try_fill_bytes(&mut key)
+        .map_err(std::io::Error::other)?;
     std::fs::write(&key_path, key)?;
     #[cfg(unix)]
     {
@@ -50,7 +52,9 @@ fn load_or_create_control_key(calm_dir: &Path) -> std::io::Result<[u8; CONTROL_K
 /// comment for the full rationale, including why `Ok(None)` for a
 /// path-less `:memory:` connection is the correct fallback and not a
 /// silent downgrade).
-pub(crate) fn control_key_for_conn(conn: &Connection) -> std::io::Result<Option<[u8; CONTROL_KEY_LEN]>> {
+pub(crate) fn control_key_for_conn(
+    conn: &Connection,
+) -> std::io::Result<Option<[u8; CONTROL_KEY_LEN]>> {
     let Some(db_path) = conn.path() else {
         return Ok(None);
     };
@@ -115,7 +119,9 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         load_or_create_control_key(dir.path()).unwrap();
-        let perms = std::fs::metadata(dir.path().join(CONTROL_KEY_FILENAME)).unwrap().permissions();
+        let perms = std::fs::metadata(dir.path().join(CONTROL_KEY_FILENAME))
+            .unwrap()
+            .permissions();
         assert_eq!(perms.mode() & 0o777, 0o600);
     }
 
@@ -138,7 +144,10 @@ mod tests {
         let key = [7u8; CONTROL_KEY_LEN];
         let a = sign(&key, "review-authority-v1", "payload");
         let b = sign(&key, "some-other-purpose-v1", "payload");
-        assert_ne!(a, b, "domain separation must change the signature even with an identical payload");
+        assert_ne!(
+            a, b,
+            "domain separation must change the signature even with an identical payload"
+        );
     }
 
     #[test]
@@ -146,7 +155,17 @@ mod tests {
         let key = [7u8; CONTROL_KEY_LEN];
         let sig = sign(&key, "review-authority-v1", "payload");
         assert!(verify(&key, "review-authority-v1", "payload", &sig));
-        assert!(!verify(&key, "review-authority-v1", "tampered-payload", &sig));
-        assert!(!verify(&key, "review-authority-v1", "payload", "hmac-sha256:not-a-real-signature"));
+        assert!(!verify(
+            &key,
+            "review-authority-v1",
+            "tampered-payload",
+            &sig
+        ));
+        assert!(!verify(
+            &key,
+            "review-authority-v1",
+            "payload",
+            "hmac-sha256:not-a-real-signature"
+        ));
     }
 }
