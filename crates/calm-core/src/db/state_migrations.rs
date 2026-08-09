@@ -181,27 +181,29 @@ fn v1_to_v2_evidence_snapshots_and_change_intents(
     Ok(())
 }
 
-/// v2->v3 (CCK-09, #65): adds `review_authorities`, `review_authority_targets`,
-/// `review_authority_evidence`, PLUS a real ALTER TABLE:
+/// v2->v3 (CCK-09, #65): adds `review_authorities` and
+/// `review_authority_targets`, PLUS a real ALTER TABLE:
 /// `edit_transactions.authority_id` is a new column on an EXISTING table, so
 /// unlike a brand new table, `STATE_SCHEMA_SQL`'s idempotent `CREATE TABLE IF
 /// NOT EXISTS edit_transactions (...)` does NOT retroactively add it to a
 /// file that already has that table from a v1/v2 install. Mirrors index.db's
 /// own `migrate_add_column` (`db/schema.rs`) idempotency check (`PRAGMA
 /// table_info`) rather than reaching across modules to reuse that private
-/// helper for one column. CCK-R1: like v1->v2, the 3 new tables are now
+/// helper for one column. CCK-R1: like v1->v2, the new tables are now
 /// created by this step's own DDL (see that step's doc comment for why),
-/// not merely postcondition-checked.
+/// not merely postcondition-checked. CCK-R6 (audit follow-up): the ALTER
+/// TABLE now adds a real FK (`REFERENCES review_authorities(authority_id)
+/// ON DELETE SET NULL`) instead of a plain column, `review_authority_targets`
+/// gained a `UNIQUE(authority_id, path, qualified_name)` constraint, and the
+/// EAV-style `review_authority_evidence` table (write-only, never read
+/// outside its own tests, fully redundant with `review_authorities`' own
+/// typed columns) is gone entirely -- this branch never shipped `state.db`
+/// v3, so there is no upgrade path that needs it preserved.
 fn v2_to_v3_review_authorities(conn: &Connection) -> Result<(), StateMigrationError> {
-    let mut stmt = conn.prepare("PRAGMA table_info(edit_transactions)")?;
-    let existing_columns: Vec<String> = stmt
-        .query_map([], |row| row.get::<_, String>(1))?
-        .filter_map(|r| r.ok())
-        .collect();
-    if !existing_columns.iter().any(|c| c == "authority_id") {
-        conn.execute_batch("ALTER TABLE edit_transactions ADD COLUMN authority_id TEXT;")?;
-    }
-
+    // CCK-R6 (audit follow-up): the review_authorities/review_authority_targets
+    // tables must exist BEFORE the ALTER TABLE below, since that statement's
+    // new FK column references review_authorities(authority_id) -- run this
+    // batch first so the parent table is never forward-referenced.
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS review_authorities (
             authority_id       TEXT PRIMARY KEY,
@@ -224,23 +226,25 @@ fn v2_to_v3_review_authorities(conn: &Connection) -> Result<(), StateMigrationEr
             id             INTEGER PRIMARY KEY AUTOINCREMENT,
             authority_id   TEXT NOT NULL REFERENCES review_authorities(authority_id) ON DELETE CASCADE,
             path           TEXT NOT NULL,
-            qualified_name TEXT
+            qualified_name TEXT,
+            UNIQUE(authority_id, path, qualified_name)
         );
-        CREATE INDEX IF NOT EXISTS idx_review_authority_targets_authority ON review_authority_targets(authority_id);
-        CREATE TABLE IF NOT EXISTS review_authority_evidence (
-            id            INTEGER PRIMARY KEY AUTOINCREMENT,
-            authority_id  TEXT NOT NULL REFERENCES review_authorities(authority_id) ON DELETE CASCADE,
-            field_name    TEXT NOT NULL,
-            field_value   TEXT NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_review_authority_evidence_authority ON review_authority_evidence(authority_id);",
+        CREATE INDEX IF NOT EXISTS idx_review_authority_targets_authority ON review_authority_targets(authority_id);",
     )?;
 
-    for table in [
-        "review_authorities",
-        "review_authority_targets",
-        "review_authority_evidence",
-    ] {
+    let mut stmt = conn.prepare("PRAGMA table_info(edit_transactions)")?;
+    let existing_columns: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(|r| r.ok())
+        .collect();
+    if !existing_columns.iter().any(|c| c == "authority_id") {
+        conn.execute_batch(
+            "ALTER TABLE edit_transactions ADD COLUMN authority_id TEXT \
+             REFERENCES review_authorities(authority_id) ON DELETE SET NULL;",
+        )?;
+    }
+
+    for table in ["review_authorities", "review_authority_targets"] {
         let exists: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
             [table],
@@ -605,11 +609,7 @@ mod tests {
             super::super::schema::STATE_DB_SCHEMA_VERSION
         );
 
-        for table in [
-            "review_authorities",
-            "review_authority_targets",
-            "review_authority_evidence",
-        ] {
+        for table in ["review_authorities", "review_authority_targets"] {
             let exists: bool = conn
                 .query_row(
                     "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
@@ -719,7 +719,6 @@ mod tests {
             "change_intent_targets",
             "review_authorities",
             "review_authority_targets",
-            "review_authority_evidence",
         ] {
             let exists: bool = conn
                 .query_row(

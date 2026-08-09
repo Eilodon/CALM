@@ -410,21 +410,6 @@ impl ReviewAuthority {
                 params![self.authority_id, target.path, target.qualified_name],
             )?;
         }
-        for (field_name, field_value) in [
-            ("intent_id", self.intent_id.as_str()),
-            ("snapshot_id", self.snapshot_id.as_str()),
-            ("graph_generation", &self.graph_generation.to_string()),
-            ("caller_set_digest", self.caller_set_digest.as_str()),
-            ("analysis_version", self.analysis_version.as_str()),
-            ("policy_digest", self.policy_digest.as_str()),
-            ("principal", self.principal.as_str()),
-            ("target_scope_digest", self.target_scope_digest.as_str()),
-        ] {
-            state_conn.execute(
-                "INSERT INTO review_authority_evidence (authority_id, field_name, field_value) VALUES (?1, ?2, ?3)",
-                params![self.authority_id, field_name, field_value],
-            )?;
-        }
         Ok(())
     }
 
@@ -911,24 +896,7 @@ mod tests {
     }
 
     #[test]
-    fn evidence_rows_are_persisted_for_every_bound_field() {
-        let dir = tempfile::tempdir().unwrap();
-        let conn = real_state_conn(dir.path());
-        seed_intent_and_snapshot(&conn);
-        let authority = ReviewAuthority::mint(&conn, mint_params(&[])).unwrap();
-
-        let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM review_authority_evidence WHERE authority_id = ?1",
-                params![authority.authority_id],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(count, 8, "one evidence row per bound field");
-    }
-
-    #[test]
-    fn deleting_the_authority_cascades_to_targets_and_evidence() {
+    fn deleting_the_authority_cascades_to_targets() {
         let dir = tempfile::tempdir().unwrap();
         let conn = real_state_conn(dir.path());
         seed_intent_and_snapshot(&conn);
@@ -950,15 +918,30 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        let evidence_left: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM review_authority_evidence WHERE authority_id = ?1",
-                params![authority.authority_id],
-                |r| r.get(0),
-            )
-            .unwrap();
         assert_eq!(targets_left, 0);
-        assert_eq!(evidence_left, 0);
+    }
+
+    #[test]
+    fn duplicate_targets_within_one_authority_are_rejected() {
+        // CCK-R6 (audit follow-up): UNIQUE(authority_id, path,
+        // qualified_name) on review_authority_targets -- persist() inserts
+        // one row per element of `targets` with no dedup, so a caller
+        // passing the same (path, qualified_name) twice must now surface a
+        // real constraint violation instead of silently storing a
+        // duplicate row.
+        let dir = tempfile::tempdir().unwrap();
+        let conn = real_state_conn(dir.path());
+        seed_intent_and_snapshot(&conn);
+        let target = ChangeIntentTarget {
+            path: "a.rs".to_string(),
+            qualified_name: Some("a.rs::f".to_string()),
+        };
+        let duplicated = vec![target.clone(), target];
+        let err = ReviewAuthority::mint(&conn, mint_params(&duplicated)).unwrap_err();
+        assert!(
+            matches!(err, AuthorityError::Db(_)),
+            "expected a DB constraint error, got {err:?}"
+        );
     }
 
     #[test]
