@@ -13,6 +13,7 @@ use calm_core::sanitize::{injection_warning, sanitize_source_output};
 use calm_core::types::{EmbedStatus, IndexingPhase};
 
 pub(crate) mod common;
+mod change;
 mod detail;
 mod edit;
 mod guardrails;
@@ -440,6 +441,7 @@ impl CalmServer {
         router.merge(Self::edit_tool_router());
         router.merge(Self::patterndebt_tool_router());
         router.merge(Self::txn_tool_router());
+        router.merge(Self::change_tool_router());
         router
     }
 

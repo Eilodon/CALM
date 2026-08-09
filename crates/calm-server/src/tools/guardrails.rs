@@ -1267,7 +1267,7 @@ impl CalmServer {
             snapshot.snapshot_id.clone(),
             vec![target.clone()],
         );
-        calm_core::change::insert_change_intent(&tx, &intent).ok()?;
+        calm_core::change::insert_change_intent(&tx, &intent, None).ok()?;
 
         let policy = calm_core::policy::loader::load_policy_or_warn(&self.project_root);
         let policy_digest = policy.digest();

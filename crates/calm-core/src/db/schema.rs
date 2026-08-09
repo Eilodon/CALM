@@ -563,13 +563,22 @@ CREATE TABLE IF NOT EXISTS evidence_snapshots (
 -- produces the OBSERVED half from the real diff, never persisted here --
 -- cheap to recompute, and persisting it would invite the two to drift).
 CREATE TABLE IF NOT EXISTS change_intents (
-    intent_id     TEXT PRIMARY KEY,
-    kind          TEXT NOT NULL,
-    reason        TEXT NOT NULL,
-    snapshot_id   TEXT NOT NULL REFERENCES evidence_snapshots(snapshot_id),
-    created_at    REAL NOT NULL
+    intent_id        TEXT PRIMARY KEY,
+    kind             TEXT NOT NULL,
+    reason           TEXT NOT NULL,
+    snapshot_id      TEXT NOT NULL REFERENCES evidence_snapshots(snapshot_id),
+    created_at       REAL NOT NULL,
+    idempotency_key  TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_change_intents_snapshot ON change_intents(snapshot_id);
+-- CCK-11: plan_change's idempotency contract -- a partial unique index
+-- (not a plain UNIQUE column) because the pre-existing CCK-07 caller
+-- (mint_review_authority_for_edit_context's single-symbol compat wrapper)
+-- never sets this and must keep inserting NULLs freely; SQLite already
+-- treats distinct NULLs as never conflicting under a plain UNIQUE
+-- constraint, but the partial WHERE clause makes that non-enforcement
+-- explicit rather than relying on that default behavior implicitly.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_change_intents_idempotency ON change_intents(idempotency_key) WHERE idempotency_key IS NOT NULL;
 
 -- v2 / CCK-07: the file(s) (optionally symbol-scoped) one change_intents row
 -- declares as its target. One-to-many so a single intent can already span

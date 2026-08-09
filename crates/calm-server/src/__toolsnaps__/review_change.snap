@@ -1,0 +1,123 @@
+{
+  "name": "review_change",
+  "description": "Mints a ReviewAuthority for a change_id from plan_change -- ONLY when approved:true (the required human/MRTR approval step; omitted or false always refuses with APPROVAL_REQUIRED, never mints). Pass the returned authority_id alongside change_id to edit_lines/edit_symbol to spend it in one write. USE WHEN: a plan_change'd intent has been reviewed and approved. NOT FOR: minting without a real approval, or a multi-file change that needs independent per-file authorization (Phase 2 ChangeSet territory -- see this module's own doc comment).",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "required": [
+      "change_id"
+    ],
+    "type": "object",
+    "properties": {
+      "change_id": {
+        "type": "string"
+      },
+      "approved": {
+        "description": "The required human/MRTR approval signal -- `review_change` NEVER\nmints an authority unless this is explicitly `true` (omitted or\n`false` both refuse with `APPROVAL_REQUIRED`). See this module's own\ndoc comment for what \"approval\" means here.",
+        "type": "boolean",
+        "default": false
+      },
+      "approver": {
+        "description": "Free text audit trail of who/what approved -- like `reason`\nelsewhere in this codebase, never itself a permission signal.",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "ttl_secs": {
+        "description": "Seconds from mint until the authority expires -- defaults to 30\nminutes (`DEFAULT_REVIEW_TTL_SECS`), validated by `AuthorityTtl`\n(finite, positive, <= 24h).",
+        "type": [
+          "number",
+          "null"
+        ],
+        "format": "double"
+      }
+    }
+  },
+  "outputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$defs": {
+      "ErrorDetail": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "recoverable": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "recoverable"
+        ]
+      },
+      "SuggestedNext": {
+        "type": "object",
+        "properties": {
+          "tool": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "args": true,
+          "gate": {
+            "description": "Plan 3 §3.5(b): `Some(true)` iff skipping `tool` is actually\nhook-enforced (currently only the edit_context/edit_lines/edit_symbol\n→ diff_impact hints set this, via `suggested_gated`) — every other\nhint is left unset (`None`), meaning advisory-only. Lets an agent\ntell \"you'll be blocked if you skip this\" apart from \"you probably\nwant this next\" without re-deriving it from AGENTS.md prose each time.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "tool",
+          "reason"
+        ]
+      }
+    },
+    "properties": {
+      "error": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/ErrorDetail"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "change_id": {
+        "type": "string"
+      },
+      "authority_id": {
+        "description": "Pass this alongside `change_id` to `edit_lines`/`edit_symbol` to\nspend it -- single-use, consumed on the first successful write.",
+        "type": "string"
+      },
+      "authority_expires_at": {
+        "type": "number",
+        "format": "double"
+      },
+      "suggested_next": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/SuggestedNext"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "type": "object"
+  },
+  "annotations": {
+    "readOnlyHint": false,
+    "destructiveHint": false,
+    "idempotentHint": false,
+    "openWorldHint": false
+  }
+}

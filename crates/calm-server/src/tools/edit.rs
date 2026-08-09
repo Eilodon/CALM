@@ -3306,7 +3306,7 @@ pub(crate) fn caller_symbol_set(conn: &rusqlite::Connection, qualified_name: &st
 /// `path` exactly as supplied here — an unvalidated traversal/symlink
 /// escape at this layer is still an informed-consent bypass one level
 /// down, regardless of what the host displays.
-fn resolve_repo_path(
+pub(crate) fn resolve_repo_path(
     project_root: &std::path::Path,
     path: &str,
 ) -> Result<std::path::PathBuf, ErrorDetail> {

@@ -115,6 +115,7 @@ pub(crate) const TOOLSET_NAMES: &[&str] = &[
     "edit",
     "patterndebt",
     "txn",
+    "change",
 ];
 
 /// Toolsets that runtime narrowing (`set_toolset`) can NEVER disable — the
@@ -157,6 +158,7 @@ fn toolset_tools(name: &str) -> Option<Vec<String>> {
         "edit" => CalmServer::edit_tool_router(),
         "patterndebt" => CalmServer::patterndebt_tool_router(),
         "txn" => CalmServer::txn_tool_router(),
+        "change" => CalmServer::change_tool_router(),
         _ => return None,
     };
     Some(
@@ -414,6 +416,29 @@ mod preset_registry_tests {
         assert!(
             resolved.contains("repo_overview"),
             "non-excluded tool should remain"
+        );
+    }
+
+    #[test]
+    fn change_toolset_is_absent_from_a_preset_that_does_not_opt_into_it() {
+        // CCK-11: plan_change/review_change (the "change" toolset) must
+        // stay opt-in, not forced onto the hand-curated legacy presets --
+        // only "full" (unfiltered) and an explicit "change"/composable spec
+        // naming it should ever expose them.
+        for legacy in ["orient", "trace", "edit", "compound"] {
+            let resolved = preset_tools(legacy).unwrap();
+            assert!(
+                !resolved.contains(&"plan_change") && !resolved.contains(&"review_change"),
+                "{legacy:?} preset must not include the change toolset's tools"
+            );
+        }
+        let change_tools = toolset_tools("change").unwrap();
+        assert!(change_tools.contains(&"plan_change".to_string()));
+        assert!(change_tools.contains(&"review_change".to_string()));
+        let resolved = resolve_preset("change").unwrap().unwrap();
+        assert_eq!(
+            resolved,
+            change_tools.into_iter().collect::<std::collections::BTreeSet<_>>()
         );
     }
 

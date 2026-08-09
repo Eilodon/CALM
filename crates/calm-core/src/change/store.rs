@@ -18,16 +18,28 @@ use crate::change::intent::{ChangeIntent, ChangeIntentTarget};
 /// references) are expected to wrap both in their own `conn.transaction()`
 /// -- see `authority::snapshot::persist` for the sibling call this is
 /// meant to be paired with.
-pub fn insert_change_intent(conn: &Connection, intent: &ChangeIntent) -> rusqlite::Result<()> {
+///
+/// CCK-11 (audit follow-up): `idempotency_key` is `None` for the pre-
+/// existing CCK-10 compat caller (`mint_review_authority_for_edit_context`,
+/// a single-symbol review with no idempotency contract of its own) and
+/// `Some` for `plan_change` (calm-server/tools/change.rs), whose repeated-
+/// call idempotency this column backs -- see `change_intents`'s partial
+/// unique index in `STATE_SCHEMA_SQL`/`state_migrations.rs`'s v1->v2 step.
+pub fn insert_change_intent(
+    conn: &Connection,
+    intent: &ChangeIntent,
+    idempotency_key: Option<&str>,
+) -> rusqlite::Result<()> {
     conn.execute(
-        "INSERT INTO change_intents (intent_id, kind, reason, snapshot_id, created_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO change_intents (intent_id, kind, reason, snapshot_id, created_at, idempotency_key) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![
             intent.intent_id,
             intent.kind.0.as_str(),
             intent.reason,
             intent.snapshot_id,
-            intent.created_at
+            intent.created_at,
+            idempotency_key,
         ],
     )?;
     for target in &intent.targets {
@@ -37,6 +49,28 @@ pub fn insert_change_intent(conn: &Connection, intent: &ChangeIntent) -> rusqlit
         )?;
     }
     Ok(())
+}
+
+/// `Ok(None)` when no `change_intents` row has this exact `idempotency_key`
+/// -- the fast path `plan_change` uses to make repeated calls with the same
+/// declared kind/targets return the same `change_id` instead of minting a
+/// fresh one every time (see `insert_change_intent`'s own doc comment for
+/// the column this backs).
+pub fn find_change_intent_by_idempotency_key(
+    conn: &Connection,
+    idempotency_key: &str,
+) -> rusqlite::Result<Option<ChangeIntent>> {
+    let intent_id: Option<String> = conn
+        .query_row(
+            "SELECT intent_id FROM change_intents WHERE idempotency_key = ?1",
+            params![idempotency_key],
+            |r| r.get(0),
+        )
+        .optional()?;
+    match intent_id {
+        Some(id) => get_change_intent(conn, &id),
+        None => Ok(None),
+    }
 }
 
 /// `Ok(None)` when no row matches -- not persisted-but-empty vs.
@@ -119,7 +153,7 @@ mod tests {
             "SNP-a",
             vec![],
         );
-        insert_change_intent(&conn, &intent).unwrap();
+        insert_change_intent(&conn, &intent, None).unwrap();
 
         let loaded = get_change_intent(&conn, &intent.intent_id)
             .unwrap()
@@ -147,7 +181,7 @@ mod tests {
             "SNP-b",
             targets,
         );
-        insert_change_intent(&conn, &intent).unwrap();
+        insert_change_intent(&conn, &intent, None).unwrap();
 
         let loaded = get_change_intent(&conn, &intent.intent_id)
             .unwrap()
@@ -166,6 +200,39 @@ mod tests {
     }
 
     #[test]
+    fn find_by_idempotency_key_returns_none_when_unset() {
+        let conn = conn();
+        insert_snapshot(&conn, "SNP-d");
+        let intent = ChangeIntent::new(ChangeIntentKind(ChangeKind::Body), "test", "SNP-d", vec![]);
+        insert_change_intent(&conn, &intent, None).unwrap();
+        assert_eq!(
+            find_change_intent_by_idempotency_key(&conn, "some-key").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn find_by_idempotency_key_round_trips_and_rejects_a_duplicate_key() {
+        let conn = conn();
+        insert_snapshot(&conn, "SNP-e");
+        let intent = ChangeIntent::new(ChangeIntentKind(ChangeKind::Body), "test", "SNP-e", vec![]);
+        insert_change_intent(&conn, &intent, Some("plan-key-1")).unwrap();
+
+        let found = find_change_intent_by_idempotency_key(&conn, "plan-key-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(found, intent);
+
+        // A second intent must not be able to reuse the same idempotency
+        // key -- that would defeat the whole point of plan_change's
+        // repeated-call dedup (two different intents both claiming to be
+        // "the" answer for one key).
+        let other =
+            ChangeIntent::new(ChangeIntentKind(ChangeKind::Signature), "other", "SNP-e", vec![]);
+        assert!(insert_change_intent(&conn, &other, Some("plan-key-1")).is_err());
+    }
+
+    #[test]
     fn deleting_the_intent_cascades_to_its_targets() {
         let conn = conn();
         insert_snapshot(&conn, "SNP-c");
@@ -175,7 +242,7 @@ mod tests {
         }];
         let intent =
             ChangeIntent::new(ChangeIntentKind(ChangeKind::Body), "test", "SNP-c", targets);
-        insert_change_intent(&conn, &intent).unwrap();
+        insert_change_intent(&conn, &intent, None).unwrap();
 
         conn.execute(
             "DELETE FROM change_intents WHERE intent_id = ?1",
@@ -205,6 +272,6 @@ mod tests {
             "SNP-missing",
             vec![],
         );
-        assert!(insert_change_intent(&conn, &intent).is_err());
+        assert!(insert_change_intent(&conn, &intent, None).is_err());
     }
 }

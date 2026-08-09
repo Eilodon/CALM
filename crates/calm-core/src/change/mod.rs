@@ -16,4 +16,4 @@ pub use classify::{
     ChangeIntentKind, ChangeKind, ObservedChangeInput, ObservedChangeKind, kinds_mismatch,
 };
 pub use intent::{ChangeIntent, ChangeIntentTarget};
-pub use store::{get_change_intent, insert_change_intent};
+pub use store::{find_change_intent_by_idempotency_key, get_change_intent, insert_change_intent};

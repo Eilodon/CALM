@@ -145,13 +145,15 @@ fn v1_to_v2_evidence_snapshots_and_change_intents(
             created_at             REAL NOT NULL
         );
         CREATE TABLE IF NOT EXISTS change_intents (
-            intent_id     TEXT PRIMARY KEY,
-            kind          TEXT NOT NULL,
-            reason        TEXT NOT NULL,
-            snapshot_id   TEXT NOT NULL REFERENCES evidence_snapshots(snapshot_id),
-            created_at    REAL NOT NULL
+            intent_id        TEXT PRIMARY KEY,
+            kind             TEXT NOT NULL,
+            reason           TEXT NOT NULL,
+            snapshot_id      TEXT NOT NULL REFERENCES evidence_snapshots(snapshot_id),
+            created_at       REAL NOT NULL,
+            idempotency_key  TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_change_intents_snapshot ON change_intents(snapshot_id);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_change_intents_idempotency ON change_intents(idempotency_key) WHERE idempotency_key IS NOT NULL;
         CREATE TABLE IF NOT EXISTS change_intent_targets (
             id             INTEGER PRIMARY KEY AUTOINCREMENT,
             intent_id      TEXT NOT NULL REFERENCES change_intents(intent_id) ON DELETE CASCADE,
