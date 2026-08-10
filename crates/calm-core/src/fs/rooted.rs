@@ -59,6 +59,28 @@ pub enum ContainmentMethod {
     TextualFallback,
 }
 
+/// CCK-05C (audit 2026-08-10): whether a write's on-disk durability is
+/// actually backed by a successful `fsync`, or merely assumed. Before this
+/// existed, `write_atomic_beneath`'s directory `fsync` return code was
+/// discarded (`unsafe { libc::fsync(...); }`, result unused) and every
+/// write still came back as an unqualified `Ok(WriteReceipt { .. })` --
+/// collapsing "the rename is durable" and "the rename applied but a crash
+/// right now could still lose the new name -> inode link" into the same
+/// reported outcome. A trust-kernel primitive should not make that
+/// distinction unobservable to its caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Durability {
+    /// Every fsync this write depended on (file content, then the
+    /// directory entry) reported success.
+    Applied,
+    /// The write itself succeeded and is visible to readers, but at least
+    /// one fsync this write depended on reported failure, or (on a
+    /// fallback path) was never attempted -- do not treat this write as
+    /// safe against a crash/power-loss until a later, confirmed-durable
+    /// write to the same directory.
+    Uncertain,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RootedFsError {
     Io {
@@ -91,13 +113,15 @@ impl From<io::Error> for RootedFsError {
     }
 }
 
-/// Receipt for one `write_atomic_beneath` call -- what was written, and
-/// how strong a containment guarantee backed it.
+/// Receipt for one `write_atomic_beneath` call -- what was written, how
+/// strong a containment guarantee backed it, and (CCK-05C) whether it's
+/// actually confirmed durable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WriteReceipt {
     pub relative_path: String,
     pub bytes_written: u64,
     pub containment: ContainmentMethod,
+    pub durability: Durability,
 }
 
 pub struct RootedFilesystem {
@@ -251,14 +275,22 @@ impl RootedFilesystem {
             linux_impl::renameat_same_dir(dir_fd.as_raw_fd(), &tmp_name, name)?;
             // fsync the directory itself so the new name -> inode link is
             // durable, not just the renamed file's content -- same
-            // rationale as `edit::fsync_parent_dir`.
-            unsafe {
-                libc::fsync(dir_fd.as_raw_fd());
-            }
+            // rationale as `edit::fsync_parent_dir`. CCK-05C: the return
+            // code used to be discarded here (`unsafe { libc::fsync(..); }`,
+            // result unused) while still reporting an unqualified `Ok` --
+            // a failed directory fsync (ENOSPC, EIO, ...) was silently
+            // reported as a fully successful, durable write. Captured now
+            // so the receipt can say which one actually happened.
+            let dir_fsync_ok = unsafe { libc::fsync(dir_fd.as_raw_fd()) } == 0;
             Ok(WriteReceipt {
                 relative_path: relative.to_string(),
                 bytes_written,
                 containment: ContainmentMethod::KernelEnforced,
+                durability: if dir_fsync_ok {
+                    Durability::Applied
+                } else {
+                    Durability::Uncertain
+                },
             })
         }
         #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
@@ -282,10 +314,17 @@ impl RootedFilesystem {
             };
             let target = parent_real.join(name);
             crate::edit::atomic_write(&target, content)?;
+            // CCK-05C: `atomic_write` doesn't return a durability signal
+            // (its own directory fsync is likewise best-effort, see
+            // `edit::fsync_parent_dir`), so this path -- already the
+            // weaker `TextualFallback` containment guarantee -- honestly
+            // can't claim `Applied` the way the Linux fast path above can
+            // now verify.
             Ok(WriteReceipt {
                 relative_path: relative.to_string(),
                 bytes_written,
                 containment: ContainmentMethod::TextualFallback,
+                durability: Durability::Uncertain,
             })
         }
     }
@@ -557,6 +596,9 @@ mod tests {
 
         let receipt = fs.write_atomic_beneath("b.txt", "bye").unwrap();
         assert_eq!(receipt.containment, ContainmentMethod::KernelEnforced);
+        // CCK-05C: a normal successful write on a real, writable directory
+        // must report a confirmed-durable receipt, not just "applied".
+        assert_eq!(receipt.durability, Durability::Applied);
     }
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]

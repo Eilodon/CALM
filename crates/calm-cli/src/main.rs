@@ -315,6 +315,21 @@ enum Commands {
         #[command(subcommand)]
         action: BundleAction,
     },
+    /// "calm review" (audit 2026-08-10 follow-up): a durable,
+    /// MCP-protocol-independent second channel for the independent review
+    /// `HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW` requires -- for the case
+    /// (verified empirically the same day) where a connected MCP client
+    /// completes CALM's own elicitation round-trip without ever showing
+    /// anything to a human at all. See
+    /// `calm_core::authority::pending_review`'s module doc comment for the
+    /// full rationale. `approve`/`decline` require a real interactive
+    /// terminal (refuse immediately on non-TTY stdin) -- that's the actual
+    /// teeth against an agent with ordinary shell access just scripting
+    /// past this the way it could a config toggle.
+    Review {
+        #[command(subcommand)]
+        action: ReviewAction,
+    },
 }
 
 #[cfg(feature = "index-bundles")]
@@ -344,6 +359,38 @@ enum BundleAction {
     Inspect {
         /// Path to the .tar.gz archive
         archive: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum ReviewAction {
+    /// List reviews (pending only, unless --all)
+    List {
+        #[arg(long, default_value = ".")]
+        project_root: PathBuf,
+        /// Show every review regardless of status, not just pending ones
+        #[arg(long)]
+        all: bool,
+    },
+    /// Show one review's full diff and details
+    Show {
+        #[arg(long, default_value = ".")]
+        project_root: PathBuf,
+        review_id: String,
+    },
+    /// Approve one review -- prints the diff and asks for an interactive
+    /// y/N confirmation. Requires a real TTY on stdin; refuses immediately
+    /// otherwise (see `Commands::Review`'s own doc comment for why).
+    Approve {
+        #[arg(long, default_value = ".")]
+        project_root: PathBuf,
+        review_id: String,
+    },
+    /// Decline one review -- same TTY requirement as `approve`.
+    Decline {
+        #[arg(long, default_value = ".")]
+        project_root: PathBuf,
+        review_id: String,
     },
 }
 
@@ -1208,8 +1255,165 @@ async fn main() -> Result<()> {
                 }
             }
         },
+        Commands::Review { action } => match action {
+            ReviewAction::List { project_root, all } => {
+                let root = std::fs::canonicalize(&project_root)?;
+                let state_db_path = calm_server::default_state_db_path(&root);
+                let conn = calm_core::db::conn::open_state_writer(&state_db_path)?;
+                calm_core::db::schema::init_state_db_versioned(&conn)?;
+                let status_filter = if all { None } else { Some("pending") };
+                let reviews = calm_core::authority::list_pending_reviews(&conn, status_filter)?;
+                if reviews.is_empty() {
+                    println!("No {}reviews.", if all { "" } else { "pending " });
+                } else {
+                    for r in &reviews {
+                        println!(
+                            "{}  [{}]  {}  risk={}",
+                            r.review_id,
+                            r.status,
+                            r.path,
+                            r.risk.as_deref().unwrap_or("?"),
+                        );
+                    }
+                }
+            }
+            ReviewAction::Show {
+                project_root,
+                review_id,
+            } => {
+                let root = std::fs::canonicalize(&project_root)?;
+                let state_db_path = calm_server::default_state_db_path(&root);
+                let conn = calm_core::db::conn::open_state_writer(&state_db_path)?;
+                calm_core::db::schema::init_state_db_versioned(&conn)?;
+                match calm_core::authority::get_pending_review(&conn, &review_id)? {
+                    Some(r) => print_pending_review(&r),
+                    None => {
+                        println!("No such review: {review_id}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            ReviewAction::Approve {
+                project_root,
+                review_id,
+            } => decide_review_interactively(&project_root, &review_id, true)?,
+            ReviewAction::Decline {
+                project_root,
+                review_id,
+            } => decide_review_interactively(&project_root, &review_id, false)?,
+        },
     }
 
+    Ok(())
+}
+
+/// Renders one `PendingReview` for a human reading a terminal -- sanitized
+/// at print time (not storage time; `pending_reviews.diff_preview`/`reason`
+/// are stored raw, same split `build_hub_elicit_message` already uses for
+/// its own sanitize-at-display treatment of agent-authored content crossing
+/// into a human-facing surface).
+fn print_pending_review(r: &calm_core::authority::PendingReview) {
+    println!("review_id:  {}", r.review_id);
+    println!("tool:       {}", r.tool);
+    println!("path:       {}", r.path);
+    println!("risk:       {}", r.risk.as_deref().unwrap_or("?"));
+    if let Some(hk) = &r.hub_kind {
+        println!("hub_kind:   {hk}");
+    }
+    println!("status:     {}", r.status);
+    println!(
+        "reason:     {}",
+        calm_core::sanitize::sanitize_source_output(r.reason.as_deref().unwrap_or("(none given)"))
+    );
+    println!();
+    println!("Proposed diff:");
+    println!(
+        "{}",
+        calm_core::sanitize::sanitize_source_output(&r.diff_preview)
+    );
+}
+
+/// `calm review approve|decline` shared body. Requires a real interactive
+/// TTY on stdin -- refuses immediately otherwise. This is the actual
+/// safeguard: most agent tool-execution sandboxes (including the one this
+/// exact feature was designed against) pipe non-interactive stdin, so a
+/// script or agent with ordinary shell access can't satisfy this the way it
+/// could a config toggle -- same class of guarantee `sudo`'s password
+/// prompt or `git commit` opening `$EDITOR` already rely on, not a claim of
+/// unbypassable-by-construction security (a sufficiently permissive sandbox
+/// could still allocate a pty).
+fn decide_review_interactively(
+    project_root: &std::path::Path,
+    review_id: &str,
+    approving: bool,
+) -> Result<()> {
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() {
+        anyhow::bail!(
+            "`calm review {}` requires a real interactive terminal (refusing on \
+             non-TTY stdin) -- run this command yourself, directly, in a terminal.",
+            if approving { "approve" } else { "decline" }
+        );
+    }
+    let root = std::fs::canonicalize(project_root)?;
+    let state_db_path = calm_server::default_state_db_path(&root);
+    let conn = calm_core::db::conn::open_state_writer(&state_db_path)?;
+    calm_core::db::schema::init_state_db_versioned(&conn)?;
+    let review = match calm_core::authority::get_pending_review(&conn, review_id)? {
+        Some(r) => r,
+        None => {
+            println!("No such review: {review_id}");
+            std::process::exit(1);
+        }
+    };
+    if review.status != "pending" {
+        println!(
+            "Review {review_id} is already {}, not pending.",
+            review.status
+        );
+        std::process::exit(1);
+    }
+    print_pending_review(&review);
+    println!();
+    print!(
+        "{} this write? [y/N] ",
+        if approving {
+            "Approve"
+        } else {
+            "Confirm declining"
+        }
+    );
+    use std::io::Write;
+    std::io::stdout().flush().ok();
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    let confirmed = matches!(answer.trim().to_lowercase().as_str(), "y" | "yes");
+    if !confirmed {
+        println!("Not confirmed -- no change made.");
+        return Ok(());
+    }
+    let decided_by = "cli_manual_review";
+    let ok = if approving {
+        calm_core::authority::approve_pending_review(&conn, review_id, decided_by)?
+    } else {
+        calm_core::authority::decline_pending_review(&conn, review_id, decided_by)?
+    };
+    if ok {
+        println!(
+            "Review {review_id} {}.",
+            if approving { "approved" } else { "declined" }
+        );
+        if approving {
+            println!("The agent's retry of the same edit should now succeed.");
+        }
+    } else {
+        println!(
+            "Could not {} {review_id} -- it may have expired or already been decided by \
+             someone else.",
+            if approving { "approve" } else { "decline" }
+        );
+        std::process::exit(1);
+    }
     Ok(())
 }
 

@@ -36,6 +36,28 @@
 //! already be committed, and must never retroactively block or undo one
 //! just because a signing side-channel had a hiccup (same fail-open
 //! contract every existing caller of this function already relies on).
+//!
+//! **CCK-30R2 (audit 2026-08-10) -- `signature_provenance`:** the WS3
+//! signature alone proves a row's bytes were signed by SOMEONE holding
+//! `control.key`, but the `v9->v10` migration originally backfilled every
+//! pre-existing (then-unsigned) row with a fresh signature over its
+//! existing bytes -- which is indistinguishable, from the signature alone,
+//! from a row `insert_approval_receipt` genuinely wrote at the moment the
+//! approval happened. A migration-backfilled signature only proves "these
+//! bytes existed when the migration ran"; it does NOT prove "this approval
+//! was authentic when it happened" -- and the original doc comment above
+//! overclaimed the latter for both cases alike. `signature_provenance` (now
+//! itself folded into the signed payload, so it can't be silently flipped
+//! by anyone with raw write access either) makes the distinction explicit:
+//! `"native"` for a row [`insert_approval_receipt`] actually signed at
+//! insert time, `"legacy_unverified"` for one whose signature was
+//! (re-)derived after the fact by a schema migration. Every row that
+//! predates this column collapses to `"legacy_unverified"` -- by the time
+//! `v9_to_v10_approval_receipt_signature_provenance` runs, a genuinely
+//! `"native"` v9-era row and a `v8_to_v9`-backfilled row are already
+//! byte-identical in shape (both just have a non-`NULL` `signature`), so
+//! there is no data left to tell them apart; claiming `"native"` for either
+//! would repeat the exact overclaim this fix exists to remove.
 
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -92,10 +114,15 @@ fn new_receipt_id() -> String {
 }
 
 /// Canonical signed material for one receipt row -- every column except
-/// `signature` itself. Shared between [`insert_approval_receipt`] (sign at
-/// write time) and the `v8_to_v9_approval_receipt_signature` state
-/// migration (backfill existing rows), so the two can never drift into two
-/// different canonical forms of "the same" payload.
+/// `signature` itself, including `signature_provenance` (CCK-30R2): folding
+/// the provenance claim INTO the signed payload is what stops an attacker
+/// with raw `state.db` write access from silently flipping a
+/// `"legacy_unverified"` row to `"native"` without the signature check
+/// noticing. Shared between [`insert_approval_receipt`] (sign at write
+/// time), [`verify_approval_receipt_signature`] (re-derive to check), and
+/// the `v9_to_v10_approval_receipt_signature_provenance` state migration
+/// (re-sign existing rows under the new shape), so all three can never
+/// drift into different canonical forms of "the same" payload.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn signing_payload(
     receipt_id: &str,
@@ -107,11 +134,12 @@ pub(crate) fn signing_payload(
     decision: &str,
     approved_at: f64,
     tx_id: Option<&str>,
+    signature_provenance: &str,
 ) -> String {
     format!(
         "receipt_id={receipt_id}\nchange_id={}\nauthority_id={}\nsubject_digest={subject_digest}\n\
          approved_by={approved_by}\nmechanism={mechanism}\ndecision={decision}\n\
-         approved_at={approved_at}\ntx_id={}\n",
+         approved_at={approved_at}\ntx_id={}\nsignature_provenance={signature_provenance}\n",
         change_id.unwrap_or(""),
         authority_id.unwrap_or(""),
         tx_id.unwrap_or(""),
@@ -131,6 +159,12 @@ pub fn insert_approval_receipt(
     let receipt_id = new_receipt_id();
     let approved_at = now_epoch_secs();
     const DECISION: &str = "approved";
+    // CCK-30R2: the only call site entitled to claim `"native"` -- this IS
+    // the moment of insert, so a signature computed here genuinely covers
+    // an approval as it actually happened, not a byte-preserving replay of
+    // it. Every other path that ever sets `signature` (only the schema
+    // migration today) must claim `"legacy_unverified"` instead.
+    const PROVENANCE: &str = "native";
     let signature = control_key_for_conn(conn).ok().flatten().map(|key| {
         sign(
             &key,
@@ -145,14 +179,21 @@ pub fn insert_approval_receipt(
                 DECISION,
                 approved_at,
                 receipt.tx_id,
+                PROVENANCE,
             ),
         )
     });
+    // Mirrors `signature`'s own `None`-iff-no-key symmetry: a provenance
+    // claim with nothing behind it (no signature to back it) would be
+    // worse than useless -- an unsigned row asserting `"native"` is
+    // exactly the "audit trail looks clean" scenario this whole mechanism
+    // exists to prevent.
+    let signature_provenance = signature.as_ref().map(|_| PROVENANCE);
     conn.execute(
         "INSERT INTO approval_receipts \
          (receipt_id, change_id, authority_id, subject_digest, approved_by, mechanism, \
-          decision, approved_at, tx_id, signature) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'approved', ?7, ?8, ?9)",
+          decision, approved_at, tx_id, signature, signature_provenance) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'approved', ?7, ?8, ?9, ?10)",
         params![
             receipt_id,
             receipt.change_id,
@@ -163,6 +204,7 @@ pub fn insert_approval_receipt(
             approved_at,
             receipt.tx_id,
             signature,
+            signature_provenance,
         ],
     )?;
     Ok(receipt_id)
@@ -174,7 +216,11 @@ pub fn insert_approval_receipt(
 /// (no such row, no stored signature, or no key available for this
 /// connection) -- deliberately never conflated with `Some(false)` (a
 /// genuine mismatch), which is the one outcome actually worth flagging as
-/// tampered or corrupted.
+/// tampered or corrupted. CCK-30R2: the recomputed payload now includes
+/// whatever `signature_provenance` is currently stored (`""` if somehow
+/// still unset), same field the signer bound in -- so tampering with
+/// EITHER `signature`-covered column OR the provenance claim itself both
+/// surface as `Some(false)`, not just the original column set.
 pub fn verify_approval_receipt_signature(
     conn: &Connection,
     receipt_id: &str,
@@ -190,11 +236,12 @@ pub fn verify_approval_receipt_signature(
         f64,
         Option<String>,
         Option<String>,
+        Option<String>,
     )> = conn
         .query_row(
             "SELECT change_id, authority_id, subject_digest, approved_by, mechanism, \
-             decision, approved_at, tx_id, signature FROM approval_receipts \
-             WHERE receipt_id = ?1",
+             decision, approved_at, tx_id, signature, signature_provenance \
+             FROM approval_receipts WHERE receipt_id = ?1",
             params![receipt_id],
             |r| {
                 Ok((
@@ -207,6 +254,7 @@ pub fn verify_approval_receipt_signature(
                     r.get(6)?,
                     r.get(7)?,
                     r.get(8)?,
+                    r.get(9)?,
                 ))
             },
         )
@@ -221,6 +269,7 @@ pub fn verify_approval_receipt_signature(
         approved_at,
         tx_id,
         Some(signature),
+        provenance,
     )) = row
     else {
         return Ok(None);
@@ -238,8 +287,29 @@ pub fn verify_approval_receipt_signature(
         &decision,
         approved_at,
         tx_id.as_deref(),
+        provenance.as_deref().unwrap_or(""),
     );
     Ok(Some(verify(&key, SIGNING_DOMAIN, &payload, &signature)))
+}
+
+/// Reads back `signature_provenance` for one receipt (`None` if the row
+/// doesn't exist, or the column is unset -- see `insert_approval_receipt`'s
+/// own `None`-iff-no-signature symmetry). Callers building an audit view
+/// should show this alongside [`verify_approval_receipt_signature`]'s
+/// result: a `Some(true)` verification on a `"legacy_unverified"` row is
+/// NOT the same trust level as one on a `"native"` row -- see this module's
+/// own doc comment.
+pub fn approval_receipt_signature_provenance(
+    conn: &Connection,
+    receipt_id: &str,
+) -> rusqlite::Result<Option<String>> {
+    conn.query_row(
+        "SELECT signature_provenance FROM approval_receipts WHERE receipt_id = ?1",
+        params![receipt_id],
+        |r| r.get(0),
+    )
+    .optional()
+    .map(Option::flatten)
 }
 
 #[cfg(test)]
@@ -430,6 +500,76 @@ mod tests {
         assert_eq!(
             verify_approval_receipt_signature(&conn, &receipt_id).unwrap(),
             Some(true)
+        );
+    }
+
+    #[test]
+    fn insert_approval_receipt_claims_native_provenance_when_signed() {
+        // CCK-30R2: only a row `insert_approval_receipt` itself signs, at
+        // the true moment of approval, may claim "native" -- this is the
+        // one call site entitled to it.
+        let dir = tempfile::tempdir().unwrap();
+        let conn = real_state_conn(dir.path());
+        seed_intent(&conn, "INT-1");
+        let receipt_id = insert_approval_receipt(
+            &conn,
+            &ApprovalReceipt {
+                change_id: Some("INT-1"),
+                authority_id: None,
+                subject_digest: "policy-decision-1",
+                approved_by: "session:abc",
+                mechanism: "self_attested",
+                tx_id: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            approval_receipt_signature_provenance(&conn, &receipt_id).unwrap(),
+            Some("native".to_string())
+        );
+        assert_eq!(
+            verify_approval_receipt_signature(&conn, &receipt_id).unwrap(),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn tampering_with_signature_provenance_itself_is_detected() {
+        // CCK-30R2: signature_provenance is folded INTO the signed
+        // payload specifically so an attacker with raw state.db write
+        // access can't silently upgrade a "legacy_unverified" row's
+        // provenance claim to "native" without the signature noticing.
+        let dir = tempfile::tempdir().unwrap();
+        let conn = real_state_conn(dir.path());
+        seed_intent(&conn, "INT-1");
+        let receipt_id = insert_approval_receipt(
+            &conn,
+            &ApprovalReceipt {
+                change_id: Some("INT-1"),
+                authority_id: None,
+                subject_digest: "policy-decision-1",
+                approved_by: "session:abc",
+                mechanism: "self_attested",
+                tx_id: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            approval_receipt_signature_provenance(&conn, &receipt_id).unwrap(),
+            Some("native".to_string()),
+            "sanity: insert_approval_receipt claims native before any tampering"
+        );
+        conn.execute(
+            "UPDATE approval_receipts SET signature_provenance = 'legacy_unverified' \
+             WHERE receipt_id = ?1",
+            params![receipt_id],
+        )
+        .unwrap();
+        assert_eq!(
+            verify_approval_receipt_signature(&conn, &receipt_id).unwrap(),
+            Some(false),
+            "flipping the provenance claim must invalidate the signature, not just \
+             flipping subject_digest/etc"
         );
     }
 

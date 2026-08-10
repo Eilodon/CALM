@@ -546,6 +546,53 @@ impl WatchSupervisor {
                 )?;
                 *catalog = refreshed_catalog;
             }
+            if outcome.graph_rebuilt {
+                if let Some(model) = self.runtime.embedder.read_ok().clone() {
+                    if let Err(error) = calm_core::embedding::embed_pending(&conn, model.as_ref()) {
+                        tracing::error!("Incremental embedding failed: {error}");
+                    }
+                    if let Err(error) =
+                        calm_core::embedding::embed_pending_chunks(&conn, model.as_ref())
+                    {
+                        tracing::error!("Incremental chunk embedding failed: {error}");
+                    }
+                }
+                #[cfg(feature = "scip-overlay")]
+                if !self.runtime.ct.is_cancelled() {
+                    // CCK-31R (audit follow-up, 2026-08-10): this overlay pass
+                    // mutates `scip_overlay_state`, which
+                    // `EvidenceSnapshot::provider_state_digest` folds into
+                    // `snapshot_id`. It must finish BEFORE the Reconciled
+                    // snapshot below is computed/persisted -- persisting first
+                    // (the original order) recorded a `snapshot_id` whose
+                    // provider-state component this pass immediately made
+                    // stale, so `compute_with_recorded_freshness`'s later,
+                    // exact content-addressed lookup would simply miss (see
+                    // that function's own doc comment: "any disk change since
+                    // the recorded snapshot changes the id"). The practical
+                    // effect: a Human-tier mint that needs `Reconciled`
+                    // freshness (`FreshnessClass::meets_bar_for`) would find
+                    // no matching row and silently degrade back to `Current`
+                    // -- defeating WS2b's own fix almost immediately after
+                    // every reconciliation that also rebuilds the graph, on
+                    // any project where `scip-overlay` (a DEFAULT-on feature)
+                    // is actually active.
+                    drop(conn);
+                    crate::scip_overlay::run_all_coalesced(
+                        &self.runtime.project_root,
+                        &self.runtime.db_path,
+                    );
+                    // `conn` was dropped to release the writer lock for the
+                    // overlay pass above (unchanged from before this reorder)
+                    // -- the Reconciled-snapshot block below reopens its own
+                    // read connection via `make_read_conn`-equivalent
+                    // (`calm_core::db::conn::open_writer` was only ever used
+                    // for the reindex steps above it; the snapshot compute
+                    // just needs `&conn`, so re-open here for the remainder
+                    // of this closure).
+                    conn = calm_core::db::conn::open_writer(&self.runtime.db_path)?;
+                }
+            }
             // WS2b (audit follow-up, gap #1 -- master change-control blueprint):
             // a full reconciliation just completed end-to-end. Record that as a
             // `Reconciled` EvidenceSnapshot in state.db so a LATER, separate
@@ -555,6 +602,13 @@ impl WatchSupervisor {
             // `EvidenceSnapshot::compute_after_reconciliation` (every other
             // caller is a unit test). Best-effort/fail-open: a persistence
             // hiccup here must not undo or block an already-successful refresh.
+            //
+            // CCK-31R: deliberately placed AFTER the `graph_rebuilt` block
+            // above (embeddings + SCIP overlay), not before -- see that
+            // block's own comment. `provider_state_digest` (part of
+            // `snapshot_id`) must reflect the FINAL post-overlay state before
+            // this snapshot is computed, or the recorded `Reconciled` row
+            // becomes unreachable the moment the overlay pass finishes.
             if let Some(reason) = outcome.full_reconciliation {
                 match calm_core::db::conn::open_state_writer(&crate::default_state_db_path(
                     &self.runtime.project_root,
@@ -587,26 +641,6 @@ impl WatchSupervisor {
                     Err(error) => tracing::warn!(
                         "could not open state.db to record reconciliation (trigger={reason:?}): {error}"
                     ),
-                }
-            }
-            if outcome.graph_rebuilt {
-                if let Some(model) = self.runtime.embedder.read_ok().clone() {
-                    if let Err(error) = calm_core::embedding::embed_pending(&conn, model.as_ref()) {
-                        tracing::error!("Incremental embedding failed: {error}");
-                    }
-                    if let Err(error) =
-                        calm_core::embedding::embed_pending_chunks(&conn, model.as_ref())
-                    {
-                        tracing::error!("Incremental chunk embedding failed: {error}");
-                    }
-                }
-                #[cfg(feature = "scip-overlay")]
-                if !self.runtime.ct.is_cancelled() {
-                    drop(conn);
-                    crate::scip_overlay::run_all_coalesced(
-                        &self.runtime.project_root,
-                        &self.runtime.db_path,
-                    );
                 }
             }
             Ok(Some(outcome))

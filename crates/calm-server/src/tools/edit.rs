@@ -1346,6 +1346,18 @@ impl CalmServer {
                             .and_then(|(level_str, _glob)| {
                                 calm_core::policy::RiskLevel::parse(level_str)
                             });
+                    // CCK-29d (audit 2026-08-10): wired at the one production
+                    // call site with both a live diff (`hunks`) and coverage
+                    // data already loaded -- `mint_review_authority_for_edit_context`
+                    // and `review_change` mint BEFORE any diff exists, so they
+                    // structurally cannot compute this (documented gap, stays
+                    // `false` there).
+                    let touches_uncovered_code = hunks_touch_uncovered_code(
+                        &self.coverage.read_ok(),
+                        &self.project_root,
+                        path,
+                        &hunks,
+                    );
                     let risk_vector = calm_core::policy::RiskVector {
                         caller_count_level,
                         is_hub: hub_hit,
@@ -1355,7 +1367,7 @@ impl CalmServer {
                         risk_rule_floor,
                         kind_mismatch,
                         touches_manifest,
-                        touches_uncovered_code: false,
+                        touches_uncovered_code,
                     };
                     let policy = calm_core::policy::loader::load_policy_or_warn(&self.project_root);
                     let policy_decision = calm_core::policy::evaluate(&risk_vector, &policy);
@@ -1563,27 +1575,136 @@ impl CalmServer {
         // are. (The equivalent check further below, inside the legacy-gate block, is
         // now unreachable when this one already returned -- left in place deliberately
         // for minimal diff; dead by construction, not a correctness gap.)
+        // "calm review" (audit 2026-08-10 follow-up): `gate`/`approval_mechanism`
+        // are shadowed mutably here -- an approved pending review (a second,
+        // MCP-protocol-independent channel; see `calm_core::authority::
+        // pending_review`'s module doc comment for why it exists) is treated
+        // as EXACTLY equivalent to a genuine `ElicitGate::Approved` for every
+        // check downstream of this point, so it never has to be special-cased
+        // again. `approval_mechanism` exists so the one place that writes an
+        // `ApprovalReceipt` (below) can still tell the two channels apart --
+        // it must never claim "elicitation" for an approval that came from the
+        // CLI instead.
+        let mut gate = gate;
+        let mut approval_mechanism: &'static str = "elicitation";
         let high_risk_needs_independent_review = risk.as_deref() == Some("high")
             && !matches!(gate, ElicitGate::Ask | ElicitGate::Approved);
         if high_risk_needs_independent_review {
-            tracing::info!(
-                target: crate::telemetry::AUDIT_TARGET,
-                session_id = self.session_id,
-                decision = "denied",
-                reason_code = "HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW",
-                path,
-                risk = risk.as_deref().unwrap_or("none"),
-                hub_hit,
-                authority_already_validated,
-            );
-            return ToolOutcome::error(error_detail(
-                "HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW",
-                "this symbol is \"high\" risk -- neither a spent ReviewAuthority nor a \
-                 cited reason is independent review at this tier. Enable [edit] \
-                 elicit_hub_confirm and get human approval via the elicitation \
-                 round-trip before treating this as safe to edit",
-                true,
-            ));
+            let review_fingerprint = fingerprint_hunks(path, &hunks);
+            let approved_pending_review =
+                calm_core::db::conn::open_state_writer(&self.state_db_path)
+                    .ok()
+                    .and_then(|conn| {
+                        calm_core::authority::find_approved_matching(
+                            &conn,
+                            path,
+                            &review_fingerprint,
+                        )
+                        .ok()
+                        .flatten()
+                    });
+            if let Some(pending) = approved_pending_review {
+                tracing::info!(
+                    target: crate::telemetry::AUDIT_TARGET,
+                    session_id = self.session_id,
+                    decision = "approved_via_pending_review",
+                    reason_code = "HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW",
+                    path,
+                    review_id = %pending.review_id,
+                );
+                gate = ElicitGate::Approved;
+                approval_mechanism = "cli_manual_review";
+            } else {
+                tracing::info!(
+                    target: crate::telemetry::AUDIT_TARGET,
+                    session_id = self.session_id,
+                    decision = "denied",
+                    reason_code = "HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW",
+                    path,
+                    risk = risk.as_deref().unwrap_or("none"),
+                    hub_hit,
+                    authority_already_validated,
+                );
+                // Part 1 diagnostics (audit 2026-08-10 follow-up): `elicit_hub_confirm`
+                // being on but `gate` still landing `Off` can ONLY mean this MCP client
+                // negotiated neither MRTR nor declared Form-mode elicitation at
+                // `initialize` -- see `elicit_setup`'s own doc comment. Telling that
+                // caller to "enable elicit_hub_confirm" (already on) is actively wrong
+                // advice; distinguish the two causes instead of repeating one message
+                // for both. No new parameter needed: `self.config()` alone plus the
+                // already-resolved `gate` is enough to tell them apart by elimination.
+                let remediation = if !self.config().edit.elicit_hub_confirm {
+                    "Enable [edit] elicit_hub_confirm and get human approval via the \
+                     elicitation round-trip before treating this as safe to edit"
+                        .to_string()
+                } else {
+                    "[edit] elicit_hub_confirm is already enabled, but this MCP client did \
+                     not negotiate the elicitation round-trip (no MRTR, no declared \
+                     form-mode elicitation) -- enabling it again will not help."
+                        .to_string()
+                };
+                // Open (or reuse an existing pending) review row -- de-duped by
+                // (path, fingerprint) so an agent retrying the same refused edit
+                // doesn't spawn a fresh row, and hence a fresh review_id, every time.
+                let review_hint = match calm_core::db::conn::open_state_writer(&self.state_db_path)
+                {
+                    Ok(state_conn) => {
+                        let existing = calm_core::authority::list_pending_reviews(
+                            &state_conn,
+                            Some("pending"),
+                        )
+                        .ok()
+                        .and_then(|rows| {
+                            rows.into_iter()
+                                .find(|r| r.path == path && r.fingerprint == review_fingerprint)
+                        });
+                        let review_id = match existing {
+                            Some(r) => Some(r.review_id),
+                            None => {
+                                let diff_preview = diff_preview_for_hunks(&outcome.results, &hunks);
+                                let tool_name = if anchor_qualified_name.is_some() {
+                                    "edit_symbol"
+                                } else {
+                                    "edit_lines"
+                                };
+                                calm_core::authority::insert_pending_review(
+                                    &state_conn,
+                                    &calm_core::authority::NewPendingReview {
+                                        tool: tool_name,
+                                        path,
+                                        fingerprint: &review_fingerprint,
+                                        diff_preview: &diff_preview,
+                                        risk: risk.as_deref(),
+                                        hub_kind: hub_kind.as_deref(),
+                                        reason,
+                                        ttl_secs:
+                                            calm_core::authority::PENDING_REVIEW_DEFAULT_TTL_SECS,
+                                    },
+                                )
+                                .ok()
+                            }
+                        };
+                        match review_id {
+                            Some(id) => format!(
+                                " A human can independently review this out-of-band: run \
+                                 `calm review show {id}` in a terminal in this project to see \
+                                 exactly what's proposed, then `calm review approve {id}` (or \
+                                 `decline`)."
+                            ),
+                            None => String::new(),
+                        }
+                    }
+                    Err(_) => String::new(),
+                };
+                return ToolOutcome::error(error_detail(
+                    "HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW",
+                    &format!(
+                        "this symbol is \"high\" risk -- neither a spent ReviewAuthority nor a \
+                         cited reason is independent review at this tier. {remediation}{review_hint}"
+                    ),
+                    true,
+                ));
+            }
         }
         if !authority_already_validated && gate_classification.will_block_without_confirm {
             let why = gate_classification.why.unwrap_or_default();
@@ -1998,6 +2119,9 @@ impl CalmServer {
                         .iter()
                         .map(|t| (t.qualified_name.clone(), t.caller_count))
                         .collect(),
+                    diff_preview: diff_preview_for_hunks(&outcome.results, &hunks),
+                    base_digest: calm_core::digest::evidence_digest(original.as_bytes()),
+                    proposed_digest: calm_core::digest::evidence_digest(new_content.as_bytes()),
                 });
                 return ToolOutcome::error(error_detail(
                     "ELICITATION_PENDING",
@@ -2172,7 +2296,7 @@ impl CalmServer {
                                 authority_id: Some(authority_id),
                                 subject_digest: &proposed_digest,
                                 approved_by: &principal,
-                                mechanism: "elicitation",
+                                mechanism: approval_mechanism,
                                 tx_id: Some(&tx.tx_id),
                             },
                         )
@@ -2653,6 +2777,20 @@ pub(crate) struct HubAskContext {
     hub_kind: Option<String>,
     /// `(qualified_name, caller_count)` of every touched symbol.
     touched: Vec<(String, i64)>,
+    /// CCK-30R (audit 2026-08-10): the actual before/after content of every
+    /// hunk this call would write, rendered by `diff_preview_for_hunks` --
+    /// UNTRUNCATED here (`build_hub_elicit_message` sanitizes/caps it, same
+    /// as `reason`). Before this field existed, `ApprovalReceipt.subject_digest`
+    /// recorded a `proposed_digest` the human approving it was never shown —
+    /// the receipt could claim "approved" without the approval having been
+    /// informed by anything more than a symbol name and a caller count.
+    diff_preview: String,
+    /// `evidence_digest` of the file's content before/after this call, same
+    /// values `authorize_and_begin_edit`/`insert_approval_receipt` bind at
+    /// spend time -- shown so the receipt's `subject_digest` is traceable
+    /// back to a digest the human actually saw named in the question.
+    base_digest: String,
+    proposed_digest: String,
 }
 
 /// Typed answer the human's client returns for the hub-edit veto question.
@@ -2804,11 +2942,33 @@ impl CalmServer {
         let result = peer
             .elicit_with_timeout::<HubEditApproval>(message, Some(timeout))
             .await;
+        // Part 1 diagnostics (audit 2026-08-10 follow-up): `map_elicit_outcome`
+        // collapses 4 different raw outcomes into one "elicit_declined" verdict
+        // (an explicit approve:false, an empty Ok(None) answer, and 2 distinct
+        // client-side error variants) -- correct for the fail-closed DECISION,
+        // but it means an operator reading `audit.log` after the fact can't
+        // tell a real informed decline apart from the client silently
+        // auto-cancelling with no human ever having seen anything. Logged
+        // here (before `result` moves into `map_elicit_outcome`) rather than
+        // changing that function's return type, which would touch its other
+        // 5 callers/tests for a pure-logging addition.
+        let raw_outcome_kind: &'static str = match &result {
+            Ok(Some(HubEditApproval { approve: true })) => "explicit_approve",
+            Ok(Some(HubEditApproval { approve: false })) => "explicit_decline",
+            Ok(None) => "empty_answer",
+            Err(rmcp::service::ElicitationError::UserDeclined) => "client_user_declined",
+            Err(rmcp::service::ElicitationError::UserCancelled) => "client_user_cancelled",
+            Err(rmcp::service::ElicitationError::Service(rmcp::ServiceError::Timeout {
+                ..
+            })) => "timeout",
+            Err(_) => "other_client_error",
+        };
         let (verdict, mapped) = map_elicit_outcome(result);
         tracing::info!(
             target: crate::telemetry::AUDIT_TARGET,
             session_id = self.session_id,
             decision = verdict,
+            raw_outcome = raw_outcome_kind,
             tool,
             path = cache_path,
             elapsed_ms = started.elapsed().as_millis() as u64,
@@ -2953,11 +3113,24 @@ impl CalmServer {
                     false,
                 )
             })?;
+        // Part 1 diagnostics (audit 2026-08-10 follow-up): same rationale as
+        // `hub_elicit_roundtrip`'s identical addition -- `decide_mrtr_answer`
+        // collapses `Some(approve:false)` and `None` (client answered nothing
+        // at all) into the same "elicit_declined" verdict. Logged separately
+        // here so `audit.log` can distinguish a real explicit decline from an
+        // empty/absent answer, without changing decide_mrtr_answer's return
+        // type (would touch its other 2 callers/tests for a logging-only add).
+        let raw_outcome_kind: &'static str = match &answer {
+            Some(HubEditApproval { approve: true }) => "explicit_approve",
+            Some(HubEditApproval { approve: false }) => "explicit_decline",
+            None => "empty_answer",
+        };
         let (verdict, mapped) = decide_mrtr_answer(answer);
         tracing::info!(
             target: crate::telemetry::AUDIT_TARGET,
             session_id = self.session_id,
             decision = verdict,
+            raw_outcome = raw_outcome_kind,
             tool,
             path = cache_path,
         );
@@ -3042,6 +3215,75 @@ fn decide_mrtr_answer(answer: Option<HubEditApproval>) -> (&'static str, Result<
 /// to cross into a human approval UI — run through the same redaction layer
 /// as source output and hard-capped, per audit FM3 (the reason field must
 /// not become an injection surface against the approver).
+/// `RiskVector::touches_uncovered_code` (CCK-29d, audit 2026-08-10): `true`
+/// iff `coverage` has real data loaded AND at least one touched hunk range
+/// has no recorded runtime coverage. `false` (never-elevating) when there's
+/// no coverage source at all -- absence of evidence isn't evidence of
+/// absence, and flagging every edit on every project without a coverage
+/// file configured would make this axis pure noise. `coverage.is_covered`
+/// needs an absolute path key (see `analysis::coverage::normalize_path`'s
+/// own doc comment); `path` here is repo-relative like every other edit-
+/// tool path, so it's resolved fresh rather than passed through mismatched.
+fn hunks_touch_uncovered_code(
+    coverage: &calm_core::analysis::coverage::CoverageData,
+    project_root: &std::path::Path,
+    path: &str,
+    hunks: &[calm_core::edit::HunkRequest],
+) -> bool {
+    if coverage.source == "none" {
+        return false;
+    }
+    let abs_path = calm_core::analysis::coverage::normalize_path(&project_root.join(path));
+    hunks
+        .iter()
+        .any(|h| !coverage.is_covered(&abs_path, h.start_line as i64, h.end_line as i64))
+}
+
+/// Renders every hunk's before/after content as a compact, `-`/`+` diff --
+/// CCK-30R (audit 2026-08-10). Deliberately dumb (no LCS/line-alignment):
+/// this is a bounded approval preview, not a review tool, and a naive
+/// whole-range replace renders unambiguously either way. Sanitization and
+/// length-capping happen in `build_hub_elicit_message`, same as `reason` --
+/// this returns the raw, untruncated text.
+fn diff_preview_for_hunks(
+    results: &[calm_core::edit::HunkResult],
+    hunks: &[calm_core::edit::HunkRequest],
+) -> String {
+    let mut out = String::new();
+    for r in results {
+        let new_text = hunks
+            .iter()
+            .find(|h| h.start_line == r.start_line && h.end_line == r.end_line)
+            .map(|h| h.new_text.as_str())
+            .unwrap_or("");
+        out.push_str(&format!("@@ lines {}-{} @@\n", r.start_line, r.end_line));
+        for line in r.old_text.lines() {
+            out.push_str("- ");
+            out.push_str(line);
+            out.push('\n');
+        }
+        for line in new_text.lines() {
+            out.push_str("+ ");
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Builds the human-facing question. `reason` is agent-authored text about
+/// to cross into a human approval UI — run through the same redaction layer
+/// as source output and hard-capped, per audit FM3 (the reason field must
+/// not become an injection surface against the approver).
+///
+/// CCK-30R (audit 2026-08-10): before this, the question named a path,
+/// risk, hub kind, up to 3 touched symbols, and the agent's stated reason
+/// -- never the diff or digests `ApprovalReceipt.subject_digest` records as
+/// "approved". A receipt can only back the claim "this is what the reviewer
+/// was shown" if the reviewer actually was; the diff and digests below
+/// close that gap. Same bounded/sanitized/truncation-marked treatment as
+/// `reason` -- an approval UI is exactly the kind of place a large or
+/// adversarially-crafted diff must not be allowed to flood or inject into.
 fn build_hub_elicit_message(
     tool: &str,
     path: &str,
@@ -3064,6 +3306,22 @@ fn build_hub_elicit_message(
     for (qn, callers) in touched.iter().take(3) {
         msg.push_str(&format!("\n- {qn} ({callers} callers)"));
     }
+    msg.push_str(&format!(
+        "\nbase_digest={} proposed_digest={}",
+        ask.base_digest, ask.proposed_digest
+    ));
+    const DIFF_CHAR_CAP: usize = 2000;
+    let sanitized_diff = calm_core::sanitize::sanitize_source_output(&ask.diff_preview);
+    let diff_char_count = sanitized_diff.chars().count();
+    let capped_diff: String = sanitized_diff.chars().take(DIFF_CHAR_CAP).collect();
+    msg.push_str(&format!("\nProposed diff:\n{capped_diff}"));
+    if diff_char_count > DIFF_CHAR_CAP {
+        msg.push_str(&format!(
+            "\n[... truncated — {} more characters not shown; the digests above are still \
+             over the FULL proposed content, not just what's displayed]",
+            diff_char_count - DIFF_CHAR_CAP
+        ));
+    }
     let sanitized = calm_core::sanitize::sanitize_source_output(reason.unwrap_or("(none given)"));
     let capped: String = sanitized.chars().take(400).collect();
     msg.push_str(&format!("\nAgent's stated reason: {capped}"));
@@ -3074,36 +3332,79 @@ fn build_hub_elicit_message(
     msg
 }
 
-/// Content fingerprint for the per-session declined-cache — keyed by what
-/// would actually be written, never by path alone (audit L7: changed content
-/// is a NEW question and must re-ask; the identical retry must not re-harass
-/// the human).
+/// Content fingerprint for the per-session declined-cache AND the MRTR
+/// seal's content-identity check (`HubEditStateSeal`, `hub_mrtr_decide`) --
+/// keyed by what would actually be written, never by path alone (audit L7:
+/// changed content is a NEW question and must re-ask; the identical retry
+/// must not re-harass the human).
+///
+/// CCK-29c (audit 2026-08-10): SHA-256 via `evidence_digest`, not
+/// `std::hash::DefaultHasher`. The old 64-bit fingerprint was the thing
+/// `hub_mrtr_decide` actually compares to decide "is this retry the exact
+/// edit a human approved" -- a real content-identity check on a
+/// security-relevant boundary. `DefaultHasher`'s SipHash-1-3 with a fixed
+/// all-zero key is a public, unkeyed 64-bit hash with no cryptographic
+/// contract: cheap enough (~2^32 birthday bound) to search offline for a
+/// different payload that collides with an already-sealed one. A strong
+/// digest was already available and used everywhere else identity-binding
+/// matters (`target_scope_digest`, `policy_digest`, ...) -- this was simply
+/// never wired here.
 fn fingerprint_edit_lines(p: &EditLinesParams) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    p.path.hash(&mut h);
-    for e in &p.edits {
-        e.start_line.hash(&mut h);
-        e.end_line.hash(&mut h);
-        e.expected_hash.hash(&mut h);
-        e.old_text.hash(&mut h);
-        e.new_text.hash(&mut h);
+    let mut material = format!("edit-lines-fingerprint-v2\npath={}\n", p.path);
+    for (i, e) in p.edits.iter().enumerate() {
+        material.push_str(&format!(
+            "edit[{i}].start_line={}\nedit[{i}].end_line={}\nedit[{i}].expected_hash={}\n\
+             edit[{i}].old_text={}\nedit[{i}].new_text={}\n",
+            e.start_line,
+            e.end_line,
+            e.expected_hash.as_deref().unwrap_or(""),
+            e.old_text.as_deref().unwrap_or(""),
+            e.new_text,
+        ));
     }
-    format!("{:016x}", h.finish())
+    calm_core::digest::evidence_digest(material.as_bytes())
 }
 
-/// See `fingerprint_edit_lines` — same contract for `edit_symbol` params.
+/// See `fingerprint_edit_lines` — same contract and same CCK-29c rationale
+/// for `edit_symbol` params.
 fn fingerprint_edit_symbol(p: &EditSymbolParams) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    p.symbol.hash(&mut h);
-    p.path.hash(&mut h);
-    p.line.hash(&mut h);
-    p.position.hash(&mut h);
-    p.expected_hash.hash(&mut h);
-    p.old_text.hash(&mut h);
-    p.new_text.hash(&mut h);
-    format!("{:016x}", h.finish())
+    let material = format!(
+        "edit-symbol-fingerprint-v2\nsymbol={}\npath={}\nline={}\nposition={}\n\
+         expected_hash={}\nold_text={}\nnew_text={}\n",
+        p.symbol,
+        p.path.as_deref().unwrap_or(""),
+        p.line.map(|l| l.to_string()).unwrap_or_default(),
+        p.position.as_deref().unwrap_or(""),
+        p.expected_hash.as_deref().unwrap_or(""),
+        p.old_text.as_deref().unwrap_or(""),
+        p.new_text,
+    );
+    calm_core::digest::evidence_digest(material.as_bytes())
+}
+
+/// "calm review" (audit 2026-08-10 follow-up): the content-identity used to
+/// both open AND (on retry) look up a `pending_reviews` row from inside
+/// `edit_lines_impl_gated` -- a different call site than
+/// `fingerprint_edit_lines`/`fingerprint_edit_symbol` above (those run in
+/// `edit_lines_tool`/`edit_symbol_tool`, over the raw incoming params,
+/// before `old_text`-mode hunks are resolved to concrete line ranges).
+/// Deliberately its own fingerprint rather than reusing those: it only
+/// needs to match itself between this function's own insert and its own
+/// later retry-lookup, both computed from the same already-resolved
+/// `path`+`hunks` this deep in the call chain.
+fn fingerprint_hunks(path: &str, hunks: &[calm_core::edit::HunkRequest]) -> String {
+    let mut material = format!("edit-hunks-fingerprint-v1\npath={path}\n");
+    for (i, h) in hunks.iter().enumerate() {
+        material.push_str(&format!(
+            "hunk[{i}].start_line={}\nhunk[{i}].end_line={}\nhunk[{i}].expected_hash={}\n\
+             hunk[{i}].new_text={}\n",
+            h.start_line,
+            h.end_line,
+            h.expected_hash.as_deref().unwrap_or(""),
+            h.new_text,
+        ));
+    }
+    calm_core::digest::evidence_digest(material.as_bytes())
 }
 
 /// One `symbols` row overlapping an edit's touched ranges — enough fields
@@ -4267,6 +4568,75 @@ mod elicit_tests {
         assert_eq!(mapped.unwrap_err().code, "ELICITATION_FAILED");
     }
 
+    // --- CCK-29d (audit 2026-08-10): RiskVector.touches_uncovered_code ---
+
+    fn hunk(start_line: usize, end_line: usize) -> calm_core::edit::HunkRequest {
+        calm_core::edit::HunkRequest {
+            start_line,
+            end_line,
+            expected_hash: None,
+            new_text: String::new(),
+        }
+    }
+
+    fn uncovered_code_test_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("ci_uncovered_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn hunks_touch_uncovered_code_is_false_with_no_coverage_source() {
+        let dir = uncovered_code_test_dir("no_source");
+        let coverage = calm_core::analysis::coverage::CoverageData::none();
+        assert!(!hunks_touch_uncovered_code(
+            &coverage,
+            &dir,
+            "a.py",
+            &[hunk(2, 2)]
+        ));
+    }
+
+    #[test]
+    fn hunks_touch_uncovered_code_is_false_when_the_touched_range_is_covered() {
+        let dir = uncovered_code_test_dir("covered");
+        std::fs::write(dir.join("a.py"), "x\ny\nz\n").unwrap();
+        let abs = calm_core::analysis::coverage::normalize_path(&dir.join("a.py"));
+        let mut covered_lines = std::collections::HashMap::new();
+        covered_lines.insert(abs, std::collections::HashSet::from([1, 2, 3]));
+        let coverage = calm_core::analysis::coverage::CoverageData {
+            source: "lcov".to_string(),
+            covered_lines,
+        };
+        assert!(!hunks_touch_uncovered_code(
+            &coverage,
+            &dir,
+            "a.py",
+            &[hunk(2, 2)]
+        ));
+    }
+
+    #[test]
+    fn hunks_touch_uncovered_code_is_true_when_a_touched_range_has_no_recorded_coverage() {
+        let dir = uncovered_code_test_dir("uncovered");
+        std::fs::write(dir.join("a.py"), "x\ny\nz\n").unwrap();
+        let abs = calm_core::analysis::coverage::normalize_path(&dir.join("a.py"));
+        let mut covered_lines = std::collections::HashMap::new();
+        // Only line 1 is covered -- the touched hunk (line 2) is not.
+        covered_lines.insert(abs, std::collections::HashSet::from([1]));
+        let coverage = calm_core::analysis::coverage::CoverageData {
+            source: "lcov".to_string(),
+            covered_lines,
+        };
+        assert!(hunks_touch_uncovered_code(
+            &coverage,
+            &dir,
+            "a.py",
+            &[hunk(2, 2)]
+        ));
+    }
+
     fn lines_params(new_text: &str) -> EditLinesParams {
         EditLinesParams {
             path: "a.py".into(),
@@ -4297,26 +4667,62 @@ mod elicit_tests {
         assert_ne!(a, c);
     }
 
-    #[test]
-    fn elicit_message_caps_the_reason_and_keeps_context() {
-        let ask = HubAskContext {
+    fn short_ask() -> HubAskContext {
+        HubAskContext {
             why: "a hub symbol (is_hub=true)".into(),
             risk: Some("high".into()),
             hub_kind: Some("degree".into()),
             touched: vec![("a.py::helper".into(), 12), ("a.py::other".into(), 3)],
-        };
+            diff_preview: "@@ lines 2-2 @@\n- return 1\n+ return 2\n".into(),
+            base_digest: "sha256:base".into(),
+            proposed_digest: "sha256:proposed".into(),
+        }
+    }
+
+    #[test]
+    fn elicit_message_caps_the_reason_and_keeps_context() {
+        let ask = short_ask();
         let long_reason = "x".repeat(5000);
         let msg = build_hub_elicit_message("edit_lines", "a.py", &ask, Some(&long_reason));
         // Audit FM3: hard cap — the 5000-char reason must not reach the
         // human's approval UI at full length.
         assert!(
-            msg.len() < 1200,
+            msg.len() < 3200,
             "message unexpectedly long: {} chars",
             msg.len()
         );
         assert!(msg.contains("a.py::helper (12 callers)"));
         assert!(msg.contains("hub_kind=degree"));
         assert!(msg.contains("risk=high"));
+        // CCK-30R: the receipt names `subject_digest` as what was
+        // "approved" -- the question must show the same digests, and a
+        // short diff must appear in full, not just its own digest.
+        assert!(msg.contains("base_digest=sha256:base"));
+        assert!(msg.contains("proposed_digest=sha256:proposed"));
+        assert!(msg.contains("- return 1"));
+        assert!(msg.contains("+ return 2"));
+    }
+
+    #[test]
+    fn elicit_message_caps_and_marks_truncation_of_a_long_diff() {
+        // CCK-30R: a diff long enough to flood or (adversarially) push the
+        // approve/decline choice off-screen must still be capped, exactly
+        // like `reason` already was -- and the truncation must be visible,
+        // not silent, since a reviewer skimming a capped diff needs to know
+        // it ISN'T the whole picture.
+        let mut ask = short_ask();
+        ask.diff_preview = "+ x\n".repeat(2000);
+        let msg = build_hub_elicit_message("edit_lines", "a.py", &ask, None);
+        assert!(
+            msg.len() < 3200,
+            "message unexpectedly long: {} chars",
+            msg.len()
+        );
+        assert!(msg.contains("truncated"));
+        // The digests are over the FULL content regardless of what's
+        // displayed -- must still be present and unaffected by the cap.
+        assert!(msg.contains("base_digest=sha256:base"));
+        assert!(msg.contains("proposed_digest=sha256:proposed"));
     }
 
     // --- SEP-2322 MRTR (docs/plans/2026-08-04-mcp-2026-07-28-upgrade-plan.md
@@ -4486,6 +4892,9 @@ mod elicit_tests {
             risk: Some("high".into()),
             hub_kind: Some("degree".into()),
             touched: vec![("a.py::helper".into(), 12)],
+            diff_preview: "@@ lines 2-2 @@\n- return 1\n+ return 2\n".into(),
+            base_digest: "sha256:base".into(),
+            proposed_digest: "sha256:proposed".into(),
         }
     }
 

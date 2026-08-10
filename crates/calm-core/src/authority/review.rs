@@ -35,6 +35,28 @@
 //! so an authority minted for one symbol was, structurally, just as valid
 //! for a different one as long as the OTHER 9 fields happened to still
 //! match. See [`target_scope_digest`]'s own doc comment.
+//!
+//! **Known, permanent scope limit (audit 2026-08-10, CCK-29c):** this
+//! object is scope-bound and risk-bound, never content-bound -- it names
+//! WHICH target(s) and WHAT RISK CATEGORY a spend may exercise
+//! (`target_scope_digest`, `risk_vector_digest`, `policy_decision_digest`),
+//! never the literal bytes that end up written. This is structural, not an
+//! oversight: every current mint path (`edit_context`'s compat wrapper,
+//! `review_change`, `plan_change`) mints BEFORE the exact diff exists, so
+//! there is no proposal content here to bind against. Two different
+//! same-risk edits to the same target (e.g. two different `doc_only`
+//! patches) are therefore both equally valid spends of one authority --
+//! call this a "scope+risk-bound authority", not an "exact mutation
+//! authority". For the one tier where a swap between "what was reviewed"
+//! and "what got spent" is a real cross-principal attack -- `Human`-
+//! required approvals, where a DIFFERENT party (the human) is the reviewer
+//! -- exact-content binding lives one layer up, at the elicitation seal
+//! (`HubEditStateSeal`/`hub_mrtr_decide` in `calm-server/src/tools/edit.rs`),
+//! which binds the human's answer to a SHA-256 digest of the literal
+//! proposed hunks, not just this authority's scope+risk. For `SelfReviewed`
+//! spends there is no separate reviewer to deceive (the minting principal
+//! and the spending principal are the same session), so content-binding at
+//! this layer would add a check without a threat model behind it.
 
 use rusqlite::{Connection, OptionalExtension, params};
 

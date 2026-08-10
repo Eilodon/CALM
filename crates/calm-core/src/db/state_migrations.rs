@@ -155,6 +155,18 @@ pub const STATE_MIGRATIONS: &[StateMigration] = &[
         name: "v9_approval_receipt_signature",
         apply: v8_to_v9_approval_receipt_signature,
     },
+    StateMigration {
+        from: 9,
+        to: 10,
+        name: "v10_approval_receipt_signature_provenance",
+        apply: v9_to_v10_approval_receipt_signature_provenance,
+    },
+    StateMigration {
+        from: 10,
+        to: 11,
+        name: "v11_pending_reviews",
+        apply: v10_to_v11_pending_reviews,
+    },
 ];
 
 /// v1->v2 (CCK-07): adds `evidence_snapshots`, `change_intents`,
@@ -517,10 +529,7 @@ fn v7_to_v8_approval_receipts(conn: &Connection) -> Result<(), StateMigrationErr
 
 /// v8->v9 (WS3 follow-up): adds `approval_receipts.signature` -- an
 /// HMAC-SHA256 (`control.key`, domain `"approval-receipt-v1"`) over every
-/// other column on the row, so a receipt can be verified as genuinely
-/// written by `insert_approval_receipt` rather than hand-inserted (e.g. by
-/// an attacker with raw state.db write access trying to make an audit
-/// trail look clean). NOT bound into `ReviewAuthority`'s own signed
+/// other column on the row. NOT bound into `ReviewAuthority`'s own signed
 /// payload -- see `authority::receipt`'s module doc comment for why that
 /// ordering is structurally impossible (a receipt is always written
 /// strictly after the authority it references already exists, for both
@@ -538,6 +547,18 @@ fn v7_to_v8_approval_receipts(conn: &Connection) -> Result<(), StateMigrationErr
 /// (the common case for any real install) can sign them retroactively
 /// rather than leaving every receipt written before this migration
 /// permanently unsigned.
+///
+/// **CCK-30R2 correction (audit 2026-08-10):** this step's signature alone
+/// does NOT prove a row was "genuinely written by `insert_approval_receipt`
+/// rather than hand-inserted", contrary to what an earlier version of this
+/// comment claimed for the backfill branch specifically. A signature this
+/// step computes over a pre-existing row only proves the row's bytes
+/// existed (and were signed) when THIS MIGRATION ran -- it cannot prove
+/// the approval it describes was authentic when it happened, since an
+/// attacker with raw `state.db` write access before this migration ever
+/// ran could have hand-inserted the exact same row and had it backfilled
+/// identically. `v9_to_v10_approval_receipt_signature_provenance` below
+/// makes that distinction explicit and durable via `signature_provenance`.
 fn v8_to_v9_approval_receipt_signature(conn: &Connection) -> Result<(), StateMigrationError> {
     let mut stmt = conn.prepare("PRAGMA table_info(approval_receipts)")?;
     let existing_columns: Vec<String> = stmt
@@ -595,6 +616,12 @@ fn v8_to_v9_approval_receipt_signature(conn: &Connection) -> Result<(), StateMig
             tx_id,
         ) in rows
         {
+            // v9_to_v10 (which adds `signature_provenance`) always runs
+            // right after this step in the same upgrade chain and
+            // re-signs every row this step touches -- the exact string
+            // passed here is transient, but "legacy_unverified" is the
+            // semantically honest one: this branch backfills a signature
+            // for a row that was never signed at its own insert time.
             let payload = crate::authority::receipt::signing_payload(
                 &receipt_id,
                 change_id.as_deref(),
@@ -605,6 +632,7 @@ fn v8_to_v9_approval_receipt_signature(conn: &Connection) -> Result<(), StateMig
                 &decision,
                 approved_at,
                 tx_id.as_deref(),
+                "legacy_unverified",
             );
             let signature = crate::authority::key::sign(
                 &key,
@@ -628,6 +656,187 @@ fn v8_to_v9_approval_receipt_signature(conn: &Connection) -> Result<(), StateMig
             migration: "v9_approval_receipt_signature",
             detail: "approval_receipts.signature does not exist after this step's own DDL ran"
                 .to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// v9->v10 (CCK-30R2, audit 2026-08-10): adds
+/// `approval_receipts.signature_provenance` and re-derives `signature` for
+/// every row that already has one, now over the new payload shape (see
+/// `authority::receipt::signing_payload`'s own doc comment). Every such row
+/// is labeled `"legacy_unverified"`, never `"native"` -- by the time this
+/// step runs, a row genuinely signed at insert time by
+/// `insert_approval_receipt` under v9 and a row `v8_to_v9_...`'s own
+/// backfill signed wholesale (which may itself have been hand-inserted
+/// before THAT migration ever ran) are already byte-identical in shape:
+/// both just have a non-`NULL` `signature`. There is no data left at this
+/// point to tell them apart, so claiming `"native"` for either would
+/// repeat the exact provenance-laundering this step exists to fix. Going
+/// forward, only [`crate::authority::receipt::insert_approval_receipt`]
+/// itself -- signing at the true moment of approval -- may claim
+/// `"native"`.
+///
+/// If no `control.key` is available to re-sign under the new shape, the
+/// old-shape `signature` is nulled out (along with `signature_provenance`,
+/// which stays unset) rather than left in place: an un-migrated signature
+/// would silently fail `verify_approval_receipt_signature` the moment a
+/// key DOES become available later, misreporting an untouched row as
+/// tampered. Same fail-open posture as every other best-effort signing
+/// path in this module, just applied to a payload-shape migration instead
+/// of a fresh insert.
+fn v9_to_v10_approval_receipt_signature_provenance(
+    conn: &Connection,
+) -> Result<(), StateMigrationError> {
+    let mut stmt = conn.prepare("PRAGMA table_info(approval_receipts)")?;
+    let existing_columns: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(|r| r.ok())
+        .collect();
+    if !existing_columns.iter().any(|c| c == "signature_provenance") {
+        conn.execute_batch("ALTER TABLE approval_receipts ADD COLUMN signature_provenance TEXT;")?;
+    }
+
+    const PROVENANCE: &str = "legacy_unverified";
+    if let Ok(Some(key)) = crate::authority::key::control_key_for_conn(conn) {
+        #[allow(clippy::type_complexity)]
+        let rows: Vec<(
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+            String,
+            String,
+            String,
+            f64,
+            Option<String>,
+        )> = {
+            let mut select = conn.prepare(
+                "SELECT receipt_id, change_id, authority_id, subject_digest, approved_by, \
+                 mechanism, decision, approved_at, tx_id FROM approval_receipts \
+                 WHERE signature IS NOT NULL AND signature_provenance IS NULL",
+            )?;
+            select
+                .query_map([], |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                        r.get(8)?,
+                    ))
+                })?
+                .filter_map(|r| r.ok())
+                .collect()
+        };
+        for (
+            receipt_id,
+            change_id,
+            authority_id,
+            subject_digest,
+            approved_by,
+            mechanism,
+            decision,
+            approved_at,
+            tx_id,
+        ) in rows
+        {
+            let payload = crate::authority::receipt::signing_payload(
+                &receipt_id,
+                change_id.as_deref(),
+                authority_id.as_deref(),
+                &subject_digest,
+                &approved_by,
+                &mechanism,
+                &decision,
+                approved_at,
+                tx_id.as_deref(),
+                PROVENANCE,
+            );
+            let signature = crate::authority::key::sign(
+                &key,
+                crate::authority::receipt::SIGNING_DOMAIN,
+                &payload,
+            );
+            conn.execute(
+                "UPDATE approval_receipts SET signature = ?1, signature_provenance = ?2 \
+                 WHERE receipt_id = ?3",
+                rusqlite::params![signature, PROVENANCE, receipt_id],
+            )?;
+        }
+    } else {
+        conn.execute_batch(
+            "UPDATE approval_receipts SET signature = NULL, signature_provenance = NULL \
+             WHERE signature IS NOT NULL AND signature_provenance IS NULL;",
+        )?;
+    }
+
+    let mut stmt = conn.prepare("PRAGMA table_info(approval_receipts)")?;
+    let now_has_column = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(|r| r.ok())
+        .any(|c| c == "signature_provenance");
+    if !now_has_column {
+        return Err(StateMigrationError::PostconditionFailed {
+            migration: "v10_approval_receipt_signature_provenance",
+            detail: "approval_receipts.signature_provenance does not exist after this step's \
+                      own DDL ran"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// v10->v11 (audit 2026-08-10 follow-up, "calm review"): adds
+/// `pending_reviews` -- a durable, MCP-protocol-independent second channel
+/// for the independent review `HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW`
+/// requires. Verified empirically the same day: a connected MCP client can
+/// complete the elicitation round-trip (no timeout, no capability error)
+/// while never actually showing anything to a human -- CALM had no way to
+/// detect that, and no alternative channel at all. `calm-cli review` reads
+/// and writes this table directly from a real, TTY-gated terminal session,
+/// independent of whichever MCP client happens to be connected. A row here
+/// is not itself an authority to write anything -- `edit_lines_impl_gated`
+/// still requires a fresh, matching content fingerprint AND `status =
+/// 'approved'` before treating a retry as reviewed, the exact same trust
+/// tier `ElicitGate::Approved` already requires (see
+/// `authority::receipt::insert_approval_receipt`'s `mechanism =
+/// "cli_manual_review"` value, written only on real approval).
+fn v10_to_v11_pending_reviews(conn: &Connection) -> Result<(), StateMigrationError> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS pending_reviews (
+            review_id     TEXT PRIMARY KEY,
+            tool          TEXT NOT NULL,
+            path          TEXT NOT NULL,
+            fingerprint   TEXT NOT NULL,
+            diff_preview  TEXT NOT NULL,
+            risk          TEXT,
+            hub_kind      TEXT,
+            reason        TEXT,
+            status        TEXT NOT NULL DEFAULT 'pending',
+            created_at    REAL NOT NULL,
+            expires_at    REAL NOT NULL,
+            decided_at    REAL,
+            decided_by    TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_pending_reviews_lookup \
+         ON pending_reviews(path, fingerprint, status);
+        CREATE INDEX IF NOT EXISTS idx_pending_reviews_status ON pending_reviews(status);",
+    )?;
+
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='pending_reviews')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !exists {
+        return Err(StateMigrationError::PostconditionFailed {
+            migration: "v11_pending_reviews",
+            detail: "pending_reviews does not exist after this step's own DDL ran".to_string(),
         });
     }
     Ok(())
@@ -1147,6 +1356,126 @@ mod tests {
             .unwrap(),
             Some(true)
         );
+    }
+
+    #[test]
+    fn registered_v9_to_v10_migration_labels_every_pre_existing_signed_row_legacy_unverified() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join(".calm").join("state.db");
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        let conn = Connection::open(&db_path).unwrap();
+        init_state_db(&conn).unwrap();
+        conn.pragma_update(None, "user_version", 9).unwrap();
+
+        // Simulates a row that was genuinely signed at insert time under
+        // real v9 code (a true "native" approval, by construction) --
+        // CCK-30R2's whole point is that this step can NOT tell this row
+        // apart from one v8->v9 merely backfilled, so it must still
+        // collapse to "legacy_unverified", never "native".
+        let payload = crate::authority::receipt::signing_payload(
+            "RCPT-was-native-under-v9",
+            None,
+            None,
+            "digest-1",
+            "session:abc",
+            "self_attested",
+            "approved",
+            123.0,
+            None,
+            // v9 had no `signature_provenance` field at all -- passing ""
+            // here reproduces exactly the payload shape v9's own
+            // `insert_approval_receipt` would have signed over.
+            "",
+        );
+        let key = crate::authority::key::control_key_for_conn(&conn)
+            .unwrap()
+            .unwrap();
+        let signature =
+            crate::authority::key::sign(&key, crate::authority::receipt::SIGNING_DOMAIN, &payload);
+        conn.execute(
+            "INSERT INTO approval_receipts \
+             (receipt_id, change_id, authority_id, subject_digest, approved_by, mechanism, \
+              decision, approved_at, tx_id, signature) \
+             VALUES ('RCPT-was-native-under-v9', NULL, NULL, 'digest-1', 'session:abc', \
+                     'self_attested', 'approved', 123.0, NULL, ?1)",
+            rusqlite::params![signature],
+        )
+        .unwrap();
+
+        migrate_state_db_to_current(&conn).unwrap();
+        assert_eq!(
+            user_version(&conn),
+            super::super::schema::STATE_DB_SCHEMA_VERSION
+        );
+
+        assert_eq!(
+            crate::authority::receipt::approval_receipt_signature_provenance(
+                &conn,
+                "RCPT-was-native-under-v9"
+            )
+            .unwrap(),
+            Some("legacy_unverified".to_string()),
+            "a row this step cannot prove was native must never be relabeled native"
+        );
+        assert_eq!(
+            crate::authority::receipt::verify_approval_receipt_signature(
+                &conn,
+                "RCPT-was-native-under-v9"
+            )
+            .unwrap(),
+            Some(true),
+            "the re-signed row must still verify under its new (legacy_unverified) shape"
+        );
+    }
+
+    #[test]
+    fn registered_v10_to_v11_migration_creates_pending_reviews_table() {
+        let conn = fresh_conn();
+        conn.pragma_update(None, "user_version", 10).unwrap();
+        migrate_state_db_to_current(&conn).unwrap();
+        assert_eq!(
+            user_version(&conn),
+            super::super::schema::STATE_DB_SCHEMA_VERSION
+        );
+        let exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' \
+                 AND name='pending_reviews')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            exists,
+            "pending_reviews should exist after migrating to current"
+        );
+        let columns: Vec<String> = conn
+            .prepare("PRAGMA table_info(pending_reviews)")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        for expected in [
+            "review_id",
+            "tool",
+            "path",
+            "fingerprint",
+            "diff_preview",
+            "risk",
+            "hub_kind",
+            "reason",
+            "status",
+            "created_at",
+            "expires_at",
+            "decided_at",
+            "decided_by",
+        ] {
+            assert!(
+                columns.iter().any(|c| c == expected),
+                "pending_reviews.{expected} should exist"
+            );
+        }
     }
 
     #[test]

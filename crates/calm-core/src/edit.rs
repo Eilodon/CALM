@@ -712,8 +712,21 @@ pub fn atomic_write_with(
 /// makes for permission preservation in `Fast` mode.
 #[cfg(unix)]
 fn fsync_parent_dir(dir: &Path) {
-    if let Ok(dir_file) = std::fs::File::open(dir) {
-        let _ = dir_file.sync_all();
+    // CCK-05C (audit 2026-08-10): previously `let _ = dir_file.sync_all();`
+    // -- a failed directory fsync (ENOSPC, EIO, permission changes mid-
+    // write, ...) was silently discarded, same as the sibling bug fixed in
+    // `fs::rooted::RootedFilesystem::write_atomic_beneath`. Still
+    // best-effort (a `rename()` that already succeeded must never be
+    // reported as a failed write just because its directory-durability
+    // fsync couldn't be verified -- see this function's own doc comment
+    // above), but the failure is no longer invisible.
+    let synced = std::fs::File::open(dir).is_ok_and(|f| f.sync_all().is_ok());
+    if !synced {
+        tracing::warn!(
+            "could not fsync directory {} after a rename -- the write is visible but its \
+             durability against a crash/power-loss is unconfirmed",
+            dir.display()
+        );
     }
 }
 

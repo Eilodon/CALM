@@ -11122,6 +11122,165 @@ mod tests {
     }
 
     #[test]
+    fn high_risk_edit_message_names_client_incapability_not_policy_when_already_enabled() {
+        // Part 1 diagnostics (audit 2026-08-10 follow-up): elicit_hub_confirm
+        // being ON but `gate` still landing `Off` can only mean this MCP
+        // client itself never negotiated the elicitation round-trip -- the
+        // error must say THAT, not repeat "enable elicit_hub_confirm" (which
+        // is already true here and would be actively wrong advice).
+        let (dir, server) = test_server("high_risk_off_elicitation_policy_already_on");
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"edit": {"elicit_hub_confirm": true}}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("a.py"), "def helper():\n    return 1\n").unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.py::helper', 'helper', 'function', 'python', 'a.py', 1, 2, '', '', 'helper', 11, 0, 0)",
+                [],
+            )
+            .unwrap();
+        }
+        let hash = calm_core::edit::range_checksum("def helper():\n    return 1\n", 2, 2).unwrap();
+        let params = EditLinesParams {
+            change_id: None,
+            authority_id: None,
+            path: "a.py".into(),
+            edits: vec![EditHunkParam {
+                old_text: None,
+                start_line: 2,
+                end_line: 2,
+                expected_hash: Some(hash),
+                new_text: "    return 2\n".into(),
+            }],
+            confirm: true,
+            reason: Some("testing the diagnostic message branch".into()),
+            cites: None,
+        };
+
+        use super::edit::{ElicitGate, HubAskContext};
+        // `ElicitGate::Off` directly, simulating a client that never
+        // negotiated elicitation even though config already has it on --
+        // `edit_lines_flow` takes the gate as an explicit param precisely so
+        // this scenario is reproducible without a live rmcp peer.
+        let mut ask: Option<HubAskContext> = None;
+        let out = server.edit_lines_flow(&params, ElicitGate::Off, &mut ask);
+        let v = serde_json::to_value(&out).unwrap();
+        assert_eq!(v["error"]["code"], "HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW");
+        let msg = v["error"]["message"].as_str().unwrap();
+        assert!(
+            msg.contains("already enabled") && msg.contains("did not negotiate"),
+            "message should name client incapability, not policy: {msg}"
+        );
+        assert!(
+            !msg.contains("Enable [edit] elicit_hub_confirm"),
+            "message must not repeat wrong advice when the policy is already on: {msg}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn high_risk_edit_can_pass_via_pending_review_approved_out_of_band() {
+        // "calm review" (audit 2026-08-10 follow-up): end-to-end proof the
+        // MCP-protocol-independent channel actually closes the loop -- a
+        // first refused call opens a durable pending review, approving it
+        // out-of-band (exactly what `calm-cli review approve` does, minus
+        // its own TTY prompt) lets the SAME retried call succeed.
+        let (dir, server) = test_server("high_risk_pending_review_out_of_band");
+        std::fs::write(dir.join("a.py"), "def helper():\n    return 1\n").unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.py::helper', 'helper', 'function', 'python', 'a.py', 1, 2, '', '', 'helper', 11, 0, 0)",
+                [],
+            )
+            .unwrap();
+        }
+        server.edit_context(rmcp::handler::server::wrapper::Parameters(
+            EditContextParams {
+                symbol: "helper".into(),
+                path: None,
+                line: None,
+                if_none_match: None,
+            },
+        ));
+        let hash = calm_core::edit::range_checksum("def helper():\n    return 1\n", 2, 2).unwrap();
+        let params = EditLinesParams {
+            change_id: None,
+            authority_id: None,
+            path: "a.py".into(),
+            edits: vec![EditHunkParam {
+                old_text: None,
+                start_line: 2,
+                end_line: 2,
+                expected_hash: Some(hash),
+                new_text: "    return 2\n".into(),
+            }],
+            confirm: true,
+            reason: Some("checked -- safe, no elicitation available in this environment".into()),
+            cites: None,
+        };
+
+        use super::edit::ElicitGate;
+        let mut ask = None;
+        let first = server.edit_lines_flow(&params, ElicitGate::Off, &mut ask);
+        let v = serde_json::to_value(&first).unwrap();
+        assert_eq!(
+            v["error"]["code"], "HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW",
+            "response: {v}"
+        );
+        let msg = v["error"]["message"].as_str().unwrap();
+        assert!(
+            msg.contains("calm review show") && msg.contains("calm review approve"),
+            "denial message should point at the out-of-band channel: {msg}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.py")).unwrap(),
+            "def helper():\n    return 1\n",
+            "must not have written anything on the first, refused call"
+        );
+
+        // A real pending review row must now exist in state.db.
+        let state_conn =
+            calm_core::db::conn::open_state_writer(&crate::default_state_db_path(&dir)).unwrap();
+        let pending =
+            calm_core::authority::list_pending_reviews(&state_conn, Some("pending")).unwrap();
+        assert_eq!(pending.len(), 1, "exactly one pending review should exist");
+        assert_eq!(pending[0].path, "a.py");
+        assert_eq!(pending[0].tool, "edit_lines");
+        assert!(pending[0].diff_preview.contains("return 2"));
+
+        // Approve it exactly the way `calm-cli review approve` would after
+        // its own TTY-gated confirmation prompt.
+        assert!(
+            calm_core::authority::approve_pending_review(
+                &state_conn,
+                &pending[0].review_id,
+                "cli_manual_review"
+            )
+            .unwrap()
+        );
+
+        // The agent retries the SAME call (unchanged params, still
+        // ElicitGate::Off since this MCP client never negotiated
+        // elicitation) -- must now succeed via the pending-review lookup.
+        let second = server.edit_lines_flow(&params, ElicitGate::Off, &mut None);
+        let v2 = serde_json::to_value(&second).unwrap();
+        assert_eq!(v2["applied"], true, "response: {v2}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.py")).unwrap(),
+            "def helper():\n    return 2\n"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn high_risk_edit_can_pass_via_elicitation_ask_then_approved() {
         use super::edit::{ElicitGate, HubAskContext};
         // Same fixture as the Off-gate test above, exercised through

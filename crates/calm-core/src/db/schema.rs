@@ -46,10 +46,21 @@ pub const INDEX_DB_SCHEMA_VERSION: i64 = 1;
 // (self-attestation at mint for SelfReviewed, a real MRTR/legacy
 // elicitation round-trip at spend for Human), not just signed as a claim.
 // v9 (WS3 follow-up): adds approval_receipts.signature -- an HMAC over the
-// receipt row itself, so it can be verified as genuinely written by
-// insert_approval_receipt rather than hand-inserted. See
-// db/state_migrations.rs's registered v1->v2 through v8->v9 steps.
-pub const STATE_DB_SCHEMA_VERSION: i64 = 9;
+// receipt row itself, so a row can be verified against tampering after the
+// fact. See db/state_migrations.rs's registered v1->v2 through v8->v9 steps.
+// v10 (CCK-30R2, audit 2026-08-10): adds approval_receipts.signature_provenance
+// ("native" vs "legacy_unverified") and folds it into the signed payload --
+// v9's signature alone could not distinguish a row insert_approval_receipt
+// genuinely signed at approval time from one a schema migration backfilled
+// wholesale (indistinguishable by the time either migration runs), so the
+// v9-era doc comments overclaiming that distinction have been corrected.
+// v11 (audit 2026-08-10 follow-up): adds pending_reviews -- a durable,
+// MCP-protocol-independent channel for HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW
+// ("calm review"), for the case (verified empirically the same day) where a
+// connected MCP client completes the elicitation round-trip without ever
+// showing anything to an actual human. See db/state_migrations.rs's
+// registered v10->v11 step for the full rationale.
+pub const STATE_DB_SCHEMA_VERSION: i64 = 11;
 
 /// Refuses to proceed if `conn`'s stamped `PRAGMA user_version` is HIGHER
 /// than `expected` -- meaning a newer CALM binary already created or
@@ -722,6 +733,12 @@ CREATE INDEX IF NOT EXISTS idx_review_authority_targets_authority ON review_auth
 -- call sites don't all have all three at receipt-write time (mint has no
 -- tx_id yet; a pure legacy elicitation approval with no ReviewAuthority
 -- at all has no authority_id).
+-- v10 (CCK-30R2, audit 2026-08-10): signature_provenance distinguishes a
+-- signature insert_approval_receipt computed at the true moment of
+-- approval (native) from one a schema migration re-derived after the fact
+-- over pre-existing rows (legacy_unverified) -- folded into the signed
+-- payload itself so it can't be silently upgraded by anyone with raw
+-- state.db write access. See authority::receipt's module doc comment.
 CREATE TABLE IF NOT EXISTS approval_receipts (
     receipt_id     TEXT PRIMARY KEY,
     change_id      TEXT REFERENCES change_intents(intent_id),
@@ -732,10 +749,35 @@ CREATE TABLE IF NOT EXISTS approval_receipts (
     decision       TEXT NOT NULL,
     approved_at    REAL NOT NULL,
     tx_id          TEXT REFERENCES edit_transactions(tx_id) ON DELETE SET NULL,
-    signature      TEXT
+    signature      TEXT,
+    signature_provenance TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_approval_receipts_change ON approval_receipts(change_id);
 CREATE INDEX IF NOT EXISTS idx_approval_receipts_authority ON approval_receipts(authority_id);
+
+-- v11 (audit 2026-08-10 follow-up): durable, MCP-protocol-independent
+-- pending-review requests for HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW --
+-- see db/state_migrations.rs's registered v10->v11 step for the full
+-- rationale. A row here is never itself authority to write anything; the
+-- edit-time gate still requires status='approved' AND a matching fresh
+-- content fingerprint before treating a retry as reviewed.
+CREATE TABLE IF NOT EXISTS pending_reviews (
+    review_id     TEXT PRIMARY KEY,
+    tool          TEXT NOT NULL,
+    path          TEXT NOT NULL,
+    fingerprint   TEXT NOT NULL,
+    diff_preview  TEXT NOT NULL,
+    risk          TEXT,
+    hub_kind      TEXT,
+    reason        TEXT,
+    status        TEXT NOT NULL DEFAULT 'pending',
+    created_at    REAL NOT NULL,
+    expires_at    REAL NOT NULL,
+    decided_at    REAL,
+    decided_by    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_pending_reviews_lookup ON pending_reviews(path, fingerprint, status);
+CREATE INDEX IF NOT EXISTS idx_pending_reviews_status ON pending_reviews(status);
 ";
 
 const FTS5_SQL: &str = "
