@@ -128,16 +128,17 @@ agent: "I need to change getUserByEmail"
 
 ## Proof, not promises
 
-The table below is a CALM snapshot observed on 2026-08-01 from this checkout. Re-run `repo_overview()` and `fitness_report()` to refresh it; repo-specific values change as the codebase changes. Benchmark ratios are task-specific and remain in the benchmark artifacts:
+The table below is a CALM snapshot observed on 2026-08-12 from this checkout. Re-run `repo_overview()` and `fitness_report()` to refresh it; repo-specific values change as the codebase changes. Benchmark ratios are task-specific and remain in the benchmark artifacts:
 
 | Metric | Measured value |
 |---|---|
-| Codebase indexed | **289 files, 4,425 symbols** — 15 language families present in this repo alone |
-| Hub concentration (`hub_pct`) | 8.15% — 218 hub symbols (gate: ≤ 20%) |
-| Dead-code rate (`dead_code_pct`, coverage-aware) | 4.79% (gate: ≤ 10%) |
-| Edge coverage (`edge_coverage_pct`) | 70.80% of symbols have at least one call edge (gate: ≥ 60%) |
+| Codebase indexed | **366 files, 6,050 symbols** — 15 language families present in this repo alone |
+| Hub concentration (`hub_pct`) | 7.38% — 271 hub symbols (gate: ≤ 20%) |
+| Dead-code rate (`dead_code_pct`, coverage-aware) | 5.04% (gate: ≤ 10%) |
+| Hotspot risk (`hotspot_risk`, churn × complexity, worst file) | **0.90 — currently above gate (≤ 0.80), fitness_report() reports FAIL** — being investigated rather than hidden or threshold-relaxed; see [`fitness_report`](#39-mcp-tools-for-ai-agents)/`calm fitness-check` |
+| Edge coverage (`edge_coverage_pct`) | 72.39% of symbols have at least one call edge (gate: ≥ 60%) |
 | High-complexity functions (`high_complexity_pct`) | 2.8% (gate: ≤ 15%) |
-| Architecture fit (`avg_distance`, Martin/OOD) | 0.30 average distance from the main sequence (gate: ≤ 1.00) |
+| Architecture fit (`avg_distance`, Martin/OOD) | 0.28 average distance from the main sequence (gate: ≤ 1.00) |
 | Ambiguous symbol boundaries (`boundary_ambiguous_count`) | 0 (gate: ≤ 0) |
 | Architecture boundary violations (`boundary_violations`) | 0 (gate: ≤ 0) — the `watcher → tools` import previously flagged here was fixed by relocating the shared `RwLockExt`/`LockExt` traits it needed out of `tools/common.rs` into their own `sync_ext` module |
 | Config drift (`config_drift_count`) | 0 (gate: ≤ 0) — the current docs/config path declarations resolve cleanly |
