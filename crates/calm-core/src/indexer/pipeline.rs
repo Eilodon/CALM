@@ -98,6 +98,10 @@ const PARSE_BATCH_SIZE: usize = 1000;
 /// A persisted call site loaded for graph rebuild. The leading id is the
 /// durable edge identity; byte spans are retained here for exact SCIP matching
 /// even though the resolver itself only needs the selected callee name.
+/// `receiver` (see `parser::RawCall::receiver`) rides along for
+/// `resolve_sites_to_edges`'s weak-fallback signal below -- `Some` for any
+/// `.`-receiver or `Type::`-path call, `None` only for a genuinely bare,
+/// unqualified name.
 type CallSiteRow = (
     i64,
     String,
@@ -108,6 +112,7 @@ type CallSiteRow = (
     Option<i64>,
     i64,
     String,
+    Option<String>,
     Option<String>,
     bool,
     Option<String>,
@@ -1117,11 +1122,44 @@ fn resolve_sites_to_edges(ctx: &ResolutionCtx, sites: &[CallSiteRow]) -> Vec<Cal
     // fix never covered this general by-name/by-name-class path, so the bug
     // survived here. Only fan out globally when nothing in-file matches, and
     // even then only up to MAX_CALLEE_CANDIDATES.
-    // `bool` = this site's target list was narrowed down to a single
-    // candidate by the C# same-namespace check below, confirmed against a
-    // real `namespace` declaration (not just a heuristic) — the second loop
-    // upgrades such a site's confidence to `resolved` on that signal.
-    let candidates: Vec<(Vec<(String, String)>, bool)> = sites
+    // `bool` (2nd tuple field) = this site's target list was narrowed down to
+    // a single candidate by the C# same-namespace check below, confirmed
+    // against a real `namespace` declaration (not just a heuristic) — the
+    // second loop upgrades such a site's confidence to `resolved` on that
+    // signal.
+    // `bool` (3rd tuple field, `weak_receiver_fallback`) — root-caused via
+    // benchmarks/b2_call_graph_quality (2026-08-12): inferred/resolved/
+    // textual-tier precision had collapsed to exactly 0.0 in CI, traced to
+    // call sites like `some_hashmap.get(k)?` (receiver of an external/std
+    // type this indexer never modeled) resolving with high confidence to
+    // this repo's own unrelated `txn::get`/`telemetry::write` — the ONLY
+    // same-named LOCAL symbol — purely because none of the scoping checks
+    // above (same_file/same_dir/same_namespace/module_hint/arity) apply to
+    // free functions vs. `.`-receiver method calls differently: a bare
+    // free-function name genuinely must be in scope (same-module or `use`)
+    // for real Rust to compile, but a `recv.method()` call's true target
+    // depends entirely on `recv`'s type. "There happens to be exactly one
+    // same-named function anywhere in the repo" is near-zero evidence for
+    // what an unknown-typed receiver's method resolves to — set true only
+    // when the site had a `.`-receiver AND `target_class` is still `None`
+    // (this closure's own `by_name`/`by_name_class` match at the top: a
+    // `Type::path()` call or a tier-2-typed `.`-receiver already came
+    // through `by_name_class` with a real class name — that's positive
+    // evidence, not a blind guess, even if it also falls through to this
+    // same unscoped-candidates fallback below with nothing further to
+    // narrow by) and it survived purely on the last, unscoped
+    // `t.len() <= MAX_CALLEE_CANDIDATES` fallback with none of the positive
+    // scoping signals above it firing. The second loop below downgrades such
+    // an edge to `Ambiguous` instead of trusting its extraction-time
+    // confidence. Free-function calls (`receiver: None`) are unaffected —
+    // Rust's real name-resolution rules make that fallback more justified
+    // for them, and this is a targeted fix for the specific false-positive
+    // shape found, not a rewrite of the whole heuristic.
+    // (candidate (qualified_name, path) pairs, namespace_confirmed, weak_receiver)
+    // per site -- factored out purely for clippy::type_complexity, see the
+    // doc comment above for what each field means.
+    type CandidateResult = (Vec<(String, String)>, bool, bool);
+    let candidates: Vec<CandidateResult> = sites
         .par_iter()
         .map(
             |(
@@ -1134,6 +1172,7 @@ fn resolve_sites_to_edges(ctx: &ResolutionCtx, sites: &[CallSiteRow]) -> Vec<Cal
                 _,
                 _,
                 _,
+                receiver,
                 target_class,
                 looks_option_or_result_chained,
                 module_hint,
@@ -1145,7 +1184,7 @@ fn resolve_sites_to_edges(ctx: &ResolutionCtx, sites: &[CallSiteRow]) -> Vec<Cal
                     None => ctx.by_name.get(callee),
                 };
                 let Some(t) = targets else {
-                    return (Vec::new(), false);
+                    return (Vec::new(), false, false);
                 };
                 // Same-language filter: a call site can only ever resolve to a
                 // symbol written in the same language as its caller — a
@@ -1164,7 +1203,7 @@ fn resolve_sites_to_edges(ctx: &ResolutionCtx, sites: &[CallSiteRow]) -> Vec<Cal
                     .map(|(qn, path, _)| (qn.clone(), path.clone()))
                     .collect();
                 if same_lang.is_empty() {
-                    return (Vec::new(), false);
+                    return (Vec::new(), false, false);
                 }
                 let t = &same_lang;
                 // Return-shape exclusion: `foo.bar()?`/`foo.bar().unwrap()` can only
@@ -1189,7 +1228,7 @@ fn resolve_sites_to_edges(ctx: &ResolutionCtx, sites: &[CallSiteRow]) -> Vec<Cal
                     t
                 };
                 if t.is_empty() {
-                    return (Vec::new(), false);
+                    return (Vec::new(), false, false);
                 }
                 // B3/A' arity gate (Tier B audit; extended to Go 2026-07-29
                 // self-audit "A'" pass): Elixir's `greet/1` and `greet/2` are
@@ -1249,7 +1288,7 @@ fn resolve_sites_to_edges(ctx: &ResolutionCtx, sites: &[CallSiteRow]) -> Vec<Cal
                         .cloned()
                         .collect();
                     if narrowed.len() == 1 {
-                        return (narrowed, true);
+                        return (narrowed, true, false);
                     } else if narrowed.is_empty() {
                         t
                     } else {
@@ -1281,7 +1320,7 @@ fn resolve_sites_to_edges(ctx: &ResolutionCtx, sites: &[CallSiteRow]) -> Vec<Cal
                         .cloned()
                         .collect();
                     if !hinted.is_empty() {
-                        return (hinted, false);
+                        return (hinted, false, false);
                     }
                 }
                 let same_file: Vec<_> = t.iter().filter(|(_, p)| p == from_path).cloned().collect();
@@ -1335,17 +1374,62 @@ fn resolve_sites_to_edges(ctx: &ResolutionCtx, sites: &[CallSiteRow]) -> Vec<Cal
                         .collect();
                     (!ns_matches.is_empty()).then_some(ns_matches)
                 };
+                // `weak_receiver` applies uniformly across same_file/
+                // same_dir/the final catch-all below: it's never about WHICH
+                // narrowing branch produced a match, only whether this call
+                // site is a `.`-receiver whose type target_class never
+                // resolved. "Same file" genuinely IS Rust's own scoping for
+                // a bare FREE-FUNCTION call (`receiver: None`) — but for a
+                // METHOD call, a file that collocates both an unrelated
+                // local `impl SomeEnum { fn as_str() }` and a call to e.g.
+                // `some_string.as_str()` (the stdlib's, never in `ctx` at
+                // all) is exactly as coincidental as the global fallback
+                // below, just scoped to one file instead of the whole repo.
+                // Verified live (2026-08-12): crates/calm-server/src/tools/
+                // edit.rs's own `.as_str()` call on a `String` field (edit.rs
+                // ALSO defines `GateRequirement::as_str`) and crates/
+                // calm-core/src/txn.rs's `.as_str()` on a `TxState` variant
+                // (txn.rs ALSO defines `TxState::as_str`) both fanned out to
+                // the wrong same-file `as_str` this way — part of the same
+                // B2 precision collapse the final catch-all's
+                // `weak_receiver_fallback` already fixed, just reached via
+                // the same_file branch instead of the unscoped one. A
+                // `Type::path()` call or a tier-2-typed `.`-receiver
+                // (target_class: Some(..), already scoped via
+                // `ctx.by_name_class` above) keeps full trust here even when
+                // it ALSO happens to match same_file/same_dir — that's a
+                // real, specific class already known, not a blind guess.
+                // `self`/`this` are excluded from the weak signal even when
+                // target_class stayed None (tier-2's self/this handling
+                // doesn't fire for every shape): the receiver's real type IS
+                // by construction the enclosing impl/class, so same_file
+                // finding a method there is strong evidence, not a
+                // coincidence — same standing as same_file already has for
+                // free functions. Caught live by
+                // test_caller_count_excludes_ambiguous_fan_out_edges'
+                // `self.as_str()` regressing to `ambiguous` before this
+                // exclusion existed.
+                let weak_receiver = receiver.is_some()
+                    && target_class.is_none()
+                    && !matches!(receiver.as_deref(), Some("self" | "this"));
                 if !same_file.is_empty() {
-                    (same_file, false)
+                    (same_file, false, weak_receiver)
                 } else if let Some(dir_matches) = same_dir() {
-                    (dir_matches, false)
+                    (dir_matches, false, weak_receiver)
                 } else if let Some(ns_matches) = same_namespace() {
                     let confirmed = ns_matches.len() == 1;
-                    (ns_matches, confirmed)
+                    (ns_matches, confirmed, false)
                 } else if t.len() <= MAX_CALLEE_CANDIDATES {
-                    (t.clone(), false)
+                    // Reached with NONE of the positive scoping signals above
+                    // firing — see this function's top doc comment and the
+                    // `weak_receiver` comment just above. Caught live by
+                    // test_type_path_call_resolves_scoped_not_fanned_out and
+                    // test_tier2_method_resolution regressing to `ambiguous`
+                    // before the target_class.is_none() half of this guard
+                    // existed.
+                    (t.clone(), false, weak_receiver)
                 } else {
-                    (Vec::new(), false)
+                    (Vec::new(), false, false)
                 }
             },
         )
@@ -1364,13 +1448,14 @@ fn resolve_sites_to_edges(ctx: &ResolutionCtx, sites: &[CallSiteRow]) -> Vec<Cal
             _,
             _,
             confidence,
+            _receiver,
             _target_class,
             _,
             _,
             edge_kind,
             _,
         ),
-        (targets, namespace_confirmed),
+        (targets, namespace_confirmed, weak_receiver_fallback),
     ) in sites.iter().zip(candidates.iter())
     {
         // >1 surviving candidate means this call site's edge is duplicated
@@ -1378,11 +1463,17 @@ fn resolve_sites_to_edges(ctx: &ResolutionCtx, sites: &[CallSiteRow]) -> Vec<Cal
         // tie — mark it `Ambiguous` regardless of which branch produced it,
         // rather than let it masquerade as an ordinary single-target edge at
         // its originally recorded confidence (which was computed per call
-        // site, not per final-candidate-count).
+        // site, not per final-candidate-count). Same treatment for a single
+        // survivor that only cleared the unscoped by-name fallback with a
+        // receiver of unknown type (`weak_receiver_fallback`) — see this
+        // function's top doc comment; that's "no other candidate left after
+        // exclusion", not "this candidate was actually identified".
         let effective_confidence = if targets.len() > 1 {
             EdgeConfidence::Ambiguous.as_str()
         } else if *namespace_confirmed {
             EdgeConfidence::Resolved.as_str()
+        } else if *weak_receiver_fallback {
+            EdgeConfidence::Ambiguous.as_str()
         } else {
             confidence.as_str()
         };
@@ -1421,7 +1512,7 @@ fn rebuild_graph(
     let sites: Vec<CallSiteRow> = {
         let mut stmt = tx.prepare(
             "SELECT id, from_path, enclosing_qn, callee_name, call_line, callee_start_byte, \
-                    callee_end_byte, identity_version, confidence, target_class, \
+                    callee_end_byte, identity_version, confidence, receiver, target_class, \
                     looks_option_or_result_chained, module_hint, edge_kind, arg_count \
              FROM call_sites ORDER BY id",
         )?;
@@ -1437,10 +1528,11 @@ fn rebuild_graph(
                 r.get::<_, i64>(7)?,
                 r.get::<_, String>(8)?,
                 r.get::<_, Option<String>>(9)?,
-                r.get::<_, i64>(10)? != 0,
-                r.get::<_, Option<String>>(11)?,
-                r.get::<_, String>(12)?,
-                r.get::<_, Option<i64>>(13)?,
+                r.get::<_, Option<String>>(10)?,
+                r.get::<_, i64>(11)? != 0,
+                r.get::<_, Option<String>>(12)?,
+                r.get::<_, String>(13)?,
+                r.get::<_, Option<i64>>(14)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?
@@ -1623,7 +1715,7 @@ pub fn incremental_graph_update(
     let sites: Vec<CallSiteRow> = {
         let sql = format!(
             "SELECT id, from_path, enclosing_qn, callee_name, call_line, callee_start_byte, \
-                    callee_end_byte, identity_version, confidence, target_class, \
+                    callee_end_byte, identity_version, confidence, receiver, target_class, \
                     looks_option_or_result_chained, module_hint, edge_kind, arg_count \
              FROM call_sites WHERE from_path IN ({placeholders}) ORDER BY id"
         );
@@ -1640,10 +1732,11 @@ pub fn incremental_graph_update(
                 r.get::<_, i64>(7)?,
                 r.get::<_, String>(8)?,
                 r.get::<_, Option<String>>(9)?,
-                r.get::<_, i64>(10)? != 0,
-                r.get::<_, Option<String>>(11)?,
-                r.get::<_, String>(12)?,
-                r.get::<_, Option<i64>>(13)?,
+                r.get::<_, Option<String>>(10)?,
+                r.get::<_, i64>(11)? != 0,
+                r.get::<_, Option<String>>(12)?,
+                r.get::<_, String>(13)?,
+                r.get::<_, Option<i64>>(14)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?
@@ -4638,6 +4731,64 @@ impl StructB {
             ),
             1,
             "CallerB's Helper() must resolve to its own directory's Helper"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    // B2 (root-caused 2026-08-12, benchmarks/b2_call_graph_quality): a
+    // `.`-receiver call whose type this indexer never tracks (e.g.
+    // `row.get(0)` on a value that came back from a function call, with no
+    // `let x: T` annotation for tier-2 to read) fell through
+    // resolve_sites_to_edges's unscoped by-name fallback and confidently
+    // resolved to whatever unrelated same-named function happens to be the
+    // ONLY one of that name in the whole repo. Verified live against this
+    // exact codebase: crates/calm-core/src/analysis/coverage.rs's own
+    // `row.get(..)` calls (a real rusqlite::Row::get, receiver="row",
+    // target_class NULL) were among 1114 false `textual` edges all pointing
+    // at the unrelated crates/calm-core/src/txn.rs::get -- the only "get" in
+    // the entire Rust symbol table -- which collapsed B2's inferred/
+    // resolved/textual-tier precision to exactly 0.0 in CI.
+    fn test_unresolved_receiver_method_call_does_not_fan_out_to_unrelated_same_named_function() {
+        let dir = std::env::temp_dir().join(format!(
+            "ci_idx_rust_receiver_fallback_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // The one, unrelated, genuinely-local `get` in this fixture -- same
+        // Result<Option<_>, _> shape as txn::get, so it would previously
+        // survive the return-shape filter too, not just the bare-name one.
+        std::fs::write(
+            dir.join("txn.rs"),
+            "pub fn get(id: &str) -> Result<Option<i32>, String> {\n    Ok(Some(1))\n}\n",
+        )
+        .unwrap();
+        // `row`'s type comes from `fetch_row()`'s return value with no `let
+        // row: T = ..` annotation -- not self/this, not a typed binding, so
+        // tier-2 cannot infer a class for it and target_class stays None,
+        // same as the real coverage.rs case this reproduces.
+        std::fs::write(
+            dir.join("reader.rs"),
+            "fn read_first() -> Result<i32, String> {\n    let row = fetch_row();\n    row.get(0)\n}\n\nfn fetch_row() -> Row {\n    unimplemented!()\n}\n",
+        )
+        .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
+
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM call_edges \
+                 WHERE from_symbol = (SELECT qualified_name FROM symbols WHERE name = 'read_first') \
+                   AND to_symbol = (SELECT qualified_name FROM symbols WHERE name = 'get' AND path = 'txn.rs') \
+                   AND edge_confidence != 'ambiguous'",
+            ),
+            0,
+            "row.get(0) on an untracked-type receiver must NOT confidently resolve to the unrelated local txn.rs::get"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
