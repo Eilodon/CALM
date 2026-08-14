@@ -118,6 +118,21 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: scip-python
+      # This job's runner starts cold every night (no npm/npx cache step exists
+      # here, unlike Cargo above) -- a first-ever `npx --yes @sourcegraph/
+      # scip-python` has to resolve+download the package and its own dependency
+      # tree from the npm registry, which routinely takes well over 3s. The
+      # in-test availability probe (`probe_succeeds`/`PROBE_TIMEOUT` in
+      # `crates/calm-core/src/scip/runner.rs`) budgets only 3s, calibrated
+      # against an already-warm cache -- on a cold runner it was timing out,
+      # silently reporting "no python indexer found" (logged at `info!`, below
+      # the test's default `warn` filter) and failing the test every night
+      # since 2026-07-22 (bisected to 15aebba, which added the timeout). This
+      # unbounded warm-up absorbs that one-time cold resolve before the timed
+      # in-test probe ever runs, without loosening the timeout itself (which is
+      # fine for its intended warm-cache case).
+      - name: Warm npx cache for scip-python
+        run: npx --yes @sourcegraph/scip-python --version
       - name: Run real-indexer integration test (scip-python via npx)
         run: |
           cargo test -p calm-core --features scip-overlay -- --ignored \
@@ -133,6 +148,12 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: scip-js
+      # Same cold-runner/timed-probe race as scip-python above (both share
+      # `probe_succeeds`/`PROBE_TIMEOUT`, added in the same commit) -- absorb
+      # the one-time cold npx resolve here, unbounded, before the in-test 3s
+      # probe runs.
+      - name: Warm npx cache for scip-typescript
+        run: npx --yes @sourcegraph/scip-typescript --version
       - name: Run real-indexer integration test (scip-typescript via npx)
         run: |
           cargo test -p calm-core --features scip-overlay -- --ignored \
