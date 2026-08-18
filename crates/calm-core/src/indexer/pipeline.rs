@@ -6061,6 +6061,146 @@ impl StructB {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    // 2026-08-18 (B15 investigation, follow-up to the inheritance fix
+    // above): `new Foo(...)` is its own `new_expression` node kind in
+    // tree-sitter-javascript/typescript, distinct from `call_expression`
+    // -- confirmed via the real vendored grammar's node-types.json, not
+    // guessed. A class invoked exclusively via `new`, never a plain
+    // function call, used to produce ZERO call edges -- the exact,
+    // real, live-confirmed miss B15's cross-language competitor
+    // benchmark found (`User`, examples/view-locals/user.js in the
+    // express corpus).
+    fn test_javascript_new_expression_resolves_as_a_call_to_the_constructed_class() {
+        let dir = std::env::temp_dir().join(format!("ci_idx_js_new_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("mod.js"),
+            "class User {\n    constructor(name) {\n        this.name = name;\n    }\n}\n\
+             function run() {\n    return new User(\"a\");\n}\n",
+        )
+        .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
+
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM call_edges \
+                 WHERE from_symbol LIKE '%::run' AND to_symbol LIKE '%::User'",
+            ),
+            1,
+            "run()'s `new User(\"a\")` must produce a call edge to the User class \
+             -- new_expression must be treated as a call site, not silently dropped"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    // Companion to the test above: TypeScript's `new_expression` additionally
+    // carries an optional `type_arguments` field (`new Box<string>(...)`) --
+    // confirmed via tree-sitter-typescript's own node-types.json that this
+    // field is SEPARATE from `constructor`, so the callee text stays clean
+    // ("Box", no generic-bracket pollution) with no extra stripping logic
+    // needed.
+    fn test_typescript_new_expression_with_generics_resolves_as_a_call() {
+        let dir = std::env::temp_dir().join(format!("ci_idx_ts_new_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("mod.ts"),
+            "class Box<T> {\n    constructor(public value: T) {}\n}\n\
+             function run(): void {\n    new Box<string>(\"a\");\n}\n",
+        )
+        .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
+
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM call_edges \
+                 WHERE from_symbol LIKE '%::run' AND to_symbol LIKE '%::Box'",
+            ),
+            1,
+            "run()'s `new Box<string>(\"a\")` must produce a call edge to Box, with \
+             the <string> type argument not corrupting the callee name"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    // Java companion: `new Foo(...)` is `object_creation_expression`, whose
+    // callee lives in a `type` field (not `constructor` like JS/TS) --
+    // confirmed via tree-sitter-java's own node-types.json. Also exercises
+    // the generic-constructor shape (`new Box<String>(...)`) to confirm
+    // `leading_ident` correctly stops at `<` rather than corrupting the
+    // callee name.
+    //
+    // Expects 2 edges, not 1: Java indexes a class's own name AND its
+    // constructor's name as two SEPARATE same-named symbols (`Box.java::Box`,
+    // kind=class, and `Box.java::Box::Box`, kind=constructor -- verified live
+    // via the real `symbols` table) -- a bare-name callee resolution with no
+    // narrowing signal to prefer one over the other correctly returns both as
+    // `ambiguous` candidates, the same "no scoping evidence, don't guess"
+    // behavior any other same-named bare-call collision already gets
+    // elsewhere in this resolver. This is a pre-existing characteristic of
+    // Java's symbol model this fix newly exercises via constructors, not a
+    // new bug -- disambiguating it further is out of scope here.
+    fn test_java_object_creation_expression_resolves_as_a_call_to_the_constructed_class() {
+        let dir = std::env::temp_dir().join(format!("ci_idx_java_new_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("Box.java"),
+            "public class Box<T> {\n    public Box(T value) {\n    }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("Caller.java"),
+            "public class Caller {\n    void m() {\n        new Box<String>(\"a\");\n    }\n}\n",
+        )
+        .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
+
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM call_edges \
+                 WHERE from_symbol LIKE '%Caller::m' AND to_symbol LIKE '%Box%'",
+            ),
+            2,
+            "Caller.m()'s `new Box<String>(\"a\")` must produce a call edge to \
+             both same-named Box symbols (the class and its own constructor), \
+             with the <String> type argument not corrupting the callee name"
+        );
+        let confidence: String = conn
+            .query_row(
+                "SELECT DISTINCT edge_confidence FROM call_edges \
+                 WHERE from_symbol LIKE '%Caller::m' AND to_symbol LIKE '%Box%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            confidence, "ambiguous",
+            "2 same-named candidates with no narrowing signal must be ambiguous, \
+             not silently trusted as if one had been confirmed"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Same fan-out bug, `by_name_class` variant: two unrelated types in
     /// different files that happen to share both a type name AND a method
     /// name (e.g. two local `struct Handler` in different modules, each with

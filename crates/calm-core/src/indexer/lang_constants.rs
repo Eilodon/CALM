@@ -339,9 +339,22 @@ const JS_TS_CONSTANTS: LangConstants = LangConstants {
     ],
     name_field: "name",
     docstring_type: Some("comment"),
-    call_node_types: &["call_expression"],
+    // `new_expression` (2026-08-18, B15 investigation): `new Foo(...)` is
+    // its own node kind in tree-sitter-javascript/typescript, distinct
+    // from `call_expression` -- confirmed via the real vendored grammar's
+    // node-types.json (tree-sitter-javascript 0.23.1, tree-sitter-
+    // typescript 0.23.2): `new_expression` has a required `constructor`
+    // field holding the callee (bare identifier or member expression, same
+    // shape `split_receiver_callee` already handles) and an optional
+    // `arguments` field (same field NAME as `call_expression`'s, so
+    // `count_arguments_node` needs no change). Without this, a class
+    // invoked exclusively via `new`, never a plain function call, produced
+    // ZERO call edges -- a real, live-confirmed miss in B15's cross-
+    // language competitor benchmark (`User`, examples/view-locals/user.js
+    // in the express corpus).
+    call_node_types: &["call_expression", "new_expression"],
     call_function_field: "function",
-    call_function_field_by_kind: &[],
+    call_function_field_by_kind: &[("new_expression", "constructor")],
     class_node_types: &["class_declaration"],
     class_name_field: "name",
     definition_macro_names: &[],
@@ -528,9 +541,25 @@ pub static LANGUAGES: &[LanguageSpec] = &[
             ],
             name_field: "name",
             docstring_type: Some("block_comment"),
-            call_node_types: &["method_invocation"],
+            // `object_creation_expression` (2026-08-18, same investigation
+            // as the JS/TS `new_expression` fix above): `new Foo(...)` is
+            // its own node kind in tree-sitter-java, distinct from
+            // `method_invocation` -- confirmed via the real vendored
+            // grammar's node-types.json (tree-sitter-java 0.23.5): the
+            // callee lives in a required `type` field (not `constructor`
+            // like JS/TS), and `arguments` lives in an `argument_list`
+            // field -- already covered by `count_arguments_node`'s
+            // existing `"arguments" || "argument_list"` check, no change
+            // needed there. A generic constructor call's `type` field text
+            // (`ArrayList<String>`) is safe: `leading_ident` already stops
+            // at the first non-identifier character (`<`), verified by
+            // reading its implementation, not assumed. Groovy shares this
+            // same `method_invocation`-only shape below but is
+            // deliberately NOT touched here -- its own grammar wasn't
+            // re-verified this session.
+            call_node_types: &["method_invocation", "object_creation_expression"],
             call_function_field: "name",
-            call_function_field_by_kind: &[],
+            call_function_field_by_kind: &[("object_creation_expression", "type")],
             class_node_types: &[
                 "class_declaration",
                 "interface_declaration",
