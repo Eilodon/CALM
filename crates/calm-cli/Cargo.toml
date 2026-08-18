@@ -2,6 +2,13 @@
 name = "calm-cli"
 version.workspace = true
 edition.workspace = true
+# `src/bin/txn_crash_harness.rs` (WS-1 crash-injection suite) makes this crate
+# have 2 binaries. Without this, `cargo run -p calm-cli` (no --bin) refuses to
+# guess and hard-errors -- silently broke every benchmark script that spawns
+# `cargo run --release -p calm-cli -- serve ...` (lib/mcp_client.py and every
+# script importing it: B3/B4/B6/B7/B10/B11/B12), and breaks the same command
+# for any human/doc following that exact invocation pattern.
+default-run = "calm"
 
 # Small lib target added alongside the `calm` bin (Phase 2, docs/superskills/
 # plans/2026-07-28-otel-http-dynamic-toolsets.md Task 2.3) so `otel::otel_layer`
