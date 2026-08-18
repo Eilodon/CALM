@@ -376,6 +376,17 @@ def main() -> int:
     rows = []
     try:
         calm_client.wait_until_indexed()
+        # 2026-08-18 fix: backports B13/B12's force_scip_refresh -- without
+        # it, calm_client's answers on the tasks below (find_callers,
+        # pre_edit_blast_radius, ...) could be read before the async SCIP
+        # overlay pass finishes upgrading edges to `formal`, understating
+        # CALM's real recall on a corpus that happens to index fast. B11's
+        # corpus is always the self-repo (Rust), so "rust" is hardcoded --
+        # no per-language provider mapping needed here, unlike B7/B12.
+        try:
+            calm_client.call_tool("scip_refresh", {"lang": "rust"})
+        except Exception:  # noqa: BLE001 -- best-effort, matches B12's posture
+            pass
         print(f"[b11] all servers ready (serena cold start: {serena_cold_start_s:.1f}s), running tasks", file=sys.stderr)
 
         for task_id, task in tasks.items():

@@ -131,7 +131,10 @@ def run_naive_arm(corpus: Path, task: dict) -> dict:
     return {"arm": "naive", "files_touched": sorted(edited), "tool_calls": 1 + len(files)}
 
 
-def run_calm_arm(corpus: Path, task: dict, real_repo_root: Path) -> dict:
+_SCIP_PROVIDER_BY_LANG: dict[str, str] = {"typescript": "javascript"}
+
+
+def run_calm_arm(corpus: Path, task: dict, real_repo_root: Path, lang: str) -> dict:
     """CALM-scripted: ask CALM's own edit_context for the blast radius (this
     IS what a real agent would see -- comparing this set against the
     independent oracle is the callsite-recall metric), then rename the
@@ -141,11 +144,25 @@ def run_calm_arm(corpus: Path, task: dict, real_repo_root: Path) -> dict:
     already in `symbol`, per its own doc comment in
     crates/calm-server/src/tools/guardrails.rs) -- the file path is the
     substring of `symbol` before the first `::`. Verified against the real
-    edit_context.snap schema before writing this, not guessed."""
+    edit_context.snap schema before writing this, not guessed.
+
+    2026-08-18 fix: backports B13/B12's `force_scip_refresh` -- without it,
+    `edit_context`'s caller-file set (the metric this whole arm exists to
+    score) could be read before the async SCIP overlay pass finishes
+    upgrading edges to `formal`, understating CALM's real recall on a
+    corpus that happens to index fast. See B12's `force_scip_refresh`
+    docstring for the live verification this race is real. `lang` needs
+    the same typescript->javascript provider-name mapping B12 needed
+    (there is no separate "typescript" scip_refresh provider)."""
     client = MCPClient(project_root=str(corpus), repo_root=str(real_repo_root))
     tool_calls = 0
     try:
         client.wait_until_indexed()
+        provider = _SCIP_PROVIDER_BY_LANG.get(lang, lang)
+        try:
+            client.call_tool("scip_refresh", {"lang": provider})
+        except Exception:  # noqa: BLE001 -- best-effort, matches B12's posture
+            pass
         raw = client.call_tool("edit_context", {"symbol": task["symbol"]})
         tool_calls += 1
         ctx = json.loads(raw)
@@ -222,7 +239,7 @@ def main() -> int:
 
         print(f"[b7]   calm arm ...", file=sys.stderr)
         calm_corpus = fresh_clone(lang, "calm")
-        calm_result = run_calm_arm(calm_corpus, task, real_repo_root)
+        calm_result = run_calm_arm(calm_corpus, task, real_repo_root, lang)
         calm_bt = build_test_gate(calm_corpus, task.get("build_cmd"), task["test_cmd"])
         calm_result["build_pass"] = calm_bt.passed
         calm_result["output_tail"] = calm_bt.output[-1500:]

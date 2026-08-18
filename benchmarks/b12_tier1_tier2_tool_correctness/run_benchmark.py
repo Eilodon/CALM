@@ -119,6 +119,12 @@ _CALLABLE_KINDS = ("function", "method", "assigned_function", "prototype_method"
 LINE_COMMENT: dict[str, str] = {
     "python": "#", "rust": "//", "go": "//", "java": "//", "javascript": "//", "typescript": "//",
 }
+# 2026-08-18: `scip_refresh`'s `lang` argument is a SCIP provider name, not
+# one of CALM's `symbols.language` DB values -- there is no separate
+# "typescript" provider (scip-typescript covers both `.ts` and `.js`,
+# exposed under the "javascript" provider). Every other CORPORA_LANGS value
+# already matches a real provider name 1:1.
+_SCIP_PROVIDER_BY_LANG: dict[str, str] = {"typescript": "javascript"}
 
 
 def jload(raw: str) -> dict:
@@ -526,9 +532,17 @@ def force_scip_refresh(client: MCPClient, lang: str) -> dict:
     edit_workflow checks the same way it was already closed for B13's
     file-recall checks. Best-effort: a language with no SCIP provider
     installed returns an error payload here, not an exception -- an
-    expected, harmless no-op, not a benchmark failure."""
+    expected, harmless no-op, not a benchmark failure.
+
+    2026-08-18 follow-up fix: this used to pass `lang` straight through to
+    `scip_refresh`, which hit `SCIP_REFRESH_FAILED: unknown SCIP provider
+    "typescript"` every single TS run (see `_SCIP_PROVIDER_BY_LANG`) --
+    harmless (best-effort, caught below), but it meant TS's overlay was
+    never actually force-refreshed, silently leaving TS exposed to the
+    exact race this function exists to close."""
+    provider = _SCIP_PROVIDER_BY_LANG.get(lang, lang)
     try:
-        raw = client.call_tool("scip_refresh", {"lang": lang})
+        raw = client.call_tool("scip_refresh", {"lang": provider})
         return json.loads(raw)
     except Exception as e:  # noqa: BLE001
         return {"error": str(e)}
