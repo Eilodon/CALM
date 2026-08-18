@@ -25,8 +25,11 @@ nhanh, không thay thế nó.
 | B10 | Real Competitor A/B | `calm` vs CodeGraph vs Semble — tool call thật trên cả 3 MCP server thật (không phải số tự báo cáo) | **Superseded by B11** — [`b10_real_competitor_ab/`](b10_real_competitor_ab/) (giữ lại, xem B11 cho methodology đã fix) |
 | B11 | Extended Real Competitor A/B | `calm` vs CodeGraph vs Semble vs grepai vs Serena — sửa các lỗ hổng methodology của B10 (oracle đúng-sai cho mọi task, N=5 thay vì N=1, thêm task risk_gate_refusal + memory_recall test thật tính năng khác biệt của `calm`) | **Implemented** — [`b11_extended_competitor_ab/`](b11_extended_competitor_ab/) |
 | B12 | Tier-1/Tier-2 Tool-Surface Correctness | Lái thật 9 MCP tool (repo_overview/search/source/file_overview/callers/edit_context/edit_lines/edit_symbol/diff_impact/hotspots) qua JSON-RPC trên 6 repo OSS ngoài (Tier-0: Python/Rust/Go/JS/TS/Java), full-power build, ground truth độc lập (regex + git grep, không phải call-graph precision) — khác trục đo với B2/resolution | **Implemented** — [`b12_tier1_tier2_tool_correctness/`](b12_tier1_tier2_tool_correctness/) |
+| B13 | CALM vs CodeGraph Multi-Repo A/B | Mở rộng B12's corpus registry thêm 1 competitor thật (CodeGraph) + task freshness-under-live-edit; canonical 100% (31/31) vs 87.1% (27/31) file-recall trên callers | **Implemented** — [`b13_codegraph_multirepo_ab/`](b13_codegraph_multirepo_ab/) |
+| B14 | Risk Calibration | `calm guard`'s `aggregate_risk` có track đúng commit gây bug thật không (SZZ-lite trên chính git history của CALM) — trục đo khác hẳn correctness, đo calibration | **Implemented** — [`b14_risk_calibration/`](b14_risk_calibration/) |
+| B15 | Cross-Language Competitor A/B | `calm` vs CodeGraph vs Ctxo vs Context+ trên cả 6 ngôn ngữ Tier-0 (không chỉ self-repo/Rust như B11) — 2 competitor mới, cả hai đều thách thức trực tiếp claim "duy nhất" của `calm` (Ctxo có pre-edit safety gate, Context+ có memory/RAG) | **Implemented** — [`b15_cross_lang_competitor_ab/`](b15_cross_lang_competitor_ab/) |
 
-Ngoài chuỗi B1-B11 (đo lợi thế `calm` so với naive/competitor), còn một track riêng đo **chất lượng
+Ngoài chuỗi B1-B15 (đo lợi thế `calm` so với naive/competitor), còn một track riêng đo **chất lượng
 resolution đa ngôn ngữ** cho kế hoạch 8-ngôn-ngữ Formal-tier
 (`docs/superskills/plans/2026-07-07-eight-lang-formal-tier.md`) — không thuộc số B, vì trục đo khác
 hẳn (độ rộng/độ chính xác hỗ trợ ngôn ngữ, không phải calm-vs-naive): **Resolution** — tier
