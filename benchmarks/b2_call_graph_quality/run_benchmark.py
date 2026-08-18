@@ -77,15 +77,44 @@ def find_rust_analyzer() -> str:
 
 def build_oracle(occurrences: list[dict]) -> set[tuple[str, int, str, int]]:
     """(ref_file, ref_line) -> (def_file, def_line) edges, mirroring
-    calm_core::scip::ingest::ingest_occurrences's own matching."""
-    def_of: dict[str, tuple[str, int]] = {}
+    calm_core::scip::ingest::ingest_occurrences's own matching.
+
+    2026-08-18 fix: rust-analyzer's scip symbol-naming scheme does not
+    disambiguate private/local functions by which independently-compiled
+    `tests/*.rs` integration-test binary they belong to -- two files each
+    defining their own local `fn run_calm()` (a common, encouraged pattern:
+    every integration test binary is self-contained) can get the IDENTICAL
+    scip symbol string. The old plain `dict` keyed by that string silently
+    let whichever occurrence got processed last "win" as ground truth for
+    EVERY file's call sites of that name -- wrongly failing a tool that
+    correctly resolved same-file. Verified live on
+    `crates/calm-cli/tests/{permissions,hooks}_doctor_fix.rs`'s `run_calm`/
+    `calm_bin`/`fresh_project` and `crates/calm-core/tests/
+    {golden_graph_equivalence,derived_artifact_versions}.rs`'s
+    `index_fresh` -- all 4 collide 2-way. A symbol with >1 distinct def
+    location is unusable as ground truth (nothing in the scip dump alone
+    says which one a given reference actually targets), so it's dropped
+    from the oracle entirely instead of arbitrarily picking one and
+    silently mismeasuring every tool that "gets it wrong" against that
+    arbitrary pick."""
+    def_locations: dict[str, set[tuple[str, int]]] = defaultdict(set)
     for o in occurrences:
         if o["is_def"] and not o["is_local"]:
-            def_of[o["symbol"]] = (o["file"], o["line"])
+            def_locations[o["symbol"]].add((o["file"], o["line"]))
+
+    collided = {sym for sym, locs in def_locations.items() if len(locs) > 1}
+    def_of = {sym: next(iter(locs)) for sym, locs in def_locations.items() if len(locs) == 1}
+    if collided:
+        preview = ", ".join(sorted(collided)[:5])
+        print(
+            f"build_oracle: excluded {len(collided)} symbol(s) with colliding scip def "
+            f"locations (ambiguous ground truth, not scored either way): {preview}"
+            f"{', ...' if len(collided) > 5 else ''}"
+        )
 
     oracle: set[tuple[str, int, str, int]] = set()
     for o in occurrences:
-        if o["is_def"] or o["is_local"]:
+        if o["is_def"] or o["is_local"] or o["symbol"] in collided:
             continue
         target = def_of.get(o["symbol"])
         if target is None:

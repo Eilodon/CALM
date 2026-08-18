@@ -149,6 +149,39 @@ def _is_comment_line(line_text: str, lang: str) -> bool:
     return bool(prefix) and line_text.lstrip().startswith(prefix)
 
 
+# 2026-08-18 fix: quote characters used by each language's string literals,
+# used by `_is_inside_string_literal` to exclude a `NAME(` match that only
+# occurs as DATA inside a quoted string (e.g. a pytest parametrize tuple
+# holding a Flask CLI factory-string) from counting as a real call site.
+_STRING_QUOTE_CHARS: dict[str, tuple[str, ...]] = {
+    "python": ("'", '"'),
+    "javascript": ("'", '"', "`"),
+    "typescript": ("'", '"', "`"),
+    "go": ('"', "`"),
+    "java": ('"',),
+    "rust": ('"',),
+}
+
+
+def _is_inside_string_literal(line_text: str, match_start: int, lang: str) -> bool:
+    """Best-effort, same 'good enough to catch gross oracle noise, not
+    parser-grade' posture as the comment/definition filters above: a
+    call-shaped `NAME(` occurring inside a quoted string on the same line
+    (odd count of a quote char before match_start) is almost never a real
+    call site -- e.g. a pytest parametrize tuple holding a Flask CLI
+    factory-string like 'create_app2("foo", "bar")' as DATA, not code.
+    Verified real on flask's `create_app2`: a fresh B12 run flagged it as a
+    zero-recall bug (0 real callers found by `callers`) when in fact
+    `git_grep_call_sites` was counting 3 string-literal occurrences inside
+    tests/test_cli.py's parametrize table -- there is no real static call
+    site anywhere in the corpus, `callers`' 0 was correct. Doesn't handle
+    escaped quotes or multi-line strings -- narrow on purpose, only strong
+    enough to catch this exact shape."""
+    quote_chars = _STRING_QUOTE_CHARS.get(lang, ("'", '"'))
+    prefix = line_text[:match_start]
+    return any(prefix.count(q) % 2 == 1 for q in quote_chars)
+
+
 def git_grep_call_sites(root: Path, name: str, def_path: str, def_line: int, lang: str) -> list[tuple[str, int]]:
     """Real CALL-shaped sites for `name` anywhere in the corpus, excluding the
     definition line itself and any OTHER line that looks like a (re)definition
@@ -184,8 +217,14 @@ def git_grep_call_sites(root: Path, name: str, def_path: str, def_line: int, lan
     own source extension(s) and skipping comment-only lines. Still an
     approximation, not a call-graph-precision oracle -- only strong enough to
     flag gross zero-recall failures, the same profile that caught the real B1
-    JS/TS bug and the two documented above."""
+    JS/TS bug and the two documented above.
+
+    2026-08-18 fix: a third ground-truth bug of the same family, found via a
+    fresh B12 run's own `zero_recall_bug` flag on flask's `create_app2` --
+    see `_is_inside_string_literal`'s docstring. Filters out any match that
+    falls inside a same-line quoted string, not just comments."""
     pattern = rf"(^|[^A-Za-z0-9_]){re.escape(name)}\("
+    compiled = re.compile(pattern)
     pathspecs = [f"*{ext}" for ext in EXTENSIONS[lang]]
     proc = subprocess.run(
         ["git", "grep", "-n", "-E", "--", pattern, *pathspecs],
@@ -207,6 +246,16 @@ def git_grep_call_sites(root: Path, name: str, def_path: str, def_line: int, lan
             continue
         if _is_comment_line(text, lang):
             continue
+        m = compiled.search(text)
+        if m is not None:
+            # `m.group(1)` is the zero-width `^` alternative or the
+            # captured non-word boundary char -- the real name starts
+            # right after it, and that boundary char itself must be
+            # INCLUDED in the quote-parity prefix (it's often the
+            # opening quote itself, e.g. `'create_app2(...`).
+            name_pos = m.start() + len(m.group(1))
+            if _is_inside_string_literal(text, name_pos, lang):
+                continue
         sites.append((path, lineno))
     return sites
 
