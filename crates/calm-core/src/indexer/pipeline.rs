@@ -1179,9 +1179,51 @@ fn resolve_sites_to_edges(ctx: &ResolutionCtx, sites: &[CallSiteRow]) -> Vec<Cal
                 _,
                 arg_count,
             )| {
-                let targets = match target_class {
-                    Some(cls) => ctx.by_name_class.get(&(callee.clone(), cls.clone())),
-                    None => ctx.by_name.get(callee),
+                // Inheritance fallback (2026-08-18, B15 investigation): an
+                // exact-class miss here does NOT always mean "no candidates
+                // exist" -- `by_name_class` only indexes each method under
+                // the class that DECLARES it, with no superclass walk, so a
+                // receiver whose STATIC type is known (`target_class`
+                // populated from a tracked binding -- Java's
+                // `formal_parameter`, Go's `parameter_declaration`, etc.)
+                // but who calls a method it only INHERITS (declared on an
+                // ancestor, not on `cls` itself) used to hit this exact-key
+                // miss and return zero candidates -- dropping the edge
+                // entirely, with NO fallback to the unscoped `by_name` path
+                // the unknown-receiver-type branch already gets. Verified
+                // live via a minimal 2-class repro (a `formal_parameter`
+                // calling an inherited method silently produced NO edge --
+                // not even `ambiguous` -- while the identical call through a
+                // local variable of the same runtime type correctly fell
+                // back to `ambiguous`) and confirmed as the root cause of 3
+                // of CALM's 4 real misses in B15's spring-petclinic sample
+                // (`getName`/`isNew`, both declared on an ancestor of the
+                // receiver's declared class, not on the declared class
+                // itself).
+                //
+                // Gated on `ctx.by_name.contains_key(cls)` -- `cls` itself
+                // must be a symbol this project actually declares (a class/
+                // struct/interface, or anything else sharing that exact
+                // name) before falling back, so a call through a receiver
+                // typed as an UNMODELED external/stdlib type (Rust's
+                // `HashMap::new()` with no `HashMap` in this project at all)
+                // keeps the original "no candidates" behavior instead of
+                // wrongly fanning out project-wide -- caught live by
+                // `test_type_path_call_resolves_scoped_not_fanned_out`
+                // regressing when the fallback was first tried unguarded.
+                // `exact_class_matched` tracks which branch fired so the
+                // `weak_receiver` computation below can still mark this
+                // fallback's edges `ambiguous` (the receiver's exact class
+                // is known, but not that it actually declares this method)
+                // instead of trusting them at whatever confidence the
+                // exact-class path would otherwise imply.
+                let (targets, exact_class_matched) = match target_class {
+                    Some(cls) => match ctx.by_name_class.get(&(callee.clone(), cls.clone())) {
+                        Some(t) => (Some(t), true),
+                        None if ctx.by_name.contains_key(cls) => (ctx.by_name.get(callee), false),
+                        None => (None, false),
+                    },
+                    None => (ctx.by_name.get(callee), false),
                 };
                 let Some(t) = targets else {
                     return (Vec::new(), false, false);
@@ -1409,8 +1451,17 @@ fn resolve_sites_to_edges(ctx: &ResolutionCtx, sites: &[CallSiteRow]) -> Vec<Cal
                 // test_caller_count_excludes_ambiguous_fan_out_edges'
                 // `self.as_str()` regressing to `ambiguous` before this
                 // exclusion existed.
+                // `!exact_class_matched` (not `target_class.is_none()`) so the
+                // new inheritance-fallback branch above -- receiver class
+                // known, but the exact-class lookup itself missed -- is
+                // treated with the same "weak evidence" caution as a
+                // genuinely unknown-type receiver, not trusted as if the
+                // exact-class path had actually confirmed it. Equivalent to
+                // the old `target_class.is_none()` check whenever that
+                // fallback never fires (exact_class_matched is only ever
+                // false when target_class was already None in that case).
                 let weak_receiver = receiver.is_some()
-                    && target_class.is_none()
+                    && !exact_class_matched
                     && !matches!(receiver.as_deref(), Some("self" | "this"));
                 if !same_file.is_empty() {
                     (same_file, false, weak_receiver)
@@ -5952,6 +6003,60 @@ impl StructB {
                 .unwrap();
             assert_eq!(formal_source.as_deref(), Some("stack_graphs"));
         }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    // 2026-08-18 (B15 cross-language competitor A/B investigation): a
+    // formal_parameter-typed Java receiver calling a method it only
+    // INHERITS from a superclass (declared on `Base`, not on the
+    // parameter's own declared class `Sub`) used to produce ZERO call
+    // edges -- `resolve_sites_to_edges`'s `by_name_class` lookup is keyed
+    // on (callee, EXACT declaring class) with no superclass walk, and an
+    // exact-key miss short-circuited straight to "no candidates" instead
+    // of falling back to the unscoped `by_name` lookup an UNKNOWN-type
+    // receiver already gets. Verified live against spring-petclinic
+    // (external, real corpus): `getName()`/`isNew()` declared on
+    // `NamedEntity`/`BaseEntity` were silently missing from `callers()`
+    // when called through a `Pet`-typed method parameter, while an
+    // identical call through a same-type LOCAL variable (no tracked
+    // static type) correctly fell back to an `ambiguous` edge -- CALM
+    // knowing MORE about the receiver's type made it strictly worse at
+    // finding the edge, the opposite of the intended tiered-confidence
+    // design. This minimal 2-class repro isolates that exact shape.
+    fn test_java_formal_parameter_resolves_inherited_superclass_method() {
+        let dir = std::env::temp_dir().join(format!("ci_idx_java_inherit_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("Base.java"),
+            "public class Base {\n    public String getName() {\n        return null;\n    }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("Sub.java"), "public class Sub extends Base {\n}\n").unwrap();
+        std::fs::write(
+            dir.join("Caller.java"),
+            "public class Caller {\n    void m(Sub sub) {\n        sub.getName();\n    }\n}\n",
+        )
+        .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
+
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM call_edges \
+                 WHERE from_symbol LIKE '%Caller::m' AND to_symbol LIKE '%Base::getName'",
+            ),
+            1,
+            "Caller.m()'s call to sub.getName() (inherited from Base, not declared \
+             on Sub) must still produce a call edge -- an exact-class miss on \
+             by_name_class must fall back to the unscoped by_name lookup, not drop \
+             the edge outright"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

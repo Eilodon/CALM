@@ -94,7 +94,7 @@ a hit) — but it's a real, disclosable precision problem, worth weighing agains
 claim on Context+'s own README, and worth reading the raw `contextplus_files` column for, not just
 the recall fraction.
 
-## Results (2026-08-18, `calm` @ `822e238`, N=8 symbols/corpus, single pass)
+## Results (2026-08-18, `calm` @ `0d9aa3a` + the inheritance-fallback fix below, N=8 symbols/corpus, single pass)
 
 File-recall on "who calls this symbol", per language (hit/total oracle files):
 
@@ -105,8 +105,15 @@ File-recall on "who calls this symbol", per language (hit/total oracle files):
 | go | 11/11 (100%) | 10/11 (91%) | **1/11 (9%) — see disclosure below, not a capability claim** | 11/11 (100%) |
 | javascript | 7/8 (88%) | 8/8 (100%) | **0/8 (0%) — see disclosure below, not a capability claim** | 8/8 (100%) |
 | typescript | 11/11 (100%) | 9/11 (82%) | **1/11 (9%) — see disclosure below, not a capability claim** | 11/11 (100%) |
-| java | 21/24 (88%) | 24/24 (100%) | 23/24 (96%) | 24/24 (100%) |
-| **aggregate (java only for Ctxo — see below)** | **68/72 (94.4%)** | **69/72 (95.8%)** | **23/24 (96%)** | **72/72 (100%)** |
+| java | 25/25 (100%) | 24/25 (96%) | 23/25 (92%) | 25/25 (100%) |
+| **aggregate (java only for Ctxo — see below)** | **72/73 (98.6%)** | **69/73 (94.5%)** | **23/25 (92%)** | **73/73 (100%)** |
+
+**This table supersedes the first published run** (calm 68/72 = 94.4%, below CodeGraph's 69/72 =
+95.8%) — see "Root-cause investigation" below for why, and note the java column's *sample itself*
+changed between runs: fixing the oracle bug changed which 8 symbols `sample_symbols` deterministically
+picks (the same symbol names — `getName`/`isNew` — that motivated the investigation are no longer in
+this particular sample, but the fix they drove is independently verified live in the investigation
+section, not just inferred from this table moving).
 
 **Read the "Ctxo go/js/ts: a real, unresolved integration-reliability finding" section below before
 citing the go/js/ts Ctxo numbers for anything** — they are published for transparency (raw data in
@@ -114,17 +121,80 @@ citing the go/js/ts Ctxo numbers for anything** — they are published for trans
 call-graph quality, so the aggregate row above excludes them and counts only Ctxo's java result
 (the one arm verified end-to-end with real, non-empty query results).
 
-**Reading the rest of the table**: CodeGraph and Context+ both land at or near 100% on every
-language they run on — CodeGraph misses 3 files total (go/1, typescript/2, both same-file or
-private-symbol edge cases, not investigated further here), Context+ misses none in this sample
-(see the CSS false-positive section below for why "0 misses" doesn't mean "flawless"). `calm`'s 4
-misses were spot-checked, not just counted: the javascript one (`User`, `examples/view-locals/
-user.js`) is a real, disclosable gap — the symbol is invoked exclusively via `new User(...)`, and
-CALM's JS/TS call extractor doesn't currently treat a `new`-expression as a call site for the
-constructed class name. The java ones are inheritance/cross-file dispatch cases (`getName`/`isNew`
-defined in a base class, invoked through a subclass instance) — a much harder class of problem for
-any syntactic (non-type-checking) resolver, consistent with this suite's own prior findings on
-Rust `Self::`/method-name collisions.
+**Reading the rest of the table**: `calm`'s only remaining miss across all 6 languages (48 sampled
+symbols) is the javascript `User` case — spot-checked, not just counted: the symbol is invoked
+exclusively via `new User(...)`, and CALM's JS/TS call extractor doesn't currently treat a
+`new`-expression as a call site for the constructed class name (a real, disclosable, separate gap —
+not investigated further here). CodeGraph misses 4 files total (go/1, typescript/2, java/1 — not
+investigated further here); Context+ misses none in this sample (see the CSS false-positive section
+below for why "0 misses" doesn't mean "flawless"). Ctxo's java column moved 23/24→23/25 between runs
+purely because the sample changed size (24→25 oracle files) under the fixed oracle, not because
+Ctxo's own behavior changed.
+
+## Root-cause investigation (2026-08-18): why did `calm` initially score below CodeGraph?
+
+The first published run above showed `calm` (94.4%) narrowly behind CodeGraph (95.8%) and well
+behind Context+ (100%). Investigated end-to-end — not just re-read the numbers — by reproducing
+`calm`'s exact misses against a live corpus, inspecting its `call_edges` table directly, and building
+a minimal 2-class Java repro. Three distinct things were found, not one:
+
+1. **A benchmark-design property, not a bug**: this task measures *recall only*, never precision.
+   Context+ and CodeGraph both lean toward "return more, don't worry about false positives" —
+   Context+'s `get_blast_radius` was caught doing plain substring text matching (see the CSS
+   false-positive section below), which trivially maximizes recall at zero precision cost under this
+   scoring. A recall-only metric structurally favors that strategy over a resolver that tries to stay
+   precise. Not fixed here (would need a precision column, e.g. `len(tool_files - oracle_files)`, to
+   fairly separate "found the real callers" from "returned everything and hoped").
+2. **A real, freshly-introduced oracle bug** (same file this benchmark's own ground truth lives in):
+   the 2026-08-18 fix that made Java's method-definition regex's modifier group optional (to catch
+   package-private JUnit test methods, see `ground_truth.py`'s `PATTERNS["java"]` comment) turned that
+   pattern into an accidental near-universal matcher for control-flow lines ending in a brace —
+   `if (pet.isNew() && ...) {` matches "modifiers?, some text, NAME(...) {" with NAME captured as the
+   keyword "if" itself. `_looks_like_a_definition` then wrongly excluded every such line from call-site
+   ground truth. Verified live: `isNew`'s real oracle should have been 3 files
+   (`Owner.java`/`PetController.java`/`PetValidator.java` — every OTHER tool in this benchmark found
+   all 3) but had collapsed to 1. Fixed in `ground_truth.py` by reusing the same `_NOT_A_NAME` keyword
+   set `extract_definitions` already filters against, applied to the definition pattern's own captured
+   group instead of just "did any pattern match at all".
+3. **A real, previously-undocumented bug in `calm`'s own core resolver** — the one that actually moved
+   the table above. Root-caused to `crates/calm-core/src/indexer/pipeline.rs::resolve_sites_to_edges`:
+   when a call site's receiver has a STATICALLY KNOWN type (`target_class` populated from a tracked
+   binding — Java's `formal_parameter`, Go's `parameter_declaration`, etc.), the code looked up
+   `ctx.by_name_class.get(&(callee, class))` — keyed on the method's *exact declaring class*, with no
+   superclass walk — and on a miss returned **zero candidates**, dropping the call edge entirely,
+   with none of the `ambiguous`-fan-out fallback an UNKNOWN-type receiver already gets. So a call to an
+   *inherited* method (`getName()`/`isNew()` declared on `NamedEntity`/`BaseEntity`, invoked through a
+   `Pet`-typed parameter) silently vanished — while the identical call through a same-type LOCAL
+   variable (untracked, so genuinely "unknown" to the resolver) correctly fell back to `ambiguous`.
+   **Knowing more about the receiver's type made `calm` strictly worse at finding the edge** — the
+   opposite of the intended tiered-confidence design. Verified with a minimal, isolated 2-class Java
+   repro (`Base`/`Sub`/3 receiver shapes) before touching any real code, confirmed as the root cause of
+   3 of `calm`'s 4 original misses via direct `call_edges` inspection, and fixed by falling back to the
+   unscoped `by_name` lookup — but ONLY when `cls` is itself a symbol this project actually declares
+   (`ctx.by_name.contains_key(cls)`), so a receiver typed as an unmodeled external/stdlib type (Rust's
+   `HashMap::new()` with no `HashMap` anywhere in the project) keeps the original "no candidates"
+   behavior rather than wrongly fanning out project-wide — caught live by
+   `test_type_path_call_resolves_scoped_not_fanned_out` regressing when the fallback was first tried
+   unguarded. New regression test:
+   `test_java_formal_parameter_resolves_inherited_superclass_method` (`pipeline.rs`). Full
+   `cargo test -p calm-core --lib` (1234 tests) and `cargo test -p calm-server --lib` (395 tests): all
+   green, 0 regressions. Re-verified live post-fix against the real spring-petclinic corpus: `getName`
+   now correctly includes `Owner.java`/`PetController.java`, `isNew` now correctly includes all 3 real
+   files.
+
+**Net effect**: after both fixes, `calm` moved from 94.4% (behind CodeGraph) to 98.6% (ahead of
+CodeGraph, within 1.4 points of Context+'s recall-maximizing ceiling) — with its one remaining miss
+being the already-known, separately-tracked `new`-expression gap, not the inheritance bug. This is
+also a broader finding than B15 itself: `by_name_class`'s inheritance blindness is generic (any
+language populating `target_class` — Go, Rust, TS, C#, PHP, C/C++ — could hit the same shape), not
+Java-specific; only Java's was live-confirmed here.
+
+**The benchmark-design finding (point 1) also answers a broader question worth stating plainly**:
+this task doesn't exercise `calm`'s actual differentiators at all. "File-recall on who calls X" is
+the one axis where a tool that returns more, unfiltered, structurally cannot lose — it says nothing
+about the pre-edit safety gate, cross-session memory, or token-efficiency tasks B11 already measures
+(and where CodeGraph/Context+ don't compete at all). A benchmark built to showcase `calm`'s strengths
+specifically would weight those differently, not just recall on one call-graph query shape.
 
 ## Ctxo go/js/ts: a real, unresolved integration-reliability finding
 

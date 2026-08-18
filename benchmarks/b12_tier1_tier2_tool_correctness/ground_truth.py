@@ -19,7 +19,7 @@ from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
-_NOT_A_NAME = {"if", "for", "while", "switch", "catch", "return", "function"}
+_NOT_A_NAME = {"if", "for", "while", "switch", "catch", "return", "function", "synchronized", "try"}
 
 
 @dataclass(frozen=True)
@@ -131,8 +131,29 @@ def _looks_like_a_definition(line_text: str, lang: str) -> bool:
     ~10 different test functions, not one real call anywhere -- and
     `jinja_loader` "call sites" were actually substring hits inside the
     unrelated, longer identifier `create_global_jinja_loader(`. Both are
-    ground-truth bugs this filter (plus the word-boundary fix below) closes."""
-    return any(re.search(pat, line_text) for pat, _kind in PATTERNS[lang])
+    ground-truth bugs this filter (plus the word-boundary fix below) closes.
+
+    2026-08-18 fix (B15 investigation): the 2026-08-18 fix that made Java's
+    method-modifier group optional (see PATTERNS["java"]'s own comment)
+    turned that pattern into an accidental near-universal matcher for ANY
+    control-flow line ending in a brace -- `if (pet.isNew()) {`, `while
+    (x) {`, `for (...) {`, `catch (E e) {`, `synchronized (lock) {` all
+    satisfy "optional modifiers, some word-ish text, NAME(...) {" with
+    NAME captured as the keyword itself ("if"/"while"/...). Every one of
+    those was then wrongly treated as "looks like a redefinition" and
+    excluded from call-site ground truth -- verified live on spring-
+    petclinic: `isNew()`'s real call sites inside `if (pet.isNew() && ...)
+    {`-shaped conditions in Owner.java/PetController.java/PetValidator.java
+    were silently dropped from the oracle, undercounting EVERY tool's
+    (not just CALM's) B15 recall on that row. Reuses the same `_NOT_A_NAME`
+    keyword set `extract_definitions` already filters the captured name
+    against, applied here to the definition-pattern's own captured group
+    instead of just checking "does any pattern match at all"."""
+    for pat, _kind in PATTERNS[lang]:
+        m = re.search(pat, line_text)
+        if m and m.group(1) not in _NOT_A_NAME:
+            return True
+    return False
 
 
 # 2026-08-02 fix: single-line comment marker per language, used by
