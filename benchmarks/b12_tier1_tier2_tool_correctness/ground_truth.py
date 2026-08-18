@@ -60,7 +60,20 @@ PATTERNS: dict[str, list[tuple[str, str]]] = {
         (r"^\s*(?:public|private|protected)?\s*(?:static\s+)?(?:final\s+)?(?:abstract\s+)?class\s+(\w+)", "class"),
         (r"^\s*(?:public|private|protected)?\s*(?:static\s+)?(?:final\s+)?interface\s+(\w+)", "interface"),
         (
-            r"^\s*(?:public|private|protected)\s+(?:static\s+)?(?:final\s+)?"
+            # 2026-08-18 fix: the visibility modifier used to be MANDATORY
+            # (`(?:public|private|protected)\s+`), so a package-private
+            # method -- the standard JUnit 5 convention for test methods,
+            # e.g. `void initUpdateOwnerForm() throws Exception {` with no
+            # modifier at all -- was never recognized as a definition by
+            # `_looks_like_a_definition`, and fell through to be counted as
+            # a real CALL SITE of any production method sharing its name.
+            # Verified live on spring-petclinic: a fresh B15 run scored
+            # CALM/CodeGraph/Ctxo 0/1 "missing" OwnerController's
+            # `initUpdateOwnerForm()` -- the sole "oracle file" was that
+            # test method's OWN declaration line, not a real call anywhere.
+            # Now optional, same as the class/interface patterns above
+            # already treat it.
+            r"^\s*(?:(?:public|private|protected)\s+)?(?:static\s+)?(?:final\s+)?"
             r"[\w<>\[\],\s]+?\s+(\w+)\s*\([^;{]*\)\s*(?:throws\s+[\w,\s]+)?\{",
             "method",
         ),
