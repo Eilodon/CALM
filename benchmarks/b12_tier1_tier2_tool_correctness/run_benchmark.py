@@ -512,6 +512,28 @@ def check_robustness(client: MCPClient, corpus_path: Path) -> dict:
 # Orchestration
 # ---------------------------------------------------------------------------
 
+def force_scip_refresh(client: MCPClient, lang: str) -> dict:
+    """2026-08-02 fix (b13 CALM-vs-CodeGraph investigation), backported here
+    2026-08-18: `wait_until_indexed` only waits for tree-sitter indexing
+    (`indexing_phase=="ready"`) -- the automatic SCIP overlay pass
+    (rust-analyzer/scip-python/scip-go/scip-typescript/scip-java, upgrading
+    edges to `formal` confidence) runs ASYNCHRONOUSLY after that and is not
+    waited for. Verified live against a fresh fd clone in the b13
+    investigation: `indexing_status.scip_overlays[rust].up_to_date` stayed
+    `false` for 15s past `ready` with no automatic trigger, only flipping to
+    `true` after this exact `scip_refresh` call. Forcing it here, before any
+    correctness check runs, closes that race for B12's callers/edit_context/
+    edit_workflow checks the same way it was already closed for B13's
+    file-recall checks. Best-effort: a language with no SCIP provider
+    installed returns an error payload here, not an exception -- an
+    expected, harmless no-op, not a benchmark failure."""
+    try:
+        raw = client.call_tool("scip_refresh", {"lang": lang})
+        return json.loads(raw)
+    except Exception as e:  # noqa: BLE001
+        return {"error": str(e)}
+
+
 def run_language(lang: str, keep_worktree: bool = False) -> dict:
     print(f"[{lang}] preparing fresh worktree ...", file=sys.stderr)
     corpus_path = prepare_worktree(lang)
@@ -528,6 +550,7 @@ def run_language(lang: str, keep_worktree: bool = False) -> dict:
     try:
         client = MCPClient(project_root=str(corpus_path), repo_root=str(repo_root_from_here()))
         client.wait_until_indexed(timeout=240.0)
+        row["scip_refresh"] = force_scip_refresh(client, lang)
         row["repo_overview"] = check_repo_overview(client, lang)
         row["search"] = check_search(client, corpus_path, defs)
         row["source"] = check_source(client, corpus_path, defs)
