@@ -4529,6 +4529,137 @@ impl StructB {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    // PR#9 (docs/plans/2026-08-19-evidence-architecture-execution-plan.md
+    // Part E): the actual DoD scenario v3 position-independent identity +
+    // slice D upsert-by-identity reconciliation exist to fix -- "insert a
+    // comment line above a proven call site; reindex; assert the proof row
+    // for that call site is unchanged". Verified at the persistence layer
+    // directly (a hand-inserted external_proofs row simulating what a real
+    // SCIP verification would produce, same INSERT shape as
+    // cancelled_identity_baseline_preserves_legacy_graph_and_records_failure
+    // above) rather than driving real SCIP machinery, which this test
+    // doesn't need to exercise.
+    fn call_site_and_external_proof_survive_an_edit_that_only_shifts_absolute_position() {
+        let dir =
+            std::env::temp_dir().join(format!("ci_idx_v3_churn_regression_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("main.py"),
+            "def caller():\n    helper()\n\ndef helper():\n    pass\n",
+        )
+        .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
+
+        let (call_site_id, identity_version, start_rel, end_rel, start_byte): (
+            i64,
+            i64,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+        ) = conn
+            .query_row(
+                "SELECT id, identity_version, callee_start_rel, callee_end_rel, callee_start_byte \
+                 FROM call_sites WHERE callee_name = 'helper'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            identity_version, 3,
+            "caller() is a real enclosing symbol -- this call site must get v3 identity"
+        );
+        assert!(
+            start_rel.is_some() && end_rel.is_some(),
+            "v3 identity must carry relative offsets"
+        );
+
+        conn.execute(
+            "INSERT INTO external_proofs
+                (call_site_id, to_symbol, provider, source_file_hash,
+                 callee_start_byte, callee_end_byte, provider_fingerprint,
+                 context_fingerprint, status, observed_at)
+             VALUES (?1, 'main.py::helper', 'scip:test', 'irrelevant-hash',
+                     0, 1, 'test-provider', 'test-context', 'fresh', 0)",
+            [call_site_id],
+        )
+        .unwrap();
+        let proof_id: i64 = conn
+            .query_row(
+                "SELECT id FROM external_proofs WHERE call_site_id = ?1",
+                [call_site_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        // Insert a comment line ABOVE caller() -- shifts every byte offset
+        // inside caller() (including the helper() call) by a fixed amount,
+        // but the call's position RELATIVE to caller()'s own start is
+        // unchanged.
+        std::fs::write(
+            dir.join("main.py"),
+            "# a harmless comment, unrelated to caller/helper\ndef caller():\n    helper()\n\ndef helper():\n    pass\n",
+        )
+        .unwrap();
+        reindex_paths(&mut conn, &dir, &["main.py".to_string()]).unwrap();
+
+        let (new_id, new_identity_version, new_start_rel, new_end_rel, new_start_byte): (
+            i64,
+            i64,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+        ) = conn
+            .query_row(
+                "SELECT id, identity_version, callee_start_rel, callee_end_rel, callee_start_byte \
+                 FROM call_sites WHERE callee_name = 'helper'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap();
+
+        assert_eq!(
+            new_id, call_site_id,
+            "the call site's own id must survive an edit that only shifts its absolute \
+             position -- this is the entire point of v3 relative identity + upsert-by-identity \
+             reconciliation"
+        );
+        assert_eq!(new_identity_version, 3);
+        assert_eq!(
+            (new_start_rel, new_end_rel),
+            (start_rel, end_rel),
+            "relative offsets must be unchanged -- the call's position within caller() didn't move"
+        );
+        assert_ne!(
+            new_start_byte, start_byte,
+            "sanity check: the absolute byte position MUST have shifted (a comment line was \
+             inserted above caller()) -- if this fails the test fixture itself is wrong, not the \
+             code under test"
+        );
+
+        let surviving_proof_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM external_proofs \
+                 WHERE id = ?1 AND call_site_id = ?2 AND status = 'fresh'",
+                rusqlite::params![proof_id, call_site_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            surviving_proof_count, 1,
+            "the external_proofs row must survive the reindex byte-for-byte (same id, same \
+             call_site_id, still 'fresh') -- before slice D this proof would have been \
+             CASCADE-deleted because call_sites blindly deleted-and-reinserted every row for the \
+             file on any edit"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Layer-2 code chunks must track incremental reindex the same way symbols
     /// do: a changed file's stale chunks are replaced (not duplicated
     /// alongside the new ones), and a deleted file's chunks disappear too.
