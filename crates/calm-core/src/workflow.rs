@@ -21,7 +21,7 @@ pub const AGENTS_MD_MARKER_END: &str = "<!-- calm:workflow:end -->";
 /// appends its own contextually-correct trailer instead of baking one in
 /// here.
 pub const CALM_WORKFLOW_GUIDE: &str = "\
-CALM MCP tool workflow -- 8 stages, 39 tools, `suggested_next` on every response tells you what to call next:
+CALM MCP tool workflow -- 8 stages, 40 tools, `suggested_next` on every response tells you what to call next:
 1. Orient -- repo_overview() ALWAYS first, then hotspots()/fitness_report() as needed.
 2. Locate -- locate(query) (search+file_overview+symbol_info in 1 call) or search(query, kind=...).
 3. Inspect -- source(symbol) for a symbol-precise read, or understand(symbol) for locate+source+callers together.
