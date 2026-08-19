@@ -784,18 +784,35 @@ impl rmcp::ServerHandler for CalmServer {
         _context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<rmcp::model::ListToolsResult, rmcp::model::ErrorData> {
         let visible = self.current_visible_tool_names();
-        // `with_all_items` leaves result_type/ttl_ms/cache_scope (SEP-2549) at
-        // their no-cache-hint defaults -- Phase 3 of the MCP 2026-07-28 upgrade
-        // (docs/plans/2026-08-04-mcp-2026-07-28-upgrade-plan.md) is where this
-        // toolset already emits `tool_list_changed` on every `set_toolset`
-        // narrowing, so that's the natural cache-bust signal to wire up then.
+        // Phase 3 of the MCP 2026-07-28 upgrade (SEP-2549,
+        // docs/plans/2026-08-04-mcp-2026-07-28-upgrade-plan.md): explicitly set
+        // `ttl_ms`/`cache_scope` rather than leaving `with_all_items`'s
+        // no-cache-hint defaults (both `None`, omitted from the wire). Live-
+        // verified 2026-08-19: at least one MCP client (Claude Code / Antigravity
+        // cc_version 2.1.232.43a, negotiating protocol 2026-07-28) treats these
+        // as *required* fields on `tools/list` results — an omitted `ttlMs`/
+        // `cacheScope` fails that client's response schema validation outright,
+        // so `tools/list` never succeeds and zero tools register. The MCP spec
+        // itself treats them as optional-with-default (rmcp's own doc comment:
+        // "Defaults to CacheScope::Public when absent from the wire"), so this
+        // is arguably a stricter-than-spec client, but sending them explicitly
+        // costs nothing and unblocks every client either way.
+        // `cache_scope` = `Private`: the visible set is per-connection (preset +
+        // `set_toolset`), never global — see the Phase 3 plan note. `ttl_ms` is
+        // a safety-net cap; the primary invalidation signal is already the
+        // `tool_list_changed` notification `set_toolset` fires on every
+        // narrowing (`enable_tool_list_changed()` above), so this doesn't need
+        // to be short. Token-savings measurement (b4_token_efficiency) is still
+        // open follow-up work, not done here.
         Ok(rmcp::model::ListToolsResult::with_all_items(
             self.tool_router
                 .list_all()
                 .into_iter()
                 .filter(|t| visible.contains(t.name.as_ref()))
                 .collect(),
-        ))
+        )
+        .with_ttl_ms(900_000)
+        .with_cache_scope(rmcp::model::CacheScope::Private))
     }
 
     async fn call_tool(
@@ -946,9 +963,16 @@ impl rmcp::ServerHandler for CalmServer {
         Output = Result<rmcp::model::ListPromptsResult, rmcp::model::ErrorData>,
     > + Send
     + '_ {
+        // See `list_tools`'s comment for why `ttl_ms`/`cache_scope` are set
+        // explicitly (SEP-2549 client compatibility). `cache_scope` = `Public`
+        // here (not `Private` like `list_tools`): `ci_prompts()` is a static,
+        // connection-independent list, unlike the preset/`set_toolset`-scoped
+        // tool set.
         std::future::ready(Ok(rmcp::model::ListPromptsResult::with_all_items(
             ci_prompts(),
-        )))
+        )
+        .with_ttl_ms(900_000)
+        .with_cache_scope(rmcp::model::CacheScope::Public)))
     }
 
     fn get_prompt(
