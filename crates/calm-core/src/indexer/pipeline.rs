@@ -5097,18 +5097,20 @@ impl StructB {
         // (still an open question -- see design doc) -- it directly verifies
         // the persistence layer's own contract: a duplicate-identity call
         // site must be silently deduped, never crash the transaction.
-        let dir = std::env::temp_dir().join(format!("ci_idx_dupcallsite_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("a.rs"),
-            "fn helper() {}\nfn caller() {\n    helper();\n}\n",
-        )
-        .unwrap();
-
+        // PR#9 (docs/plans/2026-08-19-evidence-architecture-execution-plan.md
+        // Part E): no real file/real indexing pass here anymore -- persist_file
+        // now reconciles call_sites by IDENTITY for the whole path (upsert:
+        // update-in-place / insert / delete whatever isn't in the fresh set),
+        // not a pure blind-append. A real prior indexing pass would seed a
+        // REAL call_sites row for "a.rs" that this test's hand-built
+        // `extracted.call_sites` (below) doesn't include, and the new
+        // reconciliation would then (correctly, per its own contract) treat
+        // that real row as removed -- exactly what a previous version of this
+        // test tripped over when slice D landed. This test is about
+        // persist_file's in-batch dedup behavior specifically, which doesn't
+        // need any pre-existing state to exercise.
         let mut conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
-        run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
 
         let before: i64 = count(&conn, "SELECT COUNT(*) FROM call_sites");
 
@@ -5154,8 +5156,6 @@ impl StructB {
             before + 1,
             "exactly one of the two identical CallSiteData entries should have been persisted"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Regression for the import-graph false positive: a bare `use

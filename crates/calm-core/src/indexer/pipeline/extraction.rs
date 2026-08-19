@@ -711,56 +711,285 @@ pub(super) fn persist_file(
 ) -> rusqlite::Result<()> {
     insert_symbols_batch(tx, &extracted.symbols)?;
     insert_import_edges_batch(tx, &extracted.import_edges)?;
-    // `OR IGNORE`, not a plain INSERT: `idx_call_sites_current_identity` (schema.rs
-    // migrate_call_site_identity_v2) enforces one row per (from_path, enclosing_qn,
-    // callee_start_byte, callee_end_byte, edge_kind, identity_version) -- a real,
-    // reproducible tree-sitter extractor duplicate for that exact tuple (observed
-    // live indexing pallets/flask: a UNIQUE-constraint error here aborted the whole
-    // transaction, failing the ENTIRE file's index, not just this one row) must not
-    // be allowed to take down indexing for every other file in the batch. Every
-    // sibling INSERT into an identity-constrained table (`call_edges`, `import_edges`
-    // -- see indexer/edges.rs) already uses this exact `OR IGNORE` idiom; this one
-    // was the one place still using a bare INSERT against a constraint added after
-    // it was written. Skips are counted and surfaced via `tracing::debug!` below --
-    // fail-soft, not silently swallowed.
-    let mut stmt = tx.prepare(
-        "INSERT OR IGNORE INTO call_sites (from_path, enclosing_qn, callee_name, call_line, callee_start_byte, callee_end_byte, identity_version, confidence, receiver, target_class, looks_option_or_result_chained, module_hint, edge_kind, arg_count, import_path, target_type_kind, target_type_qn, callee_start_rel, callee_end_rel) \
+    reconcile_call_sites(tx, rel, &extracted.call_sites)?;
+    insert_code_chunks_batch(tx, rel, file_hash, &extracted.chunks)?;
+    crate::indexer::edges::insert_type_relations_batch(tx, &extracted.type_relations)?;
+    crate::indexer::edges::insert_symbol_effects_batch(tx, &extracted.effects)?;
+    Ok(())
+}
+
+/// PR#9 (docs/plans/2026-08-19-evidence-architecture-execution-plan.md
+/// Part E): reconciles `call_sites` for `rel` by IDENTITY instead of
+/// blindly replacing them -- the fix for the root cause documented on
+/// `driver::remove_file_rows`'s own doc comment (a blanket delete-then-
+/// reinsert gives every call site a brand-new `id` on every reindex, even
+/// an edit that changes nothing about a given call, churning every
+/// `external_proofs`/`evidence_conflicts`/`ambiguity_group_candidates`
+/// row FK'd to `call_sites.id` ON DELETE CASCADE). An existing row whose
+/// identity tuple (version-dependent: byte-absolute for v1/v2, relative-
+/// to-enclosing-symbol for v3+ -- matching `idx_call_sites_v2_identity`/
+/// `idx_call_sites_v3_identity` in db::schema exactly) matches a freshly
+/// extracted call site keeps its `id`, UPDATEd in place only if a non-
+/// identity field (confidence, receiver, target_class, target_type_kind/
+/// qn, looks_option_or_result_chained, module_hint, arg_count,
+/// import_path) actually changed -- a pure no-op write is skipped
+/// entirely. A fresh call site with no matching existing row is INSERTed
+/// (still `OR IGNORE`: two call sites in the SAME extraction batch can
+/// legitimately collide on identity -- see
+/// `persist_file_ignores_a_call_site_that_collides_on_the_full_identity_
+/// tuple` -- that case is unrelated to this reconciliation and still
+/// needs the same fail-soft handling it always did). An existing row with
+/// no matching fresh call site is DELETEd -- the call it represented
+/// really is gone (moved, renamed, or the code was removed), so CASCADE
+/// cleanup for it is correct, not churn.
+fn reconcile_call_sites(
+    tx: &rusqlite::Transaction,
+    rel: &str,
+    call_sites: &[CallSiteData],
+) -> rusqlite::Result<()> {
+    type ExistingRow = (
+        i64,            // id
+        i64,            // call_line
+        Option<i64>,    // callee_start_byte
+        Option<i64>,    // callee_end_byte
+        Option<i64>,    // callee_start_rel
+        Option<i64>,    // callee_end_rel
+        String,         // confidence
+        Option<String>, // receiver
+        Option<String>, // target_class
+        bool,           // looks_option_or_result_chained
+        Option<String>, // module_hint
+        Option<i64>,    // arg_count
+        Option<String>, // import_path
+        Option<String>, // target_type_kind
+        Option<String>, // target_type_qn
+    );
+    type IdentityKey = (String, String, Option<i64>, Option<i64>, String, i64);
+
+    let mut existing: HashMap<IdentityKey, ExistingRow> = HashMap::new();
+    {
+        let mut stmt = tx.prepare(
+            "SELECT id, enclosing_qn, callee_name, call_line, callee_start_byte, \
+                    callee_end_byte, callee_start_rel, callee_end_rel, edge_kind, \
+                    identity_version, confidence, receiver, target_class, \
+                    looks_option_or_result_chained, module_hint, arg_count, import_path, \
+                    target_type_kind, target_type_qn \
+             FROM call_sites WHERE from_path = ?1",
+        )?;
+        let rows = stmt
+            .query_map([rel], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, Option<i64>>(4)?,
+                    r.get::<_, Option<i64>>(5)?,
+                    r.get::<_, Option<i64>>(6)?,
+                    r.get::<_, Option<i64>>(7)?,
+                    r.get::<_, String>(8)?,
+                    r.get::<_, i64>(9)?,
+                    r.get::<_, String>(10)?,
+                    r.get::<_, Option<String>>(11)?,
+                    r.get::<_, Option<String>>(12)?,
+                    r.get::<_, i64>(13)? != 0,
+                    r.get::<_, Option<String>>(14)?,
+                    r.get::<_, Option<i64>>(15)?,
+                    r.get::<_, Option<String>>(16)?,
+                    r.get::<_, Option<String>>(17)?,
+                    r.get::<_, Option<String>>(18)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (
+            id,
+            enc_qn,
+            callee,
+            call_line,
+            sb,
+            eb,
+            sr,
+            er,
+            ek,
+            iv,
+            confidence,
+            receiver,
+            target_class,
+            looks,
+            module_hint,
+            arg_count,
+            import_path,
+            ttk,
+            ttq,
+        ) in rows
+        {
+            let (start, end) = if iv >= 3 { (sr, er) } else { (sb, eb) };
+            existing.insert(
+                (enc_qn, callee, start, end, ek, iv),
+                (
+                    id,
+                    call_line,
+                    sb,
+                    eb,
+                    sr,
+                    er,
+                    confidence,
+                    receiver,
+                    target_class,
+                    looks,
+                    module_hint,
+                    arg_count,
+                    import_path,
+                    ttk,
+                    ttq,
+                ),
+            );
+        }
+    }
+
+    let mut matched_ids: HashSet<i64> = HashSet::new();
+    // Deliberately updates call_line/callee_start_byte/callee_end_byte/
+    // callee_start_rel/callee_end_rel too, even though NONE of those are
+    // part of the v3 (or v2) identity match above: a v3 row can be the
+    // SAME logical call site (relative-to-enclosing-symbol offset
+    // unchanged) while its ABSOLUTE position legitimately shifts -- an
+    // edit anywhere else in the same enclosing symbol before this call,
+    // or a rename that changes byte lengths, moves `callee_start_byte`/
+    // `callee_end_byte`/`call_line` without touching identity at all.
+    // Leaving those columns stale here was a real bug caught by
+    // golden_graph_equivalence's own RenameFn mutation round: the
+    // "continued" (incrementally reconciled) row kept its pre-rename
+    // absolute bytes while "fresh" (full reindex) correctly had the
+    // post-rename ones, a real, visible divergence for anything that
+    // reads a call site's current position (e.g. `source`/navigation).
+    let mut update_stmt = tx.prepare(
+        "UPDATE call_sites SET call_line = ?1, callee_start_byte = ?2, callee_end_byte = ?3, \
+                callee_start_rel = ?4, callee_end_rel = ?5, confidence = ?6, receiver = ?7, \
+                target_class = ?8, looks_option_or_result_chained = ?9, module_hint = ?10, \
+                arg_count = ?11, import_path = ?12, target_type_kind = ?13, \
+                target_type_qn = ?14 \
+         WHERE id = ?15",
+    )?;
+    let mut insert_stmt = tx.prepare(
+        "INSERT OR IGNORE INTO call_sites (from_path, enclosing_qn, callee_name, call_line, \
+                callee_start_byte, callee_end_byte, callee_start_rel, callee_end_rel, \
+                identity_version, confidence, receiver, target_class, \
+                looks_option_or_result_chained, module_hint, edge_kind, arg_count, \
+                import_path, target_type_kind, target_type_qn) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
     )?;
+
     let mut skipped = 0u32;
-    for c in &extracted.call_sites {
-        let inserted = stmt.execute(rusqlite::params![
-            rel,
-            c.enclosing_qn,
-            c.callee,
-            c.line,
-            c.callee_start_byte,
-            c.callee_end_byte,
+    for c in call_sites {
+        let (start, end) = if c.identity_version >= 3 {
+            (c.callee_start_rel, c.callee_end_rel)
+        } else {
+            (c.callee_start_byte, c.callee_end_byte)
+        };
+        let key: IdentityKey = (
+            c.enclosing_qn.clone(),
+            c.callee.clone(),
+            start,
+            end,
+            c.edge_kind.clone(),
             c.identity_version,
-            c.confidence,
-            c.receiver,
-            c.target_class,
-            c.looks_option_or_result_chained as i64,
-            c.module_hint,
-            c.edge_kind,
-            c.arg_count,
-            c.import_path,
-            c.target_type_kind,
-            c.target_type_qn,
-            c.callee_start_rel,
-            c.callee_end_rel,
-        ])?;
-        if inserted == 0 {
-            skipped += 1;
+        );
+        if let Some((
+            id,
+            call_line,
+            sb,
+            eb,
+            sr,
+            er,
+            confidence,
+            receiver,
+            target_class,
+            looks,
+            module_hint,
+            arg_count,
+            import_path,
+            ttk,
+            ttq,
+        )) = existing.get(&key)
+        {
+            matched_ids.insert(*id);
+            let changed = *call_line != c.line
+                || *sb != c.callee_start_byte
+                || *eb != c.callee_end_byte
+                || *sr != c.callee_start_rel
+                || *er != c.callee_end_rel
+                || *confidence != c.confidence
+                || *receiver != c.receiver
+                || *target_class != c.target_class
+                || *looks != c.looks_option_or_result_chained
+                || *module_hint != c.module_hint
+                || *arg_count != c.arg_count
+                || *import_path != c.import_path
+                || *ttk != c.target_type_kind
+                || *ttq != c.target_type_qn;
+            if changed {
+                update_stmt.execute(rusqlite::params![
+                    c.line,
+                    c.callee_start_byte,
+                    c.callee_end_byte,
+                    c.callee_start_rel,
+                    c.callee_end_rel,
+                    c.confidence,
+                    c.receiver,
+                    c.target_class,
+                    c.looks_option_or_result_chained as i64,
+                    c.module_hint,
+                    c.arg_count,
+                    c.import_path,
+                    c.target_type_kind,
+                    c.target_type_qn,
+                    id,
+                ])?;
+            }
+        } else {
+            let inserted = insert_stmt.execute(rusqlite::params![
+                rel,
+                c.enclosing_qn,
+                c.callee,
+                c.line,
+                c.callee_start_byte,
+                c.callee_end_byte,
+                c.callee_start_rel,
+                c.callee_end_rel,
+                c.identity_version,
+                c.confidence,
+                c.receiver,
+                c.target_class,
+                c.looks_option_or_result_chained as i64,
+                c.module_hint,
+                c.edge_kind,
+                c.arg_count,
+                c.import_path,
+                c.target_type_kind,
+                c.target_type_qn,
+            ])?;
+            if inserted == 0 {
+                skipped += 1;
+            }
         }
     }
     if skipped > 0 {
         tracing::debug!(
-            "persist_file({rel}): {skipped} duplicate call_sites row(s) (identical from_path/enclosing_qn/callee_start_byte/callee_end_byte/edge_kind/identity_version) skipped by OR IGNORE"
+            "persist_file({rel}): {skipped} duplicate call_sites row(s) (identical identity tuple within this extraction batch) skipped by OR IGNORE"
         );
     }
-    insert_code_chunks_batch(tx, rel, file_hash, &extracted.chunks)?;
-    crate::indexer::edges::insert_type_relations_batch(tx, &extracted.type_relations)?;
-    crate::indexer::edges::insert_symbol_effects_batch(tx, &extracted.effects)?;
+
+    let stale_ids: Vec<i64> = existing
+        .values()
+        .map(|row| row.0)
+        .filter(|id| !matched_ids.contains(id))
+        .collect();
+    if !stale_ids.is_empty() {
+        let mut del_stmt = tx.prepare("DELETE FROM call_sites WHERE id = ?1")?;
+        for id in stale_ids {
+            del_stmt.execute([id])?;
+        }
+    }
+
     Ok(())
 }

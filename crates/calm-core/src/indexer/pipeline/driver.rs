@@ -48,16 +48,46 @@ use super::{
 };
 use crate::indexer::lang_constants::{is_recognized_unparsed_extension, language_for_extension};
 
-/// Drop all rows belonging to a single file (symbols, call sites, file_index).
+/// Drop all rows belonging to a single file (symbols, import_edges,
+/// file_index, code_chunks, type_relations, symbol_effects) -- EXCEPT
+/// `call_sites`, deliberately (PR#9,
+/// docs/plans/2026-08-19-evidence-architecture-execution-plan.md Part E):
+/// a blanket delete-then-reinsert here would give every call site in the
+/// file a brand-new `id` on every single reindex, even one that changes
+/// nothing about a given call -- and `external_proofs`/`evidence_
+/// conflicts`/`ambiguity_group_candidates` are all FK'd to `call_sites.id`
+/// `ON DELETE CASCADE`, so that churns every durable proof/conflict/
+/// ambiguity record for the whole file on every edit, defeating the whole
+/// point of the v3 position-independent identity these rows now carry
+/// (see `extraction::reconcile_call_sites`'s own doc comment). Callers
+/// that ARE re-extracting this same path immediately after (the common
+/// case) must call [`extraction::persist_file`] right after this, which
+/// reconciles `call_sites` by identity (update-in-place / insert / delete
+/// only what actually changed) instead of blindly replacing them.
+/// Callers where the file has genuinely been REMOVED (no re-extraction
+/// following) must call [`delete_call_sites_for_path`] explicitly --
+/// `remove_file_rows` alone is no longer sufficient to fully clear a
+/// deleted file's rows.
 /// Call edges are rebuilt globally by [`rebuild_graph`], so they are not touched here.
 fn remove_file_rows(tx: &rusqlite::Transaction, rel: &str) -> rusqlite::Result<()> {
     tx.execute("DELETE FROM symbols WHERE path = ?1", [rel])?;
-    tx.execute("DELETE FROM call_sites WHERE from_path = ?1", [rel])?;
     tx.execute("DELETE FROM import_edges WHERE from_path = ?1", [rel])?;
     tx.execute("DELETE FROM file_index WHERE path = ?1", [rel])?;
     tx.execute("DELETE FROM code_chunks WHERE path = ?1", [rel])?;
     tx.execute("DELETE FROM type_relations WHERE source_path = ?1", [rel])?;
     tx.execute("DELETE FROM symbol_effects WHERE source_path = ?1", [rel])?;
+    Ok(())
+}
+
+/// PR#9 companion to `remove_file_rows` (see that function's own doc
+/// comment for the full rationale): the explicit, unconditional
+/// `call_sites` cleanup for a path that has genuinely gone away -- no
+/// re-extraction is coming to reconcile against, so there is nothing to
+/// preserve an `id` FOR. CASCADE naturally cleans up `external_proofs`/
+/// `evidence_conflicts`/`ambiguity_group_candidates` for these rows,
+/// correctly -- the call sites really are gone, not just repositioned.
+fn delete_call_sites_for_path(tx: &rusqlite::Transaction, rel: &str) -> rusqlite::Result<()> {
+    tx.execute("DELETE FROM call_sites WHERE from_path = ?1", [rel])?;
     Ok(())
 }
 
@@ -404,6 +434,12 @@ pub fn reindex_changed_cancellable(
                     .names_delta
                     .extend(data.symbols.iter().map(|s| s.name.clone()));
                 persist_file(&tx, &c.rel, &c.hash, data)?;
+            } else {
+                // PR#9: no fresh call sites to reconcile call_sites against
+                // (unrecognized language) -- clean up explicitly, same as
+                // a genuinely-deleted path, since persist_file (which now
+                // owns call_sites reconciliation) never runs in this branch.
+                delete_call_sites_for_path(&tx, &c.rel)?;
             }
             upsert_file_index(
                 &tx,
@@ -423,6 +459,7 @@ pub fn reindex_changed_cancellable(
         if !seen_paths.contains(path) {
             summary.names_delta.extend(names_for_path(&tx, path)?);
             remove_file_rows(&tx, path)?;
+            delete_call_sites_for_path(&tx, path)?;
             summary.deleted += 1;
             summary.changed_paths.push(path.clone());
         }
@@ -535,6 +572,7 @@ pub fn reindex_paths(
             if existing_hash.is_some() {
                 summary.names_delta.extend(names_for_path(&tx, rel)?);
                 remove_file_rows(&tx, rel)?;
+                delete_call_sites_for_path(&tx, rel)?;
                 summary.deleted += 1;
                 summary.changed_paths.push(rel.clone());
             }
@@ -573,6 +611,11 @@ pub fn reindex_paths(
                 .names_delta
                 .extend(data.symbols.iter().map(|s| s.name.clone()));
             persist_file(&tx, rel, &hash, data)?;
+        } else {
+            // PR#9: see the identical branch in reindex_changed_cancellable
+            // for why this is needed now that remove_file_rows no longer
+            // touches call_sites.
+            delete_call_sites_for_path(&tx, rel)?;
         }
         upsert_file_index(
             &tx,
