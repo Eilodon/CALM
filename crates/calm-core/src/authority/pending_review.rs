@@ -429,7 +429,10 @@ mod tests {
         assert_eq!(outcome, AgentRelayOutcome::Decided("approved"));
         let got = get_pending_review(&conn, &id).unwrap().unwrap();
         assert_eq!(got.status, "approved");
-        assert_eq!(got.decided_by.as_deref(), Some("agent_relay_after_elicitation"));
+        assert_eq!(
+            got.decided_by.as_deref(),
+            Some("agent_relay_after_elicitation")
+        );
     }
 
     #[test]
@@ -471,6 +474,9 @@ mod tests {
         let digest = crate::indexer::pipeline::hash_content(&review.diff_preview);
         decline_pending_review(&conn, &id, "cli_manual_review").unwrap();
         let outcome = decide_via_agent_relay(&conn, &id, &digest, true).unwrap();
-        assert_eq!(outcome, AgentRelayOutcome::AlreadyDecided("declined".to_string()));
+        assert_eq!(
+            outcome,
+            AgentRelayOutcome::AlreadyDecided("declined".to_string())
+        );
     }
 }
