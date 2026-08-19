@@ -1,0 +1,10 @@
+{
+  "category": "regression_sanity",
+  "workstream": "guard (no WS change should regress this)",
+  "language": "rust",
+  "call_site": {"path": "src/caller.rs", "line": 6, "callee_name": "write"},
+  "expected_targets": ["src/telemetry.rs::write"],
+  "wrong_targets": ["src/caller.rs::write"],
+  "gate": "must_prefer_explicit_qualifier",
+  "note": "crate::telemetry::write() explicit qualified call, plus a same-file private write() decoy. EMPIRICAL: call_edges correctly targets src/telemetry.rs::write at 'resolved' (module_hint preference winning over same-file decoy, as designed at pipeline.rs:1354). PASS. Regression guard only -- WS2/WS5 must not weaken module_hint's priority over same_file/same_dir."
+}

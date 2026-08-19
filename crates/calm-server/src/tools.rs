@@ -6091,6 +6091,205 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// WS1 (docs/plans/2026-08-18-context-intelligence-upgrade-plan.md):
+    /// `direct_by_confidence` must give an exact per-tier breakdown of
+    /// `direct` (never counting the `ambiguous` bucket), summing to
+    /// `direct_count` — so a caller can tell "12 confirmed" apart from "12,
+    /// mostly textual" without re-deriving it from the raw `direct` array.
+    #[test]
+    fn callers_reports_direct_by_confidence_breakdown() {
+        let dir = std::env::temp_dir().join(format!("ci_callers_breakdown_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.rs::target', 'target', 'function', 'rust', 'a.rs', 1, 1, 'fn target()', '', 'target', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+            for (from_sym, from_path, confidence, line) in [
+                ("f1.rs::one", "f1.rs", "formal", 1),
+                ("f2.rs::two", "f2.rs", "resolved", 2),
+                ("f3.rs::three", "f3.rs", "resolved", 3),
+                ("f4.rs::four", "f4.rs", "inferred", 4),
+                ("f5.rs::five", "f5.rs", "textual", 5),
+                ("f6.rs::six", "f6.rs", "textual", 6),
+                ("f7.rs::seven", "f7.rs", "textual", 7),
+                ("f8.rs::eight", "f8.rs", "ambiguous", 8),
+            ] {
+                conn.execute(
+                    "INSERT INTO call_edges (from_symbol, to_symbol, from_path, to_path, edge_confidence, call_site_line)
+                     VALUES (?1, 'a.rs::target', ?2, 'a.rs', ?3, ?4)",
+                    rusqlite::params![from_sym, from_path, confidence, line],
+                )
+                .unwrap();
+            }
+        }
+        let v = jv(
+            server.callers(rmcp::handler::server::wrapper::Parameters(CallersParams {
+                symbol: "target".into(),
+                path: Some("a.rs".into()),
+                line: Some(1),
+                transitive: false,
+                max_depth: None,
+                if_none_match: None,
+            })),
+        );
+        assert_eq!(v["direct_count"], 7, "1 formal + 2 resolved + 1 inferred + 3 textual");
+        assert_eq!(v["ambiguous_count"], 1);
+        let breakdown = &v["direct_by_confidence"];
+        assert_eq!(breakdown["formal"], 1);
+        assert_eq!(breakdown["resolved"], 2);
+        assert_eq!(breakdown["inferred"], 1);
+        assert_eq!(breakdown["textual"], 3);
+        assert_eq!(
+            breakdown["formal"].as_u64().unwrap()
+                + breakdown["resolved"].as_u64().unwrap()
+                + breakdown["inferred"].as_u64().unwrap()
+                + breakdown["textual"].as_u64().unwrap(),
+            v["direct_count"].as_u64().unwrap(),
+            "breakdown must always sum to direct_count"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// WS3 (docs/plans/2026-08-18-context-intelligence-upgrade-plan.md,
+    /// server-side counterpart of calm-core's
+    /// `test_overflow_candidates_recorded_as_ambiguity_group_not_dropped_silently`):
+    /// `callers()` itself must surface an `ambiguity_groups` row matching
+    /// this symbol's bare name — as `unresolved_group_count`, and as a
+    /// caveat even when `direct_count`/`ambiguous_count` are both nonzero
+    /// (unlike the generic zero-usage caveats, this one is not conditioned
+    /// on an otherwise-empty result).
+    #[test]
+    fn callers_reports_unresolved_ambiguity_groups() {
+        let dir = std::env::temp_dir().join(format!("ci_callers_ambgroup_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.rs::helper', 'helper', 'function', 'rust', 'a.rs', 1, 1, 'fn helper()', '', 'helper', 1, 0, 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO call_edges (from_symbol, to_symbol, from_path, to_path, edge_confidence, call_site_line)
+                 VALUES ('b.rs::caller', 'a.rs::helper', 'b.rs', 'a.rs', 'resolved', 2)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO call_sites (id, from_path, enclosing_qn, callee_name, call_line, identity_version, confidence, edge_kind)
+                 VALUES (1, 'c.rs', 'c.rs::use_it', 'helper', 9, 1, 'ambiguous', 'call')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO ambiguity_groups (call_site_id, from_path, candidate_group_key, candidate_count, reason)
+                 VALUES (1, 'c.rs', 'helper', 25, 'unscoped_candidates_exceeded_max_callee_candidates')",
+                [],
+            )
+            .unwrap();
+        }
+        let v = jv(
+            server.callers(rmcp::handler::server::wrapper::Parameters(CallersParams {
+                symbol: "helper".into(),
+                path: Some("a.rs".into()),
+                line: Some(1),
+                transitive: false,
+                max_depth: None,
+                if_none_match: None,
+            })),
+        );
+        assert_eq!(v["direct_count"], 1, "the confirmed caller is unaffected");
+        assert_eq!(
+            v["unresolved_group_count"], 1,
+            "one ambiguity_groups row matches this symbol's bare name 'helper'"
+        );
+        assert_eq!(
+            v["caveat"]["class"], "unresolved_ambiguity_group",
+            "the caveat fires even though direct_count > 0 — unresolved groups are a lower-bound warning, not conditioned on an otherwise-empty result"
+        );
+        let msg = v["caveat"]["message"].as_str().unwrap();
+        assert!(msg.contains('1'), "caveat must cite the site count: {msg}");
+        assert!(msg.contains("25"), "caveat must cite the widest candidate_count: {msg}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// WS5 (docs/plans/2026-08-18-context-intelligence-upgrade-plan.md):
+    /// `callers()` must sort `ambiguous` by `candidate_rank` so a
+    /// `same_dir`-preferred alternate (rank 0) surfaces before a demoted one
+    /// (rank 1+), without promoting it out of `ambiguous` or claiming it's
+    /// the sole resolved target. Seeds `call_edges` directly (not via a real
+    /// C fixture through `run_indexing_pipeline` -- that path is already
+    /// covered by
+    /// `test_c_same_directory_call_ranks_local_first_but_keeps_sibling_candidate`
+    /// in calm-core) specifically to isolate `callers()`'s OWN sort logic
+    /// from the resolver that produces `candidate_rank` in the first place.
+    #[test]
+    fn callers_sorts_ambiguous_by_candidate_rank() {
+        let dir = std::env::temp_dir().join(format!("ci_callers_rank_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('lib.c::target', 'target', 'function', 'c', 'lib.c', 1, 1, 'int target(void)', '', 'target', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+            // Inserted rank-1 (alternate) BEFORE rank-0 (preferred) so a
+            // naive "keep insertion order" implementation would fail this
+            // test -- the sort must actually reorder, not happen to already
+            // agree with insertion order.
+            conn.execute(
+                "INSERT INTO call_edges (from_symbol, to_symbol, from_path, to_path, edge_confidence, call_site_line, candidate_rank)
+                 VALUES ('b.c::alternate_caller', 'lib.c::target', 'b.c', 'lib.c', 'ambiguous', 2, 1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO call_edges (from_symbol, to_symbol, from_path, to_path, edge_confidence, call_site_line, candidate_rank)
+                 VALUES ('a.c::preferred_caller', 'lib.c::target', 'a.c', 'lib.c', 'ambiguous', 1, 0)",
+                [],
+            )
+            .unwrap();
+        }
+        let v = jv(
+            server.callers(rmcp::handler::server::wrapper::Parameters(CallersParams {
+                symbol: "target".into(),
+                path: Some("lib.c".into()),
+                line: Some(1),
+                transitive: false,
+                max_depth: None,
+                if_none_match: None,
+            })),
+        );
+        let ambiguous = v["ambiguous"].as_array().unwrap();
+        assert_eq!(ambiguous.len(), 2, "both candidates must survive as ambiguous");
+        assert_eq!(
+            ambiguous[0]["symbol"], "a.c::preferred_caller",
+            "the rank-0 (preferred) candidate must surface first despite being \
+             inserted second: got {ambiguous:?}"
+        );
+        assert_eq!(
+            ambiguous[1]["symbol"], "b.c::alternate_caller",
+            "the rank-1 (alternate) candidate must surface second: got {ambiguous:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn callers_if_none_match_returns_not_modified() {
         let dir = std::env::temp_dir().join(format!("ci_callers_etag_{}", std::process::id()));
@@ -6409,6 +6608,59 @@ mod tests {
         assert_eq!(second["not_modified"], true, "{second}");
         assert_eq!(second["direct"].as_array().unwrap().len(), 0, "{second}");
         assert_eq!(second["direct_count"], 1, "{second}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// WS1 (docs/plans/2026-08-18-context-intelligence-upgrade-plan.md):
+    /// same breakdown contract as `callers_reports_direct_by_confidence_breakdown`,
+    /// mirrored for `callees`.
+    #[test]
+    fn callees_reports_direct_by_confidence_breakdown() {
+        let dir = std::env::temp_dir().join(format!("ci_callees_breakdown_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.rs::source', 'source', 'function', 'rust', 'a.rs', 1, 1, 'fn source()', '', 'source', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+            for (to_sym, to_path, confidence, line) in [
+                ("f1.rs::one", "f1.rs", "formal", 1),
+                ("f2.rs::two", "f2.rs", "resolved", 2),
+                ("f3.rs::three", "f3.rs", "inferred", 3),
+                ("f4.rs::four", "f4.rs", "textual", 4),
+                ("f5.rs::five", "f5.rs", "ambiguous", 5),
+            ] {
+                conn.execute(
+                    "INSERT INTO call_edges (from_symbol, to_symbol, from_path, to_path, edge_confidence, call_site_line)
+                     VALUES ('a.rs::source', ?1, 'a.rs', ?2, ?3, ?4)",
+                    rusqlite::params![to_sym, to_path, confidence, line],
+                )
+                .unwrap();
+            }
+        }
+        let v = jv(
+            server.callees(rmcp::handler::server::wrapper::Parameters(CalleesParams {
+                symbol: "source".into(),
+                path: Some("a.rs".into()),
+                line: Some(1),
+                transitive: false,
+                max_depth: None,
+                if_none_match: None,
+            })),
+        );
+        assert_eq!(v["direct_count"], 4, "1 formal + 1 resolved + 1 inferred + 1 textual");
+        assert_eq!(v["ambiguous_count"], 1);
+        let breakdown = &v["direct_by_confidence"];
+        assert_eq!(breakdown["formal"], 1);
+        assert_eq!(breakdown["resolved"], 1);
+        assert_eq!(breakdown["inferred"], 1);
+        assert_eq!(breakdown["textual"], 1);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

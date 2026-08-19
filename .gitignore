@@ -63,6 +63,10 @@ __pycache__/
 # resolution benchmark's cloned OSS corpora — external repos, not ours to commit
 benchmarks/resolution/corpus/
 
+# WS0 resolution-precision fixtures are hand-authored and committed, but each
+# fixture's own transient index (rebuilt fresh every run) is not
+benchmarks/resolution_precision/fixtures/*/.calm/
+
 # OS / editor
 .DS_Store
 Thumbs.db

@@ -1,0 +1,39 @@
+{
+  "category": "fanout_over_cap",
+  "workstream": "WS3",
+  "language": "python",
+  "call_site": {
+    "path": "caller.py",
+    "line": 2,
+    "callee_name": "helper"
+  },
+  "expected_targets": [
+    "decoy_01.py::helper",
+    "decoy_02.py::helper",
+    "decoy_03.py::helper",
+    "decoy_04.py::helper",
+    "decoy_05.py::helper",
+    "decoy_06.py::helper",
+    "decoy_07.py::helper",
+    "decoy_08.py::helper",
+    "decoy_09.py::helper",
+    "decoy_10.py::helper",
+    "decoy_11.py::helper",
+    "decoy_12.py::helper",
+    "decoy_13.py::helper",
+    "decoy_14.py::helper",
+    "decoy_15.py::helper",
+    "decoy_16.py::helper",
+    "decoy_17.py::helper",
+    "decoy_18.py::helper",
+    "decoy_19.py::helper",
+    "decoy_20.py::helper",
+    "decoy_21.py::helper",
+    "decoy_22.py::helper",
+    "decoy_23.py::helper",
+    "decoy_24.py::helper",
+    "decoy_25.py::helper"
+  ],
+  "gate": "must_not_be_silent",
+  "note": "25 same-named decoys, NO import (no scope evidence for the formal overlay to exploit). EMPIRICAL: call_sites.confidence='textual' but call_edges is COMPLETELY EMPTY (0 rows) -- the site vanishes from callers()/reference_impact entirely, unlike fixture A where the overlay's gap-insert saved it. This is D3's live, still-fully-open form: MAX_CALLEE_CANDIDATES=20 drops the candidate list to Vec::new() at pipeline.rs:1483, and nothing downstream (no import to bind) can recover it. FLAGSHIP fixture for WS3 -- pass criterion after WS3 ships: an ambiguity_groups row exists for this call site with candidate_count=25, and callers()/reference_impact surface it instead of silence. [expected_targets lists all 25 equivalent decoys -- none is more 'correct' than another by fixture construction; any single one being emitted would satisfy recall, since the defect under test is total silence, not which decoy wins.]"
+}

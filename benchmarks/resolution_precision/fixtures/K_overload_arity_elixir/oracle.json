@@ -1,0 +1,9 @@
+{
+  "category": "arity_gate_regression_sanity",
+  "workstream": "guard (B3/A' arity gate, already shipped)",
+  "language": "elixir",
+  "call_site": {"path": "lib/caller.ex", "line": 3, "callee_name": "greet"},
+  "expected_targets": ["lib/greeter.ex::Greeter::greet/2"],
+  "gate": "blocked_missing_build_feature",
+  "note": "BLOCKED, not run in this baseline: elixir support requires rebuilding calm-cli with `--features lang-elixir` (per benchmarks/resolution/README.md's own build invocation) -- the default-features target/release/calm binary used for this baseline produced ZERO call_sites/symbols for this fixture (elixir isn't compiled in). Re-run once a lang-elixir-enabled binary is available; until then this fixture documents a build-config limitation of the BASELINE RUN, not a resolver defect."
+}

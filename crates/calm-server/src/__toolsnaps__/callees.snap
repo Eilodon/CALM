@@ -169,6 +169,38 @@
           "edge_kind"
         ]
       },
+      "ConfidenceBreakdown": {
+        "description": "Confidence-tier breakdown of a `direct` caller/callee list — see\n`CallersOutput::direct_by_confidence`/`CalleesOutput::direct_by_confidence`.\nThe four fields are exhaustive for `direct` (which never contains\n`ambiguous` edges, those are always split into their own `ambiguous`\nlist) — they always sum to `direct_count`.",
+        "type": "object",
+        "properties": {
+          "formal": {
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0
+          },
+          "resolved": {
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0
+          },
+          "inferred": {
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0
+          },
+          "textual": {
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "formal",
+          "resolved",
+          "inferred",
+          "textual"
+        ]
+      },
       "TransitiveEntry": {
         "type": "object",
         "properties": {
@@ -287,6 +319,10 @@
         "type": "integer",
         "format": "uint",
         "minimum": 0
+      },
+      "direct_by_confidence": {
+        "description": "See `CallersOutput::direct_by_confidence`.",
+        "$ref": "#/$defs/ConfidenceBreakdown"
       },
       "direct_truncated": {
         "description": "See `CallersOutput::direct_truncated` — same\n`config.callees.direct_list_cap`.",

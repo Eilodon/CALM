@@ -1,0 +1,10 @@
+{
+  "category": "regression_sanity",
+  "workstream": "guard (no WS change should regress this)",
+  "language": "python+rust",
+  "call_site": {"path": "lib.py", "line": 6, "callee_name": "foo"},
+  "expected_targets": ["lib.py::foo"],
+  "wrong_targets": ["lib.rs::foo"],
+  "gate": "must_not_cross_language",
+  "note": "python foo() and rust foo() coexist; python caller must resolve to python's own foo, never rust's. EMPIRICAL: call_edges correctly targets lib.py::foo at 'formal' (same-language filter + formal overlay both working). PASS. Regression guard only."
+}

@@ -1,11 +1,23 @@
 use super::common::*;
 use super::*;
 
-/// `(symbol, path, edge_confidence, edge_kind, line, formal_source)` --
-/// D2 (2026-07-30 stack-graphs-demotion-lever) pushed this past clippy's
-/// type_complexity threshold as a bare tuple; named here purely to satisfy
-/// that lint, same row shape serves both `callers`' and `callees`' queries.
-type EdgeRow = (String, String, String, String, Option<i64>, Option<String>);
+/// `(symbol, path, edge_confidence, edge_kind, line, formal_source,
+/// candidate_rank)` -- D2 (2026-07-30 stack-graphs-demotion-lever) pushed
+/// this past clippy's type_complexity threshold as a bare tuple; named here
+/// purely to satisfy that lint, same row shape serves both `callers`' and
+/// `callees`' queries. `candidate_rank` (WS5, docs/plans/2026-08-18-context-
+/// intelligence-upgrade-plan.md) is `0` for the overwhelming majority of
+/// rows (no ranking signal) and only ever `1+` for a `same_dir`-demoted
+/// alternate -- see `CallerEntry`'s own doc comment for how it's consumed.
+type EdgeRow = (
+    String,
+    String,
+    String,
+    String,
+    Option<i64>,
+    Option<String>,
+    i64,
+);
 
 #[rmcp::tool_router(router = "trace_tool_router", vis = "pub(crate)")]
 impl CalmServer {
@@ -45,9 +57,32 @@ impl CalmServer {
 
             let config = self.config();
 
-            let all: Vec<CallerEntry> = {
+            // WS3 (docs/plans/2026-08-18-context-intelligence-upgrade-plan.md):
+            // call sites elsewhere whose surviving candidate set for this
+            // bare name exceeded MAX_CALLEE_CANDIDATES never produced an
+            // edge to any target, this symbol possibly included -- neither
+            // `direct` nor `ambiguous` below can ever see them. Row count
+            // (not summed candidate_count) so the caveat's "N call sites"
+            // is a real count of distinct sites, not inflated by width.
+            let (unresolved_group_count, unresolved_group_max_candidates): (usize, usize) = {
                 let mut stmt = match conn.prepare(
-                    "SELECT ce.from_symbol, ce.from_path, ce.edge_confidence, ce.call_site_line, ce.edge_kind, ce.formal_source
+                    "SELECT COUNT(*), COALESCE(MAX(candidate_count), 0) \
+                     FROM ambiguity_groups WHERE candidate_group_key = ?1",
+                ) {
+                    Ok(s) => s,
+                    Err(e) => return db_error_resolved(e),
+                };
+                match stmt.query_row(rusqlite::params![c.name], |r| {
+                    Ok((r.get::<_, i64>(0)? as usize, r.get::<_, i64>(1)? as usize))
+                }) {
+                    Ok(v) => v,
+                    Err(e) => return db_error_resolved(e),
+                }
+            };
+
+            let all: Vec<(CallerEntry, i64)> = {
+                let mut stmt = match conn.prepare(
+                    "SELECT ce.from_symbol, ce.from_path, ce.edge_confidence, ce.call_site_line, ce.edge_kind, ce.formal_source, ce.candidate_rank
                      FROM call_edges ce
                      LEFT JOIN symbols s ON s.qualified_name = ce.from_symbol
                      WHERE ce.to_symbol = ?1 AND ce.ruled_out_by_scip = 0
@@ -65,6 +100,7 @@ impl CalmServer {
                             row.get::<_, String>(4)?,
                             row.get::<_, Option<i64>>(3)?,
                             row.get::<_, Option<String>>(5)?,
+                            row.get::<_, i64>(6)?,
                         ))
                     }) {
                         Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
@@ -72,22 +108,27 @@ impl CalmServer {
                     };
                 let preview_items: Vec<(String, Option<i64>)> = rows
                     .iter()
-                    .map(|(_, path, _, _, line, _)| (path.clone(), *line))
+                    .map(|(_, path, _, _, line, _, _)| (path.clone(), *line))
                     .collect();
                 let previews = line_previews_batched(&self.project_root, &preview_items);
                 rows.into_iter()
                     .zip(previews)
                     .map(
                         |(
-                            (symbol, _path, edge_confidence, edge_kind, line, formal_source),
+                            (symbol, _path, edge_confidence, edge_kind, line, formal_source, candidate_rank),
                             preview,
-                        )| CallerEntry {
-                            symbol,
-                            edge_confidence,
-                            formal_source,
-                            edge_kind,
-                            line,
-                            preview,
+                        )| {
+                            (
+                                CallerEntry {
+                                    symbol,
+                                    edge_confidence,
+                                    formal_source,
+                                    edge_kind,
+                                    line,
+                                    preview,
+                                },
+                                candidate_rank,
+                            )
                         },
                     )
                     .collect()
@@ -118,11 +159,31 @@ impl CalmServer {
             // They are not confirmed callers of this specific symbol, so
             // surfacing them as `direct` collapses precision — bucket them
             // separately for the caller to weigh.
-            let (ambiguous, direct): (Vec<CallerEntry>, Vec<CallerEntry>) = all
+            let (mut ambiguous_ranked, direct_ranked): (
+                Vec<(CallerEntry, i64)>,
+                Vec<(CallerEntry, i64)>,
+            ) = all
                 .into_iter()
-                .partition(|e| e.edge_confidence == "ambiguous");
+                .partition(|(e, _)| e.edge_confidence == "ambiguous");
+            // WS5 (docs/plans/2026-08-18-context-intelligence-upgrade-plan.md,
+            // D5): stable sort by `candidate_rank` so a `same_dir`-preferred
+            // alternate (rank 0) surfaces before a demoted one (rank 1+)
+            // WITHOUT claiming to be the sole resolved target -- both stay in
+            // `ambiguous`, just reordered. Ties (equal rank, the overwhelming
+            // majority of rows, which never got a ranking signal at all) keep
+            // their existing from_path/call_site_line order from the SQL
+            // query above (`sort_by_key` is stable).
+            ambiguous_ranked.sort_by_key(|(_, rank)| *rank);
+            let ambiguous: Vec<CallerEntry> =
+                ambiguous_ranked.into_iter().map(|(e, _)| e).collect();
+            let direct: Vec<CallerEntry> = direct_ranked.into_iter().map(|(e, _)| e).collect();
             let count = direct.len();
             let ambiguous_count = ambiguous.len();
+            // Computed once, before any later truncation, so it always
+            // reflects the TRUE full `direct` set — same discipline as
+            // `count`/`ambiguous_count` above.
+            let direct_by_confidence =
+                ConfidenceBreakdown::from_entries(direct.iter().map(|e| e.edge_confidence.as_str()));
 
             // Fingerprint of the (direct, ambiguous) answer — lets a caller
             // re-checking this same symbol after an unrelated edit elsewhere
@@ -134,6 +195,8 @@ impl CalmServer {
                     edges_ready: self.edges_ready(),
                     direct: Vec::new(),
                     direct_count: count,
+                    direct_by_confidence,
+                    unresolved_group_count,
                     ambiguous: Vec::new(),
                     ambiguous_count,
                     direct_truncated: None,
@@ -174,13 +237,27 @@ impl CalmServer {
             // dispatch protocol methods, decorator-registered handlers, ...)
             // get a distinct caveat: for them, zero is the expected,
             // permanent shape, not a "maybe dead code" signal.
-            let no_usage_caveat = (count == 0 && ambiguous_count == 0).then(|| {
-                if c.is_entry_point {
+            //
+            // WS3: unresolved ambiguity groups take priority over both of
+            // those — they are strictly more specific/actionable (a real,
+            // named reason direct_count could be a lower bound) and, unlike
+            // the zero-usage caveats, are relevant even when direct_count or
+            // ambiguous_count is already nonzero.
+            let no_usage_caveat = if unresolved_group_count > 0 {
+                Some(Caveat::unresolved_ambiguity_groups(
+                    &p.symbol,
+                    unresolved_group_count,
+                    unresolved_group_max_candidates,
+                ))
+            } else if count == 0 && ambiguous_count == 0 {
+                Some(if c.is_entry_point {
                     Caveat::entry_point_dispatch(&p.symbol)
                 } else {
                     Caveat::no_direct_usage(&p.symbol)
-                }
-            });
+                })
+            } else {
+                None
+            };
 
             // Cap the raw per-entry dump AFTER everything above (etag, sn,
             // caveat) has already looked at the full sets — direct_count/
@@ -199,6 +276,8 @@ impl CalmServer {
                 edges_ready: self.edges_ready(),
                 direct,
                 direct_count: count,
+                direct_by_confidence,
+                unresolved_group_count,
                 ambiguous,
                 ambiguous_count,
                 direct_truncated,
@@ -252,9 +331,9 @@ impl CalmServer {
 
             let config = self.config();
 
-            let all: Vec<CalleeEntry> = {
+            let all: Vec<(CalleeEntry, i64)> = {
                 let mut stmt = match conn.prepare(
-                    "SELECT ce.to_symbol, ce.to_path, ce.edge_confidence, ce.call_site_line, ce.edge_kind, ce.formal_source
+                    "SELECT ce.to_symbol, ce.to_path, ce.edge_confidence, ce.call_site_line, ce.edge_kind, ce.formal_source, ce.candidate_rank
                      FROM call_edges ce
                      LEFT JOIN symbols s ON s.qualified_name = ce.to_symbol
                      WHERE ce.from_symbol = ?1 AND ce.ruled_out_by_scip = 0
@@ -272,6 +351,7 @@ impl CalmServer {
                             row.get::<_, String>(4)?,
                             row.get::<_, Option<i64>>(3)?,
                             row.get::<_, Option<String>>(5)?,
+                            row.get::<_, i64>(6)?,
                         ))
                     }) {
                         Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
@@ -285,23 +365,28 @@ impl CalmServer {
                 let from_path = c.path.clone();
                 let preview_items: Vec<(String, Option<i64>)> = rows
                     .iter()
-                    .map(|(_, _, _, _, line, _)| (from_path.clone(), *line))
+                    .map(|(_, _, _, _, line, _, _)| (from_path.clone(), *line))
                     .collect();
                 let previews = line_previews_batched(&self.project_root, &preview_items);
                 rows.into_iter()
                     .zip(previews)
                     .map(
                         |(
-                            (symbol, path, edge_confidence, edge_kind, line, formal_source),
+                            (symbol, path, edge_confidence, edge_kind, line, formal_source, candidate_rank),
                             preview,
-                        )| CalleeEntry {
-                            symbol,
-                            path,
-                            edge_confidence,
-                            formal_source,
-                            edge_kind,
-                            line,
-                            preview,
+                        )| {
+                            (
+                                CalleeEntry {
+                                    symbol,
+                                    path,
+                                    edge_confidence,
+                                    formal_source,
+                                    edge_kind,
+                                    line,
+                                    preview,
+                                },
+                                candidate_rank,
+                            )
                         },
                     )
                     .collect()
@@ -325,11 +410,23 @@ impl CalmServer {
                 (None, None, None)
             };
 
-            let (ambiguous, direct): (Vec<CalleeEntry>, Vec<CalleeEntry>) = all
+            let (mut ambiguous_ranked, direct_ranked): (
+                Vec<(CalleeEntry, i64)>,
+                Vec<(CalleeEntry, i64)>,
+            ) = all
                 .into_iter()
-                .partition(|e| e.edge_confidence == "ambiguous");
+                .partition(|(e, _)| e.edge_confidence == "ambiguous");
+            // See `callers`' identical `candidate_rank` sort (WS5) — same
+            // rationale, same stability guarantee.
+            ambiguous_ranked.sort_by_key(|(_, rank)| *rank);
+            let ambiguous: Vec<CalleeEntry> =
+                ambiguous_ranked.into_iter().map(|(e, _)| e).collect();
+            let direct: Vec<CalleeEntry> = direct_ranked.into_iter().map(|(e, _)| e).collect();
             let count = direct.len();
             let ambiguous_count = ambiguous.len();
+            // See `callers`' identical computation — same discipline.
+            let direct_by_confidence =
+                ConfidenceBreakdown::from_entries(direct.iter().map(|e| e.edge_confidence.as_str()));
 
             // Fingerprint of the (direct, ambiguous) answer — same
             // conditional-fetch pattern as `callers`/`source`.
@@ -340,6 +437,7 @@ impl CalmServer {
                     edges_ready: self.edges_ready(),
                     direct: Vec::new(),
                     direct_count: count,
+                    direct_by_confidence,
                     ambiguous: Vec::new(),
                     ambiguous_count,
                     direct_truncated: None,
@@ -376,6 +474,7 @@ impl CalmServer {
                 edges_ready: self.edges_ready(),
                 direct,
                 direct_count: count,
+                direct_by_confidence,
                 ambiguous,
                 ambiguous_count,
                 direct_truncated,
@@ -777,10 +876,28 @@ impl CalmServer {
                 .filter(|h| h.classification == "textual_only")
                 .count();
 
+            // WS3 (docs/plans/2026-08-18-context-intelligence-upgrade-plan.md):
+            // sibling of `review_count`, but for call sites that had more
+            // than MAX_CALLEE_CANDIDATES same-named candidates and so never
+            // became any edge at all -- see `CallersOutput::unresolved_group_count`.
+            // Row count, matching that field's own "distinct sites" contract.
+            let unresolved_many_count: usize = {
+                let mut stmt = match conn.prepare(
+                    "SELECT COUNT(*) FROM ambiguity_groups WHERE candidate_group_key = ?1",
+                ) {
+                    Ok(s) => s,
+                    Err(e) => return db_error_resolved(e),
+                };
+                match stmt.query_row(rusqlite::params![c.name], |r| r.get::<_, i64>(0)) {
+                    Ok(n) => n as usize,
+                    Err(e) => return db_error_resolved(e),
+                }
+            };
+
             let truncated = hits.len() > REFERENCE_IMPACT_LIMIT;
             hits.truncate(REFERENCE_IMPACT_LIMIT);
 
-            let sn = if review_count > 0 || textual_only_count > 0 {
+            let sn = if review_count > 0 || textual_only_count > 0 || unresolved_many_count > 0 {
                 suggested(
                     "edit_context",
                     "Some references need manual review before a mechanical rename",
@@ -800,6 +917,7 @@ impl CalmServer {
                 likely_change_count,
                 review_count,
                 textual_only_count,
+                unresolved_many_count,
                 truncated: truncated.then_some(true),
                 suggested_next: self.filter_sn(sn),
             })
@@ -993,6 +1111,39 @@ pub(crate) struct CallersParams {
     pub(crate) if_none_match: Option<String>,
 }
 
+/// Confidence-tier breakdown of a `direct` caller/callee list — see
+/// `CallersOutput::direct_by_confidence`/`CalleesOutput::direct_by_confidence`.
+/// The four fields are exhaustive for `direct` (which never contains
+/// `ambiguous` edges, those are always split into their own `ambiguous`
+/// list) — they always sum to `direct_count`.
+#[derive(Serialize, JsonSchema, Default)]
+pub(crate) struct ConfidenceBreakdown {
+    pub(crate) formal: usize,
+    pub(crate) resolved: usize,
+    pub(crate) inferred: usize,
+    pub(crate) textual: usize,
+}
+
+impl ConfidenceBreakdown {
+    fn from_entries<'a>(edge_confidences: impl Iterator<Item = &'a str>) -> Self {
+        let mut b = ConfidenceBreakdown::default();
+        for c in edge_confidences {
+            match c {
+                "formal" => b.formal += 1,
+                "resolved" => b.resolved += 1,
+                "inferred" => b.inferred += 1,
+                "textual" => b.textual += 1,
+                // `ambiguous`/`unresolved` never appear in `direct` — see
+                // this struct's doc comment. Silently ignored rather than
+                // panicking so an unrecognized future tier degrades to an
+                // undercount instead of crashing the tool.
+                _ => {}
+            }
+        }
+        b
+    }
+}
+
 #[derive(Serialize, JsonSchema)]
 pub(crate) struct CallersOutput {
     pub(crate) symbol: String,
@@ -1007,6 +1158,20 @@ pub(crate) struct CallersOutput {
     pub(crate) ambiguous: Vec<CallerEntry>,
     pub(crate) ambiguous_count: usize,
     pub(crate) direct_count: usize,
+    /// Breakdown of `direct` by `edge_confidence` — always sums to
+    /// `direct_count` (`ambiguous` is excluded from `direct` entirely, see
+    /// `CallersOutput::ambiguous` above). Exists because `direct_count`
+    /// alone reads as "N confirmed callers" when it may be mostly
+    /// `textual` (found the name, not confirmed the call is real) — see
+    /// docs/plans/2026-08-18-context-intelligence-upgrade-plan.md WS1.
+    pub(crate) direct_by_confidence: ConfidenceBreakdown,
+    /// Count of `ambiguity_groups` rows (WS3) whose `candidate_group_key`
+    /// matches this symbol's bare name — call sites elsewhere that had more
+    /// than `MAX_CALLEE_CANDIDATES` same-named candidates and so produced
+    /// no edge to ANY of them, this symbol possibly included. Neither
+    /// `direct` nor `ambiguous` above can ever contain these — they are
+    /// invisible to both. See `Caveat::unresolved_ambiguity_groups`.
+    pub(crate) unresolved_group_count: usize,
     /// `true` when `direct` was cut down to `config.callers.direct_list_cap`
     /// entries — `direct_count` above is still the true total regardless.
     /// A real hub symbol can have 50-200+ direct callers; without this cap
@@ -1084,6 +1249,8 @@ pub(crate) struct CalleesOutput {
     pub(crate) ambiguous: Vec<CalleeEntry>,
     pub(crate) ambiguous_count: usize,
     pub(crate) direct_count: usize,
+    /// See `CallersOutput::direct_by_confidence`.
+    pub(crate) direct_by_confidence: ConfidenceBreakdown,
     /// See `CallersOutput::direct_truncated` — same
     /// `config.callees.direct_list_cap`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1164,6 +1331,12 @@ pub(crate) struct ReferenceImpactOutput {
     pub(crate) likely_change_count: usize,
     pub(crate) review_count: usize,
     pub(crate) textual_only_count: usize,
+    /// Count of `ambiguity_groups` rows (WS3) whose `candidate_group_key`
+    /// matches this symbol's bare name — sibling of `review_count`, but for
+    /// call sites that never became any edge at all (too many same-named
+    /// candidates), so they cannot appear in `references` alongside the
+    /// other four classifications. See `CallersOutput::unresolved_group_count`.
+    pub(crate) unresolved_many_count: usize,
     /// `true` when `references` was cut down to `REFERENCE_IMPACT_LIMIT`
     /// entries.
     #[serde(skip_serializing_if = "Option::is_none")]

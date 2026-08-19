@@ -1,0 +1,10 @@
+{
+  "category": "context_plus_comparison_no_regex_false_positive",
+  "workstream": "none (comparison point vs Context+ get_blast_radius)",
+  "language": "java+css",
+  "call_site": {"path": "Caller.java", "line": 3, "callee_name": "print"},
+  "expected_targets": ["PetTypeFormatter.java::PetTypeFormatter::print"],
+  "must_not_appear_as_call_edge": ["src/main/resources/static/css/petclinic.css"],
+  "gate": "structural_immunity_to_substring_false_positive",
+  "note": "Mirrors the exact Context+ get_blast_radius bug documented live in benchmarks/b15_cross_lang_competitor_ab/README.md (print-color-adjust CSS false positive). EMPIRICAL: call_edges correctly targets PetTypeFormatter.java::PetTypeFormatter::print at 'inferred' -- the CSS file is never a candidate at all (CALM's tree-sitter call graph structurally cannot treat a .css rule as a call site; this isn't a resolver heuristic, it's categorical -- CSS has no call-site grammar production). PASS by construction. Note: reference_impact's own grep floor (word-boundary \\bprint\\b) WOULD still match the CSS text if reference_impact were run on this fixture -- verified analytically from trace.rs's own code, not re-run live here -- but reference_impact always buckets a pure-grep hit as 'textual_only', never 'must_change'/'likely_change' (those require a real call_edge or import_edge), so CALM never over-claims confidence on it the way Context+'s get_blast_radius does. Comparison fixture, not a pass/fail gate on the resolver."
+}

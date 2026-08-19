@@ -16,6 +16,13 @@ pub struct CallEdge {
     /// `indexer::sql` module, for a view/proc's FROM/JOIN read of a table —
     /// see `call_edges.edge_kind`'s migration comment in `db::schema`).
     pub edge_kind: String,
+    /// WS5 (docs/plans/2026-08-18-context-intelligence-upgrade-plan.md, D5):
+    /// `0` = preferred (e.g. a same-directory match when other candidates
+    /// exist outside the caller's directory), `1+` = alternate -- ordinal,
+    /// not a score. `0` for every edge with no ranking signal (the
+    /// overwhelming majority) -- see `call_edges.candidate_rank`'s own
+    /// schema comment.
+    pub candidate_rank: i64,
 }
 
 pub struct ImportEdge {
@@ -60,8 +67,8 @@ pub fn insert_call_edges_batch(tx: &Transaction, edges: &[CallEdge]) -> rusqlite
     // so a redundant re-insert (e.g. the same edge extracted twice in one
     // pass) collapses to a no-op instead of a duplicate row.
     let mut stmt = tx.prepare(
-        "INSERT OR IGNORE INTO call_edges (from_symbol, to_symbol, call_site_line, call_site_id, edge_confidence, from_path, to_path, edge_kind)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
+        "INSERT OR IGNORE INTO call_edges (from_symbol, to_symbol, call_site_line, call_site_id, edge_confidence, from_path, to_path, edge_kind, candidate_rank)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"
     )?;
     for e in edges {
         stmt.execute(rusqlite::params![
@@ -72,7 +79,8 @@ pub fn insert_call_edges_batch(tx: &Transaction, edges: &[CallEdge]) -> rusqlite
             e.edge_confidence,
             e.from_path,
             e.to_path,
-            e.edge_kind
+            e.edge_kind,
+            e.candidate_rank
         ])?;
     }
     Ok(())
@@ -266,6 +274,7 @@ mod tests {
             from_path: Some("a.rs".to_string()),
             to_path: Some("b.rs".to_string()),
             edge_kind: "call".to_string(),
+            candidate_rank: 0,
         }];
         insert_call_edges_batch(&tx, &edges).unwrap();
         tx.commit().unwrap();

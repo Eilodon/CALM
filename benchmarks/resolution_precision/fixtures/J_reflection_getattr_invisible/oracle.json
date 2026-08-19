@@ -1,0 +1,9 @@
+{
+  "category": "known_limitation_documented",
+  "workstream": "none (V3 Law 1: discovery/static-analysis honesty, not a defect)",
+  "language": "python",
+  "call_site": {"path": "caller.py", "line": 6, "callee_name": "fn"},
+  "expected_targets": [],
+  "gate": "informational_must_stay_honest",
+  "note": "getattr(handlers, method_name)() -- dynamic dispatch, target only known at runtime from a caller-supplied string. EMPIRICAL: call_sites captures 'getattr' (builtin, no local candidate, 0 edges) and 'fn' (local var call, no candidate, 0 edges) -- handlers.py::process_payment never appears anywhere in call_edges. This is CORRECT, honest behavior: CALM never fabricates a static edge it cannot prove. Not a defect to fix -- matches V3's 'discovery is not evidence' law and the analysis's point that reflection is an inherent blind spot for ANY static call graph (CALM or Context+ alike). Kept as a documented-limitation fixture, not a pass/fail gate."
+}

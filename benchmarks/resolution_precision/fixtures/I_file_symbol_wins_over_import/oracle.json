@@ -1,0 +1,10 @@
+{
+  "category": "shadowing_false_confidence",
+  "workstream": "NEW FINDING (D8) -- not in original WS2-WS6 scope, route to a follow-up",
+  "language": "python",
+  "call_site": {"path": "caller.py", "line": 9, "callee_name": "name"},
+  "expected_targets": ["caller.py::name"],
+  "wrong_but_confidently_emitted_targets": ["external.py::name"],
+  "gate": "false_confidence_headline_example",
+  "note": "`from external import name` at top of file, then a LATER same-file `def name():` in the same module scope -- real Python semantics: the later def unconditionally shadows/overwrites the import binding, so calling name() always invokes the local one, never external.py's. EMPIRICAL, NEW DEFECT FOUND LIVE (2026-08-18, not anticipated by the original source-level analysis): call_edges emits TWO edges from the SAME call site: (1) caller.py::name at 'resolved' (CORRECT -- tier1's file-symbol-over-import priority rule working as designed) AND (2) external.py::name at 'formal' (WRONG -- the bundled stack-graphs overlay independently proved the import binding resolves and inserted a second edge, without modeling that the later same-scope def shadows it). This is a genuine, live false_confidence_rate data point: a 'formal' (highest tier) edge pointing at a target real Python semantics never actually calls. Root cause: the overlay's per-scope resolution and the static resolver's shadowing-priority rule are two independent authorities that can now disagree, and nothing reconciles them -- the overlay is allowed to ADD an edge the static layer already correctly rejected. Flag prominently in the WS0 README; do not silently fold into WS2's scope -- this is about overlay/static-layer reconciliation, arguably closer to WS6 territory or a new WS7."
+}

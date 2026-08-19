@@ -1,0 +1,9 @@
+{
+  "category": "inheritance_closure",
+  "workstream": "WS4",
+  "language": "java",
+  "call_site": {"path": "Caller.java", "line": 3, "callee_name": "foo"},
+  "expected_targets": ["Base.java::Base::foo"],
+  "gate": "confidence_upgrade",
+  "note": "Child extends Base (no override); call via Child-typed variable x.foo(). EMPIRICAL: call_edges correctly TARGETS Base.java::Base::foo (recall is fine, the 62b4df2 fallback works) but at edge_confidence='ambiguous' (weak_receiver_fallback path), not 'resolved'/'inferred'. FLAGSHIP fixture for WS4 -- pass criterion after WS4 ships: same target, confidence upgraded to 'resolved' or 'inferred' via real inheritance-closure traversal (ctx.by_name_class walking type_relations ancestors), not the unscoped weak-receiver fallback."
+}

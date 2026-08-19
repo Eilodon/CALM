@@ -1,0 +1,10 @@
+{
+  "category": "same_dir_destructive_narrowing",
+  "workstream": "WS5",
+  "language": "c",
+  "call_site": {"path": "dir1/caller.c", "line": 4, "callee_name": "foo"},
+  "expected_targets": ["dir2/real.c::foo"],
+  "wrong_targets_currently_emitted": ["dir1/decoy.c::foo"],
+  "gate": "must_not_lose_true_target",
+  "note": "True target dir2/real.c::foo; a same-directory decoy dir1/decoy.c::foo sits next to the caller. EMPIRICAL, CONFIRMED D5 LIVE: call_edges emits EXACTLY ONE edge, to the WRONG decoy (dir1/decoy.c::foo) at 'textual' confidence. The true target in dir2 is completely ABSENT from call_edges -- not even as an ambiguous candidate. This is the destructive-narrowing defect exactly as predicted: same_dir() replaces the candidate set instead of ranking within it. FLAGSHIP fixture for WS5 -- pass criterion after WS5 ships: dir2/real.c::foo must appear (at minimum as a co-candidate, ideally ranked/labeled appropriately), not silently discarded."
+}

@@ -166,6 +166,38 @@
           "edge_kind"
         ]
       },
+      "ConfidenceBreakdown": {
+        "description": "Confidence-tier breakdown of a `direct` caller/callee list — see\n`CallersOutput::direct_by_confidence`/`CalleesOutput::direct_by_confidence`.\nThe four fields are exhaustive for `direct` (which never contains\n`ambiguous` edges, those are always split into their own `ambiguous`\nlist) — they always sum to `direct_count`.",
+        "type": "object",
+        "properties": {
+          "formal": {
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0
+          },
+          "resolved": {
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0
+          },
+          "inferred": {
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0
+          },
+          "textual": {
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "formal",
+          "resolved",
+          "inferred",
+          "textual"
+        ]
+      },
       "TransitiveEntry": {
         "type": "object",
         "properties": {
@@ -281,6 +313,16 @@
         "minimum": 0
       },
       "direct_count": {
+        "type": "integer",
+        "format": "uint",
+        "minimum": 0
+      },
+      "direct_by_confidence": {
+        "description": "Breakdown of `direct` by `edge_confidence` — always sums to\n`direct_count` (`ambiguous` is excluded from `direct` entirely, see\n`CallersOutput::ambiguous` above). Exists because `direct_count`\nalone reads as \"N confirmed callers\" when it may be mostly\n`textual` (found the name, not confirmed the call is real) — see\ndocs/plans/2026-08-18-context-intelligence-upgrade-plan.md WS1.",
+        "$ref": "#/$defs/ConfidenceBreakdown"
+      },
+      "unresolved_group_count": {
+        "description": "Count of `ambiguity_groups` rows (WS3) whose `candidate_group_key`\nmatches this symbol's bare name — call sites elsewhere that had more\nthan `MAX_CALLEE_CANDIDATES` same-named candidates and so produced\nno edge to ANY of them, this symbol possibly included. Neither\n`direct` nor `ambiguous` above can ever contain these — they are\ninvisible to both. See `Caveat::unresolved_ambiguity_groups`.",
         "type": "integer",
         "format": "uint",
         "minimum": 0

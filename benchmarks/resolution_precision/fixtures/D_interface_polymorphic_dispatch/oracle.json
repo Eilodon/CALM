@@ -1,0 +1,9 @@
+{
+  "category": "polymorphic_dispatch",
+  "workstream": "WS4-extension (deferred to follow-up, not first WS4 PR)",
+  "language": "java",
+  "call_site": {"path": "Caller.java", "line": 3, "callee_name": "handle"},
+  "expected_targets": ["AHandler.java::AHandler::handle", "BHandler.java::BHandler::handle"],
+  "gate": "informational",
+  "note": "Handler interface, 2 implementors (AHandler, BHandler), call via Handler-typed variable. EMPIRICAL: resolves to a SINGLE edge targeting Handler.java::Handler::handle (the interface's own abstract method declaration) at 'inferred' confidence -- neither real implementation. This is a reasonable-but-incomplete answer: it never falsely claims either impl, but a caller of callers()/reference_impact on AHandler.handle or BHandler.handle would see ZERO callers, which is a real recall gap for legitimate dynamic dispatch. Matches analysis §32's 'polymorphic dispatch set' proposal. Informational only -- scoped OUT of the first WS4 PR (which targets straight inheritance, not multi-implementor interfaces); revisit as a follow-up once WS4's ancestor-closure lands."
+}

@@ -196,7 +196,8 @@ CREATE TABLE IF NOT EXISTS call_edges (
     evidence_state  TEXT NOT NULL DEFAULT 'unverified',
     from_path       TEXT,
     to_path         TEXT,
-    edge_kind       TEXT NOT NULL DEFAULT 'call'
+    edge_kind       TEXT NOT NULL DEFAULT 'call',
+    candidate_rank  INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_call_edges_from  ON call_edges(from_symbol);
@@ -253,7 +254,8 @@ CREATE TABLE IF NOT EXISTS call_sites (
     looks_option_or_result_chained INTEGER NOT NULL DEFAULT 0,
     module_hint  TEXT,
     edge_kind    TEXT NOT NULL DEFAULT 'call',
-    arg_count    INTEGER
+    arg_count    INTEGER,
+    import_path  TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_call_sites_from   ON call_sites(from_path);
 CREATE INDEX IF NOT EXISTS idx_call_sites_callee ON call_sites(callee_name);
@@ -280,6 +282,28 @@ CREATE TABLE IF NOT EXISTS external_proofs (
     UNIQUE(call_site_id, to_symbol, provider)
 );
 CREATE INDEX IF NOT EXISTS idx_external_proofs_status ON external_proofs(status, provider);
+
+-- WS3 (docs/plans/2026-08-18-context-intelligence-upgrade-plan.md, D3): a call
+-- site whose bare-name candidate set exceeded MAX_CALLEE_CANDIDATES used to be
+-- silently dropped to zero call_edges rows -- unknown read identically to
+-- nonexistent in callers()/reference_impact. This records that the site WAS
+-- seen and had real candidates, just too many to trust any single one --
+-- surfaced as an explicit caveat instead of silence. Same CASCADE-on-reindex
+-- lifecycle as external_proofs: a call_sites row deleted by reindex takes its
+-- ambiguity_groups row(s) with it, so staleness is structurally impossible.
+-- from_path is denormalized from call_sites (same reasoning as call_edges'
+-- own from_path/to_path columns) so a delta-scoped reindex can clear stale
+-- rows with a plain path-scoped DELETE, no join required.
+CREATE TABLE IF NOT EXISTS ambiguity_groups (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    call_site_id        INTEGER NOT NULL REFERENCES call_sites(id) ON DELETE CASCADE,
+    from_path           TEXT NOT NULL,
+    candidate_group_key TEXT NOT NULL,
+    candidate_count     INTEGER NOT NULL,
+    reason              TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ambiguity_groups_call_site ON ambiguity_groups(call_site_id);
+CREATE INDEX IF NOT EXISTS idx_ambiguity_groups_from_path ON ambiguity_groups(from_path);
 
 -- D4 migration observability. This is diagnostic-only and deliberately lives
 -- outside the graph baseline transaction: readers still see an all-old or
@@ -1005,6 +1029,12 @@ fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
     // call node (see `parser::count_arguments_node`) -- NULL when it
     // doesn't (every language this isn't wired for yet), never a guessed 0.
     migrate_add_column(conn, "call_sites", "arg_count", "INTEGER")?;
+    // WS2 (docs/plans/2026-08-18-context-intelligence-upgrade-plan.md, D1):
+    // `resolve_tier1`'s import-binding target for a bare call resolved via
+    // `ctx.import_map` (`from foo import bar` -> `Some("foo")`) -- see
+    // `indexer::pipeline::CallSiteData::import_path`'s doc comment. NULL
+    // when tier-1 resolved via a same-file symbol or didn't resolve at all.
+    migrate_add_column(conn, "call_sites", "import_path", "TEXT")?;
     conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_call_edges_to ON call_edges(to_symbol);")?;
     // Set by the SCIP overlay (`calm_core::scip::ingest`) when a reference at a
     // given call site is proven — via real type-checked evidence — to NOT be
@@ -1051,6 +1081,20 @@ fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
          WHERE evidence_state = 'unverified'
            AND formal_source IN ('scip', 'lsp')",
         [],
+    )?;
+    // WS5 (docs/plans/2026-08-18-context-intelligence-upgrade-plan.md, D5):
+    // `0` = preferred (e.g. a same-directory match), `1+` = alternate,
+    // ordinal not a score. The minimal persistence primitive needed to make
+    // `same_dir`'s directory preference a NON-destructive ranker instead of
+    // a filter that silently drops the true target when it lives outside
+    // the caller's directory -- see `resolve_sites_to_edges`'s `same_dir`
+    // handling for where this gets populated, and `callers`/`callees` for
+    // where the `ambiguous` list is sorted by it.
+    migrate_add_column(
+        conn,
+        "call_edges",
+        "candidate_rank",
+        "INTEGER NOT NULL DEFAULT 0",
     )?;
     // SQL indexer (8-language plan P3.3): distinguishes a genuine call
     // (proc/trigger → proc via CALL/EXEC) from a mere read reference

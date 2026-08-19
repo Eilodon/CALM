@@ -118,6 +118,11 @@ type CallSiteRow = (
     Option<String>,
     String,
     Option<i64>,
+    // WS2: `import_path` — see `CallSiteData::import_path`'s doc comment.
+    // Appended at the end (not inserted positionally) so every existing
+    // positional destructure elsewhere in this file needs only one
+    // trailing `_`/binding added, not a full renumbering.
+    Option<String>,
 );
 
 /// Collect tier-0 source files under `root` via the shared `crate::walk`
@@ -311,6 +316,18 @@ struct CallSiteData {
     /// for `indexer::sql`'s references (no call-argument concept) and for
     /// any language whose grammar's arg-count extraction isn't verified.
     arg_count: Option<i64>,
+    /// WS2 (docs/plans/2026-08-18-context-intelligence-upgrade-plan.md, D1):
+    /// `resolve_tier1`'s `ResolveResult::resolved_path` — the actual import
+    /// binding target (`from foo import bar` → `Some("foo")`) when the
+    /// callee resolved via `ctx.import_map`. Previously computed and
+    /// immediately discarded (only `.confidence` was kept) — this preserves
+    /// it so `resolve_sites_to_edges` can narrow candidates by the REAL
+    /// import target instead of re-guessing among every same-named symbol.
+    /// `None` when tier-1 resolved via a same-file symbol (no import
+    /// involved) or didn't resolve at all — never a source of new
+    /// candidates on its own, only a narrowing filter, same posture as
+    /// `module_hint` above.
+    import_path: Option<String>,
 }
 
 /// Everything extracted from a single file's source, before any DB I/O.
@@ -436,6 +453,7 @@ fn extract_file_data(
                 module_hint: None,
                 edge_kind: r.edge_kind.to_string(),
                 arg_count: None,
+                import_path: None,
             })
             .collect();
         return ExtractedFile {
@@ -621,6 +639,12 @@ fn extract_file_data(
             let mut confidence;
             let mut target_class: Option<String> = None;
             let mut module_hint = c.module_hint.clone();
+            // WS2: set only by the tier-1 `else` branch below (a real
+            // `ctx.import_map` hit) — every other branch (type-path receiver,
+            // tier-2, C# static-access, whole-module require/import) leaves
+            // this `None`, same "narrowing filter only, never a guess" posture
+            // as `module_hint`.
+            let mut import_path: Option<String> = None;
 
             if c.receiver_is_type_path
                 && let Some(receiver) = &c.receiver
@@ -670,7 +694,9 @@ fn extract_file_data(
                 confidence = EdgeConfidence::Inferred;
                 target_class = Some(effective_receiver);
             } else {
-                confidence = resolver.resolve_tier1(&c.callee, &ctx, &aliases).confidence;
+                let tier1 = resolver.resolve_tier1(&c.callee, &ctx, &aliases);
+                confidence = tier1.confidence;
+                import_path = tier1.resolved_path;
                 if confidence == EdgeConfidence::Textual
                     && let Some(receiver) = &c.receiver
                     && let Some(cls) =
@@ -762,6 +788,7 @@ fn extract_file_data(
                 module_hint,
                 edge_kind: "call".to_string(),
                 arg_count: c.arg_count,
+                import_path,
             });
         }
     }
@@ -911,8 +938,8 @@ fn persist_file(
     // it was written. Skips are counted and surfaced via `tracing::debug!` below --
     // fail-soft, not silently swallowed.
     let mut stmt = tx.prepare(
-        "INSERT OR IGNORE INTO call_sites (from_path, enclosing_qn, callee_name, call_line, callee_start_byte, callee_end_byte, identity_version, confidence, receiver, target_class, looks_option_or_result_chained, module_hint, edge_kind, arg_count) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+        "INSERT OR IGNORE INTO call_sites (from_path, enclosing_qn, callee_name, call_line, callee_start_byte, callee_end_byte, identity_version, confidence, receiver, target_class, looks_option_or_result_chained, module_hint, edge_kind, arg_count, import_path) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
     )?;
     let mut skipped = 0u32;
     for c in &extracted.call_sites {
@@ -931,6 +958,7 @@ fn persist_file(
             c.module_hint,
             c.edge_kind,
             c.arg_count,
+            c.import_path,
         ])?;
         if inserted == 0 {
             skipped += 1;
@@ -975,6 +1003,22 @@ struct ResolutionCtx<'a> {
     /// arity, `is_variadic` true when the last param is `...T`). Absent for
     /// every other language until its own arity extraction is verified.
     arity_by_qn: HashMap<String, (i64, bool)>,
+    /// WS4 (docs/plans/2026-08-18-context-intelligence-upgrade-plan.md, D4):
+    /// class/interface BARE name (matching `target_class`/`by_name_class`'s
+    /// own keying, not a qualified_name -- see `build_inheritance_closure`'s
+    /// doc comment for why) → its transitive ancestors (extends/implements),
+    /// grouped by depth (`levels[0]` = direct parents, `levels[1]` =
+    /// grandparents, ...), cycle-safe, depth-bounded. Level-grouped rather
+    /// than a flat closest-first list specifically so
+    /// `resolve_via_inheritance_closure` can tell "exactly one ancestor at
+    /// the nearest depth declares this" (real, confident evidence) apart
+    /// from "two DIFFERENT ancestors at the SAME nearest depth both declare
+    /// it" (a genuine tie -- e.g. `interface Mixed extends IA, IB` where
+    /// both declare the same method name -- which must never be resolved by
+    /// picking whichever happens to come first in source order). See
+    /// `build_inheritance_closure` for the hard `resolved`-confidence-only
+    /// gate on which `type_relations` rows may feed this.
+    inheritance_closure: HashMap<String, Vec<Vec<String>>>,
 }
 
 /// Build the candidate-lookup tables `resolve_sites_to_edges` narrows
@@ -1072,6 +1116,8 @@ fn build_resolution_context<'a>(
         }
     }
 
+    let inheritance_closure = build_inheritance_closure(tx)?;
+
     Ok(ResolutionCtx {
         by_name,
         by_name_class,
@@ -1080,7 +1126,146 @@ fn build_resolution_context<'a>(
         caller_usings,
         namespace_map,
         arity_by_qn,
+        inheritance_closure,
     })
+}
+
+const MAX_INHERITANCE_DEPTH: usize = 12;
+
+/// WS4 (docs/plans/2026-08-18-context-intelligence-upgrade-plan.md, D4):
+/// class/interface qualified_name -> its transitive `extends`/`implements`
+/// ancestors, closest-first (multi-source BFS), cycle-safe (a `visited` set
+/// per start node), bounded to `MAX_INHERITANCE_DEPTH` hops so a pathological
+/// or accidentally-cyclic relation chain can never loop or blow up cost.
+///
+/// **Hard gate, non-negotiable (post-WS2 review):** only `type_relations`
+/// rows whose OWN `confidence` is `resolved` (or, once formal type
+/// resolution exists, `formal`) ever feed this closure -- NEVER `textual`.
+/// `extract_file_data`/`graph::type_resolve::resolve_cross_file_type_relations`
+/// already stamp each relation with its own confidence (`resolved` for a
+/// real same-file or unambiguous cross-file class match, `textual` when the
+/// target text didn't resolve to any known symbol -- see
+/// `edges::TypeRelationData`). A `textual` ancestor relation is exactly the
+/// same class of weak evidence `resolve_sites_to_edges` already refuses to
+/// trust for a call (`weak_receiver`) -- feeding it here would fix Law 2 on
+/// the call graph while silently reintroducing the identical violation one
+/// layer up, through the type graph. Depends on
+/// `graph::type_resolve::resolve_cross_file_type_relations` having already
+/// run this pass (both `rebuild_graph` and `incremental_graph_update` call
+/// it before `build_resolution_context` specifically so this closure never
+/// sees last-pass-stale `to_symbol`/`confidence` values).
+fn build_inheritance_closure(
+    tx: &rusqlite::Transaction,
+) -> rusqlite::Result<HashMap<String, Vec<Vec<String>>>> {
+    // `target_class` (this closure's own lookup key -- see
+    // `resolve_via_inheritance_closure`'s call site) is always a BARE class
+    // name: `resolve_tier2`/the Rust `effective_receiver`/etc. paths that set
+    // it never had a qualified_name available to use, the same limitation
+    // `ctx.by_name_class`'s own `(name, class)` key already has. But
+    // `type_relations.from_symbol`/`to_symbol` are real qualified names. This
+    // closure is therefore built keyed by BARE name, translated from the
+    // qualified `type_relations` rows through a `symbols` reverse lookup --
+    // inheriting the exact same "two classes named the same thing in
+    // different files collide" limitation `by_name_class` already accepts,
+    // not a new one WS4 introduces.
+    let qn_to_name: HashMap<String, String> = {
+        let mut stmt = tx.prepare("SELECT qualified_name, name FROM symbols")?;
+        stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<rusqlite::Result<HashMap<_, _>>>()?
+    };
+    let direct_qn: Vec<(String, String)> = {
+        let mut stmt = tx.prepare(
+            "SELECT from_symbol, to_symbol FROM type_relations \
+             WHERE relation_kind IN ('extends', 'implements') AND confidence = 'resolved' \
+             AND to_symbol IS NOT NULL",
+        )?;
+        stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let mut direct_parents: HashMap<String, Vec<String>> = HashMap::new();
+    for (child_qn, parent_qn) in direct_qn {
+        let (Some(child), Some(parent)) =
+            (qn_to_name.get(&child_qn), qn_to_name.get(&parent_qn))
+        else {
+            continue;
+        };
+        direct_parents
+            .entry(child.clone())
+            .or_default()
+            .push(parent.clone());
+    }
+
+    let mut closure: HashMap<String, Vec<Vec<String>>> = HashMap::new();
+    for start in direct_parents.keys() {
+        let mut visited: HashSet<String> = HashSet::new();
+        visited.insert(start.clone());
+        let mut levels: Vec<Vec<String>> = Vec::new();
+        let mut frontier: Vec<String> = vec![start.clone()];
+        let mut depth = 0;
+        while !frontier.is_empty() && depth < MAX_INHERITANCE_DEPTH {
+            let mut next: Vec<String> = Vec::new();
+            for node in &frontier {
+                if let Some(parents) = direct_parents.get(node) {
+                    for p in parents {
+                        if visited.insert(p.clone()) {
+                            next.push(p.clone());
+                        }
+                    }
+                }
+            }
+            if !next.is_empty() {
+                levels.push(next.clone());
+            }
+            frontier = next;
+            depth += 1;
+        }
+        closure.insert(start.clone(), levels);
+    }
+    Ok(closure)
+}
+
+/// WS4: called only when `cls`'s own `by_name_class` entry for `callee`
+/// missed but `cls` itself is a real project symbol (the exact gate the
+/// caller below already applies before reaching here). Walks
+/// `ctx.inheritance_closure`'s LEVELS nearest-first (mirroring real single-
+/// inheritance/interface method-resolution order -- a nearer ancestor's own
+/// declaration is what a real call actually reaches) and, at the first level
+/// with ANY declaring ancestor, unions every match across every ancestor AT
+/// THAT LEVEL. Confident only when that union is a singleton: e.g.
+/// `interface Mixed extends IA, IB` where both `IA` and `IB` declare the
+/// same method name is a genuine tie at depth 1 -- picking whichever
+/// happened to come first in source order would be exactly the kind of
+/// unscoped guess this function exists to avoid, so a >1 union at the
+/// nearest declaring level stops here rather than either guessing or
+/// incorrectly continuing past it to a farther, spuriously-unique level.
+/// Returns `None` (fall through unchanged to the existing unscoped `by_name`
+/// fallback) on no hit anywhere in the closure, or a tied hit at the
+/// nearest declaring level -- WS4 deliberately defers the interface/multi-
+/// implementor "legitimate polymorphism" case (the plan's own future
+/// `polymorphic` EdgeConfidence variant) rather than guessing a single
+/// wrong pick here.
+fn resolve_via_inheritance_closure(
+    ctx: &ResolutionCtx,
+    callee: &str,
+    cls: &str,
+) -> Option<Vec<SymbolCandidate>> {
+    let levels = ctx.inheritance_closure.get(cls)?;
+    for level in levels {
+        let mut hits: Vec<SymbolCandidate> = Vec::new();
+        for ancestor in level {
+            if let Some(t) = ctx.by_name_class.get(&(callee.to_string(), ancestor.clone())) {
+                for cand in t {
+                    if !hits.contains(cand) {
+                        hits.push(cand.clone());
+                    }
+                }
+            }
+        }
+        if !hits.is_empty() {
+            return (hits.len() == 1).then_some(hits);
+        }
+    }
+    None
 }
 
 /// Narrow every call site in `sites` against `ctx` and produce the final,
@@ -1097,7 +1282,27 @@ fn build_resolution_context<'a>(
 /// (rowid) order, which silently breaks the moment a `WHERE` clause makes
 /// the query planner prefer an index instead (exactly what incremental's
 /// delta-scoped load does) — see Phase B plan A-3.
-fn resolve_sites_to_edges(ctx: &ResolutionCtx, sites: &[CallSiteRow]) -> Vec<CallEdge> {
+///
+/// One row per call site whose surviving candidate set, after every scoping
+/// filter above, still exceeded `MAX_CALLEE_CANDIDATES` (WS3,
+/// docs/plans/2026-08-18-context-intelligence-upgrade-plan.md) — the shape
+/// that previously vanished as a silent zero-edge site with no trace
+/// anywhere. `candidate_group_key` is the raw `callee_name` text (not a
+/// resolved qualified name — by definition none of the candidates were
+/// ever picked), so it's a grouping key for "sites stuck on this same
+/// ambiguous name," not an identity.
+struct AmbiguityGroup {
+    call_site_id: i64,
+    from_path: String,
+    candidate_group_key: String,
+    candidate_count: usize,
+    reason: String,
+}
+
+fn resolve_sites_to_edges(
+    ctx: &ResolutionCtx,
+    sites: &[CallSiteRow],
+) -> (Vec<CallEdge>, Vec<AmbiguityGroup>) {
     // One edge per (call site, callee, kind). Distinct calls on the same line
     // remain distinct because their selected-callee byte spans identify
     // different `call_sites` rows.
@@ -1155,10 +1360,31 @@ fn resolve_sites_to_edges(ctx: &ResolutionCtx, sites: &[CallSiteRow]) -> Vec<Cal
     // Rust's real name-resolution rules make that fallback more justified
     // for them, and this is a targeted fix for the specific false-positive
     // shape found, not a rewrite of the whole heuristic.
-    // (candidate (qualified_name, path) pairs, namespace_confirmed, weak_receiver)
-    // per site -- factored out purely for clippy::type_complexity, see the
-    // doc comment above for what each field means.
-    type CandidateResult = (Vec<(String, String)>, bool, bool);
+    // (candidate (qualified_name, path) pairs, namespace_confirmed, weak_receiver,
+    // overflow_candidate_count, preferred_subset) per site -- factored out
+    // purely for clippy::type_complexity, see the doc comment above for what
+    // each field means. 4th field (WS3, docs/plans/2026-08-18-context-
+    // intelligence-upgrade-plan.md): `Some(n)` ONLY on the one branch reached
+    // with real candidates that exceeded MAX_CALLEE_CANDIDATES (see that
+    // branch's own comment) -- every other branch (including the other,
+    // genuinely-empty Vec::new() returns) leaves this `None`. Lets the second
+    // loop below tell "real candidates existed, just too many to trust one"
+    // apart from "nothing matched at all", which an empty Vec alone can't
+    // distinguish. 5th field (WS5, same plan doc, D5): `Some(subset)` ONLY on
+    // the `same_dir` branch when it found a match that is a STRICT subset of
+    // `t` (i.e. real out-of-directory alternates survive too) -- every other
+    // branch leaves this `None`, meaning "no ranking signal, every candidate
+    // is rank 0" (the second loop's default). Lets the second loop assign
+    // `candidate_rank = 0` to the preferred (same-dir) subset and `1` to
+    // every other surviving candidate, instead of the old behavior of
+    // silently discarding them.
+    type CandidateResult = (
+        Vec<(String, String)>,
+        bool,
+        bool,
+        Option<usize>,
+        Option<HashSet<(String, String)>>,
+    );
     let candidates: Vec<CandidateResult> = sites
         .par_iter()
         .map(
@@ -1178,6 +1404,7 @@ fn resolve_sites_to_edges(ctx: &ResolutionCtx, sites: &[CallSiteRow]) -> Vec<Cal
                 module_hint,
                 _,
                 arg_count,
+                import_path,
             )| {
                 // Inheritance fallback (2026-08-18, B15 investigation): an
                 // exact-class miss here does NOT always mean "no candidates
@@ -1217,17 +1444,34 @@ fn resolve_sites_to_edges(ctx: &ResolutionCtx, sites: &[CallSiteRow]) -> Vec<Cal
                 // is known, but not that it actually declares this method)
                 // instead of trusting them at whatever confidence the
                 // exact-class path would otherwise imply.
-                let (targets, exact_class_matched) = match target_class {
-                    Some(cls) => match ctx.by_name_class.get(&(callee.clone(), cls.clone())) {
-                        Some(t) => (Some(t), true),
-                        None if ctx.by_name.contains_key(cls) => (ctx.by_name.get(callee), false),
-                        None => (None, false),
-                    },
-                    None => (ctx.by_name.get(callee), false),
-                };
+                //
+                // WS4 (docs/plans/2026-08-18-context-intelligence-upgrade-plan.md,
+                // D4): before falling all the way through to the unscoped
+                // `by_name` path, try `resolve_via_inheritance_closure` --
+                // `cls` genuinely inheriting/implementing `callee` from an
+                // ancestor (confidently-resolved evidence, see that
+                // function's own doc comment) is real scoping, not a guess,
+                // and must NOT be marked `exact_class_matched: false` (which
+                // downstream demotes to `weak_receiver`/`Ambiguous` the same
+                // as a truly unscoped fallback would be).
+                let (targets, exact_class_matched): (Option<Vec<SymbolCandidate>>, bool) =
+                    match target_class {
+                        Some(cls) => match ctx.by_name_class.get(&(callee.clone(), cls.clone())) {
+                            Some(t) => (Some(t.clone()), true),
+                            None if ctx.by_name.contains_key(cls) => {
+                                match resolve_via_inheritance_closure(ctx, callee, cls) {
+                                    Some(ancestor_hit) => (Some(ancestor_hit), true),
+                                    None => (ctx.by_name.get(callee).cloned(), false),
+                                }
+                            }
+                            None => (None, false),
+                        },
+                        None => (ctx.by_name.get(callee).cloned(), false),
+                    };
                 let Some(t) = targets else {
-                    return (Vec::new(), false, false);
+                    return (Vec::new(), false, false, None, None);
                 };
+                let t = &t;
                 // Same-language filter: a call site can only ever resolve to a
                 // symbol written in the same language as its caller — a
                 // cross-language name collision (e.g. a Rust `foo` incidentally
@@ -1245,7 +1489,7 @@ fn resolve_sites_to_edges(ctx: &ResolutionCtx, sites: &[CallSiteRow]) -> Vec<Cal
                     .map(|(qn, path, _)| (qn.clone(), path.clone()))
                     .collect();
                 if same_lang.is_empty() {
-                    return (Vec::new(), false, false);
+                    return (Vec::new(), false, false, None, None);
                 }
                 let t = &same_lang;
                 // Return-shape exclusion: `foo.bar()?`/`foo.bar().unwrap()` can only
@@ -1270,7 +1514,7 @@ fn resolve_sites_to_edges(ctx: &ResolutionCtx, sites: &[CallSiteRow]) -> Vec<Cal
                     t
                 };
                 if t.is_empty() {
-                    return (Vec::new(), false, false);
+                    return (Vec::new(), false, false, None, None);
                 }
                 // B3/A' arity gate (Tier B audit; extended to Go 2026-07-29
                 // self-audit "A'" pass): Elixir's `greet/1` and `greet/2` are
@@ -1330,7 +1574,7 @@ fn resolve_sites_to_edges(ctx: &ResolutionCtx, sites: &[CallSiteRow]) -> Vec<Cal
                         .cloned()
                         .collect();
                     if narrowed.len() == 1 {
-                        return (narrowed, true, false);
+                        return (narrowed, true, false, None, None);
                     } else if narrowed.is_empty() {
                         t
                     } else {
@@ -1340,6 +1584,42 @@ fn resolve_sites_to_edges(ctx: &ResolutionCtx, sites: &[CallSiteRow]) -> Vec<Cal
                 } else {
                     t
                 };
+                // WS2 (docs/plans/2026-08-18-context-intelligence-upgrade-plan.md,
+                // D1): import-binding preference. `import_path` is
+                // `resolve_tier1`'s `ResolveResult::resolved_path` — the actual
+                // import target text for a bare call whose callee name matched
+                // `ctx.import_map` (`from foo import bar` -> `Some("foo")`).
+                // This is REAL import-binding evidence (a language-level fact
+                // from the source's own import statement), not a convention or
+                // guess — checked even before `module_hint` below, which is
+                // only ever inferred from a lowercase `::`-qualified call's own
+                // text. Narrows the same-language candidate list to whichever
+                // file's stem matches the import target's last path segment
+                // (same matching helper the whole-module require/import branch
+                // in `extract_file_data` already uses for the
+                // receiver-is-a-module-alias case). Fail-open: an import target
+                // matching NO current candidate falls through to the same
+                // module_hint/same_file/same_dir/... chain unchanged, never
+                // removes a real candidate that simply isn't corroborated by
+                // this signal — same posture as every other narrowing pass
+                // here. Previously this evidence was computed and immediately
+                // discarded (D1 in the upgrade plan); this is the fix.
+                if let Some(path) = import_path
+                    && let Some(seg) = crate::indexer::parser::module_path_last_segment(path)
+                {
+                    let imported: Vec<_> = t
+                        .iter()
+                        .filter(|(_, p)| {
+                            Path::new(p.as_str())
+                                .file_stem()
+                                .is_some_and(|stem| stem == seg.as_str())
+                        })
+                        .cloned()
+                        .collect();
+                    if !imported.is_empty() {
+                        return (imported, false, false, None, None);
+                    }
+                }
                 // Module-qualifier preference: `crate::telemetry::timed_tool()`
                 // carries an explicit, unambiguous module segment in the source
                 // text (see `parser::module_hint_of`) — stronger evidence than
@@ -1362,7 +1642,7 @@ fn resolve_sites_to_edges(ctx: &ResolutionCtx, sites: &[CallSiteRow]) -> Vec<Cal
                         .cloned()
                         .collect();
                     if !hinted.is_empty() {
-                        return (hinted, false, false);
+                        return (hinted, false, false, None, None);
                     }
                 }
                 let same_file: Vec<_> = t.iter().filter(|(_, p)| p == from_path).cloned().collect();
@@ -1464,12 +1744,71 @@ fn resolve_sites_to_edges(ctx: &ResolutionCtx, sites: &[CallSiteRow]) -> Vec<Cal
                     && !exact_class_matched
                     && !matches!(receiver.as_deref(), Some("self" | "this"));
                 if !same_file.is_empty() {
-                    (same_file, false, weak_receiver)
+                    (same_file, false, weak_receiver, None, None)
                 } else if let Some(dir_matches) = same_dir() {
-                    (dir_matches, false, weak_receiver)
+                    // WS5 (docs/plans/2026-08-18-context-intelligence-upgrade-
+                    // plan.md, D5) scoping note, found DURING implementation,
+                    // not assumed from the plan's prose: the plan's own D5
+                    // root-cause text calls directory "a convention, not a
+                    // scoping rule" for "Java/C/C++" -- but that is only true
+                    // for C/C++. An UNQUALIFIED same-package Go call, or a
+                    // same-package (no-import) Java type reference, is
+                    // language-enforced scoping every bit as real as
+                    // `same_file` -- Go's compiler and Java's own name-
+                    // resolution rules make an out-of-package/out-of-import
+                    // candidate structurally IMPOSSIBLE as this call's real
+                    // target, not merely unlikely. Confirmed live: relaxing
+                    // this for Go/Java broke
+                    // `test_go_same_directory_call_resolves_not_fanned_out` /
+                    // `test_java_same_package_call_resolves_not_fanned_out`
+                    // (both assert a same-directory match must NOT co-surface
+                    // an unrelated other-package same-named symbol -- correct
+                    // behavior, backed by real language rules, not a bug).
+                    // C/C++ have no package/namespace-to-directory
+                    // correspondence AT ALL (the preprocessor doesn't care
+                    // where a header/impl physically lives), so "true target
+                    // in a sibling directory, decoy locally" (this plan's own
+                    // flagship WS5 fixture, `E_same_dir_decoy_vs_true_target`,
+                    // is a C fixture) is a REAL, common shape there with no
+                    // language rule to rule it out -- unlike Go/Java, where
+                    // the identical-looking shape can't actually occur for a
+                    // bare/unqualified reference. Only C/C++ get the
+                    // non-destructive ranker below; Go/Java keep the
+                    // pre-WS5 hard-filter behavior, unchanged.
+                    let same_dir_is_real_scoping =
+                        matches!(caller_lang.map(String::as_str), Some("go" | "java"));
+                    if same_dir_is_real_scoping || dir_matches.len() == t.len() {
+                        // Either this call site's language makes an
+                        // out-of-directory target structurally impossible
+                        // (Go/Java), or every surviving candidate already
+                        // lives in the caller's directory (no out-of-
+                        // directory alternate to preserve either way) --
+                        // unchanged from the pre-WS5 filter behavior.
+                        (dir_matches, false, weak_receiver, None, None)
+                    } else {
+                        // C/C++ only, reached here: a real out-of-directory
+                        // alternate exists and directory carries no language-
+                        // level scoping meaning for these -- keep the FULL
+                        // surviving set (`t.clone()`, not `dir_matches`) so
+                        // the true target, if it lives elsewhere, survives
+                        // as a candidate, just ranked lower than the same-
+                        // directory preference (`preferred`, consumed by the
+                        // second loop below to set `candidate_rank`). No new
+                        // confidence rule is needed here: the second loop's
+                        // existing `targets.len() > 1 => Ambiguous` already
+                        // downgrades this correctly the moment a real
+                        // alternate is kept (previously it never saw more
+                        // than 1 survivor here because the alternates had
+                        // already been dropped) -- matching WS5's "all still
+                        // ambiguous-tier, not a clean single target"
+                        // requirement exactly.
+                        let preferred: HashSet<(String, String)> =
+                            dir_matches.into_iter().collect();
+                        (t.clone(), false, weak_receiver, None, Some(preferred))
+                    }
                 } else if let Some(ns_matches) = same_namespace() {
                     let confirmed = ns_matches.len() == 1;
-                    (ns_matches, confirmed, false)
+                    (ns_matches, confirmed, false, None, None)
                 } else if t.len() <= MAX_CALLEE_CANDIDATES {
                     // Reached with NONE of the positive scoping signals above
                     // firing — see this function's top doc comment and the
@@ -1478,22 +1817,33 @@ fn resolve_sites_to_edges(ctx: &ResolutionCtx, sites: &[CallSiteRow]) -> Vec<Cal
                     // test_tier2_method_resolution regressing to `ambiguous`
                     // before the target_class.is_none() half of this guard
                     // existed.
-                    (t.clone(), false, weak_receiver)
+                    (t.clone(), false, weak_receiver, None, None)
                 } else {
-                    (Vec::new(), false, false)
+                    // WS3 (docs/plans/2026-08-18-context-intelligence-upgrade-plan.md,
+                    // D3): unlike every branch above, this one is reached with
+                    // REAL candidates that existed (`t` is non-empty, just over
+                    // MAX_CALLEE_CANDIDATES) -- "too many to trust any one" is a
+                    // different fact than "none exist at all" (the other empty-Vec
+                    // returns above/below this closure). Threading `Some(t.len())`
+                    // here (and only here) lets the second loop below distinguish
+                    // this specific case and record it as an ambiguity_groups row
+                    // instead of silent zero-edge dropping -- previously
+                    // indistinguishable from a genuinely unresolved site.
+                    (Vec::new(), false, false, Some(t.len()), None)
                 }
             },
         )
         .collect();
 
     let mut edges: Vec<CallEdge> = Vec::new();
+    let mut ambiguity_groups: Vec<AmbiguityGroup> = Vec::new();
     let mut seen_pairs: HashSet<(i64, String, String)> = HashSet::new();
     for (
         (
             call_site_id,
             from_path,
             enc_qn,
-            _callee,
+            callee,
             line,
             _,
             _,
@@ -1505,10 +1855,20 @@ fn resolve_sites_to_edges(ctx: &ResolutionCtx, sites: &[CallSiteRow]) -> Vec<Cal
             _,
             edge_kind,
             _,
+            _,
         ),
-        (targets, namespace_confirmed, weak_receiver_fallback),
+        (targets, namespace_confirmed, weak_receiver_fallback, overflow_count, preferred_subset),
     ) in sites.iter().zip(candidates.iter())
     {
+        if let Some(candidate_count) = overflow_count {
+            ambiguity_groups.push(AmbiguityGroup {
+                call_site_id: *call_site_id,
+                from_path: from_path.clone(),
+                candidate_group_key: callee.clone(),
+                candidate_count: *candidate_count,
+                reason: "unscoped_candidates_exceeded_max_callee_candidates".to_string(),
+            });
+        }
         // >1 surviving candidate means this call site's edge is duplicated
         // across multiple distinct symbols with nothing left to break the
         // tie — mark it `Ambiguous` regardless of which branch produced it,
@@ -1532,6 +1892,19 @@ fn resolve_sites_to_edges(ctx: &ResolutionCtx, sites: &[CallSiteRow]) -> Vec<Cal
             if !seen_pairs.insert((*call_site_id, to_qn.clone(), edge_kind.clone())) {
                 continue;
             }
+            // WS5 (docs/plans/2026-08-18-context-intelligence-upgrade-plan.md,
+            // D5): `preferred_subset` is `Some` only from the `same_dir`
+            // branch when a real out-of-directory alternate survived
+            // alongside it (see that branch's own comment) -- membership in
+            // it means "same directory as the caller", rank 0. Every other
+            // candidate (including every candidate when `preferred_subset`
+            // is `None`, i.e. no ranking signal at all) is rank 0 too,
+            // UNLESS it lost the `same_dir` tie-break, in which case it's
+            // rank 1 -- an ordinal, not a score.
+            let candidate_rank: i64 = match preferred_subset {
+                Some(preferred) if !preferred.contains(&(to_qn.clone(), to_path.clone())) => 1,
+                _ => 0,
+            };
             edges.push(CallEdge {
                 from_symbol: enc_qn.clone(),
                 to_symbol: to_qn.clone(),
@@ -1541,10 +1914,35 @@ fn resolve_sites_to_edges(ctx: &ResolutionCtx, sites: &[CallSiteRow]) -> Vec<Cal
                 from_path: Some(from_path.clone()),
                 to_path: Some(to_path.clone()),
                 edge_kind: edge_kind.clone(),
+                candidate_rank,
             });
         }
     }
-    edges
+    (edges, ambiguity_groups)
+}
+
+/// `ambiguity_groups` mirrors `call_edges`: the caller owns the DELETE scope
+/// (full sweep in `rebuild_graph`, `from_path`-scoped in
+/// `incremental_graph_update`) so this is a pure insert, matching
+/// `insert_call_edges_batch`'s own contract.
+fn insert_ambiguity_groups_batch(
+    tx: &rusqlite::Transaction,
+    groups: &[AmbiguityGroup],
+) -> rusqlite::Result<()> {
+    let mut stmt = tx.prepare(
+        "INSERT INTO ambiguity_groups (call_site_id, from_path, candidate_group_key, candidate_count, reason) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+    )?;
+    for g in groups {
+        stmt.execute(rusqlite::params![
+            g.call_site_id,
+            g.from_path,
+            g.candidate_group_key,
+            g.candidate_count as i64,
+            g.reason,
+        ])?;
+    }
+    Ok(())
 }
 
 fn rebuild_graph(
@@ -1555,6 +1953,20 @@ fn rebuild_graph(
     maps: &ResolutionMaps,
     ignore: &[String],
 ) -> rusqlite::Result<()> {
+    // WS4 (docs/plans/2026-08-18-context-intelligence-upgrade-plan.md, D4):
+    // moved ahead of `build_resolution_context` -- `build_inheritance_closure`
+    // (called from inside it) reads `type_relations.to_symbol`/`confidence`,
+    // which this call is what actually resolves for the CURRENT pass. It was
+    // previously called much later in this same function (after
+    // `resolve_sites_to_edges` already ran), which would have made every
+    // rebuild's inheritance closure exactly one pass stale. Verified safe to
+    // move: `resolve_cross_file_type_relations` only reads `symbols` (fully
+    // populated before `rebuild_graph` is ever called) and `type_relations`
+    // itself (populated per-file by `extract_file_data`, also already done)
+    // -- it has no dependency on `ctx`/`sites`/`call_edges` at all, so moving
+    // WHEN it runs changes no other pass's behavior.
+    crate::graph::type_resolve::resolve_cross_file_type_relations(tx)?;
+
     let ctx = build_resolution_context(tx, &maps.namespace_map)?;
 
     // Stable, explicit order (Phase B plan T2/A-3) so full and future
@@ -1564,7 +1976,8 @@ fn rebuild_graph(
         let mut stmt = tx.prepare(
             "SELECT id, from_path, enclosing_qn, callee_name, call_line, callee_start_byte, \
                     callee_end_byte, identity_version, confidence, receiver, target_class, \
-                    looks_option_or_result_chained, module_hint, edge_kind, arg_count \
+                    looks_option_or_result_chained, module_hint, edge_kind, arg_count, \
+                    import_path \
              FROM call_sites ORDER BY id",
         )?;
         stmt.query_map([], |r| {
@@ -1584,15 +1997,18 @@ fn rebuild_graph(
                 r.get::<_, Option<String>>(12)?,
                 r.get::<_, String>(13)?,
                 r.get::<_, Option<i64>>(14)?,
+                r.get::<_, Option<String>>(15)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?
     };
 
-    let edges = resolve_sites_to_edges(&ctx, &sites);
+    let (edges, ambiguity_groups) = resolve_sites_to_edges(&ctx, &sites);
 
     tx.execute("DELETE FROM call_edges", [])?;
     insert_call_edges_batch(tx, &edges)?;
+    tx.execute("DELETE FROM ambiguity_groups", [])?;
+    insert_ambiguity_groups_batch(tx, &ambiguity_groups)?;
     // Every `formal` row at this point came from the stack-graphs upgrade
     // already baked into `confidence` at extraction time, carried through
     // unchanged by `resolve_sites_to_edges`'s confidence-assignment loop —
@@ -1612,7 +2028,11 @@ fn rebuild_graph(
     crate::graph::hub::update_is_hub_flags(tx, hub_config)?;
     crate::graph::boundary::update_boundary_ambiguous_flags(tx)?;
     crate::graph::churn::update_churn_scores(tx, project_root, churn_since)?;
-    crate::graph::type_resolve::resolve_cross_file_type_relations(tx)?;
+    // WS4: resolve_cross_file_type_relations already ran at the top of this
+    // function (before build_resolution_context needed its output) -- see
+    // that call's own comment. Nothing between there and here writes to
+    // `symbols`/`type_relations`, so re-running it here would be a pure,
+    // wasteful no-op, not a second real pass.
     crate::graph::digest::compute_digests(tx)?;
     crate::indexer::package_deps::compute_package_dependencies(tx, project_root, ignore)?;
     Ok(())
@@ -1758,6 +2178,16 @@ pub fn incremental_graph_update(
     // Step 5 (plan D4): same shared resolver full rebuild uses — still one
     // global SELECT over symbols (accepted cost, see build_resolution_context's
     // own doc comment; scoping this too is Phase B+ backlog).
+    //
+    // WS4: resolve_cross_file_type_relations moved ahead of this call for
+    // the same reason as rebuild_graph's identical move (see that
+    // function's own comment) -- build_resolution_context's
+    // build_inheritance_closure reads type_relations.to_symbol/confidence,
+    // which this is what resolves for the current pass. Global, not
+    // delta-scoped, matching this function's own existing note above about
+    // build_resolution_context itself always doing one full global SELECT
+    // regardless of delta size.
+    crate::graph::type_resolve::resolve_cross_file_type_relations(tx)?;
     let ctx = build_resolution_context(tx, &maps.namespace_map)?;
 
     // Step 6: re-resolve exactly delta_paths' sites. `ORDER BY id` matches
@@ -1767,7 +2197,8 @@ pub fn incremental_graph_update(
         let sql = format!(
             "SELECT id, from_path, enclosing_qn, callee_name, call_line, callee_start_byte, \
                     callee_end_byte, identity_version, confidence, receiver, target_class, \
-                    looks_option_or_result_chained, module_hint, edge_kind, arg_count \
+                    looks_option_or_result_chained, module_hint, edge_kind, arg_count, \
+                    import_path \
              FROM call_sites WHERE from_path IN ({placeholders}) ORDER BY id"
         );
         let mut stmt = tx.prepare(&sql)?;
@@ -1788,13 +2219,19 @@ pub fn incremental_graph_update(
                 r.get::<_, Option<String>>(12)?,
                 r.get::<_, String>(13)?,
                 r.get::<_, Option<i64>>(14)?,
+                r.get::<_, Option<String>>(15)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?
     };
 
-    let edges = resolve_sites_to_edges(&ctx, &sites);
+    let (edges, ambiguity_groups) = resolve_sites_to_edges(&ctx, &sites);
     insert_call_edges_batch(tx, &edges)?;
+    tx.execute(
+        &format!("DELETE FROM ambiguity_groups WHERE from_path IN ({placeholders})"),
+        rusqlite::params_from_iter(path_refs.iter().copied()),
+    )?;
+    insert_ambiguity_groups_batch(tx, &ambiguity_groups)?;
     // Same one-shot fact as rebuild_graph's identical UPDATE (see its own
     // comment): a `formal` row here came from the stack-graphs upgrade
     // already baked into `confidence` at extraction time. Global, not
@@ -1817,7 +2254,9 @@ pub fn incremental_graph_update(
     crate::graph::hub::update_is_hub_flags(tx, hub_config)?;
     crate::graph::boundary::update_boundary_ambiguous_flags(tx)?;
     crate::graph::churn::update_churn_scores(tx, project_root, churn_since)?;
-    crate::graph::type_resolve::resolve_cross_file_type_relations(tx)?;
+    // WS4: resolve_cross_file_type_relations already ran above, before
+    // build_resolution_context needed its output -- see that call's own
+    // comment (mirrors rebuild_graph's identical move).
     crate::graph::digest::compute_digests(tx)?;
     crate::indexer::package_deps::compute_package_dependencies(tx, project_root, ignore)?;
 
@@ -4717,6 +5156,146 @@ impl StructB {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// WS2 (docs/plans/2026-08-18-context-intelligence-upgrade-plan.md, D1):
+    /// `resolve_tier1`'s import-binding evidence (`resolved_path`) was
+    /// computed and immediately discarded before this change -- only
+    /// `.confidence` survived, so a bare imported call amid enough
+    /// same-named decoys to exceed `MAX_CALLEE_CANDIDATES` (20) had no way
+    /// to recover its real target once the static candidate algebra's
+    /// unscoped by-name fallback gave up. This directly exercises the fix:
+    /// 22 decoy `bar()` definitions (deliberately > 20) plus one real
+    /// `from lib import bar` binding -- the resulting edge must still land
+    /// on `lib.py`'s `bar`, not a decoy, and not vanish.
+    #[test]
+    fn test_import_path_narrows_candidates_past_max_callee_candidates() {
+        let dir = std::env::temp_dir().join(format!("ci_idx_importpath_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("lib.py"), "def bar():\n    return 1\n").unwrap();
+        std::fs::write(
+            dir.join("caller.py"),
+            "from lib import bar\n\n\ndef use():\n    return bar()\n",
+        )
+        .unwrap();
+        for i in 0..22 {
+            std::fs::write(
+                dir.join(format!("decoy_{i}.py")),
+                "def bar():\n    return 0\n",
+            )
+            .unwrap();
+        }
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
+
+        // The capture itself: call_sites.import_path must carry the real
+        // import target, not be silently dropped at extraction time.
+        let import_path: String = conn
+            .query_row(
+                "SELECT import_path FROM call_sites WHERE from_path = 'caller.py' AND callee_name = 'bar'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("caller.py's bar() call site must have a captured import_path");
+        assert_eq!(import_path, "lib", "resolve_tier1's resolved_path must be 'lib', not dropped");
+
+        // The narrowing itself: the edge must target lib.py's bar, not any
+        // decoy, and must not vanish (the pre-fix MAX_CALLEE_CANDIDATES
+        // drop-to-nothing behavior).
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM call_edges \
+                 WHERE from_symbol = (SELECT qualified_name FROM symbols WHERE name = 'use') \
+                 AND to_symbol = (SELECT qualified_name FROM symbols WHERE name = 'bar' AND path = 'lib.py')",
+            ),
+            1,
+            "use()'s bar() call must resolve to lib.py's bar via the import binding"
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM call_edges \
+                 WHERE from_symbol = (SELECT qualified_name FROM symbols WHERE name = 'use') \
+                 AND to_symbol != (SELECT qualified_name FROM symbols WHERE name = 'bar' AND path = 'lib.py')",
+            ),
+            0,
+            "use()'s bar() call must NOT fan out to any of the 22 decoys"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// WS3 (docs/plans/2026-08-18-context-intelligence-upgrade-plan.md, D3,
+    /// V3 Law 4 "unknown != nonexistent"): a call site whose surviving
+    /// candidate set genuinely exceeds `MAX_CALLEE_CANDIDATES` (20) --
+    /// no import binding, no module hint, no same-file/same-dir/same-
+    /// namespace signal to narrow it, unlike
+    /// `test_import_path_narrows_candidates_past_max_callee_candidates`
+    /// above -- used to vanish as a silent zero-edge site. It must now
+    /// surface as an `ambiguity_groups` row instead: 25 same-named free
+    /// `helper()` definitions (deliberately > 20) plus one unqualified call
+    /// to `helper()`.
+    #[test]
+    fn test_overflow_candidates_recorded_as_ambiguity_group_not_dropped_silently() {
+        let dir = std::env::temp_dir().join(format!("ci_idx_ambgroup_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("caller.py"), "def use():\n    return helper()\n").unwrap();
+        for i in 0..25 {
+            std::fs::write(
+                dir.join(format!("decoy_{i}.py")),
+                "def helper():\n    return 0\n",
+            )
+            .unwrap();
+        }
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
+
+        // The drop: 25 candidates, none narrowed by any positive scoping
+        // signal, must NOT materialize as 25 (or any) call_edges rows --
+        // this function's own doc comment explicitly rejects
+        // materializing the full candidate set as edges.
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM call_edges \
+                 WHERE from_symbol = (SELECT qualified_name FROM symbols WHERE name = 'use')",
+            ),
+            0,
+            "use()'s helper() call must produce zero edges, not fan out to all 25 decoys"
+        );
+
+        // The record: exactly one ambiguity_groups row, not silence.
+        let (from_path, candidate_group_key, candidate_count, reason): (
+            String,
+            String,
+            i64,
+            String,
+        ) = conn
+            .query_row(
+                "SELECT from_path, candidate_group_key, candidate_count, reason \
+                 FROM ambiguity_groups",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .expect("the dropped call site must be recorded in ambiguity_groups, not silently lost");
+        assert_eq!(from_path, "caller.py");
+        assert_eq!(candidate_group_key, "helper");
+        assert_eq!(candidate_count, 25, "must record the true candidate count, not a truncated one");
+        assert_eq!(reason, "unscoped_candidates_exceeded_max_callee_candidates");
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM ambiguity_groups"),
+            1,
+            "exactly one call site is ambiguous here -- must not duplicate or under-record"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     // P1.3 V1: Go's compilation unit is the directory (package = dir), and a
     // bare call like `Helper()` never carries a qualifier for module_hint to
@@ -5089,11 +5668,34 @@ impl StructB {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// WS5 (docs/plans/2026-08-18-context-intelligence-upgrade-plan.md, D5):
+    /// UPDATED (2026-08-19) from its original P1.3 V1 shape, which asserted
+    /// `modb::helper` must NOT co-surface at all. That original assertion
+    /// and this plan's own flagship WS5 fixture
+    /// (`benchmarks/resolution_precision/fixtures/E_same_dir_decoy_vs_true_target`)
+    /// are the IDENTICAL structural shape -- a bare call, one same-directory
+    /// definition, one definition in a sibling directory, no other
+    /// distinguishing signal -- just with the two directories' roles
+    /// swapped in the narrative (this test called the local one "the real
+    /// one" and the sibling "unrelated"; the fixture calls the local one
+    /// "a decoy" and the sibling "the real target"). CALM's resolver cannot
+    /// structurally tell those two narratives apart: C/C++ have no
+    /// package/namespace-to-directory correspondence at all (unlike Go/Java,
+    /// where an unqualified same-directory reference is real, compiler-
+    /// enforced scoping -- see this function's own comment at the
+    /// `same_dir_is_real_scoping` check, and the still-hard-filtered
+    /// `test_go_same_directory_call_resolves_not_fanned_out`/
+    /// `test_java_same_package_call_resolves_not_fanned_out` above). So for
+    /// C specifically, "confidently exclude the sibling-directory
+    /// candidate" was never actually justified by anything more than
+    /// "usually true" -- exactly the D5 defect (same_dir as a destructive
+    /// filter) this plan sets out to fix. The corrected, intentional
+    /// behavior: BOTH candidates survive as `ambiguous`, with the same-
+    /// directory one at `candidate_rank = 0` (preferred for ordering) and
+    /// the sibling-directory one at `candidate_rank = 1` -- non-destructive,
+    /// not a silent loss, not a false confident pick either way.
     #[test]
-    // P1.3 V1: C headers/impls conventionally live in the same directory —
-    // a bare call to a same-named function defined in an unrelated
-    // directory (a different logical module) must not fan out either.
-    fn test_c_same_directory_call_resolves_not_fanned_out() {
+    fn test_c_same_directory_call_ranks_local_first_but_keeps_sibling_candidate() {
         let dir = std::env::temp_dir().join(format!("ci_idx_c_samedir_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("moda")).unwrap();
@@ -5118,25 +5720,45 @@ impl StructB {
         init_db(&conn).unwrap();
         run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
 
+        let edges: Vec<(String, i64, String)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT to_path, candidate_rank, edge_confidence FROM call_edges \
+                     WHERE from_symbol = (SELECT qualified_name FROM symbols WHERE name = 'caller_a')",
+                )
+                .unwrap();
+            stmt.query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?))
+            })
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+        };
         assert_eq!(
-            count(
-                &conn,
-                "SELECT COUNT(*) FROM call_edges \
-                 WHERE from_symbol = (SELECT qualified_name FROM symbols WHERE name = 'caller_a') \
-                 AND to_symbol = (SELECT qualified_name FROM symbols WHERE name = 'helper' AND path = 'moda/helper.c')",
-            ),
-            1,
-            "caller_a's helper() must resolve to moda's own helper()"
+            edges.len(),
+            2,
+            "both moda's and modb's helper() must survive as candidates, not be \
+             dropped or collapsed to one: got {edges:?}"
         );
-        assert_eq!(
-            count(
-                &conn,
-                "SELECT COUNT(*) FROM call_edges \
-                 WHERE from_symbol = (SELECT qualified_name FROM symbols WHERE name = 'caller_a') \
-                 AND to_symbol = (SELECT qualified_name FROM symbols WHERE name = 'helper' AND path = 'modb/helper.c')",
-            ),
-            0,
-            "caller_a's helper() must NOT fan out to modb's unrelated helper()"
+        assert!(
+            edges
+                .iter()
+                .any(|(p, rank, _)| p == "moda/helper.c" && *rank == 0),
+            "moda's own helper() (same directory as the caller) must be rank 0 \
+             (preferred): got {edges:?}"
+        );
+        assert!(
+            edges
+                .iter()
+                .any(|(p, rank, _)| p == "modb/helper.c" && *rank == 1),
+            "modb's sibling-directory helper() must survive at rank 1 (alternate), \
+             not be silently dropped: got {edges:?}"
+        );
+        assert!(
+            edges.iter().all(|(_, _, c)| c == "ambiguous"),
+            "neither candidate has real scoping evidence over the other (C has no \
+             package/namespace concept) -- both must be ambiguous, not one falsely \
+             confident: got {edges:?}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -6056,6 +6678,120 @@ impl StructB {
              on Sub) must still produce a call edge -- an exact-class miss on \
              by_name_class must fall back to the unscoped by_name lookup, not drop \
              the edge outright"
+        );
+
+        // WS4 (docs/plans/2026-08-18-context-intelligence-upgrade-plan.md,
+        // D4, this fixture is the plan's own cited test case): the edge
+        // above used to land at `ambiguous` confidence -- the "18/8 fix"
+        // only prevented the edge from vanishing entirely, by falling back
+        // to the SAME unscoped `by_name` path an unknown-receiver-type call
+        // gets, with no way to tell "genuinely no scoping evidence" apart
+        // from "the evidence was right there in type_relations, just never
+        // consulted." `Sub extends Base` is a `resolved`-confidence
+        // `type_relations` row (same-file AST match), so
+        // `resolve_via_inheritance_closure` now finds `Base::getName` as
+        // the sole candidate BEFORE the unscoped fallback ever runs --
+        // this is real scoping evidence (Java's own inheritance rules), not
+        // a guess, and must not be downgraded to `ambiguous`.
+        let confidence: String = conn
+            .query_row(
+                "SELECT edge_confidence FROM call_edges \
+                 WHERE from_symbol LIKE '%Caller::m' AND to_symbol LIKE '%Base::getName'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_ne!(
+            confidence, "ambiguous",
+            "the inherited-method edge must resolve via the inheritance closure, not \
+             fall through to the unscoped-fallback's ambiguous downgrade"
+        );
+        assert!(
+            matches!(confidence.as_str(), "resolved" | "inferred"),
+            "expected a real resolved/inferred edge to the ancestor declaration \
+             (WS4's own acceptance criterion), got {confidence:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// WS4 companion (docs/plans/2026-08-18-context-intelligence-upgrade-plan.md,
+    /// plan's own second test-plan bullet: "an interface with 2 implementors
+    /// -> assert ... not a single wrong pick"): `Mixed` extends BOTH `IA`
+    /// and `IB`, and BOTH declare `foo()` -- a genuine tie at inheritance
+    /// depth 1, not a nearer-ancestor-wins case like the Base/Sub test
+    /// above. `resolve_via_inheritance_closure` must refuse to pick
+    /// whichever of `IA`/`IB` happened to come first in `Mixed`'s own
+    /// `extends` clause -- that would be exactly the unscoped guess WS4
+    /// exists to avoid, just relocated one level deeper. The call must fall
+    /// through unchanged to the pre-WS4 unscoped `by_name` behavior
+    /// (`ambiguous`), proving WS4 only resolves genuinely unique evidence,
+    /// never forces a pick among tied ancestors.
+    #[test]
+    fn test_java_tied_ancestors_at_same_depth_do_not_force_a_pick() {
+        let dir = std::env::temp_dir().join(format!("ci_idx_java_tie_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("IA.java"),
+            "public interface IA {\n    String foo();\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("IB.java"),
+            "public interface IB {\n    String foo();\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("Mixed.java"),
+            "public interface Mixed extends IA, IB {\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("Caller.java"),
+            "public class Caller {\n    String use(Mixed m) {\n        return m.foo();\n    }\n}\n",
+        )
+        .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
+
+        // The tie must fall through to the SAME pre-WS4 unscoped-fallback
+        // shape: both IA::foo and IB::foo survive as candidates, each
+        // emitted as its own `ambiguous` edge -- not silently dropped
+        // (that would be a NEW regression) and not collapsed onto a single
+        // arbitrarily-chosen one (that would be the guess WS4 must avoid).
+        let edges: Vec<(String, String)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT to_symbol, edge_confidence FROM call_edges \
+                     WHERE from_symbol LIKE '%Caller::use'",
+                )
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert_eq!(
+            edges.len(),
+            2,
+            "both tied ancestors must survive as separate candidates, not be \
+             dropped or collapsed to one: got {edges:?}"
+        );
+        assert!(
+            edges.iter().any(|(to, _)| to.contains("IA::foo")),
+            "IA::foo must be one of the two candidates: got {edges:?}"
+        );
+        assert!(
+            edges.iter().any(|(to, _)| to.contains("IB::foo")),
+            "IB::foo must be one of the two candidates: got {edges:?}"
+        );
+        assert!(
+            edges.iter().all(|(_, c)| c == "ambiguous"),
+            "a genuine tie must never be reported at confident (resolved/inferred) \
+             confidence -- neither candidate is more evidenced than the other: got {edges:?}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -7454,6 +8190,7 @@ impl StructB {
                 module_hint: None,
                 edge_kind: "call".to_string(),
                 arg_count: Some(0),
+                import_path: None,
             }
         }
         let tx = conn.transaction().unwrap();

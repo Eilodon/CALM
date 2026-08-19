@@ -1,0 +1,15 @@
+{
+  "category": "regression_sanity",
+  "workstream": "guard (no WS change should regress this)",
+  "language": "rust",
+  "call_site": {
+    "path": "lib.rs",
+    "line": 6,
+    "callee_name": "get"
+  },
+  "expected_targets": [
+    "lib.rs::get"
+  ],
+  "gate": "must_not_falsely_resolve",
+  "note": "m.get(k) where m: &HashMap<...> (external/unmodeled type) and an unrelated local get() also exists. EMPIRICAL: call_edges targets lib.rs::get at 'ambiguous' confidence -- CORRECT, this is the already-shipped weak_receiver_fallback protection working as intended (does NOT falsely claim 'resolved'/'formal' for an unknown-receiver-type method call). Regression guard: no WS2-WS6 change may promote this to a confident tier without real evidence. [expected_targets corrected to the real qualified_name format -- oracle previously used a placeholder string that could never match, an authoring bug in this benchmark, not a resolver finding.]"
+}

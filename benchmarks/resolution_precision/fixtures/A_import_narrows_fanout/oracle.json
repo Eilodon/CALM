@@ -1,0 +1,9 @@
+{
+  "category": "import_narrowing",
+  "workstream": "WS2",
+  "language": "python",
+  "call_site": {"path": "caller.py", "line": 5, "callee_name": "bar"},
+  "expected_targets": ["lib.py::bar"],
+  "gate": "informational",
+  "note": "22 same-named decoys + 1 real import target. EMPIRICAL (2026-08-18, calm@5b61d55): resolves correctly to lib.py::bar at 'formal' via the bundled stack-graphs overlay's gap-insert mechanism (ingest.rs insert_missing_exact_edges), which fires because the STATIC candidate algebra alone drops this site (23 candidates > MAX_CALLEE_CANDIDATES=20, same defect as fixture B) and the overlay backfills the correct target from real import-scope resolution. This means D1 (resolved_path dropped in resolve_tier1) is already MASKED for bare-name imports in stack-graphs-covered languages (python/js/ts/rust). Kept as informational: documents current overlay coverage, not a strict pass/fail gate for WS2. WS2 remains valuable as defense-in-depth for when the overlay is disabled/unsupported/times out, and for languages without stack-graphs coverage."
+}

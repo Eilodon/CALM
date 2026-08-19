@@ -281,6 +281,32 @@ impl Caveat {
         }
     }
 
+    /// WS3 (docs/plans/2026-08-18-context-intelligence-upgrade-plan.md, V3
+    /// Law 4 "unknown != nonexistent"): one or more call sites elsewhere in
+    /// the repo tried to resolve a call to this bare name, found more than
+    /// `MAX_CALLEE_CANDIDATES` same-named symbols to choose from, and were
+    /// recorded in `ambiguity_groups` instead of an edge to any specific
+    /// target -- this symbol may be one of those unresolved candidates.
+    /// These sites are invisible to `direct`/`ambiguous` alike, so a low or
+    /// zero `direct_count` for a common name is not proof of low usage.
+    pub(crate) fn unresolved_ambiguity_groups(
+        symbol: &str,
+        site_count: usize,
+        max_candidates: usize,
+    ) -> Self {
+        Caveat {
+            class: "unresolved_ambiguity_group",
+            message: format!(
+                "{site_count} call site(s) elsewhere reference the name '{symbol}' but had \
+                 more than MAX_CALLEE_CANDIDATES same-named candidates to choose from (up to \
+                 {max_candidates} at the widest) -- '{symbol}' may be one of them, but none of \
+                 these sites were recorded as an edge to any specific target, so they do not \
+                 appear in direct/ambiguous above. Not enough evidence to resolve them \
+                 automatically; treat a low direct_count for a common name with caution."
+            ),
+        }
+    }
+
     /// Some, but not all, of a `symbols_batch` call's requested
     /// `qualified_names` matched nothing in the index. Names the first
     /// few missing ids so the caller doesn't have to diff the request
