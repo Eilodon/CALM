@@ -42,6 +42,24 @@ use super::{GraphMode, ReindexSummary, now_secs};
 /// identity predates D4. Incremental indexing cannot repair these rows because
 /// their file hashes are unchanged, so it must take the full transactional
 /// baseline path instead of reporting a no-op.
+///
+/// PR#9 (docs/plans/2026-08-19-evidence-architecture-execution-plan.md Part
+/// E, position-independent v3 identity) deliberately does NOT extend this
+/// predicate to force a v2->v3 baseline the same way. Two reasons: (1) a
+/// permanent, by-design mix of v2 (module-level calls with no real
+/// enclosing symbol to be relative to) and v3 (calls inside a real
+/// function/method) rows is the correct steady state, not incomplete
+/// migration -- there is no "fully migrated" endpoint to detect the way
+/// v1->v2 has one; (2) the churn v3 fixes only matters for a call_sites
+/// row that actually gets RECONCILED (i.e. its file gets reindexed) --
+/// `extraction::reconcile_call_sites` already upgrades a v2 row to v3
+/// organically the next time its file changes, at the cost of exactly one
+/// identity transition (the old v2-keyed row won't match the new v3-keyed
+/// extraction, so it's replaced once) -- cheaper and lower-risk than a
+/// global forced rebuild that would churn every proof in the database in
+/// one pass on upgrade, for files that may never be touched again anyway.
+/// A file that's never reindexed was never going to churn regardless of
+/// which identity version its rows carry.
 pub(super) fn needs_call_site_identity_baseline(conn: &Connection) -> rusqlite::Result<bool> {
     conn.query_row(
         "SELECT EXISTS(

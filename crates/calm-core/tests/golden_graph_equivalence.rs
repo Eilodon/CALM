@@ -28,6 +28,13 @@ struct CallSiteKey {
     identity_version: i64,
     callee_start_byte: Option<i64>,
     callee_end_byte: Option<i64>,
+    // PR#9 (docs/plans/2026-08-19-evidence-architecture-execution-plan.md
+    // Part E): v3's relative-to-enclosing-symbol offsets, alongside the
+    // pre-existing absolute ones above -- both compared, so equivalence
+    // catches a divergence in EITHER identity scheme, not just the
+    // absolute one v2 already covered.
+    callee_start_rel: Option<i64>,
+    callee_end_rel: Option<i64>,
     source_file_hash: Option<String>,
 }
 
@@ -78,7 +85,7 @@ fn graph_fingerprint(conn: &Connection) -> (BTreeSet<EdgeKey>, BTreeMap<String, 
                     ep.definition_snapshot, ep.call_site_identity_version, \
                     CASE WHEN ep.id IS NULL THEN NULL \
                          WHEN ep.graph_generation = graph.generation THEN 1 ELSE 0 END, \
-                    ep.status \
+                    ep.status, cs.callee_start_rel, cs.callee_end_rel \
              FROM call_edges ce \
              LEFT JOIN call_sites cs ON cs.id = ce.call_site_id \
              LEFT JOIN file_index fi ON fi.path = cs.from_path \
@@ -100,6 +107,8 @@ fn graph_fingerprint(conn: &Connection) -> (BTreeSet<EdgeKey>, BTreeMap<String, 
             let callee_start_byte: Option<i64> = r.get(15)?;
             let callee_end_byte: Option<i64> = r.get(16)?;
             let call_site_source_file_hash: Option<String> = r.get(17)?;
+            let call_site_start_rel: Option<i64> = r.get(28)?;
+            let call_site_end_rel: Option<i64> = r.get(29)?;
             let call_site = call_site_path.map(|path| CallSiteKey {
                 path,
                 enclosing_symbol: enclosing_symbol.unwrap_or_default(),
@@ -108,6 +117,8 @@ fn graph_fingerprint(conn: &Connection) -> (BTreeSet<EdgeKey>, BTreeMap<String, 
                 identity_version: call_site_identity_version.unwrap_or_default(),
                 callee_start_byte,
                 callee_end_byte,
+                callee_start_rel: call_site_start_rel,
+                callee_end_rel: call_site_end_rel,
                 source_file_hash: call_site_source_file_hash,
             });
             let provider: Option<String> = r.get(18)?;
