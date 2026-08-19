@@ -150,6 +150,16 @@ def main() -> None:
         default=repo_root_from_here() / "target" / "release" / "calm",
         help="Path to a `calm` binary built with --features scip-overlay",
     )
+    parser.add_argument(
+        "--ra-features",
+        default="all",
+        help=(
+            "Cargo features to activate for the rust-analyzer oracle run. "
+            "Default 'all' (--all-features) so the oracle covers feature-gated "
+            "source files CALM's tree-sitter indexer always parses (issue #72); "
+            "pass a comma-separated list to narrow it."
+        ),
+    )
     args = parser.parse_args()
     repo = args.repo.resolve()
     calm_bin = args.calm_bin.resolve()
@@ -163,8 +173,24 @@ def main() -> None:
 
     with tempfile.TemporaryDirectory() as tmp:
         scip_path = Path(tmp) / "oracle.scip"
-        print(f"Running rust-analyzer scip on {repo} ...")
-        run([ra_bin, "scip", str(repo), "--output", str(scip_path)])
+        # Oracle coverage fix (issue #72): a bare `rust-analyzer scip <repo>`
+        # compiles only DEFAULT Cargo features, so it emits ZERO occurrences
+        # for source files gated behind non-default features (bundle.rs behind
+        # `index-bundles`, lsp/*.rs behind `lsp-overlay`, http.rs behind
+        # `http`, ...). CALM's tree-sitter indexer parses those files
+        # UNCONDITIONALLY, so any CALM edge touching them could never match the
+        # oracle -- inflating the false-positive count independently of
+        # resolver quality. Activating all features aligns the oracle's file
+        # coverage with CALM's. `"all"` (not a hand-listed set) because the
+        # gating features live on different workspace members (`http` on
+        # calm-server, not calm-core) and a per-name feature list would error
+        # on the crate that lacks it; --all-features cannot.
+        feats = "all" if args.ra_features == "all" else args.ra_features.split(",")
+        ra_config = Path(tmp) / "ra-config.json"
+        ra_config.write_text(json.dumps({"cargo": {"features": feats}}))
+        print(f"Running rust-analyzer scip on {repo} (features={args.ra_features!r}) ...")
+        run([ra_bin, "scip", str(repo), "--output", str(scip_path),
+             "--config-path", str(ra_config)])
 
         dump = run([str(calm_bin), "scip-dump", str(scip_path)])
         occurrences = [json.loads(line) for line in dump.stdout.splitlines() if line.strip()]
@@ -183,6 +209,22 @@ def main() -> None:
     precision = len(matched) / len(calm_edges) if calm_edges else 0.0
     oracle_hit = {(e[0], e[1], e[2], e[3]) for e in matched}
     recall = len(oracle_hit) / len(oracle) if oracle else 0.0
+
+    # Oracle coverage audit (issue #72): a file the oracle never emitted an
+    # occurrence for (still feature-gated even under --all-features, generated,
+    # or otherwise excluded) can't corroborate ANY CALM edge originating in it,
+    # so those edges depress precision for reasons unrelated to resolver
+    # quality. Report coverage explicitly, plus a `precision_on_covered` that
+    # scores only edges whose from-file the oracle can actually see -- the
+    # honest number check-b2-thresholds.sh's floors should eventually track.
+    oracle_files = {o["file"] for o in occurrences}
+    calm_from_files = {e[0] for e in calm_edges}
+    uncovered_from_files = sorted(f for f in calm_from_files if f not in oracle_files)
+    covered_edges = [e for e in calm_edges if e[0] in oracle_files]
+    covered_matched = [e for e in covered_edges if (e[0], e[1], e[2], e[3]) in oracle]
+    precision_on_covered = (
+        len(covered_matched) / len(covered_edges) if covered_edges else 0.0
+    )
 
     by_conf: dict[str, list[tuple]] = defaultdict(list)
     for e in calm_edges:
@@ -203,6 +245,23 @@ def main() -> None:
     for conf, stats in conf_precision.items():
         print(f"{conf:<12} {stats['count']:>8} {stats['precision']:>10.3f}")
 
+    print()
+    print(
+        f"Oracle file coverage: {len(oracle_files)} file(s) with >=1 occurrence; "
+        f"{len(uncovered_from_files)}/{len(calm_from_files)} CALM from-file(s) "
+        f"invisible to the oracle"
+    )
+    print(
+        f"Precision on oracle-covered files only: {precision_on_covered:.3f}  "
+        f"({len(covered_matched)}/{len(covered_edges)})"
+    )
+    if uncovered_from_files:
+        preview = ", ".join(uncovered_from_files[:8])
+        print(
+            f"  uncovered from-files (first 8): {preview}"
+            f"{', ...' if len(uncovered_from_files) > 8 else ''}"
+        )
+
     result = {
         "repo": str(repo),
         "oracle_edges": len(oracle),
@@ -210,6 +269,10 @@ def main() -> None:
         "precision": precision,
         "recall": recall,
         "by_confidence": conf_precision,
+        "oracle_covered_files": len(oracle_files),
+        "calm_from_files": len(calm_from_files),
+        "uncovered_from_files": len(uncovered_from_files),
+        "precision_on_covered": precision_on_covered,
     }
     out_path = Path(__file__).parent / "results.json"
     out_path.write_text(json.dumps(result, indent=2))

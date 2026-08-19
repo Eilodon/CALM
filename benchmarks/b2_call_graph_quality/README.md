@@ -19,6 +19,14 @@ scip-dump` (dùng lại `calm_core::scip::parse`, không viết lại protobuf d
 index` (mặc định feature, tức **chỉ Phase A**, SCIP overlay không bật) rồi so `call_edges` (Rust)
 với oracle.
 
+Oracle chạy với **`--all-features`** (`--ra-features`, mặc định `all`) — xem issue #72: một lần
+`rust-analyzer scip` mặc-định-feature không phát occurrence cho các file sau feature-gate
+(`bundle.rs` sau `index-bundles`, `lsp/*.rs` sau `lsp-overlay`, `http.rs` sau `http`, …), trong khi
+indexer tree-sitter của CALM parse chúng vô điều kiện — làm mọi edge CALM chạm các file đó không bao
+giờ khớp oracle và thổi phồng false-positive. Output giờ báo `oracle_covered_files`,
+`uncovered_from_files` và `precision_on_covered` (precision chỉ tính trên các file oracle thực sự
+thấy) để chỉ số coverage-gap luôn quan sát được.
+
 ## Kết quả đo lần đầu (self-repo, sau Phase A, trước khi bật SCIP overlay)
 
 | | |
@@ -61,3 +69,9 @@ Theo `edge_confidence`:
   dưới thực tế chứ không phải chính xác tuyệt đối.
 - Chưa đo lần chạy có bật SCIP overlay (Phase B) — số trên là baseline Phase A thuần, mốc để đối
   chiếu khi B cải thiện.
+- **Bảng “Kết quả đo lần đầu” và floors trong `scripts/check-b2-thresholds.sh` chưa phản ánh
+  oracle `--all-features` mới.** Việc re-baseline (đo lại honest baseline rồi reset floors) cố tình
+  hoãn đến sau khi fix qualified-path `std::`/`core::`/`alloc::` (issue #72 ask #1) — issue tự ghi:
+  ~967 edge non-ambiguous/non-formal còn lại bị chi phối bởi cả coverage-gap (đã fix ở PR này) *và*
+  qualified-path gap, nên reset floors bây giờ sẽ phải reset lại lần nữa. Đo + set floors một lần
+  sau khi cả hai fix đã land.
