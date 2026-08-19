@@ -19,14 +19,19 @@ missing that the later same-scope `def name` shadows it.
 
 Fix: `insert_missing_exact_edges` now skips inserting a competing `formal`/`scip` edge when the same
 call site already carries a CONFIDENT STATIC edge (`resolved`, or non-scip `formal`) to a DIFFERENT
-target (`has_conflicting_confident_static_edge`). Deliberately narrow — `ambiguous`/`textual`/
+target (`conflicting_confident_static_target`), and RECORDS the disagreement in the new
+`evidence_conflicts` table (+ the `scip_static_conflict_count` process counter) so it is countable,
+not silently dropped — surfaced as the benchmark's `provider_conflict_rate` (WS7B, seeds the Wave 3
+evidence ledger). Deliberately narrow — `ambiguous`/`textual`/
 `inferred` edges stay overridable (that is the overlay's job); only a real language-rule resolution
 is protected. Regression test (scip-independent, constructed directly):
 `crates/calm-core/src/scip/ingest.rs::scip_does_not_add_formal_edge_conflicting_with_confident_static_resolution`.
 
 Full corpus before → after: `false_confidence_rate` **0.25 → 0.0**, `false_confident_site_rate`
 0.125 → 0.0, `call_recall` 0.875 (unchanged), no other fixture's outcome changed; fixture I went
-FALSE_CONFIDENCE → RECALL_LOWCONF_CORRECT.
+FALSE_CONFIDENCE → RECALL_LOWCONF_CORRECT. The eliminated false-confidence now shows up honestly as
+`provider_conflict_count` 1 / `provider_conflict_rate` 0.125 — the same site, reclassified from
+"confidently wrong" to "measured provider/static disagreement."
 
 The separate stack-graphs `formally_resolved` bare-name upgrade (`pipeline.rs` — upgrades a site to
 `formal` when stack-graphs proved *any* same-named reference resolves in the file) is a real but

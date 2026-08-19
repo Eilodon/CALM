@@ -67,6 +67,10 @@ class FixtureResult:
     # too-ambiguous-to-resolve" (the exact D3 defect WS3 fixes). See
     # `query_ambiguity_group` and `classify`'s MISSING_RECORDED_AMBIGUOUS.
     ambiguity_group: dict | None = None
+    # WS7B: count of `evidence_conflicts` rows for this fixture -- provider
+    # (SCIP) proofs skipped because they contradicted a confident static
+    # resolution of the same call site (fixture I / D8). Countable, not silent.
+    conflicts: int = 0
 
 
 def write_disable_embeddings_config(fixture_path: Path) -> None:
@@ -125,6 +129,21 @@ def query_call_edges(db_path: Path, from_path: str, call_line: int) -> list[tupl
     ).fetchall()
     conn.close()
     return [(r[0], r[1]) for r in rows]
+
+
+def query_conflict_count(db_path: Path) -> int:
+    """WS7B: number of recorded provider/static evidence conflicts in this
+    fixture's index (see `evidence_conflicts` and
+    `crates/calm-core/src/scip/ingest.rs::conflicting_confident_static_target`).
+    Tolerates an older DB with no such table (returns 0)."""
+    conn = sqlite3.connect(db_path)
+    try:
+        row = conn.execute("SELECT COUNT(*) FROM evidence_conflicts").fetchone()
+        return int(row[0]) if row else 0
+    except sqlite3.OperationalError:
+        return 0
+    finally:
+        conn.close()
 
 
 def query_ambiguity_group(db_path: Path, from_path: str, call_line: int) -> dict | None:
@@ -209,7 +228,8 @@ def run_fixture(calm_bin: Path, fixture_path: Path) -> FixtureResult:
     ambiguity_group = query_ambiguity_group(db_path, cs["path"], cs["line"]) if not emitted else None
     outcome = classify(expected, emitted, ambiguity_group)
     return FixtureResult(name, category, workstream, gate, outcome, emitted, expected,
-                          ambiguity_group=ambiguity_group)
+                          ambiguity_group=ambiguity_group,
+                          conflicts=query_conflict_count(db_path))
 
 
 MIN_SITES_FOR_COVERAGE_CURVE = 50
@@ -309,6 +329,13 @@ def print_report(results: list[FixtureResult]) -> dict:
             1 for r in gating if r.outcome == "MISSING_RECORDED_AMBIGUOUS"
         ),
         "missing_silent_count": sum(1 for r in gating if r.outcome == "MISSING_RECALL"),
+        # WS7B: provider (SCIP) proofs skipped because they contradicted a
+        # confident static resolution of the same call site -- recorded in
+        # `evidence_conflicts`, never emitted as a competing formal edge.
+        "provider_conflict_count": sum(r.conflicts for r in results),
+        "provider_conflict_rate": (
+            (sum(r.conflicts for r in gating) / total_gating) if total_gating else None
+        ),
         "blocked": [r.name for r in results if r.outcome == "BLOCKED"],
         "index_errors": [r.name for r in results if r.outcome == "INDEX_ERROR"],
     }

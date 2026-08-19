@@ -305,6 +305,28 @@ CREATE TABLE IF NOT EXISTS ambiguity_groups (
 CREATE INDEX IF NOT EXISTS idx_ambiguity_groups_call_site ON ambiguity_groups(call_site_id);
 CREATE INDEX IF NOT EXISTS idx_ambiguity_groups_from_path ON ambiguity_groups(from_path);
 
+-- WS7 (evidence reconciliation): a provider (SCIP) proof that CONTRADICTS a
+-- confident static resolution of the SAME call site is a conflict, not a new
+-- target -- inserting it would manufacture a false-confidence edge (fixture I /
+-- D8). `insert_missing_exact_edges` records the conflict here instead of adding
+-- the competing edge, so provider disagreement is COUNTABLE (the WS0 benchmark's
+-- `provider_conflict_rate`) rather than silently dropped. Seeds the Wave 3
+-- evidence ledger. from_path denormalized + call_site_id CASCADE so a
+-- delta-scoped reindex clears stale rows the same way ambiguity_groups does.
+CREATE TABLE IF NOT EXISTS evidence_conflicts (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    call_site_id      INTEGER NOT NULL REFERENCES call_sites(id) ON DELETE CASCADE,
+    from_path         TEXT NOT NULL,
+    call_site_line    INTEGER,
+    static_target     TEXT NOT NULL,
+    provider_target   TEXT NOT NULL,
+    provider          TEXT NOT NULL,
+    conflict_kind     TEXT NOT NULL,
+    UNIQUE(call_site_id, provider_target)
+);
+CREATE INDEX IF NOT EXISTS idx_evidence_conflicts_call_site ON evidence_conflicts(call_site_id);
+CREATE INDEX IF NOT EXISTS idx_evidence_conflicts_from_path ON evidence_conflicts(from_path);
+
 -- D4 migration observability. This is diagnostic-only and deliberately lives
 -- outside the graph baseline transaction: readers still see an all-old or
 -- all-new graph, while operators can tell whether an identity rebuild is

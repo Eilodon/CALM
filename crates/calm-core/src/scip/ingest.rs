@@ -115,6 +115,17 @@ pub fn scip_stack_graphs_override_count() -> u64 {
     SCIP_STACK_GRAPHS_OVERRIDES.load(Ordering::Relaxed)
 }
 
+/// WS7: process-wide count of SCIP proofs skipped because they contradicted a
+/// confident static resolution of the same call site -- recorded in the
+/// `evidence_conflicts` table, never inserted as a competing formal edge.
+/// Distinct from the D3 stack-graphs override counter above.
+static SCIP_STATIC_CONFLICTS: AtomicU64 = AtomicU64::new(0);
+
+/// Count of WS7 provider/static conflicts detected since process start.
+pub fn scip_static_conflict_count() -> u64 {
+    SCIP_STATIC_CONFLICTS.load(Ordering::Relaxed)
+}
+
 /// Records one legacy SCIP-vs-stack_graphs disagreement: bumps the process-wide
 /// counter and logs the call site + target so it can be traced back to a
 /// specific edge without re-querying the DB. `ruled_out` distinguishes the
@@ -431,7 +442,25 @@ fn insert_missing_exact_edges(
             // is a genuine, live false_confidence_rate data point (a top-tier
             // edge to a target the language never actually calls). Skip the
             // insert on conflict; the correct static edge stays.
-            if has_conflicting_confident_static_edge(conn, call_site_id, &to_symbol)? {
+            if let Some(static_target) =
+                conflicting_confident_static_target(conn, call_site_id, &to_symbol)?
+            {
+                // Record the conflict (countable via `evidence_conflicts` and
+                // scip_static_conflict_count), then skip -- do NOT add a
+                // competing formal edge (fixture I / D8). INSERT OR IGNORE with
+                // the UNIQUE(call_site_id, provider_target) constraint keeps a
+                // repeat overlay pass idempotent.
+                if conn.execute(
+                    "INSERT OR IGNORE INTO evidence_conflicts
+                        (call_site_id, from_path, call_site_line, static_target,
+                         provider_target, provider, conflict_kind)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 'scip',
+                             'provider_contradicts_confident_static')",
+                    rusqlite::params![call_site_id, &key.0, call_line, static_target, to_symbol],
+                )? > 0
+                {
+                    SCIP_STATIC_CONFLICTS.fetch_add(1, Ordering::Relaxed);
+                }
                 continue;
             }
             let added = insert.execute(rusqlite::params![
@@ -461,33 +490,37 @@ fn insert_missing_exact_edges(
     Ok(inserted)
 }
 
-/// WS7 reconciliation guard for `insert_missing_exact_edges`: true when this
-/// call site already carries a CONFIDENT STATIC edge to a target OTHER than the
-/// one SCIP wants to add. "Confident static" = `resolved` (tier-1 language-rule
+/// WS7 reconciliation for `insert_missing_exact_edges`: returns `Some(target)`
+/// -- the confident static edge's target -- when this call site already carries
+/// a CONFIDENT STATIC edge to a target OTHER than the one SCIP wants to add,
+/// else `None`. "Confident static" = `resolved` (tier-1 language-rule
 /// resolution) or a non-SCIP `formal` (e.g. stack-graphs) edge -- deliberately
 /// NOT `ambiguous`/`textual`/`inferred`, which the overlay is SUPPOSED to
 /// override (that is the whole point of SCIP disambiguating fan-out). A SCIP
 /// proof contradicting a confident static resolution is a conflict, not a new
-/// target: adding it would manufacture a false-confidence edge (D8).
-fn has_conflicting_confident_static_edge(
+/// target: adding it would manufacture a false-confidence edge (D8). The caller
+/// records the returned target in `evidence_conflicts` instead of inserting.
+fn conflicting_confident_static_target(
     conn: &Connection,
     call_site_id: i64,
     scip_target: &str,
-) -> rusqlite::Result<bool> {
-    conn.query_row(
-        "SELECT EXISTS(
-             SELECT 1 FROM call_edges
-             WHERE call_site_id = ?1
-               AND to_symbol != ?2
-               AND ruled_out_by_scip = 0
-               AND ( edge_confidence = 'resolved'
-                  OR (edge_confidence = 'formal'
-                      AND (formal_source IS NULL OR formal_source != 'scip')) )
-         )",
+) -> rusqlite::Result<Option<String>> {
+    match conn.query_row(
+        "SELECT to_symbol FROM call_edges
+         WHERE call_site_id = ?1
+           AND to_symbol != ?2
+           AND ruled_out_by_scip = 0
+           AND ( edge_confidence = 'resolved'
+              OR (edge_confidence = 'formal'
+                  AND (formal_source IS NULL OR formal_source != 'scip')) )
+         LIMIT 1",
         rusqlite::params![call_site_id, scip_target],
-        |row| row.get::<_, i64>(0),
-    )
-    .map(|exists| exists != 0)
+        |row| row.get::<_, String>(0),
+    ) {
+        Ok(target) => Ok(Some(target)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 /// Persist evidence only after the graph row itself was accepted.  The SELECT
@@ -1520,6 +1553,30 @@ mod tests {
             edges,
             vec![("caller.py::name".to_string(), "resolved".to_string(), 0)],
             "only the correct local edge should survive, un-ruled-out: {edges:?}"
+        );
+
+        // WS7B: the skipped provider proof must be RECORDED as a conflict
+        // (countable), not silently dropped.
+        let conflicts: Vec<(String, String, String)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT static_target, provider_target, conflict_kind \
+                     FROM evidence_conflicts",
+                )
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        assert_eq!(
+            conflicts,
+            vec![(
+                "caller.py::name".to_string(),
+                "external.py::name".to_string(),
+                "provider_contradicts_confident_static".to_string()
+            )],
+            "the skipped provider proof must be recorded in evidence_conflicts: {conflicts:?}"
         );
     }
 
