@@ -227,6 +227,24 @@ pub struct EditConfig {
     /// (`ContainmentMethod::TextualFallback`), so enabling this on a
     /// non-Linux-x86_64 target changes nothing observable.
     pub kernel_enforced_writes: bool,
+    /// Opt-in, explicitly WEAKER alternative to `calm review approve` (the
+    /// TTY-gated CLI in `crates/calm-core/src/authority/pending_review.rs`)
+    /// for clearing a `HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW` pending
+    /// review. That module's whole reason to exist is to be
+    /// MCP-protocol-independent -- a channel the connected agent itself
+    /// cannot write to, specifically because an agent-mediated round-trip
+    /// (this flag's own mechanism, and `elicit_hub_confirm` before it) was
+    /// found to be able to silently complete with no human ever having seen
+    /// anything. Turning this on re-opens exactly that gap: the calling
+    /// agent decides when to call `review_decide_via_agent_relay` and what
+    /// `approve` value to pass, and nothing at the server can verify a
+    /// human actually saw the diff or gave that answer -- only that the
+    /// agent echoed back the review's real current digest (rules out
+    /// approving blind, nothing more). Default `false`. Requested and
+    /// explicitly, repeatedly confirmed by the project owner
+    /// (2026-08-19) after being shown this exact tradeoff in plain terms;
+    /// keep it default-off for every other project.
+    pub elicit_via_agent_relay: bool,
 }
 
 impl Default for EditConfig {
@@ -236,6 +254,7 @@ impl Default for EditConfig {
             elicit_timeout_secs: 120,
             always_require_edit_context: false,
             kernel_enforced_writes: false,
+            elicit_via_agent_relay: false,
         }
     }
 }

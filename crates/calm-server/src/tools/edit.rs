@@ -2751,6 +2751,128 @@ impl CalmServer {
             )),
         })
     }
+
+    /// WS-Auth (2026-08-19, requested and explicitly confirmed by the
+    /// project owner after being shown the tradeoff below in plain terms —
+    /// see `EditConfig::elicit_via_agent_relay`'s own doc comment).
+    ///
+    /// Deliberately weaker sibling of `calm review approve` (the TTY-gated
+    /// CLI in `calm_core::authority::pending_review` — see that module's own
+    /// doc comment for why it exists and what it defends against). That
+    /// channel is MCP-protocol-independent BY DESIGN: the connected agent
+    /// cannot write to it at all, specifically because an agent-mediated
+    /// round-trip was found able to silently complete with no human ever
+    /// having seen anything. This tool re-opens exactly that gap on purpose,
+    /// for environments where the TTY CLI is unusable and the project owner
+    /// has decided the tradeoff is acceptable: it trusts the calling agent's
+    /// own account of what it showed the human and what they answered, with
+    /// nothing at the server able to verify either. The ONE thing this DOES
+    /// verify: `diff_digest` must equal `hash_content` of the review's own
+    /// CURRENT `diff_preview`, proving the caller fetched and is referencing
+    /// the real, current diff at the moment of deciding — it rules out
+    /// approving blind or against a stale/guessed copy, nothing more.
+    /// Disabled unless `[edit] elicit_via_agent_relay = true`.
+    #[tool(
+        name = "review_decide_via_agent_relay",
+        description = "Approve or decline a HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW pending review through the calling agent, after it has shown the human the review's exact diff_preview (e.g. via its own UI) and gotten a real answer. Disabled by default -- requires [edit] elicit_via_agent_relay = true in .calm/config.json, an explicit project-owner opt-in. WEAKER than `calm review approve` (the TTY-gated CLI): this channel trusts the calling agent's own account of what it showed the human and what they answered; nothing at the server can verify either. Requires echoing back hash_content(the review's diff_preview) as diff_digest -- proves the agent is referencing the CURRENT real diff, not a guess or stale copy. Prefer the TTY CLI when it's usable.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        ),
+        output_schema = rmcp::handler::server::tool::schema_for_output::<ToolOutcome<ReviewDecideOutput>>()
+    )]
+    pub(crate) fn review_decide_via_agent_relay(
+        &self,
+        Parameters(p): Parameters<ReviewDecideParams>,
+    ) -> Json<ToolOutcome<ReviewDecideOutput>> {
+        Json(self.timed_tool("review_decide_via_agent_relay", || {
+            if !self.config().edit.elicit_via_agent_relay {
+                return ToolOutcome::error(error_detail(
+                    "AGENT_RELAY_DISABLED",
+                    "this channel is disabled by default -- set [edit] elicit_via_agent_relay = \
+                     true in .calm/config.json to opt in (a deliberate, explicit project-owner \
+                     decision -- see EditConfig::elicit_via_agent_relay's doc comment for the \
+                     tradeoff). Prefer `calm review approve <id>` in a real terminal if one is \
+                     available.",
+                    false,
+                ));
+            }
+            let conn = match calm_core::db::conn::open_state_writer(&self.state_db_path) {
+                Ok(c) => c,
+                Err(e) => return db_error(e),
+            };
+            let review = match calm_core::authority::get_pending_review(&conn, &p.review_id) {
+                Ok(Some(r)) => r,
+                Ok(None) => {
+                    return ToolOutcome::error(error_detail(
+                        "REVIEW_NOT_FOUND",
+                        &format!(
+                            "no review {} -- never existed, already decided, or expired",
+                            p.review_id
+                        ),
+                        false,
+                    ));
+                }
+                Err(e) => return db_error(e),
+            };
+            if review.status != "pending" {
+                return ToolOutcome::error(error_detail(
+                    "REVIEW_ALREADY_DECIDED",
+                    &format!(
+                        "review {} is already '{}' -- do not re-decide it",
+                        p.review_id, review.status
+                    ),
+                    false,
+                ));
+            }
+            let expected_digest =
+                calm_core::indexer::pipeline::hash_content(&review.diff_preview);
+            if p.diff_digest != expected_digest {
+                return ToolOutcome::error(error_detail(
+                    "DIFF_DIGEST_MISMATCH",
+                    "the echoed diff_digest does not match this review's actual current \
+                     diff_preview -- fetch it fresh (get_pending_review's diff_preview, or `calm \
+                     review show`) and echo hash_content of THAT exact text; do not guess or \
+                     reuse a stale digest",
+                    true,
+                ));
+            }
+            let decided_by = "agent_relay_after_elicitation";
+            let outcome = if p.approve {
+                calm_core::authority::approve_pending_review(&conn, &p.review_id, decided_by)
+            } else {
+                calm_core::authority::decline_pending_review(&conn, &p.review_id, decided_by)
+            };
+            match outcome {
+                Ok(true) => {
+                    tracing::info!(
+                        target: crate::telemetry::AUDIT_TARGET,
+                        session_id = self.session_id,
+                        decision = if p.approve {
+                            "agent_relay_approved"
+                        } else {
+                            "agent_relay_declined"
+                        },
+                        review_id = %p.review_id,
+                        path = %review.path,
+                    );
+                    ToolOutcome::success(ReviewDecideOutput {
+                        review_id: p.review_id,
+                        status: if p.approve { "approved" } else { "declined" }.to_string(),
+                    })
+                }
+                Ok(false) => ToolOutcome::error(error_detail(
+                    "REVIEW_ALREADY_DECIDED",
+                    "the review was decided or expired between the check above and this write \
+                     -- race, re-fetch and retry",
+                    true,
+                )),
+                Err(e) => db_error(e),
+            }
+        }))
+    }
 }
 
 /// How the hub/high-risk gate interacts with the human-elicitation veto
@@ -4254,6 +4376,29 @@ pub(crate) struct EditHunkParam {
     /// newline handling) — include your own `\n` between lines and after
     /// the last one if the following line should stay on its own line.
     pub(crate) new_text: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub(crate) struct ReviewDecideParams {
+    /// The `review_id` from a `HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW` error
+    /// (e.g. `REVIEW-...`).
+    pub(crate) review_id: String,
+    /// `hash_content` of the review's own CURRENT `diff_preview` -- fetch it
+    /// fresh (`calm review show <id>`, or read the pending review directly)
+    /// and hash THAT exact text. Mismatches are refused (`DIFF_DIGEST_MISMATCH`).
+    pub(crate) diff_digest: String,
+    /// `true` to approve, `false` to decline. Only call this after the human
+    /// has actually seen the review's real diff and given a real answer --
+    /// see this tool's own description for what this channel does and does
+    /// not verify.
+    pub(crate) approve: bool,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub(crate) struct ReviewDecideOutput {
+    pub(crate) review_id: String,
+    /// `"approved"` or `"declined"`.
+    pub(crate) status: String,
 }
 
 #[derive(Deserialize, JsonSchema)]

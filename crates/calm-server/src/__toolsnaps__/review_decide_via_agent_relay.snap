@@ -1,0 +1,77 @@
+{
+  "name": "review_decide_via_agent_relay",
+  "description": "Approve or decline a HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW pending review through the calling agent, after it has shown the human the review's exact diff_preview (e.g. via its own UI) and gotten a real answer. Disabled by default -- requires [edit] elicit_via_agent_relay = true in .calm/config.json, an explicit project-owner opt-in. WEAKER than `calm review approve` (the TTY-gated CLI): this channel trusts the calling agent's own account of what it showed the human and what they answered; nothing at the server can verify either. Requires echoing back hash_content(the review's diff_preview) as diff_digest -- proves the agent is referencing the CURRENT real diff, not a guess or stale copy. Prefer the TTY CLI when it's usable.",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "required": [
+      "review_id",
+      "diff_digest",
+      "approve"
+    ],
+    "type": "object",
+    "properties": {
+      "review_id": {
+        "description": "The `review_id` from a `HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW` error\n(e.g. `REVIEW-...`).",
+        "type": "string"
+      },
+      "diff_digest": {
+        "description": "`hash_content` of the review's own CURRENT `diff_preview` -- fetch it\nfresh (`calm review show <id>`, or read the pending review directly)\nand hash THAT exact text. Mismatches are refused (`DIFF_DIGEST_MISMATCH`).",
+        "type": "string"
+      },
+      "approve": {
+        "description": "`true` to approve, `false` to decline. Only call this after the human\nhas actually seen the review's real diff and given a real answer --\nsee this tool's own description for what this channel does and does\nnot verify.",
+        "type": "boolean"
+      }
+    }
+  },
+  "outputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$defs": {
+      "ErrorDetail": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "recoverable": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "recoverable"
+        ]
+      }
+    },
+    "properties": {
+      "error": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/ErrorDetail"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "review_id": {
+        "type": "string"
+      },
+      "status": {
+        "description": "`\"approved\"` or `\"declined\"`.",
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "annotations": {
+    "readOnlyHint": false,
+    "destructiveHint": false,
+    "idempotentHint": false,
+    "openWorldHint": false
+  }
+}
