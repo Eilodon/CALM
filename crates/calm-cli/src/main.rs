@@ -392,6 +392,31 @@ enum ReviewAction {
         project_root: PathBuf,
         review_id: String,
     },
+    /// Same channel as the MCP tool `review_decide_via_agent_relay` -- see
+    /// `calm_core::config::EditConfig::elicit_via_agent_relay`'s doc comment
+    /// for the full tradeoff this accepts. Deliberately WEAKER than
+    /// `approve` (no TTY requirement): trusts the caller's own account of
+    /// what it showed a human and what they answered. Disabled unless
+    /// `[edit] elicit_via_agent_relay = true` in config.json. Requires
+    /// `--diff-digest` = the digest `calm review show <id>` prints
+    /// (`hash_content` of the review's CURRENT `diff_preview`) -- proves
+    /// the caller is referencing the real, current diff, not a guess or
+    /// stale copy.
+    ApproveViaAgentRelay {
+        #[arg(long, default_value = ".")]
+        project_root: PathBuf,
+        review_id: String,
+        #[arg(long)]
+        diff_digest: String,
+    },
+    /// Same as `approve-via-agent-relay` but declines instead.
+    DeclineViaAgentRelay {
+        #[arg(long, default_value = ".")]
+        project_root: PathBuf,
+        review_id: String,
+        #[arg(long)]
+        diff_digest: String,
+    },
 }
 
 #[tokio::main]
@@ -1301,6 +1326,16 @@ async fn main() -> Result<()> {
                 project_root,
                 review_id,
             } => decide_review_interactively(&project_root, &review_id, false)?,
+            ReviewAction::ApproveViaAgentRelay {
+                project_root,
+                review_id,
+                diff_digest,
+            } => decide_review_via_agent_relay(&project_root, &review_id, &diff_digest, true)?,
+            ReviewAction::DeclineViaAgentRelay {
+                project_root,
+                review_id,
+                diff_digest,
+            } => decide_review_via_agent_relay(&project_root, &review_id, &diff_digest, false)?,
         },
     }
 
@@ -1330,6 +1365,11 @@ fn print_pending_review(r: &calm_core::authority::PendingReview) {
     println!(
         "{}",
         calm_core::sanitize::sanitize_source_output(&r.diff_preview)
+    );
+    println!();
+    println!(
+        "diff_digest (for --diff-digest, e.g. with approve-via-agent-relay): {}",
+        calm_core::indexer::pipeline::hash_content(&r.diff_preview)
     );
 }
 
@@ -1415,6 +1455,67 @@ fn decide_review_interactively(
         std::process::exit(1);
     }
     Ok(())
+}
+
+/// `calm review approve-via-agent-relay|decline-via-agent-relay` shared body
+/// -- the CLI mirror of the MCP tool `review_decide_via_agent_relay`, using
+/// the exact same `calm_core::authority::decide_via_agent_relay` so the one
+/// safety-relevant check (the diff digest match) lives in one place
+/// regardless of which front-end calls it. See that function's doc comment,
+/// and `EditConfig::elicit_via_agent_relay`'s, for the tradeoff this
+/// deliberately accepts. No TTY requirement, unlike
+/// `decide_review_interactively` above.
+fn decide_review_via_agent_relay(
+    project_root: &std::path::Path,
+    review_id: &str,
+    diff_digest: &str,
+    approving: bool,
+) -> Result<()> {
+    let root = std::fs::canonicalize(project_root)?;
+    let config = calm_core::config::load_config_or_warn(&root);
+    if !config.edit.elicit_via_agent_relay {
+        anyhow::bail!(
+            "this channel is disabled by default -- set [edit] elicit_via_agent_relay = true in \
+             config.json (repo root) or .calm/config.json to opt in (a deliberate, explicit \
+             project-owner decision -- see EditConfig::elicit_via_agent_relay's doc comment for \
+             the tradeoff). Prefer `calm review {}` in a real terminal if one is available.",
+            if approving { "approve" } else { "decline" }
+        );
+    }
+    let state_db_path = calm_server::default_state_db_path(&root);
+    let conn = calm_core::db::conn::open_state_writer(&state_db_path)?;
+    calm_core::db::schema::init_state_db_versioned(&conn)?;
+    match calm_core::authority::decide_via_agent_relay(&conn, review_id, diff_digest, approving)? {
+        calm_core::authority::AgentRelayOutcome::Decided(status) => {
+            println!("Review {review_id} {status} (via agent relay).");
+            if approving {
+                println!("The agent's retry of the same edit should now succeed.");
+            }
+            Ok(())
+        }
+        calm_core::authority::AgentRelayOutcome::NotFound => {
+            println!("No such review: {review_id}");
+            std::process::exit(1);
+        }
+        calm_core::authority::AgentRelayOutcome::AlreadyDecided(status) => {
+            println!("Review {review_id} is already {status}, not pending.");
+            std::process::exit(1);
+        }
+        calm_core::authority::AgentRelayOutcome::DigestMismatch => {
+            anyhow::bail!(
+                "diff_digest does not match this review's actual current diff_preview -- fetch \
+                 it fresh (`calm review show {review_id}`) and pass THAT exact digest; do not \
+                 guess or reuse a stale one"
+            );
+        }
+        calm_core::authority::AgentRelayOutcome::Race => {
+            println!(
+                "Could not decide {review_id} -- it may have expired or already been decided by \
+                 someone else."
+            );
+            std::process::exit(1);
+        }
+    }
 }
 
 /// Builds the `{ "command", "args" }` MCP entry every client config shares,
