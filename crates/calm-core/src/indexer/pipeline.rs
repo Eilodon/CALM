@@ -2987,6 +2987,83 @@ impl StructB {
     }
 
     #[test]
+    // PR#8 (docs/plans/2026-08-19-evidence-architecture-execution-plan.md
+    // Part E): the actual adversarial case target_type_kind/target_type_qn
+    // exist to fix. TWO classes both named `User`, in different Java
+    // packages/directories (com.foo.User, com.bar.User), each declaring a
+    // same-named method. by_name_class's (callee, "User") key alone cannot
+    // tell them apart -- before this slice, both candidates would survive
+    // and the edge would be marked Ambiguous (or worse, silently pick
+    // whichever narrowing heuristic like same_dir happened to fire, for
+    // reasons unrelated to the receiver's REAL declared type). Caller.java
+    // imports com.foo.User specifically and calls it through a typed
+    // variable (tier-2, ctx.type_map) -- target_type_kind should resolve to
+    // 'resolved_import' with target_type_qn "com.foo.User", which
+    // type_qn_matches_path then matches against the com/foo/User.java
+    // candidate's path (dots-to-slashes) and NOT the com/bar/User.java one.
+    fn test_java_cross_package_bare_name_collision_resolves_via_target_type_qn() {
+        let dir =
+            std::env::temp_dir().join(format!("ci_idx_java_typequalify_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("com/foo")).unwrap();
+        std::fs::create_dir_all(dir.join("com/bar")).unwrap();
+        std::fs::write(
+            dir.join("com/foo/User.java"),
+            "package com.foo;\npublic class User {\n    public String getName() { return \"foo\"; }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("com/bar/User.java"),
+            "package com.bar;\npublic class User {\n    public String getName() { return \"bar\"; }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("Caller.java"),
+            "import com.foo.User;\n\nclass Caller {\n    void run(User u) {\n        u.getName();\n    }\n}\n",
+        )
+        .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
+
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM call_edges \
+                 WHERE from_symbol = (SELECT qualified_name FROM symbols WHERE name = 'run') \
+                 AND to_symbol = (SELECT qualified_name FROM symbols WHERE name = 'getName' \
+                     AND path LIKE '%com/foo/User.java')",
+            ),
+            1,
+            "u.getName() must resolve to com.foo.User::getName -- the imported User, not the unrelated com.bar.User"
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM call_edges \
+                 WHERE from_symbol = (SELECT qualified_name FROM symbols WHERE name = 'run') \
+                 AND to_symbol = (SELECT qualified_name FROM symbols WHERE name = 'getName' \
+                     AND path LIKE '%com/bar/User.java')",
+            ),
+            0,
+            "must NOT also fan out to the unrelated com.bar.User::getName just because both classes are bare-named User"
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM call_edges \
+                 WHERE from_symbol = (SELECT qualified_name FROM symbols WHERE name = 'run') \
+                 AND edge_confidence = 'ambiguous'",
+            ),
+            0,
+            "must not be Ambiguous -- target_type_qn scoping should have picked exactly the imported User"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     // P1.5 remainder, the actual disambiguation case the "using -> namespace"
     // gap was closed for: TWO classes named `Helper` exist, in different
     // namespaces — `by_name_class` alone can't tell them apart (its key is

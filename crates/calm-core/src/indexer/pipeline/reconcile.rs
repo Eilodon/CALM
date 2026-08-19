@@ -42,6 +42,52 @@ use super::{
     resolve_via_inheritance_closure, signature_returns_option_or_result,
 };
 
+/// PR#8 (docs/plans/2026-08-19-evidence-architecture-execution-plan.md Part
+/// E): does `path` (a `by_name_class` candidate's file path) plausibly
+/// belong to the type `target_type_qn` refers to, per `target_type_kind`'s
+/// variant? A pure narrowing predicate -- `resolve_sites_to_edges` only
+/// ever uses this to prefer a SUBSET of an already-name-matched candidate
+/// list, exactly like `import_path`'s/`module_hint`'s own file-stem checks
+/// (never a source of new candidates), so a false negative here just falls
+/// through to the unscoped bare-name behavior that predates PR#8 -- never a
+/// wrong resolution, only a missed narrowing opportunity.
+///
+/// `"resolved_same_file"`: `target_type_qn` is the caller's own file path
+/// (self/this/Rust's `Self::`, set in `extract_file_data`) -- exact match
+/// only, the strongest signal this function has (the receiver's type IS
+/// the enclosing class, guaranteed declared in that exact file).
+///
+/// `"resolved_import"`: `target_type_qn` is the RAW, unmodified import
+/// text the receiver's bare type name was bound to in the caller's file
+/// (e.g. Java `import com.foo.User;` -> `"com.foo.User"`, JS `import
+/// {User} from '../models/user'` -> `"../models/user"`). Two heuristics,
+/// tried in order, both fail-open:
+/// 1. Dots-to-slashes: `"com.foo.User"` -> `"com/foo/User"` -- matches
+///    Java/Kotlin/Python's directory-mirrors-package convention when
+///    `path` contains that translated form (with or without a trailing
+///    file extension after the last segment).
+/// 2. Raw substring: covers already-slash-delimited specifiers (JS/TS/Go
+///    relative or package-style imports) where no dot-to-slash
+///    translation is meaningful -- strips a leading `./`/`../` first so a
+///    relative import matches regardless of how many directories up it
+///    climbs relative to the (different) `by_name_class` candidate path.
+///
+/// Every other `target_type_kind` value (`"unresolved"`, unrecognized, or
+/// absent) never matches -- `resolve_sites_to_edges`'s caller only invokes
+/// this when both `target_type_kind`/`target_type_qn` are `Some`, so this
+/// arm is defensive, not reachable in practice.
+fn type_qn_matches_path(kind: &str, qn: &str, path: &str) -> bool {
+    match kind {
+        "resolved_same_file" => path == qn,
+        "resolved_import" => {
+            let dotted_to_slashed = qn.replace('.', "/");
+            let stripped = qn.trim_start_matches("../").trim_start_matches("./");
+            path.contains(&dotted_to_slashed) || (!stripped.is_empty() && path.contains(stripped))
+        }
+        _ => false,
+    }
+}
+
 /// Narrow every call site in `sites` against `ctx` and produce the final,
 /// deduped `CallEdge` list — a pure function of `(ctx, sites)` with no DB
 /// access (the caller owns the DELETE/INSERT scope, letting `rebuild_graph`
@@ -192,8 +238,8 @@ pub(super) fn resolve_sites_to_edges(
                 _,
                 arg_count,
                 import_path,
-                _,
-                _,
+                target_type_kind,
+                target_type_qn,
             )| {
                 // Inheritance fallback (2026-08-18, B15 investigation): an
                 // exact-class miss here does NOT always mean "no candidates
@@ -246,7 +292,42 @@ pub(super) fn resolve_sites_to_edges(
                 let (targets, exact_class_matched): (Option<Vec<SymbolCandidate>>, bool) =
                     match target_class {
                         Some(cls) => match ctx.by_name_class.get(&(callee.clone(), cls.clone())) {
-                            Some(t) => (Some(t.clone()), true),
+                            Some(t) => {
+                                // PR#8 (docs/plans/2026-08-19-evidence-
+                                // architecture-execution-plan.md Part E):
+                                // disambiguate a bare-name collision --
+                                // by_name_class's (callee, cls) key can't
+                                // by itself tell two same-named classes in
+                                // different packages/files apart (both set
+                                // target_class: Some("User")). When there's
+                                // more than one candidate AND this call
+                                // site's target_type_kind/qn narrowed to a
+                                // real qualifier, prefer the subset whose
+                                // path plausibly matches it. Fail-open: an
+                                // empty match (heuristic missed, or every
+                                // candidate is equally (im)plausible) keeps
+                                // the full unscoped set, identical to
+                                // pre-PR#8 behavior -- never a regression,
+                                // same posture as every other narrowing
+                                // filter in this function.
+                                if t.len() > 1
+                                    && let Some(kind) = target_type_kind
+                                    && let Some(qn) = target_type_qn
+                                {
+                                    let qualified: Vec<(String, String, String)> = t
+                                        .iter()
+                                        .filter(|(_, p, _)| type_qn_matches_path(kind, qn, p))
+                                        .cloned()
+                                        .collect();
+                                    if qualified.is_empty() {
+                                        (Some(t.clone()), true)
+                                    } else {
+                                        (Some(qualified), true)
+                                    }
+                                } else {
+                                    (Some(t.clone()), true)
+                                }
+                            }
                             None if ctx.by_name.contains_key(cls) => {
                                 match resolve_via_inheritance_closure(ctx, callee, cls) {
                                     Some(ancestor_hit) => (Some(ancestor_hit), true),

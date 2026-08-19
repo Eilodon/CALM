@@ -452,23 +452,41 @@ pub(super) fn extract_file_data(
                             // construction, guaranteed declared in THIS
                             // file. Stronger, cheaper signal than an
                             // import-table lookup: this file's own path IS
-                            // the qualification.
-                            (Some("resolved".to_string()), Some(rel.to_string()))
-                        } else if let Some(module_path) = ctx.import_map.get(cls)
-                            && let Some(seg) =
-                                crate::indexer::parser::module_path_last_segment(module_path)
-                        {
+                            // the qualification, matched EXACTLY (not a
+                            // heuristic) against a by_name_class candidate's
+                            // own `path` at reconcile time.
+                            (
+                                Some("resolved_same_file".to_string()),
+                                Some(rel.to_string()),
+                            )
+                        } else if let Some(module_path) = ctx.import_map.get(cls) {
                             // The bare receiver-type name was itself imported
-                            // from a specific module in THIS file -- same
-                            // import-table signal already used for
-                            // import_path/module_hint on the CALLEE-name
-                            // axis (see the whole-module-import branch
-                            // above), applied here to the class-name axis.
-                            // `seg` narrows resolve_sites_to_edges's
-                            // by_name_class candidates to the file(s) whose
-                            // stem matches, the same filter mechanism
-                            // import_path already applies.
-                            (Some("resolved".to_string()), Some(seg))
+                            // from a specific module in THIS file. Stores the
+                            // RAW import text unmodified (e.g. Java `import
+                            // com.foo.User;` -> "com.foo.User",
+                            // imported_names bound "User" -> module_name
+                            // "com.foo.User" INCLUDES the class name itself
+                            // as its trailing segment -- see
+                            // parse_java_import) -- deliberately NOT reduced
+                            // via `module_path_last_segment` the way
+                            // import_path/module_hint are on the callee-name
+                            // axis: that reduction throws away exactly the
+                            // package-qualifying prefix this field exists to
+                            // preserve (module_path_last_segment("com.foo.
+                            // User") == "User", i.e. right back to the bare
+                            // class name PR#8 is trying to disambiguate --
+                            // caught live while designing the slice-3
+                            // matching logic, before it shipped, by tracing
+                            // parse_java_import's actual module_name shape).
+                            // resolve_sites_to_edges (slice 3) resolves this
+                            // raw text against a by_name_class candidate's
+                            // `path` with a best-effort dots-to-slashes
+                            // substring heuristic, fail-open exactly like
+                            // every other narrowing filter in that function.
+                            (
+                                Some("resolved_import".to_string()),
+                                Some(module_path.clone()),
+                            )
                         } else {
                             // Not self/this/Self::, not found in this file's
                             // own import table. Could be a local (same-file)
