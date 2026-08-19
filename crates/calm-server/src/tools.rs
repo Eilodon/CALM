@@ -6289,31 +6289,31 @@ mod tests {
             )
             .unwrap();
         }
-        let rust_result = jv(
-            server.callers(rmcp::handler::server::wrapper::Parameters(CallersParams {
+        let rust_result = jv(server.callers(rmcp::handler::server::wrapper::Parameters(
+            CallersParams {
                 symbol: "helper".into(),
                 path: Some("rust_mod.rs".into()),
                 line: Some(1),
                 transitive: false,
                 max_depth: None,
                 if_none_match: None,
-            })),
-        );
+            },
+        )));
         assert_eq!(
             rust_result["unresolved_group_count"], 0,
             "the Rust helper was never a member of the Python overflow group -- must not inherit its caveat"
         );
 
-        let py_result = jv(
-            server.callers(rmcp::handler::server::wrapper::Parameters(CallersParams {
+        let py_result = jv(server.callers(rmcp::handler::server::wrapper::Parameters(
+            CallersParams {
                 symbol: "helper".into(),
                 path: Some("py_mod.py".into()),
                 line: Some(1),
                 transitive: false,
                 max_depth: None,
                 if_none_match: None,
-            })),
-        );
+            },
+        )));
         assert_eq!(
             py_result["unresolved_group_count"], 1,
             "the Python helper genuinely is a persisted member of the overflow group"
