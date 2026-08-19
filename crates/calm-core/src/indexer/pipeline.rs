@@ -5435,6 +5435,50 @@ impl StructB {
     }
 
     #[test]
+    // Issue #72: a call explicitly rooted at an external crate
+    // (`std::fs::write`) must NOT fall through the unscoped by-name fallback and
+    // misresolve to an unrelated local same-named function (`txn.rs::write`).
+    // The qualification itself proves it is not local. Exercised via the pure
+    // syntactic pipeline (no SCIP overlay), which is where the misresolution
+    // lived (SCIP masks it when a rust-analyzer index is available).
+    fn test_external_crate_root_call_does_not_bind_to_local_same_named_fn() {
+        let dir = std::env::temp_dir().join(format!("ci_idx_ext_root_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // The only local `write` in the fixture -- the decoy the std call used
+        // to misbind to.
+        std::fs::write(
+            dir.join("txn.rs"),
+            "pub fn write(data: &str) -> usize {\n    data.len()\n}\n",
+        )
+        .unwrap();
+        // `run` calls ONLY std::fs::write -- there is no local write() call at
+        // all, so any edge from `run` to txn.rs::write is the misresolution bug.
+        std::fs::write(
+            dir.join("main.rs"),
+            "fn run() {\n    std::fs::write(\"/tmp/x\", \"hi\").unwrap();\n}\n",
+        )
+        .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
+
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM call_edges \
+                 WHERE to_symbol = (SELECT qualified_name FROM symbols \
+                                    WHERE name = 'write' AND path = 'txn.rs')",
+            ),
+            0,
+            "std::fs::write (external crate root) must not bind to the unrelated local txn.rs::write"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     // P1.3 V1: a same-package (no-import-needed) qualified static call —
     // `Helper.greet()` — with a same-named class in an unrelated package's
     // directory must not fan out to that unrelated Helper.

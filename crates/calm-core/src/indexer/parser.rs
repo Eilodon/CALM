@@ -1538,6 +1538,24 @@ fn module_hint_of(raw: &str) -> Option<String> {
     }
 }
 
+/// Issue #72: the leading segment of a `::`-rooted path call when it names a
+/// well-known EXTERNAL crate root -- the Rust/C++ standard library (`std`,
+/// `core`, `alloc`), which is never a local crate: a bare `std::`/`core::`/
+/// `alloc::` path always refers to the stdlib (a local module of that name is
+/// reached via `crate::`/`self::`, never bare). Returned so `walk_calls` can
+/// drop such a call instead of letting its bare last segment (`write` from
+/// `std::fs::write`) fall through to the unscoped by-name fallback and
+/// misresolve to an unrelated local same-named function. A single set here,
+/// not scattered `== "std"` checks -- extend it (or swap in a real crate-map
+/// lookup) when more roots need covering.
+fn external_crate_root(raw: &str) -> Option<&'static str> {
+    if raw.contains('.') || !raw.contains("::") {
+        return None;
+    }
+    let root = raw.split("::").next()?.trim();
+    ["std", "core", "alloc"].into_iter().find(|&r| r == root)
+}
+
 // The rightmost meaningful segment of a module specifier string -- "utils"
 // from "../lib/utils" or "./utils", "os" from "os", "path" from Python's
 // dotted "os.path". Counterpart to `module_hint_of` above for languages
@@ -1822,20 +1840,33 @@ fn walk_calls(
                 receiver = last_ident_segment(&source[recv.byte_range()]);
             }
         }
-        out.push(RawCall {
-            enclosing_name: enc_name.clone(),
-            enclosing_line: *enc_line,
-            enclosing_class: child_class.clone(),
-            callee,
-            callee_start_byte,
-            callee_end_byte,
-            receiver,
-            receiver_is_type_path,
-            module_hint: module_hint_of(&source[fn_node.byte_range()]),
-            looks_option_or_result_chained: looks_option_or_result_chained(node, source),
-            line: node.start_position().row + 1,
-            arg_count: count_arguments_node(node),
-        });
+        // Issue #72: a call explicitly rooted at an external crate
+        // (`std::fs::write`, `core::mem::swap`, ... -- the Rust/C++ standard
+        // library, never a local crate) has NO local target. Left in, its
+        // callee collapses to the bare last segment (`write`) and module_hint
+        // to the immediate module (`fs`), which fails OPEN through the unscoped
+        // by-name fallback and misresolves to whatever unrelated local `write`
+        // is the only one (verified live: main.rs's `std::fs::write` binding to
+        // `txn.rs::write`). The qualification proves it's not local -- don't
+        // emit it (no edge), matching what the SCIP overlay produces for it
+        // when available. Child recursion below is unaffected, so nested calls
+        // in its arguments are still walked.
+        if external_crate_root(&source[fn_node.byte_range()]).is_none() {
+            out.push(RawCall {
+                enclosing_name: enc_name.clone(),
+                enclosing_line: *enc_line,
+                enclosing_class: child_class.clone(),
+                callee,
+                callee_start_byte,
+                callee_end_byte,
+                receiver,
+                receiver_is_type_path,
+                module_hint: module_hint_of(&source[fn_node.byte_range()]),
+                looks_option_or_result_chained: looks_option_or_result_chained(node, source),
+                line: node.start_position().row + 1,
+                arg_count: count_arguments_node(node),
+            });
+        }
     }
 
     // Elixir: a definition-macro call's own "arguments" child is its

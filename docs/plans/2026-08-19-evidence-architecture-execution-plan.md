@@ -146,7 +146,19 @@ immediately.
 - **DoD:** provider disagreement is countable in the benchmark; a conflict never renders
   as `formal`/`resolved` to `callers`/`callees`/`reference_impact`.
 
-**0.5 — Issue #72: qualified external roots (universal, not `if root=="std"`)** *(~M)*
+**0.5 — Issue #72: qualified external roots (universal, not `if root=="std"`)** *(~M)* — **SHIPPED 2026-08-19 (Rust/C++ stdlib slice)**
+> Landed as a parser-level `external_crate_root()` helper (`parser.rs`, single set
+> `{std, core, alloc}`, not scattered `== "std"` checks) that makes `walk_calls` DROP a
+> call rooted at an external crate instead of letting its bare last segment (`write` from
+> `std::fs::write`) fall through the unscoped by-name fallback to an unrelated local
+> `write` (verified live: `main.rs`'s `std::fs::write` bound to `txn.rs::write`). Chosen
+> over the full `QualifiedReference` schema plumbing below because it's parser-only (no
+> high-risk `resolve_sites_to_edges` surgery, no schema change) and matches what SCIP
+> already produces (no local edge). Regression test
+> `test_external_crate_root_call_does_not_bind_to_local_same_named_fn` (syntactic pipeline,
+> no overlay). npm/Python/Go/JVM analogues remain follow-ups — each needs its own fixture
+> before extending the set (discipline: no change without a demonstrating case). The
+> `QualifiedReference` representation below is still the Wave 2 direction.
 - Per `feedback-prefer-universal-over-hardcoded-local`: introduce a `QualifiedReference`
   representation `{ root: ExternalCrate(name) | Local, path, name }` in the candidate
   planner. When a call's receiver/root is a known external module (`std`, an npm
