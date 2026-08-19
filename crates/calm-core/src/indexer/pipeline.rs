@@ -167,6 +167,14 @@ type CallSiteRow = (
     // positional destructure elsewhere in this file needs only one
     // trailing `_`/binding added, not a full renumbering.
     Option<String>,
+    // PR#8 (docs/plans/2026-08-19-evidence-architecture-execution-plan.md
+    // Part E): target_type_kind/target_type_qn -- see `CallSiteData`'s own
+    // doc comment on these two fields for the full semantics. Same
+    // append-at-the-end convention as `import_path` above, for the same
+    // reason (every existing positional destructure needs only trailing
+    // additions, not renumbering).
+    Option<String>,
+    Option<String>,
 );
 
 fn now_secs() -> f64 {
@@ -275,6 +283,30 @@ struct CallSiteData {
     /// candidates on its own, only a narrowing filter, same posture as
     /// `module_hint` above.
     import_path: Option<String>,
+    /// PR#8 (docs/plans/2026-08-19-evidence-architecture-execution-plan.md
+    /// Part E): `'resolved' | 'external' | 'unresolved'`, `None` iff
+    /// `target_class` itself is `None` (no receiver-type inference applies
+    /// to this call site at all -- a free-function call, or a `.`-receiver
+    /// whose type genuinely couldn't be inferred). `'resolved'` = the
+    /// receiver's declared type is a real project symbol whose qualified
+    /// name is known (`target_type_qn` holds it) -- this is the actual
+    /// fix for the P0-shaped bug `target_class` alone has: two classes
+    /// named `User` in different packages both set `target_class: Some(
+    /// "User")`, indistinguishable to `by_name_class`'s bare-name key,
+    /// until this field's qualified payload disambiguates them.
+    /// `'external'` = the declared type resolved to something OUTSIDE this
+    /// project (stdlib/third-party) -- a first-class state, not "local
+    /// lookup missed", the type-level twin of PR#5's `external_crate_root`
+    /// for calls; `target_type_qn` holds a canonical external reference
+    /// (e.g. `"java.util.List"`) when derivable, `None` when not.
+    /// `'unresolved'` = a receiver type was named in the source but this
+    /// pass couldn't classify it as either resolved-local or external
+    /// (e.g. a generic type parameter) -- `target_type_qn` is diagnostic
+    /// text only here, never matched against.
+    target_type_kind: Option<String>,
+    /// The qualified identity payload for `target_type_kind` -- see that
+    /// field's own doc comment for what it holds per variant.
+    target_type_qn: Option<String>,
 }
 
 /// Everything extracted from a single file's source, before any DB I/O.
@@ -5003,6 +5035,8 @@ impl StructB {
                 edge_kind: "call".to_string(),
                 arg_count: Some(0),
                 import_path: None,
+                target_type_kind: None,
+                target_type_qn: None,
             }
         }
         let tx = conn.transaction().unwrap();

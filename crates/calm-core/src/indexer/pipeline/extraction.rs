@@ -115,6 +115,8 @@ pub(super) fn extract_file_data(
                 edge_kind: r.edge_kind.to_string(),
                 arg_count: None,
                 import_path: None,
+                target_type_kind: None,
+                target_type_qn: None,
             })
             .collect();
         return ExtractedFile {
@@ -428,6 +430,69 @@ pub(super) fn extract_file_data(
                     module_hint = Some(seg);
                 }
             }
+            // PR#8 (docs/plans/2026-08-19-evidence-architecture-execution-plan.md
+            // Part E): qualify target_class instead of leaving it a bare
+            // string -- root cause of the P0-shaped bug this fixes: two
+            // classes named e.g. "User" in different files/packages both
+            // set target_class: Some("User"), and reconcile.rs's
+            // by_name_class lookup keys purely on that bare name, unable to
+            // tell them apart. Computed uniformly for target_class from ANY
+            // of the three branches above (type-path receiver, tier-2,
+            // C# static-access) -- the disambiguation signal doesn't depend
+            // on which branch produced the bare name.
+            let (target_type_kind, target_type_qn): (Option<String>, Option<String>) =
+                match target_class.as_deref() {
+                    None => (None, None),
+                    Some(cls) => {
+                        if c.enclosing_class.as_deref() == Some(cls) {
+                            // self/this (tier-2 substitutes enclosing_class
+                            // for these) or Rust's Self:: (receiver_is_type_path
+                            // branch above, same substitution) -- the
+                            // receiver's type IS the enclosing class by
+                            // construction, guaranteed declared in THIS
+                            // file. Stronger, cheaper signal than an
+                            // import-table lookup: this file's own path IS
+                            // the qualification.
+                            (Some("resolved".to_string()), Some(rel.to_string()))
+                        } else if let Some(module_path) = ctx.import_map.get(cls)
+                            && let Some(seg) =
+                                crate::indexer::parser::module_path_last_segment(module_path)
+                        {
+                            // The bare receiver-type name was itself imported
+                            // from a specific module in THIS file -- same
+                            // import-table signal already used for
+                            // import_path/module_hint on the CALLEE-name
+                            // axis (see the whole-module-import branch
+                            // above), applied here to the class-name axis.
+                            // `seg` narrows resolve_sites_to_edges's
+                            // by_name_class candidates to the file(s) whose
+                            // stem matches, the same filter mechanism
+                            // import_path already applies.
+                            (Some("resolved".to_string()), Some(seg))
+                        } else {
+                            // Not self/this/Self::, not found in this file's
+                            // own import table. Could be a local (same-file)
+                            // class not going through self/this, a
+                            // same-package sibling never explicitly imported
+                            // (Java/Go implicit-package visibility), or a
+                            // genuinely external/stdlib type -- none
+                            // distinguishable here (extract_file_data runs
+                            // per-file, in parallel, with no whole-project
+                            // view). 'external' is deliberately NOT emitted
+                            // yet -- would need per-language external-vs-
+                            // project import syntax detection (e.g.
+                            // Python's `from os import X` vs `from .models
+                            // import X`, TS's bare package specifier vs
+                            // relative path); real, scoped out of this
+                            // slice. 'unresolved' is the honest answer, and
+                            // reconcile.rs's matching logic falls through to
+                            // today's unscoped by_name_class bare-name
+                            // behavior unchanged whenever it sees this --
+                            // never a regression from pre-PR#8 behavior.
+                            (Some("unresolved".to_string()), None)
+                        }
+                    }
+                };
             let callee = aliases.get(&c.callee).unwrap_or(&c.callee).clone();
             // Tier-3: StackGraph confirmed this callee has a definition in scope.
             // Upgrades "textual" and "inferred" but not "resolved" (already correct).
@@ -450,6 +515,8 @@ pub(super) fn extract_file_data(
                 edge_kind: "call".to_string(),
                 arg_count: c.arg_count,
                 import_path,
+                target_type_kind,
+                target_type_qn,
             });
         }
     }
@@ -599,8 +666,8 @@ pub(super) fn persist_file(
     // it was written. Skips are counted and surfaced via `tracing::debug!` below --
     // fail-soft, not silently swallowed.
     let mut stmt = tx.prepare(
-        "INSERT OR IGNORE INTO call_sites (from_path, enclosing_qn, callee_name, call_line, callee_start_byte, callee_end_byte, identity_version, confidence, receiver, target_class, looks_option_or_result_chained, module_hint, edge_kind, arg_count, import_path) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+        "INSERT OR IGNORE INTO call_sites (from_path, enclosing_qn, callee_name, call_line, callee_start_byte, callee_end_byte, identity_version, confidence, receiver, target_class, looks_option_or_result_chained, module_hint, edge_kind, arg_count, import_path, target_type_kind, target_type_qn) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
     )?;
     let mut skipped = 0u32;
     for c in &extracted.call_sites {
@@ -620,6 +687,8 @@ pub(super) fn persist_file(
             c.edge_kind,
             c.arg_count,
             c.import_path,
+            c.target_type_kind,
+            c.target_type_qn,
         ])?;
         if inserted == 0 {
             skipped += 1;
