@@ -7,6 +7,19 @@ pub struct ParsedSymbol {
     pub language: String,
     pub path: String,
     pub line_start: usize,
+    /// PR#9 (docs/plans/2026-08-19-evidence-architecture-execution-plan.md
+    /// Part E): this symbol's own start byte within its file's source --
+    /// tree-sitter nodes always carry this, it just wasn't propagated out
+    /// of the parse before now. Used by `pipeline::extraction` to compute
+    /// a call site's identity RELATIVE to its enclosing symbol's start
+    /// (`callee_start_byte - enclosing_symbol.start_byte`), so an edit
+    /// anywhere ABOVE the enclosing symbol (a comment, a new function
+    /// earlier in the file) doesn't shift a call site's identity the way
+    /// a purely file-absolute byte offset does. Never persisted to the
+    /// `symbols` table itself -- only needed transiently, within the same
+    /// per-file extraction pass that already has both the symbol and its
+    /// enclosing calls in memory together.
+    pub start_byte: usize,
     pub line_end: usize,
     pub signature: String,
     pub docstring: String,
@@ -851,6 +864,7 @@ fn walk_symbols(
             language: language.to_string(),
             path: path.to_string(),
             line_start: node.start_position().row + 1,
+            start_byte: node.start_byte(),
             line_end: node.end_position().row + 1,
             signature,
             docstring,
@@ -2973,6 +2987,12 @@ pub fn extract_symbols_shallow(source: &str, language: &str, path: &str) -> Vec<
             path: path.to_string(),
             line_start: idx + 1,
             line_end: idx + 1,
+            // No tree-sitter node here (no grammar for this language) --
+            // `line` is a genuine subslice of `source` (str::lines() never
+            // copies), so pointer subtraction gives its exact byte offset,
+            // correctly handling any line-ending style (LF/CRLF) without
+            // manually accumulating line lengths.
+            start_byte: line.as_ptr() as usize - source.as_ptr() as usize,
             signature: trimmed.chars().take(120).collect(),
             docstring: String::new(),
             name_tokens: tokenize_identifier(&name),
@@ -3056,6 +3076,10 @@ pub fn extract_markdown_symbols(source: &str, path: &str) -> Vec<ParsedSymbol> {
             path: path.to_string(),
             line_start: idx + 1,
             line_end: idx + 1,
+            // Same pointer-subtraction technique as extract_symbols_shallow
+            // -- exact regardless of line-ending style, no manual
+            // accumulation.
+            start_byte: line.as_ptr() as usize - source.as_ptr() as usize,
             signature: trimmed.chars().take(120).collect(),
             docstring: String::new(),
             name_tokens: tokenize_identifier(text),

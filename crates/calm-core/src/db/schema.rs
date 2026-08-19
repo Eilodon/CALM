@@ -247,6 +247,8 @@ CREATE TABLE IF NOT EXISTS call_sites (
     call_line    INTEGER,
     callee_start_byte INTEGER,
     callee_end_byte   INTEGER,
+    callee_start_rel  INTEGER,
+    callee_end_rel    INTEGER,
     identity_version  INTEGER NOT NULL DEFAULT 1,
     confidence   TEXT NOT NULL DEFAULT 'textual',
     receiver     TEXT,
@@ -1229,6 +1231,7 @@ fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
     migrate_add_scip_overlay_state(conn)?;
     dedup_edges_and_add_unique_indexes(conn)?;
     migrate_call_site_identity_v2(conn)?;
+    migrate_call_site_identity_v3(conn)?;
     migrate_add_column(
         conn,
         "external_proofs",
@@ -1342,6 +1345,61 @@ fn migrate_call_site_identity_v2(conn: &Connection) -> rusqlite::Result<()> {
                AND callee_end_byte IS NOT NULL;
          CREATE INDEX IF NOT EXISTS idx_call_edges_call_site
              ON call_edges(call_site_id);",
+    )?;
+    Ok(())
+}
+
+/// PR#9 (docs/plans/2026-08-19-evidence-architecture-execution-plan.md Part
+/// E): position-independent call-site identity. v2's key
+/// (`callee_start_byte`/`callee_end_byte`) is byte-ABSOLUTE within the
+/// whole file -- inserting a line anywhere ABOVE a call site shifts it,
+/// even though the call itself never changed. v3 adds `callee_start_rel`/
+/// `callee_end_rel`: the same span, but relative to the ENCLOSING
+/// SYMBOL's own start byte (computed in `pipeline::extraction`, only when
+/// a real enclosing symbol exists -- see `ParsedSymbol::start_byte`'s doc
+/// comment) -- immune to edits outside that symbol's own body.
+///
+/// Narrows the v2 unique index from `identity_version >= 2` to `= 2`
+/// (exact) so a v3 row -- which still carries populated `callee_start_
+/// byte`/`callee_end_byte` for tooling that wants the absolute span (e.g.
+/// `source`/navigation), and NEEDS to for v3's own
+/// `identity_version >= 3` index below not to be the only thing
+/// enforcing uniqueness -- doesn't ALSO get covered by the v2 index,
+/// which would re-introduce byte-absolute churn sensitivity into a v3
+/// row's identity through the back door. The whole point of the version
+/// split is that a v2 row's identity is exactly the v2 tuple and a v3
+/// row's identity is exactly the v3 tuple, never both at once for the
+/// same row.
+fn migrate_call_site_identity_v3(conn: &Connection) -> rusqlite::Result<()> {
+    migrate_add_column(conn, "call_sites", "callee_start_rel", "INTEGER")?;
+    migrate_add_column(conn, "call_sites", "callee_end_rel", "INTEGER")?;
+
+    conn.execute_batch(
+        "DROP INDEX IF EXISTS idx_call_sites_current_identity;
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_call_sites_v2_identity
+             ON call_sites(
+                 from_path,
+                 enclosing_qn,
+                 callee_start_byte,
+                 callee_end_byte,
+                 edge_kind,
+                 identity_version
+             )
+             WHERE identity_version = 2
+               AND callee_start_byte IS NOT NULL
+               AND callee_end_byte IS NOT NULL;
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_call_sites_v3_identity
+             ON call_sites(
+                 from_path,
+                 enclosing_qn,
+                 callee_start_rel,
+                 callee_end_rel,
+                 edge_kind,
+                 identity_version
+             )
+             WHERE identity_version >= 3
+               AND callee_start_rel IS NOT NULL
+               AND callee_end_rel IS NOT NULL;",
     )?;
     Ok(())
 }

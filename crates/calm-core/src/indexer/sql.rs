@@ -113,6 +113,7 @@ pub fn extract_sql_file(rel: &str, source: &str) -> SqlFile {
             path: rel.to_string(),
             line_start: start_line,
             line_end,
+            start_byte: stmt_start_byte,
             signature: first_line(&stmt_text),
             docstring: String::new(),
             name_tokens: tokenize_identifier(&name),

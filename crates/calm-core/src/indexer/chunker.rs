@@ -164,6 +164,7 @@ mod tests {
             path: "test.py".to_string(),
             line_start,
             line_end,
+            start_byte: 0,
             signature: String::new(),
             docstring: String::new(),
             name_tokens: name.to_string(),

@@ -240,6 +240,7 @@ mod tests {
             path: "test.py".to_string(),
             line_start: 1,
             line_end: 2,
+            start_byte: 0,
             signature: "".to_string(),
             docstring: "".to_string(),
             name_tokens: "hello".to_string(),
