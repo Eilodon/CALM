@@ -1184,8 +1184,7 @@ fn build_inheritance_closure(
     };
     let mut direct_parents: HashMap<String, Vec<String>> = HashMap::new();
     for (child_qn, parent_qn) in direct_qn {
-        let (Some(child), Some(parent)) =
-            (qn_to_name.get(&child_qn), qn_to_name.get(&parent_qn))
+        let (Some(child), Some(parent)) = (qn_to_name.get(&child_qn), qn_to_name.get(&parent_qn))
         else {
             continue;
         };
@@ -1253,7 +1252,10 @@ fn resolve_via_inheritance_closure(
     for level in levels {
         let mut hits: Vec<SymbolCandidate> = Vec::new();
         for ancestor in level {
-            if let Some(t) = ctx.by_name_class.get(&(callee.to_string(), ancestor.clone())) {
+            if let Some(t) = ctx
+                .by_name_class
+                .get(&(callee.to_string(), ancestor.clone()))
+            {
                 for cand in t {
                     if !hits.contains(cand) {
                         hits.push(cand.clone());
@@ -5198,7 +5200,10 @@ impl StructB {
                 |r| r.get(0),
             )
             .expect("caller.py's bar() call site must have a captured import_path");
-        assert_eq!(import_path, "lib", "resolve_tier1's resolved_path must be 'lib', not dropped");
+        assert_eq!(
+            import_path, "lib",
+            "resolve_tier1's resolved_path must be 'lib', not dropped"
+        );
 
         // The narrowing itself: the edge must target lib.py's bar, not any
         // decoy, and must not vanish (the pre-fix MAX_CALLEE_CANDIDATES
@@ -5282,10 +5287,15 @@ impl StructB {
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
-            .expect("the dropped call site must be recorded in ambiguity_groups, not silently lost");
+            .expect(
+                "the dropped call site must be recorded in ambiguity_groups, not silently lost",
+            );
         assert_eq!(from_path, "caller.py");
         assert_eq!(candidate_group_key, "helper");
-        assert_eq!(candidate_count, 25, "must record the true candidate count, not a truncated one");
+        assert_eq!(
+            candidate_count, 25,
+            "must record the true candidate count, not a truncated one"
+        );
         assert_eq!(reason, "unscoped_candidates_exceeded_max_callee_candidates");
         assert_eq!(
             count(&conn, "SELECT COUNT(*) FROM ambiguity_groups"),
@@ -5728,7 +5738,11 @@ impl StructB {
                 )
                 .unwrap();
             stmt.query_map([], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?))
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
             })
             .unwrap()
             .map(|r| r.unwrap())

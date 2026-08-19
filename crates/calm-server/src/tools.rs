@@ -6138,7 +6138,10 @@ mod tests {
                 if_none_match: None,
             })),
         );
-        assert_eq!(v["direct_count"], 7, "1 formal + 2 resolved + 1 inferred + 3 textual");
+        assert_eq!(
+            v["direct_count"], 7,
+            "1 formal + 2 resolved + 1 inferred + 3 textual"
+        );
         assert_eq!(v["ambiguous_count"], 1);
         let breakdown = &v["direct_by_confidence"];
         assert_eq!(breakdown["formal"], 1);
@@ -6219,7 +6222,10 @@ mod tests {
         );
         let msg = v["caveat"]["message"].as_str().unwrap();
         assert!(msg.contains('1'), "caveat must cite the site count: {msg}");
-        assert!(msg.contains("25"), "caveat must cite the widest candidate_count: {msg}");
+        assert!(
+            msg.contains("25"),
+            "caveat must cite the widest candidate_count: {msg}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -6276,7 +6282,11 @@ mod tests {
             })),
         );
         let ambiguous = v["ambiguous"].as_array().unwrap();
-        assert_eq!(ambiguous.len(), 2, "both candidates must survive as ambiguous");
+        assert_eq!(
+            ambiguous.len(),
+            2,
+            "both candidates must survive as ambiguous"
+        );
         assert_eq!(
             ambiguous[0]["symbol"], "a.c::preferred_caller",
             "the rank-0 (preferred) candidate must surface first despite being \
@@ -6654,7 +6664,10 @@ mod tests {
                 if_none_match: None,
             })),
         );
-        assert_eq!(v["direct_count"], 4, "1 formal + 1 resolved + 1 inferred + 1 textual");
+        assert_eq!(
+            v["direct_count"], 4,
+            "1 formal + 1 resolved + 1 inferred + 1 textual"
+        );
         assert_eq!(v["ambiguous_count"], 1);
         let breakdown = &v["direct_by_confidence"];
         assert_eq!(breakdown["formal"], 1);

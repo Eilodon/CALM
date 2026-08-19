@@ -2827,8 +2827,7 @@ impl CalmServer {
                     false,
                 ));
             }
-            let expected_digest =
-                calm_core::indexer::pipeline::hash_content(&review.diff_preview);
+            let expected_digest = calm_core::indexer::pipeline::hash_content(&review.diff_preview);
             if p.diff_digest != expected_digest {
                 return ToolOutcome::error(error_detail(
                     "DIFF_DIGEST_MISMATCH",

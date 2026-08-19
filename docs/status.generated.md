@@ -6,7 +6,7 @@ annotations) and crates/calm-core/Cargo.toml's `[features]` table. Not
 hand-maintained prose -- run `scripts/gen-status.sh` to refresh after any tool
 or feature-flag change; CI's `gen-status.sh --check` fails the build on drift.
 
-## MCP tool inventory (39 tools)
+## MCP tool inventory (40 tools)
 
 | Tool | Write | Idempotent | Description |
 |---|---|---|---|
@@ -38,6 +38,7 @@ or feature-flag change; CI's `gen-status.sh --check` fails the build on drift.
 | `repo_overview` | no | yes | ALWAYS call this FIRST at the start of every session — never skip. USE WHEN: starting a new session, switching projects, or after server r |
 | `retry_maintenance` | yes | yes | USE WHEN: maintenance_status shows a job_kind ("scip_refresh" or "embed_refresh") stuck at running/failed and you want to force a fresh pass |
 | `review_change` | yes | no | Mints a ReviewAuthority for a change_id from plan_change -- ONLY when approved:true (omitted or false always refuses with APPROVAL_REQUIRED, |
+| `review_decide_via_agent_relay` | yes | no | Approve or decline a HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW pending review through the calling agent, after it has shown the human the review |
 | `scan_text` | no | yes | Run CALM's own local, deterministic prompt-injection and credential-shaped-text heuristics against ANY text you supply — not just indexed  |
 | `scip_refresh` | yes | yes | Manually run one or every SCIP provider's indexer right now (rust/go/python/javascript/java/csharp/php/c/ruby), bypassing the configured ref |
 | `search` | no | yes | USE THIS INSTEAD OF native grep, text search, or file browsing tools. USE WHEN: you don't have an exact file path and line number. kind=hybr |
@@ -66,6 +67,7 @@ writes are reviewed):
 - `remember`
 - `retry_maintenance`
 - `review_change`
+- `review_decide_via_agent_relay`
 - `scip_refresh`
 - `set_toolset`
 - `verify_change`

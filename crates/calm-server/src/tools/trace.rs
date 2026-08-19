@@ -159,6 +159,7 @@ impl CalmServer {
             // They are not confirmed callers of this specific symbol, so
             // surfacing them as `direct` collapses precision — bucket them
             // separately for the caller to weigh.
+            #[allow(clippy::type_complexity)]
             let (mut ambiguous_ranked, direct_ranked): (
                 Vec<(CallerEntry, i64)>,
                 Vec<(CallerEntry, i64)>,
@@ -410,6 +411,7 @@ impl CalmServer {
                 (None, None, None)
             };
 
+            #[allow(clippy::type_complexity)]
             let (mut ambiguous_ranked, direct_ranked): (
                 Vec<(CalleeEntry, i64)>,
                 Vec<(CalleeEntry, i64)>,
@@ -882,9 +884,9 @@ impl CalmServer {
             // became any edge at all -- see `CallersOutput::unresolved_group_count`.
             // Row count, matching that field's own "distinct sites" contract.
             let unresolved_many_count: usize = {
-                let mut stmt = match conn.prepare(
-                    "SELECT COUNT(*) FROM ambiguity_groups WHERE candidate_group_key = ?1",
-                ) {
+                let mut stmt = match conn
+                    .prepare("SELECT COUNT(*) FROM ambiguity_groups WHERE candidate_group_key = ?1")
+                {
                     Ok(s) => s,
                     Err(e) => return db_error_resolved(e),
                 };
