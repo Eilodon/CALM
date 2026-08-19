@@ -251,6 +251,8 @@ CREATE TABLE IF NOT EXISTS call_sites (
     confidence   TEXT NOT NULL DEFAULT 'textual',
     receiver     TEXT,
     target_class TEXT,
+    target_type_kind TEXT,
+    target_type_qn   TEXT,
     looks_option_or_result_chained INTEGER NOT NULL DEFAULT 0,
     module_hint  TEXT,
     edge_kind    TEXT NOT NULL DEFAULT 'call',
@@ -1058,6 +1060,21 @@ fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
     )?;
     migrate_add_column(conn, "call_sites", "receiver", "TEXT")?;
     migrate_add_column(conn, "call_sites", "target_class", "TEXT")?;
+    // PR#8 (docs/plans/2026-08-19-evidence-architecture-execution-plan.md Part
+    // E): dual-write alongside target_class. target_type_kind is
+    // 'resolved' | 'external' | 'unresolved' (NULL when target_class itself
+    // is NULL -- no receiver-type inference applies). target_type_qn is the
+    // qualified identity payload: for 'resolved', a real symbols.qualified_name
+    // for the receiver's declared type; for 'external', a canonical
+    // qualified reference to a non-project type (stdlib/third-party) --
+    // the type-level twin of PR#5's external_crate_root, a first-class
+    // state rather than "local lookup missed"; for 'unresolved', best-effort
+    // diagnostic text only, never matched against. Additive, no identity_
+    // version bump (same policy as evidence_conflicts/ambiguity_group_
+    // candidates) -- existing target_class-only rows simply read both new
+    // columns as NULL until the next reindex populates them.
+    migrate_add_column(conn, "call_sites", "target_type_kind", "TEXT")?;
+    migrate_add_column(conn, "call_sites", "target_type_qn", "TEXT")?;
     migrate_add_column(
         conn,
         "call_sites",
