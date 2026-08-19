@@ -22,10 +22,15 @@
 //! two files plus `calm-core/tests/golden_graph_equivalence.rs`).
 //!
 //! `cached_formal_resolver`/`cached_resolution_maps`/
-//! `invalidate_resolution_maps_cache`/`is_manifest_path`/
+//! `invalidate_resolution_maps_cache`/`is_manifest_path` moved to
+//! `pipeline/cache.rs` (Wave 1 slice 8, `pub(super)` there since driver.rs
+//! and cache.rs are siblings) -- still pulled in here via a plain `use
+//! super::{...}` unchanged, since pipeline.rs's own `use cache::{...}`
+//! re-exports them into its scope the same way slice 6's `graph.rs` items
+//! already were (no driver.rs import edit needed for this).
 //! `needs_call_site_identity_baseline`/`rebuild_call_site_identity_baseline`
-//! are still plain private items in `pipeline.rs` (Wave 1 slices 8/9, not
-//! yet extracted) -- pulled in via `super::` for now, same pattern as
+//! are still plain private items in `pipeline.rs` (Wave 1 slice 9, not yet
+//! extracted) -- pulled in via `super::` for now, same pattern as
 //! `rebuild_graph`/`incremental_graph_update` in slice 6's `graph.rs`.
 
 use rayon::prelude::*;
@@ -290,6 +295,12 @@ pub fn reindex_changed(
     }
 }
 
+/// Same as `reindex_changed`, but checked against `cancel` between parse
+/// batches — see `run_indexing_pipeline_cancellable`'s doc comment for why
+/// this matters on the shutdown path (a large changed-file set, e.g. a git
+/// branch switch, can take long enough to matter even inside the already
+/// per-event-cancellable watch loop). Bailing mid-loop drops `tx` without
+/// committing — same rollback guarantee as the full-index cancellable path.
 pub fn reindex_changed_cancellable(
     conn: &mut Connection,
     project_root: &Path,
