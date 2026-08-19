@@ -419,6 +419,21 @@ fn insert_missing_exact_edges(
             let Some(to_symbol) = resolve_unique_symbol_at(conn, def_path, *def_line)? else {
                 continue;
             };
+            // WS7 (evidence reconciliation, fixture I / D8): the static
+            // resolver may have already resolved this EXACT call site to a
+            // DIFFERENT target at a confident tier via a real language rule --
+            // e.g. Python's file-symbol-over-import priority, where a later
+            // same-scope `def name` shadows `from x import name`, so `name()`
+            // never calls the import. SCIP is a strong authority but not an
+            // infallible one: some SCIP indexers follow the import binding and
+            // miss that shadowing. It must NOT silently ADD a competing
+            // `formal` edge contradicting a confident static resolution -- that
+            // is a genuine, live false_confidence_rate data point (a top-tier
+            // edge to a target the language never actually calls). Skip the
+            // insert on conflict; the correct static edge stays.
+            if has_conflicting_confident_static_edge(conn, call_site_id, &to_symbol)? {
+                continue;
+            }
             let added = insert.execute(rusqlite::params![
                 enclosing_qn,
                 to_symbol,
@@ -444,6 +459,35 @@ fn insert_missing_exact_edges(
         }
     }
     Ok(inserted)
+}
+
+/// WS7 reconciliation guard for `insert_missing_exact_edges`: true when this
+/// call site already carries a CONFIDENT STATIC edge to a target OTHER than the
+/// one SCIP wants to add. "Confident static" = `resolved` (tier-1 language-rule
+/// resolution) or a non-SCIP `formal` (e.g. stack-graphs) edge -- deliberately
+/// NOT `ambiguous`/`textual`/`inferred`, which the overlay is SUPPOSED to
+/// override (that is the whole point of SCIP disambiguating fan-out). A SCIP
+/// proof contradicting a confident static resolution is a conflict, not a new
+/// target: adding it would manufacture a false-confidence edge (D8).
+fn has_conflicting_confident_static_edge(
+    conn: &Connection,
+    call_site_id: i64,
+    scip_target: &str,
+) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM call_edges
+             WHERE call_site_id = ?1
+               AND to_symbol != ?2
+               AND ruled_out_by_scip = 0
+               AND ( edge_confidence = 'resolved'
+                  OR (edge_confidence = 'formal'
+                      AND (formal_source IS NULL OR formal_source != 'scip')) )
+         )",
+        rusqlite::params![call_site_id, scip_target],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|exists| exists != 0)
 }
 
 /// Persist evidence only after the graph row itself was accepted.  The SELECT
@@ -1395,6 +1439,88 @@ mod tests {
         );
         assert_eq!(confidence, "formal");
         assert_eq!(source, "scip");
+    }
+
+    #[test]
+    fn scip_does_not_add_formal_edge_conflicting_with_confident_static_resolution() {
+        // WS7 / fixture I (D8): `from external import name; def name(): ...;
+        // name()`. Python's file-symbol-over-import priority correctly resolves
+        // the call to the LOCAL `name` at `resolved`. scip-python follows the
+        // import binding and reports external.py::name -- but real Python
+        // semantics never call it (the later same-scope def shadows the
+        // import). The overlay must NOT insert a competing `formal` edge that
+        // contradicts the confident static resolution (verified live 2026-08-19:
+        // it used to, producing a top-tier false_confidence edge).
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end)
+             VALUES
+                ('caller.py::name', 'name', 'function', 'python', 'caller.py', 4, 5),
+                ('external.py::name', 'name', 'function', 'python', 'external.py', 1, 2);
+             INSERT INTO file_index (path, hash, language, symbol_count, last_indexed)
+             VALUES ('caller.py', 'fresh-source', 'python', 2, 0);
+             INSERT INTO call_sites
+                (from_path, enclosing_qn, callee_name, call_line, callee_start_byte,
+                 callee_end_byte, identity_version, edge_kind)
+             VALUES ('caller.py', 'caller.py::use', 'name', 9, 4, 9, 2, 'call');
+             INSERT INTO call_edges
+                (from_symbol, to_symbol, call_site_line, call_site_id, edge_confidence,
+                 from_path, to_path, edge_kind)
+             VALUES ('caller.py::use', 'caller.py::name', 9, 1, 'resolved',
+                     'caller.py', 'caller.py', 'call');",
+        )
+        .unwrap();
+        let occ = vec![
+            crate::scip::parse::ScipOccurrence {
+                file: "external.py".into(),
+                line: 1,
+                start_byte: None,
+                end_byte: None,
+                source_file_hash: None,
+                symbol: "N".into(),
+                is_def: true,
+                is_local: false,
+                encoding_provenance: crate::scip::parse::EncodingProvenance::Declared,
+                guessed_alt_byte_range: None,
+            },
+            crate::scip::parse::ScipOccurrence {
+                file: "caller.py".into(),
+                line: 9,
+                start_byte: Some(4),
+                end_byte: Some(9),
+                source_file_hash: Some("fresh-source".into()),
+                symbol: "N".into(),
+                is_def: false,
+                is_local: false,
+                encoding_provenance: crate::scip::parse::EncodingProvenance::Declared,
+                guessed_alt_byte_range: None,
+            },
+        ];
+
+        let stats = super::ingest_occurrences(&conn, &occ, true).unwrap();
+        assert_eq!(
+            stats.inserted, 0,
+            "scip must not insert a competing formal edge conflicting with the \
+             confident static (resolved) resolution of the same call site"
+        );
+        let edges: Vec<(String, String, i64)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT to_symbol, edge_confidence, ruled_out_by_scip \
+                     FROM call_edges ORDER BY to_symbol",
+                )
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        assert_eq!(
+            edges,
+            vec![("caller.py::name".to_string(), "resolved".to_string(), 0)],
+            "only the correct local edge should survive, un-ruled-out: {edges:?}"
+        );
     }
 
     #[test]

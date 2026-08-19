@@ -5,6 +5,34 @@ Implements **WS0** of
 Every WS2–WS6 change in that plan must attach a before/after run of this benchmark; a change
 merges only if `call_recall` does not drop **and** `false_confidence_rate` does not rise.
 
+## WS7 status: SHIPPED (2026-08-19) — fixture I / D8 false-confidence eliminated, `false_confidence_rate` 0.25 → 0.0
+
+Fixture I (`I_file_symbol_wins_over_import`, the D8 shadowing case) used to emit TWO edges from one
+call site: `caller.py::name@resolved` (correct — tier-1 file-symbol-over-import priority) AND
+`external.py::name@formal` (WRONG). **Root-caused live (2026-08-19), correcting this fixture's own
+oracle note:** the wrong edge is inserted by the *SCIP overlay* (`formal_source = 'scip'`,
+`crates/calm-core/src/scip/ingest.rs::insert_missing_exact_edges`), NOT the bundled stack-graphs
+`formally_resolved` bare-name upgrade the plan/audit assumed. The call site's persisted confidence
+is already `resolved`, so `extract_file_data`'s formal upgrade (gated on `!= Resolved`) never fires
+here; scip-python follows the `from external import name` binding and reports `external.py::name`,
+missing that the later same-scope `def name` shadows it.
+
+Fix: `insert_missing_exact_edges` now skips inserting a competing `formal`/`scip` edge when the same
+call site already carries a CONFIDENT STATIC edge (`resolved`, or non-scip `formal`) to a DIFFERENT
+target (`has_conflicting_confident_static_edge`). Deliberately narrow — `ambiguous`/`textual`/
+`inferred` edges stay overridable (that is the overlay's job); only a real language-rule resolution
+is protected. Regression test (scip-independent, constructed directly):
+`crates/calm-core/src/scip/ingest.rs::scip_does_not_add_formal_edge_conflicting_with_confident_static_resolution`.
+
+Full corpus before → after: `false_confidence_rate` **0.25 → 0.0**, `false_confident_site_rate`
+0.125 → 0.0, `call_recall` 0.875 (unchanged), no other fixture's outcome changed; fixture I went
+FALSE_CONFIDENCE → RECALL_LOWCONF_CORRECT.
+
+The separate stack-graphs `formally_resolved` bare-name upgrade (`pipeline.rs` — upgrades a site to
+`formal` when stack-graphs proved *any* same-named reference resolves in the file) is a real but
+currently-undemonstrated latent false-confidence risk; tracked as a follow-up, not fixed
+speculatively without a failing fixture.
+
 ## WS2 status: SHIPPED (2026-08-18) — verify via unit test, not this corpus
 
 `import_path` now threads end-to-end (`resolve_tier1` → `CallSiteData` → `call_sites` column →

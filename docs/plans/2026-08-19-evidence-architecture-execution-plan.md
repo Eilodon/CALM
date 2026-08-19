@@ -111,9 +111,19 @@ immediately.
 - **DoD:** `check-b2-thresholds.sh` passes on a corpus whose oracle coverage is
   measured and documented; thresholds reflect the honest baseline, not aspirational floors.
 
-**0.3 — WS7A: preserve provider target identity** *(the P0 core; ~M)*
-- Change `formally_resolved_names` (`pipeline.rs:400-407`) to stop collapsing to
-  `HashSet<String>`. Return the **pairs** `(reference_symbol, definition_symbol)`.
+**0.3 — WS7A: reconcile provider proof against confident static resolution** *(the P0 core; ~M)* — **SHIPPED 2026-08-19**
+> **Mechanism correction (verified live, not from the audit/fixture comment):** the D8
+> false-confidence edge is inserted by the **SCIP overlay**
+> (`scip/ingest.rs::insert_missing_exact_edges`, `formal_source='scip'`), *not* the
+> stack-graphs `formally_resolved` bare-name upgrade the audit and fixture I's own
+> oracle note blamed — the call site is already `resolved`, so `extract_file_data`'s
+> upgrade (gated on `!= Resolved`) never fires. Fix landed there instead:
+> `insert_missing_exact_edges` skips a competing `formal` insert when the same call
+> site already has a confident static edge (`resolved`/non-scip `formal`) to a different
+> target (`has_conflicting_confident_static_edge`). The stack-graphs bare-name upgrade
+> is a *separate*, currently-undemonstrated latent risk — follow-up, not fixed here.
+- ~~Change `formally_resolved_names` to return `(reference_symbol, definition_symbol)` pairs~~
+  (superseded — that path is not the D8 cause; see correction above).
 - At the upgrade site (`pipeline.rs:771-776`), map `definition_symbol` → the target
   `SymbolId` the static resolver *actually chose* for this call site, and compare:
   - **agree** → confirm `Formal` (today's happy path, now *justified*);
