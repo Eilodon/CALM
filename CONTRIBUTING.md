@@ -36,6 +36,15 @@ cargo test --workspace  # embeddings is on by default, no extra --features flag 
 
 ## Before opening a PR
 
+Run `scripts/ci-local.sh` — it reproduces every blocking CI gate in one command
+and reports *all* failures at once, instead of finding them one push at a time:
+
+- `scripts/ci-local.sh` — default: fmt + all clippy feature-sets + doc-truth + `cargo test --workspace` (fast, offline)
+- `scripts/ci-local.sh --lint` — lint + doc checks only (fastest pre-push gate)
+- `scripts/ci-local.sh --full` — everything CI runs, including the feature-matrix tests, fitness-check, and crash-injection
+
+The individual gates it wraps, if you'd rather run them by hand:
+
 - `cargo fmt` and `cargo clippy` clean
 - `cargo test --workspace` passes
 - `calm fitness-check --project-root .` passes against this repo's own thresholds — CALM reviewing itself is part of the point
