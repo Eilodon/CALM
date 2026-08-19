@@ -175,6 +175,11 @@ type CallSiteRow = (
     // additions, not renumbering).
     Option<String>,
     Option<String>,
+    // PR#9 (docs/plans/2026-08-19-evidence-architecture-execution-plan.md
+    // Part E): callee_start_rel/callee_end_rel -- see CallSiteData's own
+    // doc comment. Same append-at-the-end convention.
+    Option<i64>,
+    Option<i64>,
 );
 
 fn now_secs() -> f64 {
@@ -251,6 +256,17 @@ struct CallSiteData {
     line: i64,
     callee_start_byte: Option<i64>,
     callee_end_byte: Option<i64>,
+    /// PR#9 (docs/plans/2026-08-19-evidence-architecture-execution-plan.md
+    /// Part E): `callee_start_byte`/`callee_end_byte`, made RELATIVE to the
+    /// enclosing symbol's own start byte instead of absolute within the
+    /// file. `None` when there's no real enclosing symbol to be relative
+    /// to (the `MODULE_ENCLOSING` sentinel case -- a top-level call) or
+    /// when this row is a legacy v2/v1 identity, in which case
+    /// `identity_version` stays at its pre-v3 value. Set together with
+    /// `identity_version: 3` -- see `extract_file_data`'s call-site loop
+    /// for how it's computed.
+    callee_start_rel: Option<i64>,
+    callee_end_rel: Option<i64>,
     identity_version: i64,
     confidence: String,
     receiver: Option<String>,
@@ -5114,6 +5130,8 @@ impl StructB {
                 import_path: None,
                 target_type_kind: None,
                 target_type_qn: None,
+                callee_start_rel: None,
+                callee_end_rel: None,
             }
         }
         let tx = conn.transaction().unwrap();

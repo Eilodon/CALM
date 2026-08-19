@@ -240,6 +240,8 @@ pub(super) fn resolve_sites_to_edges(
                 import_path,
                 target_type_kind,
                 target_type_qn,
+                _,
+                _,
             )| {
                 // Inheritance fallback (2026-08-18, B15 investigation): an
                 // exact-class miss here does NOT always mean "no candidates
@@ -724,6 +726,8 @@ pub(super) fn resolve_sites_to_edges(
             _,
             _,
             edge_kind,
+            _,
+            _,
             _,
             _,
             _,

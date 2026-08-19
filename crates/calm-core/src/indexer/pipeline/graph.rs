@@ -65,7 +65,8 @@ pub(super) fn rebuild_graph(
             "SELECT id, from_path, enclosing_qn, callee_name, call_line, callee_start_byte, \
                     callee_end_byte, identity_version, confidence, receiver, target_class, \
                     looks_option_or_result_chained, module_hint, edge_kind, arg_count, \
-                    import_path, target_type_kind, target_type_qn \
+                    import_path, target_type_kind, target_type_qn, callee_start_rel, \
+                    callee_end_rel \
              FROM call_sites ORDER BY id",
         )?;
         stmt.query_map([], |r| {
@@ -88,6 +89,8 @@ pub(super) fn rebuild_graph(
                 r.get::<_, Option<String>>(15)?,
                 r.get::<_, Option<String>>(16)?,
                 r.get::<_, Option<String>>(17)?,
+                r.get::<_, Option<i64>>(18)?,
+                r.get::<_, Option<i64>>(19)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?
@@ -288,7 +291,8 @@ pub(super) fn incremental_graph_update(
             "SELECT id, from_path, enclosing_qn, callee_name, call_line, callee_start_byte, \
                     callee_end_byte, identity_version, confidence, receiver, target_class, \
                     looks_option_or_result_chained, module_hint, edge_kind, arg_count, \
-                    import_path, target_type_kind, target_type_qn \
+                    import_path, target_type_kind, target_type_qn, callee_start_rel, \
+                    callee_end_rel \
              FROM call_sites WHERE from_path IN ({placeholders}) ORDER BY id"
         );
         let mut stmt = tx.prepare(&sql)?;
@@ -312,6 +316,8 @@ pub(super) fn incremental_graph_update(
                 r.get::<_, Option<String>>(15)?,
                 r.get::<_, Option<String>>(16)?,
                 r.get::<_, Option<String>>(17)?,
+                r.get::<_, Option<i64>>(18)?,
+                r.get::<_, Option<i64>>(19)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?

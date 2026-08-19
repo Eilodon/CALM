@@ -117,6 +117,8 @@ pub(super) fn extract_file_data(
                 import_path: None,
                 target_type_kind: None,
                 target_type_qn: None,
+                callee_start_rel: None,
+                callee_end_rel: None,
             })
             .collect();
         return ExtractedFile {
@@ -230,6 +232,18 @@ pub(super) fn extract_file_data(
         .iter()
         .map(|s| ((s.name.clone(), s.line_start), s.qualified_name.clone()))
         .collect();
+    // PR#9 (docs/plans/2026-08-19-evidence-architecture-execution-plan.md
+    // Part E): qualified_name → start_byte, so each call site below can
+    // compute its identity RELATIVE to its own enclosing symbol's start
+    // (position-independent v3) instead of absolute-within-file (v2).
+    // Only real symbols land here -- the MODULE_ENCLOSING synthetic qn a
+    // top-level call gets (see the loop below) is never a key in `syms`,
+    // so those calls correctly fall back to v2 (no enclosing symbol to be
+    // relative to).
+    let qn_to_start_byte: HashMap<String, usize> = syms
+        .iter()
+        .map(|s| (s.qualified_name.clone(), s.start_byte))
+        .collect();
     let file_symbols: HashSet<String> = syms.iter().map(|s| s.name.clone()).collect();
     let symbol_count = syms.len();
 
@@ -299,6 +313,30 @@ pub(super) fn extract_file_data(
                 (c.enclosing_name == MODULE_ENCLOSING).then(|| format!("{rel}::{MODULE_ENCLOSING}"))
             });
         if let Some(enc_qn) = enc_qn {
+            // PR#9 (docs/plans/2026-08-19-evidence-architecture-execution-
+            // plan.md Part E): position-independent identity. `Some` only
+            // when `enc_qn` is a REAL symbol (`qn_to_start_byte` has it) --
+            // the `MODULE_ENCLOSING` synthetic qn a top-level call gets
+            // (this loop's own comment above) is never a key there, so
+            // those calls correctly stay at v2 (no enclosing symbol to be
+            // relative to). The `>=` guard is defensive, not expected to
+            // ever fail for a genuinely-enclosed call (tree-sitter
+            // guarantees a node's byte range is nested inside its parent's),
+            // but fails open to v2 rather than panicking or wrapping on
+            // unsigned underflow if some future language's `enclosing_line`
+            // attribution ever turns out to be looser than that.
+            let (callee_start_rel, callee_end_rel, identity_version): (
+                Option<i64>,
+                Option<i64>,
+                i64,
+            ) = match qn_to_start_byte.get(&enc_qn) {
+                Some(&enclosing_start) if c.callee_start_byte >= enclosing_start => (
+                    Some((c.callee_start_byte - enclosing_start) as i64),
+                    Some((c.callee_end_byte - enclosing_start) as i64),
+                    3,
+                ),
+                _ => (None, None, 2),
+            };
             let mut confidence;
             let mut target_class: Option<String> = None;
             let mut module_hint = c.module_hint.clone();
@@ -524,7 +562,9 @@ pub(super) fn extract_file_data(
                 line: c.line as i64,
                 callee_start_byte: Some(c.callee_start_byte as i64),
                 callee_end_byte: Some(c.callee_end_byte as i64),
-                identity_version: 2,
+                callee_start_rel,
+                callee_end_rel,
+                identity_version,
                 confidence: confidence.as_str().to_string(),
                 receiver: c.receiver.clone(),
                 target_class,
@@ -684,8 +724,8 @@ pub(super) fn persist_file(
     // it was written. Skips are counted and surfaced via `tracing::debug!` below --
     // fail-soft, not silently swallowed.
     let mut stmt = tx.prepare(
-        "INSERT OR IGNORE INTO call_sites (from_path, enclosing_qn, callee_name, call_line, callee_start_byte, callee_end_byte, identity_version, confidence, receiver, target_class, looks_option_or_result_chained, module_hint, edge_kind, arg_count, import_path, target_type_kind, target_type_qn) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+        "INSERT OR IGNORE INTO call_sites (from_path, enclosing_qn, callee_name, call_line, callee_start_byte, callee_end_byte, identity_version, confidence, receiver, target_class, looks_option_or_result_chained, module_hint, edge_kind, arg_count, import_path, target_type_kind, target_type_qn, callee_start_rel, callee_end_rel) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
     )?;
     let mut skipped = 0u32;
     for c in &extracted.call_sites {
@@ -707,6 +747,8 @@ pub(super) fn persist_file(
             c.import_path,
             c.target_type_kind,
             c.target_type_qn,
+            c.callee_start_rel,
+            c.callee_end_rel,
         ])?;
         if inserted == 0 {
             skipped += 1;
