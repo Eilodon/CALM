@@ -203,6 +203,68 @@ pub fn decline_pending_review(
     decide_pending_review(conn, review_id, "declined", decided_by)
 }
 
+/// Outcome of `decide_via_agent_relay` -- one variant per case its two
+/// front-ends (the MCP tool `review_decide_via_agent_relay` in calm-server,
+/// and the CLI `calm review approve-via-agent-relay`/`decline-via-agent-relay`
+/// in calm-cli) each already need to report back in their own idiom (a JSON
+/// `ErrorDetail` for the former, an exit code/message for the latter).
+#[derive(Debug, Clone, PartialEq)]
+pub enum AgentRelayOutcome {
+    /// `"approved"` or `"declined"`.
+    Decided(&'static str),
+    NotFound,
+    /// Carries the review's actual current status (already decided, or
+    /// -- same row, same message -- expired).
+    AlreadyDecided(String),
+    DigestMismatch,
+    /// The review was decided or expired between the status check and the
+    /// write -- caller should re-fetch and retry.
+    Race,
+}
+
+/// Shared body of the "agent relay" decision channel: the deliberately
+/// WEAKER, opt-in (`EditConfig::elicit_via_agent_relay`) sibling of the
+/// TTY-gated `calm review approve`/`decline` (`decide_pending_review` above).
+/// Both front-ends that expose this channel -- the MCP tool
+/// `review_decide_via_agent_relay` and the CLI's `*-via-agent-relay`
+/// subcommands -- call this exact function, so the one safety-relevant
+/// check it performs (that `diff_digest` equals `hash_content` of the
+/// review's own CURRENT `diff_preview`, proving the caller is referencing
+/// the real, current diff and not a guess or stale copy) lives in exactly
+/// one place rather than two copies that could drift. See
+/// `EditConfig::elicit_via_agent_relay`'s doc comment for the full tradeoff
+/// this channel accepts -- callers are responsible for the config-flag gate
+/// and for not calling this before a human has actually seen the diff and
+/// answered; this function itself cannot verify either.
+pub fn decide_via_agent_relay(
+    conn: &Connection,
+    review_id: &str,
+    diff_digest: &str,
+    approve: bool,
+) -> rusqlite::Result<AgentRelayOutcome> {
+    let Some(review) = get_pending_review(conn, review_id)? else {
+        return Ok(AgentRelayOutcome::NotFound);
+    };
+    if review.status != "pending" {
+        return Ok(AgentRelayOutcome::AlreadyDecided(review.status));
+    }
+    let expected_digest = crate::indexer::pipeline::hash_content(&review.diff_preview);
+    if diff_digest != expected_digest {
+        return Ok(AgentRelayOutcome::DigestMismatch);
+    }
+    let decided_by = "agent_relay_after_elicitation";
+    let ok = if approve {
+        approve_pending_review(conn, review_id, decided_by)?
+    } else {
+        decline_pending_review(conn, review_id, decided_by)?
+    };
+    Ok(if ok {
+        AgentRelayOutcome::Decided(if approve { "approved" } else { "declined" })
+    } else {
+        AgentRelayOutcome::Race
+    })
+}
+
 /// The retry-time lookup `edit_lines_impl_gated` uses: an unexpired,
 /// `status = "approved"` row for this exact `path` + content `fingerprint`.
 /// Content-addressed by construction (same rationale as
@@ -354,5 +416,67 @@ mod tests {
         let all = list_pending_reviews(&conn, None).unwrap();
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].review_id, second, "newest first");
+    }
+
+    #[test]
+    fn agent_relay_approves_on_matching_digest() {
+        let conn = state_conn();
+        let id =
+            insert_pending_review(&conn, &new_review("edit_lines", "a.py", "sha256:abc")).unwrap();
+        let review = get_pending_review(&conn, &id).unwrap().unwrap();
+        let digest = crate::indexer::pipeline::hash_content(&review.diff_preview);
+        let outcome = decide_via_agent_relay(&conn, &id, &digest, true).unwrap();
+        assert_eq!(outcome, AgentRelayOutcome::Decided("approved"));
+        let got = get_pending_review(&conn, &id).unwrap().unwrap();
+        assert_eq!(got.status, "approved");
+        assert_eq!(
+            got.decided_by.as_deref(),
+            Some("agent_relay_after_elicitation")
+        );
+    }
+
+    #[test]
+    fn agent_relay_declines_on_matching_digest() {
+        let conn = state_conn();
+        let id =
+            insert_pending_review(&conn, &new_review("edit_lines", "a.py", "sha256:abc")).unwrap();
+        let review = get_pending_review(&conn, &id).unwrap().unwrap();
+        let digest = crate::indexer::pipeline::hash_content(&review.diff_preview);
+        let outcome = decide_via_agent_relay(&conn, &id, &digest, false).unwrap();
+        assert_eq!(outcome, AgentRelayOutcome::Decided("declined"));
+    }
+
+    #[test]
+    fn agent_relay_refuses_a_stale_or_guessed_digest() {
+        let conn = state_conn();
+        let id =
+            insert_pending_review(&conn, &new_review("edit_lines", "a.py", "sha256:abc")).unwrap();
+        let outcome = decide_via_agent_relay(&conn, &id, "not-the-real-digest", true).unwrap();
+        assert_eq!(outcome, AgentRelayOutcome::DigestMismatch);
+        // Refused -- must not have flipped status.
+        let got = get_pending_review(&conn, &id).unwrap().unwrap();
+        assert_eq!(got.status, "pending");
+    }
+
+    #[test]
+    fn agent_relay_reports_not_found_for_unknown_id() {
+        let conn = state_conn();
+        let outcome = decide_via_agent_relay(&conn, "REVIEW-nope", "whatever", true).unwrap();
+        assert_eq!(outcome, AgentRelayOutcome::NotFound);
+    }
+
+    #[test]
+    fn agent_relay_reports_already_decided() {
+        let conn = state_conn();
+        let id =
+            insert_pending_review(&conn, &new_review("edit_lines", "a.py", "sha256:abc")).unwrap();
+        let review = get_pending_review(&conn, &id).unwrap().unwrap();
+        let digest = crate::indexer::pipeline::hash_content(&review.diff_preview);
+        decline_pending_review(&conn, &id, "cli_manual_review").unwrap();
+        let outcome = decide_via_agent_relay(&conn, &id, &digest, true).unwrap();
+        assert_eq!(
+            outcome,
+            AgentRelayOutcome::AlreadyDecided("declined".to_string())
+        );
     }
 }

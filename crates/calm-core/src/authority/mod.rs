@@ -12,9 +12,9 @@ pub mod review;
 pub mod snapshot;
 
 pub use pending_review::{
-    NewPendingReview, PENDING_REVIEW_DEFAULT_TTL_SECS, PendingReview, approve_pending_review,
-    decline_pending_review, find_approved_matching, get_pending_review, insert_pending_review,
-    list_pending_reviews,
+    AgentRelayOutcome, NewPendingReview, PENDING_REVIEW_DEFAULT_TTL_SECS, PendingReview,
+    approve_pending_review, decide_via_agent_relay, decline_pending_review, find_approved_matching,
+    get_pending_review, insert_pending_review, list_pending_reviews,
 };
 pub use receipt::{ApprovalReceipt, insert_approval_receipt};
 pub use review::{
