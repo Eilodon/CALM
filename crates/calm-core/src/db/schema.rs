@@ -305,6 +305,28 @@ CREATE TABLE IF NOT EXISTS ambiguity_groups (
 CREATE INDEX IF NOT EXISTS idx_ambiguity_groups_call_site ON ambiguity_groups(call_site_id);
 CREATE INDEX IF NOT EXISTS idx_ambiguity_groups_from_path ON ambiguity_groups(from_path);
 
+-- PR#6 (target-aware ambiguity membership): the surviving candidate SET of an
+-- overflow group (too many same-named candidates to trust any single one) used
+-- to be DISCARDED -- only its length survived as ambiguity_groups.candidate_count,
+-- the same identity-collapse-to-a-scalar as the P0 formal-upgrade bug. Persisting
+-- the members lets callers()/reference_impact ask whether THIS symbol (by
+-- qualified_name) is one of the candidates, instead of matching any unrelated
+-- symbol that merely shares the bare name (a Python helper inheriting a Rust
+-- helper group's caveat). candidate_qn is exactly the resolver's target
+-- qualified_name -- same format as symbols.qualified_name / call_edges.to_symbol.
+-- CASCADE off ambiguity_groups(id) so the existing group DELETE scopes (full
+-- sweep in rebuild_graph, from_path-scoped in incremental_graph_update) clear
+-- members for free -- staleness structurally impossible, same lifecycle as parent.
+CREATE TABLE IF NOT EXISTS ambiguity_group_candidates (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    group_id       INTEGER NOT NULL REFERENCES ambiguity_groups(id) ON DELETE CASCADE,
+    candidate_qn   TEXT NOT NULL,
+    candidate_path TEXT,
+    rank_hint      INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_ambiguity_group_candidates_group ON ambiguity_group_candidates(group_id);
+CREATE INDEX IF NOT EXISTS idx_ambiguity_group_candidates_qn ON ambiguity_group_candidates(candidate_qn);
+
 -- WS7 (evidence reconciliation): a provider (SCIP) proof that CONTRADICTS a
 -- confident static resolution of the SAME call site is a conflict, not a new
 -- target -- inserting it would manufacture a false-confidence edge (fixture I /

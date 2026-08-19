@@ -322,7 +322,7 @@
         "$ref": "#/$defs/ConfidenceBreakdown"
       },
       "unresolved_group_count": {
-        "description": "Count of `ambiguity_groups` rows (WS3) whose `candidate_group_key`\nmatches this symbol's bare name — call sites elsewhere that had more\nthan `MAX_CALLEE_CANDIDATES` same-named candidates and so produced\nno edge to ANY of them, this symbol possibly included. Neither\n`direct` nor `ambiguous` above can ever contain these — they are\ninvisible to both. See `Caveat::unresolved_ambiguity_groups`.",
+        "description": "Count of distinct `ambiguity_groups` rows (WS3) whose PERSISTED\ncandidate members (`ambiguity_group_candidates`, PR#6) include this\nsymbol's real `qualified_name` — call sites elsewhere that had more\nthan `MAX_CALLEE_CANDIDATES` same-named candidates, this symbol\ngenuinely among them, and so produced no edge to ANY of them. Target-\naware: an unrelated same-named symbol in another language/module can\nno longer inherit this caveat (pre-PR#6 it matched on bare name).\nNeither `direct` nor `ambiguous` above can ever contain these — they\nare invisible to both. See `Caveat::unresolved_ambiguity_groups`.",
         "type": "integer",
         "format": "uint",
         "minimum": 0

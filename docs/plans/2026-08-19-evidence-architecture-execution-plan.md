@@ -1,6 +1,6 @@
 # CALM Evidence-Architecture Upgrade — Verified Execution Plan
 
-> **Status:** Draft for review · **Date:** 2026-08-19 · **Base commit:** `903d3ef`
+> **Status:** Wave 0 SHIPPED (PR#1-5) · PR#6-10 specs execution-ready (Part E) · **Date:** 2026-08-19 · **Base commit:** `903d3ef` + Wave 0
 > **Method:** Every claim in the source audit was cross-checked against real code
 > (file:line below), not docs/comments. This plan keeps what verified, corrects
 > what was overstated, and sequences the work by real dependency, not wishlist order.
@@ -205,6 +205,8 @@ a 10k-line God-module — but **strictly no semantics change**.
 
 ### Wave 2 — Unified identity foundation
 
+> **See Part E (PR#8, PR#9) for build-ready specs. ⚠ Reading real code corrected this wave: call-site identity already exists at v2 (byte-span) — PR#9 evolves it to a position-independent v3, it does not build it.**
+
 Ship stable identity so evidence and ANN have something durable to bind to.
 
 - `TypeId { language, package_or_module, lexical_scope, qualified_name,
@@ -222,6 +224,8 @@ Ship stable identity so evidence and ANN have something durable to bind to.
 ---
 
 ### Wave 3 — Full evidence ledger + reconciler (the strategic core)
+
+> **See Part E (PR#10) for a build-ready first slice. ⚠ `external_proofs` + `evidence_conflicts` already provide 2 of the ledger tables — PR#10 generalizes them, it does not start from zero.**
 
 Turn "providers mutate `call_edges` directly" into "providers append immutable evidence;
 a reconciler materializes verdicts." SCIP already binds occurrence→byte-span→source-hash
@@ -402,3 +406,211 @@ against B2 until the oracle is fixed.**
 - `benchmarks/resolution_precision/` — grow corpus to ≥50 gating sites, add D8-class
   fixtures, add `provider_conflict_rate` (Wave 0).
 - `scripts/ci-local.sh` (new) + `.github/workflows/ci.yml` — Wave 0.1.
+
+---
+
+## Part E — Execution-ready specs for PR#6–10 (verified against real code 2026-08-19)
+
+> Wave 0 (PR#1–5) is **SHIPPED**. This part turns the remaining critical-path PRs from
+> Part B outlines into build-ready specs, each anchored to real `file:line` and — most
+> importantly — each stating **what already exists** so we extend rather than rebuild.
+> Reading the real code surfaced three facts that change the plan (flagged **⚠ CORRECTION**
+> below). Verified at base `903d3ef` + Wave 0.
+
+### PR#6 — AmbiguityGroup target-aware membership (Wave 0.6) · size **M** · gate: **high-risk** (`trace.rs` read queries)
+
+**The bug (confirmed).** An overflow "too many same-named candidates" group is keyed by the
+**bare callee name** and both consumer queries match on that bare name, so the caveat leaks
+across unrelated symbols:
+- Construction: [`resolve_sites_to_edges`](../../crates/calm-core/src/indexer/pipeline.rs#L1866) pushes
+  `AmbiguityGroup { candidate_group_key: callee.clone(), .. }` — bare name, explicitly documented
+  "not an identity" ([pipeline.rs:1292-1295](../../crates/calm-core/src/indexer/pipeline.rs#L1292-L1295)).
+- Consumers: `callers()` [trace.rs:68-70](../../crates/calm-server/src/tools/trace.rs#L68-L70) and
+  `reference_impact` [trace.rs:887-888](../../crates/calm-server/src/tools/trace.rs#L887-L888) both do
+  `WHERE candidate_group_key = ?1` bound to `c.name` (bare). A Python `helper` inherits a Rust
+  `helper` group's caveat.
+
+**⚠ CORRECTION to Part B ("query by `symbol_id`").** The overflow branch cannot key by a resolved
+`symbol_id` because *by definition none of the candidates was picked*. But the candidate **set is
+known and then thrown away** — the same "identity collapsed to a scalar" pattern as the P0 bug:
+[pipeline.rs:1834](../../crates/calm-core/src/indexer/pipeline.rs#L1834) returns
+`(Vec::new(), false, false, Some(t.len()), None)`, discarding `t` (the surviving candidate
+`Vec<(qualified_name, path)>` from [pipeline.rs:1559](../../crates/calm-core/src/indexer/pipeline.rs#L1559))
+and keeping only its length. So the correct fix is **persist the candidate members**, then match a
+queried symbol by exact `qualified_name`, not bare name.
+
+**Two implementable options (recommend A):**
+
+- **A — member table (fully target-aware; matches the P0 thesis).**
+  - Schema: `CREATE TABLE ambiguity_group_candidates (group_id INTEGER NOT NULL REFERENCES
+    ambiguity_groups(id) ON DELETE CASCADE, candidate_qn TEXT NOT NULL, candidate_path TEXT,
+    rank_hint INTEGER)` + `INDEX(candidate_qn)`. Additive `IF NOT EXISTS`, no version bump
+    (same policy as `evidence_conflicts` in PR#4).
+  - `AmbiguityGroup` struct ([pipeline.rs:1296](../../crates/calm-core/src/indexer/pipeline.rs#L1296))
+    gains `candidates: Vec<(String, Option<String>)>`; thread `t` through the overflow branch
+    instead of dropping it at :1834; `insert_ambiguity_groups_batch`
+    ([pipeline.rs:1930](../../crates/calm-core/src/indexer/pipeline.rs#L1930)) inserts children.
+    CASCADE + the two existing DELETE scopes (`rebuild_graph`
+    [:2012](../../crates/calm-core/src/indexer/pipeline.rs#L2012), `incremental_graph_update`
+    [:2233](../../crates/calm-core/src/indexer/pipeline.rs#L2233)) already clean children for free.
+  - Queries: join and match `WHERE agc.candidate_qn = ?1` bound to `c.qualified_name`.
+- **B — language column (minimal; kills only the cross-language collision).** Add `language TEXT`
+  to `ambiguity_groups` (derive from `from_path` via `language_for_extension` at insert), filter
+  `AND language = ?2`. Cheaper, but a same-language different-module `helper`↔`helper` still leaks.
+  Satisfies the *stated* DoD (cross-language) but not the thesis. Fallback only if scope must shrink.
+
+**Test:** cross-language fixture — a Python file with a >`MAX_CALLEE_CANDIDATES` `helper` overflow
+and an *unrelated* Rust `helper` symbol; assert `callers(rust::helper).caveat` is `None`
+(option A also: `callers(python::helper)` still gets it). Keep green:
+`test_overflow_candidates_recorded_as_ambiguity_group_not_dropped_silently`
+([pipeline.rs:5246](../../crates/calm-core/src/indexer/pipeline.rs#L5246)) and
+`callers_reports_unresolved_ambiguity_groups` ([tools.rs:6172](../../crates/calm-server/src/tools.rs#L6172)).
+
+**DoD:** cross-language leak = 0; WS3 "dropped site is recorded" tests still pass;
+`resolution_precision` unchanged (this touches only the caveat surface, never `call_edges`).
+
+**Risk/rollback:** read-path + additive schema only; no edge semantics change. Revert = drop table +
+restore bare-name query. **Gate:** `trace.rs` is risk-high → needs one out-of-band TTY
+`calm review approve <id>` for the query edits.
+
+---
+
+### PR#7 — `pipeline.rs` behavior-preserving split (Wave 1, issue #67) · size **L** · own session
+
+**Reality of the file.** ~7,200 lines: **non-test logic ends ≈ line 3687**, tests run 3696→7202.
+So the "6k-line" figure is ~3.7k lines of logic + ~3.5k lines of in-file tests. Two functions
+dominate and are the real work:
+- `extract_file_data` [423–903](../../crates/calm-core/src/indexer/pipeline.rs#L423) (~480 lines)
+- `resolve_sites_to_edges` [1304–1924](../../crates/calm-core/src/indexer/pipeline.rs#L1304) (~620 lines)
+
+**Verified extraction seams (already cleanly grouped by concern — move-only, one PR each):**
+
+| New module | Functions (line ranges) |
+|---|---|
+| `pipeline/discovery.rs` | `read_source_capped` 49, `collect_source_files` 133, `hash_content`/`mtime_secs`/`rel_path`/`upsert_file_index` 154–291 |
+| `pipeline/extraction.rs` | `formally_resolved_names` 400, `extract_file_data` 423–903, `persist_file` 920 |
+| `resolver/context.rs` | `build_resolution_context` 1033, `build_inheritance_closure` 1157, `resolve_via_inheritance_closure` 1246 |
+| `resolver/reconcile.rs` | `resolve_sites_to_edges` 1304–1924, `insert_ambiguity_groups_batch` 1930 |
+| `resolver/modules.rs` | `resolve_import_targets` 2300 … `normalize_rel` 2761 (module/path resolution cluster) |
+| `pipeline/graph.rs` | `rebuild_graph` 1950, `rebuild_graph_from_index` 2052, `incremental_graph_update` 2109, `refresh_caller_counts` 2285 |
+| `pipeline/driver.rs` | `run_indexing_pipeline*` 2799–2824, `reindex_*` 2834–2975, 2990, 3335, 3530 |
+| `resolver/cache.rs` | `cached_formal_resolver` 3024, `cached_resolution_maps` 3092, `invalidate_resolution_maps_cache` 3157 |
+| `pipeline/identity_migration.rs` | `needs_call_site_identity_baseline` 3169, `record_call_site_identity_migration_status` 3186, `rebuild_call_site_identity_baseline` 3247 |
+
+Extract in **dependency-leaf order** (discovery → extraction → modules/context → reconcile →
+graph → driver) so each PR compiles against already-moved deps. Keep every function `pub(crate)`
+at first; tighten visibility only in a final no-op pass. Tests stay in `pipeline.rs` until logic
+is fully split, then move alongside.
+
+**Safety oracle (already built).** [`tests/golden_graph_equivalence.rs`](../../crates/calm-core/tests/golden_graph_equivalence.rs)
+compares a *continued* vs a *fresh* index by **semantic keys only** (never DB id/timestamp/order),
+keyed on full call-site identity + SCIP proof provenance. **DoD per extraction PR:** golden
+equivalence green · `resolution_precision` byte-identical before/after · B2 identical · zero net
+logic diff (`git diff` shows moves + `use` only). **No `resolve_sites_to_edges` behavior change
+lands in this wave** — TypeId (PR#8) is the first semantic change and rides *on top of* the split.
+
+**Gate:** each slice touches risk-high `pipeline.rs` → one TTY approval per PR. Keep PRs small
+(one module each) so each approval covers a reviewable move.
+
+---
+
+### PR#8 — `TypeId` / qualified type identity (Wave 2) · size **L** · depends on PR#7
+
+**What exists.** Receiver type is a **bare string**: `target_class: Option<String>` on
+`CallSiteData` ([pipeline.rs:302](../../crates/calm-core/src/indexer/pipeline.rs#L302)), column
+`target_class TEXT` ([schema.rs:253](../../crates/calm-core/src/db/schema.rs#L253), migrated
+[:1038](../../crates/calm-core/src/db/schema.rs#L1038)), persisted via `persist_file`
+([:941/:956](../../crates/calm-core/src/indexer/pipeline.rs#L941)), and **consumed at ~15 sites
+inside `resolve_sites_to_edges`** (1404, 1460, 1546, 1559, 1681, 1704, 1722, 1727, 1736, 1742).
+A bare `User` cannot distinguish `com.foo.User` from `com.bar.User`.
+
+**Why it must follow PR#7.** All ~15 consumers live in the 620-line `resolve_sites_to_edges`.
+Changing `target_class` before that function is extracted into `resolver/reconcile.rs` means
+editing the single riskiest span in the repo. Split first, then evolve the isolated module.
+
+**Mechanism.** Introduce `TypeRef = Resolved(TypeId) | External(ExternalTypeId) | Unresolved(TypeShape)`
+where `TypeId { language, package_or_module, lexical_scope, qualified_name, declaration_symbol_id }`.
+**`External` is a first-class state**, not "local lookup missed" — this is the type-level twin of
+PR#5's `external_crate_root`. Add `target_type` **alongside** `target_class` first (dual-write),
+migrate consumers one branch at a time behind the reconcile module, then drop the string. Ambiguous
+identity (two packages, same bare name) **fails closed to conflict**, never a guess.
+
+**Test:** `com.foo.User` vs `com.bar.User` (Java) and `foo.Base` vs `bar.Base` (Python) adversarial
+fixtures resolve to distinct targets or conflict — never silently to one. **DoD:** no same-bare-name
+different-package confident edge; `resolution_precision` `false_confidence_rate` non-increasing.
+
+---
+
+### PR#9 — Position-independent call-site identity (Wave 2) · size **L** · depends on PR#7
+
+**⚠ CORRECTION to Part B ("add `CallSiteKey`/`CallSiteRevision`").** Call-site identity is **not
+missing — it already exists at v2** and is byte-span based:
+- `call_sites` carries `callee_start_byte`, `callee_end_byte`, `identity_version`
+  ([migrate_call_site_identity_v2, schema.rs:1268](../../crates/calm-core/src/db/schema.rs#L1268));
+  unique identity = `(from_path, enclosing_qn, callee_start_byte, callee_end_byte, edge_kind,
+  identity_version)` ([schema.rs:1292-1303](../../crates/calm-core/src/db/schema.rs#L1292-L1303)).
+- `external_proofs` anchors durable proof to that identity + `source_file_hash`
+  ([schema.rs:266-283](../../crates/calm-core/src/db/schema.rs#L266-L283)), CASCADE-deleted when the
+  `call_sites` row is.
+- A full migration harness already exists: `needs_call_site_identity_baseline`
+  ([pipeline.rs:3169](../../crates/calm-core/src/indexer/pipeline.rs#L3169)) →
+  `rebuild_call_site_identity_baseline` ([:3247](../../crates/calm-core/src/indexer/pipeline.rs#L3247))
+  → `record_call_site_identity_migration_status` ([:3186](../../crates/calm-core/src/indexer/pipeline.rs#L3186)),
+  emitting `GraphMode::FullFallback("call_site_identity_v2")`.
+
+**The real, narrower gap (audit §37, now precise).** The v2 key is **byte-ABSOLUTE**. Inserting a
+comment *above* a call site (same function, unchanged call) shifts `callee_start/end_byte` → identity
+changes → `external_proofs` CASCADE-deleted → **the proof re-verifies from scratch though nothing
+about the call changed** (proof churn). So PR#9 is not "build identity"; it is "make the existing
+identity position-independent": add a **v3** identity whose offsets are **relative to the enclosing
+symbol's start byte** (or an AST-path/normalized-subtree key), so edits *outside* the enclosing
+symbol don't perturb it.
+
+**Reuse, don't rebuild.** Bump `identity_version` 2→3, add the relative-offset columns, and drive
+the reparse through the **existing** `needs_call_site_identity_baseline`/`rebuild_call_site_identity_baseline`
+path — it already handles "detect stale identity version → forced full baseline → status rows →
+`FullFallback` graph mode." Update `tests/golden_graph_equivalence.rs`'s `CallSiteKey`/`ProofKey`
+([golden_graph_equivalence.rs:22-46](../../crates/calm-core/tests/golden_graph_equivalence.rs#L22-L46))
+in lockstep (they key on the byte offsets today).
+
+**Test:** index a fixture; snapshot `external_proofs`; insert a comment line *above* a proven call
+site; reindex; assert the proof row for that call site is **unchanged** (`status='fresh'`, same
+identity) — today it churns. **DoD:** upstream-insertion proof churn = 0; golden equivalence green;
+`SymbolRevision` (declaration/signature hash) added for signature-vs-body change discrimination.
+
+---
+
+### PR#10 — Evidence ledger v1 + `call_edges` compatibility projection (Wave 3, first slice) · size **L**
+
+**What exists (2 of the ledger's tables are already seeded).**
+- `external_proofs` ([schema.rs:266-283](../../crates/calm-core/src/db/schema.rs#L266-L283)) already
+  is a per-provider evidence row: `provider`, `provider_fingerprint`, `context_fingerprint`,
+  `source_file_hash`, byte span, `graph_generation` fence, `definition_snapshot`, and a
+  `status IN (fresh|stale|legacy|unverified|rejected)` lifecycle. This **is** the "SCIP machinery to
+  keep" — evidence ledger v1 is a **generalization of this table into `reference_evidence`**
+  (add `disposition supports|excludes`, `authority_class`, `observed_revision`), not a greenfield build.
+- `evidence_conflicts` (shipped PR#4) is already the ledger's conflict table.
+
+**The one behavioral flip.** Today providers **mutate `call_edges` directly** — the concrete site is
+`scip/ingest.rs::insert_missing_exact_edges` (the function PR#3 guarded). Rule A: providers **append
+evidence**; a reconciler materializes `reference_verdicts`; `call_edges` becomes a **materialized
+projection** so the 40 MCP tools keep working unchanged through the migration. First slice = stand up
+`reference_evidence` (migrate `external_proofs` inserts to also write it) + `reference_verdicts` +
+the projection that reproduces today's `call_edges` byte-for-byte under golden equivalence. Authority
+(Rule B): SCIP proof outranks a same-dir heuristic, but contradicting a local lexical binding /
+explicit import / package rule / explicit receiver type is **conflict**, not silent overwrite.
+
+**DoD:** with the projection active, `resolution_precision` + B2 + golden equivalence are all
+identical to pre-PR#10 (proves the projection is faithful) · every `verified` edge is explainable
+(which evidence/provider/revision) · no provider writes `call_edges` directly anymore.
+
+---
+
+### Revised sequencing note
+
+PR#8 and PR#9 both depend on PR#7 (they edit code that lives inside the not-yet-split
+`resolve_sites_to_edges` / `pipeline.rs`), and both are independent of each other — so after the
+split they can proceed in either order or in parallel. PR#10 depends on PR#9's stable revision
+(evidence must bind to a churn-free identity). Net critical path is unchanged from Part C; the
+correction is that **#9 is "evolve v2→v3", not "introduce", and #10 "generalizes `external_proofs`",
+not "creates a ledger"** — both materially smaller than the Part B wording implied.

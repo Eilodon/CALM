@@ -6200,6 +6200,15 @@ mod tests {
                 [],
             )
             .unwrap();
+            // PR#6: persisted member row -- 'a.rs::helper' is genuinely among
+            // the 25 overflow candidates, so callers() must match it by real
+            // qualified_name, not merely by the group's bare candidate_group_key.
+            conn.execute(
+                "INSERT INTO ambiguity_group_candidates (group_id, candidate_qn, candidate_path)
+                 VALUES (1, 'a.rs::helper', 'a.rs')",
+                [],
+            )
+            .unwrap();
         }
         let v = jv(
             server.callers(rmcp::handler::server::wrapper::Parameters(CallersParams {
@@ -6225,6 +6234,89 @@ mod tests {
         assert!(
             msg.contains("25"),
             "caveat must cite the widest candidate_count: {msg}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    /// PR#6 (docs/plans/2026-08-19-evidence-architecture-execution-plan.md
+    /// Part E): an unrelated same-named symbol in another language must NOT
+    /// inherit an `ambiguity_groups` caveat that was never about it -- pre-PR#6
+    /// the query matched on the group's bare `candidate_group_key` alone, so a
+    /// Python `helper` overflow group would leak onto an unrelated Rust
+    /// `helper`. Target-aware membership (`ambiguity_group_candidates`,
+    /// matched by real `qualified_name`) must keep the caveat scoped to
+    /// symbols the resolver actually saw as candidates.
+    #[test]
+    fn ambiguity_group_membership_is_target_aware_not_bare_name() {
+        let dir =
+            std::env::temp_dir().join(format!("ci_callers_ambgroup_xlang_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('rust_mod.rs::helper', 'helper', 'function', 'rust', 'rust_mod.rs', 1, 1, 'fn helper()', '', 'helper', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('py_mod.py::helper', 'helper', 'function', 'python', 'py_mod.py', 1, 1, 'def helper()', '', 'helper', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO call_sites (id, from_path, enclosing_qn, callee_name, call_line, identity_version, confidence, edge_kind)
+                 VALUES (1, 'caller.py', 'caller.py::use_it', 'helper', 9, 1, 'ambiguous', 'call')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO ambiguity_groups (call_site_id, from_path, candidate_group_key, candidate_count, reason)
+                 VALUES (1, 'caller.py', 'helper', 25, 'unscoped_candidates_exceeded_max_callee_candidates')",
+                [],
+            )
+            .unwrap();
+            // The overflow candidate set is entirely Python -- the Rust `helper`
+            // symbol was never a real candidate at this call site, only its
+            // bare name coincides.
+            conn.execute(
+                "INSERT INTO ambiguity_group_candidates (group_id, candidate_qn, candidate_path)
+                 VALUES (1, 'py_mod.py::helper', 'py_mod.py')",
+                [],
+            )
+            .unwrap();
+        }
+        let rust_result = jv(
+            server.callers(rmcp::handler::server::wrapper::Parameters(CallersParams {
+                symbol: "helper".into(),
+                path: Some("rust_mod.rs".into()),
+                line: Some(1),
+                transitive: false,
+                max_depth: None,
+                if_none_match: None,
+            })),
+        );
+        assert_eq!(
+            rust_result["unresolved_group_count"], 0,
+            "the Rust helper was never a member of the Python overflow group -- must not inherit its caveat"
+        );
+
+        let py_result = jv(
+            server.callers(rmcp::handler::server::wrapper::Parameters(CallersParams {
+                symbol: "helper".into(),
+                path: Some("py_mod.py".into()),
+                line: Some(1),
+                transitive: false,
+                max_depth: None,
+                if_none_match: None,
+            })),
+        );
+        assert_eq!(
+            py_result["unresolved_group_count"], 1,
+            "the Python helper genuinely is a persisted member of the overflow group"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

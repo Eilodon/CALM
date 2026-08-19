@@ -262,7 +262,7 @@
         "minimum": 0
       },
       "unresolved_many_count": {
-        "description": "Count of `ambiguity_groups` rows (WS3) whose `candidate_group_key`\nmatches this symbol's bare name — sibling of `review_count`, but for\ncall sites that never became any edge at all (too many same-named\ncandidates), so they cannot appear in `references` alongside the\nother four classifications. See `CallersOutput::unresolved_group_count`.",
+        "description": "Count of distinct `ambiguity_groups` rows (WS3) whose PERSISTED\ncandidate members include this symbol's real `qualified_name` (PR#6,\ntarget-aware) — sibling of `review_count`, but for call sites that\nnever became any edge at all (too many same-named candidates), so\nthey cannot appear in `references` alongside the other four\nclassifications. See `CallersOutput::unresolved_group_count`.",
         "type": "integer",
         "format": "uint",
         "minimum": 0

@@ -1292,12 +1292,21 @@ fn resolve_via_inheritance_closure(
 /// anywhere. `candidate_group_key` is the raw `callee_name` text (not a
 /// resolved qualified name — by definition none of the candidates were
 /// ever picked), so it's a grouping key for "sites stuck on this same
-/// ambiguous name," not an identity.
+/// ambiguous name," not an identity. `candidates` (PR#6) is the real
+/// identity: the actual (qualified_name, path) surviving-candidate SET, so
+/// `callers()`/`reference_impact` can match a queried symbol precisely
+/// instead of via the bare `candidate_group_key` (which let an unrelated
+/// same-named symbol in another language/module inherit this caveat).
 struct AmbiguityGroup {
     call_site_id: i64,
     from_path: String,
     candidate_group_key: String,
     candidate_count: usize,
+    // PR#6: the surviving candidate SET (qualified_name, path) pairs, persisted
+    // so callers()/reference_impact can match by real identity instead of the
+    // bare candidate_group_key above -- see ambiguity_group_candidates in
+    // db/schema.rs for why this kills the cross-language bare-name collision.
+    candidates: Vec<(String, String)>,
     reason: String,
 }
 
@@ -1380,11 +1389,15 @@ fn resolve_sites_to_edges(
     // `candidate_rank = 0` to the preferred (same-dir) subset and `1` to
     // every other surviving candidate, instead of the old behavior of
     // silently discarding them.
+    // PR#6: 4th field now carries the actual overflow candidate SET (not just
+    // its length) so ambiguity_groups can persist real (qualified_name, path)
+    // members instead of only a count -- callers()/reference_impact then match
+    // a queried symbol by identity, not by the group's bare candidate_group_key.
     type CandidateResult = (
         Vec<(String, String)>,
         bool,
         bool,
-        Option<usize>,
+        Option<Vec<(String, String)>>,
         Option<HashSet<(String, String)>>,
     );
     let candidates: Vec<CandidateResult> = sites
@@ -1831,7 +1844,7 @@ fn resolve_sites_to_edges(
                     // this specific case and record it as an ambiguity_groups row
                     // instead of silent zero-edge dropping -- previously
                     // indistinguishable from a genuinely unresolved site.
-                    (Vec::new(), false, false, Some(t.len()), None)
+                    (Vec::new(), false, false, Some(t.clone()), None)
                 }
             },
         )
@@ -1862,12 +1875,13 @@ fn resolve_sites_to_edges(
         (targets, namespace_confirmed, weak_receiver_fallback, overflow_count, preferred_subset),
     ) in sites.iter().zip(candidates.iter())
     {
-        if let Some(candidate_count) = overflow_count {
+        if let Some(overflow_candidates) = overflow_count {
             ambiguity_groups.push(AmbiguityGroup {
                 call_site_id: *call_site_id,
                 from_path: from_path.clone(),
                 candidate_group_key: callee.clone(),
-                candidate_count: *candidate_count,
+                candidate_count: overflow_candidates.len(),
+                candidates: overflow_candidates.clone(),
                 reason: "unscoped_candidates_exceeded_max_callee_candidates".to_string(),
             });
         }
@@ -1935,6 +1949,13 @@ fn insert_ambiguity_groups_batch(
         "INSERT INTO ambiguity_groups (call_site_id, from_path, candidate_group_key, candidate_count, reason) \
          VALUES (?1, ?2, ?3, ?4, ?5)",
     )?;
+    // PR#6: persist the real (qualified_name, path) candidate members alongside
+    // the parent row so callers()/reference_impact can match by identity --
+    // see ambiguity_group_candidates in db/schema.rs.
+    let mut candidate_stmt = tx.prepare(
+        "INSERT INTO ambiguity_group_candidates (group_id, candidate_qn, candidate_path) \
+         VALUES (?1, ?2, ?3)",
+    )?;
     for g in groups {
         stmt.execute(rusqlite::params![
             g.call_site_id,
@@ -1943,6 +1964,10 @@ fn insert_ambiguity_groups_batch(
             g.candidate_count as i64,
             g.reason,
         ])?;
+        let group_id = tx.last_insert_rowid();
+        for (qn, path) in &g.candidates {
+            candidate_stmt.execute(rusqlite::params![group_id, qn, path])?;
+        }
     }
     Ok(())
 }

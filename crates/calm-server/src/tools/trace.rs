@@ -57,22 +57,29 @@ impl CalmServer {
 
             let config = self.config();
 
-            // WS3 (docs/plans/2026-08-18-context-intelligence-upgrade-plan.md):
-            // call sites elsewhere whose surviving candidate set for this
-            // bare name exceeded MAX_CALLEE_CANDIDATES never produced an
-            // edge to any target, this symbol possibly included -- neither
-            // `direct` nor `ambiguous` below can ever see them. Row count
-            // (not summed candidate_count) so the caveat's "N call sites"
-            // is a real count of distinct sites, not inflated by width.
+            // WS3 (docs/plans/2026-08-18-context-intelligence-upgrade-plan.md),
+            // target-aware since PR#6 (docs/plans/2026-08-19-evidence-architecture-
+            // execution-plan.md Part E): call sites elsewhere whose surviving
+            // candidate set exceeded MAX_CALLEE_CANDIDATES never produced an edge
+            // to any target -- neither `direct` nor `ambiguous` below can ever see
+            // them. Joins ambiguity_group_candidates and matches this symbol's
+            // real `qualified_name`, NOT the group's bare candidate_group_key --
+            // matching by bare name let an unrelated same-named symbol in another
+            // language/module inherit a caveat that was never about it (e.g. a
+            // Python `helper` inheriting a Rust `helper` group's overflow). COUNT
+            // DISTINCT ag.id (not summed candidate_count) so the caveat's "N call
+            // sites" is a real count of distinct sites, not inflated by width.
             let (unresolved_group_count, unresolved_group_max_candidates): (usize, usize) = {
                 let mut stmt = match conn.prepare(
-                    "SELECT COUNT(*), COALESCE(MAX(candidate_count), 0) \
-                     FROM ambiguity_groups WHERE candidate_group_key = ?1",
+                    "SELECT COUNT(DISTINCT ag.id), COALESCE(MAX(ag.candidate_count), 0) \
+                     FROM ambiguity_groups ag \
+                     JOIN ambiguity_group_candidates agc ON agc.group_id = ag.id \
+                     WHERE agc.candidate_qn = ?1",
                 ) {
                     Ok(s) => s,
                     Err(e) => return db_error_resolved(e),
                 };
-                match stmt.query_row(rusqlite::params![c.name], |r| {
+                match stmt.query_row(rusqlite::params![c.qualified_name], |r| {
                     Ok((r.get::<_, i64>(0)? as usize, r.get::<_, i64>(1)? as usize))
                 }) {
                     Ok(v) => v,
@@ -878,19 +885,25 @@ impl CalmServer {
                 .filter(|h| h.classification == "textual_only")
                 .count();
 
-            // WS3 (docs/plans/2026-08-18-context-intelligence-upgrade-plan.md):
-            // sibling of `review_count`, but for call sites that had more
-            // than MAX_CALLEE_CANDIDATES same-named candidates and so never
-            // became any edge at all -- see `CallersOutput::unresolved_group_count`.
-            // Row count, matching that field's own "distinct sites" contract.
+            // WS3 (docs/plans/2026-08-18-context-intelligence-upgrade-plan.md),
+            // target-aware since PR#6: sibling of `review_count`, but for call
+            // sites that had more than MAX_CALLEE_CANDIDATES same-named candidates
+            // and so never became any edge at all -- see
+            // `CallersOutput::unresolved_group_count` for the full rationale
+            // (matches this symbol's real `qualified_name` via
+            // ambiguity_group_candidates, not the group's bare
+            // candidate_group_key). COUNT DISTINCT, matching that field's own
+            // "distinct sites" contract.
             let unresolved_many_count: usize = {
-                let mut stmt = match conn
-                    .prepare("SELECT COUNT(*) FROM ambiguity_groups WHERE candidate_group_key = ?1")
-                {
+                let mut stmt = match conn.prepare(
+                    "SELECT COUNT(DISTINCT ag.id) FROM ambiguity_groups ag \
+                     JOIN ambiguity_group_candidates agc ON agc.group_id = ag.id \
+                     WHERE agc.candidate_qn = ?1",
+                ) {
                     Ok(s) => s,
                     Err(e) => return db_error_resolved(e),
                 };
-                match stmt.query_row(rusqlite::params![c.name], |r| r.get::<_, i64>(0)) {
+                match stmt.query_row(rusqlite::params![c.qualified_name], |r| r.get::<_, i64>(0)) {
                     Ok(n) => n as usize,
                     Err(e) => return db_error_resolved(e),
                 }
@@ -1167,12 +1180,15 @@ pub(crate) struct CallersOutput {
     /// `textual` (found the name, not confirmed the call is real) — see
     /// docs/plans/2026-08-18-context-intelligence-upgrade-plan.md WS1.
     pub(crate) direct_by_confidence: ConfidenceBreakdown,
-    /// Count of `ambiguity_groups` rows (WS3) whose `candidate_group_key`
-    /// matches this symbol's bare name — call sites elsewhere that had more
-    /// than `MAX_CALLEE_CANDIDATES` same-named candidates and so produced
-    /// no edge to ANY of them, this symbol possibly included. Neither
-    /// `direct` nor `ambiguous` above can ever contain these — they are
-    /// invisible to both. See `Caveat::unresolved_ambiguity_groups`.
+    /// Count of distinct `ambiguity_groups` rows (WS3) whose PERSISTED
+    /// candidate members (`ambiguity_group_candidates`, PR#6) include this
+    /// symbol's real `qualified_name` — call sites elsewhere that had more
+    /// than `MAX_CALLEE_CANDIDATES` same-named candidates, this symbol
+    /// genuinely among them, and so produced no edge to ANY of them. Target-
+    /// aware: an unrelated same-named symbol in another language/module can
+    /// no longer inherit this caveat (pre-PR#6 it matched on bare name).
+    /// Neither `direct` nor `ambiguous` above can ever contain these — they
+    /// are invisible to both. See `Caveat::unresolved_ambiguity_groups`.
     pub(crate) unresolved_group_count: usize,
     /// `true` when `direct` was cut down to `config.callers.direct_list_cap`
     /// entries — `direct_count` above is still the true total regardless.
@@ -1333,11 +1349,12 @@ pub(crate) struct ReferenceImpactOutput {
     pub(crate) likely_change_count: usize,
     pub(crate) review_count: usize,
     pub(crate) textual_only_count: usize,
-    /// Count of `ambiguity_groups` rows (WS3) whose `candidate_group_key`
-    /// matches this symbol's bare name — sibling of `review_count`, but for
-    /// call sites that never became any edge at all (too many same-named
-    /// candidates), so they cannot appear in `references` alongside the
-    /// other four classifications. See `CallersOutput::unresolved_group_count`.
+    /// Count of distinct `ambiguity_groups` rows (WS3) whose PERSISTED
+    /// candidate members include this symbol's real `qualified_name` (PR#6,
+    /// target-aware) — sibling of `review_count`, but for call sites that
+    /// never became any edge at all (too many same-named candidates), so
+    /// they cannot appear in `references` alongside the other four
+    /// classifications. See `CallersOutput::unresolved_group_count`.
     pub(crate) unresolved_many_count: usize,
     /// `true` when `references` was cut down to `REFERENCE_IMPACT_LIMIT`
     /// entries.
