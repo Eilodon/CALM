@@ -574,6 +574,56 @@ pub(crate) fn record_external_proof_for_edge(
             context.graph_generation,
         ],
     )?;
+    // Wave 3 evidence ledger v1 (PR#10 slice 1): mirrors the external_proofs
+    // write above into reference_evidence under the identical guard, so the
+    // two never disagree about which proofs qualified. disposition is always
+    // 'supports' here -- record_external_proof_for_edge only ever runs after
+    // a proof was ACCEPTED (see this fn's own doc comment); 'excludes' is
+    // written by a future slice migrating insert_missing_exact_edges's
+    // evidence_conflicts INSERT.
+    conn.execute(
+        "INSERT INTO reference_evidence
+            (call_site_id, to_symbol, provider, disposition, authority_class, source_file_hash,
+             callee_start_byte, callee_end_byte, provider_fingerprint, context_fingerprint,
+             graph_generation, call_site_identity_version, definition_snapshot, status, observed_at)
+         SELECT ce.call_site_id, ce.to_symbol, ?1, 'supports', 'external_proof', fi.hash,
+                 cs.callee_start_byte, cs.callee_end_byte, ?2, ?3, graph.generation,
+                 cs.identity_version,
+                 printf('%s:%d:%d:%s', COALESCE(def_file.hash, ''), def.line_start, def.line_end, def.signature),
+                 'fresh', unixepoch('now')
+         FROM call_edges ce
+         JOIN call_sites cs ON cs.id = ce.call_site_id
+         JOIN file_index fi ON fi.path = cs.from_path
+         JOIN symbols def ON def.qualified_name = ce.to_symbol
+         LEFT JOIN file_index def_file ON def_file.path = def.path
+         JOIN graph_generation_state graph ON graph.id = 1
+         WHERE ce.id = ?4
+            AND ce.formal_source = ?5
+            AND cs.identity_version >= 2
+            AND cs.callee_start_byte IS NOT NULL
+            AND cs.callee_end_byte IS NOT NULL
+            AND (?6 IS NULL OR graph.generation = ?6)
+          ON CONFLICT(call_site_id, to_symbol, provider, disposition) DO UPDATE SET
+              source_file_hash = excluded.source_file_hash,
+              callee_start_byte = excluded.callee_start_byte,
+              callee_end_byte = excluded.callee_end_byte,
+              provider_fingerprint = excluded.provider_fingerprint,
+              context_fingerprint = excluded.context_fingerprint,
+              graph_generation = excluded.graph_generation,
+              call_site_identity_version = excluded.call_site_identity_version,
+              definition_snapshot = excluded.definition_snapshot,
+              status = 'fresh',
+              observed_at = excluded.observed_at,
+              failure_reason = NULL",
+        rusqlite::params![
+            context.provider,
+            context.provider_fingerprint,
+            context.context_fingerprint,
+            edge_id,
+            expected_formal_source,
+            context.graph_generation,
+        ],
+    )?;
     Ok(())
 }
 
@@ -1245,6 +1295,72 @@ mod tests {
             "a range derived from different source bytes must not mutate the graph"
         );
     }
+
+
+#[test]
+fn record_external_proof_for_edge_dual_writes_reference_evidence() {
+    let conn = Connection::open_in_memory().unwrap();
+    crate::db::schema::init_db(&conn).unwrap();
+    conn.execute_batch(
+        "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end)
+         VALUES ('core/src/engine.rs::Engine::start', 'start', 'method', 'rust',
+                 'core/src/engine.rs', 6, 8);
+         INSERT INTO file_index (path, hash, language, symbol_count, last_indexed)
+         VALUES ('app/src/main.rs', 'fresh-source', 'rust', 1, 0);
+         INSERT INTO call_sites
+            (from_path, enclosing_qn, callee_name, call_line, callee_start_byte,
+             callee_end_byte, identity_version, edge_kind)
+         VALUES ('app/src/main.rs', 'app/src/main.rs::main', 'start', 5, 4, 9, 2, 'call');",
+    )
+    .unwrap();
+    let call_site_id: i64 = conn
+        .query_row("SELECT id FROM call_sites", [], |row| row.get(0))
+        .unwrap();
+    conn.execute(
+        "INSERT INTO call_edges
+            (from_symbol, to_symbol, call_site_line, call_site_id, edge_confidence,
+             formal_source, from_path, to_path, edge_kind)
+         VALUES ('app/src/main.rs::main', 'core/src/engine.rs::Engine::start', 5, ?1,
+                 'formal', 'scip', 'app/src/main.rs', 'core/src/engine.rs', 'call')",
+        [call_site_id],
+    )
+    .unwrap();
+    let edge_id = conn.last_insert_rowid();
+
+    let context = super::ExternalProofContext::new("scip:test", "test-binary", "test-context");
+    super::record_external_proof_for_edge(&conn, &context, edge_id, "scip").unwrap();
+
+    let proof_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM external_proofs", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(proof_count, 1);
+
+    let (provider, disposition, authority_class, status): (String, String, String, String) = conn
+        .query_row(
+            "SELECT provider, disposition, authority_class, status FROM reference_evidence",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(provider, "scip:test");
+    assert_eq!(disposition, "supports");
+    assert_eq!(authority_class, "external_proof");
+    assert_eq!(status, "fresh");
+
+    // Idempotent re-run (a repeat overlay pass) must not duplicate rows in
+    // either table -- same ON CONFLICT guarantee external_proofs already had.
+    super::record_external_proof_for_edge(&conn, &context, edge_id, "scip").unwrap();
+    let proof_count_again: i64 = conn
+        .query_row("SELECT COUNT(*) FROM external_proofs", [], |row| row.get(0))
+        .unwrap();
+    let evidence_count_again: i64 = conn
+        .query_row("SELECT COUNT(*) FROM reference_evidence", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(proof_count_again, 1);
+    assert_eq!(evidence_count_again, 1);
+}
 
     #[test]
     fn ambiguous_guessed_encoding_upgrades_neither_candidate() {

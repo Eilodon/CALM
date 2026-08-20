@@ -287,6 +287,45 @@ CREATE TABLE IF NOT EXISTS external_proofs (
 );
 CREATE INDEX IF NOT EXISTS idx_external_proofs_status ON external_proofs(status, provider);
 
+-- Wave 3 evidence ledger v1 (docs/plans/2026-08-19-evidence-architecture-execution-plan.md
+-- Part E PR#10, slice 1 of N). Generalizes external_proofs above -- additive
+-- schema + dual-write only in this slice; every call_edges write path is
+-- UNCHANGED. disposition distinguishes a provider proof FOR a target
+-- ('supports', the only value written so far, from record_external_proof_for_edge
+-- which both the SCIP and LSP overlays call) from one recording disagreement
+-- ('excludes' -- not written yet; migrating insert_missing_exact_edges's
+-- evidence_conflicts INSERT to also land here is future work, not this slice).
+-- authority_class names the KIND of evidence: 'external_proof' for a live
+-- SCIP/LSP result today, leaving room for a 'heuristic'/'static' class if the
+-- static resolver's own confidence tiers are ever folded in here too (this
+-- slice deliberately does not attempt that -- see PR#10's real write-path
+-- inventory: indexer/pipeline/graph.rs's rebuild_graph/incremental_graph_update
+-- DELETE-then-reinsert call_edges wholesale from call_sites+symbols on every
+-- pass, making the static tier already a projection rather than a provider in
+-- this sense). Same CASCADE-on-reindex lifecycle as external_proofs.
+CREATE TABLE IF NOT EXISTS reference_evidence (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    call_site_id         INTEGER NOT NULL REFERENCES call_sites(id) ON DELETE CASCADE,
+    to_symbol            TEXT NOT NULL,
+    provider             TEXT NOT NULL,
+    disposition          TEXT NOT NULL CHECK (disposition IN ('supports', 'excludes')),
+    authority_class      TEXT NOT NULL DEFAULT 'external_proof',
+    source_file_hash     TEXT NOT NULL,
+    callee_start_byte    INTEGER NOT NULL,
+    callee_end_byte      INTEGER NOT NULL,
+    provider_fingerprint TEXT NOT NULL,
+    context_fingerprint  TEXT NOT NULL,
+    graph_generation     INTEGER NOT NULL DEFAULT 0,
+    call_site_identity_version INTEGER NOT NULL DEFAULT 1,
+    definition_snapshot  TEXT,
+    status               TEXT NOT NULL CHECK (status IN ('fresh', 'stale', 'legacy', 'unverified', 'rejected')),
+    observed_at          REAL NOT NULL,
+    failure_reason       TEXT,
+    UNIQUE(call_site_id, to_symbol, provider, disposition)
+);
+CREATE INDEX IF NOT EXISTS idx_reference_evidence_status ON reference_evidence(status, provider);
+CREATE INDEX IF NOT EXISTS idx_reference_evidence_call_site ON reference_evidence(call_site_id);
+
 -- WS3 (docs/plans/2026-08-18-context-intelligence-upgrade-plan.md, D3): a call
 -- site whose bare-name candidate set exceeded MAX_CALLEE_CANDIDATES used to be
 -- silently dropped to zero call_edges rows -- unknown read identically to
@@ -2556,4 +2595,41 @@ mod tests {
             "proof lifetime follows CallSite identity, never edge id"
         );
     }
+
+
+#[test]
+fn reference_evidence_is_keyed_by_call_site_and_deleted_with_it() {
+    let conn = Connection::open_in_memory().unwrap();
+    init_db(&conn).unwrap();
+    conn.execute(
+        "INSERT INTO call_sites
+            (from_path, enclosing_qn, callee_name, call_line, callee_start_byte,
+             callee_end_byte, identity_version, edge_kind)
+         VALUES ('main.rs', 'main.rs::main', 'target', 1, 0, 6, 2, 'call')",
+        [],
+    )
+    .unwrap();
+    let call_site_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO reference_evidence
+            (call_site_id, to_symbol, provider, disposition, source_file_hash, callee_start_byte,
+             callee_end_byte, provider_fingerprint, context_fingerprint, status, observed_at)
+         VALUES (?1, 'lib.rs::target', 'scip:rust', 'supports', 'source-hash', 0, 6,
+                 'binary-fingerprint', 'context-fingerprint', 'fresh', 1.0)",
+        [call_site_id],
+    )
+    .unwrap();
+
+    conn.execute("DELETE FROM call_sites WHERE id = ?1", [call_site_id])
+        .unwrap();
+    let evidence: i64 = conn
+        .query_row("SELECT COUNT(*) FROM reference_evidence", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        evidence, 0,
+        "reference_evidence lifetime follows CallSite identity, same as external_proofs"
+    );
+}
 }
