@@ -3681,6 +3681,11 @@ type TouchRiskResult = (
     Option<String>,
 );
 
+// 8 params: each is an independently meaningful input (conn, project_root,
+// path, ranges, coverage, risk_rules, proposed_hunks, policy) with no
+// natural sub-grouping that wouldn't be an arbitrary bundle just to satisfy
+// the lint -- see this function's own doc comment for what each is used for.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn compute_touch_risk(
     conn: &rusqlite::Connection,
     project_root: &std::path::Path,
@@ -3883,14 +3888,12 @@ pub(crate) fn compute_touch_risk(
     // signature-change escalation above already has), so this only ever
     // fires from edit_lines_impl_gated's real gate, which supplies real
     // hunks.
-    let touches_uncovered_code = !proposed_hunks.is_empty()
-        && coverage.source != "none"
-        && {
-            let abs_path = calm_core::analysis::coverage::normalize_path(&project_root.join(path));
-            proposed_hunks
-                .iter()
-                .any(|&(hs, he, _)| !coverage.is_covered(&abs_path, hs, he))
-        };
+    let touches_uncovered_code = !proposed_hunks.is_empty() && coverage.source != "none" && {
+        let abs_path = calm_core::analysis::coverage::normalize_path(&project_root.join(path));
+        proposed_hunks
+            .iter()
+            .any(|&(hs, he, _)| !coverage.is_covered(&abs_path, hs, he))
+    };
     let (risk, risk_rule_reason) = if touches_uncovered_code {
         let floor = policy.uncovered_code_floor.as_str();
         let floor_severity = risk_severity(floor);

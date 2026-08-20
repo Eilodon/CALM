@@ -2625,40 +2625,39 @@ mod tests {
         );
     }
 
-
-#[test]
-fn reference_evidence_is_keyed_by_call_site_and_deleted_with_it() {
-    let conn = Connection::open_in_memory().unwrap();
-    init_db(&conn).unwrap();
-    conn.execute(
-        "INSERT INTO call_sites
+    #[test]
+    fn reference_evidence_is_keyed_by_call_site_and_deleted_with_it() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO call_sites
             (from_path, enclosing_qn, callee_name, call_line, callee_start_byte,
              callee_end_byte, identity_version, edge_kind)
          VALUES ('main.rs', 'main.rs::main', 'target', 1, 0, 6, 2, 'call')",
-        [],
-    )
-    .unwrap();
-    let call_site_id = conn.last_insert_rowid();
-    conn.execute(
-        "INSERT INTO reference_evidence
+            [],
+        )
+        .unwrap();
+        let call_site_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO reference_evidence
             (call_site_id, to_symbol, provider, disposition, source_file_hash, callee_start_byte,
              callee_end_byte, provider_fingerprint, context_fingerprint, status, observed_at)
          VALUES (?1, 'lib.rs::target', 'scip:rust', 'supports', 'source-hash', 0, 6,
                  'binary-fingerprint', 'context-fingerprint', 'fresh', 1.0)",
-        [call_site_id],
-    )
-    .unwrap();
+            [call_site_id],
+        )
+        .unwrap();
 
-    conn.execute("DELETE FROM call_sites WHERE id = ?1", [call_site_id])
-        .unwrap();
-    let evidence: i64 = conn
-        .query_row("SELECT COUNT(*) FROM reference_evidence", [], |row| {
-            row.get(0)
-        })
-        .unwrap();
-    assert_eq!(
-        evidence, 0,
-        "reference_evidence lifetime follows CallSite identity, same as external_proofs"
-    );
-}
+        conn.execute("DELETE FROM call_sites WHERE id = ?1", [call_site_id])
+            .unwrap();
+        let evidence: i64 = conn
+            .query_row("SELECT COUNT(*) FROM reference_evidence", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            evidence, 0,
+            "reference_evidence lifetime follows CallSite identity, same as external_proofs"
+        );
+    }
 }

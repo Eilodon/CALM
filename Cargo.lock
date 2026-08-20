@@ -326,7 +326,7 @@ checksum = "8ae3f5d315924270530207e2a68396c3cc547f6dca3fbdca317cfb1a51edb593"
 
 [[package]]
 name = "calm-cli"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "calm-core",
@@ -347,7 +347,7 @@ dependencies = [
 
 [[package]]
 name = "calm-core"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "flate2",
@@ -413,7 +413,7 @@ dependencies = [
 
 [[package]]
 name = "calm-server"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "axum",

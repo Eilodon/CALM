@@ -1393,13 +1393,12 @@ mod tests {
         );
     }
 
-
-#[test]
-fn record_external_proof_for_edge_dual_writes_reference_evidence() {
-    let conn = Connection::open_in_memory().unwrap();
-    crate::db::schema::init_db(&conn).unwrap();
-    conn.execute_batch(
-        "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end)
+    #[test]
+    fn record_external_proof_for_edge_dual_writes_reference_evidence() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end)
          VALUES ('core/src/engine.rs::Engine::start', 'start', 'method', 'rust',
                  'core/src/engine.rs', 6, 8);
          INSERT INTO file_index (path, hash, language, symbol_count, last_indexed)
@@ -1408,56 +1407,56 @@ fn record_external_proof_for_edge_dual_writes_reference_evidence() {
             (from_path, enclosing_qn, callee_name, call_line, callee_start_byte,
              callee_end_byte, identity_version, edge_kind)
          VALUES ('app/src/main.rs', 'app/src/main.rs::main', 'start', 5, 4, 9, 2, 'call');",
-    )
-    .unwrap();
-    let call_site_id: i64 = conn
-        .query_row("SELECT id FROM call_sites", [], |row| row.get(0))
+        )
         .unwrap();
-    conn.execute(
-        "INSERT INTO call_edges
+        let call_site_id: i64 = conn
+            .query_row("SELECT id FROM call_sites", [], |row| row.get(0))
+            .unwrap();
+        conn.execute(
+            "INSERT INTO call_edges
             (from_symbol, to_symbol, call_site_line, call_site_id, edge_confidence,
              formal_source, from_path, to_path, edge_kind)
          VALUES ('app/src/main.rs::main', 'core/src/engine.rs::Engine::start', 5, ?1,
                  'formal', 'scip', 'app/src/main.rs', 'core/src/engine.rs', 'call')",
-        [call_site_id],
-    )
-    .unwrap();
-    let edge_id = conn.last_insert_rowid();
-
-    let context = super::ExternalProofContext::new("scip:test", "test-binary", "test-context");
-    super::record_external_proof_for_edge(&conn, &context, edge_id, "scip").unwrap();
-
-    let proof_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM external_proofs", [], |row| row.get(0))
-        .unwrap();
-    assert_eq!(proof_count, 1);
-
-    let (provider, disposition, authority_class, status): (String, String, String, String) = conn
-        .query_row(
-            "SELECT provider, disposition, authority_class, status FROM reference_evidence",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            [call_site_id],
         )
         .unwrap();
-    assert_eq!(provider, "scip:test");
-    assert_eq!(disposition, "supports");
-    assert_eq!(authority_class, "external_proof");
-    assert_eq!(status, "fresh");
+        let edge_id = conn.last_insert_rowid();
 
-    // Idempotent re-run (a repeat overlay pass) must not duplicate rows in
-    // either table -- same ON CONFLICT guarantee external_proofs already had.
-    super::record_external_proof_for_edge(&conn, &context, edge_id, "scip").unwrap();
-    let proof_count_again: i64 = conn
-        .query_row("SELECT COUNT(*) FROM external_proofs", [], |row| row.get(0))
-        .unwrap();
-    let evidence_count_again: i64 = conn
-        .query_row("SELECT COUNT(*) FROM reference_evidence", [], |row| {
-            row.get(0)
-        })
-        .unwrap();
-    assert_eq!(proof_count_again, 1);
-    assert_eq!(evidence_count_again, 1);
-}
+        let context = super::ExternalProofContext::new("scip:test", "test-binary", "test-context");
+        super::record_external_proof_for_edge(&conn, &context, edge_id, "scip").unwrap();
+
+        let proof_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM external_proofs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(proof_count, 1);
+
+        let (provider, disposition, authority_class, status): (String, String, String, String) =
+            conn.query_row(
+                "SELECT provider, disposition, authority_class, status FROM reference_evidence",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(provider, "scip:test");
+        assert_eq!(disposition, "supports");
+        assert_eq!(authority_class, "external_proof");
+        assert_eq!(status, "fresh");
+
+        // Idempotent re-run (a repeat overlay pass) must not duplicate rows in
+        // either table -- same ON CONFLICT guarantee external_proofs already had.
+        super::record_external_proof_for_edge(&conn, &context, edge_id, "scip").unwrap();
+        let proof_count_again: i64 = conn
+            .query_row("SELECT COUNT(*) FROM external_proofs", [], |row| row.get(0))
+            .unwrap();
+        let evidence_count_again: i64 = conn
+            .query_row("SELECT COUNT(*) FROM reference_evidence", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(proof_count_again, 1);
+        assert_eq!(evidence_count_again, 1);
+    }
 
     #[test]
     fn ambiguous_guessed_encoding_upgrades_neither_candidate() {
@@ -1793,7 +1792,6 @@ fn record_external_proof_for_edge_dual_writes_reference_evidence() {
         );
     }
 
-
     #[test]
     fn record_external_proof_exclusion_dual_writes_reference_evidence_excludes() {
         // Isolates record_external_proof_exclusion's own idempotency, same
@@ -1839,7 +1837,10 @@ fn record_external_proof_for_edge_dual_writes_reference_evidence() {
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM reference_evidence", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(count, 1, "a repeat exclusion write must not duplicate the row");
+        assert_eq!(
+            count, 1,
+            "a repeat exclusion write must not duplicate the row"
+        );
     }
 
     #[test]
@@ -1899,10 +1900,12 @@ fn record_external_proof_for_edge_dual_writes_reference_evidence() {
         ];
 
         let context = super::ExternalProofContext::new("scip:test", "test-binary", "test-context");
-        let stats =
-            super::ingest_occurrences_with_proof_context(&conn, &occ, true, Some(&context))
-                .unwrap();
-        assert_eq!(stats.inserted, 0, "must still not insert a competing formal edge");
+        let stats = super::ingest_occurrences_with_proof_context(&conn, &occ, true, Some(&context))
+            .unwrap();
+        assert_eq!(
+            stats.inserted, 0,
+            "must still not insert a competing formal edge"
+        );
 
         let (disposition, to_symbol): (String, String) = conn
             .query_row(
@@ -1917,7 +1920,6 @@ fn record_external_proof_for_edge_dual_writes_reference_evidence() {
             "reference_evidence must record the REJECTED scip target, not the static winner"
         );
     }
-
 
     #[test]
     fn recompute_reference_verdicts_matches_real_call_edges_for_a_supports_case() {
@@ -1969,9 +1971,8 @@ fn record_external_proof_for_edge_dual_writes_reference_evidence() {
         ];
 
         let context = super::ExternalProofContext::new("scip:test", "test-binary", "test-context");
-        let stats =
-            super::ingest_occurrences_with_proof_context(&conn, &occ, true, Some(&context))
-                .unwrap();
+        let stats = super::ingest_occurrences_with_proof_context(&conn, &occ, true, Some(&context))
+            .unwrap();
         assert_eq!(stats.inserted, 1);
 
         let (call_site_id, real_confidence, real_formal_source, real_evidence_state): (

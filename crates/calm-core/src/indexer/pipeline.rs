@@ -3403,8 +3403,8 @@ impl StructB {
         // one variable at a time) before this test was written, not
         // guessed. `test/utils.js` here deliberately mirrors the real
         // express corpus's own file almost verbatim.
-        let dir = std::env::temp_dir()
-            .join(format!("ci_idx_js_no_named_symbols_{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("ci_idx_js_no_named_symbols_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("lib")).unwrap();
         std::fs::create_dir_all(dir.join("test")).unwrap();
