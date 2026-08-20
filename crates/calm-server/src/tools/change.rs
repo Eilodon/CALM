@@ -657,11 +657,13 @@ impl CalmServer {
                                 let (_, _, _, sym_uncertain, _, _) =
                                     super::edit::compute_touch_risk(
                                         &conn,
+                                        &self.project_root,
                                         &t.path,
                                         &[(line_start, line_end)],
                                         &self.coverage.read_ok(),
                                         &self.config().risk_rules,
                                         &[],
+                                        &calm_core::policy::Policy::default(),
                                     );
                                 uncertain_zero_caller = sym_uncertain.is_some();
                             }

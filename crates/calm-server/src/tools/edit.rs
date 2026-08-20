@@ -1181,14 +1181,17 @@ impl CalmServer {
                 .map(|h| (h.start_line as i64, h.end_line as i64, h.new_text.as_str()))
                 .collect();
             let coverage = self.coverage.read_ok();
+            let policy = calm_core::policy::loader::load_policy_or_warn(&self.project_root);
             let (risk, hub_hit, hub_kind, uncertain_zero_caller, touched, risk_rule_reason) =
                 compute_touch_risk(
                     &conn,
+                    &self.project_root,
                     path,
                     &ranges,
                     &coverage,
                     &self.config().risk_rules,
                     &proposed_hunks,
+                    &policy,
                 );
             // Plan 3 §3.3 (F10): a bridge-only touch (never degree/both) at
             // risk ≤ medium MAY use the lighter CONFIRM_REQUIRED-only tier
@@ -2724,8 +2727,16 @@ impl CalmServer {
                 .map(|r| (r.start_line as i64, r.new_end_line as i64))
                 .collect();
             let coverage = self.coverage.read_ok();
-            let (_, _, _, _, touched, _) =
-                compute_touch_risk(&conn, path, &new_ranges, &coverage, &[], &[]);
+            let (_, _, _, _, touched, _) = compute_touch_risk(
+                &conn,
+                &self.project_root,
+                path,
+                &new_ranges,
+                &coverage,
+                &[],
+                &[],
+                &calm_core::policy::Policy::default(),
+            );
             touched
         };
 
@@ -3672,11 +3683,13 @@ type TouchRiskResult = (
 
 pub(crate) fn compute_touch_risk(
     conn: &rusqlite::Connection,
+    project_root: &std::path::Path,
     path: &str,
     ranges: &[(i64, i64)],
     coverage: &calm_core::analysis::coverage::CoverageData,
     risk_rules: &[calm_core::config::RiskRule],
     proposed_hunks: &[(i64, i64, &str)],
+    policy: &calm_core::policy::Policy,
 ) -> TouchRiskResult {
     let rows = symbols_overlapping_ranges(conn, path, ranges);
     let mut max_callers = 0i64;
@@ -3823,6 +3836,80 @@ pub(crate) fn compute_touch_risk(
             }
         }
     };
+
+    // Canonical PolicyDecision (roadmap item 3, 2026-08-20): fold in the
+    // same two configurable floors `policy::evaluate()` already applies to
+    // a ChangeIntent-backed RiskVector (`Policy::default()` sets both to
+    // `high` -- its own test calls this "the maximally conservative
+    // setting"). Before this, only the authority-spend/review_change
+    // RiskVector path (edit_lines_impl_gated's authority branch,
+    // review_change, mint_review_authority_for_edit_context) considered
+    // touches_manifest/touches_uncovered_code at all -- classify_gate's
+    // real-time gate, fed entirely by this function's `risk` return at
+    // BOTH edit_lines_impl_gated's real gate and edit_context's
+    // gate_prediction, was completely blind to them on the plain
+    // confirm/reason path (no change_id/authority_id supplied). Same
+    // severity-max escalation pattern as the risk_rules block above, so a
+    // project that configures a lower floor in .calm/policy.toml is
+    // honored here exactly like it already is by `evaluate()`.
+    let touches_manifest = calm_core::change::classify::is_manifest_path(path);
+    let (risk, risk_rule_reason) = if touches_manifest {
+        let floor = policy.manifest_floor.as_str();
+        let floor_severity = risk_severity(floor);
+        let current_severity = risk.as_deref().map(risk_severity).unwrap_or(0);
+        if floor_severity > current_severity {
+            (
+                Some(floor.to_string()),
+                Some(format!(
+                    "path {path:?} is a dependency manifest (floor: {floor}, \
+                     policy.manifest_floor)"
+                )),
+            )
+        } else {
+            (risk, risk_rule_reason)
+        }
+    } else {
+        (risk, risk_rule_reason)
+    };
+
+    // Mirrors `hunks_touch_uncovered_code`'s exact logic (coverage.source
+    // == "none" never elevates; a hunk range with no recorded coverage
+    // does) -- inlined rather than called directly because that helper
+    // takes `&[calm_core::edit::HunkRequest]`, not this function's
+    // `&[(i64, i64, &str)]` tuples, and converting would need an
+    // allocation per call for no real benefit. Empty at edit_context's
+    // pre-edit `gate_prediction` call (no proposed edit content exists yet
+    // to check coverage against -- the same structural limitation the
+    // signature-change escalation above already has), so this only ever
+    // fires from edit_lines_impl_gated's real gate, which supplies real
+    // hunks.
+    let touches_uncovered_code = !proposed_hunks.is_empty()
+        && coverage.source != "none"
+        && {
+            let abs_path = calm_core::analysis::coverage::normalize_path(&project_root.join(path));
+            proposed_hunks
+                .iter()
+                .any(|&(hs, he, _)| !coverage.is_covered(&abs_path, hs, he))
+        };
+    let (risk, risk_rule_reason) = if touches_uncovered_code {
+        let floor = policy.uncovered_code_floor.as_str();
+        let floor_severity = risk_severity(floor);
+        let current_severity = risk.as_deref().map(risk_severity).unwrap_or(0);
+        if floor_severity > current_severity {
+            (
+                Some(floor.to_string()),
+                Some(format!(
+                    "touched range has no recorded test coverage (floor: {floor}, \
+                     policy.uncovered_code_floor)"
+                )),
+            )
+        } else {
+            (risk, risk_rule_reason)
+        }
+    } else {
+        (risk, risk_rule_reason)
+    };
+
     (
         risk,
         hub_hit,

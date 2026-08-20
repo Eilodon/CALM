@@ -33,7 +33,20 @@ fn import_node_types(language: &str) -> &'static [&'static str] {
         // two extractions look for different shapes in the same nodes and
         // don't conflict (alias tracking wants a bare-identifier RHS,
         // `parse_js_require` wants a `require(...)` call RHS).
-        "javascript" | "typescript" => &["import_statement", "variable_declarator"],
+        // `export_statement` (added 2026-08-20, real gap found via B7's zod
+        // `prettifyError` miss): catches `export { a, b } from '...'` and
+        // `export * from '...'` re-exports -- previously invisible to
+        // `import_edges` entirely, for every JS/TS project, not just this
+        // one. Every OTHER export shape this node kind also matches
+        // (`export function f(){}`, `export const x = ...`, `export
+        // default ...`, a `from`-less `export { a };`) has no " from "
+        // clause at all, so `parse_js_export_from` correctly returns `None`
+        // for all of them -- see that function's own doc comment.
+        "javascript" | "typescript" => &[
+            "import_statement",
+            "variable_declarator",
+            "export_statement",
+        ],
         "java" => &["import_declaration"],
         // R has no import statement: `library(pkg)`/`require(pkg)` are ordinary
         // calls loading an installed CRAN package (never a repo file, so this
@@ -272,7 +285,83 @@ fn parse_go_import(text: &str) -> Option<ParsedImport> {
 }
 
 fn parse_js_import(text: &str) -> Option<ParsedImport> {
+    // `export`-shaped text (from the `export_statement` node kind added
+    // above) must go through `parse_js_export_from` ONLY -- never fall
+    // through to `parse_js_esm_import`/`parse_js_require`, which assume an
+    // `import`-shaped RHS and were never designed for export text. Found
+    // live, not guessed: a namespace re-export (`export * as ns from
+    // '...'`), which `parse_js_export_from` correctly refuses to parse
+    // (see its own doc comment), used to then fall through to
+    // `parse_js_esm_import`'s default-import fallback branch, which
+    // misparsed the literal word "export" out of "export * as ns" as if it
+    // were a bound identifier -- a real bug caught by
+    // `js_namespace_export_from_yields_no_import` before this guard
+    // existed, not shipped.
+    if text.trim_start().starts_with("export") {
+        return parse_js_export_from(text);
+    }
     parse_js_esm_import(text).or_else(|| parse_js_require(text))
+}
+
+/// `export { a, b as c } from '...'` (named re-export) and `export * from
+/// '...'` (wildcard re-export). Added 2026-08-20 alongside `export_statement`
+/// joining `import_node_types` above -- see that entry's comment for the
+/// real gap this closes (B7's zod `prettifyError` miss: a bare re-export
+/// statement was completely invisible to `import_edges`).
+///
+/// The wildcard branch deliberately reuses `imported_names: Vec::new()` --
+/// the SAME "no specific names" convention `parse_rust_import`'s `use
+/// super::*;` branch already established for `symbols_used = '[]'` (not a
+/// new sentinel), so `dependencies()`'s existing one-hop glob-chain SQL and
+/// `reference_impact`'s transitive-reexport walk both recognize a JS/TS
+/// wildcard re-export for free, no separate code path needed.
+///
+/// Two shapes explicitly NOT handled, by design, not oversight:
+/// - `export * as ns from '...'` (namespace re-export) -- consumers access
+///   `ns.symbol`, a different reference shape than the bare-identifier one
+///   this whole module models; would need its own resolution logic.
+/// - An `as`-aliased named re-export (`export { prettifyError as pretty }
+///   from '...'`) -- `bound_name` (reused below, same as every other `{...}`
+///   list in this file) resolves to the ALIAS ("pretty"), not the original
+///   name, so a chain that renames-via-alias won't be found searching for
+///   the original name. Fixing this needs `imported_names` to carry
+///   (original, alias) pairs instead of a bare name list -- a real, scoped-
+///   out follow-up, not attempted here; the common no-alias re-export case
+///   (zod's own real shape) is unaffected.
+///
+/// Every other `export` form this function's caller (`export_statement`)
+/// also matches -- `export function f(){}`, `export const x = ...`,
+/// `export default ...`, a `from`-less `export { a };` -- has no " from "
+/// clause at all, so this correctly returns `None` for all of them and
+/// `extract_imports_from_tree`'s caller just skips the node, same as any
+/// other non-import statement today.
+fn parse_js_export_from(text: &str) -> Option<ParsedImport> {
+    let rest = text.strip_prefix("export")?.trim_start();
+    let (clause, module) = rest.split_once(" from ")?;
+    let module = module
+        .trim()
+        .trim_matches(|c| c == '"' || c == '\'')
+        .to_string();
+    let clause = clause.trim();
+    if clause == "*" {
+        return Some(ParsedImport {
+            module_name: module,
+            imported_names: Vec::new(),
+        });
+    }
+    if clause.starts_with("* as ") {
+        return None;
+    }
+    let start = clause.find('{')?;
+    let end = clause.find('}')?;
+    let names = clause[start + 1..end]
+        .split(',')
+        .filter_map(bound_name)
+        .collect();
+    Some(ParsedImport {
+        module_name: module,
+        imported_names: names,
+    })
 }
 
 fn parse_js_esm_import(text: &str) -> Option<ParsedImport> {
@@ -601,6 +690,38 @@ mod tests {
         let i = one("import { a, b as c } from './mod';\n", "javascript");
         assert_eq!(i.module_name, "./mod");
         assert_eq!(i.imported_names, vec!["a", "c"]);
+    }
+
+    #[test]
+    fn js_named_export_from() {
+        let i = one(
+            "export { prettifyError, formatError } from '../core/index.js';\n",
+            "javascript",
+        );
+        assert_eq!(i.module_name, "../core/index.js");
+        assert_eq!(i.imported_names, vec!["prettifyError", "formatError"]);
+    }
+
+    #[test]
+    fn js_wildcard_export_from_yields_no_names() {
+        // Same "no specific names" convention as Rust's `use x::*` (see
+        // rust_use_group below) -- reused, not a new sentinel, so
+        // dependencies()'s existing glob-chain SQL and reference_impact's
+        // transitive walk both recognize it for free.
+        let i = one("export * from './errors.js';\n", "javascript");
+        assert_eq!(i.module_name, "./errors.js");
+        assert!(i.imported_names.is_empty());
+    }
+
+    #[test]
+    fn js_namespace_export_from_yields_no_import() {
+        // `export * as ns from '...'` -- deliberately unhandled (namespace
+        // re-export, a different reference shape: consumers access
+        // `ns.symbol`, not a bare identifier). Must NOT be misparsed as a
+        // wildcard (which would wrongly claim this file re-exports the
+        // bare name too).
+        let v = extract_imports("export * as core from './core.js';\n", "javascript");
+        assert!(v.is_empty(), "expected no import, got {v:?}");
     }
 
     #[test]

@@ -49,10 +49,34 @@ pub(super) fn build_resolution_context<'a>(
     // can tell whether a candidate's return type could possibly be
     // `Option`/`Result` — see `looks_option_or_result_chained`'s doc comment.
     let mut sig_by_qn: HashMap<String, String> = HashMap::new();
-    // path → language, one entry per indexed file (derived from that file's
-    // own symbols, so it's always populated for any path that could ever be
-    // a call site's `from_path` below).
+    // path → language, ONE ENTRY PER INDEXED FILE -- bugfix (found via B7's
+    // real express/test/utils.js miss): this used to be derived only from
+    // `symbols` (populated inside that table's own loop below), so a file
+    // with ZERO top-level named functions/classes anywhere in it -- the
+    // ordinary shape of a JS/TS test file written with `describe`/`it`/
+    // `test` nested-anonymous-callback style -- never got an entry at all.
+    // The same-language safety filter in `resolve_sites_to_edges`
+    // (`Some(candidate_lang) == ctx.path_lang.get(caller_path)`) then came
+    // out `Some(_) == None`, always false, silently emptying every outgoing
+    // candidate list for every call that file made -- not a resolution-
+    // confidence gap, a total blind spot, independent of call shape or
+    // nesting depth (root-caused live via 8 controlled repro fixtures).
+    // `file_index` already records `(path, language)` for every indexed
+    // file regardless of symbol count -- the exact same `language_for_
+    // extension(ext)` value `extract_file_data` itself was called with (see
+    // `driver.rs`'s `upsert_file_index` call sites) -- so it's the correct,
+    // already-existing source of truth, not a new concept.
     let mut path_lang: HashMap<String, String> = HashMap::new();
+    {
+        let mut stmt =
+            tx.prepare("SELECT path, language FROM file_index WHERE language IS NOT NULL")?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (path, language) in rows {
+            path_lang.insert(path, language);
+        }
+    }
     // qualified_name → (declared arity, is_variadic) -- Elixir/Go for now --
     // feeds the arity gate below (B3/A').
     let mut arity_by_qn: HashMap<String, (i64, bool)> = HashMap::new();
@@ -75,9 +99,6 @@ pub(super) fn build_resolution_context<'a>(
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         for (name, qn, path, cls, sig, language, arity, variadic) in rows {
-            path_lang
-                .entry(path.clone())
-                .or_insert_with(|| language.clone());
             by_name.entry(name.clone()).or_default().push((
                 qn.clone(),
                 path.clone(),

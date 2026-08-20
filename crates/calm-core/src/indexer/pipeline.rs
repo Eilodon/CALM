@@ -3378,6 +3378,83 @@ impl StructB {
     }
 
     #[test]
+    fn test_call_from_a_file_with_no_named_symbols_still_gets_a_call_edge() {
+        // Regression test for the real, reproducible gap found via a live
+        // follow-up investigation of the express test/utils.js miss above
+        // (see docs/plans/2026-08-20-product-uplift-and-b7v2-roadmap.md §8).
+        // `build_resolution_context`'s `path_lang` map used to be derived
+        // ONLY from the `symbols` table, so a file with ZERO top-level named
+        // functions/classes anywhere in it -- the ordinary shape of a JS/TS
+        // test file written in the standard `describe`/`it`/`test`
+        // nested-anonymous-callback style -- never got a `path_lang` entry
+        // at all. `resolve_sites_to_edges`'s same-language safety filter
+        // (`Some(candidate_lang) == ctx.path_lang.get(caller_path)`) then
+        // came out `Some(_) == None`, always false, silently emptying every
+        // outgoing candidate list for every call that file made --
+        // independent of confidence tier, call shape, or nesting depth (the
+        // test right above this one only ever exercised a file that DOES
+        // have a named function, so it could not catch this).
+        //
+        // Fixture: a real two-level Mocha `describe(){ it(){ ... } }` nest
+        // (no named function anywhere in the file) making a single bare,
+        // destructured-import call -- the simplest shape that exercises the
+        // bug, isolated live via 8 controlled repro fixtures (varying
+        // nesting depth, receiver shape, and same-file vs cross-file target
+        // one variable at a time) before this test was written, not
+        // guessed. `test/utils.js` here deliberately mirrors the real
+        // express corpus's own file almost verbatim.
+        let dir = std::env::temp_dir()
+            .join(format!("ci_idx_js_no_named_symbols_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("lib")).unwrap();
+        std::fs::create_dir_all(dir.join("test")).unwrap();
+        std::fs::write(
+            dir.join("lib/utils.js"),
+            "exports.setCharset = function setCharset(type, charset) {\n    return type;\n};\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("test/utils.js"),
+            "var { setCharset } = require('../lib/utils');\n\
+             describe('utils.setCharset', function () {\n  \
+             it('does a thing', function () {\n    \
+             setCharset('text/html', 'utf-8');\n  \
+             });\n\
+             });\n",
+        )
+        .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT to_symbol, edge_confidence FROM call_edges \
+                 WHERE from_path = 'test/utils.js' AND to_symbol LIKE '%setCharset'",
+            )
+            .unwrap();
+        let rows: Vec<(String, String)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+
+        assert_eq!(
+            rows,
+            vec![(
+                "lib/utils.js::setCharset".to_string(),
+                "resolved".to_string()
+            )],
+            "a call made only inside nested anonymous describe/it callbacks (no named \
+             function anywhere in the caller's own file) must still produce a real \
+             call_edges row, not silently zero: {rows:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     // P1.2 end-to-end DoD: all 4 steps together on one small PHP project —
     // require_once resolves its import_edge; a typed property's
     // `$this->helper->run()` resolves via tier-2 (confidence "inferred") to

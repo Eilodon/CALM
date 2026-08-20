@@ -7232,6 +7232,149 @@ mod tests {
     }
 
     #[test]
+    fn reference_impact_follows_a_two_hop_wildcard_reexport_chain() {
+        // Regression for the real zod `prettifyError` B7 miss (see
+        // docs/plans/2026-08-20-product-uplift-and-b7v2-roadmap.md §7.1):
+        // `external.js` re-exports the symbol BY NAME from `barrel.js`,
+        // which itself only re-exports it via a WILDCARD from `errors.js`
+        // (the actual definition) naming no symbols at all. A single-hop
+        // `WHERE to_path = ?1` query finds nothing for `external.js` (its
+        // own edge points at `barrel.js`, not `errors.js`) -- only a
+        // transitive walk through the wildcard hop finds it.
+        let dir = std::env::temp_dir().join(format!(
+            "ci_ref_impact_wildcard_chain_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("errors.js"),
+            "export function prettifyError() { return ''; }\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("barrel.js"), "export * from './errors.js';\n").unwrap();
+        std::fs::write(
+            dir.join("external.js"),
+            "export { prettifyError } from './barrel.js';\n",
+        )
+        .unwrap();
+
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('errors.js::prettifyError', 'prettifyError', 'function', 'javascript', 'errors.js', 1, 1, 'export function prettifyError() {', '', 'prettifyError', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+            // barrel.js: wildcard re-export -- same '[]' "no specific
+            // names" convention as Rust's `use x::*` glob.
+            conn.execute(
+                "INSERT INTO import_edges (from_path, to_path, module_name, symbols_used)
+                 VALUES ('barrel.js', 'errors.js', './errors.js', '[]')",
+                [],
+            )
+            .unwrap();
+            // external.js: named re-export FROM the barrel, not from
+            // errors.js directly -- the exact shape a single-hop query
+            // cannot see.
+            conn.execute(
+                "INSERT INTO import_edges (from_path, to_path, module_name, symbols_used)
+                 VALUES ('external.js', 'barrel.js', './barrel.js', '[\"prettifyError\"]')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let v = jv(
+            server.reference_impact(rmcp::handler::server::wrapper::Parameters(
+                ReferenceImpactParams {
+                    symbol: "prettifyError".into(),
+                    path: None,
+                    line: None,
+                },
+            )),
+        );
+
+        let refs = v["references"].as_array().unwrap();
+        assert!(
+            refs.iter().any(|r| r["path"] == "external.js"
+                && r["classification"] == "must_change"
+                && r["source"] == "import"),
+            "external.js re-exports prettifyError two hops away through a wildcard \
+             barrel -- must surface as must_change, not be invisible: {v}"
+        );
+        assert!(
+            !refs
+                .iter()
+                .any(|r| r["path"] == "barrel.js" && r["classification"] == "must_change"),
+            "barrel.js's own text never names prettifyError (pure wildcard) -- it must \
+             NOT be flagged must_change itself, only used as a pass-through hop: {v}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reference_impact_reexport_walk_is_immune_to_a_circular_chain() {
+        // A malformed/circular re-export chain (a.js wildcard-imports from
+        // b.js, b.js wildcard-imports back from a.js) must not hang or
+        // loop forever -- the BFS's visited-set + bounded-hops guard
+        // against exactly this.
+        let dir = std::env::temp_dir().join(format!("ci_ref_impact_cycle_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.js"), "export * from './b.js';\n").unwrap();
+        std::fs::write(
+            dir.join("b.js"),
+            "export * from './a.js';\nexport function target() { return 1; }\n",
+        )
+        .unwrap();
+
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('b.js::target', 'target', 'function', 'javascript', 'b.js', 2, 2, 'export function target() {', '', 'target', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO import_edges (from_path, to_path, module_name, symbols_used)
+                 VALUES ('a.js', 'b.js', './b.js', '[]')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO import_edges (from_path, to_path, module_name, symbols_used)
+                 VALUES ('b.js', 'a.js', './a.js', '[]')",
+                [],
+            )
+            .unwrap();
+        }
+
+        // Must return promptly (no infinite loop) -- the test itself
+        // timing out is the failure mode this guards against.
+        let v = jv(
+            server.reference_impact(rmcp::handler::server::wrapper::Parameters(
+                ReferenceImpactParams {
+                    symbol: "target".into(),
+                    path: None,
+                    line: None,
+                },
+            )),
+        );
+        assert_eq!(
+            v["qualified_name"], "b.js::target",
+            "the tool must still resolve and return normally despite the cycle: {v}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn reference_impact_counts_reflect_the_full_match_set_even_when_truncated() {
         // Regression: must_change_count/likely_change_count/review_count/
         // textual_only_count used to be computed AFTER
@@ -10350,8 +10493,16 @@ mod tests {
         // signature (`signature = ''` here still spans line_start=1 with 0
         // embedded newlines), and touching it would trip the separate
         // signature-escalation signal this test isn't exercising.
-        let (risk, _, _, _, _, reason) =
-            compute_touch_risk(&conn, "a.py", &[(2, 2)], &coverage, &[], &[]);
+        let (risk, _, _, _, _, reason) = compute_touch_risk(
+            &conn,
+            &dir,
+            "a.py",
+            &[(2, 2)],
+            &coverage,
+            &[],
+            &[],
+            &calm_core::policy::Policy::default(),
+        );
         assert_eq!(risk.as_deref(), Some("low"), "baseline structural risk");
         assert!(reason.is_none());
 
@@ -10361,8 +10512,16 @@ mod tests {
             glob: "a.py".to_string(),
             minimum: "high".to_string(),
         }];
-        let (risk, _, _, _, _, reason) =
-            compute_touch_risk(&conn, "a.py", &[(2, 2)], &coverage, &rules, &[]);
+        let (risk, _, _, _, _, reason) = compute_touch_risk(
+            &conn,
+            &dir,
+            "a.py",
+            &[(2, 2)],
+            &coverage,
+            &rules,
+            &[],
+            &calm_core::policy::Policy::default(),
+        );
         assert_eq!(risk.as_deref(), Some("high"));
         let reason = reason.expect("risk_rule_reason must be set when a rule raises the floor");
         assert!(
@@ -10392,8 +10551,16 @@ mod tests {
             glob: "a.py".to_string(),
             minimum: "low".to_string(),
         }];
-        let (risk, _, _, _, _, reason) =
-            compute_touch_risk(&conn, "a.py", &[(1, 2)], &coverage, &rules, &[]);
+        let (risk, _, _, _, _, reason) = compute_touch_risk(
+            &conn,
+            &dir,
+            "a.py",
+            &[(1, 2)],
+            &coverage,
+            &rules,
+            &[],
+            &calm_core::policy::Policy::default(),
+        );
         assert_eq!(
             risk.as_deref(),
             Some("high"),
@@ -10430,11 +10597,13 @@ mod tests {
         // escalate_risk_if_signature_changed uses.
         let (risk, _, _, _, _, reason) = compute_touch_risk(
             &conn,
+            &dir,
             "a.py",
             &[(1, 1)],
             &coverage,
             &[],
             &[(1, 1, "def helper(x):")],
+            &calm_core::policy::Policy::default(),
         );
         assert_eq!(
             risk.as_deref(),
@@ -10470,11 +10639,13 @@ mod tests {
         // even though its new text obviously differs from the old body.
         let (risk, _, _, _, _, reason) = compute_touch_risk(
             &conn,
+            &dir,
             "a.py",
             &[(2, 2)],
             &coverage,
             &[],
             &[(2, 2, "    return 2")],
+            &calm_core::policy::Policy::default(),
         );
         assert_eq!(
             risk.as_deref(),
@@ -10508,16 +10679,175 @@ mod tests {
         // that caller count already did).
         let (risk, _, _, _, _, reason) = compute_touch_risk(
             &conn,
+            &dir,
             "a.py",
             &[(1, 1)],
             &coverage,
             &[],
             &[(1, 1, "def hot(x):")],
+            &calm_core::policy::Policy::default(),
         );
         assert_eq!(risk.as_deref(), Some("high"));
         assert!(
             reason.is_none(),
             "no escalation happened (already high), so there's nothing to attribute: {reason:?}"
+        );
+    }
+
+    #[test]
+    fn compute_touch_risk_escalates_for_a_manifest_path() {
+        let (dir, server) = test_server("touch_risk_manifest_default_floor");
+        std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        let conn = server.make_read_conn().unwrap();
+        let coverage = calm_core::analysis::coverage::CoverageData::none();
+
+        // Cargo.toml has zero indexed symbols -- caller_count-based
+        // structural risk is `None`, so this isolates the manifest-floor
+        // escalation as the ONLY signal at play.
+        let (risk, _, _, _, _, reason) = compute_touch_risk(
+            &conn,
+            &dir,
+            "Cargo.toml",
+            &[(1, 1)],
+            &coverage,
+            &[],
+            &[],
+            &calm_core::policy::Policy::default(),
+        );
+        assert_eq!(
+            risk.as_deref(),
+            Some("high"),
+            "Policy::default's manifest_floor is high -- a manifest edit must escalate even \
+             with zero touched symbols"
+        );
+        let reason = reason.expect("manifest escalation must carry a reason");
+        assert!(
+            reason.contains("Cargo.toml") && reason.contains("manifest"),
+            "reason should name the manifest path, got: {reason}"
+        );
+    }
+
+    #[test]
+    fn compute_touch_risk_manifest_floor_honors_project_policy_config() {
+        let (dir, server) = test_server("touch_risk_manifest_configured_floor");
+        std::fs::write(dir.join("package.json"), "{}\n").unwrap();
+        let conn = server.make_read_conn().unwrap();
+        let coverage = calm_core::analysis::coverage::CoverageData::none();
+        let lenient = calm_core::policy::Policy {
+            manifest_floor: calm_core::policy::RiskLevel::Medium,
+            ..calm_core::policy::Policy::default()
+        };
+
+        // Proves this escalation reads `policy.manifest_floor` rather than
+        // hardcoding "high" -- a project that configures a lower floor in
+        // .calm/policy.toml must see that floor honored here exactly like
+        // `policy::evaluate()` already does for a ChangeIntent-backed
+        // RiskVector.
+        let (risk, _, _, _, _, _) = compute_touch_risk(
+            &conn,
+            &dir,
+            "package.json",
+            &[(1, 1)],
+            &coverage,
+            &[],
+            &[],
+            &lenient,
+        );
+        assert_eq!(
+            risk.as_deref(),
+            Some("medium"),
+            "a project that configures manifest_floor=medium must see medium, not the \
+             default high"
+        );
+    }
+
+    #[test]
+    fn compute_touch_risk_escalates_for_uncovered_code_when_hunks_are_proposed() {
+        let (dir, server) = test_server("touch_risk_uncovered_code_escalate");
+        std::fs::write(dir.join("a.py"), "def helper():\n    return 1\n").unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.py::helper', 'helper', 'function', 'python', 'a.py', 1, 2, '', '', 'helper', 2, 0, 0)",
+                [],
+            )
+            .unwrap();
+        }
+        let conn = server.make_read_conn().unwrap();
+        let abs = calm_core::analysis::coverage::normalize_path(&dir.join("a.py"));
+        let mut covered_lines = std::collections::HashMap::new();
+        // Line 1 (the signature) is covered; line 2 (the body, what this
+        // edit touches) has no recorded coverage at all.
+        covered_lines.insert(abs, std::collections::HashSet::from([1]));
+        let coverage = calm_core::analysis::coverage::CoverageData {
+            source: "lcov".to_string(),
+            covered_lines,
+        };
+
+        let (risk, _, _, _, _, reason) = compute_touch_risk(
+            &conn,
+            &dir,
+            "a.py",
+            &[(2, 2)],
+            &coverage,
+            &[],
+            &[(2, 2, "    return 2")],
+            &calm_core::policy::Policy::default(),
+        );
+        assert_eq!(
+            risk.as_deref(),
+            Some("high"),
+            "a proposed hunk touching a range with no recorded coverage must escalate to \
+             Policy::default's uncovered_code_floor (high), even though caller_count=2 alone \
+             is structurally only \"low\""
+        );
+        let reason = reason.expect("uncovered-code escalation must carry a reason");
+        assert!(
+            reason.contains("test coverage"),
+            "reason should explain the uncovered-coverage escalation, got: {reason}"
+        );
+    }
+
+    #[test]
+    fn compute_touch_risk_uncovered_code_never_fires_with_no_proposed_hunks() {
+        let (dir, server) = test_server("touch_risk_uncovered_code_needs_hunks");
+        std::fs::write(dir.join("a.py"), "def helper():\n    return 1\n").unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.py::helper', 'helper', 'function', 'python', 'a.py', 1, 2, '', '', 'helper', 2, 0, 0)",
+                [],
+            )
+            .unwrap();
+        }
+        let conn = server.make_read_conn().unwrap();
+        let coverage = calm_core::analysis::coverage::CoverageData {
+            source: "lcov".to_string(),
+            covered_lines: std::collections::HashMap::new(),
+        };
+
+        // Same file, same uncovered range, but NO proposed_hunks -- this is
+        // exactly edit_context's pre-edit gate_prediction shape (no
+        // proposed edit content exists yet to check coverage against).
+        // Must not escalate, the same structural limitation the
+        // signature-change escalation already has.
+        let (risk, _, _, _, _, _) = compute_touch_risk(
+            &conn,
+            &dir,
+            "a.py",
+            &[(2, 2)],
+            &coverage,
+            &[],
+            &[],
+            &calm_core::policy::Policy::default(),
+        );
+        assert_eq!(
+            risk.as_deref(),
+            Some("low"),
+            "uncovered-code escalation must not fire when there are no proposed_hunks to \
+             check coverage against, matching edit_context's gate_prediction limitation"
         );
     }
 

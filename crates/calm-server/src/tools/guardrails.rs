@@ -320,6 +320,7 @@ impl CalmServer {
             // (closes F2b, not just F2). Single source of truth with the
             // real gate -- see classify_gate's doc comment.
             let gate_prediction = {
+                let gate_policy = calm_core::policy::loader::load_policy_or_warn(&self.project_root);
                 let (
                     gate_risk,
                     gate_hub_hit,
@@ -329,6 +330,7 @@ impl CalmServer {
                     gate_risk_rule_reason,
                 ) = edit::compute_touch_risk(
                     &conn,
+                    &self.project_root,
                     &c.path,
                     &[(c.line_start, c.line_end)],
                     &self.coverage.read_ok(),
@@ -339,6 +341,7 @@ impl CalmServer {
                     // signature against. edit_lines_impl_gated's own real
                     // gate call supplies real hunks once an edit is proposed.
                     &[],
+                    &gate_policy,
                 );
                 // Mirrors edit_lines_impl_gated's own bridge-downgrade
                 // eligibility check exactly (edit.rs) -- computed here too,

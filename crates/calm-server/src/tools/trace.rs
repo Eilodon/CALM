@@ -776,45 +776,94 @@ impl CalmServer {
                 });
             }
 
-            // 2. Import edges directly naming this symbol -- catches a bare
-            // re-export/import that never becomes a call edge. This is the
-            // exact gap behind two real benchmarks/b7_task_correctness
-            // misses (rename_express_set_charset, rename_zod_prettify_error
-            // -- both miss a bare re-export statement; see
-            // KNOWN_LIMITATIONS.md "No unified reference-impact tool").
+            // 2. Import edges directly OR TRANSITIVELY (through a chain of
+            // wildcard `export * from`/`use x::*` re-exports) naming this
+            // symbol -- catches a bare re-export/import that never becomes
+            // a call edge. This was the exact gap behind two real
+            // benchmarks/b7_task_correctness misses
+            // (rename_express_set_charset, rename_zod_prettify_error --
+            // both miss a bare re-export statement). Express's half closed
+            // separately (a `path_lang` bug in the call-graph resolver, not
+            // this tool -- see docs/plans/2026-08-20-product-uplift-and-
+            // b7v2-roadmap.md §9); THIS transitive walk closes zod's half:
+            // its real miss is a two-hop barrel chain (`export
+            // {prettifyError} from core/index.js`, which itself only
+            // re-exports it via a wildcard `export * from errors.js` naming
+            // no symbols at all) -- a single-hop query here found nothing
+            // because the direct edge from `external.ts` points at the
+            // barrel file, not at `errors.ts` where the symbol is actually
+            // defined (full trace: that doc's §7.1/§6.1).
+            //
+            // BFS outward from the definition's own file: at each hop, a
+            // direct-name hit (the symbol literally named in that file's
+            // own re-export text) is a `must_change` result AND a new
+            // frontier node (it could itself be re-exported further up
+            // under the same name); a wildcard hit (`symbols_used = '[]'`
+            // -- the SAME "no specific names" convention
+            // `parse_rust_import`'s `use x::*` branch already established,
+            // reused here rather than inventing a new sentinel) is NOT
+            // itself a hit (nothing in that file's own text names the
+            // symbol) but DOES continue the search, since a file further up
+            // the chain might import it BY name through this wildcard hop.
+            // Bounded depth + a visited set guard a circular-reexport chain
+            // from looping forever -- real barrel chains are shallow (zod's
+            // own real case is 2 hops), so
+            // `REFERENCE_IMPACT_MAX_REEXPORT_HOPS` is generous headroom,
+            // not a real limit in practice.
+            //
+            // Known gap NOT covered here (see `parse_js_export_from`'s own
+            // doc comment in indexer/imports.rs): an `as`-aliased re-export
+            // changes the bound name at that hop (`imported_names` stores
+            // the alias, not the original), so a chain that renames-via-
+            // alias partway through won't be found searching for the
+            // original name. zod's own real chain has no aliasing, so this
+            // doesn't affect that case.
             {
-                let mut stmt = match conn
-                    .prepare("SELECT from_path, symbols_used FROM import_edges WHERE to_path = ?1")
-                {
-                    Ok(s) => s,
-                    Err(e) => return db_error_resolved(e),
-                };
-                let rows: Vec<(String, String)> = match stmt
-                    .query_map(rusqlite::params![c.path], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                    }) {
-                    Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
-                    Err(e) => return db_error_resolved(e),
-                };
-                for (from_path, symbols_used_raw) in rows {
-                    if from_path == c.path {
-                        continue;
+                let mut frontier: Vec<String> = vec![c.path.clone()];
+                let mut visited: std::collections::HashSet<String> =
+                    std::collections::HashSet::from([c.path.clone()]);
+                for _ in 0..REFERENCE_IMPACT_MAX_REEXPORT_HOPS {
+                    if frontier.is_empty() {
+                        break;
                     }
-                    let names = parse_symbols_used(&symbols_used_raw);
-                    if !names.iter().any(|n| n == &c.name) {
-                        continue;
+                    let mut next_frontier: Vec<String> = Vec::new();
+                    for target_path in &frontier {
+                        let mut stmt = match conn.prepare(
+                            "SELECT from_path, symbols_used FROM import_edges WHERE to_path = ?1",
+                        ) {
+                            Ok(s) => s,
+                            Err(e) => return db_error_resolved(e),
+                        };
+                        let rows: Vec<(String, String)> = match stmt
+                            .query_map(rusqlite::params![target_path], |row| {
+                                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                            }) {
+                            Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+                            Err(e) => return db_error_resolved(e),
+                        };
+                        for (from_path, symbols_used_raw) in rows {
+                            if !visited.insert(from_path.clone()) {
+                                continue;
+                            }
+                            let names = parse_symbols_used(&symbols_used_raw);
+                            if names.iter().any(|n| n == &c.name) {
+                                if seen.insert((from_path.clone(), None)) {
+                                    hits.push(ReferenceHit {
+                                        path: from_path.clone(),
+                                        line: None,
+                                        classification: "must_change".to_string(),
+                                        source: "import".to_string(),
+                                        confidence: None,
+                                        snippet: None,
+                                    });
+                                }
+                                next_frontier.push(from_path);
+                            } else if names.is_empty() {
+                                next_frontier.push(from_path);
+                            }
+                        }
                     }
-                    if !seen.insert((from_path.clone(), None)) {
-                        continue;
-                    }
-                    hits.push(ReferenceHit {
-                        path: from_path,
-                        line: None,
-                        classification: "must_change".to_string(),
-                        source: "import".to_string(),
-                        confidence: None,
-                        snippet: None,
-                    });
+                    frontier = next_frontier;
                 }
             }
 
@@ -1298,6 +1347,12 @@ pub(crate) struct CalleesOutput {
 /// feeding it) -- same rationale as `callers.direct_list_cap`: a real hub
 /// symbol can have far more usages than are useful to dump in one response.
 const REFERENCE_IMPACT_LIMIT: usize = 200;
+
+/// Max BFS depth for `reference_impact`'s transitive re-export walk (2. Import
+/// edges, above) -- generous headroom against a circular re-export chain,
+/// not a real limit: a genuine barrel-file chain runs 2-3 hops deep in
+/// practice (zod's own real case, the one this constant exists for, is 2).
+const REFERENCE_IMPACT_MAX_REEXPORT_HOPS: usize = 8;
 
 #[derive(Deserialize, JsonSchema)]
 #[allow(dead_code)]

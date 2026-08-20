@@ -298,6 +298,125 @@ which is not committed and safe to delete between runs.
 
 ## Next steps
 
+## v2 (2026-08-20): a third `calm_v2` arm, and why it did NOT close the gap
+
+## Update (same day): Express's real bug found and FIXED — `path_lang` gap in `context.rs`
+
+## Update (same day): Zod's real bug found and FIXED too — transitive re-export walk
+
+Per an explicit follow-up ask, the zod gap (§7.1/§6.1's "materially bigger feature") was fixed in
+the same session. Two changes: (1) `crates/calm-core/src/indexer/imports.rs` now walks
+`export_statement` for JS/TS and parses `export {...} from '...'` / `export * from '...'` into
+`import_edges` (previously zero export syntax was ever indexed, for any JS/TS project); (2)
+`reference_impact`'s import-edge lookup (`crates/calm-server/src/tools/trace.rs`) is now a bounded
+BFS through wildcard re-export chains instead of a single-hop query, closing zod's actual two-hop
+barrel-file case. Full detail, including a real fallback-chain bug caught and fixed before it
+shipped: `docs/plans/2026-08-20-product-uplift-and-b7v2-roadmap.md` §10.
+
+`cargo test --workspace --release`: 0 failed. Re-ran all 6 B7 tasks end-to-end:
+
+| task | calm_v2, before | calm_v2, after |
+|---|---|---|
+| rename_zod_prettify_error | 0.5/False | **1.0/True** |
+| the other 5 tasks (incl. express) | 1.0/True | 1.0/True (unchanged) |
+
+**B7 now passes 6/6 via the `calm_v2` arm.** `calm` v1 stays at 0.5/False for zod by design (v1
+never calls `reference_impact`, the tool this fix lives in). Not covered, documented as a known
+scoped-out gap: `export * as ns from` namespace re-exports, and an `as`-aliased re-export changing
+the name partway through a chain.
+
+The deeper audit above (triggered by a user follow-up: "is there truly no way to fix this?") found
+that the actual root cause was neither `reference_impact`'s coverage nor the parser — it was
+`build_resolution_context`'s `path_lang` map being derived only from the `symbols` table, so a
+file with zero top-level named declarations anywhere (any Mocha/Jest/Vitest-style `describe`/`it`/
+`test` file, including the real `test/utils.js`) never got a language entry, causing
+`resolve_sites_to_edges`'s same-language safety filter to empty out every outgoing call that file
+made — regardless of confidence tier. Full root-cause trace: `docs/plans/2026-08-20-product-uplift-
+and-b7v2-roadmap.md` §8.
+
+**Fixed** in `crates/calm-core/src/indexer/pipeline/context.rs` (`path_lang` now seeded from
+`file_index`, which already tracks every indexed file's language regardless of symbol count) —
+same doc's §9 has the full verification chain. Re-ran all 6 B7 tasks end-to-end against the fixed
+binary:
+
+| task | calm / calm_v2, before | calm / calm_v2, after |
+|---|---|---|
+| rename_express_set_charset | 0.667/False · 0.667/False | **1.0/True · 1.0/True** |
+| rename_zod_prettify_error | 0.5/False · 0.5/False | 0.5/False · 0.5/False (unchanged — separate bug, §7.1) |
+| the other 4 tasks | 1.0/True | 1.0/True (unchanged, no regression) |
+
+`cargo test --workspace --release`: 0 failed. New permanent regression test:
+`test_call_from_a_file_with_no_named_symbols_still_gets_a_call_edge` in
+`crates/calm-core/src/indexer/pipeline.rs`. Fix is currently uncommitted, pending the user's
+go-ahead to commit/push.
+
+Full rationale and audit trail: `docs/plans/2026-08-20-product-uplift-and-b7v2-roadmap.md`.
+
+A third arm, `calm_v2`, was added (`run_calm_arm_v2` in `run_benchmark.py`, alongside `naive`/
+`calm` — `calm` v1 kept unchanged for comparison). It supplements `edit_context`'s `callers()`
+with `reference_impact`'s `must_change`/`likely_change` hits, on the hypothesis (from
+`reference_impact`'s own source comment, `crates/calm-server/src/tools/trace.rs:780-784`, which
+names both tasks below) that this tool — built specifically to close this benchmark's own
+documented gap — would fix Express and Zod.
+
+**Result: it did not.** Both tasks scored identically to v1:
+
+| task | v1 (`calm`) recall/build | v2 (`calm_v2`) recall/build |
+|---|---|---|
+| rename_express_set_charset | 0.667 / False | 0.667 / False |
+| rename_zod_prettify_error | 0.5 / False | 0.5 / False |
+
+The other four tasks (fd, flask, gin, spring-petclinic) stayed at 1.0/True in `calm_v2` too — no
+regression from the wider `reference_impact` surface.
+
+**Root-caused, not assumed:**
+
+- **Zod**: `reference_impact` returned `must_change_count: 0` for `prettifyError`. Both missing
+  files re-export it via `export { …, prettifyError, … } from "../core/index.js";`. Traced to
+  `crates/calm-core/src/indexer/imports.rs::import_node_types`, which for `"javascript" |
+  "typescript"` only walks `["import_statement", "variable_declarator"]` — **`export_statement` is
+  never walked at all**, so no `import_edges` row is ever created for a re-export, for any JS/TS
+  project. This is a real, previously-undocumented gap in the import extraction, not something
+  `reference_impact`'s existing import-edge tier can see. (The two real `z.prettifyError(...)` call
+  sites did get a call_edge, but at `"ambiguous"` confidence, correctly bucketed as `review` —
+  `edit_context.callers()` already covered those, so this was never where the miss came from.)
+- **Express**: `reference_impact` produced 0 `review` hits and 7 `textual_only` hits for
+  `setCharset` — `test/utils.js`'s `utils.setCharset(...)` (property access on a bare
+  `require('../lib/utils')`) still produces no call_edge at all. Confirms this is exactly the
+  pre-existing `parser.rs` call-site-extraction gap already named in this section's own "Next
+  steps" above — orthogonal to what an import/export-edge fix could address.
+
+**Correction to `reference_impact`'s own source comment**: its claim to catch "the exact gap
+behind" both tasks holds for a plain-`import`-side reference, but not for Zod's actual `export {
+X } from 'y'` re-export shape, and not for Express's case at all (a different bug class — call-site
+extraction, not import/export tracking). Worth narrowing that comment once the `export_statement`
+gap below is fixed.
+
+**Follow-up, not done in this pass — revised after a deeper audit** (full detail:
+`docs/plans/2026-08-20-product-uplift-and-b7v2-roadmap.md` §6-§7): walking `export_statement` in
+`import_node_types`/`extract_imports_from_tree` is real and necessary, but **not sufficient on its
+own** for Zod — its actual re-export is a two-hop barrel chain (`external.ts` names `prettifyError`
+re-exporting from `core/index.ts`, which itself re-exports `errors.ts` via a *wildcard*
+`export * from './errors.js'` naming no symbols at all). A single-hop `import_edges` fix would
+point `external.ts` at `core/index.ts`, not at `errors.ts` where the symbol is actually defined —
+`reference_impact`'s direct `to_path` lookup still wouldn't find it. Closing this needs transitive
+import-edge resolution through wildcard re-export chains, not a single-function patch — re-run
+`rename_zod_prettify_error` after landing whichever shape of fix to confirm empirically, not
+assume (this file's own history is a live example of why: the original `reference_impact` source
+comment claimed to close this gap and, empirically re-run here, did not). Express's gap needs a
+separate `parser.rs` call-site-extraction fix (property-access call through a required module's
+bare identifier), already scoped above — unaffected by anything import/export-related.
+
+Also independently re-verified this session (adversarial self-audit, not just re-reading the
+numbers): both failures reproduce identically outside the benchmark harness (`npm test` /
+`pnpm test` run directly against the renamed corpus copies — same `TypeError`/`TypeCheckError` as
+above); both symbols are collision-free and false-positive-free in the pinned corpora (manual grep
+matches `oracle_callsite_files` exactly for both); and naive's "1.0 recall" on every task is close
+to tautological by construction (`run_naive_arm`'s file-selection regex and `oracle.py`'s
+ground-truth regex are near-identical) — the informative, independent signal is `build_pass` on
+both arms, which is real compiler/test ground truth and was the first thing re-verified. See the
+roadmap doc's §7 for the full adversarial audit trail.
+
 1. Investigate the express `setCharset` call-graph gap directly in
    `parser.rs`'s JS/TS call-site extraction (property-access call through a
    required module's bare identifier vs. a destructured bare-name call to

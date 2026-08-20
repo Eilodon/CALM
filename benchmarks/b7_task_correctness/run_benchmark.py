@@ -183,6 +183,74 @@ def run_calm_arm(corpus: Path, task: dict, real_repo_root: Path, lang: str) -> d
     finally:
         client.close()
 
+def run_calm_arm_v2(corpus: Path, task: dict, real_repo_root: Path, lang: str) -> dict:
+    """CALM-scripted, v2 -- docs/plans/2026-08-20-product-uplift-and-b7v2-roadmap.md
+    Phase 0 item 1. Same as run_calm_arm above, but supplements edit_context's
+    `callers()` with `reference_impact`'s must_change/likely_change hits.
+    `reference_impact` was purpose-built (landed 2026-08-04, commit 60ff9c9 --
+    AFTER this file's Phase-2 results were last recorded, 2026-07-30) to close
+    exactly the two gaps this benchmark's own README documents in its Phase 2
+    section: a bare re-export/import edge that never becomes a call edge
+    (zod's `prettifyError`), and (empirically checked here, not assumed) a
+    property-access call through a required module's bare identifier
+    (express's `setCharset`) -- see that function's own doc comment in
+    crates/calm-server/src/tools/trace.rs, which names both tasks by id.
+
+    `review`/`textual_only` hits are counted but deliberately NOT
+    auto-renamed -- same caution AGENTS.md's documented workflow already
+    recommends (a textual-only match can be an unrelated same-named symbol;
+    see this README's own `slugify` 3-way-collision finding). A real agent
+    would surface those counts and decide, not silently skip or silently
+    rename them; this arm reports them in the result row instead of hiding
+    the number, matching this repo's stated benchmark policy of not hiding
+    an inconvenient measurement."""
+    client = MCPClient(project_root=str(corpus), repo_root=str(real_repo_root))
+    tool_calls = 0
+    try:
+        client.wait_until_indexed()
+        provider = _SCIP_PROVIDER_BY_LANG.get(lang, lang)
+        try:
+            client.call_tool("scip_refresh", {"lang": provider})
+        except Exception:  # noqa: BLE001 -- best-effort, matches B12's posture
+            pass
+        raw = client.call_tool("edit_context", {"symbol": task["symbol"]})
+        tool_calls += 1
+        ctx = json.loads(raw)
+        touch_files = set()
+        for c in ctx.get("callers", []):
+            sym = c.get("symbol", "")
+            if "::" in sym:
+                touch_files.add(sym.split("::", 1)[0])
+        touch_files.add(task["def_path"])
+
+        ri_raw = client.call_tool("reference_impact", {"symbol": task["symbol"]})
+        tool_calls += 1
+        ri = json.loads(ri_raw)
+        review_hits = 0
+        textual_only_hits = 0
+        for hit in ri.get("references", []):
+            cls = hit.get("classification")
+            if cls in ("must_change", "likely_change"):
+                touch_files.add(hit["path"])
+            elif cls == "review":
+                review_hits += 1
+            elif cls == "textual_only":
+                textual_only_hits += 1
+
+        edited = [f for f in sorted(touch_files) if apply_rename_at(corpus, f, task["symbol"], task["new_name"])]
+        tool_calls += len(touch_files)
+        client.call_tool("diff_impact", {})  # mandatory post-edit verification, AGENTS.md Stage 7
+        tool_calls += 1
+        return {
+            "arm": "calm_v2", "files_touched": sorted(edited),
+            "calm_reported_touch_files": sorted(touch_files), "tool_calls": tool_calls,
+            "reference_impact_review_count": review_hits,
+            "reference_impact_textual_only_count": textual_only_hits,
+        }
+    finally:
+        client.close()
+
+
 
 def score_arm(oracle_files: set[str], result: dict) -> dict:
     touched = set(result["files_touched"])
@@ -245,10 +313,19 @@ def main() -> int:
         calm_result["output_tail"] = calm_bt.output[-1500:]
         row["calm"] = score_arm(oracle_files, calm_result)
 
+        print(f"[b7]   calm_v2 arm (edit_context + reference_impact) ...", file=sys.stderr)
+        calm_v2_corpus = fresh_clone(lang, "calm-v2")
+        calm_v2_result = run_calm_arm_v2(calm_v2_corpus, task, real_repo_root, lang)
+        calm_v2_bt = build_test_gate(calm_v2_corpus, task.get("build_cmd"), task["test_cmd"])
+        calm_v2_result["build_pass"] = calm_v2_bt.passed
+        calm_v2_result["output_tail"] = calm_v2_bt.output[-1500:]
+        row["calm_v2"] = score_arm(oracle_files, calm_v2_result)
+
         rows.append(row)
 
     summary = {
-        "phase": "B7 Phase 1-3 (fd/Rust, flask/Python, express/JS, zod/TS, gin/Go, spring-petclinic/Java)",
+        "phase": "B7 Phase 1-3 (fd/Rust, flask/Python, express/JS, zod/TS, gin/Go, spring-petclinic/Java)"
+                 " + v2 (2026-08-20 roadmap doc, calm_v2 = edit_context + reference_impact)",
         "methodology": "deterministic oracle only (build/test pass + independent "
                         "callsite recall via B12's ground_truth, extension-filtered) "
                         "-- no LLM judge, per design spec constraint",
@@ -258,14 +335,14 @@ def main() -> int:
     out_path.write_text(json.dumps(summary, indent=2))
 
     print()
-    print("| task | baseline | naive build_pass | naive recall | calm build_pass | calm recall |")
-    print("|---|---|---|---|---|---|")
+    print("| task | baseline | naive build_pass | naive recall | calm build_pass | calm recall | calm_v2 build_pass | calm_v2 recall |")
+    print("|---|---|---|---|---|---|---|---|")
     for row in rows:
         if "skipped_reason" in row:
-            print(f"| {row['id']} | SKIPPED | - | - | - | - | ({row['skipped_reason']}) |")
+            print(f"| {row['id']} | SKIPPED | - | - | - | - | - | - | ({row['skipped_reason']}) |")
             continue
-        n, c = row["naive"], row["calm"]
-        print(f"| {row['id']} | green | {n['build_pass']} | {n['recall']} | {c['build_pass']} | {c['recall']} |")
+        n, c, v2 = row["naive"], row["calm"], row["calm_v2"]
+        print(f"| {row['id']} | green | {n['build_pass']} | {n['recall']} | {c['build_pass']} | {c['recall']} | {v2['build_pass']} | {v2['recall']} |")
     print(f"\nfull results written to {out_path}")
     return 0
 
