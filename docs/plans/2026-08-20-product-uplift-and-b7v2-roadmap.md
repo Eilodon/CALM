@@ -633,4 +633,128 @@ inputs, and touches the CCK-tagged authority system directly. Not attempted here
 fix closes the one concrete, demonstrated failure scenario (manifest/uncovered-code edits sailing
 through ungated) without that larger blast radius.
 
-Uncommitted, same as §9/§10, awaiting the user's go-ahead to commit/push.
+§9-§14 (Express fix, Zod fix, canonical PolicyDecision) were committed and pushed later the same
+session: `7d209a6` (the 3 fixes) and `47f5489` (PR#10 slice 1, the user's own pre-existing
+in-progress work, committed separately once reviewed — see §15 below for what came after).
+
+---
+
+# Execution record — roadmap item 2: PR#10 slice 2 (evidence ledger, read-only)
+
+## §15. Scope and corrected findings
+
+After §9-§14 shipped, the user asked what to do next; offered a menu, chose to resume PR#10 (the
+evidence-ledger item). Per this session's own "audit before trusting" discipline, the previous
+session's "3 provider writers" framing (`docs/plans/2026-08-19-evidence-architecture-execution-plan.md`,
+carried into memory) was re-verified against live code with two parallel Explore agents before any
+design work, rather than trusted as-is — and turned out to be inaccurate:
+
+- **Real production `call_edges` mutators**: `indexer/edges.rs::insert_call_edges_batch` (1 INSERT,
+  always inside `rebuild_graph`/`incremental_graph_update`'s DELETE-then-reinsert — its own schema
+  comment already calls this tier "already a projection rather than a provider"),
+  `scip/ingest.rs::insert_missing_exact_edges` (1 INSERT, gated by a conflict check) + 2 UPDATEs, and
+  `lsp/overlay.rs` (**0** INSERTs, 3 UPDATEs only — it only ever upgrades/downgrades pre-existing
+  rows). The earlier "7 SCIP inserts / 5 LSP inserts" counts were mostly `#[cfg(test)]` fixtures the
+  original grep didn't filter out.
+- **`golden_graph_equivalence.rs`'s fingerprint is byte-for-byte strict**: its `EdgeKey` covers
+  `from_symbol, to_symbol, call_site_line, edge_confidence, edge_kind, from_path, to_path,
+  formal_source, evidence_state, ruled_out_by_scip` — not just `from_symbol`/`to_symbol` — plus
+  joined `call_sites`/`external_proofs` identity. `evidence_state` is write-only in every other
+  production code path (no MCP tool reads it) but IS read by this test, so any future
+  writer-cutover work must reproduce it exactly, not just approximately.
+- **No existing "materialize evidence into a derived table" precedent anywhere in the codebase.**
+  Both `evidence_conflicts` (PR#4) and `reference_evidence` (this session's earlier slice 1,
+  `47f5489`) had zero production readers before this slice — this is the first time anything reads
+  them back.
+
+Given that combination (strict byte-for-byte bar, zero precedent, writer landscape simpler than
+assumed but still real), this slice deliberately does **not** touch any `call_edges` writer and does
+**not** attempt to reproduce the static resolver's own output — that would mean re-implementing
+`resolve_sites_to_edges` a second time, its own separate, much larger undertaking. Presented this
+corrected picture to the user via `AskUserQuestion`; chose to do both parts below in one sitting
+(scope confirmed narrow enough — neither touches `call_edges` — to not need further splitting).
+
+## §16. What was built
+
+**Part 1 — `reference_evidence(disposition='excludes')`.** `scip/ingest.rs`'s own slice-1 comment
+had already named this "future work, not this slice." New function
+`record_external_proof_exclusion` (mirrors `record_external_proof_for_edge`'s 'supports' write, but
+starts its `INSERT ... SELECT` from `call_sites` directly via `call_site_id` rather than joining
+through an existing `call_edges` row — there isn't one for a rejected target). Wired into
+`insert_missing_exact_edges`'s conflict branch, inside the same `if let Some(context) = proof_context`
+guard the 'supports' path already uses, right after the existing `evidence_conflicts` INSERT.
+
+**Part 2 — `reference_verdicts` (new table) + `recompute_reference_verdicts` (new function).** A
+DERIVED, fully recomputable reconciliation of `reference_evidence`: for each `(call_site_id,
+to_symbol)` pair that has real evidence, what `call_edges` should say if only that evidence is
+trusted. Pure DELETE+repopulate SQL, not wired into any reindex/overlay pass or MCP tool — a
+standalone function callable any time. Deliberately does **not** cover edges with no evidence at
+all (the static resolver's own output) — matches the DoD's own "every **verified** edge is
+explainable" wording, not "every edge." `projected_formal_source` is derived from `provider`'s
+`"scip:..."`/`"lsp:..."` prefix via `substr`/`instr`, not hardcoded. Documented (in the function's
+own doc comment) the one real edge case found during design: `insert_missing_exact_edges`'s control
+flow makes 'supports' and 'excludes' mutually exclusive per pair in practice, so
+`UNIQUE(call_site_id, to_symbol)` + `INSERT OR IGNORE` never needs real arbitration — verified by a
+dedicated test that hand-constructs the (currently unreachable) both-dispositions case and confirms
+it degrades gracefully instead of erroring.
+
+## §17. Verification chain
+
+1. `cargo check --workspace --all-features` after each part — clean both times. (First attempt at
+   the schema.rs edit hit a real `PARSE_ERROR`: a doc-comment-style phrase with literal `"..."`
+   double quotes, written directly into SQL text embedded in `SCHEMA_SQL: &str = "..."` — a plain,
+   non-raw Rust string literal. Fixed by rewriting the comment without embedded double quotes;
+   caught by the edit tool's own parse check before anything was written, not by a later build
+   failure.)
+2. 5 new tests, each asserting against real, code-produced state rather than hand-typed
+   expectations wherever the real ingest path could be exercised directly:
+   - `record_external_proof_exclusion_dual_writes_reference_evidence_excludes` — isolates the new
+     function's own idempotency (calls it directly twice, since the real
+     `insert_missing_exact_edges` pipeline gates re-entry behind `evidence_conflicts`' own `INSERT
+     OR IGNORE`, so a repeat *pipeline* pass wouldn't actually re-exercise this function's own
+     `ON CONFLICT` at all — a real subtlety caught while designing the test, not assumed).
+   - `scip_conflict_records_reference_evidence_exclusion_end_to_end` — same WS7/fixture-I Python
+     shadowing shape as the existing `scip_does_not_add_formal_edge_conflicting_with_confident_static_resolution`
+     test, exercised through the real `ingest_occurrences_with_proof_context` entry point, proving
+     the conflict-branch wiring (not just the helper function standalone) actually fires.
+   - `recompute_reference_verdicts_matches_real_call_edges_for_a_supports_case` — runs the real SCIP
+     insert path, then asserts the verdict's projected columns match the REAL `call_edges` row's
+     `edge_confidence`/`formal_source`/`evidence_state` exactly, read back from the database rather
+     than a hand-typed expected value.
+   - `recompute_reference_verdicts_marks_a_rejected_scip_target_excluded` — same real-conflict
+     fixture, asserts the verdict is `'excluded'` AND that no `call_edges` row actually exists for
+     the rejected target (ground truth cross-check, not just an isolated assertion).
+   - `recompute_reference_verdicts_does_not_error_on_a_defensive_supports_and_excludes_pair` — the
+     documented edge-case test described in §16.
+3. `cargo test --workspace --release` — **entire workspace, 0 failed**: calm-core 1,260 (was 1,255
+   before this session's earlier B7 work touched other files, +5 here — note slice 1's own +2 landed
+   in a prior commit, not this diff), calm-server 406 (unaffected, this slice doesn't touch
+   calm-server at all), schema_version_migration 5, watcher_integration 3.
+4. `cargo test -p calm-core --release --test golden_graph_equivalence` explicitly, as the plan's own
+   sanity check (not because risk was expected): **18 passed, 0 failed, 1 ignored** (the
+   real-CALM-repo heavy test, `#[ignore]`d by design) — confirms `call_edges` was genuinely untouched,
+   as designed.
+5. `diff_impact` on the full working-tree diff: exactly 2 files changed
+   (`crates/calm-core/src/db/schema.rs`, `crates/calm-core/src/scip/ingest.rs`) — matches the plan's
+   scope precisely, no surprise files.
+
+## §18. What's still not done toward PR#10's full DoD (explicit, not silently dropped)
+
+- **The writer cutover / Rule A flip** ("providers append evidence; call_edges becomes a
+  materialized projection; no provider writes call_edges directly") — not attempted. This slice
+  proves the evidence-to-verdict reconciliation is correct against today's real, already-produced
+  `call_edges` state; it does not yet make anything DEPEND on that reconciliation.
+- **Reproducing the static resolver's own output** inside a projection — explicitly out of scope
+  (§15), would require re-implementing `resolve_sites_to_edges` a second time.
+- **Wiring `recompute_reference_verdicts` into any automatic pipeline** (reindex, SCIP/LSP overlay,
+  edit tools) — it's a standalone, manually-invoked function for now.
+- **LSP overlay has no 'excludes' case to migrate** — confirmed during research: it dual-writes
+  'supports' via the same shared `record_external_proof_for_edge` SCIP uses, but has no
+  confident-static-conflict-rejection branch analogous to SCIP's `insert_missing_exact_edges`, so
+  there's nothing LSP-side for Part 1's pattern to extend to.
+- **B2 / `resolution_precision` re-runs** — not done, and correctly so: neither benchmark measures
+  anything this slice touches (both read `call_edges`/`ambiguity_groups`, untouched here); re-run
+  them once (if ever) a future slice changes real `call_edges` behavior, not before.
+
+Uncommitted, awaiting the user's go-ahead to commit/push — same norm as every other piece of work
+this session.

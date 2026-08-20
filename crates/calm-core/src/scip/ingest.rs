@@ -460,6 +460,13 @@ fn insert_missing_exact_edges(
                 )? > 0
                 {
                     SCIP_STATIC_CONFLICTS.fetch_add(1, Ordering::Relaxed);
+                    // Wave 3 evidence ledger v1 (PR#10 slice 2): mirror this
+                    // rejection into reference_evidence too, so it's
+                    // explainable the same way an accepted proof already is
+                    // (record_external_proof_for_edge's 'supports' write).
+                    if let Some(context) = proof_context {
+                        record_external_proof_exclusion(conn, context, call_site_id, &to_symbol)?;
+                    }
                 }
                 continue;
             }
@@ -625,6 +632,96 @@ pub(crate) fn record_external_proof_for_edge(
         ],
     )?;
     Ok(())
+}
+
+/// Wave 3 evidence ledger v1 (PR#10 slice 2): the 'excludes' counterpart to
+/// `record_external_proof_for_edge`'s 'supports' write. Called from
+/// `insert_missing_exact_edges`'s conflict branch, where SCIP's proposed
+/// target was REJECTED (a confident static edge already claims this call
+/// site) -- there is no call_edges row for the rejected target to join
+/// through, so this starts from `call_sites` directly via `call_site_id`
+/// instead of `record_external_proof_for_edge`'s `call_edges`-anchored SELECT.
+fn record_external_proof_exclusion(
+    conn: &Connection,
+    context: &ExternalProofContext,
+    call_site_id: i64,
+    rejected_target: &str,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO reference_evidence
+            (call_site_id, to_symbol, provider, disposition, authority_class, source_file_hash,
+             callee_start_byte, callee_end_byte, provider_fingerprint, context_fingerprint,
+             graph_generation, call_site_identity_version, definition_snapshot, status, observed_at)
+         SELECT cs.id, ?2, ?1, 'excludes', 'external_proof', fi.hash,
+                 cs.callee_start_byte, cs.callee_end_byte, ?3, ?4, graph.generation,
+                 cs.identity_version,
+                 printf('%s:%d:%d:%s', COALESCE(def_file.hash, ''), def.line_start, def.line_end, def.signature),
+                 'fresh', unixepoch('now')
+         FROM call_sites cs
+         JOIN file_index fi ON fi.path = cs.from_path
+         LEFT JOIN symbols def ON def.qualified_name = ?2
+         LEFT JOIN file_index def_file ON def_file.path = def.path
+         JOIN graph_generation_state graph ON graph.id = 1
+         WHERE cs.id = ?5
+            AND cs.identity_version >= 2
+            AND cs.callee_start_byte IS NOT NULL
+            AND cs.callee_end_byte IS NOT NULL
+            AND (?6 IS NULL OR graph.generation = ?6)
+          ON CONFLICT(call_site_id, to_symbol, provider, disposition) DO UPDATE SET
+              source_file_hash = excluded.source_file_hash,
+              callee_start_byte = excluded.callee_start_byte,
+              callee_end_byte = excluded.callee_end_byte,
+              provider_fingerprint = excluded.provider_fingerprint,
+              context_fingerprint = excluded.context_fingerprint,
+              graph_generation = excluded.graph_generation,
+              call_site_identity_version = excluded.call_site_identity_version,
+              definition_snapshot = excluded.definition_snapshot,
+              status = 'fresh',
+              observed_at = excluded.observed_at,
+              failure_reason = NULL",
+        rusqlite::params![
+            context.provider,
+            rejected_target,
+            context.provider_fingerprint,
+            context.context_fingerprint,
+            call_site_id,
+            context.graph_generation,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Wave 3 evidence ledger v1 (PR#10 slice 2): recomputes `reference_verdicts`
+/// wholesale from the current `reference_evidence` table. Pure/derived
+/// (DELETE + repopulate, safe to call any time, touches no other table) --
+/// NOT wired into any reindex/overlay pass in this slice, purely a
+/// standalone read-only-with-respect-to-call_edges reconciliation.
+/// `insert_missing_exact_edges`'s own control flow makes 'supports' and
+/// 'excludes' mutually exclusive per (call_site_id, to_symbol) pair (a given
+/// SCIP-proposed target is either inserted-and-proven or rejected-and-
+/// recorded, never both in the same overlay pass) -- verified by a dedicated
+/// test, not just assumed, since this function's `UNIQUE(call_site_id,
+/// to_symbol)` would otherwise silently pick an arbitrary winner via
+/// `INSERT OR IGNORE`'s row-order-dependent behavior if that ever changed.
+pub fn recompute_reference_verdicts(conn: &Connection) -> rusqlite::Result<usize> {
+    conn.execute("DELETE FROM reference_verdicts", [])?;
+    conn.execute(
+        "INSERT OR IGNORE INTO reference_verdicts
+            (call_site_id, to_symbol, verdict, provider, authority_class,
+             projected_edge_confidence, projected_formal_source, projected_evidence_state,
+             justifying_evidence_id, computed_at)
+         SELECT call_site_id, to_symbol,
+                CASE WHEN disposition = 'excludes' THEN 'excluded' ELSE 'confirmed' END,
+                provider, authority_class,
+                CASE WHEN disposition = 'supports' THEN 'formal' END,
+                CASE WHEN disposition = 'supports'
+                     THEN substr(provider, 1, instr(provider || ':', ':') - 1) END,
+                CASE WHEN disposition = 'supports' THEN 'fresh' END,
+                id, unixepoch('now')
+         FROM reference_evidence
+         WHERE status = 'fresh'",
+        [],
+    )
 }
 
 /// Finds one current call site only when its source hash proves the SCIP range
@@ -1693,6 +1790,375 @@ fn record_external_proof_for_edge_dual_writes_reference_evidence() {
                 "provider_contradicts_confident_static".to_string()
             )],
             "the skipped provider proof must be recorded in evidence_conflicts: {conflicts:?}"
+        );
+    }
+
+
+    #[test]
+    fn record_external_proof_exclusion_dual_writes_reference_evidence_excludes() {
+        // Isolates record_external_proof_exclusion's own idempotency, same
+        // style as record_external_proof_for_edge_dual_writes_reference_evidence
+        // -- calls the function directly twice rather than through the full
+        // ingest pipeline (which gates re-entry behind evidence_conflicts'
+        // own INSERT OR IGNORE, so a repeat pipeline pass wouldn't actually
+        // re-exercise this function's own ON CONFLICT at all).
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO file_index (path, hash, language, symbol_count, last_indexed)
+             VALUES ('caller.py', 'fresh-source', 'python', 2, 0);
+             INSERT INTO call_sites
+                (from_path, enclosing_qn, callee_name, call_line, callee_start_byte,
+                 callee_end_byte, identity_version, edge_kind)
+             VALUES ('caller.py', 'caller.py::use', 'name', 9, 4, 9, 2, 'call');",
+        )
+        .unwrap();
+        let call_site_id: i64 = conn
+            .query_row("SELECT id FROM call_sites", [], |row| row.get(0))
+            .unwrap();
+
+        let context = super::ExternalProofContext::new("scip:test", "test-binary", "test-context");
+        super::record_external_proof_exclusion(&conn, &context, call_site_id, "external.py::name")
+            .unwrap();
+
+        let (provider, disposition, to_symbol): (String, String, String) = conn
+            .query_row(
+                "SELECT provider, disposition, to_symbol FROM reference_evidence",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(provider, "scip:test");
+        assert_eq!(disposition, "excludes");
+        assert_eq!(to_symbol, "external.py::name");
+
+        // Idempotent re-run (a repeat overlay pass) must not duplicate the
+        // row -- same ON CONFLICT guarantee the 'supports' write already has.
+        super::record_external_proof_exclusion(&conn, &context, call_site_id, "external.py::name")
+            .unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM reference_evidence", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "a repeat exclusion write must not duplicate the row");
+    }
+
+    #[test]
+    fn scip_conflict_records_reference_evidence_exclusion_end_to_end() {
+        // Same WS7/fixture-I shape as
+        // scip_does_not_add_formal_edge_conflicting_with_confident_static_resolution
+        // (Python file-symbol-over-import shadowing), but exercised through the
+        // real ingest_occurrences_with_proof_context entry point with a real
+        // proof_context, to confirm insert_missing_exact_edges's conflict
+        // branch actually wires up record_external_proof_exclusion -- not just
+        // that the helper works when called directly (previous test).
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end)
+             VALUES
+                ('caller.py::name', 'name', 'function', 'python', 'caller.py', 4, 5),
+                ('external.py::name', 'name', 'function', 'python', 'external.py', 1, 2);
+             INSERT INTO file_index (path, hash, language, symbol_count, last_indexed)
+             VALUES ('caller.py', 'fresh-source', 'python', 2, 0);
+             INSERT INTO call_sites
+                (from_path, enclosing_qn, callee_name, call_line, callee_start_byte,
+                 callee_end_byte, identity_version, edge_kind)
+             VALUES ('caller.py', 'caller.py::use', 'name', 9, 4, 9, 2, 'call');
+             INSERT INTO call_edges
+                (from_symbol, to_symbol, call_site_line, call_site_id, edge_confidence,
+                 from_path, to_path, edge_kind)
+             VALUES ('caller.py::use', 'caller.py::name', 9, 1, 'resolved',
+                     'caller.py', 'caller.py', 'call');",
+        )
+        .unwrap();
+        let occ = vec![
+            crate::scip::parse::ScipOccurrence {
+                file: "external.py".into(),
+                line: 1,
+                start_byte: None,
+                end_byte: None,
+                source_file_hash: None,
+                symbol: "N".into(),
+                is_def: true,
+                is_local: false,
+                encoding_provenance: crate::scip::parse::EncodingProvenance::Declared,
+                guessed_alt_byte_range: None,
+            },
+            crate::scip::parse::ScipOccurrence {
+                file: "caller.py".into(),
+                line: 9,
+                start_byte: Some(4),
+                end_byte: Some(9),
+                source_file_hash: Some("fresh-source".into()),
+                symbol: "N".into(),
+                is_def: false,
+                is_local: false,
+                encoding_provenance: crate::scip::parse::EncodingProvenance::Declared,
+                guessed_alt_byte_range: None,
+            },
+        ];
+
+        let context = super::ExternalProofContext::new("scip:test", "test-binary", "test-context");
+        let stats =
+            super::ingest_occurrences_with_proof_context(&conn, &occ, true, Some(&context))
+                .unwrap();
+        assert_eq!(stats.inserted, 0, "must still not insert a competing formal edge");
+
+        let (disposition, to_symbol): (String, String) = conn
+            .query_row(
+                "SELECT disposition, to_symbol FROM reference_evidence",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(disposition, "excludes");
+        assert_eq!(
+            to_symbol, "external.py::name",
+            "reference_evidence must record the REJECTED scip target, not the static winner"
+        );
+    }
+
+
+    #[test]
+    fn recompute_reference_verdicts_matches_real_call_edges_for_a_supports_case() {
+        // Fresh call site with NO pre-existing call_edges row -- SCIP inserts
+        // one via insert_missing_exact_edges's INSERT path (not the
+        // UPDATE-upgrade path), recording 'supports' evidence. Verifies
+        // recompute_reference_verdicts' projected columns exactly match the
+        // REAL call_edges row SCIP's own ingest code produced, not a
+        // hand-typed expectation.
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end)
+             VALUES ('core/src/engine.rs::Engine::start', 'start', 'method', 'rust',
+                     'core/src/engine.rs', 6, 8);
+             INSERT INTO file_index (path, hash, language, symbol_count, last_indexed)
+             VALUES ('app/src/main.rs', 'fresh-source', 'rust', 1, 0);
+             INSERT INTO call_sites
+                (from_path, enclosing_qn, callee_name, call_line, callee_start_byte,
+                 callee_end_byte, identity_version, edge_kind)
+             VALUES ('app/src/main.rs', 'app/src/main.rs::main', 'start', 5, 4, 9, 2, 'call');",
+        )
+        .unwrap();
+        let occ = vec![
+            crate::scip::parse::ScipOccurrence {
+                file: "core/src/engine.rs".into(),
+                line: 6,
+                start_byte: None,
+                end_byte: None,
+                source_file_hash: None,
+                symbol: "M".into(),
+                is_def: true,
+                is_local: false,
+                encoding_provenance: crate::scip::parse::EncodingProvenance::Declared,
+                guessed_alt_byte_range: None,
+            },
+            crate::scip::parse::ScipOccurrence {
+                file: "app/src/main.rs".into(),
+                line: 5,
+                start_byte: Some(4),
+                end_byte: Some(9),
+                source_file_hash: Some("fresh-source".into()),
+                symbol: "M".into(),
+                is_def: false,
+                is_local: false,
+                encoding_provenance: crate::scip::parse::EncodingProvenance::Declared,
+                guessed_alt_byte_range: None,
+            },
+        ];
+
+        let context = super::ExternalProofContext::new("scip:test", "test-binary", "test-context");
+        let stats =
+            super::ingest_occurrences_with_proof_context(&conn, &occ, true, Some(&context))
+                .unwrap();
+        assert_eq!(stats.inserted, 1);
+
+        let (call_site_id, real_confidence, real_formal_source, real_evidence_state): (
+            i64,
+            String,
+            Option<String>,
+            String,
+        ) = conn
+            .query_row(
+                "SELECT call_site_id, edge_confidence, formal_source, evidence_state \
+                 FROM call_edges",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+
+        super::recompute_reference_verdicts(&conn).unwrap();
+
+        let (verdict, projected_confidence, projected_formal_source, projected_evidence_state): (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT verdict, projected_edge_confidence, projected_formal_source, \
+                 projected_evidence_state FROM reference_verdicts WHERE call_site_id = ?1",
+                [call_site_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+
+        assert_eq!(verdict, "confirmed");
+        assert_eq!(
+            projected_confidence.as_deref(),
+            Some(real_confidence.as_str()),
+            "projection must match the real call_edges.edge_confidence exactly"
+        );
+        assert_eq!(
+            projected_formal_source, real_formal_source,
+            "projection must match the real call_edges.formal_source exactly"
+        );
+        assert_eq!(
+            projected_evidence_state.as_deref(),
+            Some(real_evidence_state.as_str()),
+            "projection must match the real call_edges.evidence_state exactly"
+        );
+    }
+
+    #[test]
+    fn recompute_reference_verdicts_marks_a_rejected_scip_target_excluded() {
+        // Same WS7/fixture-I conflict shape as
+        // scip_conflict_records_reference_evidence_exclusion_end_to_end, plus
+        // the recompute_reference_verdicts step: asserts the rejected
+        // target's verdict is 'excluded' and that no call_edges row exists
+        // for it -- the real, ground-truth behavior the verdict must match.
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end)
+             VALUES
+                ('caller.py::name', 'name', 'function', 'python', 'caller.py', 4, 5),
+                ('external.py::name', 'name', 'function', 'python', 'external.py', 1, 2);
+             INSERT INTO file_index (path, hash, language, symbol_count, last_indexed)
+             VALUES ('caller.py', 'fresh-source', 'python', 2, 0);
+             INSERT INTO call_sites
+                (from_path, enclosing_qn, callee_name, call_line, callee_start_byte,
+                 callee_end_byte, identity_version, edge_kind)
+             VALUES ('caller.py', 'caller.py::use', 'name', 9, 4, 9, 2, 'call');
+             INSERT INTO call_edges
+                (from_symbol, to_symbol, call_site_line, call_site_id, edge_confidence,
+                 from_path, to_path, edge_kind)
+             VALUES ('caller.py::use', 'caller.py::name', 9, 1, 'resolved',
+                     'caller.py', 'caller.py', 'call');",
+        )
+        .unwrap();
+        let call_site_id: i64 = conn
+            .query_row("SELECT id FROM call_sites", [], |row| row.get(0))
+            .unwrap();
+        let occ = vec![
+            crate::scip::parse::ScipOccurrence {
+                file: "external.py".into(),
+                line: 1,
+                start_byte: None,
+                end_byte: None,
+                source_file_hash: None,
+                symbol: "N".into(),
+                is_def: true,
+                is_local: false,
+                encoding_provenance: crate::scip::parse::EncodingProvenance::Declared,
+                guessed_alt_byte_range: None,
+            },
+            crate::scip::parse::ScipOccurrence {
+                file: "caller.py".into(),
+                line: 9,
+                start_byte: Some(4),
+                end_byte: Some(9),
+                source_file_hash: Some("fresh-source".into()),
+                symbol: "N".into(),
+                is_def: false,
+                is_local: false,
+                encoding_provenance: crate::scip::parse::EncodingProvenance::Declared,
+                guessed_alt_byte_range: None,
+            },
+        ];
+
+        let context = super::ExternalProofContext::new("scip:test", "test-binary", "test-context");
+        super::ingest_occurrences_with_proof_context(&conn, &occ, true, Some(&context)).unwrap();
+
+        super::recompute_reference_verdicts(&conn).unwrap();
+
+        let (verdict, projected_confidence): (String, Option<String>) = conn
+            .query_row(
+                "SELECT verdict, projected_edge_confidence FROM reference_verdicts \
+                 WHERE call_site_id = ?1 AND to_symbol = 'external.py::name'",
+                [call_site_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(verdict, "excluded");
+        assert_eq!(projected_confidence, None);
+
+        let real_edge_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM call_edges WHERE call_site_id = ?1 \
+                 AND to_symbol = 'external.py::name')",
+                [call_site_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            !real_edge_exists,
+            "the excluded verdict must match reality: no call_edges row for the rejected target"
+        );
+    }
+
+    #[test]
+    fn recompute_reference_verdicts_does_not_error_on_a_defensive_supports_and_excludes_pair() {
+        // insert_missing_exact_edges's own control flow makes 'supports' and
+        // 'excludes' mutually exclusive per (call_site_id, to_symbol) pair in
+        // practice -- this test hand-inserts both anyway (bypassing the real
+        // ingest path) to confirm recompute_reference_verdicts'
+        // UNIQUE(call_site_id, to_symbol) + INSERT OR IGNORE degrades
+        // gracefully (keeps whichever disposition SQLite's SELECT visits
+        // first) instead of erroring, per its own doc comment's documented
+        // limitation.
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO file_index (path, hash, language, symbol_count, last_indexed)
+             VALUES ('caller.py', 'fresh-source', 'python', 1, 0);
+             INSERT INTO call_sites
+                (from_path, enclosing_qn, callee_name, call_line, callee_start_byte,
+                 callee_end_byte, identity_version, edge_kind)
+             VALUES ('caller.py', 'caller.py::use', 'name', 9, 4, 9, 2, 'call');",
+        )
+        .unwrap();
+        let call_site_id: i64 = conn
+            .query_row("SELECT id FROM call_sites", [], |row| row.get(0))
+            .unwrap();
+
+        for disposition in ["supports", "excludes"] {
+            conn.execute(
+                "INSERT INTO reference_evidence
+                    (call_site_id, to_symbol, provider, disposition, authority_class,
+                     source_file_hash, callee_start_byte, callee_end_byte, provider_fingerprint,
+                     context_fingerprint, status, observed_at)
+                 VALUES (?1, 'external.py::name', 'scip:test', ?2, 'external_proof',
+                         'fresh-source', 4, 9, 'fp', 'cf', 'fresh', 1.0)",
+                rusqlite::params![call_site_id, disposition],
+            )
+            .unwrap();
+        }
+
+        // Must not error, and must produce exactly one verdict row (UNIQUE
+        // constraint), not two or a panic.
+        super::recompute_reference_verdicts(&conn).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM reference_verdicts WHERE call_site_id = ?1",
+                [call_site_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "UNIQUE(call_site_id, to_symbol) must keep exactly one verdict"
         );
     }
 

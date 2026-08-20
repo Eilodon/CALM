@@ -288,21 +288,22 @@ CREATE TABLE IF NOT EXISTS external_proofs (
 CREATE INDEX IF NOT EXISTS idx_external_proofs_status ON external_proofs(status, provider);
 
 -- Wave 3 evidence ledger v1 (docs/plans/2026-08-19-evidence-architecture-execution-plan.md
--- Part E PR#10, slice 1 of N). Generalizes external_proofs above -- additive
--- schema + dual-write only in this slice; every call_edges write path is
--- UNCHANGED. disposition distinguishes a provider proof FOR a target
--- ('supports', the only value written so far, from record_external_proof_for_edge
--- which both the SCIP and LSP overlays call) from one recording disagreement
--- ('excludes' -- not written yet; migrating insert_missing_exact_edges's
--- evidence_conflicts INSERT to also land here is future work, not this slice).
--- authority_class names the KIND of evidence: 'external_proof' for a live
--- SCIP/LSP result today, leaving room for a 'heuristic'/'static' class if the
--- static resolver's own confidence tiers are ever folded in here too (this
--- slice deliberately does not attempt that -- see PR#10's real write-path
--- inventory: indexer/pipeline/graph.rs's rebuild_graph/incremental_graph_update
--- DELETE-then-reinsert call_edges wholesale from call_sites+symbols on every
--- pass, making the static tier already a projection rather than a provider in
--- this sense). Same CASCADE-on-reindex lifecycle as external_proofs.
+-- Part E PR#10, slice 1-2). Generalizes external_proofs above -- additive
+-- schema + dual-write only; every call_edges write path is UNCHANGED (still
+-- true through slice 2). disposition distinguishes a provider proof FOR a
+-- target ('supports', from record_external_proof_for_edge, called by both the
+-- SCIP and LSP overlays) from one recording disagreement ('excludes', from
+-- record_external_proof_exclusion, called by insert_missing_exact_edges's
+-- conflict branch as of slice 2 -- mirrors evidence_conflicts' INSERT under
+-- the same guard rather than replacing it). authority_class names the KIND of
+-- evidence: 'external_proof' for a live SCIP/LSP result today, leaving room
+-- for a 'heuristic'/'static' class if the static resolver's own confidence
+-- tiers are ever folded in here too (deliberately not attempted yet -- see
+-- PR#10's real write-path inventory: indexer/pipeline/graph.rs's
+-- rebuild_graph/incremental_graph_update DELETE-then-reinsert call_edges
+-- wholesale from call_sites+symbols on every pass, making the static tier
+-- already a projection rather than a provider in this sense). Same
+-- CASCADE-on-reindex lifecycle as external_proofs.
 CREATE TABLE IF NOT EXISTS reference_evidence (
     id                   INTEGER PRIMARY KEY AUTOINCREMENT,
     call_site_id         INTEGER NOT NULL REFERENCES call_sites(id) ON DELETE CASCADE,
@@ -325,6 +326,34 @@ CREATE TABLE IF NOT EXISTS reference_evidence (
 );
 CREATE INDEX IF NOT EXISTS idx_reference_evidence_status ON reference_evidence(status, provider);
 CREATE INDEX IF NOT EXISTS idx_reference_evidence_call_site ON reference_evidence(call_site_id);
+
+-- Wave 3 evidence ledger v1, slice 2: reference_verdicts is a DERIVED, fully
+-- recomputable reconciliation of reference_evidence -- for each
+-- (call_site_id, to_symbol) pair it has evidence about, what call_edges
+-- SHOULD say if reference_evidence alone is trusted. Populated exclusively by
+-- recompute_reference_verdicts (scip/ingest.rs), a pure DELETE+repopulate
+-- function, never hand-authored and never written by any overlay directly.
+-- Deliberately NOT wired into any reindex/overlay pass or MCP tool yet, and
+-- deliberately does NOT attempt to reproduce a row for every call_edges edge
+-- -- only the subset reference_evidence has an opinion about (the DoD's own
+-- 'every VERIFIED edge is explainable' wording, not 'every edge'). This is
+-- the first table in the whole schema that materializes evidence into a
+-- derived reconciliation; there is no earlier precedent to follow here.
+CREATE TABLE IF NOT EXISTS reference_verdicts (
+    id                         INTEGER PRIMARY KEY AUTOINCREMENT,
+    call_site_id               INTEGER NOT NULL REFERENCES call_sites(id) ON DELETE CASCADE,
+    to_symbol                  TEXT NOT NULL,
+    verdict                    TEXT NOT NULL CHECK (verdict IN ('confirmed', 'excluded')),
+    provider                   TEXT NOT NULL,
+    authority_class            TEXT NOT NULL,
+    projected_edge_confidence  TEXT,
+    projected_formal_source    TEXT,
+    projected_evidence_state   TEXT,
+    justifying_evidence_id     INTEGER NOT NULL REFERENCES reference_evidence(id) ON DELETE CASCADE,
+    computed_at                REAL NOT NULL,
+    UNIQUE(call_site_id, to_symbol)
+);
+CREATE INDEX IF NOT EXISTS idx_reference_verdicts_call_site ON reference_verdicts(call_site_id);
 
 -- WS3 (docs/plans/2026-08-18-context-intelligence-upgrade-plan.md, D3): a call
 -- site whose bare-name candidate set exceeded MAX_CALLEE_CANDIDATES used to be
