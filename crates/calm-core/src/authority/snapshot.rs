@@ -199,8 +199,31 @@ impl EvidenceSnapshot {
         project_root: &Path,
         state_conn: &Connection,
     ) -> rusqlite::Result<Self> {
-        let mut snapshot = Self::compute(conn, project_root)?;
-        if let Some(recorded) = Self::load(state_conn, &snapshot.snapshot_id)?
+        // Wave 6 (audit follow-up, P0-A): inlines `compute`'s own drift
+        // derivation instead of calling it, so this function can tell
+        // WHETHER `live_mtime_drift` is what produced a `Degraded` result --
+        // that distinction is the whole fix. `live_mtime_drift` closes a
+        // real, currently-observed lag window (disk changed, DB not
+        // reindexed yet); a recorded snapshot from BEFORE that change can
+        // share the same `snapshot_id` (content-addressed over DB rows
+        // only, which haven't moved) and must never be allowed to silently
+        // overturn what this call just observed live. Without this
+        // distinction, the block below would re-promote a live-drifted
+        // `Degraded` straight back to a stale `Reconciled`, and
+        // `mint_review_authority_for_edit_context` would mint an authority
+        // on a false freshness guarantee that survives all the way to
+        // `edit.rs`'s spend-time check.
+        let catalog = InputCatalog::for_project(project_root);
+        let drift = index_input_drift(conn, &catalog)?;
+        let mut freshness_class = drift_to_freshness(drift);
+        let live_drifted =
+            freshness_class == FreshnessClass::Current && live_mtime_drift(conn, project_root)?;
+        if live_drifted {
+            freshness_class = FreshnessClass::Degraded;
+        }
+        let mut snapshot = Self::build(conn, project_root, freshness_class)?;
+        if !live_drifted
+            && let Some(recorded) = Self::load(state_conn, &snapshot.snapshot_id)?
             && recorded.freshness_class > snapshot.freshness_class
         {
             snapshot.freshness_class = recorded.freshness_class;
@@ -392,6 +415,26 @@ fn live_mtime_drift(conn: &Connection, project_root: &Path) -> rusqlite::Result<
             return Ok(true);
         }
     }
+    // Wave 6 (audit follow-up, P0-A.3): a brand-new source file added to
+    // disk since the last index has no `file_index` row at all, so the
+    // loop above -- which only ever iterates EXISTING rows -- can't see it.
+    // A live-tree-walk fix (compare `collect_source_files`'s live path set
+    // against `file_index`) was implemented and then REVERTED after it
+    // broke 7 existing tests, all with the same root cause: this
+    // codebase's own test fixtures routinely `std::fs::write` a file and
+    // insert directly into `symbols`/persist a reconciled InputCatalog
+    // WITHOUT a matching `file_index` row (a fast test-setup shortcut, not
+    // a bug in the tests). That revealed a real, unresolved semantic
+    // question, not just a test-fixture inconvenience: `index_input_drift`
+    // (and therefore `Current`/`Reconciled`) was designed to answer "does
+    // the index match disk" for config/context fingerprints specifically,
+    // not "has every matching file actually been read into `file_index`" --
+    // conflating the two would also fire on the normal, transient,
+    // non-adversarial case of a freshly-added file the watcher hasn't
+    // debounced yet, at every risk tier, not just the ones that actually
+    // need Reconciled-strength freshness. Left as a documented, deliberate
+    // residual pending a real design decision (e.g. a distinct signal
+    // rather than folding into this boolean), not silently dropped.
     Ok(false)
 }
 
@@ -891,6 +934,80 @@ mod tests {
                 .unwrap();
         assert_ne!(after_change.snapshot_id, stale_reconciled.snapshot_id);
         assert_ne!(after_change.freshness_class, FreshnessClass::Reconciled);
+    }
+
+    #[test]
+    fn compute_with_recorded_freshness_does_not_revive_a_stale_reconciled_over_live_drift() {
+        // Wave 6 (audit follow-up, P0-A): the actual dangerous scenario --
+        // content is genuinely unchanged according to the DB
+        // (source_catalog_digest/snapshot_id unchanged, since nothing has
+        // been reindexed), but the file changed ON DISK in the meantime.
+        // Before this fix, the recorded Reconciled row (same snapshot_id,
+        // because that digest never saw the disk-only change) would
+        // silently overwrite the live-derived Degraded right back to
+        // Reconciled -- letting `mint_review_authority_for_edit_context`
+        // mint an authority on a false freshness guarantee. The sibling
+        // test above (`..._falls_back_to_live_drift_when_content_changed_
+        // since`) does NOT cover this despite its name: it mutates
+        // file_index directly, which flips snapshot_id and makes the
+        // recorded-lookup miss entirely -- a different, already-safe path.
+        use crate::indexer::refresh::{InputCatalog, persist_index_input_snapshot};
+        let root = tmp_project();
+        let file_path = root.path().join("a.rs");
+        std::fs::write(&file_path, "fn a() {}").unwrap();
+        let indexed_mtime = crate::indexer::pipeline::mtime_secs(&file_path);
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO file_index (path, hash, last_indexed, mtime) \
+             VALUES ('a.rs', 'h1', 0, ?1)",
+            params![indexed_mtime],
+        )
+        .unwrap();
+        persist_index_input_snapshot(&conn, &InputCatalog::for_project(root.path())).unwrap();
+
+        let state = state_conn();
+
+        // Record a real full reconciliation for this exact content (same
+        // snapshot_id the DB currently reflects) -- the legitimate case
+        // `compute_with_recorded_freshness` exists to serve.
+        let reconciled =
+            EvidenceSnapshot::compute_after_reconciliation(&conn, root.path()).unwrap();
+        reconciled.persist(&state).unwrap();
+
+        // Sanity: right now (no live drift yet), the recorded Reconciled
+        // DOES correctly apply -- this is the upgrade path that must keep
+        // working after the fix.
+        let still_fresh =
+            EvidenceSnapshot::compute_with_recorded_freshness(&conn, root.path(), &state).unwrap();
+        assert_eq!(still_fresh.freshness_class, FreshnessClass::Reconciled);
+
+        // Mutate the file ON DISK ONLY -- no reindex, so file_index (and
+        // therefore snapshot_id) stays byte-for-byte identical to what was
+        // just recorded as Reconciled above.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(
+            &file_path,
+            "fn a() { /* changed on disk, not reindexed */ }",
+        )
+        .unwrap();
+
+        let after_live_change =
+            EvidenceSnapshot::compute_with_recorded_freshness(&conn, root.path(), &state).unwrap();
+        assert_eq!(
+            after_live_change.snapshot_id, reconciled.snapshot_id,
+            "snapshot_id is content-addressed over file_index DB rows only -- a \
+             live-disk-only change must NOT flip it (this assertion proves the \
+             test is actually exercising the dangerous path, not the already-safe \
+             snapshot_id-changed path the sibling test above covers)"
+        );
+        assert_eq!(
+            after_live_change.freshness_class,
+            FreshnessClass::Degraded,
+            "a live-disk-only change must not be silently revived back to \
+             Reconciled by a stale recorded snapshot sharing the same snapshot_id"
+        );
     }
 
     #[test]

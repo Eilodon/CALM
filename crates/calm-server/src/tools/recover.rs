@@ -23,8 +23,23 @@ impl CalmServer {
                 Ok(c) => c,
                 Err(e) => return db_error(e),
             };
+            // Wave 6 (audit follow-up, P1-B): excludes the placeholder rows
+            // `mark_file_index_skip_reason` inserts for a file that has
+            // NEVER been successfully indexed (empty hash, symbol_count 0)
+            // -- those exist only so `skip_reason` is discoverable, and
+            // counting them here double-claimed a skipped, contentless
+            // file as "indexed". Deliberately `hash != ''`, not a blanket
+            // `skip_reason IS NULL` exclusion: a file skipped on the MOST
+            // RECENT pass but successfully indexed on a PRIOR one keeps its
+            // real hash (mark_file_index_skip_reason's own doc comment --
+            // "hash/symbol_count/... from a prior successful index are
+            // left exactly as they were") and genuinely IS indexed
+            // content, just possibly stale; excluding it too would
+            // understate this count for a case that's actually fine.
             let files: i64 = conn
-                .query_row("SELECT COUNT(*) FROM file_index", [], |r| r.get(0))
+                .query_row("SELECT COUNT(*) FROM file_index WHERE hash != ''", [], |r| {
+                    r.get(0)
+                })
                 .unwrap_or(0);
             let symbols: i64 = conn
                 .query_row("SELECT COUNT(*) FROM symbols", [], |r| r.get(0))
@@ -66,8 +81,17 @@ impl CalmServer {
                 }
                 SkippedFilesStatusOutput { total, entries }
             };
+            // Wave 6 (audit follow-up, P1-B): same `hash != ''` exclusion as
+            // `files` above -- a skip-only placeholder's `last_indexed` is
+            // the timestamp of the SKIP attempt, not of any real indexing
+            // work, so including it here could make `last_updated` claim
+            // freshness a file that was never actually read never earned.
             let last_updated: Option<f64> = conn
-                .query_row("SELECT MAX(last_indexed) FROM file_index", [], |r| r.get(0))
+                .query_row(
+                    "SELECT MAX(last_indexed) FROM file_index WHERE hash != ''",
+                    [],
+                    |r| r.get(0),
+                )
                 .ok()
                 .flatten();
             let mut external_proofs = ExternalProofStatusOutput::default();
@@ -841,6 +865,13 @@ pub(crate) struct IndexingStatusOutput {
     /// when `indexing_phase == "failed"` — see `IndexingPhase::Failed`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) indexing_error: Option<String>,
+    /// Wave 6 (audit follow-up, P1-B): `file_index` rows with real indexed
+    /// content (`hash != ''`) -- excludes the placeholder rows
+    /// `mark_file_index_skip_reason` inserts for a file that has NEVER
+    /// been successfully indexed. A file skipped on the most recent pass
+    /// but successfully indexed on a prior one still counts here (it
+    /// genuinely has content, just possibly stale) -- see `skipped_files`
+    /// for which rows are in that state.
     pub(crate) files_indexed: i64,
     /// Tier-0 source files currently discoverable on disk (respects
     /// `config.ignore`) — compare against `files_indexed` to see whether the

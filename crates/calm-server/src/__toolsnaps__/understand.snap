@@ -13,7 +13,7 @@
         "type": "string"
       },
       "kind": {
-        "description": "One of `\"symbol\"` (default), `\"text\"`, or `\"file\"` — same meaning as\n`locate`'s `kind`, minus `\"semantic\"`/`\"hybrid\"` (not supported\nhere). Any other value silently falls back to `\"symbol\"`.",
+        "description": "One of `\"text\"`, `\"file\"`, `\"hybrid\"` (default), or `\"symbol\"` --\nsame meaning as `locate`'s `kind`, minus `\"semantic\"` (not supported\nhere). Any other value silently falls back to `\"symbol\"` (see\n`UnderstandOutput::note` when that happens). Wave 6 (audit\nfollow-up): corrected -- this previously claimed `\"symbol\"` was the\ndefault and `\"hybrid\"` unsupported, both wrong (the handler\ndefaults to `\"hybrid\"` and `parse_understand_kind` maps it\nexplicitly).",
         "type": [
           "string",
           "null"
@@ -563,6 +563,13 @@
           }
         ]
       },
+      "note": {
+        "description": "Wave 6 (audit follow-up, P1-A): set when `kind` was an unrecognized\nstring (silently narrowed to `\"symbol\"`) -- absent otherwise.",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
       "architecture_digest": {
         "description": "Tier 2 semantic fact (2026-08-07 roadmap T2). `None` when this\nsymbol has no digest row yet — never a fabricated summary; see\n`ArchitectureDigestOutput`'s doc comment.",
         "anyOf": [
@@ -575,7 +582,7 @@
         ]
       },
       "resolution_confidence": {
-        "description": "3.3 (Wave 3, P1-2): `\"none\"` (no match at all), `\"confident\"` (a\nclear top hit), or `\"ambiguous\"` (the runner-up scored too close to\ncall — see `UNDERSTAND_AMBIGUOUS_MARGIN_RATIO`). When `\"ambiguous\"`,\n`symbol`/`source`/`callers_summary`/`architecture_digest` are all\nleft empty rather than committing to a coin-flip pick — see\n`alternatives` instead.",
+        "description": "3.3 (Wave 3, P1-2): `\"none\"` (no match at all), `\"confident\"` (a\nclear top hit), or `\"ambiguous\"` (the runner-up scored too close to\ncall — see `UNDERSTAND_AMBIGUOUS_MARGIN_RATIO`). When `\"ambiguous\"`,\n`symbol`/`source`/`callers_summary`/`architecture_digest` are all\nleft empty rather than committing to a coin-flip pick — see\n`alternatives` instead.\n\nWave 6 (audit follow-up, P1-A): a fourth value, `\"weak\"` — a top hit\nexists (and there's no close runner-up), but its own score is `<=\n0.0`, i.e. no real positive relevance signal at all. Still populates\n`symbol`/`source`/etc. (this is a \"believe it cautiously\" signal,\nnot a disambiguation failure like `\"ambiguous\"`) but the caller\nshould not treat it as a confirmed match the way `\"confident\"`\nimplies.",
         "type": "string"
       },
       "alternatives": {

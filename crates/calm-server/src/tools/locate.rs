@@ -89,24 +89,35 @@ impl CalmServer {
                     // in any Tier-0 language (JS/TS included — resolve_name_node
                     // only resolves `const`/`let` bindings whose value is itself a
                     // function, not plain data constants).
+                    // Wave 6 (audit follow-up, P1-B): every `search`-targeting
+                    // suggestion below now includes `query` -- previously
+                    // omitted, so a caller that fed `args` straight into
+                    // `search` would fail its required-field validation
+                    // (the whole point of `suggested_next` is a directly
+                    // usable call, not just a hint).
                     let sn = if !results.is_empty() && kind_str == "symbol" {
                         suggested_with_args("locate", "Full context in 1 call (replaces symbol_info)", serde_json::json!({"query": results[0].name, "kind": "symbol"}))
                     } else if results.is_empty() && kind_str == "semantic" {
-                        suggested_with_args("search", "Semantic index may not cover this — try text or hybrid search", serde_json::json!({"kind": "text"}))
+                        suggested_with_args("search", "Semantic index may not cover this — try text or hybrid search", serde_json::json!({"query": p.query, "kind": "text"}))
                     } else if results.is_empty() && kind_str == "hybrid" && output.degraded {
-                        // Degraded hybrid's FTS component is search_symbol, which
-                        // matches name+docstring+signature with no column filter —
-                        // a strict superset of search_text's {docstring signature}
-                        // filtered match set. If this came up empty, text is
-                        // guaranteed empty too, so skip straight to grep.
-                        suggested_with_args("search", "Embeddings inactive and hybrid (name/docstring/signature FTS) found nothing — text search can't find more (its match set is a subset of hybrid's). Try grep over raw file content, which also covers symbols never extracted at all (e.g. module-level const/static)", serde_json::json!({"kind": "grep"}))
+                        // Degraded hybrid's FTS leg is search_symbol (name+
+                        // docstring+signature) merged with chunk_text_results
+                        // (function bodies) -- Wave 6 (P1-A) closed the gap
+                        // where this used to be search_symbol alone, and in
+                        // doing so made hybrid a strict superset of
+                        // search_text's own coverage (search_text = the same
+                        // chunk_text_results merge, but docstring+signature
+                        // only, deliberately excluding name). If hybrid came
+                        // up empty, text is guaranteed empty too, so skip
+                        // straight to grep.
+                        suggested_with_args("search", "Embeddings inactive and hybrid (name/docstring/signature/body FTS) found nothing — text search can't find more (its match set is a subset of hybrid's). Try grep over raw file content, which also covers symbols never extracted at all (e.g. module-level const/static)", serde_json::json!({"query": p.query, "kind": "grep"}))
                     } else if results.is_empty() && kind_str == "hybrid" {
-                        suggested_with_args("search", "Try exact text search", serde_json::json!({"kind": "text"}))
+                        suggested_with_args("search", "Try exact text search", serde_json::json!({"query": p.query, "kind": "text"}))
                     } else if results.is_empty() && kind_str == "text" {
-                        suggested_with_args("search", "Text/symbol index may not cover this — module-level const/static isn't extracted as a symbol in any Tier-0 language, so it's invisible to symbol/text/hybrid search. Try grep over raw file content", serde_json::json!({"kind": "grep"}))
+                        suggested_with_args("search", "Text/symbol index may not cover this — module-level const/static isn't extracted as a symbol in any Tier-0 language, so it's invisible to symbol/text/hybrid search. Try grep over raw file content", serde_json::json!({"query": p.query, "kind": "grep"}))
                     } else if results.is_empty() {
                         // symbol, file, or any other kind
-                        suggested_with_args("search", "Try hybrid for broader recall", serde_json::json!({"kind": "hybrid"}))
+                        suggested_with_args("search", "Try hybrid for broader recall", serde_json::json!({"query": p.query, "kind": "hybrid"}))
                     } else {
                         None
                     };

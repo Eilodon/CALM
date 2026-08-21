@@ -188,6 +188,29 @@ pub struct HubThresholdConfig {
     pub coreness_pct: f64,
 }
 
+/// Wave 6 audit closure ("Assist/Strict mode profiles"): `assist`
+/// (default, today's behavior, zero change) or `strict`. `strict` ORs a
+/// fixed profile onto the individual `EditConfig` booleans below rather
+/// than replacing them -- see `EditConfig::always_require_edit_context_effective`/
+/// `kernel_enforced_writes_effective` for exactly what it sets and why
+/// those two and not the others. Deliberately gated on the truth-kernel
+/// correctness work (P0-A/P0-B/P0-C) landing first: shipping a "strict"
+/// label on top of the pre-fix live-verification gaps would have been
+/// strict about ceremony, not about truth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum EditMode {
+    #[default]
+    Assist,
+    Strict,
+}
+
+impl EditMode {
+    pub fn is_strict(self) -> bool {
+        matches!(self, EditMode::Strict)
+    }
+}
+
 /// Phase B (`docs/plans/2026-07-13-phase-b-incremental-graph-update.md`)
 /// Edit-tool behavior flags (`[edit]` in `.calm/config.json`).
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -245,6 +268,11 @@ pub struct EditConfig {
     /// (2026-08-19) after being shown this exact tradeoff in plain terms;
     /// keep it default-off for every other project.
     pub elicit_via_agent_relay: bool,
+    /// Wave 6: see `EditMode`'s own doc comment. Read only through
+    /// `always_require_edit_context_effective`/`kernel_enforced_writes_effective`
+    /// below, never the raw fields above, at any new call site -- otherwise
+    /// `mode = "strict"` silently has no effect.
+    pub mode: EditMode,
 }
 
 impl Default for EditConfig {
@@ -255,7 +283,42 @@ impl Default for EditConfig {
             always_require_edit_context: false,
             kernel_enforced_writes: false,
             elicit_via_agent_relay: false,
+            mode: EditMode::Assist,
         }
+    }
+}
+
+impl EditConfig {
+    /// `mode = "strict"` ORs this gate on regardless of the raw
+    /// `always_require_edit_context` field (monotonic: strict can only
+    /// ADD strictness, never remove one a project explicitly turned on).
+    /// Safe to fold into `strict` because it is a protocol-level,
+    /// client-agnostic gate (the tool's own JSON-RPC error response) --
+    /// behaves identically for every MCP client, unlike `elicit_hub_confirm`
+    /// (see below).
+    pub fn always_require_edit_context_effective(&self) -> bool {
+        self.always_require_edit_context || self.mode.is_strict()
+    }
+
+    /// Same contract as `always_require_edit_context_effective`. Safe to
+    /// fold into `strict` for the same reason: every platform without
+    /// kernel-enforced containment already falls back to the same textual
+    /// check `atomic_write` uses unconditionally, so turning this on never
+    /// makes writes fail where they previously succeeded -- see the field's
+    /// own doc comment above.
+    ///
+    /// `elicit_hub_confirm` and `elicit_via_agent_relay` deliberately have
+    /// no `_effective` counterpart and are NOT folded into `strict`:
+    /// `elicit_hub_confirm` enabled for a client that never declared
+    /// elicitation support is not a silent no-op -- `elicit_setup`
+    /// (crates/calm-server/src/tools/edit.rs) turns it into a hard
+    /// client-incapability error on every hub/high-risk edit, which would
+    /// brick edits for exactly the non-interactive automation clients most
+    /// likely to opt into `strict`. `elicit_via_agent_relay` is an
+    /// explicitly WEAKER opt-out (see its own doc comment) -- the opposite
+    /// of what `strict` means, so it must never be implied by it.
+    pub fn kernel_enforced_writes_effective(&self) -> bool {
+        self.kernel_enforced_writes || self.mode.is_strict()
     }
 }
 
@@ -1514,6 +1577,88 @@ mod tests {
             diff.contains(&"edit.always_require_edit_context".to_string()),
             "{diff:?}"
         );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn edit_mode_defaults_to_assist_with_effective_accessors_matching_raw_fields() {
+        // Absent [edit].mode = "assist" = today's behavior, unchanged: the
+        // effective accessors must read identically to the raw booleans
+        // when mode never fires.
+        let d = Config::default();
+        assert_eq!(d.edit.mode, EditMode::Assist);
+        assert!(!d.edit.always_require_edit_context_effective());
+        assert!(!d.edit.kernel_enforced_writes_effective());
+    }
+
+    #[test]
+    fn edit_mode_strict_ors_the_two_protocol_gates_without_flipping_raw_fields() {
+        let tmp =
+            std::env::temp_dir().join(format!("ci_cfg_edit_mode_strict_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("config.json"), r#"{"edit": {"mode": "strict"}}"#).unwrap();
+        let loaded = load_config(&tmp).unwrap();
+
+        assert_eq!(loaded.edit.mode, EditMode::Strict);
+        // Raw fields stay exactly as written (nothing overrides them) --
+        // only the effective accessors change.
+        assert!(!loaded.edit.always_require_edit_context);
+        assert!(!loaded.edit.kernel_enforced_writes);
+        assert!(loaded.edit.always_require_edit_context_effective());
+        assert!(loaded.edit.kernel_enforced_writes_effective());
+
+        let diff = diff_from_default(&loaded);
+        assert!(diff.contains(&"edit.mode".to_string()), "{diff:?}");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn edit_mode_strict_does_not_imply_elicit_hub_confirm_or_agent_relay() {
+        // See EditConfig::kernel_enforced_writes_effective's doc comment:
+        // these two are deliberately excluded from the strict compiler.
+        let tmp = std::env::temp_dir().join(format!(
+            "ci_cfg_edit_mode_strict_elicit_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("config.json"), r#"{"edit": {"mode": "strict"}}"#).unwrap();
+        let loaded = load_config(&tmp).unwrap();
+
+        assert!(!loaded.edit.elicit_hub_confirm);
+        assert!(!loaded.edit.elicit_via_agent_relay);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn edit_mode_rejects_unknown_string() {
+        let tmp = std::env::temp_dir().join(format!("ci_cfg_edit_mode_bad_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("config.json"), r#"{"edit": {"mode": "yolo"}}"#).unwrap();
+        assert!(load_config(&tmp).is_err());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn edit_mode_strict_can_coexist_with_an_explicit_raw_field_already_true() {
+        // Monotonic: an explicit `true` the project already set stays true
+        // regardless of mode -- strict is an OR, never a reset.
+        let tmp = std::env::temp_dir().join(format!(
+            "ci_cfg_edit_mode_strict_explicit_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(
+            tmp.join("config.json"),
+            r#"{"edit": {"mode": "assist", "always_require_edit_context": true}}"#,
+        )
+        .unwrap();
+        let loaded = load_config(&tmp).unwrap();
+        assert_eq!(loaded.edit.mode, EditMode::Assist);
+        assert!(loaded.edit.always_require_edit_context_effective());
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

@@ -420,7 +420,7 @@ impl CalmServer {
                         return ResolvedOutcome::ambiguous(&candidates);
                     }
                     SymbolResolution::ReadFailed(e) => return ResolvedOutcome::error(e),
-                    SymbolResolution::Found(c) => *c,
+                    SymbolResolution::Found(c, _) => *c,
                 }
             };
             if c.boundary_ambiguous {
@@ -738,7 +738,7 @@ impl CalmServer {
                 path,
                 &full_path,
                 &formatted,
-                self.config().edit.kernel_enforced_writes,
+                self.config().edit.kernel_enforced_writes_effective(),
             ) {
                 let _ = calm_core::txn::advance(
                     &file_conn,
@@ -1412,8 +1412,9 @@ impl CalmServer {
         // every touched symbol regardless of risk -- see OrientationConfig/
         // EditConfig's own doc comments (config.rs) for why this exists as a
         // protocol-level, client-agnostic alternative to a Claude-Code-only
-        // hook.
-        let force_gate_always = self.config().edit.always_require_edit_context;
+        // hook. `_effective()` also ORs in `mode = "strict"` -- see
+        // EditConfig::always_require_edit_context_effective's doc comment.
+        let force_gate_always = self.config().edit.always_require_edit_context_effective();
         let gate_classification = classify_gate(
             hub_hit,
             risk.as_deref(),
@@ -1429,14 +1430,45 @@ impl CalmServer {
         // also supplied alongside it) is never consulted on this path.
         let authority_already_validated = match (change_id, authority_id) {
             (Some(change_id), Some(authority_id)) => {
-                let snapshot_id = self
-                    .make_read_conn()
-                    .ok()
-                    .and_then(|c| {
-                        calm_core::authority::EvidenceSnapshot::compute(&c, &self.project_root).ok()
+                // Wave 6 (audit follow-up, P0-A.2): re-derive freshness
+                // here too, not just snapshot_id. snapshot_id alone
+                // (`EvidenceSnapshot::compute`'s bare digest) is blind to a
+                // live-disk-only change -- it's content-addressed over
+                // `file_index` DB rows, which a change on disk doesn't
+                // touch until the watcher/reindexer catches up. That's
+                // exactly the lag window `live_mtime_drift` exists to
+                // catch (see snapshot.rs), and exactly the window between
+                // this edit's own `edit_context` mint and this spend: a
+                // file changed on disk in between, not yet reindexed, still
+                // produces the SAME snapshot_id the mint-time authority was
+                // signed against, so the plain-`compute()` + snapshot_id-
+                // only check below would let a stale mint through. Using
+                // `compute_with_recorded_freshness` (not bare `compute`)
+                // additionally protects against the P0-A sibling bug this
+                // spend-time check would otherwise reintroduce.
+                let state_read_conn_for_freshness = self.make_state_read_conn().ok();
+                let spend_snapshot = self.make_read_conn().ok().and_then(|c| {
+                    state_read_conn_for_freshness.as_ref().and_then(|sc| {
+                        calm_core::authority::EvidenceSnapshot::compute_with_recorded_freshness(
+                            &c,
+                            &self.project_root,
+                            sc,
+                        )
+                        .ok()
                     })
-                    .map(|s| s.snapshot_id)
-                    .unwrap_or_default();
+                });
+                if let Some(snap) = &spend_snapshot
+                    && snap.freshness_class == calm_core::authority::FreshnessClass::Degraded
+                {
+                    return ToolOutcome::error(error_detail(
+                        "AUTHORITY_SNAPSHOT_DEGRADED_SINCE_MINT",
+                        "source content on disk changed since this authority was minted \
+                         (edit_context) and has not yet been reindexed -- re-run edit_context \
+                         to mint a fresh authority against current content",
+                        true,
+                    ));
+                }
+                let snapshot_id = spend_snapshot.map(|s| s.snapshot_id).unwrap_or_default();
                 let current_graph_generation: i64 = self
                     .make_read_conn()
                     .ok()
@@ -2383,7 +2415,7 @@ impl CalmServer {
             path,
             &full_path,
             &new_content,
-            self.config().edit.kernel_enforced_writes,
+            self.config().edit.kernel_enforced_writes_effective(),
         ) {
             if let Some(tx_id) = &shadow_tx_id {
                 let _ = calm_core::txn::advance(
@@ -4076,7 +4108,7 @@ pub(crate) fn classify_gate(
             .map(|r| r.to_string())
             .unwrap_or_else(|| "a high-risk symbol (>10 callers)".to_string())
     } else {
-        "this project's `edit.always_require_edit_context` config (every edit requires edit_context first, regardless of risk)".to_string()
+        "this project's `edit.always_require_edit_context` config (or `edit.mode = \"strict\"`) -- every edit requires edit_context first, regardless of risk".to_string()
     };
     let requirement = if bridge_downgrade_eligible {
         GateRequirement::ConfirmOnly

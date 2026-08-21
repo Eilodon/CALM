@@ -48,6 +48,22 @@ pub fn compute_coreness(conn: &Connection) -> rusqlite::Result<HashMap<String, i
         // Unrecognized confidence strings (should never happen — every
         // writer goes through `EdgeConfidence::as_str`) are treated as
         // confirmed rather than silently dropped from the stricter graph.
+        //
+        // Wave 6 (audit follow-up, P0-C, reviewed 2026-08-21): an external
+        // audit flagged both `rank() > 0` (which counts `Textual`/`Inferred`
+        // edges as "confirmed", not just `Formal`/`Resolved`) and this
+        // `unwrap_or(true)` as fail-open. Both are DELIBERATE here and were
+        // left unchanged after review — this is the "stricter" graph that
+        // feeds `is_hub`/bridge-hub gating (see the module doc comment
+        // above): failing an edge INTO "confirmed" is the conservative
+        // direction for a hub-detection false-negative guard (better to
+        // over-gate a symbol as a hub than silently miss one). This is the
+        // opposite direction from `trace.rs::weakest_route_confidence`/
+        // `path().certain`, which fail closed toward LESS confidence for
+        // the same reason applied to a different consumer (a display/
+        // certainty signal, not a safety gate) — see that file's own Wave 6
+        // fix. Do not "fix" this one the same way without re-deriving why
+        // it's inverted here.
         let is_confirmed = crate::types::EdgeConfidence::parse(&confidence)
             .map(|c| c.rank() > 0)
             .unwrap_or(true);

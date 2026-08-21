@@ -616,6 +616,7 @@
         ]
       },
       "files_indexed": {
+        "description": "Wave 6 (audit follow-up, P1-B): `file_index` rows with real indexed\ncontent (`hash != ''`) -- excludes the placeholder rows\n`mark_file_index_skip_reason` inserts for a file that has NEVER\nbeen successfully indexed. A file skipped on the most recent pass\nbut successfully indexed on a prior one still counts here (it\ngenuinely has content, just possibly stale) -- see `skipped_files`\nfor which rows are in that state.",
         "type": "integer",
         "format": "int64"
       },

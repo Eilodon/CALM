@@ -52,7 +52,7 @@ impl CalmServer {
                     return ResolvedOutcome::ambiguous(&candidates);
                 }
                 SymbolResolution::ReadFailed(e) => return ResolvedOutcome::error(e),
-                SymbolResolution::Found(c) => *c,
+                SymbolResolution::Found(c, _) => *c,
             };
             self.track_symbol(&c.qualified_name);
             self.track_file(&c.path);
@@ -377,7 +377,7 @@ impl CalmServer {
                     gate_risk.as_deref(),
                     gate_uncertain_zero_caller,
                     bridge_downgrade_eligible,
-                    config.edit.always_require_edit_context,
+                    config.edit.always_require_edit_context_effective(),
                     gate_risk_rule_reason.as_deref(),
                 );
                 let blocking_symbols: Vec<String> = gate_touched

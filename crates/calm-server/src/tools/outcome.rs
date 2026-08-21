@@ -578,7 +578,20 @@ pub(crate) fn resolve_symbol_candidates(
 pub(crate) enum SymbolResolution {
     NotFound,
     Ambiguous(Vec<CandidateRow>),
-    Found(Box<CandidateRow>),
+    /// Wave 6 (audit follow-up, P0-B): the second field is the EXACT file
+    /// content `verify_live` read to produce this candidate -- `Some` in
+    /// every case except the pre-existing "no `file_index` row, trust the
+    /// DB row as-is" escape hatch inside `verify_live` (still `None` there;
+    /// see that function's own doc comment). A consumer that needs to serve
+    /// this symbol's source text (`source()`, `understand()`) MUST slice
+    /// from these bytes instead of re-reading the file itself -- re-reading
+    /// opens a TOCTOU window between "what was verified" and "what was
+    /// served" that a write landing in between could exploit (a file
+    /// changing between this read and a second, independent read is not
+    /// covered by anything else in the resolve path). Callers that only
+    /// need the resolved coordinates/identity (not the content) are free to
+    /// ignore this field.
+    Found(Box<CandidateRow>, Option<String>),
     /// Disk read or fresh re-parse failed while live-verifying a resolved
     /// candidate (see `resolve_symbol`'s doc comment) -- distinct from a DB
     /// query failure (which stays in the outer `rusqlite::Result::Err`).
@@ -652,10 +665,14 @@ pub(crate) fn resolve_symbol(
     if candidates.len() > MAX_LIVE_VERIFIED_CANDIDATES {
         return Ok(SymbolResolution::Ambiguous(candidates));
     }
-    let mut still_live = Vec::with_capacity(candidates.len());
+    // Wave 6 (audit follow-up, P0-B): carries each survivor's verified
+    // bytes alongside it so a narrow-to-one-candidate result below can
+    // still return them in `Found` -- an ambiguous set drops them (nothing
+    // downstream serves content from an unresolved `Ambiguous`).
+    let mut still_live: Vec<(CandidateRow, Option<String>)> = Vec::with_capacity(candidates.len());
     for c in candidates {
         match verify_live(conn, project_root, c) {
-            SymbolResolution::Found(c) => still_live.push(*c),
+            SymbolResolution::Found(c, bytes) => still_live.push((*c, bytes)),
             SymbolResolution::NotFound => {}
             // Fail closed: can't be sure of the whole set if even one
             // candidate's live-check itself failed to read/re-parse.
@@ -665,8 +682,13 @@ pub(crate) fn resolve_symbol(
     }
     match still_live.len() {
         0 => Ok(SymbolResolution::NotFound),
-        1 => Ok(SymbolResolution::Found(Box::new(still_live.remove(0)))),
-        _ => Ok(SymbolResolution::Ambiguous(still_live)),
+        1 => {
+            let (c, bytes) = still_live.remove(0);
+            Ok(SymbolResolution::Found(Box::new(c), bytes))
+        }
+        _ => Ok(SymbolResolution::Ambiguous(
+            still_live.into_iter().map(|(c, _)| c).collect(),
+        )),
     }
 }
 
@@ -690,10 +712,16 @@ pub(crate) fn verify_live(
         )
         .ok();
     // No file_index row for this symbol's path -- should not happen for a
-    // healthy index, but degrade rather than panic: can't live-verify, so
-    // trust the DB row as-is (no worse than pre-Wave-1 behavior).
+    // healthy index, but degrade rather than panic: can't live-verify
+    // identity via hash, so trust the DB row's coordinates as-is (no worse
+    // than pre-Wave-1 behavior). Wave 6 (P0-B): still attempt a live read
+    // so a downstream consumer (source()/understand()) can serve THESE
+    // bytes instead of re-reading the file itself a second time -- a
+    // second, independent read would reopen its own TOCTOU window even
+    // though this escape hatch already can't verify identity.
     let Some(indexed_hash) = indexed_hash else {
-        return SymbolResolution::Found(Box::new(c));
+        let bytes = std::fs::read_to_string(project_root.join(&c.path)).ok();
+        return SymbolResolution::Found(Box::new(c), bytes);
     };
     let full_path = project_root.join(&c.path);
     let live = match std::fs::read_to_string(&full_path) {
@@ -707,7 +735,7 @@ pub(crate) fn verify_live(
         }
     };
     if calm_core::indexer::pipeline::hash_content(&live) == indexed_hash {
-        return SymbolResolution::Found(Box::new(c));
+        return SymbolResolution::Found(Box::new(c), Some(live));
     }
     let symbols = match calm_core::indexer::parser::extract_symbols(&live, &c.language, &c.path) {
         Ok(s) => s,
@@ -731,7 +759,7 @@ pub(crate) fn verify_live(
             let mut c = c;
             c.line_start = m.line_start as i64;
             c.line_end = m.line_end as i64;
-            SymbolResolution::Found(Box::new(c))
+            SymbolResolution::Found(Box::new(c), Some(live))
         }
         n => SymbolResolution::ReadFailed(error_detail(
             "STALE_AMBIGUOUS",

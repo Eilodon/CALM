@@ -51,7 +51,7 @@ impl CalmServer {
                     return ResolvedOutcome::ambiguous(&candidates);
                 }
                 SymbolResolution::ReadFailed(e) => return ResolvedOutcome::error(e),
-                SymbolResolution::Found(c) => *c,
+                SymbolResolution::Found(c, _) => *c,
             };
             self.track_symbol(&c.qualified_name);
             self.track_file(&c.path);
@@ -334,7 +334,7 @@ impl CalmServer {
                     return ResolvedOutcome::ambiguous(&candidates);
                 }
                 SymbolResolution::ReadFailed(e) => return ResolvedOutcome::error(e),
-                SymbolResolution::Found(c) => *c,
+                SymbolResolution::Found(c, _) => *c,
             };
             self.track_symbol(&c.qualified_name);
             self.track_file(&c.path);
@@ -712,7 +712,7 @@ impl CalmServer {
                     return ResolvedOutcome::ambiguous(&candidates);
                 }
                 SymbolResolution::ReadFailed(e) => return ResolvedOutcome::error(e),
-                SymbolResolution::Found(c) => *c,
+                SymbolResolution::Found(c, _) => *c,
             };
             self.track_symbol(&c.qualified_name);
             self.track_file(&c.path);
@@ -1016,12 +1016,24 @@ impl CalmServer {
     /// certain by construction, so that case reports `formal`, not an
     /// arbitrary/misleadingly-low default.
     fn weakest_route_confidence(route: &[calm_core::graph::path::PathStep]) -> &'static str {
+        if route.is_empty() {
+            // Trivial self-step (from_symbol == to_symbol) has no edge at
+            // all to rank -- reaching a node trivially is certain by
+            // construction, so this case alone reports `formal` (see the
+            // doc comment above).
+            return calm_core::types::EdgeConfidence::Formal.as_str();
+        }
         route
             .iter()
             .filter_map(|step| step.edge_confidence.as_deref())
             .filter_map(calm_core::types::EdgeConfidence::parse)
             .min_by_key(calm_core::types::EdgeConfidence::rank)
-            .unwrap_or(calm_core::types::EdgeConfidence::Formal)
+            // Wave 6 (audit follow-up, P0-C): a NON-empty route whose steps
+            // all have missing/unparseable edge_confidence is a genuine
+            // "don't know" case, not the trivial self-path above -- must
+            // never silently read as Formal-grade. Reports the weakest
+            // tier instead now that the empty-route case is handled above.
+            .unwrap_or(calm_core::types::EdgeConfidence::Unresolved)
             .as_str()
     }
 
@@ -1053,7 +1065,7 @@ impl CalmServer {
                 SymbolResolution::NotFound => return ResolvedOutcome::not_found(&p.from_symbol),
                 SymbolResolution::Ambiguous(candidates) => return ResolvedOutcome::ambiguous(&candidates),
                 SymbolResolution::ReadFailed(e) => return ResolvedOutcome::error(e),
-                SymbolResolution::Found(c) => *c,
+                SymbolResolution::Found(c, _) => *c,
             };
             self.track_symbol(&from.qualified_name);
             self.track_file(&from.path);
@@ -1066,7 +1078,7 @@ impl CalmServer {
                 SymbolResolution::NotFound => return ResolvedOutcome::not_found(&p.to_symbol),
                 SymbolResolution::Ambiguous(candidates) => return ResolvedOutcome::ambiguous(&candidates),
                 SymbolResolution::ReadFailed(e) => return ResolvedOutcome::error(e),
-                SymbolResolution::Found(c) => *c,
+                SymbolResolution::Found(c, _) => *c,
             };
             self.track_symbol(&to.qualified_name);
             self.track_file(&to.path);
@@ -1126,16 +1138,36 @@ impl CalmServer {
             // downstream currently drives an edit-permissiveness decision
             // off `certain`, so tightening it here is a pure correctness
             // fix, not a safety-relevant behavior change.
+            // Wave 6 (audit follow-up, P0-C): fail CLOSED on an unparseable
+            // confidence string, not open. In practice `c` always comes
+            // from `weakest_route_confidence`'s own `as_str()` output (a
+            // proper `EdgeConfidence::parse` inverse), so this branch is
+            // defense-in-depth only -- but "certain" defaulting to `true`
+            // on data this function itself doesn't recognize was the wrong
+            // direction for a flag whose whole contract is "verified, not
+            // a guess".
             let certain = exists == Some(true)
                 && route_confidence.iter().any(|c| {
                     calm_core::types::EdgeConfidence::parse(c)
                         .map(|ec| ec.is_verified())
-                        .unwrap_or(true)
+                        .unwrap_or(false)
                 });
 
             let count = routes.len();
+            // Wave 6 (audit follow-up, P1-B): this branch was missing
+            // `from_symbol`/`to_symbol` -- `path`'s own required fields --
+            // while the MaxHops branch right below it already had them.
+            // Same fix, applied here too.
             let sn = if matches!(&terminated_by, Some(TerminatedByOutput::Timeout)) {
-                suggested_with_args("path", "Retry with smaller max_hops", serde_json::json!({"max_hops": 4}))
+                suggested_with_args(
+                    "path",
+                    "Retry with smaller max_hops",
+                    serde_json::json!({
+                        "max_hops": 4,
+                        "from_symbol": p.from_symbol,
+                        "to_symbol": p.to_symbol,
+                    }),
+                )
             } else if matches!(&terminated_by, Some(TerminatedByOutput::MaxHops)) {
                 let new_hops = requested_hops + 4;
                 suggested_with_args("path", "Path may exceed hop limit — retry with larger max_hops, or check the reverse direction",

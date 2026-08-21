@@ -98,7 +98,18 @@ pub fn search(
 /// implementation file with e.g. "test" in a legitimate directory name like
 /// `latest/`, so checks anchor on path-segment boundaries via `/`, `_`, `.`
 /// rather than bare substring wherever that risk is realistic).
-fn is_noisy_path(path: &str) -> bool {
+/// Path-only "does this look like a test file" heuristic -- shared by
+/// `is_noisy_path` (ranking demotion, unchanged behavior) and, as of Wave 6
+/// (audit follow-up, P1-B), `chunk_hit_to_result`'s gap-chunk branch (a
+/// chunk with no enclosing symbol -- `detect_is_test`, the per-SYMBOL
+/// detector `symbols.is_test` is populated from, needs a function name/
+/// decorator to inspect and simply has nothing to work with there). This
+/// is deliberately narrower than `is_noisy_path` as a whole: naming/
+/// directory conventions for TESTS specifically, not also generated/
+/// vendor/example paths -- `include_tests=false`'s own contract is about
+/// tests, and conflating it with the broader noise set would silently
+/// start filtering generated/vendor/example content too.
+fn is_test_path(path: &str) -> bool {
     let p = path.to_ascii_lowercase();
     // Paths are stored project-root-relative with no leading slash (e.g.
     // "src/main.py"), so a top-level noisy directory has no "/" before it —
@@ -107,14 +118,22 @@ fn is_noisy_path(path: &str) -> bool {
         let with_slash = format!("{name}/");
         p.starts_with(&with_slash) || p.contains(&format!("/{with_slash}"))
     };
-    let is_test = has_dir("test")
+    has_dir("test")
         || has_dir("tests")
         || p.starts_with("test_")
         || p.contains("/test_")
         || p.contains("_test.")
         || p.contains(".test.")
         || p.contains(".spec.")
-        || p.contains("_spec.");
+        || p.contains("_spec.")
+}
+
+fn is_noisy_path(path: &str) -> bool {
+    let p = path.to_ascii_lowercase();
+    let has_dir = |name: &str| {
+        let with_slash = format!("{name}/");
+        p.starts_with(&with_slash) || p.contains(&format!("/{with_slash}"))
+    };
     let is_generated = has_dir("generated")
         || p.contains(".generated.")
         || has_dir("vendor")
@@ -128,7 +147,7 @@ fn is_noisy_path(path: &str) -> bool {
         || has_dir("fixture")
         || has_dir("mocks")
         || has_dir("mock");
-    is_test || is_generated || is_example
+    is_test_path(path) || is_generated || is_example
 }
 
 /// Score multiplier for a result — see `NOISE_PENALTY`, `is_noisy_path`, and
@@ -921,7 +940,20 @@ fn chunk_hit_to_result(conn: &Connection, chunk_id: i64) -> rusqlite::Result<Opt
                 format!("{path}#chunk:{line_start}-{line_end}"),
                 fname,
                 None,
-                false,
+                // Wave 6 (audit follow-up, P1-B): was hardcoded `false` --
+                // a gap-chunk (no enclosing symbol, so no `symbols.is_test`
+                // row to inherit) always reported not-a-test regardless of
+                // the file it actually came from, so `include_tests=false`
+                // could never filter body-only content sitting at module
+                // level in a test file (module-level fixtures/constants/
+                // setup code between test functions, or a test file with
+                // no functions extracted as symbols at all). Path-only
+                // heuristic, same one `is_noisy_path` uses for its own
+                // narrower test-detection slice -- necessarily coarser
+                // than `detect_is_test`'s per-symbol check (no function
+                // name/decorator to inspect here), but strictly better
+                // than never matching at all.
+                is_test_path(&path),
                 None,
                 None,
             )
@@ -1109,7 +1141,43 @@ fn search_hybrid(
     embedder: Option<&Embedder>,
     rrf_k: f64,
 ) -> rusqlite::Result<SearchOutput> {
-    let fts_output = search_symbol(conn, query, limit)?;
+    // Wave 6 (audit follow-up, P1-A): the FTS leg (used both as the 3-way
+    // RRF input below AND as the degraded-fallback result in both early
+    // returns) must cover name+docstring+signature (search_symbol's own
+    // domain) UNION function bodies (chunk_text_results) -- NEITHER
+    // `search_symbol` NOR `search_text` alone is a superset of the other:
+    // `search_symbol` matches `name` (which `search_text` deliberately
+    // excludes -- "that's what kind=symbol is for", see that function's own
+    // comment), while `search_text`/`chunk_text_results` additionally cover
+    // body content `search_symbol` never touches. A first version of this
+    // fix swapped in `search_text` wholesale and broke exactly this: a
+    // name-only match (searching for a function by its exact name, the
+    // single most common query shape) returned NOTHING once embeddings
+    // were unavailable -- caught by this crate's own
+    // `search_handler_hybrid_default_degrades_to_symbol_results_without_
+    // embedder` test. Skips the merge entirely (byte-identical to
+    // `search_symbol`'s own output) when there's no body match at all --
+    // the common case, and exactly what that test's fixture exercises.
+    let symbol_output = search_symbol(conn, query, limit)?;
+    let chunk_hits = chunk_text_results(conn, query, limit)?;
+    let fts_output = if chunk_hits.is_empty() {
+        symbol_output
+    } else {
+        SearchOutput {
+            truncated: symbol_output.truncated || chunk_hits.len() > limit,
+            results: rrf_merge_n(
+                &[
+                    (&symbol_output.results, RRF_FTS_WEIGHT),
+                    (&chunk_hits, RRF_CHUNK_WEIGHT),
+                ],
+                limit,
+                rrf_k,
+                "hybrid_fts",
+            ),
+            degraded: false,
+            note: None,
+        }
+    };
 
     let Some(embedder) = embedder else {
         return Ok(SearchOutput {
@@ -1881,6 +1949,44 @@ mod tests {
     }
 
     #[test]
+    fn test_search_hybrid_degraded_still_finds_function_body_only_content() {
+        // Wave 6 (audit follow-up, P1-A): before this fix, hybrid's
+        // degraded (no-embedder) fallback used search_symbol's FTS leg
+        // (name/docstring/signature only), so a query matching ONLY inside
+        // a function body was invisible to the DEFAULT search kind whenever
+        // embeddings were unavailable -- exactly the gap kind="text" itself
+        // already closed for the SAME kind of query in Wave 3, just never
+        // carried over to hybrid's own fallback. Same fixture/query shape
+        // as test_search_text_finds_function_body_only_content_via_chunk_fts.
+        let conn = setup_db_with_symbols();
+        conn.execute(
+            "INSERT INTO code_chunks (path, line_start, line_end, chunk_text, symbol_qn, file_hash) \
+             VALUES ('src/main.py', 20, 24, 'result = xylophonemarkerzzz(x, y)\nreturn result', NULL, 'h')",
+            [],
+        )
+        .unwrap();
+
+        let output = search(
+            &conn,
+            "xylophonemarkerzzz",
+            SearchKind::Hybrid,
+            10,
+            None,
+            DEFAULT_RRF_K,
+        )
+        .unwrap();
+        assert!(
+            output.degraded,
+            "no embedder supplied -- must still degrade"
+        );
+        assert!(
+            !output.results.is_empty(),
+            "body-only content must be found via degraded kind=hybrid now that its FTS \
+             leg is search_text, not search_symbol"
+        );
+    }
+
+    #[test]
     fn test_rrf_merge_combines_results() {
         let fts = vec![
             SearchResult {
@@ -2044,6 +2150,33 @@ mod tests {
         // Synthesized key must be unique per line range, not collide with a
         // real qualified_name.
         assert!(r.qualified_name.contains("#chunk:1-2"));
+    }
+
+    #[test]
+    fn test_chunk_hit_to_result_gap_chunk_in_a_test_file_reports_is_test() {
+        // Wave 6 (audit follow-up, P1-B): a gap-chunk (no enclosing symbol)
+        // used to hardcode `is_test: false` regardless of the file it came
+        // from -- `include_tests=false` could never filter module-level
+        // content (fixtures/constants/setup code between test functions)
+        // sitting in an obviously-named test file. Path-only heuristic now
+        // applies (`is_test_path`), same convention `is_noisy_path` already
+        // used for ranking demotion.
+        let conn = setup_db_with_symbols();
+        conn.execute(
+            "INSERT INTO code_chunks (path, line_start, line_end, chunk_text, symbol_qn, file_hash) \
+             VALUES ('tests/test_helpers.py', 1, 2, 'FIXTURE_DATA = {}', NULL, 'h')",
+            [],
+        )
+        .unwrap();
+        let chunk_id: i64 = conn
+            .query_row("SELECT id FROM code_chunks", [], |r| r.get(0))
+            .unwrap();
+
+        let r = chunk_hit_to_result(&conn, chunk_id).unwrap().unwrap();
+        assert!(
+            r.is_test,
+            "a gap-chunk from tests/test_helpers.py must report is_test: true"
+        );
     }
 
     #[test]

@@ -162,7 +162,7 @@ impl CalmServer {
                 SymbolResolution::NotFound => ResolvedOutcome::not_found(&p.symbol),
                 SymbolResolution::Ambiguous(candidates) => ResolvedOutcome::ambiguous(&candidates),
                 SymbolResolution::ReadFailed(e) => ResolvedOutcome::error(e),
-                SymbolResolution::Found(c) => {
+                SymbolResolution::Found(c, _) => {
                     let c = *c;
                     self.track_symbol(&c.qualified_name);
                     self.track_file(&c.path);
@@ -235,13 +235,13 @@ impl CalmServer {
                 Ok(r) => r,
                 Err(e) => return db_error_resolved(e),
             };
-            let c = match resolution {
+            let (c, verified_bytes) = match resolution {
                 SymbolResolution::NotFound => return ResolvedOutcome::not_found(&symbol_name),
                 SymbolResolution::Ambiguous(candidates) => {
                     return ResolvedOutcome::ambiguous(&candidates);
                 }
                 SymbolResolution::ReadFailed(e) => return ResolvedOutcome::error(e),
-                SymbolResolution::Found(c) => *c,
+                SymbolResolution::Found(c, bytes) => (*c, bytes),
             };
             // Release the read connection before file IO (mirrors the original
             // scoping); range mode above keeps it for its language lookup.
@@ -249,9 +249,17 @@ impl CalmServer {
             self.track_symbol(&c.qualified_name);
             self.track_file(&c.path);
 
-            let full_path = self.project_root.join(&c.path);
-            let (raw_source, data_source, etag) = match std::fs::read_to_string(&full_path) {
-                Ok(content) => {
+            // Wave 6 (audit follow-up, P0-B): slice from the EXACT bytes
+            // `resolve_symbol`'s live-verification just read, instead of
+            // re-reading the file here -- a second, independent read would
+            // reopen a TOCTOU window between "what was verified" and "what
+            // was served" (a write landing between the two reads could make
+            // this serve content that was never actually checked against
+            // `c.line_start`/`c.line_end`). `verified_bytes` is `None` only
+            // when verify_live's own read failed (rare: TOCTOU delete,
+            // permission change) -- same "unreadable" outcome as before.
+            let (raw_source, data_source, etag) = match verified_bytes {
+                Some(content) => {
                     let lines: Vec<&str> = content.lines().collect();
                     // Both ends clamped to lines.len() (2026-08-20
                     // truth-kernel audit, P0-1e): `start` alone being
@@ -270,7 +278,7 @@ impl CalmServer {
                     );
                     (lines[start..end].join("\n"), "disk", etag)
                 }
-                Err(_) => ("(source file not readable)".into(), "unavailable", None),
+                None => ("(source file not readable)".into(), "unavailable", None),
             };
 
             // A non-hub symbol read fresh from disk is directly edit-ready:
@@ -448,10 +456,17 @@ impl CalmServer {
             sanitized
         };
         let token_estimate = estimate_tokens(&rendered);
-        let sn = self.filter_sn(suggested_with_args(
+        // Wave 6 (audit follow-up, P1-B): was `suggested_with_args` with
+        // only `{"path": path}` -- `edit_lines` also requires `edits`
+        // (the hunk array), which can't be safely pre-filled here (this
+        // function doesn't know what the caller wants to WRITE, only what
+        // it read). Downgraded to `suggested` (no args): still names the
+        // right next tool and explains how to use the etag, without
+        // claiming a directly-callable args object that would actually
+        // fail `edit_lines`'s own required-field validation.
+        let sn = self.filter_sn(suggested(
             "edit_lines",
-            "Range read — edit this window directly (etag is the expected_hash; or set old_text on a hunk to skip the hash entirely and edit narrower than this window)",
-            serde_json::json!({ "path": path }),
+            "Range read — edit this window directly (etag is the expected_hash for an edits hunk spanning this range; or set old_text on a hunk to skip the hash entirely and edit narrower than this window)",
         ));
         ResolvedOutcome::success(SourceOutput {
             symbol: String::new(),
@@ -486,6 +501,21 @@ impl CalmServer {
         Json(self.timed_tool("understand", || {
             let kind_str = p.kind.as_deref().unwrap_or("hybrid");
             let kind = Self::parse_understand_kind(kind_str);
+            // Wave 6 (audit follow-up, P1-A): `parse_understand_kind` maps
+            // any unrecognized string to Symbol -- indistinguishable, from
+            // its return value alone, from an explicit `kind: "symbol"`.
+            // Surface it here (the one place that still has the original
+            // string) so a caller who mistyped `kind` gets an honest signal
+            // instead of a silent, unexplained narrowing to symbol-only
+            // results.
+            let kind_note = if matches!(kind_str, "text" | "file" | "hybrid" | "symbol") {
+                None
+            } else {
+                Some(format!(
+                    "unrecognized kind '{kind_str}' — defaulting to 'symbol' \
+                     (valid values: text, file, hybrid, symbol)"
+                ))
+            };
 
             // READ-only: open a dedicated read connection (SINGLE_WRITER enforcement)
             let conn = match self.make_read_conn() {
@@ -517,16 +547,14 @@ impl CalmServer {
             // report that honestly instead of quietly picking top-1.
             // UNDERSTAND_AMBIGUOUS_MARGIN_RATIO is a judgment call (no
             // existing precedent in this codebase's search/ranking code to
-            // anchor it to).
-            let resolution_confidence = match (&top, &second) {
-                (None, _) => "none",
-                (Some(t), Some(s))
-                    if t.score > 0.0 && s.score >= t.score * UNDERSTAND_AMBIGUOUS_MARGIN_RATIO =>
-                {
-                    "ambiguous"
-                }
-                (Some(_), _) => "confident",
-            };
+            // anchor it to). Wave 6 (audit follow-up, P1-A) added the
+            // "weak" tier -- see `classify_resolution_confidence`'s own
+            // doc comment for the full rationale.
+            let resolution_confidence = Self::classify_resolution_confidence(
+                top.as_ref().map(|t| t.score),
+                second.as_ref().map(|s| s.score),
+                UNDERSTAND_AMBIGUOUS_MARGIN_RATIO,
+            );
             let alternatives: Vec<UnderstandAlternative> = if resolution_confidence == "ambiguous" {
                 [top.as_ref(), second.as_ref()]
                     .into_iter()
@@ -564,7 +592,20 @@ impl CalmServer {
             // (bare name + path from the search hit) so a renamed/moved/
             // deleted symbol is caught here instead of silently returning
             // whatever DB row still matches the search hit's qualified_name.
-            let mut symbol_info: Option<(SymbolInfoOutput, String)> = top.as_ref().and_then(|t| {
+            // Wave 6 (audit follow-up, P0-B): third tuple field carries the
+            // exact bytes `resolve_symbol`'s live-verification read for this
+            // candidate, threaded down to `source_output` below so it can
+            // slice from THESE bytes instead of re-reading the file -- a
+            // second, independent read reopens a TOCTOU window between what
+            // was verified and what gets served. `None` for the Ambiguous
+            // fallback branch (that residual candidate was never itself
+            // live-verified in the first place -- see its own comment
+            // below -- so there are no verified bytes to propagate; falls
+            // back to `source_output`'s own read, unchanged from before
+            // this fix, not a new gap).
+            let mut symbol_info: Option<(SymbolInfoOutput, String, Option<String>)> = top
+                .as_ref()
+                .and_then(|t| {
                 // 3.4 (Wave 3): the search hit already carries its own
                 // exact qualified_name -- use it directly instead of
                 // re-deriving via bare name+path, closing even the DB-
@@ -572,8 +613,8 @@ impl CalmServer {
                 // Ambiguous match arm below, now unreachable in practice
                 // but kept as defense in depth).
                 match resolve_symbol(&conn, &self.project_root, &t.name, Some(&t.path), None, Some(t.qualified_name.as_str())) {
-                    Ok(SymbolResolution::Found(c)) => {
-                        Some((c.to_symbol_info(), c.language.clone()))
+                    Ok(SymbolResolution::Found(c, bytes)) => {
+                        Some((c.to_symbol_info(), c.language.clone(), bytes))
                     }
                     // DB-ambiguous (rare: e.g. a cfg/not(cfg) same-named stub
                     // pair) -- the search hit already told us exactly which
@@ -585,7 +626,7 @@ impl CalmServer {
                     Ok(SymbolResolution::Ambiguous(candidates)) => candidates
                         .into_iter()
                         .find(|c| c.qualified_name == t.qualified_name)
-                        .map(|c| (c.to_symbol_info(), c.language.clone())),
+                        .map(|c| (c.to_symbol_info(), c.language.clone(), None)),
                     Ok(SymbolResolution::NotFound) | Ok(SymbolResolution::ReadFailed(_)) | Err(_) => {
                         None
                     }
@@ -596,7 +637,7 @@ impl CalmServer {
             // query_row above (not inside its closure) since both borrow
             // `conn` and rusqlite doesn't allow a nested prepare() while
             // one row-mapping call is still in flight.
-            if let Some((info, _)) = symbol_info.as_mut() {
+            if let Some((info, _, _)) = symbol_info.as_mut() {
                 let (tr, ef) = fetch_semantic_facts(&conn, &info.qualified_name);
                 info.content_warning = semantic_facts_content_warning(
                     tr.as_deref().unwrap_or_default(),
@@ -608,16 +649,22 @@ impl CalmServer {
             // Tier 2 semantic fact (2026-08-07 roadmap T2).
             let architecture_digest = symbol_info
                 .as_ref()
-                .and_then(|(info, _)| fetch_architecture_digest(&conn, &info.qualified_name));
+                .and_then(|(info, _, _)| fetch_architecture_digest(&conn, &info.qualified_name));
 
-            if let Some((info, _)) = symbol_info.as_ref() {
+            if let Some((info, _, _)) = symbol_info.as_ref() {
                 self.track_symbol(&info.qualified_name);
                 self.track_file(&info.path);
             }
 
-            let source_output = symbol_info.as_ref().and_then(|(info, language)| {
-                let full_path = self.project_root.join(&info.path);
-                let content = std::fs::read_to_string(&full_path).ok()?;
+            let source_output = symbol_info.as_ref().and_then(|(info, language, bytes)| {
+                // Wave 6 (P0-B): prefer the already-verified bytes; only
+                // fall back to a fresh read for the Ambiguous-residual case
+                // above, where none were ever captured (pre-existing
+                // posture, not a new TOCTOU window).
+                let content = match bytes {
+                    Some(b) => b.clone(),
+                    None => std::fs::read_to_string(self.project_root.join(&info.path)).ok()?,
+                };
                 let lines: Vec<&str> = content.lines().collect();
                 // Both ends clamped to lines.len() -- same P0-1e defensive
                 // fix as source() (2026-08-20 truth-kernel audit).
@@ -650,7 +697,7 @@ impl CalmServer {
             });
 
             let callers = match symbol_info.as_ref() {
-                Some((info, _)) => {
+                Some((info, _, _)) => {
                     let mut stmt = match conn.prepare(
                         // PATTERN-DEBT call-edges-missing-ruled-out-filter:
                         // a SCIP-disproven caller isn't a real caller.
@@ -699,7 +746,7 @@ impl CalmServer {
                 None => Vec::new(),
             };
 
-            let sn = if let Some((ref info, _)) = symbol_info {
+            let sn = if let Some((ref info, _, _)) = symbol_info {
                 if info.is_hub {
                     suggested_with_args("edit_context", "Hub — mandatory pre-edit check", serde_json::json!({"symbol": info.name, "path": info.path}))
                 } else {
@@ -712,11 +759,12 @@ impl CalmServer {
             };
 
             ToolOutcome::success(UnderstandOutput {
-                symbol: symbol_info.map(|(info, _)| info),
+                symbol: symbol_info.map(|(info, _, _)| info),
                 source: source_output,
                 callers_summary: callers,
                 edges_ready: Some(self.edges_ready()),
                 suggested_next: self.filter_sn(sn),
+                note: kind_note,
                 architecture_digest,
                 resolution_confidence: resolution_confidence.to_string(),
                 alternatives: if alternatives.is_empty() {
@@ -742,6 +790,31 @@ impl CalmServer {
             "file" => calm_core::types::SearchKind::File,
             "hybrid" => calm_core::types::SearchKind::Hybrid,
             _ => calm_core::types::SearchKind::Symbol,
+        }
+    }
+
+    /// Wave 6 (audit follow-up, P1-A): extracted out of `understand`'s body
+    /// for the same reason `parse_understand_kind` was (5.4, Wave 5) --
+    /// directly unit-testable without needing a real search backend to
+    /// naturally produce a `<= 0.0`-scoring top hit (verified-positive by
+    /// construction on today's real search producers, per
+    /// `search_symbol`'s own `scores_positive` test invariant, so this
+    /// branch is defense-in-depth against a future/different producer, not
+    /// a case reachable through today's real data -- extracting it as its
+    /// own function is what makes it testable at all). See
+    /// `UnderstandOutput::resolution_confidence`'s doc comment for the full
+    /// four-value contract and why a single fixed score-magnitude floor
+    /// isn't sound across every `SearchKind`.
+    pub(crate) fn classify_resolution_confidence(
+        top_score: Option<f64>,
+        second_score: Option<f64>,
+        margin_ratio: f64,
+    ) -> &'static str {
+        match (top_score, second_score) {
+            (None, _) => "none",
+            (Some(t), Some(s)) if t > 0.0 && s >= t * margin_ratio => "ambiguous",
+            (Some(t), _) if t > 0.0 => "confident",
+            (Some(_), _) => "weak",
         }
     }
 
@@ -842,7 +915,7 @@ impl CalmServer {
                 .into_iter()
                 .filter_map(
                     |(qn, row)| match verify_live(&conn, &self.project_root, row) {
-                        SymbolResolution::Found(c) => Some((qn, *c)),
+                        SymbolResolution::Found(c, _) => Some((qn, *c)),
                         _ => None,
                     },
                 )
@@ -1352,9 +1425,14 @@ pub(crate) struct UnderstandParams {
     /// `resolution_confidence: "ambiguous"` is returned instead, with both
     /// candidates in `alternatives` and no committed `symbol`/`source`.
     pub(crate) query: String,
-    /// One of `"symbol"` (default), `"text"`, or `"file"` — same meaning as
-    /// `locate`'s `kind`, minus `"semantic"`/`"hybrid"` (not supported
-    /// here). Any other value silently falls back to `"symbol"`.
+    /// One of `"text"`, `"file"`, `"hybrid"` (default), or `"symbol"` --
+    /// same meaning as `locate`'s `kind`, minus `"semantic"` (not supported
+    /// here). Any other value silently falls back to `"symbol"` (see
+    /// `UnderstandOutput::note` when that happens). Wave 6 (audit
+    /// follow-up): corrected -- this previously claimed `"symbol"` was the
+    /// default and `"hybrid"` unsupported, both wrong (the handler
+    /// defaults to `"hybrid"` and `parse_understand_kind` maps it
+    /// explicitly).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) kind: Option<String>,
 }
@@ -1369,6 +1447,10 @@ pub(crate) struct UnderstandOutput {
     pub(crate) edges_ready: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) suggested_next: Option<SuggestedNext>,
+    /// Wave 6 (audit follow-up, P1-A): set when `kind` was an unrecognized
+    /// string (silently narrowed to `"symbol"`) -- absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) note: Option<String>,
     /// Tier 2 semantic fact (2026-08-07 roadmap T2). `None` when this
     /// symbol has no digest row yet — never a fabricated summary; see
     /// `ArchitectureDigestOutput`'s doc comment.
@@ -1380,6 +1462,14 @@ pub(crate) struct UnderstandOutput {
     /// `symbol`/`source`/`callers_summary`/`architecture_digest` are all
     /// left empty rather than committing to a coin-flip pick — see
     /// `alternatives` instead.
+    ///
+    /// Wave 6 (audit follow-up, P1-A): a fourth value, `"weak"` — a top hit
+    /// exists (and there's no close runner-up), but its own score is `<=
+    /// 0.0`, i.e. no real positive relevance signal at all. Still populates
+    /// `symbol`/`source`/etc. (this is a "believe it cautiously" signal,
+    /// not a disambiguation failure like `"ambiguous"`) but the caller
+    /// should not treat it as a confirmed match the way `"confident"`
+    /// implies.
     pub(crate) resolution_confidence: String,
     /// Populated only when `resolution_confidence == "ambiguous"`: the top
     /// two candidates that were too close to call, for the caller to

@@ -59,7 +59,7 @@ impl CalmServer {
                     return ResolvedOutcome::ambiguous(&candidates);
                 }
                 SymbolResolution::ReadFailed(e) => return ResolvedOutcome::error(e),
-                SymbolResolution::Found(c) => *c,
+                SymbolResolution::Found(c, _) => *c,
             };
             self.track_symbol(&c.qualified_name);
             self.track_file(&c.path);
