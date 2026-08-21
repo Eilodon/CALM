@@ -12,8 +12,9 @@ use crate::indexer::parser::ParsedSymbol;
 // hash_content / collect_source_files) unchanged -- verified via callers()
 // before the move that both have real external callers reaching them that way.
 mod discovery;
+pub(crate) use discovery::mtime_secs;
 pub use discovery::{collect_source_files, hash_content};
-use discovery::{mtime_secs, read_source_capped, rel_path, upsert_file_index};
+use discovery::{mark_file_index_skip_reason, read_source_capped, rel_path, upsert_file_index};
 
 // PR#7 slice 2: move-only extraction of per-file parsing/resolution +
 // persistence into pipeline/extraction.rs. formal_resolution_timeout_count
@@ -898,6 +899,58 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Regression for 4.1a (docs/plans/2026-08-20-truth-kernel-hardening-
+    /// execution-plan.md): before the fix, a file that was walked (still on
+    /// disk, recognized extension) but transiently failed `read_source_capped`
+    /// (simulated here by pushing it over `MAX_INDEXABLE_FILE_BYTES`) was
+    /// dropped from `seen_paths` and treated exactly like a genuinely deleted
+    /// file -- its indexed symbols/call_sites were removed even though the
+    /// file still existed and would read fine on the very next pass.
+    #[test]
+    fn test_reindex_changed_does_not_delete_a_transiently_unreadable_file_row() {
+        let dir = std::env::temp_dir().join(format!(
+            "ci_idx_transient_unreadable_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("a.py");
+        std::fs::write(&target, "def hello():\n    pass\n").unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        run_indexing_pipeline(&mut conn, &dir, dummy_phase()).unwrap();
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM file_index"), 1);
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM symbols WHERE name = 'hello'"),
+            1
+        );
+
+        // Simulate a transient read failure without deleting the file: push
+        // it over the byte cap, same technique as
+        // `read_source_capped_skips_a_file_over_the_byte_cap` above.
+        let f = std::fs::File::create(&target).unwrap();
+        f.set_len(MAX_INDEXABLE_FILE_BYTES + 1).unwrap();
+
+        let summary = reindex_changed(&mut conn, &dir).unwrap();
+        assert_eq!(
+            summary.deleted, 0,
+            "a file that still exists on disk but transiently failed to read must not be counted as deleted"
+        );
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM file_index WHERE path = 'a.py'"),
+            1,
+            "a.py's file_index row must survive a transient read failure"
+        );
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM symbols WHERE name = 'hello'"),
+            1,
+            "a.py's symbols must not be deleted just because this pass couldn't re-read it"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // Plan 3 §3.1 Phase A: reindex_paths must touch ONLY the given paths —
     // no full-repo walk/hash, no re-scan of files not in the given list.
     #[test]
@@ -979,7 +1032,7 @@ mod tests {
         std::fs::write(&small, "def a():\n    pass\n").unwrap();
         assert_eq!(
             read_source_capped(&small).as_deref(),
-            Some("def a():\n    pass\n"),
+            Ok("def a():\n    pass\n"),
             "a normal-sized file must still be read exactly as before"
         );
 
@@ -988,16 +1041,18 @@ mod tests {
         // actually allocates/reads MAX_INDEXABLE_FILE_BYTES worth of data.
         let f = std::fs::File::create(&huge).unwrap();
         f.set_len(MAX_INDEXABLE_FILE_BYTES + 1).unwrap();
+        let skip_reason = read_source_capped(&huge)
+            .expect_err("a file over MAX_INDEXABLE_FILE_BYTES must be skipped, not read");
         assert!(
-            read_source_capped(&huge).is_none(),
-            "a file over MAX_INDEXABLE_FILE_BYTES must be skipped, not read"
+            skip_reason.starts_with("too_large:"),
+            "skip reason must identify the cause as too_large, got {skip_reason:?}"
         );
 
         let exactly_at_cap = dir.join("at_cap.py");
         let f = std::fs::File::create(&exactly_at_cap).unwrap();
         f.set_len(MAX_INDEXABLE_FILE_BYTES).unwrap();
         assert!(
-            read_source_capped(&exactly_at_cap).is_some(),
+            read_source_capped(&exactly_at_cap).is_ok(),
             "a file exactly AT the cap must still be read (cap is an upper bound, not exclusive)"
         );
 
@@ -1029,13 +1084,22 @@ mod tests {
             1,
             "the normal-sized sibling file must still be indexed"
         );
-        assert_eq!(
-            count(
-                &conn,
-                "SELECT COUNT(*) FROM file_index WHERE path = 'huge.py'"
-            ),
-            0,
-            "the oversized file must be skipped entirely -- no file_index row at all"
+        // 4.1b: a skipped file now earns a placeholder file_index row (so
+        // its skip is discoverable, e.g. via fitness_report) instead of no
+        // row at all -- symbol_count stays 0 and skip_reason records why.
+        let (huge_symbol_count, huge_skip_reason): (i64, Option<String>) = conn
+            .query_row(
+                "SELECT symbol_count, skip_reason FROM file_index WHERE path = 'huge.py'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(huge_symbol_count, 0, "a skipped file has nothing extracted");
+        assert!(
+            huge_skip_reason
+                .as_deref()
+                .is_some_and(|r| r.starts_with("too_large:")),
+            "skip_reason must record why the file was skipped, got {huge_skip_reason:?}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -5174,6 +5238,56 @@ impl StructB {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verified_caller_count_excludes_inferred_and_textual_too() {
+        // 2.3 (Wave 2): verified_caller_count is EdgeConfidence::is_verified()
+        // (Formal/Resolved only) -- strictly narrower than caller_count's
+        // "everything except Ambiguous" bucket, which still counts
+        // Inferred/Textual. Direct call_edges inserts (not a real indexing
+        // run) keep this deterministic instead of depending on the resolver
+        // happening to produce each confidence tier from source text.
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end) \
+             VALUES ('t::target', 'target', 'function', 'rust', 't.rs', 1, 1)",
+            [],
+        )
+        .unwrap();
+        for (from, confidence) in [
+            ("t::formal_caller", "formal"),
+            ("t::resolved_caller", "resolved"),
+            ("t::inferred_caller", "inferred"),
+            ("t::textual_caller", "textual"),
+        ] {
+            conn.execute(
+                "INSERT INTO call_edges (from_symbol, to_symbol, edge_confidence, ruled_out_by_scip) \
+                 VALUES (?1, 't::target', ?2, 0)",
+                rusqlite::params![from, confidence],
+            )
+            .unwrap();
+        }
+
+        refresh_caller_counts(&conn).unwrap();
+
+        let (caller_count, verified_caller_count): (i64, i64) = conn
+            .query_row(
+                "SELECT caller_count, verified_caller_count FROM symbols \
+                 WHERE qualified_name = 't::target'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            caller_count, 4,
+            "caller_count counts everything except ambiguous-confidence edges"
+        );
+        assert_eq!(
+            verified_caller_count, 2,
+            "verified_caller_count excludes inferred/textual too, not just ambiguous"
+        );
     }
 
     #[test]

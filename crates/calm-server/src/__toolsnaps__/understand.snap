@@ -9,7 +9,7 @@
     "type": "object",
     "properties": {
       "query": {
-        "description": "Symbol name or free text to look up — resolved via the same search\nused by `locate`, but only the single best match is used.",
+        "description": "Symbol name or free text to look up — resolved via the same search\nused by `locate`. The best match is used when it clearly outranks\nthe runner-up (3.3, Wave 3); when the two are too close to call,\n`resolution_confidence: \"ambiguous\"` is returned instead, with both\ncandidates in `alternatives` and no committed `symbol`/`source`.",
         "type": "string"
       },
       "kind": {
@@ -477,6 +477,37 @@
           "recursive_component",
           "truncated"
         ]
+      },
+      "UnderstandAlternative": {
+        "description": "One candidate in `UnderstandOutput::alternatives` (3.3, Wave 3).",
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "qualified_name": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "kind": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "score": {
+            "type": "number",
+            "format": "double"
+          }
+        },
+        "required": [
+          "name",
+          "qualified_name",
+          "path",
+          "score"
+        ]
       }
     },
     "properties": {
@@ -542,6 +573,20 @@
             "type": "null"
           }
         ]
+      },
+      "resolution_confidence": {
+        "description": "3.3 (Wave 3, P1-2): `\"none\"` (no match at all), `\"confident\"` (a\nclear top hit), or `\"ambiguous\"` (the runner-up scored too close to\ncall — see `UNDERSTAND_AMBIGUOUS_MARGIN_RATIO`). When `\"ambiguous\"`,\n`symbol`/`source`/`callers_summary`/`architecture_digest` are all\nleft empty rather than committing to a coin-flip pick — see\n`alternatives` instead.",
+        "type": "string"
+      },
+      "alternatives": {
+        "description": "Populated only when `resolution_confidence == \"ambiguous\"`: the top\ntwo candidates that were too close to call, for the caller to\ndisambiguate (e.g. via `symbol_info` with an explicit `path`).",
+        "type": [
+          "array",
+          "null"
+        ],
+        "items": {
+          "$ref": "#/$defs/UnderstandAlternative"
+        }
       }
     },
     "type": "object"

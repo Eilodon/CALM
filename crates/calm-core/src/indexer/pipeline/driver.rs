@@ -42,9 +42,9 @@ use super::{
     ExtractedBatchRow, ExtractedFile, GraphMode, IncrementalOutcome, PARSE_BATCH_SIZE,
     ReindexSummary, cached_formal_resolver, cached_resolution_maps, collect_source_files,
     extract_file_data, hash_content, incremental_graph_update, invalidate_resolution_maps_cache,
-    is_manifest_path, mtime_secs, needs_call_site_identity_baseline, now_secs, persist_file,
-    read_source_capped, rebuild_call_site_identity_baseline, rebuild_graph, rel_path,
-    upsert_file_index,
+    is_manifest_path, mark_file_index_skip_reason, mtime_secs, needs_call_site_identity_baseline,
+    now_secs, persist_file, read_source_capped, rebuild_call_site_identity_baseline, rebuild_graph,
+    rel_path, upsert_file_index,
 };
 use crate::indexer::lang_constants::{is_recognized_unparsed_extension, language_for_extension};
 
@@ -230,6 +230,10 @@ fn reindex_all_cancellable_with_phase(
     // the first exact overlay pass after rebuilding the graph.
     tx.execute("DELETE FROM scip_overlay_state", [])?;
 
+    enum WalkOutcome {
+        Extracted(ExtractedBatchRow),
+        Skipped { rel: String, skip_reason: String },
+    }
     for batch in files.chunks(PARSE_BATCH_SIZE) {
         if cancel() {
             return Ok(PipelineOutcome::Cancelled);
@@ -237,8 +241,11 @@ fn reindex_all_cancellable_with_phase(
         // `lang: None` + `data: None` means a recognized-unparsed-extension
         // file (see `is_recognized_unparsed_extension`) — still earns a
         // `file_index` row below (path/hash/mtime, `language` NULL,
-        // `symbol_count` 0), just with nothing to extract or persist.
-        let extracted: Vec<ExtractedBatchRow> = batch
+        // `symbol_count` 0), just with nothing to extract or persist. A file
+        // that fails `read_source_capped` (too large, unreadable) records
+        // its `skip_reason` instead (truth-kernel-hardening plan, Wave 4
+        // item 4.1b) rather than silently getting no `file_index` row at all.
+        let outcomes: Vec<WalkOutcome> = batch
             .par_iter()
             .map(|file| {
                 let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("");
@@ -246,33 +253,44 @@ fn reindex_all_cancellable_with_phase(
                 if lang.is_none() && !is_recognized_unparsed_extension(ext) {
                     return None;
                 }
-                let source = read_source_capped(file)?;
                 let rel = rel_path(project_root, file);
-                let hash = hash_content(&source);
-                let mtime = mtime_secs(file);
-                let data = lang.map(|lang| {
-                    extract_file_data(&rel, lang, &source, &entry_point_patterns, formal)
-                });
-                Some((rel, lang, hash, mtime, data))
+                match read_source_capped(file) {
+                    Ok(source) => {
+                        let hash = hash_content(&source);
+                        let mtime = mtime_secs(file);
+                        let data = lang.map(|lang| {
+                            extract_file_data(&rel, lang, &source, &entry_point_patterns, formal)
+                        });
+                        Some(WalkOutcome::Extracted((rel, lang, hash, mtime, data)))
+                    }
+                    Err(skip_reason) => Some(WalkOutcome::Skipped { rel, skip_reason }),
+                }
             })
             .collect::<Vec<_>>()
             .into_iter()
             .flatten()
             .collect();
 
-        for (rel, lang, hash, mtime, data) in &extracted {
-            if let Some(data) = data {
-                persist_file(&tx, rel, hash, data)?;
+        for outcome in outcomes {
+            match outcome {
+                WalkOutcome::Extracted((rel, lang, hash, mtime, data)) => {
+                    if let Some(data) = &data {
+                        persist_file(&tx, &rel, &hash, data)?;
+                    }
+                    upsert_file_index(
+                        &tx,
+                        &rel,
+                        lang,
+                        &hash,
+                        mtime,
+                        data.as_ref().map(|d| d.symbol_count).unwrap_or(0),
+                        now,
+                    )?;
+                }
+                WalkOutcome::Skipped { rel, skip_reason } => {
+                    mark_file_index_skip_reason(&tx, &rel, &skip_reason, now)?;
+                }
             }
-            upsert_file_index(
-                &tx,
-                rel,
-                *lang,
-                hash,
-                *mtime,
-                data.as_ref().map(|d| d.symbol_count).unwrap_or(0),
-                now,
-            )?;
         }
     }
 
@@ -376,7 +394,19 @@ pub fn reindex_changed_cancellable(
         hash: String,
         mtime: f64,
     }
-    let candidates: Vec<Candidate> = files
+    // A file that was walked (still exists on disk, has a recognized
+    // extension) but whose content couldn't be read this pass (transiently
+    // too large, a permission hiccup, a non-UTF-8 write mid-flight) must
+    // still count as "seen" — otherwise it's indistinguishable from a
+    // genuinely deleted file to the `existing.keys()` loop below, and its
+    // symbols/call_sites get deleted even though the file still exists and
+    // will read fine on the very next pass (truth-kernel-hardening plan,
+    // Wave 4 item 4.1a).
+    enum WalkOutcome {
+        Candidate(Candidate),
+        Unreadable { rel: String, skip_reason: String },
+    }
+    let outcomes: Vec<WalkOutcome> = files
         .par_iter()
         .map(|file| {
             let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("");
@@ -384,23 +414,43 @@ pub fn reindex_changed_cancellable(
             if lang.is_none() && !is_recognized_unparsed_extension(ext) {
                 return None;
             }
-            let source = read_source_capped(file)?;
             let rel = rel_path(project_root, file);
-            let hash = hash_content(&source);
-            Some(Candidate {
-                rel,
-                lang,
-                source,
-                hash,
-                mtime: mtime_secs(file),
-            })
+            match read_source_capped(file) {
+                Ok(source) => {
+                    let hash = hash_content(&source);
+                    Some(WalkOutcome::Candidate(Candidate {
+                        rel,
+                        lang,
+                        source,
+                        hash,
+                        mtime: mtime_secs(file),
+                    }))
+                }
+                Err(skip_reason) => Some(WalkOutcome::Unreadable { rel, skip_reason }),
+            }
         })
         .collect::<Vec<_>>()
         .into_iter()
         .flatten()
         .collect();
 
-    let seen_paths: HashSet<String> = candidates.iter().map(|c| c.rel.clone()).collect();
+    let mut candidates: Vec<Candidate> = Vec::with_capacity(outcomes.len());
+    let mut seen_paths: HashSet<String> = HashSet::with_capacity(outcomes.len());
+    // Deferred until `tx` exists below (truth-kernel-hardening plan, Wave 4
+    // item 4.1b) -- can't persist a skip_reason before the transaction is open.
+    let mut skipped: Vec<(String, String)> = Vec::new();
+    for outcome in outcomes {
+        match outcome {
+            WalkOutcome::Candidate(c) => {
+                seen_paths.insert(c.rel.clone());
+                candidates.push(c);
+            }
+            WalkOutcome::Unreadable { rel, skip_reason } => {
+                seen_paths.insert(rel.clone());
+                skipped.push((rel, skip_reason));
+            }
+        }
+    }
     let changed: Vec<Candidate> = candidates
         .into_iter()
         .filter(|c| existing.get(&c.rel) != Some(&c.hash)) // unchanged — skip the parse
@@ -410,6 +460,9 @@ pub fn reindex_changed_cancellable(
     // for why: caps peak memory to one batch instead of every changed file).
     let now = now_secs();
     let tx = conn.transaction()?;
+    for (rel, skip_reason) in &skipped {
+        mark_file_index_skip_reason(&tx, rel, skip_reason, now)?;
+    }
     let mut summary = ReindexSummary::default();
 
     for batch in changed.chunks(PARSE_BATCH_SIZE) {
@@ -589,13 +642,18 @@ pub fn reindex_paths(
             continue;
         }
 
-        let Some(source) = read_source_capped(&abs) else {
-            // Unreadable, or over MAX_INDEXABLE_FILE_BYTES (permissions,
-            // binary content, an oversized file, or a TOCTOU delete
-            // between the exists() check above and this read) — skip
-            // rather than guess; a subsequent full/watcher reindex will
-            // pick it up once it's readable (or gone) again.
-            continue;
+        let source = match read_source_capped(&abs) {
+            Ok(source) => source,
+            Err(skip_reason) => {
+                // Unreadable, or over MAX_INDEXABLE_FILE_BYTES (permissions,
+                // binary content, an oversized file, or a TOCTOU delete
+                // between the exists() check above and this read) — record
+                // why (4.1b) and skip rather than guess; a subsequent
+                // full/watcher reindex will pick it up once it's readable
+                // (or gone) again.
+                mark_file_index_skip_reason(&tx, rel, &skip_reason, now)?;
+                continue;
+            }
         };
         let hash = hash_content(&source);
         if existing_hash.as_deref() == Some(hash.as_str()) {

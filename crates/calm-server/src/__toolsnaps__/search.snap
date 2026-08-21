@@ -13,9 +13,9 @@
         "type": "string"
       },
       "kind": {
-        "description": "One of `\"symbol\"` (default, name/signature match), `\"text\"` (FTS\nover code body), `\"file\"` (path match — glob syntax like `*.md` or\n`src/**` also works, otherwise plain substring), `\"grep\"` (real\nregex over raw file content read from disk, including files the\nindexer never parses — Cargo.toml, docs/*.md, etc.; see `glob`/\n`case_insensitive`/`context`), `\"semantic\"` (embedding KNN — needs\nthe `embeddings` feature and a ready index), `\"hybrid\"` (RRF\nfusion of text + symbol-identity + code-chunk vectors), or\n`\"similar\"` (embedding KNN anchored at `path`+`line` instead of a\ntext query — \"find code that looks like *this location*\", not \"find\ncode matching these words\"; needs `embeddings` and `path`+`line`).\nAny other value silently falls back to `\"symbol\"`.",
+        "description": "One of `\"symbol\"` (name/signature match), `\"text\"` (FTS over\nname/docstring/signature AND function bodies, 3.2 Wave 3 — still\ndoes NOT cover imports or non-code files; use `\"grep\"` for those),\n`\"file\"` (path\nmatch — glob syntax like `*.md` or\n`src/**` also works, otherwise plain substring), `\"grep\"` (real\nregex over raw file content read from disk, including files the\nindexer never parses — Cargo.toml, docs/*.md, etc.; see `glob`/\n`case_insensitive`/`context`), `\"semantic\"` (embedding KNN — needs\nthe `embeddings` feature and a ready index), `\"hybrid\"` (default —\nRRF fusion of text + symbol-identity + code-chunk vectors; degrades\ngracefully to plain `\"symbol\"` behavior when no embedder is\nconfigured, see `degraded`/`note`), or `\"similar\"` (embedding KNN\nanchored at `path`+`line` instead of a text query — \"find code that\nlooks like *this location*\", not \"find code matching these words\";\nneeds `embeddings` and `path`+`line`). Any other value silently\nfalls back to `\"symbol\"`.",
         "type": "string",
-        "default": "symbol"
+        "default": "hybrid"
       },
       "limit": {
         "description": "Max results to return. Default 10.",
@@ -95,6 +95,13 @@
           },
           "path": {
             "type": "string"
+          },
+          "qualified_name": {
+            "description": "3.4 (Wave 3, P1-3): the symbol's exact `qualified_name`, restored\nafter being dropped from this output type -- feed it straight into\n`source`/`symbol_info`/`callers`/`callees`/`reference_impact`/`path`/\n`pattern_debt_register`'s new `qualified_name` param to resolve by\nidentity, never `Ambiguous`, even for a globally-common bare name.\nPresent only when `kind` is also present -- both are populated from\nthe same live `symbols` row join, so a hit with no enclosing symbol\n(`kind=\"file\"` path hits, `kind=\"grep\"` matches outside any symbol\nbody, gap-chunk semantic hits) has neither.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "kind": {
             "type": [

@@ -47,6 +47,20 @@
         ],
         "format": "int64"
       },
+      "from_qualified_name": {
+        "description": "3.4 (Wave 3): exact `qualified_name` from a prior `search`/`locate`\nresult for `from_symbol` -- when set, resolves directly by identity\nand `from_path`/`from_line` are ignored.",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "to_qualified_name": {
+        "description": "Same as `from_qualified_name`, for `to_symbol`.",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
       "max_hops": {
         "description": "Max BFS depth to search before giving up. Defaults to\n`path.default_max_hops` in config.json (8 out of the box), clamped\nto `path.max_allowed_hops` (20 out of the box).",
         "type": [

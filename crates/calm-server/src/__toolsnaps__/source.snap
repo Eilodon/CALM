@@ -26,6 +26,13 @@
         ],
         "format": "int64"
       },
+      "qualified_name": {
+        "description": "3.4 (Wave 3): exact `qualified_name` from a prior `search`/`locate`\nresult -- when set, resolves directly by identity and `path`/`line`\nare ignored, so this can never come back ambiguous even for a\nglobally-common bare `symbol` name. Ignored in range mode.",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
       "end_line": {
         "description": "Range mode: 1-indexed, inclusive END line of a raw window read\ndirectly from `path` with no symbol resolution — for module-level or\nbetween-symbol code no symbol range covers. Requires `path` + `line`\n(the start) and `symbol` omitted. Ignored in symbol mode.",
         "type": [

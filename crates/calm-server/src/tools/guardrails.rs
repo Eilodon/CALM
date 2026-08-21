@@ -19,9 +19,9 @@ impl CalmServer {
         name = "edit_context",
         description = "ALWAYS CALL THIS before any code modification — mandatory, never skip. USE WHEN: you are about to edit, refactor, or delete a symbol. NOT FOR: read-only inspection (use symbol_info + source). NOT post-edit (use diff_impact).",
         annotations(
-            read_only_hint = true,
+            read_only_hint = false,
             destructive_hint = false,
-            idempotent_hint = true,
+            idempotent_hint = false,
             open_world_hint = false
         )
     )]
@@ -35,7 +35,7 @@ impl CalmServer {
                 Ok(c) => c,
                 Err(e) => return db_error_resolved(e),
             };
-            let resolution = match resolve_symbol(&conn, &p.symbol, p.path.as_deref(), p.line) {
+            let resolution = match resolve_symbol(&conn, &self.project_root, &p.symbol, p.path.as_deref(), p.line, None) {
                 Ok(r) => r,
                 Err(e) => return db_error_resolved(e),
             };
@@ -44,6 +44,7 @@ impl CalmServer {
                 SymbolResolution::Ambiguous(candidates) => {
                     return ResolvedOutcome::ambiguous(&candidates);
                 }
+                SymbolResolution::ReadFailed(e) => return ResolvedOutcome::error(e),
                 SymbolResolution::Found(c) => *c,
             };
             self.track_symbol(&c.qualified_name);

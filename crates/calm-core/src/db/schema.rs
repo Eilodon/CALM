@@ -170,6 +170,13 @@ CREATE TABLE IF NOT EXISTS symbols (
     docstring       TEXT NOT NULL DEFAULT '',
     name_tokens     TEXT NOT NULL DEFAULT '',
     caller_count    INTEGER NOT NULL DEFAULT 0,
+    -- 2.3 (Wave 2, truth-kernel hardening): is_verified()-only bucket
+    -- (Formal/Resolved) alongside caller_count's broader definition
+    -- (everything except Ambiguous) -- mirrors coreness/possible_coreness's
+    -- existing dual-column pattern below. No consumer reads this yet;
+    -- landed so a future gate can migrate to the stricter bucket
+    -- deliberately, not by silently changing caller_count's meaning.
+    verified_caller_count INTEGER NOT NULL DEFAULT 0,
     is_hub          INTEGER NOT NULL DEFAULT 0,
     coreness        INTEGER,
     possible_coreness INTEGER,
@@ -221,7 +228,8 @@ CREATE TABLE IF NOT EXISTS file_index (
     language      TEXT,
     symbol_count  INTEGER NOT NULL DEFAULT 0,
     last_indexed  REAL NOT NULL,
-    mtime         REAL
+    mtime         REAL,
+    skip_reason   TEXT
 );
 
 CREATE TABLE IF NOT EXISTS symbol_metrics_history (
@@ -966,6 +974,36 @@ CREATE TRIGGER IF NOT EXISTS symbols_au
 END;
 ";
 
+/// 3.2 (Wave 3): `code_chunks`' own FTS5 shadow table, `fts_exact`'s sibling
+/// but keyed on `chunk_text` (function-body text) instead of
+/// name/docstring/signature -- the real fix behind Wave 0's 0.3 stopgap.
+/// Unlike `symbols` (see `symbols_au` above), `code_chunks` rows are never
+/// UPDATEd in place -- every write path (`driver.rs::remove_file_rows`,
+/// `reindex_all_cancellable_with_phase`) DELETEs then re-INSERTs
+/// (`edges.rs::insert_code_chunks_batch`), confirmed by direct read before
+/// choosing this trigger set -- so only AFTER INSERT/DELETE are needed, no
+/// `code_chunks_au`.
+const FTS_CHUNKS_SQL: &str = "
+CREATE VIRTUAL TABLE IF NOT EXISTS fts_chunks USING fts5(
+    chunk_text,
+    content='code_chunks',
+    content_rowid='id',
+    tokenize='unicode61'
+);
+";
+
+const CODE_CHUNKS_TRIGGERS_SQL: &str = "
+CREATE TRIGGER IF NOT EXISTS code_chunks_ai AFTER INSERT ON code_chunks BEGIN
+    INSERT INTO fts_chunks(rowid, chunk_text)
+        VALUES (new.id, new.chunk_text);
+END;
+
+CREATE TRIGGER IF NOT EXISTS code_chunks_ad AFTER DELETE ON code_chunks BEGIN
+    INSERT INTO fts_chunks(fts_chunks, rowid, chunk_text)
+        VALUES ('delete', old.id, old.chunk_text);
+END;
+";
+
 pub fn init_db(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch("PRAGMA journal_mode=WAL;")?;
     conn.execute_batch(SCHEMA_SQL)?;
@@ -1111,6 +1149,12 @@ fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
         "INTEGER NOT NULL DEFAULT 0",
     )?;
     migrate_add_column(conn, "symbols", "coreness", "INTEGER")?;
+    migrate_add_column(
+        conn,
+        "symbols",
+        "verified_caller_count",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
     migrate_add_column(conn, "symbols", "possible_coreness", "INTEGER")?;
     migrate_add_column(conn, "symbols", "class_context", "TEXT")?;
     migrate_add_column(conn, "symbols", "is_test", "INTEGER NOT NULL DEFAULT 0")?;
@@ -1121,6 +1165,7 @@ fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
         "INTEGER NOT NULL DEFAULT 1",
     )?;
     migrate_add_column(conn, "file_index", "mtime", "REAL")?;
+    migrate_add_column(conn, "file_index", "skip_reason", "TEXT")?;
     // call_sites columns added after the table first shipped.
     migrate_add_column(
         conn,
@@ -1296,6 +1341,7 @@ fn run_migrations(conn: &Connection) -> rusqlite::Result<()> {
         "INTEGER NOT NULL DEFAULT 0",
     )?;
     migrate_fts_add_signature(conn)?;
+    migrate_fts_chunks(conn)?;
     migrate_add_scip_overlay_state(conn)?;
     dedup_edges_and_add_unique_indexes(conn)?;
     migrate_call_site_identity_v2(conn)?;
@@ -1566,6 +1612,33 @@ fn migrate_fts_add_signature(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(TRIGGERS_SQL)?;
     conn.execute_batch("INSERT INTO fts_exact(fts_exact) VALUES ('rebuild');")?;
     tracing::info!("Migration: rebuilt fts_exact with signature column");
+    Ok(())
+}
+
+/// 3.2 (Wave 3): one-time creation + backfill of `fts_chunks` for existing
+/// databases whose `code_chunks` table already has rows from before this
+/// migration existed -- `CREATE VIRTUAL TABLE IF NOT EXISTS` alone would
+/// create an empty shadow table with no way to know about those
+/// already-there rows (the AFTER INSERT trigger only fires for FUTURE
+/// writes). Detected via `sqlite_master`, not a column-shape check (there's
+/// no prior `fts_chunks` to compare a column against, unlike
+/// `migrate_fts_add_signature`'s ALTER-style case) -- if it's already
+/// there, both the table and any backfill already happened in a past run.
+/// A fresh DB reaches this with `code_chunks` still empty, so the rebuild
+/// below is a harmless no-op there.
+fn migrate_fts_chunks(conn: &Connection) -> rusqlite::Result<()> {
+    let exists: bool = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'fts_chunks'",
+        [],
+        |r| r.get::<_, i64>(0),
+    )? > 0;
+    if exists {
+        return Ok(());
+    }
+    conn.execute_batch(FTS_CHUNKS_SQL)?;
+    conn.execute_batch(CODE_CHUNKS_TRIGGERS_SQL)?;
+    conn.execute_batch("INSERT INTO fts_chunks(fts_chunks) VALUES ('rebuild');")?;
+    tracing::info!("Migration: created fts_chunks and backfilled from existing code_chunks rows");
     Ok(())
 }
 

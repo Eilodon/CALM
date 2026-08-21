@@ -24,12 +24,52 @@ use super::MAX_INDEXABLE_FILE_BYTES;
 /// reading the file first) -- the shared choke point for all three
 /// indexing entry points below (full reindex, changed-file reindex,
 /// targeted path reindex) so the cap can't be forgotten on any one path.
-pub(super) fn read_source_capped(path: &Path) -> Option<String> {
-    let len = std::fs::metadata(path).ok()?.len();
+/// `std::fs::read_to_string`, but skipping the read entirely for a file over
+/// `MAX_INDEXABLE_FILE_BYTES` (checked via a cheap `metadata()` stat, not by
+/// reading the file first) -- the shared choke point for all three
+/// indexing entry points below (full reindex, changed-file reindex,
+/// targeted path reindex) so the cap can't be forgotten on any one path.
+///
+/// Returns `Err(reason)` instead of `None` (truth-kernel-hardening plan,
+/// Wave 4 item 4.1b) so a caller can persist *why* a file was skipped, not
+/// just *that* it was: `"too_large:<byte len>"` for the cap, or
+/// `"unreadable:<io::ErrorKind Debug repr>"` for a metadata/read failure
+/// (permission denied, TOCTOU delete, a non-UTF-8 write mid-flight --
+/// `read_to_string` itself reports invalid UTF-8 as `io::ErrorKind::
+/// InvalidData`, so that case is already distinguishable via `kind` without
+/// a dedicated variant).
+pub(super) fn read_source_capped(path: &Path) -> Result<String, String> {
+    let meta = std::fs::metadata(path).map_err(|e| format!("unreadable:{:?}", e.kind()))?;
+    let len = meta.len();
     if len > MAX_INDEXABLE_FILE_BYTES {
-        return None;
+        return Err(format!("too_large:{len}"));
     }
-    std::fs::read_to_string(path).ok()
+    std::fs::read_to_string(path).map_err(|e| format!("unreadable:{:?}", e.kind()))
+}
+
+/// Records why a file was skipped this pass (`file_index.skip_reason`)
+/// without disturbing whatever was already known about it -- `hash`/
+/// `symbol_count`/`language`/`mtime` from a prior successful index (if any)
+/// are left exactly as they were, since nothing was actually re-extracted
+/// this pass. A file skipped before it was ever successfully indexed gets a
+/// placeholder row (empty hash, `symbol_count` 0, `language` NULL, `mtime`
+/// NULL) purely so its `skip_reason` is discoverable (`fitness_report`) --
+/// a successful `upsert_file_index` afterwards always clears `skip_reason`
+/// back to NULL, since `INSERT OR REPLACE` deletes the old row first and
+/// the fresh INSERT there never lists this column.
+pub(super) fn mark_file_index_skip_reason(
+    tx: &rusqlite::Transaction,
+    rel: &str,
+    skip_reason: &str,
+    now: f64,
+) -> rusqlite::Result<()> {
+    tx.execute(
+        "INSERT INTO file_index (path, hash, language, symbol_count, last_indexed, mtime, skip_reason) \
+         VALUES (?1, '', NULL, 0, ?2, NULL, ?3) \
+         ON CONFLICT(path) DO UPDATE SET skip_reason = excluded.skip_reason, last_indexed = excluded.last_indexed",
+        rusqlite::params![rel, now, skip_reason],
+    )?;
+    Ok(())
 }
 
 /// Collect tier-0 source files under `root` via the shared `crate::walk`
@@ -70,7 +110,7 @@ pub fn hash_content(s: &str) -> String {
     format!("{h:016x}")
 }
 
-pub(super) fn mtime_secs(path: &Path) -> f64 {
+pub(crate) fn mtime_secs(path: &Path) -> f64 {
     std::fs::metadata(path)
         .ok()
         .and_then(|m| m.modified().ok())

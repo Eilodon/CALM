@@ -614,11 +614,37 @@ impl WatchSupervisor {
                     &self.runtime.project_root,
                 )) {
                     Ok(state_conn) => {
-                        match calm_core::authority::EvidenceSnapshot::compute_after_reconciliation(
+                        // 2.2 (Wave 2, reconciliation fence): a plain `compute`
+                        // (not `compute_after_reconciliation`) already runs the
+                        // same live-mtime spot-check every other `compute` caller
+                        // gets (2.1) -- reusing it here catches disk drift that
+                        // happened DURING this reconciliation's own reindex/
+                        // embed/overlay window, which the old unconditional
+                        // `compute_after_reconciliation` call could never see.
+                        // `compute`'s output space is exactly {Current, Degraded}
+                        // (it never sets Reconciled on its own), so promoting
+                        // Current -> Reconciled below only ever STRENGTHENS what
+                        // it already verified -- a Degraded result is left
+                        // Degraded, never silently upgraded.
+                        match calm_core::authority::EvidenceSnapshot::compute(
                             &conn,
                             &self.runtime.project_root,
                         ) {
-                            Ok(snapshot) => {
+                            Ok(mut snapshot) => {
+                                if snapshot.freshness_class
+                                    == calm_core::authority::FreshnessClass::Current
+                                {
+                                    snapshot.freshness_class =
+                                        calm_core::authority::FreshnessClass::Reconciled;
+                                } else {
+                                    tracing::warn!(
+                                        "full reconciliation completed but live disk drift \
+                                         was detected before the evidence snapshot could be \
+                                         persisted -- recording {:?} instead of Reconciled \
+                                         (trigger={reason:?})",
+                                        snapshot.freshness_class
+                                    );
+                                }
                                 if let Err(error) = snapshot.persist(&state_conn) {
                                     tracing::warn!(
                                         "could not persist reconciled evidence snapshot \
@@ -627,8 +653,9 @@ impl WatchSupervisor {
                                 } else {
                                     tracing::info!(
                                         "full reconciliation recorded as evidence: \
-                                         snapshot_id={} trigger={reason:?}",
-                                        snapshot.snapshot_id
+                                         snapshot_id={} freshness={} trigger={reason:?}",
+                                        snapshot.snapshot_id,
+                                        snapshot.freshness_class.as_str()
                                     );
                                 }
                             }
@@ -1263,6 +1290,94 @@ mod tests {
                 ..
             }
         ));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn full_reconciliation_persists_a_reconciled_evidence_snapshot_when_no_drift() {
+        // 2.2 (Wave 2) regression check: the reconciliation-fence refactor
+        // (compute_after_reconciliation -> plain compute() + a Current ->
+        // Reconciled promotion, see `refresh`) must still persist a
+        // `reconciled` evidence snapshot on the ordinary happy path where
+        // nothing drifted during reindexing -- proving the new conditional
+        // logic doesn't silently downgrade the common case while fixing the
+        // drift-during-reconciliation gap it was written for.
+        let root = test_root("reconciled_snapshot");
+        let calm_dir = root.join(".calm");
+        std::fs::create_dir_all(&calm_dir).unwrap();
+        std::fs::write(root.join("README.md"), "# Before\n").unwrap();
+        let db_path = calm_dir.join("index.db");
+        {
+            let mut conn = calm_core::db::conn::open_writer(&db_path).unwrap();
+            calm_core::db::schema::init_db(&conn).unwrap();
+            calm_core::indexer::pipeline::run_indexing_pipeline(
+                &mut conn,
+                &root,
+                Arc::new(RwLock::new(calm_core::types::IndexingPhase::Scanning)),
+            )
+            .unwrap();
+        }
+
+        // Production always initializes state.db (server startup, see
+        // CalmServer::new_with_preset) before the watcher ever runs --
+        // open_state_writer itself does NOT create/migrate schema, so this
+        // test must do the same setup step or evidence_snapshots won't
+        // exist yet when `refresh`'s reconciliation-fence block tries to
+        // persist into it.
+        {
+            let state_conn =
+                rusqlite::Connection::open(crate::default_state_db_path(&root)).unwrap();
+            calm_core::db::schema::init_state_db_versioned(&state_conn).unwrap();
+        }
+
+        let health = new_health_handle();
+        let factory = Arc::new(FakeFactory::with_outcomes([Ok(())]));
+        let ct = CancellationToken::new();
+        let config = test_config();
+        let supervisor = WatchSupervisor::with_factory(
+            root.clone(),
+            db_path.clone(),
+            ct.clone(),
+            Arc::new(RwLock::new(None)),
+            Arc::new(RwLock::new(
+                calm_core::analysis::coverage::CoverageData::none(),
+            )),
+            Arc::new(RwLock::new(None)),
+            health.clone(),
+            None,
+            config,
+            factory.clone(),
+        );
+        let worker = std::thread::spawn(move || supervisor.run());
+
+        // Startup itself triggers a full reconciliation (`watcher_start`) --
+        // health only reports this reason AFTER `refresh`'s own evidence-
+        // snapshot persist block has already run synchronously (same
+        // closure, before the outer health update), so seeing this reason
+        // here means the snapshot write already happened.
+        wait_until(|| {
+            let state = health.read_ok();
+            state.armed
+                && state.freshness == WatcherFreshness::Fresh
+                && state.last_reconciliation_reason == Some("watcher_start")
+        });
+
+        let state_conn = rusqlite::Connection::open(crate::default_state_db_path(&root)).unwrap();
+        let freshness_class: String = state_conn
+            .query_row(
+                "SELECT freshness_class FROM evidence_snapshots \
+                 ORDER BY created_at DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            freshness_class, "reconciled",
+            "no drift occurred -- the refactored path must still promote to Reconciled"
+        );
+
+        ct.cancel();
+        worker.join().unwrap();
         let _ = std::fs::remove_dir_all(root);
     }
 }

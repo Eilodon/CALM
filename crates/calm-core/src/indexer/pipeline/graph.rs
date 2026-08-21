@@ -378,13 +378,26 @@ pub(super) fn incremental_graph_update(
 /// after this function's other caller, so without a second refresh
 /// afterward, `caller_count` would immediately go stale again relative to
 /// the very columns this filter depends on.
+///
+/// 2.3 (Wave 2, canonical `EvidencePolicy`): also populates
+/// `verified_caller_count`, `caller_count`'s stricter sibling
+/// (`EdgeConfidence::is_verified` -- `Formal`/`Resolved` only, excluding
+/// `Inferred`/`Textual` too, not just `Ambiguous`). Purely additive: no
+/// existing consumer reads `verified_caller_count` yet, so `caller_count`'s
+/// own meaning and every caller of THIS function are unaffected.
 pub fn refresh_caller_counts(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     conn.execute(
-        "UPDATE symbols SET caller_count = \
-            (SELECT COUNT(DISTINCT from_symbol) FROM call_edges \
-             WHERE to_symbol = symbols.qualified_name \
-               AND ruled_out_by_scip = 0 \
-               AND edge_confidence != 'ambiguous')",
+        "UPDATE symbols SET \
+            caller_count = \
+                (SELECT COUNT(DISTINCT from_symbol) FROM call_edges \
+                 WHERE to_symbol = symbols.qualified_name \
+                   AND ruled_out_by_scip = 0 \
+                   AND edge_confidence != 'ambiguous'), \
+            verified_caller_count = \
+                (SELECT COUNT(DISTINCT from_symbol) FROM call_edges \
+                 WHERE to_symbol = symbols.qualified_name \
+                   AND ruled_out_by_scip = 0 \
+                   AND edge_confidence IN ('formal', 'resolved'))",
         [],
     )?;
     Ok(())

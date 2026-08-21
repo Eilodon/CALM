@@ -58,6 +58,20 @@ impl CalmServer {
                         .map(|r| SearchResultItem {
                             name: r.name,
                             path: r.path,
+                            // 3.4 (Wave 3, P1-3): restores qualified_name to
+                            // the output -- the identity-chaining fix. A
+                            // caller can now pass this straight into
+                            // source/symbol_info/callers/etc.'s new
+                            // qualified_name param and never hit Ambiguous,
+                            // even for a globally-common bare name. Gated on
+                            // `kind.is_some()`: file-path hits (kind=file)
+                            // and gap-chunk semantic hits with no enclosing
+                            // symbol carry a synthetic qualified_name (the
+                            // raw path, or "path#chunk:N-M") that doesn't
+                            // resolve to a real symbols row -- surfacing
+                            // those would send callers into a guaranteed
+                            // NotFound round trip.
+                            qualified_name: r.kind.is_some().then_some(r.qualified_name),
                             kind: r.kind,
                             line_start: r.line_start,
                             line_end: r.line_end,
@@ -147,6 +161,10 @@ impl CalmServer {
                     .map(|r| SearchResultItem {
                         name: r.name,
                         path: r.path,
+                        // See search()'s identical hunk: only a real
+                        // enclosing-symbol hit (kind.is_some()) carries a
+                        // live qualified_name.
+                        qualified_name: r.kind.is_some().then_some(r.qualified_name),
                         kind: r.kind,
                         line_start: r.line_start,
                         line_end: r.line_end,
@@ -215,6 +233,10 @@ impl CalmServer {
                     .map(|r| SearchResultItem {
                         name: r.name,
                         path: r.path,
+                        // See search()'s identical hunk: only a real
+                        // enclosing-symbol hit (kind.is_some()) carries a
+                        // live qualified_name.
+                        qualified_name: r.kind.is_some().then_some(r.qualified_name),
                         kind: r.kind,
                         line_start: r.line_start,
                         line_end: r.line_end,
@@ -262,7 +284,10 @@ impl CalmServer {
         Parameters(p): Parameters<LocateParams>,
     ) -> Json<ToolOutcome<LocateOutput>> {
         Json(self.timed_tool("locate", || {
-            let kind_str = p.kind.as_deref().unwrap_or("symbol");
+            // 3.1 (Wave 3): matches search's own default flip -- see
+            // default_search_kind's doc comment for why this can't regress
+            // a no-embeddings project below today's plain-symbol behavior.
+            let kind_str = p.kind.as_deref().unwrap_or("hybrid");
             let kind = match kind_str {
                 "text" => calm_core::types::SearchKind::Text,
                 "file" => calm_core::types::SearchKind::File,
@@ -304,6 +329,8 @@ impl CalmServer {
                 .map(|r| SearchResultItem {
                     name: r.name.clone(),
                     path: r.path.clone(),
+                    // 3.4 (Wave 3, P1-3): see search()'s own identical hunk.
+                    qualified_name: Some(r.qualified_name.clone()),
                     kind: r.kind.clone(),
                     line_start: r.line_start,
                     line_end: r.line_end,
@@ -408,20 +435,20 @@ impl CalmServer {
                 } else if sym.caller_count == 0 {
                     suggested_with_args("callers", "No callers found — verify dead code before deleting", serde_json::json!({"symbol": sym.name}))
                 } else {
-                    suggested_with_args("source", "Read implementation", serde_json::json!({"target": results[0].name}))
+                    suggested_with_args("source", "Read implementation", serde_json::json!({"symbol": sym.name, "path": sym.path}))
                 }
             } else if results.is_empty() && kind_str == "hybrid" && search_output.degraded {
-                suggested_with_args("search", "Embeddings inactive and hybrid found nothing — try grep over raw file content (also covers symbols never extracted at all, e.g. module-level const/static)", serde_json::json!({"kind": "grep"}))
+                suggested_with_args("search", "Embeddings inactive and hybrid found nothing — try grep over raw file content (also covers symbols never extracted at all, e.g. module-level const/static)", serde_json::json!({"query": p.query, "kind": "grep"}))
             } else if results.is_empty() && kind_str == "hybrid" {
-                suggested_with_args("search", "Try exact text search", serde_json::json!({"kind": "text"}))
+                suggested_with_args("search", "Try exact text search", serde_json::json!({"query": p.query, "kind": "text"}))
             } else if results.is_empty() && kind_str == "text" {
-                suggested_with_args("search", "Text/symbol index may not cover this — module-level const/static isn't extracted as a symbol in any Tier-0 language. Try grep over raw file content", serde_json::json!({"kind": "grep"}))
+                suggested_with_args("search", "Text/symbol index may not cover this — module-level const/static isn't extracted as a symbol in any Tier-0 language. Try grep over raw file content", serde_json::json!({"query": p.query, "kind": "grep"}))
             } else if results.is_empty() {
-                suggested_with_args("search", "No match — broaden with hybrid search", serde_json::json!({"kind": "hybrid"}))
+                suggested_with_args("search", "No match — broaden with hybrid search", serde_json::json!({"query": p.query, "kind": "hybrid"}))
             } else if results.len() > 1 && results[0].name == results[1].name {
                 suggested_with_args("symbol_info", "Multiple matches for same name — disambiguate", serde_json::json!({"symbol": results[0].name, "path": results[0].path}))
             } else {
-                suggested_with_args("source", "Read implementation", serde_json::json!({"target": results[0].name}))
+                suggested_with_args("source", "Read implementation", serde_json::json!({"symbol": results[0].name, "path": results[0].path}))
             };
 
             let related_notes = top_symbol
@@ -491,19 +518,24 @@ pub(crate) struct SearchParams {
     /// it's ignored — pass `path`+`line` instead (an anchor location has no
     /// text query to embed; its own stored chunk vector is reused as-is).
     pub(crate) query: String,
-    /// One of `"symbol"` (default, name/signature match), `"text"` (FTS
-    /// over code body), `"file"` (path match — glob syntax like `*.md` or
+    /// One of `"symbol"` (name/signature match), `"text"` (FTS over
+    /// name/docstring/signature AND function bodies, 3.2 Wave 3 — still
+    /// does NOT cover imports or non-code files; use `"grep"` for those),
+    /// `"file"` (path
+    /// match — glob syntax like `*.md` or
     /// `src/**` also works, otherwise plain substring), `"grep"` (real
     /// regex over raw file content read from disk, including files the
     /// indexer never parses — Cargo.toml, docs/*.md, etc.; see `glob`/
     /// `case_insensitive`/`context`), `"semantic"` (embedding KNN — needs
-    /// the `embeddings` feature and a ready index), `"hybrid"` (RRF
-    /// fusion of text + symbol-identity + code-chunk vectors), or
-    /// `"similar"` (embedding KNN anchored at `path`+`line` instead of a
-    /// text query — "find code that looks like *this location*", not "find
-    /// code matching these words"; needs `embeddings` and `path`+`line`).
-    /// Any other value silently falls back to `"symbol"`.
-    #[serde(default = "default_symbol")]
+    /// the `embeddings` feature and a ready index), `"hybrid"` (default —
+    /// RRF fusion of text + symbol-identity + code-chunk vectors; degrades
+    /// gracefully to plain `"symbol"` behavior when no embedder is
+    /// configured, see `degraded`/`note`), or `"similar"` (embedding KNN
+    /// anchored at `path`+`line` instead of a text query — "find code that
+    /// looks like *this location*", not "find code matching these words";
+    /// needs `embeddings` and `path`+`line`). Any other value silently
+    /// falls back to `"symbol"`.
+    #[serde(default = "default_search_kind")]
     pub(crate) kind: String,
     /// Max results to return. Default 10.
     #[serde(default = "default_limit")]
@@ -538,8 +570,16 @@ pub(crate) struct SearchParams {
     pub(crate) include_tests: bool,
 }
 
-pub(crate) fn default_symbol() -> String {
-    "symbol".into()
+/// 3.1 (Wave 3, P1-1a): default is `"hybrid"`, not `"symbol"` -- a natural-
+/// language query with `kind` omitted used to return zero hits under the
+/// old `"symbol"` default (name/signature match only). `search_hybrid`
+/// gracefully degrades to exactly the old default's own output
+/// (`search_symbol`, wrapped with `degraded: true` + a note) when no
+/// embedder is configured, so this cannot regress a no-embeddings project
+/// below today's behavior -- confirmed via `search_hybrid`'s own fallback
+/// before choosing this over a separate `"auto"` classifier.
+pub(crate) fn default_search_kind() -> String {
+    "hybrid".into()
 }
 
 pub(crate) fn default_limit() -> usize {
@@ -598,6 +638,17 @@ pub(crate) fn round_score(score: f64) -> f64 {
 pub(crate) struct SearchResultItem {
     pub(crate) name: String,
     pub(crate) path: String,
+    /// 3.4 (Wave 3, P1-3): the symbol's exact `qualified_name`, restored
+    /// after being dropped from this output type -- feed it straight into
+    /// `source`/`symbol_info`/`callers`/`callees`/`reference_impact`/`path`/
+    /// `pattern_debt_register`'s new `qualified_name` param to resolve by
+    /// identity, never `Ambiguous`, even for a globally-common bare name.
+    /// Present only when `kind` is also present -- both are populated from
+    /// the same live `symbols` row join, so a hit with no enclosing symbol
+    /// (`kind="file"` path hits, `kind="grep"` matches outside any symbol
+    /// body, gap-chunk semantic hits) has neither.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) qualified_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) kind: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -737,8 +788,8 @@ pub(crate) fn build_file_overview(
 #[derive(Deserialize, JsonSchema)]
 pub(crate) struct LocateParams {
     pub(crate) query: String,
-    /// Same values as `search`'s `kind` — `"symbol"` (default), `"text"`,
-    /// `"file"`, `"semantic"`, or `"hybrid"`.
+    /// Same values as `search`'s `kind` — `"hybrid"` (default, 3.1 Wave 3),
+    /// `"symbol"`, `"text"`, `"file"`, or `"semantic"`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) kind: Option<String>,
     /// How much to enrich the top hit beyond `results`, in increasing

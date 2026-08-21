@@ -507,8 +507,22 @@ pub(crate) fn resolve_symbol_candidates(
     conn: &rusqlite::Connection,
     name: &str,
     path: Option<&str>,
+    // 3.4 (Wave 3, P1-3): when set, the SOLE filter -- qualified_name is
+    // already unique, so name/path are redundant and ignored. This is the
+    // "identity chaining" fix: a caller that already has an exact
+    // qualified_name (e.g. from a prior `search` result) can never land on
+    // `Ambiguous`, even for a globally-common bare name, while still
+    // flowing through this same function's live-verification (`verify_live`
+    // in `resolve_symbol`) -- unlike the original draft's literal
+    // "short-circuit resolve_symbol" wording, which would have bypassed
+    // that check and reintroduced P0-1 staleness risk (see this wave's
+    // research-pass note in the execution plan).
+    qualified_name: Option<&str>,
 ) -> rusqlite::Result<Vec<CandidateRow>> {
-    let sql = if path.is_some() {
+    let sql = if qualified_name.is_some() {
+        "SELECT name, qualified_name, kind, path, line_start, line_end, signature, docstring, caller_count, is_hub, language, class_context, is_entry_point, is_test, coreness, boundary_ambiguous
+         FROM symbols WHERE qualified_name = ?1"
+    } else if path.is_some() {
         "SELECT name, qualified_name, kind, path, line_start, line_end, signature, docstring, caller_count, is_hub, language, class_context, is_entry_point, is_test, coreness, boundary_ambiguous
          FROM symbols WHERE name = ?1 AND path = ?2 ORDER BY path, line_start"
     } else {
@@ -545,7 +559,9 @@ pub(crate) fn resolve_symbol_candidates(
         })
     };
 
-    let rows = if let Some(path) = path {
+    let rows = if let Some(qn) = qualified_name {
+        stmt.query_map(rusqlite::params![qn], map_row)
+    } else if let Some(path) = path {
         stmt.query_map(rusqlite::params![name, path], map_row)
     } else {
         stmt.query_map(rusqlite::params![name], map_row)
@@ -563,6 +579,11 @@ pub(crate) enum SymbolResolution {
     NotFound,
     Ambiguous(Vec<CandidateRow>),
     Found(Box<CandidateRow>),
+    /// Disk read or fresh re-parse failed while live-verifying a resolved
+    /// candidate (see `resolve_symbol`'s doc comment) -- distinct from a DB
+    /// query failure (which stays in the outer `rusqlite::Result::Err`).
+    /// Never silently degrades to the stale DB coordinates (that was P0-1g).
+    ReadFailed(ErrorDetail),
 }
 
 /// Resolve a bare symbol name (+ optional path, + optional disambiguating
@@ -580,24 +601,136 @@ pub(crate) enum SymbolResolution {
 /// candidates is ignored (falls back to the unnarrowed set) rather than
 /// forcing `NotFound` — a stale/wrong hint should degrade to the old
 /// behavior, not make an otherwise-resolvable symbol disappear.
+///
+/// 2026-08-20 truth-kernel Wave 1 (P0-1): once narrowed to exactly one DB
+/// candidate, it is live-verified against disk in THIS SAME call before
+/// being trusted (see `verify_live`) — an index-derived coordinate is a
+/// hint until checked against live disk in the same call that uses it, per
+/// docs/plans/2026-08-20-truth-kernel-hardening-execution-plan.md. This was
+/// folded directly into `resolve_symbol` (not a separate opt-in function)
+/// so every one of its 9 existing callers, and any future one, gets the
+/// check automatically -- a second function callers must remember to
+/// invoke could silently be skipped by a new call site, reintroducing P0-1.
 pub(crate) fn resolve_symbol(
     conn: &rusqlite::Connection,
+    project_root: &std::path::Path,
     name: &str,
     path: Option<&str>,
     line: Option<i64>,
+    // 3.4 (Wave 3, P1-3): see resolve_symbol_candidates' own doc comment --
+    // threaded straight through, `line`-narrowing below still applies but
+    // is a no-op once qualified_name has already narrowed to one candidate.
+    qualified_name: Option<&str>,
 ) -> rusqlite::Result<SymbolResolution> {
-    let mut candidates = resolve_symbol_candidates(conn, name, path)?;
+    let mut candidates = resolve_symbol_candidates(conn, name, path, qualified_name)?;
     if let Some(line) = line {
         let in_range = |c: &CandidateRow| c.line_start <= line && line <= c.line_end;
         if candidates.iter().any(in_range) {
             candidates.retain(in_range);
         }
     }
-    Ok(if candidates.is_empty() {
-        SymbolResolution::NotFound
-    } else if candidates.len() == 1 {
-        SymbolResolution::Found(Box::new(candidates.remove(0)))
-    } else {
-        SymbolResolution::Ambiguous(candidates)
-    })
+    if candidates.is_empty() {
+        return Ok(SymbolResolution::NotFound);
+    }
+    if candidates.len() > 1 {
+        return Ok(SymbolResolution::Ambiguous(candidates));
+    }
+    Ok(verify_live(conn, project_root, candidates.remove(0)))
+}
+
+/// Live-verifies a single DB-resolved candidate against disk before
+/// `resolve_symbol` trusts it (2026-08-20 truth-kernel Wave 1, P0-1a/b/d/f/g).
+/// Fast path (unchanged file): one read + one FNV hash, no re-parse. Slow
+/// path (file changed since index): re-parses live and re-matches by full
+/// identity `(name, kind, class_context)` -- not bare name alone (P0-1f) --
+/// rather than trust a DB line range that may now point at the wrong code,
+/// or at nothing (P0-1g: never silently falls back to the stale range).
+pub(crate) fn verify_live(
+    conn: &rusqlite::Connection,
+    project_root: &std::path::Path,
+    c: CandidateRow,
+) -> SymbolResolution {
+    let indexed_hash: Option<String> = conn
+        .query_row(
+            "SELECT hash FROM file_index WHERE path = ?1",
+            rusqlite::params![c.path],
+            |r| r.get(0),
+        )
+        .ok();
+    // No file_index row for this symbol's path -- should not happen for a
+    // healthy index, but degrade rather than panic: can't live-verify, so
+    // trust the DB row as-is (no worse than pre-Wave-1 behavior).
+    let Some(indexed_hash) = indexed_hash else {
+        return SymbolResolution::Found(Box::new(c));
+    };
+    let full_path = project_root.join(&c.path);
+    let live = match std::fs::read_to_string(&full_path) {
+        Ok(s) => s,
+        Err(e) => {
+            return SymbolResolution::ReadFailed(error_detail(
+                "READ_FAILED",
+                &format!("could not read {} to live-verify '{}': {e}", c.path, c.name),
+                true,
+            ));
+        }
+    };
+    if calm_core::indexer::pipeline::hash_content(&live) == indexed_hash {
+        return SymbolResolution::Found(Box::new(c));
+    }
+    let symbols = match calm_core::indexer::parser::extract_symbols(&live, &c.language, &c.path) {
+        Ok(s) => s,
+        Err(e) => {
+            return SymbolResolution::ReadFailed(error_detail(
+                "REPARSE_FAILED",
+                &format!(
+                    "{} changed on disk since indexing and could not be re-parsed to \
+                     verify '{}' is still live: {e}",
+                    c.path, c.name
+                ),
+                true,
+            ));
+        }
+    };
+    let matches = match_live_symbol(&symbols, &c.name, &c.kind, c.class_context.as_deref());
+    match matches.len() {
+        0 => SymbolResolution::NotFound,
+        1 => {
+            let m = matches[0];
+            let mut c = c;
+            c.line_start = m.line_start as i64;
+            c.line_end = m.line_end as i64;
+            SymbolResolution::Found(Box::new(c))
+        }
+        n => SymbolResolution::ReadFailed(error_detail(
+            "STALE_AMBIGUOUS",
+            &format!(
+                "{} changed on disk since indexing and now has {n} equally-matching live \
+                 symbols named '{}' (was uniquely indexed) -- the index is stale; call \
+                 search/locate fresh rather than trust any cached range",
+                c.path, c.name
+            ),
+            true,
+        )),
+    }
+}
+
+/// Match live-parsed symbols against a DB-known identity key -- `(name,
+/// kind, class_context)`, not bare name alone (P0-1f: two same-named
+/// methods in different `impl` blocks must not cross-match). Shared by
+/// `resolve_symbol`'s live-reresolve path and `best_live_range`'s
+/// insertion-anchor re-parse (`edit.rs`) so both use one matching rule.
+/// Callers decide how to handle 2+ survivors -- this returns every tie,
+/// never guesses one.
+pub(crate) fn match_live_symbol<'a>(
+    symbols: &'a [calm_core::indexer::parser::ParsedSymbol],
+    name: &str,
+    kind: &str,
+    class_context: Option<&str>,
+) -> Vec<&'a calm_core::indexer::parser::ParsedSymbol> {
+    symbols
+        .iter()
+        .filter(|s| {
+            s.name == name && s.kind.as_str() == kind && s.class_context.as_deref() == class_context
+        })
+        .collect()
 }

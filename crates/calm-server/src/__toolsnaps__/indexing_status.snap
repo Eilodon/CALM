@@ -34,6 +34,42 @@
           "recoverable"
         ]
       },
+      "SkippedFilesStatusOutput": {
+        "description": "Files currently carrying a `file_index.skip_reason` (4.1b). `entries` is\ncapped at `SKIPPED_FILES_STATUS_CAP`; `total` is the true count even when\ntruncated -- same cap-with-true-count contract `callers`/`callees`\nalready use for their own direct-caller/callee lists. A file that reads\nsuccessfully on its next pass has its row's `skip_reason` cleared back\nto `NULL` (see `discovery::upsert_file_index`'s doc comment) and drops\nout of this list on its own, with no separate cleanup step needed.",
+        "type": "object",
+        "properties": {
+          "total": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "entries": {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/SkippedFileEntryOutput"
+            }
+          }
+        },
+        "required": [
+          "total",
+          "entries"
+        ]
+      },
+      "SkippedFileEntryOutput": {
+        "description": "One `file_index` row with a recorded `skip_reason` (4.1b, truth-kernel-\nhardening plan) -- couldn't be read on its most recent reindex pass\n(too large, unreadable, permission denied, a non-UTF-8 write\nmid-flight), so nothing was extracted/re-extracted for it that pass.",
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "skip_reason": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "skip_reason"
+        ]
+      },
       "ExternalProofStatusOutput": {
         "type": "object",
         "properties": {
@@ -587,6 +623,10 @@
         "description": "Tier-0 source files currently discoverable on disk (respects\n`config.ignore`) — compare against `files_indexed` to see whether the\nindex is behind what's actually in the project tree.",
         "type": "integer",
         "format": "int64"
+      },
+      "skipped_files": {
+        "description": "`file_index` rows currently carrying a `skip_reason` (4.1b,\ntruth-kernel-hardening plan) -- files that couldn't be read on their\nmost recent reindex pass, with why. Explains the common case where\n`files_indexed` (or its symbol/edge contribution) falls short of\n`files_total` for a reason other than \"still indexing\".",
+        "$ref": "#/$defs/SkippedFilesStatusOutput"
       },
       "symbols_indexed": {
         "type": "integer",

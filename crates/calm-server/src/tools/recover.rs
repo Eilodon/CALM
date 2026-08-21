@@ -40,6 +40,32 @@ impl CalmServer {
             let edges: i64 = conn
                 .query_row("SELECT COUNT(*) FROM call_edges", [], |r| r.get(0))
                 .unwrap_or(0);
+            // 4.1b (truth-kernel-hardening plan): files whose most recent
+            // reindex pass couldn't read them, with why -- `total` is the
+            // true count even when `entries` is capped.
+            let skipped_files = {
+                const SKIPPED_FILES_STATUS_CAP: i64 = 20;
+                let total: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM file_index WHERE skip_reason IS NOT NULL",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(0);
+                let mut entries = Vec::new();
+                if let Ok(mut stmt) = conn.prepare(
+                    "SELECT path, skip_reason FROM file_index WHERE skip_reason IS NOT NULL \
+                     ORDER BY path LIMIT ?1",
+                ) && let Ok(rows) = stmt.query_map([SKIPPED_FILES_STATUS_CAP], |r| {
+                    Ok(SkippedFileEntryOutput {
+                        path: r.get(0)?,
+                        skip_reason: r.get(1)?,
+                    })
+                }) {
+                    entries.extend(rows.flatten());
+                }
+                SkippedFilesStatusOutput { total, entries }
+            };
             let last_updated: Option<f64> = conn
                 .query_row("SELECT MAX(last_indexed) FROM file_index", [], |r| r.get(0))
                 .ok()
@@ -296,6 +322,7 @@ impl CalmServer {
                 indexing_error,
                 files_indexed: files,
                 files_total,
+                skipped_files,
                 symbols_indexed: symbols,
                 edges_indexed: edges,
                 embeddings_status: self.embed_status_str(),
@@ -819,6 +846,12 @@ pub(crate) struct IndexingStatusOutput {
     /// `config.ignore`) — compare against `files_indexed` to see whether the
     /// index is behind what's actually in the project tree.
     pub(crate) files_total: i64,
+    /// `file_index` rows currently carrying a `skip_reason` (4.1b,
+    /// truth-kernel-hardening plan) -- files that couldn't be read on their
+    /// most recent reindex pass, with why. Explains the common case where
+    /// `files_indexed` (or its symbol/edge contribution) falls short of
+    /// `files_total` for a reason other than "still indexing".
+    pub(crate) skipped_files: SkippedFilesStatusOutput,
     pub(crate) symbols_indexed: i64,
     pub(crate) edges_indexed: i64,
     pub(crate) embeddings_status: String,
@@ -1007,6 +1040,29 @@ pub(crate) struct ExternalProofStatusOutput {
     pub(crate) legacy: u64,
     pub(crate) unverified: u64,
     pub(crate) rejected: u64,
+}
+
+/// One `file_index` row with a recorded `skip_reason` (4.1b, truth-kernel-
+/// hardening plan) -- couldn't be read on its most recent reindex pass
+/// (too large, unreadable, permission denied, a non-UTF-8 write
+/// mid-flight), so nothing was extracted/re-extracted for it that pass.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub(crate) struct SkippedFileEntryOutput {
+    pub(crate) path: String,
+    pub(crate) skip_reason: String,
+}
+
+/// Files currently carrying a `file_index.skip_reason` (4.1b). `entries` is
+/// capped at `SKIPPED_FILES_STATUS_CAP`; `total` is the true count even when
+/// truncated -- same cap-with-true-count contract `callers`/`callees`
+/// already use for their own direct-caller/callee lists. A file that reads
+/// successfully on its next pass has its row's `skip_reason` cleared back
+/// to `NULL` (see `discovery::upsert_file_index`'s doc comment) and drops
+/// out of this list on its own, with no separate cleanup step needed.
+#[derive(Default, Serialize, JsonSchema)]
+pub(crate) struct SkippedFilesStatusOutput {
+    pub(crate) total: i64,
+    pub(crate) entries: Vec<SkippedFileEntryOutput>,
 }
 
 #[derive(Default, Serialize, JsonSchema)]

@@ -85,7 +85,7 @@ pub fn search(
 ) -> rusqlite::Result<SearchOutput> {
     match kind {
         SearchKind::Symbol => search_symbol(conn, query, limit),
-        SearchKind::Text => search_text(conn, query, limit),
+        SearchKind::Text => search_text(conn, query, limit, rrf_k),
         SearchKind::File => search_file(conn, query, limit),
         SearchKind::Semantic => search_semantic(conn, query, limit, embedder, rrf_k),
         SearchKind::Hybrid => search_hybrid(conn, query, limit, embedder, rrf_k),
@@ -362,14 +362,22 @@ fn search_symbol(conn: &Connection, query: &str, limit: usize) -> rusqlite::Resu
     })
 }
 
-fn search_text(conn: &Connection, query: &str, limit: usize) -> rusqlite::Result<SearchOutput> {
+fn search_text(
+    conn: &Connection,
+    query: &str,
+    limit: usize,
+    rrf_k: f64,
+) -> rusqlite::Result<SearchOutput> {
     let raw_query = escape_fts5_query(query);
     // FTS5 global column filter: {docstring signature} restricts ALL tokens to
     // just those two columns — deliberately excludes `name` (that's what
     // kind="symbol" is for) but, unlike the old docstring-only filter, now
     // also matches a symbol's signature (parameter/return types), not just
-    // its docstring. Still doesn't cover function bodies, imports, or
-    // non-code files — that's what kind="grep" is for (search_grep, above).
+    // its docstring. 3.2 (Wave 3): this used to be the WHOLE story for
+    // kind="text" -- "does NOT search function bodies" was a real, honestly
+    // documented gap (Wave 0's 0.3 stopgap). Now merged below with
+    // chunk_text_results (fts_chunks, over code_chunks.chunk_text) so
+    // kind="text" genuinely covers bodies too.
     let fts_query = format!("{{docstring signature}} : {raw_query}");
     // Fetch one extra row beyond `limit` so `truncated` can tell "exactly
     // `limit` results, no more" apart from "more results exist beyond the
@@ -403,13 +411,36 @@ fn search_text(conn: &Connection, query: &str, limit: usize) -> rusqlite::Result
         })
     })?;
 
-    let mut results = Vec::new();
+    let mut name_docstring_hits = Vec::new();
     for row in rows {
-        results.push(row?.into_result("text"));
+        name_docstring_hits.push(row?.into_result("text"));
     }
+    let name_docstring_truncated = name_docstring_hits.len() > limit;
+    name_docstring_hits.truncate(limit);
 
-    let truncated = results.len() > limit;
+    let chunk_hits = chunk_text_results(conn, query, limit)?;
+
+    let truncated = name_docstring_truncated || chunk_hits.len() > limit;
+
+    let mut results = match (name_docstring_hits.is_empty(), chunk_hits.is_empty()) {
+        (true, true) => Vec::new(),
+        (false, true) => name_docstring_hits,
+        (true, false) => chunk_hits,
+        (false, false) => rrf_merge_n(
+            &[
+                (&name_docstring_hits, RRF_FTS_WEIGHT),
+                (&chunk_hits, RRF_CHUNK_WEIGHT),
+            ],
+            limit,
+            rrf_k,
+            "text",
+        ),
+    };
+    // rrf_merge_n already caps its own output to `limit`; this only bites
+    // the two direct-passthrough branches above, which can carry the extra
+    // over-fetched chunk row.
     results.truncate(limit);
+
     Ok(SearchOutput {
         results,
         truncated,
@@ -513,18 +544,24 @@ fn search_file(conn: &Connection, query: &str, limit: usize) -> rusqlite::Result
 /// `search_grep` matches with a `name`/`qualified_name`/`kind` a raw text
 /// search can't offer on its own. Narrowest span wins when ranges nest
 /// (e.g. a method inside a class).
+/// `(name, qualified_name, kind, is_test)` of the tightest enclosing
+/// symbol, if any -- factored out of `enclosing_symbol`'s own signature
+/// to satisfy clippy's `type_complexity` lint, same convention this
+/// crate already uses for `ExtractedBatchRow`.
+type EnclosingSymbolRow = (String, String, Option<String>, bool);
+
 fn enclosing_symbol(
     conn: &Connection,
     path: &str,
     line: i64,
-) -> rusqlite::Result<Option<(String, String, Option<String>)>> {
+) -> rusqlite::Result<Option<EnclosingSymbolRow>> {
     conn.query_row(
-        "SELECT name, qualified_name, kind FROM symbols
+        "SELECT name, qualified_name, kind, is_test FROM symbols
          WHERE path = ?1 AND line_start <= ?2 AND line_end >= ?2
          ORDER BY (line_end - line_start) ASC
          LIMIT 1",
         rusqlite::params![path, line],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
     )
     .optional()
 }
@@ -689,8 +726,8 @@ pub fn search_grep(
                 break 'enrich;
             }
             let symbol = enclosing_symbol(conn, &m.rel_path, m.line_no)?;
-            let (name, qualified_name, kind) = match symbol {
-                Some((name, qn, kind)) => (name, qn, kind),
+            let (name, qualified_name, kind, is_test) = match symbol {
+                Some((name, qn, kind, is_test)) => (name, qn, kind, is_test),
                 None => (
                     m.rel_path
                         .rsplit('/')
@@ -699,6 +736,7 @@ pub fn search_grep(
                         .to_string(),
                     format!("{}:{}", m.rel_path, m.line_no),
                     None,
+                    false,
                 ),
             };
 
@@ -712,7 +750,7 @@ pub fn search_grep(
                 score: 1.0,
                 match_type: "grep".to_string(),
                 snippet: Some(m.snippet),
-                is_test: false,
+                is_test,
                 churn_score: None,
                 coreness: None,
             });
@@ -786,6 +824,48 @@ fn chunk_semantic_results(
         if let Some(mut r) = chunk_hit_to_result(conn, *chunk_id)? {
             // cosine distance → similarity in [0, 1] for a friendlier score.
             r.score = 1.0 - dist;
+            results.push(r);
+        }
+    }
+    Ok(results)
+}
+
+/// FTS5 BM25 search over `code_chunks.chunk_text` (3.2, Wave 3) -- the real
+/// fix behind Wave 0's 0.3 stopgap doc-truth fix: `fts_exact` (used by
+/// `search_text`'s name/docstring/signature query) never covers function
+/// bodies. Resolved back to a `SearchResult` via [`chunk_hit_to_result`],
+/// the same helper [`chunk_semantic_results`] uses -- one shared
+/// gap-chunk/dangling-`symbol_qn` resolution story for both the semantic
+/// and lexical chunk paths, not two. Over-fetches by 1 like its semantic
+/// sibling, for the same truncation-detection reason.
+fn chunk_text_results(
+    conn: &Connection,
+    query: &str,
+    limit: usize,
+) -> rusqlite::Result<Vec<SearchResult>> {
+    let raw_query = escape_fts5_query(query);
+    let fetch_limit = (limit + 1) as i64;
+    let mut stmt = conn.prepare(
+        "SELECT rowid, -bm25(fts_chunks) AS score
+         FROM fts_chunks
+         WHERE fts_chunks MATCH ?1
+         ORDER BY score DESC
+         LIMIT ?2",
+    )?;
+    let hits: Vec<(i64, f64)> = stmt
+        .query_map(rusqlite::params![raw_query, fetch_limit], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let mut results = Vec::with_capacity(hits.len());
+    for (chunk_id, score) in hits {
+        if let Some(mut r) = chunk_hit_to_result(conn, chunk_id)? {
+            r.score = score;
+            // Distinct from chunk_hit_to_result's default "semantic_chunk"
+            // -- this hit came from lexical BM25 match, not embedding KNN.
+            r.match_type = "text_chunk".to_string();
             results.push(r);
         }
     }
@@ -1354,6 +1434,38 @@ mod tests {
             "Should find symbols with 'database' in docstring, got: {:?}",
             output.results.iter().map(|r| &r.name).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn test_search_text_finds_function_body_only_content_via_chunk_fts() {
+        // 3.2 (Wave 3) DoD: a query string that appears ONLY inside a
+        // function body -- never in any symbol's name/docstring/signature
+        // -- must now be found by kind="text", via the new fts_chunks path
+        // merged into search_text. Before this wave, kind="text" only ever
+        // queried fts_exact (name/docstring/signature) and would have
+        // returned nothing for this query.
+        let conn = setup_db_with_symbols();
+        conn.execute(
+            "INSERT INTO code_chunks (path, line_start, line_end, chunk_text, symbol_qn, file_hash) \
+             VALUES ('src/main.py', 20, 24, 'result = xylophonemarkerzzz(x, y)\nreturn result', NULL, 'h')",
+            [],
+        )
+        .unwrap();
+
+        let output = search(
+            &conn,
+            "xylophonemarkerzzz",
+            SearchKind::Text,
+            10,
+            None,
+            DEFAULT_RRF_K,
+        )
+        .unwrap();
+        assert!(
+            !output.results.is_empty(),
+            "body-only content must be found via kind=text now that fts_chunks is merged in"
+        );
+        assert_eq!(output.results[0].match_type, "text_chunk");
     }
 
     #[test]

@@ -49,7 +49,7 @@ impl CalmServer {
                 Ok(c) => c,
                 Err(e) => return db_error_resolved(e),
             };
-            let resolution = match resolve_symbol(&read_conn, &p.symbol, p.path.as_deref(), p.line) {
+            let resolution = match resolve_symbol(&read_conn, &self.project_root, &p.symbol, p.path.as_deref(), p.line, p.qualified_name.as_deref()) {
                 Ok(r) => r,
                 Err(e) => return db_error_resolved(e),
             };
@@ -58,6 +58,7 @@ impl CalmServer {
                 SymbolResolution::Ambiguous(candidates) => {
                     return ResolvedOutcome::ambiguous(&candidates);
                 }
+                SymbolResolution::ReadFailed(e) => return ResolvedOutcome::error(e),
                 SymbolResolution::Found(c) => *c,
             };
             self.track_symbol(&c.qualified_name);
@@ -335,6 +336,12 @@ pub(crate) struct PatternDebtRegisterParams {
     /// Disambiguates same-named symbols in the same file.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) line: Option<i64>,
+    /// 3.4 (Wave 3): exact `qualified_name` from a prior `search`/`locate`
+    /// result -- when set, resolves directly by identity and `path`/`line`
+    /// are ignored, so this can never come back ambiguous even for a
+    /// globally-common bare `symbol` name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) qualified_name: Option<String>,
     /// Free-text description of the bug/duplication pattern this anchor
     /// tracks — shown back on every `pattern_debt_status` check.
     pub(crate) note: String,

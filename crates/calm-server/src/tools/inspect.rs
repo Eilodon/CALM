@@ -154,13 +154,14 @@ impl CalmServer {
                 Ok(c) => c,
                 Err(e) => return db_error_resolved(e),
             };
-            let resolution = match resolve_symbol(&conn, &p.symbol, p.path.as_deref(), p.line) {
+            let resolution = match resolve_symbol(&conn, &self.project_root, &p.symbol, p.path.as_deref(), p.line, p.qualified_name.as_deref()) {
                 Ok(r) => r,
                 Err(e) => return db_error_resolved(e),
             };
             match resolution {
                 SymbolResolution::NotFound => ResolvedOutcome::not_found(&p.symbol),
                 SymbolResolution::Ambiguous(candidates) => ResolvedOutcome::ambiguous(&candidates),
+                SymbolResolution::ReadFailed(e) => ResolvedOutcome::error(e),
                 SymbolResolution::Found(c) => {
                     let c = *c;
                     self.track_symbol(&c.qualified_name);
@@ -223,7 +224,14 @@ impl CalmServer {
                 None => return self.source_range(&conn, &p),
             };
 
-            let resolution = match resolve_symbol(&conn, &symbol_name, p.path.as_deref(), p.line) {
+            let resolution = match resolve_symbol(
+                &conn,
+                &self.project_root,
+                &symbol_name,
+                p.path.as_deref(),
+                p.line,
+                p.qualified_name.as_deref(),
+            ) {
                 Ok(r) => r,
                 Err(e) => return db_error_resolved(e),
             };
@@ -232,6 +240,7 @@ impl CalmServer {
                 SymbolResolution::Ambiguous(candidates) => {
                     return ResolvedOutcome::ambiguous(&candidates);
                 }
+                SymbolResolution::ReadFailed(e) => return ResolvedOutcome::error(e),
                 SymbolResolution::Found(c) => *c,
             };
             // Release the read connection before file IO (mirrors the original
@@ -244,8 +253,16 @@ impl CalmServer {
             let (raw_source, data_source, etag) = match std::fs::read_to_string(&full_path) {
                 Ok(content) => {
                     let lines: Vec<&str> = content.lines().collect();
-                    let start = (c.line_start as usize).saturating_sub(1);
-                    let end = (c.line_end as usize).min(lines.len());
+                    // Both ends clamped to lines.len() (2026-08-20
+                    // truth-kernel audit, P0-1e): `start` alone being
+                    // saturating_sub'd left it unclamped above EOF, so a
+                    // stale (too-large) indexed line_start against a file
+                    // that shrank since last index could make start > end
+                    // and panic on the slice below -- defense-in-depth only,
+                    // not a fix for the underlying stale-coordinate risk
+                    // (Wave 1's live-resolution work is that fix).
+                    let start = (c.line_start as usize).saturating_sub(1).min(lines.len());
+                    let end = (c.line_end as usize).min(lines.len()).max(start);
                     let etag = calm_core::edit::range_checksum(
                         &content,
                         c.line_start as usize,
@@ -377,7 +394,17 @@ impl CalmServer {
             }
         };
         self.track_file(path);
-        let full_path = self.project_root.join(path);
+        // Path containment (2026-08-20 truth-kernel audit, P0-5): `path` is
+        // caller-supplied and, unlike symbol mode (where it comes from an
+        // already-indexed DB row), was never checked against `..` traversal
+        // or a symlink escaping `project_root` -- the write path
+        // (`resolve_repo_path`, edit.rs) has always had this check, the read
+        // path never did. Reuse the exact same policy so read and write
+        // agree on what "inside the project" means.
+        let full_path = match super::edit::resolve_repo_path(&self.project_root, path) {
+            Ok(fp) => fp,
+            Err(e) => return ResolvedOutcome::error(e),
+        };
         let content = match std::fs::read_to_string(&full_path) {
             Ok(c) => c,
             Err(_) => {
@@ -473,59 +500,100 @@ impl CalmServer {
                 &conn,
                 &p.query,
                 kind,
-                1,
+                // 3.3 (Wave 3, P1-2): top-2, not top-1 -- need the runner-up
+                // to compute a resolution_confidence margin instead of
+                // silently committing to whatever ranked first.
+                2,
                 self.embedder().as_deref(),
                 calm_core::search::DEFAULT_RRF_K, // understand tool: single-result lookup, hybrid unused
             );
 
-            let top = search_result
+            let mut hits = search_result
                 .ok()
-                .and_then(|o| o.results.into_iter().next());
+                .map(|o| o.results)
+                .unwrap_or_default()
+                .into_iter();
+            let top = hits.next();
+            let second = hits.next();
+
+            // 3.3 (Wave 3, P1-2): a second candidate scoring nearly as well
+            // as the top hit means this wasn't a confident resolution --
+            // report that honestly instead of quietly picking top-1.
+            // UNDERSTAND_AMBIGUOUS_MARGIN_RATIO is a judgment call (no
+            // existing precedent in this codebase's search/ranking code to
+            // anchor it to).
+            let resolution_confidence = match (&top, &second) {
+                (None, _) => "none",
+                (Some(t), Some(s))
+                    if t.score > 0.0 && s.score >= t.score * UNDERSTAND_AMBIGUOUS_MARGIN_RATIO =>
+                {
+                    "ambiguous"
+                }
+                (Some(_), _) => "confident",
+            };
+            let alternatives: Vec<UnderstandAlternative> = if resolution_confidence == "ambiguous" {
+                [top.as_ref(), second.as_ref()]
+                    .into_iter()
+                    .flatten()
+                    .map(|r| UnderstandAlternative {
+                        name: r.name.clone(),
+                        qualified_name: r.qualified_name.clone(),
+                        path: r.path.clone(),
+                        kind: r.kind.clone(),
+                        score: r.score,
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            // Ambiguous: never commit to either candidate as if it were a
+            // confident single answer -- the agent must disambiguate first
+            // (e.g. `symbol_info` with an explicit `path`, or a narrower
+            // query). `top` was only needed above to detect the ambiguity;
+            // resolution stops here, and every field below that's gated on
+            // `top`/`symbol_info` naturally comes out empty as a result.
+            let top = if resolution_confidence == "ambiguous" {
+                None
+            } else {
+                top
+            };
 
             // Carries `language` alongside `SymbolInfoOutput` (which doesn't have
             // a language field) so `SourceOutput.language` below isn't stubbed.
+            //
+            // 2026-08-20 truth-kernel Wave 1 (P0-1d): previously a hand-rolled
+            // `query_row` keyed on `qualified_name`, bypassing resolve_symbol
+            // entirely -- no live-verification, same stale-slice risk as
+            // source()'s pre-Wave-1 bug. Now routes through resolve_symbol
+            // (bare name + path from the search hit) so a renamed/moved/
+            // deleted symbol is caught here instead of silently returning
+            // whatever DB row still matches the search hit's qualified_name.
             let mut symbol_info: Option<(SymbolInfoOutput, String)> = top.as_ref().and_then(|t| {
-                conn
-                    .query_row(
-                        "SELECT name, qualified_name, kind, path, line_start, line_end, signature, docstring, caller_count, is_hub, language
-                         FROM symbols WHERE qualified_name = ?1 LIMIT 1",
-                        rusqlite::params![t.qualified_name],
-                        |row| {
-                            Ok((
-                                SymbolInfoOutput {
-                                    name: row.get(0)?,
-                                    qualified_name: row.get(1)?,
-                                    kind: row.get(2)?,
-                                    path: row.get(3)?,
-                                    line_start: row.get(4)?,
-                                    line_end: row.get(5)?,
-                                    // Verbatim source text at index time — redact
-                                    // the same as this tool's own `source` field
-                                    // below (see common.rs's `to_symbol_info`).
-                                    signature: row
-                                        .get::<_, String>(6)
-                                        .ok()
-                                        .map(|s| sanitize_source_output(&s))
-                                        .filter(|s| !s.is_empty()),
-                                    docstring: row
-                                        .get::<_, String>(7)
-                                        .ok()
-                                        .map(|s| sanitize_source_output(&s))
-                                        .filter(|s| !s.is_empty()),
-                                    caller_count: row.get(8)?,
-                                    is_hub: row.get::<_, i64>(9)? != 0,
-                                    coreness: None,
-                                    health: None,
-                                    suggested_next: None,
-                                    type_relations: None,
-                                    effects: None,
-                                    content_warning: None,
-                                },
-                                row.get::<_, String>(10).unwrap_or_default(),
-                            ))
-                        },
-                    )
-                    .ok()
+                // 3.4 (Wave 3): the search hit already carries its own
+                // exact qualified_name -- use it directly instead of
+                // re-deriving via bare name+path, closing even the DB-
+                // Ambiguous residual this call site used to hit (see the
+                // Ambiguous match arm below, now unreachable in practice
+                // but kept as defense in depth).
+                match resolve_symbol(&conn, &self.project_root, &t.name, Some(&t.path), None, Some(t.qualified_name.as_str())) {
+                    Ok(SymbolResolution::Found(c)) => {
+                        Some((c.to_symbol_info(), c.language.clone()))
+                    }
+                    // DB-ambiguous (rare: e.g. a cfg/not(cfg) same-named stub
+                    // pair) -- the search hit already told us exactly which
+                    // qualified_name it meant, so pick that one deterministically
+                    // rather than surfacing ambiguity from a single-best-match
+                    // tool. Known residual (documented in the Wave 1 plan):
+                    // this specific candidate isn't itself live-re-verified in
+                    // this path.
+                    Ok(SymbolResolution::Ambiguous(candidates)) => candidates
+                        .into_iter()
+                        .find(|c| c.qualified_name == t.qualified_name)
+                        .map(|c| (c.to_symbol_info(), c.language.clone())),
+                    Ok(SymbolResolution::NotFound) | Ok(SymbolResolution::ReadFailed(_)) | Err(_) => {
+                        None
+                    }
+                }
             });
             // Tier 1 semantic facts (2026-08-07 roadmap T1) -- see
             // `fetch_semantic_facts`'s doc comment. Computed AFTER the
@@ -555,8 +623,12 @@ impl CalmServer {
                 let full_path = self.project_root.join(&info.path);
                 let content = std::fs::read_to_string(&full_path).ok()?;
                 let lines: Vec<&str> = content.lines().collect();
-                let start = (info.line_start as usize).saturating_sub(1);
-                let end = (info.line_end as usize).min(lines.len());
+                // Both ends clamped to lines.len() -- same P0-1e defensive
+                // fix as source() (2026-08-20 truth-kernel audit).
+                let start = (info.line_start as usize)
+                    .saturating_sub(1)
+                    .min(lines.len());
+                let end = (info.line_end as usize).min(lines.len()).max(start);
                 let raw = sanitize_source_output(&lines[start..end].join("\n"));
                 let content_warning = injection_warning(&raw);
                 // Numbered by default: `understand` is a pre-edit/comprehension
@@ -637,6 +709,8 @@ impl CalmServer {
                 } else {
                     suggested_with_args("edit_context", "Pre-edit: verify blast radius before modifying", serde_json::json!({"symbol": info.name, "path": info.path}))
                 }
+            } else if resolution_confidence == "ambiguous" {
+                suggested_with_args("symbol_info", "Ambiguous match — disambiguate with an explicit path", serde_json::json!({"symbol": p.query}))
             } else {
                 None
             };
@@ -648,6 +722,12 @@ impl CalmServer {
                 edges_ready: Some(self.edges_ready()),
                 suggested_next: self.filter_sn(sn),
                 architecture_digest,
+                resolution_confidence: resolution_confidence.to_string(),
+                alternatives: if alternatives.is_empty() {
+                    None
+                } else {
+                    Some(alternatives)
+                },
             })
         }))
     }
@@ -736,6 +816,24 @@ impl CalmServer {
                     }
                 }
             }
+
+            // 2026-08-20 truth-kernel Wave 1 (P0-1): live-verify each DB row
+            // against disk in this same call before trusting its coordinates
+            // for source-slicing below -- reuses the same verify_live check
+            // resolve_symbol applies internally, instead of symbols_batch
+            // repeating the old stale-slice pattern a third time. A row
+            // that's vanished/moved-ambiguous/unreadable since indexing is
+            // dropped from `found` entirely -- it reports `found: false`
+            // below rather than confidently returning stale content.
+            let found: std::collections::HashMap<String, CandidateRow> = found
+                .into_iter()
+                .filter_map(
+                    |(qn, row)| match verify_live(&conn, &self.project_root, row) {
+                        SymbolResolution::Found(c) => Some((qn, *c)),
+                        _ => None,
+                    },
+                )
+                .collect();
 
             let found_ids: Vec<String> = found.keys().cloned().collect();
             let mut callers_by_symbol: std::collections::HashMap<String, Vec<CallerEntry>> = std::collections::HashMap::new();
@@ -864,8 +962,13 @@ impl CalmServer {
                     let (source, token_estimate, content_warning) = match std::fs::read_to_string(&full_path) {
                         Ok(content) => {
                             let lines: Vec<&str> = content.lines().collect();
-                            let start = (row.line_start as usize).saturating_sub(1);
-                            let end = (row.line_end as usize).min(lines.len());
+                            // Both ends clamped to lines.len() -- same
+                            // P0-1e defensive fix as source() (2026-08-20
+                            // truth-kernel audit).
+                            let start = (row.line_start as usize)
+                                .saturating_sub(1)
+                                .min(lines.len());
+                            let end = (row.line_end as usize).min(lines.len()).max(start);
                             let sanitized = sanitize_source_output(&lines[start..end].join("\n"));
                             let tok = estimate_tokens(&sanitized);
                             let warn = injection_warning(&sanitized);
@@ -957,6 +1060,12 @@ pub(crate) struct SymbolInfoParams {
     /// `line_start`/`line_end`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) line: Option<i64>,
+    /// 3.4 (Wave 3): exact `qualified_name` from a prior `search`/`locate`
+    /// result -- when set, resolves directly by identity and `path`/`line`
+    /// are ignored, so this can never come back ambiguous even for a
+    /// globally-common bare `symbol` name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) qualified_name: Option<String>,
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -1128,6 +1237,12 @@ pub(crate) struct SourceParams {
     /// 1-indexed START line of the window to read.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) line: Option<i64>,
+    /// 3.4 (Wave 3): exact `qualified_name` from a prior `search`/`locate`
+    /// result -- when set, resolves directly by identity and `path`/`line`
+    /// are ignored, so this can never come back ambiguous even for a
+    /// globally-common bare `symbol` name. Ignored in range mode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) qualified_name: Option<String>,
     /// Range mode: 1-indexed, inclusive END line of a raw window read
     /// directly from `path` with no symbol resolution — for module-level or
     /// between-symbol code no symbol range covers. Requires `path` + `line`
@@ -1219,7 +1334,10 @@ pub(crate) fn estimate_tokens(s: &str) -> i64 {
 #[allow(dead_code)]
 pub(crate) struct UnderstandParams {
     /// Symbol name or free text to look up — resolved via the same search
-    /// used by `locate`, but only the single best match is used.
+    /// used by `locate`. The best match is used when it clearly outranks
+    /// the runner-up (3.3, Wave 3); when the two are too close to call,
+    /// `resolution_confidence: "ambiguous"` is returned instead, with both
+    /// candidates in `alternatives` and no committed `symbol`/`source`.
     pub(crate) query: String,
     /// One of `"symbol"` (default), `"text"`, or `"file"` — same meaning as
     /// `locate`'s `kind`, minus `"semantic"`/`"hybrid"` (not supported
@@ -1243,7 +1361,39 @@ pub(crate) struct UnderstandOutput {
     /// `ArchitectureDigestOutput`'s doc comment.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) architecture_digest: Option<ArchitectureDigestOutput>,
+    /// 3.3 (Wave 3, P1-2): `"none"` (no match at all), `"confident"` (a
+    /// clear top hit), or `"ambiguous"` (the runner-up scored too close to
+    /// call — see `UNDERSTAND_AMBIGUOUS_MARGIN_RATIO`). When `"ambiguous"`,
+    /// `symbol`/`source`/`callers_summary`/`architecture_digest` are all
+    /// left empty rather than committing to a coin-flip pick — see
+    /// `alternatives` instead.
+    pub(crate) resolution_confidence: String,
+    /// Populated only when `resolution_confidence == "ambiguous"`: the top
+    /// two candidates that were too close to call, for the caller to
+    /// disambiguate (e.g. via `symbol_info` with an explicit `path`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) alternatives: Option<Vec<UnderstandAlternative>>,
 }
+
+/// One candidate in `UnderstandOutput::alternatives` (3.3, Wave 3).
+#[derive(Serialize, JsonSchema)]
+pub(crate) struct UnderstandAlternative {
+    pub(crate) name: String,
+    pub(crate) qualified_name: String,
+    pub(crate) path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) kind: Option<String>,
+    pub(crate) score: f64,
+}
+
+/// 3.3 (Wave 3, P1-2): a second `understand` candidate scoring within this
+/// fraction of the top hit's own score is treated as too close to call
+/// (`resolution_confidence: "ambiguous"`). A judgment call, not tuned
+/// against a real corpus (unlike e.g. `search.rs`'s RRF weights) -- kept as
+/// a single named constant specifically so it's a one-line tuning knob if
+/// it proves too strict/loose in practice, not a magic number buried in a
+/// conditional.
+const UNDERSTAND_AMBIGUOUS_MARGIN_RATIO: f64 = 0.9;
 
 // ---------------------------------------------------------------------------
 // Tool: symbols_batch

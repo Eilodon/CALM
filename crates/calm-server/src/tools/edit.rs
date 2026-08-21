@@ -396,7 +396,21 @@ impl CalmServer {
                     Ok(c) => c,
                     Err(e) => return db_error_resolved(e),
                 };
-                let resolution = match resolve_symbol(&conn, &p.symbol, p.path.as_deref(), p.line) {
+                let resolution = match resolve_symbol(
+                    &conn,
+                    &self.project_root,
+                    &p.symbol,
+                    p.path.as_deref(),
+                    p.line,
+                    // 3.4 (Wave 3): write-path tools keep bare-name+path/line
+                    // resolution unchanged in this landing -- qualified_name
+                    // identity-chaining is scoped to the read-only tools
+                    // (source/symbol_info/callers/callees/reference_impact/
+                    // path/pattern_debt_register/understand), where the
+                    // ambiguity-avoidance value is highest and the risk is
+                    // lowest (no gate/authority interactions to reason about).
+                    None,
+                ) {
                     Ok(r) => r,
                     Err(e) => return db_error_resolved(e),
                 };
@@ -405,6 +419,7 @@ impl CalmServer {
                     SymbolResolution::Ambiguous(candidates) => {
                         return ResolvedOutcome::ambiguous(&candidates);
                     }
+                    SymbolResolution::ReadFailed(e) => return ResolvedOutcome::error(e),
                     SymbolResolution::Found(c) => *c,
                 }
             };
@@ -4081,6 +4096,13 @@ pub(crate) fn all_caller_edges_confident(
     // permissive one, but it's still wrong: a symbol whose only caller
     // edges were N confident ones plus M since-disproven ones reported
     // `false` here instead of `true`.
+    // 2.3 (Wave 2, canonical `EvidencePolicy`): this `IN ('resolved','formal')`
+    // clause is SQL text, so it can't literally call
+    // `EdgeConfidence::is_verified()` -- but it must stay byte-for-byte
+    // equivalent to it (already is; both name exactly `Formal`/`Resolved`).
+    // If `is_verified()`'s definition ever changes, this string must change
+    // with it -- there is no compiler to enforce that link across the
+    // Rust/SQL boundary, so keep this comment current.
     let sql = format!(
         "SELECT COUNT(*), SUM(CASE WHEN edge_confidence IN ('resolved','formal') THEN 1 ELSE 0 END) \
          FROM call_edges WHERE to_symbol IN ({placeholders}) AND ruled_out_by_scip = 0"
@@ -4242,7 +4264,7 @@ fn insertion_hunk_for(
     })?;
     let (line_start, line_end) =
         match calm_core::indexer::parser::extract_symbols(&live, &c.language, &c.path) {
-            Ok(symbols) => match best_live_range(&symbols, &c.name, c.line_start) {
+            Ok(symbols) => match best_live_range(&symbols, c) {
                 Some(range) => range,
                 None => {
                     return Err(error_detail(
@@ -4256,7 +4278,21 @@ fn insertion_hunk_for(
                     ));
                 }
             },
-            Err(_) => (c.line_start as usize, c.line_end as usize),
+            Err(e) => {
+                // 2026-08-20 truth-kernel Wave 1, P0-1g: a fresh-parse failure
+                // must never silently fall back to the (possibly stale) DB
+                // coordinates -- that was the exact bug. Fail closed instead,
+                // matching resolve_symbol's own verify_live behavior.
+                return Err(error_detail(
+                    "REPARSE_FAILED",
+                    &format!(
+                        "{} changed on disk and could not be re-parsed to anchor the \
+                         insertion for '{}': {e}",
+                        c.path, c.name
+                    ),
+                    true,
+                ));
+            }
         };
     // Root-cause fix (2026-07-14, replaces the former backlog-B1 warning-only
     // mitigation): `Before` used to always anchor at the symbol's own
@@ -4417,13 +4453,11 @@ fn last_two_segments(qn: &str) -> String {
 
 fn best_live_range(
     symbols: &[calm_core::indexer::parser::ParsedSymbol],
-    name: &str,
-    indexed_start: i64,
+    c: &CandidateRow,
 ) -> Option<(usize, usize)> {
-    symbols
-        .iter()
-        .filter(|s| s.name == name)
-        .min_by_key(|s| (s.line_start as i64 - indexed_start).abs())
+    match_live_symbol(symbols, &c.name, &c.kind, c.class_context.as_deref())
+        .into_iter()
+        .min_by_key(|s| (s.line_start as i64 - c.line_start).abs())
         .map(|s| (s.line_start, s.line_end))
 }
 

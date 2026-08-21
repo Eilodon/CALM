@@ -146,10 +146,26 @@ impl EvidenceSnapshot {
     /// reconciliation first -- `freshness_class` reflects whatever
     /// `index_input_drift` reports right now (`Current` or `Degraded`,
     /// never `Reconciled`).
+    /// Computes a snapshot from `conn`'s current state without forcing
+    /// reconciliation first -- `freshness_class` reflects whatever
+    /// `index_input_drift` reports right now (`Current` or `Degraded`,
+    /// never `Reconciled`). A `Current` result additionally gets a cheap
+    /// live-disk spot-check (2.1, Wave 2 -- `live_mtime_drift`) that can
+    /// still downgrade it to `Degraded`: `index_input_drift` only tracks
+    /// config/context fingerprints, not "has a source file changed on disk
+    /// since the last successful index" -- that's a separate lag window
+    /// (the watcher's debounce/reconciliation interval), closed here rather
+    /// than left to `source_catalog_digest` (which only ever reads DB rows,
+    /// never live bytes). The check is skipped when drift is already
+    /// `Degraded` -- no need to pay for it when the answer can't change.
     pub fn compute(conn: &Connection, project_root: &Path) -> rusqlite::Result<Self> {
         let catalog = InputCatalog::for_project(project_root);
         let drift = index_input_drift(conn, &catalog)?;
-        Self::build(conn, project_root, drift_to_freshness(drift))
+        let mut freshness_class = drift_to_freshness(drift);
+        if freshness_class == FreshnessClass::Current && live_mtime_drift(conn, project_root)? {
+            freshness_class = FreshnessClass::Degraded;
+        }
+        Self::build(conn, project_root, freshness_class)
     }
 
     /// Same as [`compute`](Self::compute), but for a caller that just ran a
@@ -169,10 +185,15 @@ impl EvidenceSnapshot {
     /// content's `snapshot_id` -- if a stronger freshness class was ever
     /// recorded for identical content (e.g. a past full reconciliation via
     /// [`compute_after_reconciliation`](Self::compute_after_reconciliation)),
-    /// that's honored here too, not only at persist-time. Safe against
-    /// TOCTOU by construction: `snapshot_id` is content-addressed, so any
-    /// disk change since the recorded snapshot changes the id and the
-    /// lookup simply misses -- there is no timestamp/TTL window to race.
+    /// that's honored here too, not only at persist-time. `snapshot_id` is
+    /// content-addressed over what the DB currently believes, so a disk
+    /// change that has already been reindexed changes the id and this
+    /// lookup simply misses -- no TTL window to race there. A disk change
+    /// NOT yet reflected in any DB row is a different lag window, closed
+    /// separately by `compute`'s own `live_mtime_drift` check (2.1, Wave 2):
+    /// that degrades `freshness_class` to `Degraded` without needing a new
+    /// `snapshot_id`, since the DB-visible content genuinely hasn't changed
+    /// yet.
     pub fn compute_with_recorded_freshness(
         conn: &Connection,
         project_root: &Path,
@@ -324,6 +345,54 @@ fn source_catalog_digest(conn: &Connection) -> rusqlite::Result<String> {
         material.push('\n');
     }
     Ok(evidence_digest(material.as_bytes()))
+}
+
+/// Live-disk companion to `source_catalog_digest` (2.1, Wave 2): that digest
+/// only ever reads DB rows, so a file edited on disk after its last
+/// successful index -- but before the watcher's debounce/reconciliation
+/// catches up -- is invisible to it (`snapshot_id` stays keyed on the stale
+/// DB hash). This closes that specific lag window cheaply by comparing each
+/// `file_index` row's live mtime (via `mtime_secs`, the exact function the
+/// indexer itself stamps rows with -- reused, not reimplemented, so both
+/// sides of the comparison come from one conversion) to its stored `mtime`
+/// column. Deliberately mtime-only, not a content rehash: `compute` runs on
+/// every gated edit (`edit_lines_impl_gated`), not just `edit_context`, so
+/// re-reading every indexed file's bytes here would double that cost across
+/// the whole catalog on every edit for a signal `source_catalog_digest`
+/// already gets once real reindexing happens.
+///
+/// **Documented residual, not silently claimed as caught:** a live mtime
+/// that matches the stored one on a file whose content genuinely differs
+/// (a same-timestamp overwrite) is not detected by this signal alone --
+/// closing that would need a full content rehash, deliberately not done
+/// here (see 2.1's design decision,
+/// docs/plans/2026-08-20-truth-kernel-hardening-execution-plan.md).
+///
+/// Fail-closed like `index_input_drift`'s own `Unknown` posture: a file
+/// missing from disk and a `NULL` stored `mtime` (a pre-migration row, or
+/// one indexed before this column existed) both count as drift rather than
+/// being silently skipped. Short-circuits on the first mismatch -- this is
+/// a boolean gate, not a digest, so there is no reason to keep scanning
+/// once drift is already proven.
+fn live_mtime_drift(conn: &Connection, project_root: &Path) -> rusqlite::Result<bool> {
+    let mut stmt = conn.prepare("SELECT path, mtime FROM file_index")?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let path: String = row.get(0)?;
+        let stored_mtime: Option<f64> = row.get(1)?;
+        let Some(stored_mtime) = stored_mtime else {
+            return Ok(true);
+        };
+        let full_path = project_root.join(&path);
+        if !full_path.exists() {
+            return Ok(true);
+        }
+        let live_mtime = crate::indexer::pipeline::mtime_secs(&full_path);
+        if live_mtime != stored_mtime {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// `evidence_digest` over the sorted `provider\0cache_key\0upgraded\0
@@ -822,5 +891,91 @@ mod tests {
                 .unwrap();
         assert_ne!(after_change.snapshot_id, stale_reconciled.snapshot_id);
         assert_ne!(after_change.freshness_class, FreshnessClass::Reconciled);
+    }
+
+    #[test]
+    fn live_disk_mtime_drift_downgrades_current_to_degraded() {
+        use crate::indexer::refresh::{InputCatalog, persist_index_input_snapshot};
+        let root = tmp_project();
+        let file_path = root.path().join("a.rs");
+        std::fs::write(&file_path, "fn a() {}").unwrap();
+        let indexed_mtime = crate::indexer::pipeline::mtime_secs(&file_path);
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO file_index (path, hash, last_indexed, mtime) \
+             VALUES ('a.rs', 'h1', 0, ?1)",
+            params![indexed_mtime],
+        )
+        .unwrap();
+        persist_index_input_snapshot(&conn, &InputCatalog::for_project(root.path())).unwrap();
+
+        let before = EvidenceSnapshot::compute(&conn, root.path()).unwrap();
+        assert_eq!(
+            before.freshness_class,
+            FreshnessClass::Current,
+            "no drift yet -- stored mtime matches the file as indexed"
+        );
+
+        // Mutate the file on disk WITHOUT reindexing (no file_index update) --
+        // the exact "watcher hasn't caught up yet" lag window 2.1 exists to
+        // catch. A short sleep guards against filesystems with coarse mtime
+        // granularity reporting an identical timestamp for both writes.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(
+            &file_path,
+            "fn a() { /* changed on disk, not reindexed */ }",
+        )
+        .unwrap();
+
+        let after = EvidenceSnapshot::compute(&conn, root.path()).unwrap();
+        assert_eq!(
+            after.freshness_class,
+            FreshnessClass::Degraded,
+            "live mtime no longer matches file_index.mtime -- must not still claim Current"
+        );
+    }
+
+    #[test]
+    fn live_disk_mtime_drift_missing_file_fails_closed() {
+        use crate::indexer::refresh::{InputCatalog, persist_index_input_snapshot};
+        let root = tmp_project();
+        // file_index claims a row for a file that was never actually written
+        // to this project_root -- e.g. deleted since indexing.
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO file_index (path, hash, last_indexed, mtime) \
+             VALUES ('missing.rs', 'h1', 0, 123.0)",
+            [],
+        )
+        .unwrap();
+        persist_index_input_snapshot(&conn, &InputCatalog::for_project(root.path())).unwrap();
+
+        let snap = EvidenceSnapshot::compute(&conn, root.path()).unwrap();
+        assert_eq!(
+            snap.freshness_class,
+            FreshnessClass::Degraded,
+            "a file_index row with no file on disk must fail closed, not be skipped"
+        );
+    }
+
+    #[test]
+    fn live_disk_mtime_drift_null_mtime_fails_closed() {
+        use crate::indexer::refresh::{InputCatalog, persist_index_input_snapshot};
+        let root = tmp_project();
+        std::fs::write(root.path().join("a.rs"), "fn a() {}").unwrap();
+        // conn_with_file_index leaves `mtime` NULL -- a pre-migration row, or
+        // one indexed before this column existed.
+        let conn = conn_with_file_index(&[("a.rs", "h1")]);
+        persist_index_input_snapshot(&conn, &InputCatalog::for_project(root.path())).unwrap();
+
+        let snap = EvidenceSnapshot::compute(&conn, root.path()).unwrap();
+        assert_eq!(
+            snap.freshness_class,
+            FreshnessClass::Degraded,
+            "a NULL stored mtime must fail closed, not be silently treated as no drift"
+        );
     }
 }

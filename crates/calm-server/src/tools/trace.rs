@@ -41,7 +41,7 @@ impl CalmServer {
                 Ok(c) => c,
                 Err(e) => return db_error_resolved(e),
             };
-            let resolution = match resolve_symbol(&conn, &p.symbol, p.path.as_deref(), p.line) {
+            let resolution = match resolve_symbol(&conn, &self.project_root, &p.symbol, p.path.as_deref(), p.line, p.qualified_name.as_deref()) {
                 Ok(r) => r,
                 Err(e) => return db_error_resolved(e),
             };
@@ -50,6 +50,7 @@ impl CalmServer {
                 SymbolResolution::Ambiguous(candidates) => {
                     return ResolvedOutcome::ambiguous(&candidates);
                 }
+                SymbolResolution::ReadFailed(e) => return ResolvedOutcome::error(e),
                 SymbolResolution::Found(c) => *c,
             };
             self.track_symbol(&c.qualified_name);
@@ -323,7 +324,7 @@ impl CalmServer {
                 Ok(c) => c,
                 Err(e) => return db_error_resolved(e),
             };
-            let resolution = match resolve_symbol(&conn, &p.symbol, p.path.as_deref(), p.line) {
+            let resolution = match resolve_symbol(&conn, &self.project_root, &p.symbol, p.path.as_deref(), p.line, p.qualified_name.as_deref()) {
                 Ok(r) => r,
                 Err(e) => return db_error_resolved(e),
             };
@@ -332,6 +333,7 @@ impl CalmServer {
                 SymbolResolution::Ambiguous(candidates) => {
                     return ResolvedOutcome::ambiguous(&candidates);
                 }
+                SymbolResolution::ReadFailed(e) => return ResolvedOutcome::error(e),
                 SymbolResolution::Found(c) => *c,
             };
             self.track_symbol(&c.qualified_name);
@@ -693,7 +695,14 @@ impl CalmServer {
                 Ok(c) => c,
                 Err(e) => return db_error_resolved(e),
             };
-            let resolution = match resolve_symbol(&conn, &p.symbol, p.path.as_deref(), p.line) {
+            let resolution = match resolve_symbol(
+                &conn,
+                &self.project_root,
+                &p.symbol,
+                p.path.as_deref(),
+                p.line,
+                p.qualified_name.as_deref(),
+            ) {
                 Ok(r) => r,
                 Err(e) => return db_error_resolved(e),
             };
@@ -702,6 +711,7 @@ impl CalmServer {
                 SymbolResolution::Ambiguous(candidates) => {
                     return ResolvedOutcome::ambiguous(&candidates);
                 }
+                SymbolResolution::ReadFailed(e) => return ResolvedOutcome::error(e),
                 SymbolResolution::Found(c) => *c,
             };
             self.track_symbol(&c.qualified_name);
@@ -1035,25 +1045,27 @@ impl CalmServer {
                 Ok(c) => c,
                 Err(e) => return db_error_resolved(e),
             };
-            let from = match resolve_symbol(&conn, &p.from_symbol, p.from_path.as_deref(), p.from_line) {
+            let from = match resolve_symbol(&conn, &self.project_root, &p.from_symbol, p.from_path.as_deref(), p.from_line, p.from_qualified_name.as_deref()) {
                 Ok(r) => r,
                 Err(e) => return db_error_resolved(e),
             };
             let from = match from {
                 SymbolResolution::NotFound => return ResolvedOutcome::not_found(&p.from_symbol),
                 SymbolResolution::Ambiguous(candidates) => return ResolvedOutcome::ambiguous(&candidates),
+                SymbolResolution::ReadFailed(e) => return ResolvedOutcome::error(e),
                 SymbolResolution::Found(c) => *c,
             };
             self.track_symbol(&from.qualified_name);
             self.track_file(&from.path);
 
-            let to = match resolve_symbol(&conn, &p.to_symbol, p.to_path.as_deref(), p.to_line) {
+            let to = match resolve_symbol(&conn, &self.project_root, &p.to_symbol, p.to_path.as_deref(), p.to_line, p.to_qualified_name.as_deref()) {
                 Ok(r) => r,
                 Err(e) => return db_error_resolved(e),
             };
             let to = match to {
                 SymbolResolution::NotFound => return ResolvedOutcome::not_found(&p.to_symbol),
                 SymbolResolution::Ambiguous(candidates) => return ResolvedOutcome::ambiguous(&candidates),
+                SymbolResolution::ReadFailed(e) => return ResolvedOutcome::error(e),
                 SymbolResolution::Found(c) => *c,
             };
             self.track_symbol(&to.qualified_name);
@@ -1100,12 +1112,24 @@ impl CalmServer {
             // `exists: true` alone doesn't say whether that's backed by a
             // real, single-candidate chain or purely by fan-out edges the
             // graph never resolved to one target — `certain` is the
-            // explicit signal for that, `true` only when at least one
-            // returned route's weakest hop is not ambiguous/unresolved.
+            // explicit signal for that.
+            //
+            // 2.3 (Wave 2, P0-3e correctness fix): tightened from `rank() >
+            // 0` (which let an all-`textual`/`inferred` route report
+            // `certain: true`) to `is_verified()` (`Formal`/`Resolved`
+            // only), matching what `digest.rs`'s recursive-symbol detection
+            // already considers the stricter, more honest bar. This tool's
+            // own advertised contract is "terminated_by=null + exists=true
+            // -> certain result" -- a route backed only by lexical/inferred
+            // leads doesn't meet that bar. Unlike `coreness.rs`'s hub-gate
+            // bucket (deliberately left broader, see that file), nothing
+            // downstream currently drives an edit-permissiveness decision
+            // off `certain`, so tightening it here is a pure correctness
+            // fix, not a safety-relevant behavior change.
             let certain = exists == Some(true)
                 && route_confidence.iter().any(|c| {
                     calm_core::types::EdgeConfidence::parse(c)
-                        .map(|ec| ec.rank() > 0)
+                        .map(|ec| ec.is_verified())
                         .unwrap_or(true)
                 });
 
@@ -1157,6 +1181,12 @@ pub(crate) struct CallersParams {
     /// `line_start`/`line_end`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) line: Option<i64>,
+    /// 3.4 (Wave 3): exact `qualified_name` from a prior `search`/`locate`
+    /// result -- when set, resolves directly by identity and `path`/`line`
+    /// are ignored, so this can never come back ambiguous even for a
+    /// globally-common bare `symbol` name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) qualified_name: Option<String>,
     /// `true` to also do a multi-hop BFS (`transitive`/`transitive_count`
     /// in the output) beyond direct callers. `false` (default) returns
     /// only direct callers — cheaper.
@@ -1288,6 +1318,12 @@ pub(crate) struct CalleesParams {
     /// `line_start`/`line_end`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) line: Option<i64>,
+    /// 3.4 (Wave 3): exact `qualified_name` from a prior `search`/`locate`
+    /// result -- when set, resolves directly by identity and `path`/`line`
+    /// are ignored, so this can never come back ambiguous even for a
+    /// globally-common bare `symbol` name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) qualified_name: Option<String>,
     /// `true` to also do a multi-hop BFS (`transitive`/`transitive_count`
     /// in the output) beyond direct callees. `false` (default) returns
     /// only direct callees — cheaper.
@@ -1368,6 +1404,12 @@ pub(crate) struct ReferenceImpactParams {
     /// `line_start`/`line_end`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) line: Option<i64>,
+    /// 3.4 (Wave 3): exact `qualified_name` from a prior `search`/`locate`
+    /// result -- when set, resolves directly by identity and `path`/`line`
+    /// are ignored, so this can never come back ambiguous even for a
+    /// globally-common bare `symbol` name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) qualified_name: Option<String>,
 }
 
 #[derive(Serialize, JsonSchema, Clone)]
@@ -1485,6 +1527,14 @@ pub(crate) struct PathParams {
     /// Same as `from_line`, for `to_symbol`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) to_line: Option<i64>,
+    /// 3.4 (Wave 3): exact `qualified_name` from a prior `search`/`locate`
+    /// result for `from_symbol` -- when set, resolves directly by identity
+    /// and `from_path`/`from_line` are ignored.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) from_qualified_name: Option<String>,
+    /// Same as `from_qualified_name`, for `to_symbol`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) to_qualified_name: Option<String>,
     /// Max BFS depth to search before giving up. Defaults to
     /// `path.default_max_hops` in config.json (8 out of the box), clamped
     /// to `path.max_allowed_hops` (20 out of the box).

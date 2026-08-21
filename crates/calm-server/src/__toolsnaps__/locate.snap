@@ -12,7 +12,7 @@
         "type": "string"
       },
       "kind": {
-        "description": "Same values as `search`'s `kind` — `\"symbol\"` (default), `\"text\"`,\n`\"file\"`, `\"semantic\"`, or `\"hybrid\"`.",
+        "description": "Same values as `search`'s `kind` — `\"hybrid\"` (default, 3.1 Wave 3),\n`\"symbol\"`, `\"text\"`, `\"file\"`, or `\"semantic\"`.",
         "type": [
           "string",
           "null"
@@ -66,6 +66,13 @@
           },
           "path": {
             "type": "string"
+          },
+          "qualified_name": {
+            "description": "3.4 (Wave 3, P1-3): the symbol's exact `qualified_name`, restored\nafter being dropped from this output type -- feed it straight into\n`source`/`symbol_info`/`callers`/`callees`/`reference_impact`/`path`/\n`pattern_debt_register`'s new `qualified_name` param to resolve by\nidentity, never `Ambiguous`, even for a globally-common bare name.\nPresent only when `kind` is also present -- both are populated from\nthe same live `symbols` row join, so a hit with no enclosing symbol\n(`kind=\"file\"` path hits, `kind=\"grep\"` matches outside any symbol\nbody, gap-chunk semantic hits) has neither.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "kind": {
             "type": [

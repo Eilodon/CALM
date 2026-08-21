@@ -83,6 +83,31 @@ impl EdgeConfidence {
         }
     }
 
+    /// 2.3 (Wave 2, canonical `EvidencePolicy`): `true` for `Formal`/
+    /// `Resolved` only -- the bar every consumer that gates real edit
+    /// permissiveness on confidence (e.g. `edit.rs`'s bridge-hub gate)
+    /// already independently re-derives via `rank() >= 3` or an explicit
+    /// `IN ('resolved','formal')` SQL clause. A single named predicate here
+    /// so future consumers import a shared definition instead of re-deriving
+    /// their own `rank()` cutoff inline (the exact drift the audit's P0-3
+    /// findings trace back to).
+    pub fn is_verified(&self) -> bool {
+        matches!(self, Self::Formal | Self::Resolved)
+    }
+
+    /// `true` for `Inferred` only -- confidently a real candidate, but not
+    /// independently confirmed the way `Formal`/`Resolved` are.
+    pub fn is_probable(&self) -> bool {
+        matches!(self, Self::Inferred)
+    }
+
+    /// `true` for `Textual` only -- a lexical/name-based lead, weakest
+    /// confidence tier that still names exactly one candidate (contrast
+    /// `Ambiguous`, which names several for one call site).
+    pub fn is_lexical_lead(&self) -> bool {
+        matches!(self, Self::Textual)
+    }
+
     /// Inverse of `as_str` — parses a DB-stored `edge_confidence` value back
     /// into the typed enum. `None` on an unrecognized string (defensive;
     /// every writer goes through `as_str`, so this should never happen on

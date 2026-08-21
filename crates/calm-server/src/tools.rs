@@ -1635,6 +1635,7 @@ mod tests {
         let v = jv(
             server.symbol_info(rmcp::handler::server::wrapper::Parameters(
                 SymbolInfoParams {
+                    qualified_name: None,
                     symbol: "target".into(),
                     path: None,
                     line: None,
@@ -1666,6 +1667,7 @@ mod tests {
         let v = jv(
             server.symbol_info(rmcp::handler::server::wrapper::Parameters(
                 SymbolInfoParams {
+                    qualified_name: None,
                     symbol: "anything".into(),
                     path: None,
                     line: None,
@@ -2619,6 +2621,7 @@ mod tests {
 
         let v = jv(
             server.callers(rmcp::handler::server::wrapper::Parameters(CallersParams {
+                qualified_name: None,
                 symbol: "foo".into(),
                 path: None,
                 line: None,
@@ -2674,6 +2677,7 @@ mod tests {
 
         let v = jv(
             server.callers(rmcp::handler::server::wrapper::Parameters(CallersParams {
+                qualified_name: None,
                 symbol: "foo".into(),
                 path: None,
                 line: None,
@@ -2731,6 +2735,7 @@ mod tests {
 
         let params = || {
             rmcp::handler::server::wrapper::Parameters(CallersParams {
+                qualified_name: None,
                 symbol: "foo".into(),
                 path: None,
                 line: None,
@@ -2785,6 +2790,7 @@ mod tests {
 
         let entry_point = jv(server.callers(rmcp::handler::server::wrapper::Parameters(
             CallersParams {
+                qualified_name: None,
                 symbol: "repo_overview".into(),
                 path: None,
                 line: None,
@@ -2807,6 +2813,7 @@ mod tests {
 
         let generic = jv(server.callers(rmcp::handler::server::wrapper::Parameters(
             CallersParams {
+                qualified_name: None,
                 symbol: "orphan_helper".into(),
                 path: None,
                 line: None,
@@ -2843,6 +2850,7 @@ mod tests {
 
         let v = jv(
             server.callers(rmcp::handler::server::wrapper::Parameters(CallersParams {
+                qualified_name: None,
                 symbol: "foo".into(),
                 path: None,
                 line: None,
@@ -2891,6 +2899,7 @@ mod tests {
 
         let v = jv(
             server.callers(rmcp::handler::server::wrapper::Parameters(CallersParams {
+                qualified_name: None,
                 symbol: "a".into(),
                 path: None,
                 line: None,
@@ -3098,6 +3107,48 @@ mod tests {
     }
 
     #[test]
+    fn search_params_kind_defaults_to_hybrid_when_omitted() {
+        // 3.1 (Wave 3, P1-1a): `kind` omitted from the wire JSON must
+        // resolve to "hybrid", not "symbol" -- the actual default a real
+        // MCP client sees. Proven at the serde boundary (not by
+        // constructing SearchParams directly in Rust, which would bypass
+        // #[serde(default = "default_search_kind")] entirely).
+        let p: crate::tools::locate::SearchParams =
+            serde_json::from_str(r#"{"query": "widget"}"#).unwrap();
+        assert_eq!(p.kind, "hybrid");
+    }
+
+    #[test]
+    fn search_handler_hybrid_default_degrades_to_symbol_results_without_embedder() {
+        // 3.1's safety argument, proven end-to-end: with no embedder
+        // configured (the CI-typical case, same as every other test in this
+        // module), the new "hybrid" default must return exactly what
+        // "symbol" already found -- never worse, never different -- because
+        // search_hybrid degrades straight to search_symbol's own output.
+        let dir =
+            std::env::temp_dir().join(format!("ci_search_hybrid_degrade_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+        insert_search_symbol(&server, "src/a.rs::widget", "widget", "src/a.rs", false);
+
+        let symbol_v = jv(server.search(rmcp::handler::server::wrapper::Parameters(
+            search_params("widget", "symbol"),
+        )));
+        let hybrid_v = jv(server.search(rmcp::handler::server::wrapper::Parameters(
+            search_params("widget", "hybrid"),
+        )));
+
+        assert_eq!(
+            hybrid_v["results"], symbol_v["results"],
+            "no embedder configured -- hybrid must degrade to identical symbol-search results"
+        );
+        assert_eq!(hybrid_v["degraded"], true);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn search_handler_empty_symbol_result_suggests_hybrid() {
         let dir = std::env::temp_dir().join(format!("ci_search_empty_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -3153,6 +3204,55 @@ mod tests {
             arr[0]["path"], "src/impl.rs",
             "only the non-test implementation survives"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn search_handler_grep_include_tests_false_excludes_a_match_inside_a_test_symbol() {
+        let dir =
+            std::env::temp_dir().join(format!("ci_search_grep_notest_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("src/impl.rs"),
+            "fn helper() {\n    needle_marker_42();\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("src/probe.rs"),
+            "fn helper() {\n    needle_marker_42();\n}\n",
+        )
+        .unwrap();
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+        insert_search_symbol(
+            &server,
+            "src/impl.rs::helper",
+            "helper",
+            "src/impl.rs",
+            false,
+        );
+        insert_search_symbol(
+            &server,
+            "src/probe.rs::helper",
+            "helper",
+            "src/probe.rs",
+            true,
+        );
+
+        let mut p = search_params("needle_marker_42", "grep");
+        p.include_tests = false;
+        let v = jv(server.search(rmcp::handler::server::wrapper::Parameters(p)));
+        let arr = v["results"].as_array().unwrap();
+        assert_eq!(
+            arr.len(),
+            1,
+            "the grep match inside the is_test symbol must be hard-excluded, same as kind=symbol already does"
+        );
+        assert_eq!(
+            arr[0]["path"], "src/impl.rs",
+            "only the non-test file's match survives"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3847,6 +3947,7 @@ mod tests {
 
         let _ = server.symbol_info(rmcp::handler::server::wrapper::Parameters(
             SymbolInfoParams {
+                qualified_name: None,
                 symbol: "foo".into(),
                 path: None,
                 line: None,
@@ -4811,6 +4912,7 @@ mod tests {
         let v = jv(
             server.symbol_info(rmcp::handler::server::wrapper::Parameters(
                 SymbolInfoParams {
+                    qualified_name: None,
                     symbol: "method".into(),
                     path: Some("src/multi.py".into()),
                     line: None,
@@ -4858,6 +4960,7 @@ mod tests {
         // No line hint: stays ambiguous, same as before this feature existed.
         let ambiguous = server.symbol_info(rmcp::handler::server::wrapper::Parameters(
             SymbolInfoParams {
+                qualified_name: None,
                 symbol: "load".into(),
                 path: Some("src/embedding.rs".into()),
                 line: None,
@@ -4872,6 +4975,7 @@ mod tests {
         // A line inside the real impl's range resolves to exactly that one.
         let resolved = server.symbol_info(rmcp::handler::server::wrapper::Parameters(
             SymbolInfoParams {
+                qualified_name: None,
                 symbol: "load".into(),
                 path: Some("src/embedding.rs".into()),
                 line: Some(15),
@@ -4884,6 +4988,7 @@ mod tests {
         // (ambiguous) set rather than reporting NotFound.
         let stale_hint = server.symbol_info(rmcp::handler::server::wrapper::Parameters(
             SymbolInfoParams {
+                qualified_name: None,
                 symbol: "load".into(),
                 path: Some("src/embedding.rs".into()),
                 line: Some(9999),
@@ -4926,6 +5031,8 @@ mod tests {
         // old hardcoded literal (20) this would NOT have been clamped.
         let v = jv(
             server.path(rmcp::handler::server::wrapper::Parameters(PathParams {
+                from_qualified_name: None,
+                to_qualified_name: None,
                 from_symbol: "a".into(),
                 to_symbol: "b".into(),
                 from_path: None,
@@ -4970,6 +5077,8 @@ mod tests {
 
         let v = jv(
             server.path(rmcp::handler::server::wrapper::Parameters(PathParams {
+                from_qualified_name: None,
+                to_qualified_name: None,
                 from_symbol: "a".into(),
                 to_symbol: "b".into(),
                 from_path: None,
@@ -5024,6 +5133,8 @@ mod tests {
 
         let v = jv(
             server.path(rmcp::handler::server::wrapper::Parameters(PathParams {
+                from_qualified_name: None,
+                to_qualified_name: None,
                 from_symbol: "a".into(),
                 to_symbol: "b".into(),
                 from_path: None,
@@ -5149,6 +5260,61 @@ mod tests {
 
         assert_eq!(v["symbol"]["qualified_name"], "foo.py::foo");
         assert_eq!(v["source"]["language"], "python");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn understand_reports_ambiguous_resolution_confidence_for_a_near_tied_query() {
+        // 3.3 (Wave 3, P1-2) DoD: a query matching two equally-scored
+        // symbols must return resolution_confidence: "ambiguous" + both as
+        // alternatives, not a confident single answer. Two symbols with
+        // byte-identical name/signature/docstring/name_tokens content tie
+        // exactly under FTS bm25 scoring -- the same deterministic-tie
+        // scenario `test_search_symbol_ties_break_deterministically_by_
+        // qualified_name` (search.rs) already relies on.
+        let dir = std::env::temp_dir().join(format!("ci_understand_ambig_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.rs"), "fn widget() {}\n").unwrap();
+        std::fs::write(dir.join("b.rs"), "fn widget() {}\n").unwrap();
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        {
+            let conn = server.db();
+            for path in ["a.rs", "b.rs"] {
+                conn.execute(
+                    "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                     VALUES (?1, 'widget', 'function', 'rust', ?2, 1, 1, 'fn widget()', 'a widget helper', 'widget helper', 0, 0, 0)",
+                    rusqlite::params![format!("{path}::widget"), path],
+                )
+                .unwrap();
+            }
+        }
+
+        let v = jv(
+            server.understand(rmcp::handler::server::wrapper::Parameters(
+                UnderstandParams {
+                    query: "widget".into(),
+                    kind: None,
+                },
+            )),
+        );
+
+        assert_eq!(v["resolution_confidence"], "ambiguous");
+        assert!(
+            v["symbol"].is_null(),
+            "must not commit to either tied candidate as a confident single answer"
+        );
+        assert!(v["source"].is_null());
+        let alts = v["alternatives"].as_array().unwrap();
+        assert_eq!(alts.len(), 2);
+        let names: std::collections::HashSet<&str> = alts
+            .iter()
+            .map(|a| a["qualified_name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains("a.rs::widget"));
+        assert!(names.contains("b.rs::widget"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -5331,6 +5497,7 @@ mod tests {
 
         let v = jv(
             server.source(rmcp::handler::server::wrapper::Parameters(SourceParams {
+                qualified_name: None,
                 symbol: Some("foo".into()),
                 path: None,
                 line: None,
@@ -5370,6 +5537,7 @@ mod tests {
 
         let first = jv(
             server.source(rmcp::handler::server::wrapper::Parameters(SourceParams {
+                qualified_name: None,
                 symbol: Some("foo".into()),
                 path: None,
                 line: None,
@@ -5394,6 +5562,7 @@ mod tests {
 
         let second = jv(
             server.source(rmcp::handler::server::wrapper::Parameters(SourceParams {
+                qualified_name: None,
                 symbol: Some("foo".into()),
                 path: None,
                 line: None,
@@ -5418,6 +5587,7 @@ mod tests {
 
         let stale = jv(
             server.source(rmcp::handler::server::wrapper::Parameters(SourceParams {
+                qualified_name: None,
                 symbol: Some("foo".into()),
                 path: None,
                 line: None,
@@ -5575,6 +5745,7 @@ mod tests {
 
         let v = jv(
             server.source(rmcp::handler::server::wrapper::Parameters(SourceParams {
+                qualified_name: None,
                 symbol: Some("foo".into()),
                 path: None,
                 line: None,
@@ -5617,6 +5788,7 @@ mod tests {
 
         let v = jv(
             server.source(rmcp::handler::server::wrapper::Parameters(SourceParams {
+                qualified_name: None,
                 symbol: Some("foo".into()),
                 path: None,
                 line: None,
@@ -5671,6 +5843,7 @@ mod tests {
         // line_numbers:false → raw, and the SAME etag (hash is of the raw range).
         let raw = jv(
             server.source(rmcp::handler::server::wrapper::Parameters(SourceParams {
+                qualified_name: None,
                 symbol: Some("foo".into()),
                 path: None,
                 line: None,
@@ -5715,6 +5888,7 @@ mod tests {
         }
         let v = jv(
             server.source(rmcp::handler::server::wrapper::Parameters(SourceParams {
+                qualified_name: None,
                 symbol: Some("foo".into()),
                 path: None,
                 line: None,
@@ -5764,6 +5938,7 @@ mod tests {
 
         let src_v = jv(
             server.source(rmcp::handler::server::wrapper::Parameters(SourceParams {
+                qualified_name: None,
                 symbol: Some("foo".into()),
                 path: None,
                 line: None,
@@ -5842,6 +6017,7 @@ mod tests {
         // Module-level import/const window (lines 1-4), numbered, no symbol.
         let v = jv(
             server.source(rmcp::handler::server::wrapper::Parameters(SourceParams {
+                qualified_name: None,
                 symbol: None,
                 path: Some("a.py".into()),
                 line: Some(1),
@@ -5869,6 +6045,7 @@ mod tests {
         // Missing `end_line` → INVALID_PARAMS, not a panic.
         let bad = jv(
             server.source(rmcp::handler::server::wrapper::Parameters(SourceParams {
+                qualified_name: None,
                 symbol: None,
                 path: Some("a.py".into()),
                 line: Some(1),
@@ -6042,6 +6219,7 @@ mod tests {
         let v = jv(
             server.symbol_info(rmcp::handler::server::wrapper::Parameters(
                 SymbolInfoParams {
+                    qualified_name: None,
                     symbol: "default".into(),
                     path: None,
                     line: None,
@@ -6092,6 +6270,7 @@ mod tests {
         }
         let v = jv(
             server.callers(rmcp::handler::server::wrapper::Parameters(CallersParams {
+                qualified_name: None,
                 symbol: "as_str".into(),
                 path: Some("a.rs".into()),
                 line: Some(41),
@@ -6154,6 +6333,7 @@ mod tests {
         }
         let v = jv(
             server.callers(rmcp::handler::server::wrapper::Parameters(CallersParams {
+                qualified_name: None,
                 symbol: "target".into(),
                 path: Some("a.rs".into()),
                 line: Some(1),
@@ -6236,6 +6416,7 @@ mod tests {
         }
         let v = jv(
             server.callers(rmcp::handler::server::wrapper::Parameters(CallersParams {
+                qualified_name: None,
                 symbol: "helper".into(),
                 path: Some("a.rs".into()),
                 line: Some(1),
@@ -6315,6 +6496,7 @@ mod tests {
         }
         let rust_result = jv(server.callers(rmcp::handler::server::wrapper::Parameters(
             CallersParams {
+                qualified_name: None,
                 symbol: "helper".into(),
                 path: Some("rust_mod.rs".into()),
                 line: Some(1),
@@ -6330,6 +6512,7 @@ mod tests {
 
         let py_result = jv(server.callers(rmcp::handler::server::wrapper::Parameters(
             CallersParams {
+                qualified_name: None,
                 symbol: "helper".into(),
                 path: Some("py_mod.py".into()),
                 line: Some(1),
@@ -6389,6 +6572,7 @@ mod tests {
         }
         let v = jv(
             server.callers(rmcp::handler::server::wrapper::Parameters(CallersParams {
+                qualified_name: None,
                 symbol: "target".into(),
                 path: Some("lib.c".into()),
                 line: Some(1),
@@ -6440,6 +6624,7 @@ mod tests {
 
         let first = jv(
             server.callers(rmcp::handler::server::wrapper::Parameters(CallersParams {
+                qualified_name: None,
                 symbol: "foo".into(),
                 path: None,
                 line: None,
@@ -6461,6 +6646,7 @@ mod tests {
 
         let second = jv(server.callers(rmcp::handler::server::wrapper::Parameters(
             CallersParams {
+                qualified_name: None,
                 symbol: "foo".into(),
                 path: None,
                 line: None,
@@ -6489,6 +6675,7 @@ mod tests {
 
         let stale = jv(
             server.callers(rmcp::handler::server::wrapper::Parameters(CallersParams {
+                qualified_name: None,
                 symbol: "foo".into(),
                 path: None,
                 line: None,
@@ -6536,6 +6723,7 @@ mod tests {
 
         let v = jv(
             server.callers(rmcp::handler::server::wrapper::Parameters(CallersParams {
+                qualified_name: None,
                 symbol: "foo".into(),
                 path: None,
                 line: None,
@@ -6613,6 +6801,7 @@ mod tests {
 
         let v = jv(
             server.callers(rmcp::handler::server::wrapper::Parameters(CallersParams {
+                qualified_name: None,
                 symbol: "foo".into(),
                 path: None,
                 line: None,
@@ -6665,6 +6854,7 @@ mod tests {
 
         let v = jv(
             server.callees(rmcp::handler::server::wrapper::Parameters(CalleesParams {
+                qualified_name: None,
                 symbol: "bar".into(),
                 path: None,
                 line: None,
@@ -6706,6 +6896,7 @@ mod tests {
 
         let first = jv(
             server.callees(rmcp::handler::server::wrapper::Parameters(CalleesParams {
+                qualified_name: None,
                 symbol: "bar".into(),
                 path: None,
                 line: None,
@@ -6723,6 +6914,7 @@ mod tests {
 
         let second = jv(server.callees(rmcp::handler::server::wrapper::Parameters(
             CalleesParams {
+                qualified_name: None,
                 symbol: "bar".into(),
                 path: None,
                 line: None,
@@ -6772,6 +6964,7 @@ mod tests {
         }
         let v = jv(
             server.callees(rmcp::handler::server::wrapper::Parameters(CalleesParams {
+                qualified_name: None,
                 symbol: "source".into(),
                 path: Some("a.rs".into()),
                 line: Some(1),
@@ -6821,6 +7014,7 @@ mod tests {
 
         let v = jv(
             server.callees(rmcp::handler::server::wrapper::Parameters(CalleesParams {
+                qualified_name: None,
                 symbol: "bar".into(),
                 path: None,
                 line: None,
@@ -7053,6 +7247,7 @@ mod tests {
         let v = jv(
             server.reference_impact(rmcp::handler::server::wrapper::Parameters(
                 ReferenceImpactParams {
+                    qualified_name: None,
                     symbol: "setCharset".into(),
                     path: None,
                     line: None,
@@ -7141,6 +7336,7 @@ mod tests {
         let v = jv(
             server.reference_impact(rmcp::handler::server::wrapper::Parameters(
                 ReferenceImpactParams {
+                    qualified_name: None,
                     symbol: "widgetInit".into(),
                     path: None,
                     line: None,
@@ -7206,6 +7402,7 @@ mod tests {
         let v = jv(
             server.reference_impact(rmcp::handler::server::wrapper::Parameters(
                 ReferenceImpactParams {
+                    qualified_name: None,
                     symbol: "widgetInit".into(),
                     path: None,
                     line: None,
@@ -7290,6 +7487,7 @@ mod tests {
         let v = jv(
             server.reference_impact(rmcp::handler::server::wrapper::Parameters(
                 ReferenceImpactParams {
+                    qualified_name: None,
                     symbol: "prettifyError".into(),
                     path: None,
                     line: None,
@@ -7360,6 +7558,7 @@ mod tests {
         let v = jv(
             server.reference_impact(rmcp::handler::server::wrapper::Parameters(
                 ReferenceImpactParams {
+                    qualified_name: None,
                     symbol: "target".into(),
                     path: None,
                     line: None,
@@ -7411,6 +7610,7 @@ mod tests {
         let v = jv(
             server.reference_impact(rmcp::handler::server::wrapper::Parameters(
                 ReferenceImpactParams {
+                    qualified_name: None,
                     symbol: "popular".into(),
                     path: None,
                     line: None,
@@ -7443,6 +7643,7 @@ mod tests {
         let v = jv(
             server.reference_impact(rmcp::handler::server::wrapper::Parameters(
                 ReferenceImpactParams {
+                    qualified_name: None,
                     symbol: "doesNotExist".into(),
                     path: None,
                     line: None,
@@ -7488,6 +7689,47 @@ mod tests {
         assert_eq!(v["files_indexed"], 1);
         assert_eq!(v["files_total"], 2, "both a.py and b.py exist on disk");
         assert_eq!(v["last_updated"], "2023-11-14T22:13:20Z");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn indexing_status_surfaces_skipped_files_with_their_reason() {
+        let dir = std::env::temp_dir().join(format!("ci_idxstatus_skipped_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO file_index (path, hash, language, symbol_count, last_indexed, skip_reason) \
+                 VALUES ('huge.py', '', NULL, 0, 1700000000.0, 'too_large:9000000')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO file_index (path, hash, language, symbol_count, last_indexed) \
+                 VALUES ('a.py', 'h1', 'python', 1, 1700000000.0)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let v = jv(
+            server.indexing_status(rmcp::handler::server::wrapper::Parameters(
+                IndexingStatusParams {
+                    retry_embeddings: false,
+                },
+            )),
+        );
+
+        assert_eq!(v["skipped_files"]["total"], 1);
+        assert_eq!(v["skipped_files"]["entries"].as_array().unwrap().len(), 1);
+        assert_eq!(v["skipped_files"]["entries"][0]["path"], "huge.py");
+        assert_eq!(
+            v["skipped_files"]["entries"][0]["skip_reason"],
+            "too_large:9000000"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -7850,6 +8092,7 @@ mod tests {
         let v = jv(
             server.symbol_info(rmcp::handler::server::wrapper::Parameters(
                 SymbolInfoParams {
+                    qualified_name: None,
                     symbol: "my_fn".into(),
                     path: None,
                     line: None,
@@ -7915,6 +8158,7 @@ mod tests {
         let v = jv(
             server.symbol_info(rmcp::handler::server::wrapper::Parameters(
                 SymbolInfoParams {
+                    qualified_name: None,
                     symbol: "Foo".into(),
                     path: None,
                     line: None,
@@ -7980,6 +8224,7 @@ mod tests {
         let v = jv(
             server.symbol_info(rmcp::handler::server::wrapper::Parameters(
                 SymbolInfoParams {
+                    qualified_name: None,
                     symbol: "m".into(),
                     path: None,
                     line: None,
@@ -8048,6 +8293,7 @@ mod tests {
         let v = jv(
             server.symbol_info(rmcp::handler::server::wrapper::Parameters(
                 SymbolInfoParams {
+                    qualified_name: None,
                     symbol: "plain_fn".into(),
                     path: None,
                     line: None,
@@ -8105,6 +8351,7 @@ mod tests {
         let v = jv(
             server.symbol_info(rmcp::handler::server::wrapper::Parameters(
                 SymbolInfoParams {
+                    qualified_name: None,
                     symbol: "my_fn2".into(),
                     path: None,
                     line: None,
@@ -8400,6 +8647,89 @@ mod tests {
         assert_eq!(
             sn["tool"], "symbol_info",
             "locate should suggest symbol_info for ambiguous name, got: {sn}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // P1-4 regression (2026-08-20 truth-kernel audit, verified live): several
+    // `suggested_next.args` payloads didn't validate against their target
+    // tool's own Parameters<T> schema (`{"target": ...}` sent to `source`,
+    // which needs `symbol`; `{"kind": ...}` sent to `search` missing the
+    // required `query`). These two tests exercise the exact branches that
+    // were broken and assert the emitted `args` round-trip through the real
+    // param types a client would actually deserialize into.
+    #[test]
+    fn locate_source_suggestion_args_deserialize_as_source_params() {
+        let dir = std::env::temp_dir().join(format!("ci_locate_sn_source_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (name, qualified_name, kind, language, path, line_start, line_end,
+                 signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                rusqlite::params![
+                    "widget_helper", "a::widget_helper", "function", "rust", "src/a.rs",
+                    1i64, 5i64, "fn widget_helper()", "", "widget_helper",
+                    1i64, 0i64, 0i64
+                ],
+            ).unwrap();
+        }
+        let output = server.locate(rmcp::handler::server::wrapper::Parameters(LocateParams {
+            query: "widget_helper".into(),
+            kind: None,
+            depth: None,
+            limit: None,
+        }));
+        let v = jv(output);
+        let sn = &v["suggested_next"];
+        assert_eq!(
+            sn["tool"], "source",
+            "expected source suggestion, got: {sn}"
+        );
+        let args = sn["args"].clone();
+        let parsed: Result<SourceParams, _> = serde_json::from_value(args.clone());
+        assert!(
+            parsed.is_ok(),
+            "suggested_next.args for `source` must deserialize as SourceParams, got {args}: {:?}",
+            parsed.err()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn locate_search_fallback_args_deserialize_as_search_params() {
+        let dir = std::env::temp_dir().join(format!("ci_locate_sn_search_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        // No symbols indexed -> results empty, default kind ("symbol") hits
+        // the generic "no match" branch, which suggests `search` with
+        // kind="hybrid". `query` is a required field on SearchParams.
+        let output = server.locate(rmcp::handler::server::wrapper::Parameters(LocateParams {
+            query: "nonexistent_zyx_symbol".into(),
+            kind: None,
+            depth: None,
+            limit: None,
+        }));
+        let v = jv(output);
+        let sn = &v["suggested_next"];
+        assert_eq!(
+            sn["tool"], "search",
+            "expected search suggestion, got: {sn}"
+        );
+        let args = sn["args"].clone();
+        let parsed: Result<SearchParams, _> = serde_json::from_value(args.clone());
+        assert!(
+            parsed.is_ok(),
+            "suggested_next.args for `search` must deserialize as SearchParams, got {args}: {:?}",
+            parsed.err()
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -13663,6 +13993,392 @@ mod tests {
     }
 
     #[test]
+    fn wave1_stale_index_source_rebinds_to_live_coordinates() {
+        // 2026-08-20 truth-kernel Wave 1 (P0-1a/f), adversarial case "stale"/
+        // "moved": the index claims `target()` is at lines 1-2, but the file
+        // on disk now has 2 leading comment lines inserted above it, real
+        // location lines 3-5. `resolve_symbol`'s live-verification must
+        // re-parse and rebind to the REAL location, not slice the stale
+        // range (which would return the leading comments instead).
+        let (dir, server) = test_server("wave1_stale_rebind");
+        std::fs::write(
+            dir.join("a.rs"),
+            "// new leading comment\n// another line\nfn target() -> i64 {\n    42\n}\n",
+        )
+        .unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.rs::target', 'target', 'function', 'rust', 'a.rs', 1, 2, '', '', 'target', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+            // hash deliberately does not match live disk content -- forces
+            // verify_live's slow (re-parse) path every time.
+            conn.execute(
+                "INSERT INTO file_index (path, hash, language, symbol_count, last_indexed, mtime) \
+                 VALUES ('a.rs', 'deadbeef', 'rust', 1, 0.0, 0.0)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let out = server.source(rmcp::handler::server::wrapper::Parameters(SourceParams {
+            qualified_name: None,
+            symbol: Some("target".into()),
+            path: None,
+            line: None,
+            end_line: None,
+            include_metadata: false,
+            line_numbers: false,
+            if_none_match: None,
+        }));
+        let v = jv(out);
+        assert_eq!(v["line_start"], 3, "response: {v}");
+        assert_eq!(v["line_end"], 5, "response: {v}");
+        let src = v["source"].as_str().unwrap();
+        assert!(src.contains("42"), "response: {v}");
+        assert!(!src.contains("leading comment"), "response: {v}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wave1_duplicate_class_context_disambiguates_correct_target() {
+        // 2026-08-20 truth-kernel Wave 1 (P0-1f), adversarial case
+        // "duplicate": the index has exactly one `run` (in `impl Foo`,
+        // stale-indexed at lines 1-2), but the live file now has TWO `run`
+        // methods (Foo::run and Bar::run) after a reindex-less edit. Bare-
+        // name matching alone could rebind to either one; the
+        // (name, kind, class_context) matcher must pick Foo::run
+        // specifically, not just the nearest line.
+        let (dir, server) = test_server("wave1_duplicate_class_context");
+        std::fs::write(
+            dir.join("b.rs"),
+            "struct Bar;\nimpl Bar {\n    fn run(&self) -> i64 {\n        2\n    }\n}\nstruct Foo;\nimpl Foo {\n    fn run(&self) -> i64 {\n        1\n    }\n}\n",
+        )
+        .unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point, class_context)
+                 VALUES ('b.rs::Foo::run', 'run', 'method', 'rust', 'b.rs', 1, 2, '', '', 'run', 0, 0, 0, 'Foo')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO file_index (path, hash, language, symbol_count, last_indexed, mtime) \
+                 VALUES ('b.rs', 'deadbeef', 'rust', 1, 0.0, 0.0)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let out = server.source(rmcp::handler::server::wrapper::Parameters(SourceParams {
+            qualified_name: None,
+            symbol: Some("run".into()),
+            path: None,
+            line: None,
+            end_line: None,
+            include_metadata: false,
+            line_numbers: false,
+            if_none_match: None,
+        }));
+        let v = jv(out);
+        let src = v["source"].as_str().unwrap_or_default();
+        assert!(
+            src.contains('1'),
+            "expected Foo::run's body (returns 1), got: {v}"
+        );
+        assert!(
+            !src.contains('2'),
+            "must not have rebound to Bar::run (returns 2): {v}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wave1_genuinely_ambiguous_live_match_reports_error_not_a_guess() {
+        // 2026-08-20 truth-kernel Wave 1, the DoD's explicit edge case: two
+        // live symbols with the exact same (name, kind, class_context) --
+        // should not occur in valid code, but the matcher must not panic
+        // and must not silently guess one. Expect a non-crashing error
+        // response, never a 200 with an arbitrarily-picked body.
+        let (dir, server) = test_server("wave1_genuinely_ambiguous");
+        std::fs::write(
+            dir.join("c.rs"),
+            "fn dup() -> i64 {\n    1\n}\nfn dup() -> i64 {\n    2\n}\n",
+        )
+        .unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('c.rs::dup', 'dup', 'function', 'rust', 'c.rs', 1, 3, '', '', 'dup', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO file_index (path, hash, language, symbol_count, last_indexed, mtime) \
+                 VALUES ('c.rs', 'deadbeef', 'rust', 1, 0.0, 0.0)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let out = server.source(rmcp::handler::server::wrapper::Parameters(SourceParams {
+            qualified_name: None,
+            symbol: Some("dup".into()),
+            path: None,
+            line: None,
+            end_line: None,
+            include_metadata: false,
+            line_numbers: false,
+            if_none_match: None,
+        }));
+        let v = jv(out);
+        assert!(
+            v["error"].is_object(),
+            "expected a non-guessing error response: {v}"
+        );
+        assert!(
+            v["success"].is_null(),
+            "must not silently return one of the two ties: {v}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wave1_deleted_symbol_reports_not_found_not_stale_bytes() {
+        // 2026-08-20 truth-kernel Wave 1 (P0-1g), adversarial case
+        // "deleted": the indexed symbol no longer exists anywhere in the
+        // live file (removed since indexing). Must report not-found, never
+        // fall back to reading whatever bytes now occupy the old range.
+        let (dir, server) = test_server("wave1_deleted_symbol");
+        std::fs::write(dir.join("d.rs"), "fn survivor() -> i64 {\n    1\n}\n").unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('d.rs::gone', 'gone', 'function', 'rust', 'd.rs', 1, 2, '', '', 'gone', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO file_index (path, hash, language, symbol_count, last_indexed, mtime) \
+                 VALUES ('d.rs', 'deadbeef', 'rust', 1, 0.0, 0.0)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let out = server.source(rmcp::handler::server::wrapper::Parameters(SourceParams {
+            qualified_name: None,
+            symbol: Some("gone".into()),
+            path: None,
+            line: None,
+            end_line: None,
+            include_metadata: false,
+            line_numbers: false,
+            if_none_match: None,
+        }));
+        let v = jv(out);
+        assert_eq!(v["error"]["code"], "NOT_FOUND", "response: {v}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn qualified_name_resolves_uniquely_even_for_a_globally_common_bare_name() {
+        // 2026-08-20 truth-kernel Wave 3 (P1-3), the DoD's literal ask: a
+        // caller holding an exact qualified_name (e.g. from a prior `search`
+        // hit) must never land on `Ambiguous`, even for a name common
+        // enough to genuinely tie across files -- "new" here, picked as
+        // about as common a bare function name as real code gets.
+        let (dir, server) = test_server("qualified_name_never_ambiguous");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        let content_a = "fn new() -> i64 {\n    1\n}\n";
+        let content_b = "fn new() -> i64 {\n    2\n}\n";
+        std::fs::write(dir.join("src/a.rs"), content_a).unwrap();
+        std::fs::write(dir.join("src/b.rs"), content_b).unwrap();
+        let hash_a = calm_core::indexer::pipeline::hash_content(content_a);
+        let hash_b = calm_core::indexer::pipeline::hash_content(content_b);
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('src/a.rs::new', 'new', 'function', 'rust', 'src/a.rs', 1, 3, '', '', 'new', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('src/b.rs::new', 'new', 'function', 'rust', 'src/b.rs', 1, 3, '', '', 'new', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO file_index (path, hash, language, symbol_count, last_indexed, mtime) VALUES ('src/a.rs', ?1, 'rust', 1, 0.0, 0.0)",
+                rusqlite::params![hash_a],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO file_index (path, hash, language, symbol_count, last_indexed, mtime) VALUES ('src/b.rs', ?1, 'rust', 1, 0.0, 0.0)",
+                rusqlite::params![hash_b],
+            )
+            .unwrap();
+        }
+
+        // Sanity check: without qualified_name, the bare name really is
+        // ambiguous -- otherwise this test wouldn't be proving anything.
+        let bare = jv(
+            server.symbol_info(rmcp::handler::server::wrapper::Parameters(
+                SymbolInfoParams {
+                    symbol: "new".into(),
+                    path: None,
+                    line: None,
+                    qualified_name: None,
+                },
+            )),
+        );
+        assert_eq!(bare["ambiguous"], true, "response: {bare}");
+
+        // With qualified_name set, the exact same tie resolves uniquely.
+        let resolved = jv(
+            server.symbol_info(rmcp::handler::server::wrapper::Parameters(
+                SymbolInfoParams {
+                    symbol: "new".into(),
+                    path: None,
+                    line: None,
+                    qualified_name: Some("src/b.rs::new".into()),
+                },
+            )),
+        );
+        assert!(resolved["ambiguous"].is_null(), "response: {resolved}");
+        assert!(resolved["error"].is_null(), "response: {resolved}");
+        assert_eq!(
+            resolved["qualified_name"], "src/b.rs::new",
+            "response: {resolved}"
+        );
+        assert_eq!(resolved["path"], "src/b.rs", "response: {resolved}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn qualified_name_lookup_of_a_since_deleted_symbol_still_live_verifies() {
+        // 2026-08-20 truth-kernel Wave 3 (P1-3) regression guard:
+        // qualified_name is a narrowing SQL filter feeding the SAME
+        // resolve_symbol call, not a short-circuit around it (see
+        // resolve_symbol_candidates' own doc comment) -- a
+        // qualified_name-driven lookup for a symbol since deleted/renamed
+        // on disk must still go through verify_live and report NotFound,
+        // never trust the stale DB row's coordinates. Mirrors
+        // wave1_deleted_symbol_reports_not_found_not_stale_bytes above, but
+        // driven by qualified_name instead of a bare symbol name -- proving
+        // this wave's addition didn't reopen P0-1g for the new code path.
+        let (dir, server) = test_server("qualified_name_live_verify_deleted");
+        std::fs::write(dir.join("d.rs"), "fn survivor() -> i64 {\n    1\n}\n").unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('d.rs::gone', 'gone', 'function', 'rust', 'd.rs', 1, 2, '', '', 'gone', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO file_index (path, hash, language, symbol_count, last_indexed, mtime) \
+                 VALUES ('d.rs', 'deadbeef', 'rust', 1, 0.0, 0.0)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let out = server.symbol_info(rmcp::handler::server::wrapper::Parameters(
+            SymbolInfoParams {
+                symbol: "gone".into(),
+                path: None,
+                line: None,
+                qualified_name: Some("d.rs::gone".into()),
+            },
+        ));
+        let v = jv(out);
+        assert_eq!(v["error"]["code"], "NOT_FOUND", "response: {v}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wave1_concurrent_second_call_independently_catches_further_drift() {
+        // 2026-08-20 truth-kernel Wave 1, adversarial case "concurrent":
+        // two sequential `source` calls on the same symbol, with the file
+        // mutated again between them. Proves live-verification is re-done
+        // EVERY call (no caching of a prior call's corrected answer) --
+        // the file_index hash stays permanently mismatched ('deadbeef'),
+        // so each call must independently re-parse and land on whatever
+        // the CURRENT disk state says, not whichever range the first call
+        // happened to resolve to.
+        let (dir, server) = test_server("wave1_concurrent_drift");
+        std::fs::write(
+            dir.join("e.rs"),
+            "// c1\n// c2\nfn shifting() -> i64 {\n    1\n}\n",
+        )
+        .unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('e.rs::shifting', 'shifting', 'function', 'rust', 'e.rs', 1, 2, '', '', 'shifting', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO file_index (path, hash, language, symbol_count, last_indexed, mtime) \
+                 VALUES ('e.rs', 'deadbeef', 'rust', 1, 0.0, 0.0)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let params = || {
+            rmcp::handler::server::wrapper::Parameters(SourceParams {
+                qualified_name: None,
+                symbol: Some("shifting".into()),
+                path: None,
+                line: None,
+                end_line: None,
+                include_metadata: false,
+                line_numbers: false,
+                if_none_match: None,
+            })
+        };
+
+        let first = jv(server.source(params()));
+        assert_eq!(first["line_start"], 3, "first call response: {first}");
+
+        // Mutate again -- a THIRD comment line, shifting the function
+        // further down -- without touching file_index at all.
+        std::fs::write(
+            dir.join("e.rs"),
+            "// c1\n// c2\n// c3\nfn shifting() -> i64 {\n    1\n}\n",
+        )
+        .unwrap();
+
+        let second = jv(server.source(params()));
+        assert_eq!(
+            second["line_start"], 4,
+            "second call must independently re-verify against the NEW disk \
+             state, not reuse the first call's already-corrected range: {second}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn edit_symbol_position_after_adds_sibling() {
         let (dir, server) = test_server("edit_symbol_after");
         std::fs::write(dir.join("a.py"), "def helper():\n    return 1\n").unwrap();
@@ -14123,6 +14839,7 @@ mod tests {
         let reg = jv(
             server.pattern_debt_register(rmcp::handler::server::wrapper::Parameters(
                 PatternDebtRegisterParams {
+                    qualified_name: None,
                     symbol: "foo".into(),
                     path: None,
                     line: None,
@@ -14186,6 +14903,7 @@ mod tests {
         let reg = jv(
             server.pattern_debt_register(rmcp::handler::server::wrapper::Parameters(
                 PatternDebtRegisterParams {
+                    qualified_name: None,
                     symbol: "foo".into(),
                     path: None,
                     line: None,
@@ -14239,6 +14957,7 @@ mod tests {
         let reg = jv(
             server.pattern_debt_register(rmcp::handler::server::wrapper::Parameters(
                 PatternDebtRegisterParams {
+                    qualified_name: None,
                     symbol: "foo".into(),
                     path: None,
                     line: None,
