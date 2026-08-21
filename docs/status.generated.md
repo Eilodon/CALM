@@ -15,7 +15,7 @@ or feature-flag change; CI's `gen-status.sh --check` fails the build on drift.
 | `callers` | no | yes | USE WHEN: you need to know who calls a specific symbol — blast radius scan, refactoring impact. USE THIS for SYMBOL-LEVEL call sites. NOT  |
 | `dependencies` | no | yes | USE WHEN: you need to understand file-level architectural connections. USE THIS for FILE-LEVEL import graph. NOT for symbol-level call sites |
 | `diff_impact` | no | yes | CALL THIS after every code change, BEFORE commit or push — never skip. USE WHEN: you have uncommitted changes and want to verify blast rad |
-| `edit_context` | no | yes | ALWAYS CALL THIS before any code modification — mandatory, never skip. USE WHEN: you are about to edit, refactor, or delete a symbol. NOT  |
+| `edit_context` | yes | no | ALWAYS CALL THIS before any code modification — mandatory, never skip. USE WHEN: you are about to edit, refactor, or delete a symbol. NOT  |
 | `edit_lines` | yes | no | The only write-capable tool in calm — line-range granularity, works on ANY tracked file (source code, Cargo.toml, docs — not just parsed |
 | `edit_symbol` | yes | no | Sugar over edit_lines: resolves symbol (+ optional path/line, same disambiguation contract as edit_context). Default position="replace" swap |
 | `edit_transaction_status` | no | yes | USE WHEN: you have a tx_id (from maintenance_status/repair_consistency, or the tx_id an edit_lines/edit_symbol/format_files response already |
@@ -57,6 +57,7 @@ Tools with `readOnlyHint: false` -- the ones capable of touching disk or index
 state (see AGENTS.md's edit_context/diff_impact gate discipline for how their
 writes are reviewed):
 
+- `edit_context`
 - `edit_lines`
 - `edit_symbol`
 - `format_files`
