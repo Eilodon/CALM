@@ -35,7 +35,14 @@ impl CalmServer {
                 Ok(c) => c,
                 Err(e) => return db_error_resolved(e),
             };
-            let resolution = match resolve_symbol(&conn, &self.project_root, &p.symbol, p.path.as_deref(), p.line, None) {
+            let resolution = match resolve_symbol(
+                &conn,
+                &self.project_root,
+                &p.symbol,
+                p.path.as_deref(),
+                p.line,
+                p.qualified_name.as_deref(),
+            ) {
                 Ok(r) => r,
                 Err(e) => return db_error_resolved(e),
             };
@@ -336,13 +343,18 @@ impl CalmServer {
                     &[(c.line_start, c.line_end)],
                     &self.coverage.read_ok(),
                     &config.risk_rules,
-                    // No proposed edit content exists yet at this pre-edit
-                    // exploration call -- the agent hasn't decided what to
-                    // write, so there's nothing to compare the current
-                    // signature against. edit_lines_impl_gated's own real
-                    // gate call supplies real hunks once an edit is proposed.
-                    &[],
+                    // Wave 5, item 5.1b (truth-kernel-hardening plan, P0-6):
+                    // no real proposed edit content exists yet at this
+                    // pre-edit exploration call, but a synthetic full-range
+                    // placeholder hunk still lets compute_touch_risk's
+                    // uncovered-code probe run for real (that probe only
+                    // reads hunk start/end, never text). real_hunks=false
+                    // below ensures the placeholder's empty text is never
+                    // misread as a real signature change by the (separate)
+                    // signature-escalation check inside compute_touch_risk.
+                    &[(c.line_start, c.line_end, "")],
                     &gate_policy,
+                    false,
                 );
                 // Mirrors edit_lines_impl_gated's own bridge-downgrade
                 // eligibility check exactly (edit.rs) -- computed here too,
@@ -946,6 +958,13 @@ pub(crate) struct EditContextParams {
     /// response's `line_start`/`line_end`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) line: Option<i64>,
+    /// 5.3 (Wave 5): exact `qualified_name` from a prior `search`/`locate`
+    /// result — when set, resolves directly by identity and `path`/`line`
+    /// are ignored, so this can never come back ambiguous even for a
+    /// globally-common bare `symbol` name. Still flows through the same
+    /// live-verification every resolution does (Wave 1's `verify_live`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) qualified_name: Option<String>,
     /// `edges_etag` from a prior `edit_context` call on this exact symbol —
     /// if the caller/callee lists haven't changed since, the response omits
     /// `callers`/`callees` and sets `edges_not_modified: true`. Every other

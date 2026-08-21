@@ -402,14 +402,14 @@ impl CalmServer {
                     &p.symbol,
                     p.path.as_deref(),
                     p.line,
-                    // 3.4 (Wave 3): write-path tools keep bare-name+path/line
-                    // resolution unchanged in this landing -- qualified_name
-                    // identity-chaining is scoped to the read-only tools
-                    // (source/symbol_info/callers/callees/reference_impact/
-                    // path/pattern_debt_register/understand), where the
-                    // ambiguity-avoidance value is highest and the risk is
-                    // lowest (no gate/authority interactions to reason about).
-                    None,
+                    // 5.3 (Wave 5): Wave 3.4 originally deferred this for
+                    // write-path tools pending a lower-risk confirmation --
+                    // now wired for real. qualified_name only changes WHICH
+                    // symbol resolve_symbol targets before any gate logic
+                    // runs; it never touches classify_gate/ReviewAuthority,
+                    // so the concern that justified deferring it doesn't
+                    // actually apply here.
+                    p.qualified_name.as_deref(),
                 ) {
                     Ok(r) => r,
                     Err(e) => return db_error_resolved(e),
@@ -1207,6 +1207,7 @@ impl CalmServer {
                     &self.config().risk_rules,
                     &proposed_hunks,
                     &policy,
+                    true, // Wave 5, 5.1b: real proposed hunks from a genuine write
                 );
             // Plan 3 §3.3 (F10): a bridge-only touch (never degree/both) at
             // risk ≤ medium MAY use the lighter CONFIRM_REQUIRED-only tier
@@ -2751,6 +2752,8 @@ impl CalmServer {
                 &[],
                 &[],
                 &calm_core::policy::Policy::default(),
+                true, // Wave 5, 5.1b: reflects a real completed edit; inert here
+                      // since proposed_hunks is already &[] at this call site
             );
             touched
         };
@@ -3710,6 +3713,21 @@ pub(crate) fn compute_touch_risk(
     risk_rules: &[calm_core::config::RiskRule],
     proposed_hunks: &[(i64, i64, &str)],
     policy: &calm_core::policy::Policy,
+    // Wave 5, item 5.1 (truth-kernel-hardening plan, P0-6): `false` ONLY at
+    // edit_context's speculative pre-edit `gate_prediction` call site, which
+    // has no real proposed edit content yet and passes a synthetic
+    // placeholder hunk just to give the uncovered-code probe below a
+    // non-empty range to check (that probe ignores hunk *text* entirely, so
+    // a placeholder is safe there). `real_hunks` exists specifically to keep
+    // that placeholder's empty text from being misread as a genuine
+    // signature deletion by the signature-change escalation block below --
+    // gating on `new_text.is_empty()` instead would have been unsafe, since
+    // a REAL edit that deletes a signature (replacing it with empty text) is
+    // a legitimate signature change that must still escalate for the real
+    // gate. Every other caller (the real `edit_lines`/`edit_symbol` write
+    // gate, `review_change`) always has genuine proposed content and passes
+    // `true`.
+    real_hunks: bool,
 ) -> TouchRiskResult {
     let rows = symbols_overlapping_ranges(conn, path, ranges);
     let mut max_callers = 0i64;
@@ -3720,9 +3738,17 @@ pub(crate) fn compute_touch_risk(
     // First function/method whose own signature is semantically changed by
     // `proposed_hunks` -- see the signature-escalation block below.
     let mut signature_touch: Option<String> = None;
+    // Wave 5, item 5.1a: whether any touched row is executable code at all
+    // (function/method) -- struct/enum/interface/type/heading declarations
+    // have no runtime coverage to report by construction, so coverage
+    // tooling reading `is_covered` as `false` for them is a false positive,
+    // not evidence of untested logic. Same allowlist the signature-touch
+    // and dead-code checks below already use.
+    let mut any_executable_kind = false;
     for row in rows {
         max_callers = max_callers.max(row.caller_count);
         hub_hit |= row.is_hub;
+        any_executable_kind |= matches!(row.kind.as_str(), "function" | "method");
         if let Some(k) = &row.hub_kind {
             let stronger = strongest_hub_kind
                 .as_deref()
@@ -3731,7 +3757,8 @@ pub(crate) fn compute_touch_risk(
                 strongest_hub_kind = Some(k.clone());
             }
         }
-        if signature_touch.is_none()
+        if real_hunks
+            && signature_touch.is_none()
             && !row.signature.is_empty()
             && matches!(row.kind.as_str(), "function" | "method")
         {
@@ -3897,18 +3924,20 @@ pub(crate) fn compute_touch_risk(
     // does) -- inlined rather than called directly because that helper
     // takes `&[calm_core::edit::HunkRequest]`, not this function's
     // `&[(i64, i64, &str)]` tuples, and converting would need an
-    // allocation per call for no real benefit. Empty at edit_context's
-    // pre-edit `gate_prediction` call (no proposed edit content exists yet
-    // to check coverage against -- the same structural limitation the
-    // signature-change escalation above already has), so this only ever
-    // fires from edit_lines_impl_gated's real gate, which supplies real
-    // hunks.
-    let touches_uncovered_code = !proposed_hunks.is_empty() && coverage.source != "none" && {
-        let abs_path = calm_core::analysis::coverage::normalize_path(&project_root.join(path));
-        proposed_hunks
-            .iter()
-            .any(|&(hs, he, _)| !coverage.is_covered(&abs_path, hs, he))
-    };
+    // allocation per call for no real benefit. `any_executable_kind` (5.1a)
+    // keeps this from firing on a struct/enum/doc-only touch, which has no
+    // instrumentable lines for a coverage tool to ever report on in the
+    // first place. `real_hunks=false` callers (edit_context's speculative
+    // `gate_prediction`) still reach this check via a synthetic placeholder
+    // hunk (5.1b) -- only hunk (start, end) is read here, never the text,
+    // so the placeholder's empty text is harmless at this specific check.
+    let touches_uncovered_code =
+        any_executable_kind && !proposed_hunks.is_empty() && coverage.source != "none" && {
+            let abs_path = calm_core::analysis::coverage::normalize_path(&project_root.join(path));
+            proposed_hunks
+                .iter()
+                .any(|&(hs, he, _)| !coverage.is_covered(&abs_path, hs, he))
+        };
     let (risk, risk_rule_reason) = if touches_uncovered_code {
         let floor = policy.uncovered_code_floor.as_str();
         let floor_severity = risk_severity(floor);
@@ -4595,6 +4624,13 @@ pub(crate) struct EditSymbolParams {
     /// response's `line_start`/`line_end`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) line: Option<i64>,
+    /// 5.3 (Wave 5): exact `qualified_name` from a prior `search`/`locate`
+    /// result — when set, resolves directly by identity and `path`/`line`
+    /// are ignored, so this can never come back ambiguous even for a
+    /// globally-common bare `symbol` name. Still flows through the same
+    /// live-verification every resolution does (Wave 1's `verify_live`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) qualified_name: Option<String>,
     /// Same contract as `edit_lines`' hunk `expected_hash` — omit to
     /// preview the symbol's current hash/content instead of writing.
     /// Ignored by the insertion `position` modes, which anchor and hash

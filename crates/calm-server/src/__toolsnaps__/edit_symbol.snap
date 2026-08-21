@@ -28,6 +28,13 @@
         ],
         "format": "int64"
       },
+      "qualified_name": {
+        "description": "5.3 (Wave 5): exact `qualified_name` from a prior `search`/`locate`\nresult — when set, resolves directly by identity and `path`/`line`\nare ignored, so this can never come back ambiguous even for a\nglobally-common bare `symbol` name. Still flows through the same\nlive-verification every resolution does (Wave 1's `verify_live`).",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
       "expected_hash": {
         "description": "Same contract as `edit_lines`' hunk `expected_hash` — omit to\npreview the symbol's current hash/content instead of writing.\nIgnored by the insertion `position` modes, which anchor and hash\nthemselves.",
         "type": [

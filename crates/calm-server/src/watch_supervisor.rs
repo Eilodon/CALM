@@ -209,6 +209,15 @@ pub(crate) struct WatchSupervisor {
     runtime: WatchRuntime,
     config: WatchSupervisorConfig,
     factory: Arc<dyn WatchFactory>,
+    // 5.5 (Wave 5, Wave-2 test-coverage gap): test-only hook invoked right
+    // before the reconciliation fence's EvidenceSnapshot::compute call in
+    // refresh() -- lets a test inject a disk mutation in the exact window
+    // between "reindex/overlay work is done" and "the fence checks live
+    // mtime drift", proving 2.2's own DoD (drift injected DURING
+    // reconciliation must never let a Reconciled snapshot through).
+    // Compiles away entirely outside test builds.
+    #[cfg(test)]
+    reconciliation_test_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl WatchSupervisor {
@@ -263,7 +272,17 @@ impl WatchSupervisor {
             },
             config,
             factory,
+            #[cfg(test)]
+            reconciliation_test_hook: None,
         }
+    }
+
+    // 5.5 (Wave 5): test-only opt-in for the reconciliation_test_hook field
+    // above -- see its own doc comment for what it proves.
+    #[cfg(test)]
+    fn with_reconciliation_test_hook(mut self, hook: impl Fn() + Send + Sync + 'static) -> Self {
+        self.reconciliation_test_hook = Some(Arc::new(hook));
+        self
     }
 
     pub(crate) fn run(mut self) {
@@ -609,6 +628,18 @@ impl WatchSupervisor {
             // `snapshot_id`) must reflect the FINAL post-overlay state before
             // this snapshot is computed, or the recorded `Reconciled` row
             // becomes unreachable the moment the overlay pass finishes.
+            //
+            // 5.5 (Wave 5): test-only injection point, right before the
+            // fence's own live-mtime check below -- lets a test mutate a
+            // watched file in the exact window between "reindex/overlay
+            // work is done" and "the fence checks for drift", proving a
+            // disk change landing here is caught and blocks the Reconciled
+            // promotion (2.2's own DoD). Compiles away entirely outside
+            // test builds.
+            #[cfg(test)]
+            if let Some(hook) = &self.reconciliation_test_hook {
+                hook();
+            }
             if let Some(reason) = outcome.full_reconciliation {
                 match calm_core::db::conn::open_state_writer(&crate::default_state_db_path(
                     &self.runtime.project_root,
@@ -1374,6 +1405,98 @@ mod tests {
         assert_eq!(
             freshness_class, "reconciled",
             "no drift occurred -- the refactored path must still promote to Reconciled"
+        );
+
+        ct.cancel();
+        worker.join().unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reconciliation_drift_injected_during_the_reconciliation_window_blocks_reconciled() {
+        // 5.5 (Wave 5, Wave-2 test-coverage gap): the parent plan's own
+        // original DoD for 2.2 -- a disk mutation injected DURING a full
+        // reconciliation (not before or after it) must still be caught by
+        // the fence and block the Reconciled promotion. Mirrors the sibling
+        // no-drift test's exact fixture, but uses the new
+        // reconciliation_test_hook to mutate README.md's content *and*
+        // mtime in the precise window between the reconciliation's own
+        // reindex step and the fence's live-mtime-drift check.
+        let root = test_root("reconciliation_drift_injected_mid_flight");
+        let calm_dir = root.join(".calm");
+        std::fs::create_dir_all(&calm_dir).unwrap();
+        std::fs::write(root.join("README.md"), "# Before\n").unwrap();
+        let db_path = calm_dir.join("index.db");
+        {
+            let mut conn = calm_core::db::conn::open_writer(&db_path).unwrap();
+            calm_core::db::schema::init_db(&conn).unwrap();
+            calm_core::indexer::pipeline::run_indexing_pipeline(
+                &mut conn,
+                &root,
+                Arc::new(RwLock::new(calm_core::types::IndexingPhase::Scanning)),
+            )
+            .unwrap();
+        }
+        {
+            let state_conn =
+                rusqlite::Connection::open(crate::default_state_db_path(&root)).unwrap();
+            calm_core::db::schema::init_state_db_versioned(&state_conn).unwrap();
+        }
+
+        let health = new_health_handle();
+        let factory = Arc::new(FakeFactory::with_outcomes([Ok(())]));
+        let ct = CancellationToken::new();
+        let config = test_config();
+        let readme_path = root.join("README.md");
+        let supervisor = WatchSupervisor::with_factory(
+            root.clone(),
+            db_path.clone(),
+            ct.clone(),
+            Arc::new(RwLock::new(None)),
+            Arc::new(RwLock::new(
+                calm_core::analysis::coverage::CoverageData::none(),
+            )),
+            Arc::new(RwLock::new(None)),
+            health.clone(),
+            None,
+            config,
+            factory.clone(),
+        )
+        .with_reconciliation_test_hook(move || {
+            std::fs::write(&readme_path, "# Mutated mid-reconciliation\n").unwrap();
+            // Bump mtime far into the future so this is unambiguously
+            // distinguishable from the indexed mtime regardless of the
+            // filesystem's own timestamp resolution.
+            let future = std::time::SystemTime::now() + std::time::Duration::from_secs(120);
+            std::fs::File::options()
+                .write(true)
+                .open(&readme_path)
+                .unwrap()
+                .set_modified(future)
+                .unwrap();
+        });
+        let worker = std::thread::spawn(move || supervisor.run());
+
+        wait_until(|| {
+            let state = health.read_ok();
+            state.armed
+                && state.freshness == WatcherFreshness::Fresh
+                && state.last_reconciliation_reason == Some("watcher_start")
+        });
+
+        let state_conn = rusqlite::Connection::open(crate::default_state_db_path(&root)).unwrap();
+        let freshness_class: String = state_conn
+            .query_row(
+                "SELECT freshness_class FROM evidence_snapshots \
+                 ORDER BY created_at DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_ne!(
+            freshness_class, "reconciled",
+            "drift injected during the reconciliation window must block the Reconciled \
+             promotion, not silently let it through"
         );
 
         ct.cancel();

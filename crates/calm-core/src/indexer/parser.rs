@@ -191,22 +191,68 @@ fn node_kind_to_symbol_kind(node_kind: &str, in_class: bool) -> SymbolKind {
 // covers this with no further changes needed.
 const PARSE_TIMEOUT_MICROS: u64 = 5_000_000;
 
+/// Why `parse_tree` failed to produce a tree (Wave 5 item 5.7,
+/// docs/plans/2026-08-21-truth-kernel-hardening-wave5-residual-closure-plan.md)
+/// -- threaded as a `Result` instead of collapsing every cause into one
+/// `None`, so a caller that surfaces failure reasons (this module's own
+/// `extract_*` wrappers, `verify_live`, `insertion_hunk_for`) can say WHY a
+/// re-parse failed, not just THAT it did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParseFailure {
+    /// `language` has no registered `LanguageSpec` at all, or the spec
+    /// exists but its `ts_language` grammar loader returned `None` (the
+    /// `lang-*` Cargo feature gating that grammar wasn't compiled into this
+    /// build). The normal, expected outcome for any Tier-0.5 language --
+    /// callers that fall back to shallow extraction on this variant are not
+    /// handling an error, just routing around a grammar that was never
+    /// supposed to exist here.
+    UnsupportedLanguage,
+    /// `Parser::set_language` rejected the grammar -- an ABI version
+    /// mismatch between the `tree-sitter` core crate and this grammar
+    /// crate. Unlike `UnsupportedLanguage`, this would indicate a real
+    /// dependency-version bug, not an expected per-language gap.
+    AbiLoadFailed,
+    /// `Parser::parse` returned `None` -- the per-call timeout
+    /// (`PARSE_TIMEOUT_MICROS`) was hit on a pathological/adversarial input.
+    Timeout,
+}
+
+impl ParseFailure {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ParseFailure::UnsupportedLanguage => "unsupported_language",
+            ParseFailure::AbiLoadFailed => "abi_load_failed",
+            ParseFailure::Timeout => "timeout",
+        }
+    }
+}
+
+impl std::fmt::Display for ParseFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Parse `source` for a tier-0 `language` into a tree-sitter tree, or `None` if
 /// the language is unsupported or parsing fails. Single source of the per-language
 /// grammar mapping.
-pub fn parse_tree(source: &str, language: &str) -> Option<tree_sitter::Tree> {
-    let lang = (crate::indexer::lang_constants::find_spec(language)?.ts_language)()?;
+pub fn parse_tree(source: &str, language: &str) -> Result<tree_sitter::Tree, ParseFailure> {
+    let spec = crate::indexer::lang_constants::find_spec(language)
+        .ok_or(ParseFailure::UnsupportedLanguage)?;
+    let lang = (spec.ts_language)().ok_or(ParseFailure::UnsupportedLanguage)?;
     let mut parser = tree_sitter::Parser::new();
-    parser.set_language(&lang).ok()?;
+    parser
+        .set_language(&lang)
+        .map_err(|_| ParseFailure::AbiLoadFailed)?;
     parser.set_timeout_micros(PARSE_TIMEOUT_MICROS);
-    parser.parse(source, None)
+    parser.parse(source, None).ok_or(ParseFailure::Timeout)
 }
 pub fn extract_symbols(
     source: &str,
     language: &str,
     path: &str,
 ) -> Result<Vec<ParsedSymbol>, String> {
-    let tree = parse_tree(source, language).ok_or("Failed to parse")?;
+    let tree = parse_tree(source, language).map_err(|e| e.to_string())?;
     Ok(extract_symbols_from_tree(&tree, source, language, path))
 }
 
@@ -1968,7 +2014,7 @@ fn selected_callee_byte_span(
 /// Extract call sites from a source file, each attributed to its enclosing function.
 /// Top-level calls (outside any function) are skipped — they have no caller symbol.
 pub fn extract_calls(source: &str, language: &str, _path: &str) -> Result<Vec<RawCall>, String> {
-    let tree = parse_tree(source, language).ok_or("Failed to parse")?;
+    let tree = parse_tree(source, language).map_err(|e| e.to_string())?;
     Ok(extract_calls_from_tree(&tree, source, language))
 }
 
@@ -2031,7 +2077,7 @@ pub fn extract_file_aliases(
     language: &str,
     ctx: &crate::resolver::FileContext,
 ) -> std::collections::HashMap<String, String> {
-    let Some(tree) = parse_tree(source, language) else {
+    let Ok(tree) = parse_tree(source, language) else {
         return std::collections::HashMap::new();
     };
     extract_file_aliases_from_tree(&tree, source, language, ctx)
@@ -2060,7 +2106,7 @@ pub fn extract_file_aliases_from_tree(
 /// JavaScript (dynamic) yields an empty map. Go shares one type across several
 /// names (`x, y Foo`), so each name is mapped.
 pub fn extract_type_map(source: &str, language: &str) -> std::collections::HashMap<String, String> {
-    let Some(tree) = parse_tree(source, language) else {
+    let Ok(tree) = parse_tree(source, language) else {
         return std::collections::HashMap::new();
     };
     extract_type_map_from_tree(&tree, source, language)
@@ -4259,43 +4305,98 @@ public class FooTest {
     #[test]
     #[cfg(feature = "lang-ruby")]
     fn test_tier0_5_grammar_loads_ruby() {
-        assert!(parse_tree("def foo\nend\n", "ruby").is_some());
+        assert!(parse_tree("def foo\nend\n", "ruby").is_ok());
     }
 
     #[test]
     #[cfg(feature = "lang-php")]
     fn test_tier0_5_grammar_loads_php() {
-        assert!(parse_tree("<?php\nfunction foo() {}\n", "php").is_some());
+        assert!(parse_tree("<?php\nfunction foo() {}\n", "php").is_ok());
     }
 
     #[test]
     #[cfg(feature = "lang-csharp")]
     fn test_tier0_5_grammar_loads_csharp() {
-        assert!(parse_tree("class Foo { void Bar() {} }\n", "csharp").is_some());
+        assert!(parse_tree("class Foo { void Bar() {} }\n", "csharp").is_ok());
     }
 
     #[test]
     #[cfg(feature = "lang-shell")]
     fn test_tier0_5_grammar_loads_shell() {
-        assert!(parse_tree("foo() {\n echo hi\n}\n", "shell").is_some());
+        assert!(parse_tree("foo() {\n echo hi\n}\n", "shell").is_ok());
     }
 
     #[test]
     #[cfg(feature = "lang-c")]
     fn test_tier0_5_grammar_loads_c() {
-        assert!(parse_tree("int foo() { return 0; }\n", "c").is_some());
+        assert!(parse_tree("int foo() { return 0; }\n", "c").is_ok());
     }
 
     #[test]
     #[cfg(feature = "lang-cpp")]
     fn test_tier0_5_grammar_loads_cpp() {
-        assert!(parse_tree("int foo() { return 0; }\n", "cpp").is_some());
+        assert!(parse_tree("int foo() { return 0; }\n", "cpp").is_ok());
     }
 
     #[test]
     #[cfg(feature = "lang-r")]
     fn test_tier0_5_grammar_loads_r() {
-        assert!(parse_tree("foo <- function(x) {\n  x\n}\n", "r").is_some());
+        assert!(parse_tree("foo <- function(x) {\n  x\n}\n", "r").is_ok());
+    }
+
+    // Wave 5 item 5.7 (docs/plans/2026-08-21-truth-kernel-hardening-wave5-
+    // residual-closure-plan.md): parse_tree's ParseFailure reason must be
+    // the correct variant for each real failure mode, and its `as_str`/
+    // `Display` output is load-bearing -- verify_live/insertion_hunk_for
+    // interpolate it directly into an agent-facing error message via `{e}`.
+    #[test]
+    fn parse_tree_unrecognized_language_name_reports_unsupported_language() {
+        // tree_sitter::Tree implements neither PartialEq nor Debug, so
+        // assert_eq!/unwrap_err() can't be used directly on this Result --
+        // matches! sidesteps both trait requirements.
+        assert!(matches!(
+            parse_tree("fn main() {}", "not-a-real-language"),
+            Err(ParseFailure::UnsupportedLanguage)
+        ));
+    }
+
+    #[test]
+    fn parse_tree_valid_source_and_supported_language_succeeds() {
+        assert!(parse_tree("fn main() {}", "rust").is_ok());
+    }
+
+    #[test]
+    fn parse_failure_as_str_and_display_match_for_every_variant() {
+        for variant in [
+            ParseFailure::UnsupportedLanguage,
+            ParseFailure::AbiLoadFailed,
+            ParseFailure::Timeout,
+        ] {
+            assert_eq!(variant.to_string(), variant.as_str());
+            assert!(!variant.as_str().is_empty());
+        }
+        // Exact strings are part of the public contract now that
+        // extract_symbols/extract_calls thread `.to_string()` of this type
+        // straight into REPARSE_FAILED/STALE_SYMBOL error messages shown to
+        // an agent -- a silent rename here would silently change those.
+        assert_eq!(
+            ParseFailure::UnsupportedLanguage.as_str(),
+            "unsupported_language"
+        );
+        assert_eq!(ParseFailure::AbiLoadFailed.as_str(), "abi_load_failed");
+        assert_eq!(ParseFailure::Timeout.as_str(), "timeout");
+    }
+
+    #[test]
+    fn extract_symbols_unsupported_language_error_names_the_real_reason_not_a_generic_string() {
+        // Regression guard for the exact improvement Wave 5.7 makes over the
+        // old `.ok_or("Failed to parse")?`: the error string a caller like
+        // verify_live surfaces must now say WHY, not just THAT parsing failed.
+        // `.err()` (not `.unwrap_err()`) is used deliberately: ParsedSymbol
+        // has no Debug impl, and unwrap_err() requires the Ok side (here
+        // Vec<ParsedSymbol>) to implement it too.
+        let err = extract_symbols("fn main() {}", "not-a-real-language", "a.rs").err();
+        assert_eq!(err, Some("unsupported_language".to_string()));
     }
 
     /// Regression test for the shell-specific bug this guard suite was born
@@ -4563,7 +4664,7 @@ public class FooTest {
         );
         // Markdown has no tree-sitter grammar, ever — extract_file_data's
         // dedicated branch is the only path that can produce symbols for it.
-        assert!(parse_tree("# x", "markdown").is_none());
+        assert!(parse_tree("# x", "markdown").is_err());
     }
     #[test]
     fn test_shallow_kotlin() {
@@ -4595,7 +4696,7 @@ public class FooTest {
     #[cfg(feature = "lang-kotlin")]
     fn test_tier0_5_grammar_loads_kotlin() {
         assert!(
-            parse_tree("fun main() {}", "kotlin").is_some(),
+            parse_tree("fun main() {}", "kotlin").is_ok(),
             "tree-sitter-kotlin-ng grammar should load and parse"
         );
     }
@@ -4604,7 +4705,7 @@ public class FooTest {
     #[cfg(feature = "lang-swift")]
     fn test_tier0_5_grammar_loads_swift() {
         assert!(
-            parse_tree("func main() {}", "swift").is_some(),
+            parse_tree("func main() {}", "swift").is_ok(),
             "tree-sitter-swift grammar should load and parse"
         );
     }
@@ -4696,7 +4797,7 @@ public class FooTest {
     #[cfg(feature = "lang-scala")]
     fn test_tier0_5_grammar_loads_scala() {
         assert!(
-            parse_tree("def main(): Unit = {}", "scala").is_some(),
+            parse_tree("def main(): Unit = {}", "scala").is_ok(),
             "tree-sitter-scala grammar should load and parse — locks the pinned ABI (=0.24.1, ABI 14); \
              a caret-range bump to 0.25.0+ (ABI 15) would silently regress this to shallow line-scan"
         );
@@ -5168,7 +5269,7 @@ class Foo {
     #[cfg(feature = "lang-dart")]
     fn test_tier0_5_grammar_loads_dart() {
         assert!(
-            parse_tree("void main() {}", "dart").is_some(),
+            parse_tree("void main() {}", "dart").is_ok(),
             "tree-sitter-dart grammar should load and parse — locks the pinned ABI \
              (=0.0.4, ABI 14, the newest ABI-14 release since this grammar has no git \
              tags — verified by downloading each published .crate tarball and grepping \
@@ -5283,7 +5384,7 @@ class Foo {
     #[cfg(feature = "lang-lua")]
     fn test_tier0_5_grammar_loads_lua() {
         assert!(
-            parse_tree("function main() end", "lua").is_some(),
+            parse_tree("function main() end", "lua").is_ok(),
             "tree-sitter-lua grammar should load and parse — locks the pinned ABI \
              (=0.2.0, ABI 14); a caret-range bump to 0.4.1+ (ABI 15) would silently \
              regress this to shallow line-scan"
@@ -5343,7 +5444,7 @@ class Foo {
     #[cfg(feature = "lang-elixir")]
     fn test_tier0_5_grammar_loads_elixir() {
         assert!(
-            parse_tree("def main do\nend\n", "elixir").is_some(),
+            parse_tree("def main do\nend\n", "elixir").is_ok(),
             "tree-sitter-elixir grammar should load and parse — locks the pinned ABI \
              (=0.3.5, ABI 14)"
         );
@@ -5434,7 +5535,7 @@ class Foo {
     #[cfg(feature = "lang-haskell")]
     fn test_tier0_5_grammar_loads_haskell() {
         assert!(
-            parse_tree("main :: IO ()\nmain = putStrLn \"hi\"\n", "haskell").is_some(),
+            parse_tree("main :: IO ()\nmain = putStrLn \"hi\"\n", "haskell").is_ok(),
             "tree-sitter-haskell grammar should load and parse — locks the pinned ABI \
              (=0.23.1, ABI 14)"
         );
@@ -5512,7 +5613,7 @@ class Foo {
     #[cfg(feature = "lang-ocaml")]
     fn test_tier0_5_grammar_loads_ocaml() {
         assert!(
-            parse_tree("let main () = print_string \"hi\"\n", "ocaml").is_some(),
+            parse_tree("let main () = print_string \"hi\"\n", "ocaml").is_ok(),
             "tree-sitter-ocaml grammar should load and parse — locks the pinned ABI \
              (=0.24.2, ABI 14); a caret-range bump to 0.25.0+ (ABI 15) would silently \
              regress this to shallow line-scan"
@@ -5585,7 +5686,7 @@ class Foo {
     #[cfg(feature = "lang-zig")]
     fn test_tier0_5_grammar_loads_zig() {
         assert!(
-            parse_tree("pub fn main() void {}\n", "zig").is_some(),
+            parse_tree("pub fn main() void {}\n", "zig").is_ok(),
             "tree-sitter-zig grammar should load and parse — locks the pinned ABI \
              (=1.1.2, ABI 14)"
         );
@@ -5664,7 +5765,7 @@ class Foo {
     #[cfg(feature = "lang-powershell")]
     fn test_tier0_5_grammar_loads_powershell() {
         assert!(
-            parse_tree("function Main {\n    Write-Host \"hi\"\n}\n", "powershell").is_some(),
+            parse_tree("function Main {\n    Write-Host \"hi\"\n}\n", "powershell").is_ok(),
             "tree-sitter-powershell grammar should load and parse — locks the pinned ABI \
              (=0.25.9, ABI 14); a caret-range bump to 0.25.10+ (ABI 15) would silently \
              regress this to shallow line-scan"
@@ -5739,7 +5840,7 @@ class Foo {
     #[cfg(feature = "lang-groovy")]
     fn test_tier0_5_grammar_loads_groovy() {
         assert!(
-            parse_tree("def main() {}\n", "groovy").is_some(),
+            parse_tree("def main() {}\n", "groovy").is_ok(),
             "tree-sitter-groovy grammar should load and parse — locks the pinned ABI \
              (=0.1.2, ABI 14)"
         );

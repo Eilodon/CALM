@@ -27,6 +27,13 @@
         ],
         "format": "int64"
       },
+      "qualified_name": {
+        "description": "5.3 (Wave 5): exact `qualified_name` from a prior `search`/`locate`\nresult — when set, resolves directly by identity and `path`/`line`\nare ignored, so this can never come back ambiguous even for a\nglobally-common bare `symbol` name. Still flows through the same\nlive-verification every resolution does (Wave 1's `verify_live`).",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
       "if_none_match": {
         "description": "`edges_etag` from a prior `edit_context` call on this exact symbol —\nif the caller/callee lists haven't changed since, the response omits\n`callers`/`callees` and sets `edges_not_modified: true`. Every other\nfield (`risk_assessment`, `dead_code_confidence`, `blast_radius`,\n`trend`, `co_changed_files`, `range_checksum`) is always recomputed\nand returned in full regardless — never gated behind this etag, since\nthis is the mandatory pre-edit safety tool and none of those may go\nsilently stale.",
         "type": [

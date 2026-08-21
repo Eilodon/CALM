@@ -102,7 +102,7 @@ fn rel_file(project_root: &Path, abs_file: &Path) -> Option<String> {
 /// (holding either a plain `identifier` or a dotted `qualified_name`; taking
 /// the field's raw source text handles either shape without unwrapping).
 fn namespaces_declared_in(source: &str, consts: &LangConstants) -> Vec<String> {
-    let Some(tree) = parse_tree(source, "csharp") else {
+    let Ok(tree) = parse_tree(source, "csharp") else {
         return Vec::new();
     };
     let root = tree.root_node();

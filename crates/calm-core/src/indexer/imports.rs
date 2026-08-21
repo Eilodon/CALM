@@ -85,7 +85,7 @@ pub fn extract_imports(source: &str, language: &str) -> Vec<ParsedImport> {
     if types.is_empty() {
         return Vec::new();
     }
-    let Some(tree) = parse_tree(source, language) else {
+    let Ok(tree) = parse_tree(source, language) else {
         return Vec::new();
     };
     extract_imports_from_tree(&tree, source, language)

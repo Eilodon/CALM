@@ -484,12 +484,8 @@ impl CalmServer {
         Parameters(p): Parameters<UnderstandParams>,
     ) -> Json<ToolOutcome<UnderstandOutput>> {
         Json(self.timed_tool("understand", || {
-            let kind_str = p.kind.as_deref().unwrap_or("symbol");
-            let kind = match kind_str {
-                "text" => calm_core::types::SearchKind::Text,
-                "file" => calm_core::types::SearchKind::File,
-                _ => calm_core::types::SearchKind::Symbol,
-            };
+            let kind_str = p.kind.as_deref().unwrap_or("hybrid");
+            let kind = Self::parse_understand_kind(kind_str);
 
             // READ-only: open a dedicated read connection (SINGLE_WRITER enforcement)
             let conn = match self.make_read_conn() {
@@ -730,6 +726,23 @@ impl CalmServer {
                 },
             })
         }))
+    }
+
+    // Wave 5, item 5.4 (truth-kernel-hardening plan): extracted so the
+    // mapping itself is directly unit-testable -- understand()'s actual
+    // results can't distinguish "hybrid" from "symbol" in a no-embedder
+    // test environment (search_hybrid degrades to exactly search_symbol's
+    // output when no embedder is configured), so testing through the
+    // tool's own output alone couldn't have caught the original bug (the
+    // match had no "hybrid" arm at all, silently falling through to
+    // Symbol regardless of what kind_str said).
+    pub(crate) fn parse_understand_kind(kind_str: &str) -> calm_core::types::SearchKind {
+        match kind_str {
+            "text" => calm_core::types::SearchKind::Text,
+            "file" => calm_core::types::SearchKind::File,
+            "hybrid" => calm_core::types::SearchKind::Hybrid,
+            _ => calm_core::types::SearchKind::Symbol,
+        }
     }
 
     #[tool(

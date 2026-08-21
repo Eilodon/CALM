@@ -2944,6 +2944,7 @@ mod tests {
 
         let output = server.edit_context(rmcp::handler::server::wrapper::Parameters(
             EditContextParams {
+                qualified_name: None,
                 symbol: "a".into(),
                 path: None,
                 line: None,
@@ -3006,6 +3007,7 @@ mod tests {
 
         let output = server.edit_context(rmcp::handler::server::wrapper::Parameters(
             EditContextParams {
+                qualified_name: None,
                 symbol: "a".into(),
                 path: None,
                 line: None,
@@ -3295,6 +3297,7 @@ mod tests {
 
         let output = server.edit_context(rmcp::handler::server::wrapper::Parameters(
             EditContextParams {
+                qualified_name: None,
                 symbol: "has".into(),
                 path: None,
                 line: None,
@@ -3348,6 +3351,7 @@ mod tests {
         let v = jv(
             server.edit_context(rmcp::handler::server::wrapper::Parameters(
                 EditContextParams {
+                    qualified_name: None,
                     symbol: "hub".into(),
                     path: None,
                     line: None,
@@ -3424,6 +3428,7 @@ mod tests {
         let v = jv(
             server.edit_context(rmcp::handler::server::wrapper::Parameters(
                 EditContextParams {
+                    qualified_name: None,
                     symbol: "helper".into(),
                     path: None,
                     line: None,
@@ -3499,6 +3504,7 @@ mod tests {
         let v = jv(
             server.edit_context(rmcp::handler::server::wrapper::Parameters(
                 EditContextParams {
+                    qualified_name: None,
                     symbol: "helper".into(),
                     path: None,
                     line: None,
@@ -3548,6 +3554,7 @@ mod tests {
         let v = jv(
             server.edit_context(rmcp::handler::server::wrapper::Parameters(
                 EditContextParams {
+                    qualified_name: None,
                     symbol: "helper".into(),
                     path: None,
                     line: None,
@@ -3617,6 +3624,7 @@ mod tests {
         let v = jv(
             server.edit_context(rmcp::handler::server::wrapper::Parameters(
                 EditContextParams {
+                    qualified_name: None,
                     symbol: "hub".into(),
                     path: None,
                     line: None,
@@ -3661,6 +3669,7 @@ mod tests {
         let first = jv(
             server.edit_context(rmcp::handler::server::wrapper::Parameters(
                 EditContextParams {
+                    qualified_name: None,
                     symbol: "foo".into(),
                     path: None,
                     line: None,
@@ -3679,6 +3688,7 @@ mod tests {
         let second = jv(
             server.edit_context(rmcp::handler::server::wrapper::Parameters(
                 EditContextParams {
+                    qualified_name: None,
                     symbol: "foo".into(),
                     path: None,
                     line: None,
@@ -3757,6 +3767,7 @@ mod tests {
 
         let output = server.edit_context(rmcp::handler::server::wrapper::Parameters(
             EditContextParams {
+                qualified_name: None,
                 symbol: "model_fn".into(),
                 path: None,
                 line: None,
@@ -3795,6 +3806,7 @@ mod tests {
 
         let output = server.edit_context(rmcp::handler::server::wrapper::Parameters(
             EditContextParams {
+                qualified_name: None,
                 symbol: "a".into(),
                 path: None,
                 line: None,
@@ -3840,6 +3852,7 @@ mod tests {
 
         let output = server.edit_context(rmcp::handler::server::wrapper::Parameters(
             EditContextParams {
+                qualified_name: None,
                 symbol: "a".into(),
                 path: None,
                 line: None,
@@ -4627,6 +4640,7 @@ mod tests {
 
         conn_b.edit_context(rmcp::handler::server::wrapper::Parameters(
             EditContextParams {
+                qualified_name: None,
                 symbol: "reviewed_fn".into(),
                 path: None,
                 line: None,
@@ -5228,6 +5242,38 @@ mod tests {
 
     /// Regression test: `understand`'s inline SQL used to omit the `language`
     /// column, so `SourceOutput.language` was always empty.
+    #[test]
+    fn parse_understand_kind_maps_hybrid_and_falls_back_to_symbol() {
+        // Wave 5, item 5.4 (truth-kernel-hardening plan): the actual
+        // regression guard. Before this fix, "hybrid" had no match arm at
+        // all and silently fell through to `_ => Symbol` -- flipping only
+        // the default *string* (p.kind.as_deref().unwrap_or(...)) without
+        // this arm would have been a complete no-op, since every
+        // understand() call with kind omitted still resolved to Symbol.
+        assert_eq!(
+            CalmServer::parse_understand_kind("hybrid"),
+            calm_core::types::SearchKind::Hybrid
+        );
+        assert_eq!(
+            CalmServer::parse_understand_kind("text"),
+            calm_core::types::SearchKind::Text
+        );
+        assert_eq!(
+            CalmServer::parse_understand_kind("file"),
+            calm_core::types::SearchKind::File
+        );
+        assert_eq!(
+            CalmServer::parse_understand_kind("symbol"),
+            calm_core::types::SearchKind::Symbol
+        );
+        assert_eq!(
+            CalmServer::parse_understand_kind("not_a_real_kind"),
+            calm_core::types::SearchKind::Symbol,
+            "an unrecognized value must fall back to Symbol, matching this tool's documented \
+             'any other value silently falls back to symbol' contract"
+        );
+    }
+
     #[test]
     fn understand_includes_symbol_language_in_source_output() {
         let dir = std::env::temp_dir().join(format!("ci_understand_lang_{}", std::process::id()));
@@ -5963,6 +6009,7 @@ mod tests {
         let out = jv(
             server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
                 EditSymbolParams {
+                    qualified_name: None,
                     change_id: None,
                     authority_id: None,
                     symbol: "foo".into(),
@@ -10249,6 +10296,7 @@ mod tests {
         let hash2 = calm_core::edit::range_checksum("def other():\n    return 1\n", 1, 2).unwrap();
         let out2 = server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
             EditSymbolParams {
+                qualified_name: None,
                 change_id: None,
                 authority_id: None,
                 symbol: "other".into(),
@@ -10832,6 +10880,7 @@ mod tests {
             &[],
             &[],
             &calm_core::policy::Policy::default(),
+            true,
         );
         assert_eq!(risk.as_deref(), Some("low"), "baseline structural risk");
         assert!(reason.is_none());
@@ -10851,6 +10900,7 @@ mod tests {
             &rules,
             &[],
             &calm_core::policy::Policy::default(),
+            true,
         );
         assert_eq!(risk.as_deref(), Some("high"));
         let reason = reason.expect("risk_rule_reason must be set when a rule raises the floor");
@@ -10890,6 +10940,7 @@ mod tests {
             &rules,
             &[],
             &calm_core::policy::Policy::default(),
+            true,
         );
         assert_eq!(
             risk.as_deref(),
@@ -10934,6 +10985,7 @@ mod tests {
             &[],
             &[(1, 1, "def helper(x):")],
             &calm_core::policy::Policy::default(),
+            true,
         );
         assert_eq!(
             risk.as_deref(),
@@ -10976,6 +11028,7 @@ mod tests {
             &[],
             &[(2, 2, "    return 2")],
             &calm_core::policy::Policy::default(),
+            true,
         );
         assert_eq!(
             risk.as_deref(),
@@ -11016,6 +11069,7 @@ mod tests {
             &[],
             &[(1, 1, "def hot(x):")],
             &calm_core::policy::Policy::default(),
+            true,
         );
         assert_eq!(risk.as_deref(), Some("high"));
         assert!(
@@ -11043,6 +11097,7 @@ mod tests {
             &[],
             &[],
             &calm_core::policy::Policy::default(),
+            true,
         );
         assert_eq!(
             risk.as_deref(),
@@ -11082,6 +11137,7 @@ mod tests {
             &[],
             &[],
             &lenient,
+            true,
         );
         assert_eq!(
             risk.as_deref(),
@@ -11124,6 +11180,7 @@ mod tests {
             &[],
             &[(2, 2, "    return 2")],
             &calm_core::policy::Policy::default(),
+            true,
         );
         assert_eq!(
             risk.as_deref(),
@@ -11140,7 +11197,7 @@ mod tests {
     }
 
     #[test]
-    fn compute_touch_risk_uncovered_code_never_fires_with_no_proposed_hunks() {
+    fn compute_touch_risk_uncovered_code_never_fires_with_truly_empty_hunks() {
         let (dir, server) = test_server("touch_risk_uncovered_code_needs_hunks");
         std::fs::write(dir.join("a.py"), "def helper():\n    return 1\n").unwrap();
         {
@@ -11158,11 +11215,14 @@ mod tests {
             covered_lines: std::collections::HashMap::new(),
         };
 
-        // Same file, same uncovered range, but NO proposed_hunks -- this is
-        // exactly edit_context's pre-edit gate_prediction shape (no
-        // proposed edit content exists yet to check coverage against).
-        // Must not escalate, the same structural limitation the
-        // signature-change escalation already has.
+        // Same file, same uncovered range, but a genuinely EMPTY
+        // proposed_hunks list -- must not escalate regardless of
+        // real_hunks, since there's nothing to check coverage against.
+        // Wave 5, 5.1b: this is no longer edit_context's gate_prediction
+        // shape (that now passes a synthetic non-empty placeholder hunk +
+        // real_hunks=false instead -- see
+        // compute_touch_risk_placeholder_hunk_activates_coverage_probe_
+        // without_a_false_signature_escalation below for that case).
         let (risk, _, _, _, _, _) = compute_touch_risk(
             &conn,
             &dir,
@@ -11172,12 +11232,109 @@ mod tests {
             &[],
             &[],
             &calm_core::policy::Policy::default(),
+            true,
         );
         assert_eq!(
             risk.as_deref(),
             Some("low"),
-            "uncovered-code escalation must not fire when there are no proposed_hunks to \
-             check coverage against, matching edit_context's gate_prediction limitation"
+            "uncovered-code escalation must not fire on a truly empty proposed_hunks list"
+        );
+    }
+
+    #[test]
+    fn compute_touch_risk_uncovered_code_skipped_for_non_executable_kind() {
+        // Wave 5, 5.1a (truth-kernel-hardening plan): a struct/enum/doc-only
+        // symbol has no instrumentable lines for a coverage tool to ever
+        // report on -- coverage.is_covered reading `false` for it is a
+        // false positive, not evidence of untested logic. Must not trip
+        // the uncovered_code_floor even with real proposed_hunks and zero
+        // recorded coverage.
+        let (dir, server) = test_server("touch_risk_uncovered_code_non_executable");
+        std::fs::write(dir.join("a.py"), "class Foo:\n    \"\"\"doc\"\"\"\n").unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.py::Foo', 'Foo', 'class', 'python', 'a.py', 1, 2, 'class Foo:', '', 'Foo', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        }
+        let conn = server.make_read_conn().unwrap();
+        let coverage = calm_core::analysis::coverage::CoverageData {
+            source: "lcov".to_string(),
+            covered_lines: std::collections::HashMap::new(),
+        };
+        let (risk, _, _, _, _, reason) = compute_touch_risk(
+            &conn,
+            &dir,
+            "a.py",
+            &[(2, 2)],
+            &coverage,
+            &[],
+            &[(2, 2, "    \"\"\"new doc\"\"\"")],
+            &calm_core::policy::Policy::default(),
+            true,
+        );
+        assert_eq!(
+            risk.as_deref(),
+            Some("low"),
+            "a class/doc-only touch with zero coverage must not hit the uncovered_code_floor -- \
+             there's no executable line here for a coverage tool to ever report on"
+        );
+        assert!(reason.is_none());
+    }
+
+    #[test]
+    fn compute_touch_risk_placeholder_hunk_activates_coverage_probe_without_a_false_signature_escalation()
+     {
+        // Wave 5, 5.1b: the exact mechanism edit_context's gate_prediction
+        // now uses -- a synthetic full-range placeholder hunk with EMPTY
+        // text, real_hunks=false. Proves both halves: (a) the coverage
+        // probe still fires for real (only hunk start/end are read there,
+        // never text), and (b) the empty placeholder text is never misread
+        // as a real signature deletion, because real_hunks=false skips that
+        // check entirely -- even though this placeholder's range (1, 2)
+        // fully covers the signature line the way a real deleting edit
+        // would.
+        let (dir, server) = test_server("touch_risk_placeholder_hunk");
+        std::fs::write(dir.join("a.py"), "def helper():\n    return 1\n").unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.py::helper', 'helper', 'function', 'python', 'a.py', 1, 2, 'def helper():', '', 'helper', 2, 0, 0)",
+                [],
+            )
+            .unwrap();
+        }
+        let conn = server.make_read_conn().unwrap();
+        let coverage = calm_core::analysis::coverage::CoverageData {
+            source: "lcov".to_string(),
+            covered_lines: std::collections::HashMap::new(),
+        };
+        let (risk, _, _, _, _, reason) = compute_touch_risk(
+            &conn,
+            &dir,
+            "a.py",
+            &[(1, 2)],
+            &coverage,
+            &[],
+            &[(1, 2, "")],
+            &calm_core::policy::Policy::default(),
+            false,
+        );
+        assert_eq!(
+            risk.as_deref(),
+            Some("high"),
+            "the placeholder hunk's non-empty range must still activate the uncovered-code \
+             probe (coverage check only reads hunk start/end, never text)"
+        );
+        let reason = reason.expect("uncovered-code escalation must carry a reason");
+        assert!(
+            reason.contains("test coverage"),
+            "the escalation reason must be the coverage floor, NOT a false signature-change \
+             escalation from the placeholder's empty text -- got: {reason}"
         );
     }
 
@@ -11319,6 +11476,7 @@ mod tests {
         // Satisfy layer 1.
         server.edit_context(rmcp::handler::server::wrapper::Parameters(
             EditContextParams {
+                qualified_name: None,
                 symbol: "helper".into(),
                 path: None,
                 line: None,
@@ -11421,6 +11579,7 @@ mod tests {
 
         let ctx = server.edit_context(rmcp::handler::server::wrapper::Parameters(
             EditContextParams {
+                qualified_name: None,
                 symbol: "helper".into(),
                 path: None,
                 line: None,
@@ -11467,6 +11626,97 @@ mod tests {
     }
 
     #[test]
+    fn edit_context_gate_prediction_now_predicts_uncovered_code_escalation() {
+        // Wave 5, item 5.1 (truth-kernel-hardening plan, P0-6): before this
+        // fix, gate_prediction always passed empty proposed_hunks to
+        // compute_touch_risk, so it could NEVER predict the
+        // uncovered_code_floor escalation -- the real edit_lines gate would
+        // block, but gate_prediction had already told the caller
+        // will_block=false. This test is the actual regression guard for
+        // that bug: a low-caller-count, non-hub, uncovered function must
+        // now predict the SAME block the real gate applies.
+        let (dir, server) = test_server("gate_prediction_uncovered_code");
+        std::fs::write(dir.join("a.py"), "def helper():\n    return 1\n").unwrap();
+
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.py::helper', 'helper', 'function', 'python', 'a.py', 1, 2, 'def helper():', '', 'helper', 2, 0, 0)",
+                [],
+            )
+            .unwrap();
+        }
+        *server.coverage.write_ok() = calm_core::analysis::coverage::CoverageData {
+            source: "lcov".to_string(),
+            covered_lines: std::collections::HashMap::new(),
+        };
+
+        let ctx = server.edit_context(rmcp::handler::server::wrapper::Parameters(
+            EditContextParams {
+                qualified_name: None,
+                symbol: "helper".into(),
+                path: None,
+                line: None,
+                if_none_match: None,
+            },
+        ));
+        let ctx_v = jv(ctx);
+        assert_eq!(
+            ctx_v["gate_prediction"]["will_block"], true,
+            "response: {ctx_v}"
+        );
+        assert_eq!(
+            ctx_v["gate_prediction"]["is_hub"], false,
+            "response: {ctx_v}"
+        );
+        assert_eq!(
+            ctx_v["gate_prediction"]["requires"], "edit_context+confirm+grounded_reason",
+            "response: {ctx_v}"
+        );
+        let reason = ctx_v["gate_prediction"]["reason"].as_str().unwrap_or("");
+        assert!(
+            reason.contains("test coverage"),
+            "gate_prediction's reason should name the uncovered-code floor, got: {reason}"
+        );
+
+        // The real gate must agree it blocks -- the uncovered-code floor's
+        // default ("high") pushes real risk_assessment all the way to
+        // "high" (not just hub_hit), so this specific case routes through
+        // the stronger independent-review tier rather than the plainer
+        // CONFIRM_REQUIRED the sibling hub-symbol test above hits (that one
+        // is gated via is_hub alone, at a lower risk level). Both are
+        // "blocked", which is exactly what gate_prediction.will_block
+        // already asserted above -- this only confirms the real gate did
+        // NOT silently let the write through.
+        let hash = calm_core::edit::range_checksum("def helper():\n    return 1\n", 2, 2).unwrap();
+        let no_confirm = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
+            EditLinesParams {
+                change_id: None,
+                authority_id: None,
+                path: "a.py".into(),
+                edits: vec![EditHunkParam {
+                    old_text: None,
+                    start_line: 2,
+                    end_line: 2,
+                    expected_hash: Some(hash),
+                    new_text: "    return 2\n".into(),
+                }],
+                confirm: false,
+                reason: None,
+                cites: None,
+            },
+        ));
+        let v = jv(no_confirm);
+        assert_eq!(
+            v["error"]["code"], "HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW",
+            "response: {v}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     // Parity test (FIX2/F2b, UPGRADE_PLAN.md), non-hub low-risk case:
     // gate_prediction must predict a FREE write, and the real gate must
     // agree (confirm:false still applies, no gate fires at all).
@@ -11486,6 +11736,7 @@ mod tests {
 
         let ctx = server.edit_context(rmcp::handler::server::wrapper::Parameters(
             EditContextParams {
+                qualified_name: None,
                 symbol: "helper".into(),
                 path: None,
                 line: None,
@@ -11585,6 +11836,7 @@ mod tests {
         // Satisfy layer 1.
         server.edit_context(rmcp::handler::server::wrapper::Parameters(
             EditContextParams {
+                qualified_name: None,
                 symbol: "mcp_tool_handler".into(),
                 path: None,
                 line: None,
@@ -11702,6 +11954,7 @@ mod tests {
 
         server.edit_context(rmcp::handler::server::wrapper::Parameters(
             EditContextParams {
+                qualified_name: None,
                 symbol: "mystery_fn".into(),
                 path: None,
                 line: None,
@@ -11765,6 +12018,7 @@ mod tests {
         }
         server.edit_context(rmcp::handler::server::wrapper::Parameters(
             EditContextParams {
+                qualified_name: None,
                 symbol: "mystery_fn".into(),
                 path: None,
                 line: None,
@@ -11838,6 +12092,7 @@ mod tests {
 
         server.edit_context(rmcp::handler::server::wrapper::Parameters(
             EditContextParams {
+                qualified_name: None,
                 symbol: "target".into(),
                 path: None,
                 line: None,
@@ -11913,6 +12168,7 @@ mod tests {
 
         server.edit_context(rmcp::handler::server::wrapper::Parameters(
             EditContextParams {
+                qualified_name: None,
                 symbol: "target".into(),
                 path: None,
                 line: None,
@@ -11981,6 +12237,7 @@ mod tests {
 
         server.edit_context(rmcp::handler::server::wrapper::Parameters(
             EditContextParams {
+                qualified_name: None,
                 symbol: "target".into(),
                 path: None,
                 line: None,
@@ -12054,6 +12311,7 @@ mod tests {
 
         server.edit_context(rmcp::handler::server::wrapper::Parameters(
             EditContextParams {
+                qualified_name: None,
                 symbol: "target".into(),
                 path: None,
                 line: None,
@@ -12116,6 +12374,7 @@ mod tests {
         }
         server.edit_context(rmcp::handler::server::wrapper::Parameters(
             EditContextParams {
+                qualified_name: None,
                 symbol: "helper".into(),
                 path: None,
                 line: None,
@@ -12244,6 +12503,7 @@ mod tests {
         }
         server.edit_context(rmcp::handler::server::wrapper::Parameters(
             EditContextParams {
+                qualified_name: None,
                 symbol: "helper".into(),
                 path: None,
                 line: None,
@@ -12349,6 +12609,7 @@ mod tests {
         }
         server.edit_context(rmcp::handler::server::wrapper::Parameters(
             EditContextParams {
+                qualified_name: None,
                 symbol: "helper".into(),
                 path: None,
                 line: None,
@@ -12435,6 +12696,7 @@ mod tests {
 
         let ctx_out = server.edit_context(rmcp::handler::server::wrapper::Parameters(
             EditContextParams {
+                qualified_name: None,
                 symbol: "helper".into(),
                 path: None,
                 line: None,
@@ -12452,6 +12714,7 @@ mod tests {
             .to_string();
 
         let params = EditSymbolParams {
+            qualified_name: None,
             change_id: Some(change_id),
             authority_id: Some(authority_id),
             symbol: "helper".into(),
@@ -12523,6 +12786,7 @@ mod tests {
         // one.
         let ctx_out = server.edit_context(rmcp::handler::server::wrapper::Parameters(
             EditContextParams {
+                qualified_name: None,
                 symbol: "check_token".into(),
                 path: None,
                 line: None,
@@ -12617,6 +12881,7 @@ mod tests {
 
         let ctx_out = server.edit_context(rmcp::handler::server::wrapper::Parameters(
             EditContextParams {
+                qualified_name: None,
                 symbol: "check_token".into(),
                 path: None,
                 line: None,
@@ -13164,6 +13429,7 @@ mod tests {
 
         server.edit_context(rmcp::handler::server::wrapper::Parameters(
             EditContextParams {
+                qualified_name: None,
                 symbol: "test_something".into(),
                 path: None,
                 line: None,
@@ -13242,6 +13508,7 @@ mod tests {
 
         server.edit_context(rmcp::handler::server::wrapper::Parameters(
             EditContextParams {
+                qualified_name: None,
                 symbol: "helper".into(),
                 path: None,
                 line: None,
@@ -13745,6 +14012,7 @@ mod tests {
 
         let out = server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
             EditSymbolParams {
+                qualified_name: None,
                 change_id: None,
                 authority_id: None,
                 symbol: "helper".into(),
@@ -13792,6 +14060,7 @@ mod tests {
 
         let out = server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
             EditSymbolParams {
+                qualified_name: None,
                 change_id: None,
                 authority_id: None,
                 symbol: "a".into(),
@@ -13833,6 +14102,7 @@ mod tests {
 
         let out = server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
             EditSymbolParams {
+                qualified_name: None,
                 change_id: None,
                 authority_id: None,
                 symbol: "a".into(),
@@ -13877,6 +14147,7 @@ mod tests {
 
         let out = server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
             EditSymbolParams {
+                qualified_name: None,
                 change_id: None,
                 authority_id: None,
                 symbol: "a".into(),
@@ -13925,6 +14196,7 @@ mod tests {
 
         let out = server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
             EditSymbolParams {
+                qualified_name: None,
                 change_id: None,
                 authority_id: None,
                 symbol: "a".into(),
@@ -13967,6 +14239,7 @@ mod tests {
 
         let out = server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
             EditSymbolParams {
+                qualified_name: None,
                 change_id: None,
                 authority_id: None,
                 symbol: "helper".into(),
@@ -14192,6 +14465,222 @@ mod tests {
     }
 
     #[test]
+    fn wave5_db_ambiguous_still_genuinely_ambiguous_after_live_verification() {
+        // 5.2 (Wave 5, Wave-1 residual): regression guard -- two DB
+        // candidates that are BOTH still live and both still match their
+        // own (name, kind, class_context) after re-parse must still report
+        // Ambiguous with exactly 2 entries, same as before this fix.
+        let (dir, server) = test_server("wave5_db_ambiguous_still_ambiguous");
+        std::fs::write(
+            dir.join("e.rs"),
+            "struct Baz;\nimpl Baz {\n    fn dup_method(&self) -> i64 {\n        1\n    }\n}\nstruct Qux;\nimpl Qux {\n    fn dup_method(&self) -> i64 {\n        2\n    }\n}\n",
+        )
+        .unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point, class_context)
+                 VALUES ('e.rs::Baz::dup_method', 'dup_method', 'method', 'rust', 'e.rs', 3, 5, '', '', 'dup_method', 0, 0, 0, 'Baz')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point, class_context)
+                 VALUES ('e.rs::Qux::dup_method', 'dup_method', 'method', 'rust', 'e.rs', 8, 10, '', '', 'dup_method', 0, 0, 0, 'Qux')",
+                [],
+            )
+            .unwrap();
+            // deliberate hash mismatch forces verify_live's slow (re-parse)
+            // path for each candidate.
+            conn.execute(
+                "INSERT INTO file_index (path, hash, language, symbol_count, last_indexed, mtime) \
+                 VALUES ('e.rs', 'deadbeef', 'rust', 2, 0.0, 0.0)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let out = server.source(rmcp::handler::server::wrapper::Parameters(SourceParams {
+            qualified_name: None,
+            symbol: Some("dup_method".into()),
+            path: None,
+            line: None,
+            end_line: None,
+            include_metadata: false,
+            line_numbers: false,
+            if_none_match: None,
+        }));
+        let v = jv(out);
+        assert_eq!(v["ambiguous"], true, "response: {v}");
+        assert_eq!(
+            v["total"], 2,
+            "both Baz::dup_method and Qux::dup_method are still live -- must stay ambiguous \
+             with both, not silently pick one: {v}"
+        );
+        let candidates = v["candidates"]
+            .as_array()
+            .expect("ambiguous response must carry a candidates array");
+        assert_eq!(candidates.len(), 2, "response: {v}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wave5_db_ambiguous_narrows_to_found_when_one_candidate_has_vanished() {
+        // 5.2 (Wave 5, Wave-1 residual): the actual payoff -- of two DB
+        // candidates, one (Bar::keep) has since been deleted from disk
+        // without a reindex. Live-verification must drop it and resolve
+        // uniquely to the survivor (Foo::keep), not report a stale
+        // Ambiguous that still lists a symbol which no longer exists.
+        let (dir, server) = test_server("wave5_db_ambiguous_one_vanished");
+        std::fs::write(
+            dir.join("f.rs"),
+            "struct Foo;\nimpl Foo {\n    fn keep(&self) -> i64 {\n        7\n    }\n}\n",
+        )
+        .unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point, class_context)
+                 VALUES ('f.rs::Foo::keep', 'keep', 'method', 'rust', 'f.rs', 3, 5, '', '', 'keep', 0, 0, 0, 'Foo')",
+                [],
+            )
+            .unwrap();
+            // Bar::keep is indexed but Bar no longer exists anywhere in the
+            // live file -- simulates a since-deleted duplicate.
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point, class_context)
+                 VALUES ('f.rs::Bar::keep', 'keep', 'method', 'rust', 'f.rs', 10, 12, '', '', 'keep', 0, 0, 0, 'Bar')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO file_index (path, hash, language, symbol_count, last_indexed, mtime) \
+                 VALUES ('f.rs', 'deadbeef', 'rust', 2, 0.0, 0.0)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let out = server.source(rmcp::handler::server::wrapper::Parameters(SourceParams {
+            qualified_name: None,
+            symbol: Some("keep".into()),
+            path: None,
+            line: None,
+            end_line: None,
+            include_metadata: false,
+            line_numbers: false,
+            if_none_match: None,
+        }));
+        let v = jv(out);
+        assert!(
+            v["error"].is_null(),
+            "must resolve uniquely once Bar::keep is dropped, not still report ambiguous/error: {v}"
+        );
+        let src = v["source"].as_str().unwrap_or_default();
+        assert!(
+            src.contains('7'),
+            "must be Foo::keep's live body (returns 7), got: {v}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wave5_db_ambiguous_reports_not_found_when_both_candidates_have_vanished() {
+        // 5.2 (Wave 5, Wave-1 residual): both DB candidates deleted from
+        // disk since indexing (the whole file was rewritten) -- must
+        // report NotFound, never a stale Ambiguous naming symbols that no
+        // longer exist, and never a read of unrelated bytes.
+        let (dir, server) = test_server("wave5_db_ambiguous_both_vanished");
+        std::fs::write(dir.join("g.rs"), "fn unrelated() -> i64 {\n    0\n}\n").unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point, class_context)
+                 VALUES ('g.rs::Foo::gone_a', 'gone_a', 'method', 'rust', 'g.rs', 1, 2, '', '', 'gone_a', 0, 0, 0, 'Foo')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point, class_context)
+                 VALUES ('g.rs::Bar::gone_a', 'gone_a', 'method', 'rust', 'g.rs', 4, 5, '', '', 'gone_a', 0, 0, 0, 'Bar')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO file_index (path, hash, language, symbol_count, last_indexed, mtime) \
+                 VALUES ('g.rs', 'deadbeef', 'rust', 2, 0.0, 0.0)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let out = server.source(rmcp::handler::server::wrapper::Parameters(SourceParams {
+            qualified_name: None,
+            symbol: Some("gone_a".into()),
+            path: None,
+            line: None,
+            end_line: None,
+            include_metadata: false,
+            line_numbers: false,
+            if_none_match: None,
+        }));
+        let v = jv(out);
+        assert_eq!(v["error"]["code"], "NOT_FOUND", "response: {v}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wave5_db_ambiguous_above_the_cap_skips_live_verification() {
+        // 5.2 (Wave 5): above MAX_LIVE_VERIFIED_CANDIDATES, resolve_symbol
+        // must degrade back to today's un-reverified Ambiguous rather than
+        // attempting O(many) file reads. Proven by pointing every candidate
+        // at a path with NO file_index row and a file that doesn't exist on
+        // disk: if verification were (wrongly) attempted, the very first
+        // candidate's read would fail and surface as ReadFailed, not a
+        // clean Ambiguous with all N candidates intact.
+        let (dir, server) = test_server("wave5_db_ambiguous_above_cap");
+        {
+            let conn = server.db();
+            for i in 0..21 {
+                conn.execute(
+                    &format!(
+                        "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                         VALUES ('missing{i}.rs::over_cap', 'over_cap', 'function', 'rust', 'missing{i}.rs', 1, 2, '', '', 'over_cap', 0, 0, 0)"
+                    ),
+                    [],
+                )
+                .unwrap();
+                // Deliberately NO file_index row and NO file on disk for
+                // any of these paths -- a real live-check attempt here
+                // would report ReadFailed, not a clean Ambiguous.
+            }
+        }
+
+        let out = server.source(rmcp::handler::server::wrapper::Parameters(SourceParams {
+            qualified_name: None,
+            symbol: Some("over_cap".into()),
+            path: None,
+            line: None,
+            end_line: None,
+            include_metadata: false,
+            line_numbers: false,
+            if_none_match: None,
+        }));
+        let v = jv(out);
+        assert_eq!(v["ambiguous"], true, "response: {v}");
+        assert_eq!(
+            v["total"], 21,
+            "above the cap, verification must be skipped and the true DB count preserved \
+             (display truncation is a separate, pre-existing concern): {v}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn qualified_name_resolves_uniquely_even_for_a_globally_common_bare_name() {
         // 2026-08-20 truth-kernel Wave 3 (P1-3), the DoD's literal ask: a
         // caller holding an exact qualified_name (e.g. from a prior `search`
@@ -14264,6 +14753,160 @@ mod tests {
             "response: {resolved}"
         );
         assert_eq!(resolved["path"], "src/b.rs", "response: {resolved}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_context_and_edit_symbol_resolve_uniquely_via_qualified_name_for_a_write_path_tie() {
+        // Wave 5, item 5.3 (truth-kernel-hardening plan): Wave 3.4 scoped
+        // real qualified_name wiring to the read-only tools only, deferring
+        // edit_context/edit_symbol pending confirmation the risk was
+        // actually lower than assumed. This is that DoD, mirrored from
+        // qualified_name_resolves_uniquely_even_for_a_globally_common_bare_name
+        // above but exercised through the two write-path tools instead.
+        let (dir, server) = test_server("qualified_name_write_path_never_ambiguous");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        let content_a = "fn new() -> i64 {\n    1\n}\n";
+        let content_b = "fn new() -> i64 {\n    2\n}\n";
+        std::fs::write(dir.join("src/a.rs"), content_a).unwrap();
+        std::fs::write(dir.join("src/b.rs"), content_b).unwrap();
+        let hash_a = calm_core::indexer::pipeline::hash_content(content_a);
+        let hash_b = calm_core::indexer::pipeline::hash_content(content_b);
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('src/a.rs::new', 'new', 'function', 'rust', 'src/a.rs', 1, 3, '', '', 'new', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('src/b.rs::new', 'new', 'function', 'rust', 'src/b.rs', 1, 3, '', '', 'new', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO file_index (path, hash, language, symbol_count, last_indexed, mtime) VALUES ('src/a.rs', ?1, 'rust', 1, 0.0, 0.0)",
+                rusqlite::params![hash_a],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO file_index (path, hash, language, symbol_count, last_indexed, mtime) VALUES ('src/b.rs', ?1, 'rust', 1, 0.0, 0.0)",
+                rusqlite::params![hash_b],
+            )
+            .unwrap();
+        }
+
+        // edit_context, qualified_name pointing at b.rs's "new": must
+        // resolve to b.rs's own body specifically, proven via
+        // range_checksum matching content_b's exact hash (not content_a's).
+        let ctx = jv(
+            server.edit_context(rmcp::handler::server::wrapper::Parameters(
+                EditContextParams {
+                    symbol: "new".into(),
+                    path: None,
+                    line: None,
+                    qualified_name: Some("src/b.rs::new".into()),
+                    if_none_match: None,
+                },
+            )),
+        );
+        assert!(ctx["error"].is_null(), "response: {ctx}");
+        assert_eq!(
+            ctx["range_checksum"],
+            calm_core::edit::range_checksum(content_b, 1, 3).unwrap(),
+            "must target src/b.rs::new specifically, not a.rs's tie: {ctx}"
+        );
+
+        // edit_symbol, same qualified_name: the actual write lands on
+        // b.rs's body, not a.rs's.
+        let out = jv(
+            server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
+                EditSymbolParams {
+                    symbol: "new".into(),
+                    path: None,
+                    line: None,
+                    qualified_name: Some("src/b.rs::new".into()),
+                    expected_hash: Some(calm_core::edit::range_checksum(content_b, 1, 3).unwrap()),
+                    new_text: "fn new() -> i64 {\n    99\n}\n".into(),
+                    position: None,
+                    confirm: false,
+                    reason: None,
+                    cites: None,
+                    old_text: None,
+                    change_id: None,
+                    authority_id: None,
+                },
+            )),
+        );
+        assert_eq!(out["applied"], true, "response: {out}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("src/b.rs")).unwrap(),
+            "fn new() -> i64 {\n    99\n}\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("src/a.rs")).unwrap(),
+            content_a,
+            "a.rs must be untouched -- the write must not have landed on the wrong tie"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_symbol_qualified_name_lookup_of_a_since_deleted_symbol_still_live_verifies() {
+        // Wave 5, item 5.3: mirrors wave1_deleted_symbol_reports_not_found_
+        // not_stale_bytes (P0-1g) and qualified_name_lookup_of_a_since_
+        // deleted_symbol_still_live_verifies (Wave 3.4), but for the
+        // write-path resolve_symbol call this wave newly wires up --
+        // proves it still goes through live-verification (NotFound), never
+        // a stale write to whatever now occupies the old range.
+        let (dir, server) = test_server("qualified_name_write_path_deleted_symbol");
+        std::fs::write(dir.join("d.rs"), "fn survivor() -> i64 {\n    1\n}\n").unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('d.rs::gone', 'gone', 'function', 'rust', 'd.rs', 1, 2, '', '', 'gone', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO file_index (path, hash, language, symbol_count, last_indexed, mtime) \
+                 VALUES ('d.rs', 'deadbeef', 'rust', 1, 0.0, 0.0)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let out = jv(
+            server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
+                EditSymbolParams {
+                    symbol: "gone".into(),
+                    path: None,
+                    line: None,
+                    qualified_name: Some("d.rs::gone".into()),
+                    expected_hash: None,
+                    new_text: "fn gone() -> i64 {\n    -1\n}\n".into(),
+                    position: None,
+                    confirm: false,
+                    reason: None,
+                    cites: None,
+                    old_text: None,
+                    change_id: None,
+                    authority_id: None,
+                },
+            )),
+        );
+        assert_eq!(out["error"]["code"], "NOT_FOUND", "response: {out}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("d.rs")).unwrap(),
+            "fn survivor() -> i64 {\n    1\n}\n",
+            "d.rs must be untouched -- a since-deleted qualified_name lookup must never write \
+             unrelated bytes"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -14395,6 +15038,7 @@ mod tests {
 
         let out = server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
             EditSymbolParams {
+                qualified_name: None,
                 change_id: None,
                 authority_id: None,
                 symbol: "helper".into(),
@@ -14446,6 +15090,7 @@ mod tests {
 
         let out = server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
             EditSymbolParams {
+                qualified_name: None,
                 change_id: None,
                 authority_id: None,
                 symbol: "helper".into(),
@@ -14507,6 +15152,7 @@ mod tests {
 
         let out = server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
             EditSymbolParams {
+                qualified_name: None,
                 change_id: None,
                 authority_id: None,
                 symbol: "helper".into(),
@@ -14552,6 +15198,7 @@ mod tests {
 
         let out = server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
             EditSymbolParams {
+                qualified_name: None,
                 change_id: None,
                 authority_id: None,
                 symbol: "helper".into(),
@@ -14597,6 +15244,7 @@ mod tests {
 
         let out = server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
             EditSymbolParams {
+                qualified_name: None,
                 change_id: None,
                 authority_id: None,
                 symbol: "a".into(),
@@ -14625,6 +15273,7 @@ mod tests {
 
         let out = server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
             EditSymbolParams {
+                qualified_name: None,
                 change_id: None,
                 authority_id: None,
                 symbol: "".into(),
@@ -14656,6 +15305,7 @@ mod tests {
 
         let out = server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
             EditSymbolParams {
+                qualified_name: None,
                 change_id: None,
                 authority_id: None,
                 symbol: "".into(),
@@ -14687,6 +15337,7 @@ mod tests {
 
         let out = server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
             EditSymbolParams {
+                qualified_name: None,
                 change_id: None,
                 authority_id: None,
                 symbol: "".into(),
@@ -15014,6 +15665,7 @@ mod tests {
         let v = jv(
             server.edit_context(rmcp::handler::server::wrapper::Parameters(
                 EditContextParams {
+                    qualified_name: None,
                     symbol: "foo".into(),
                     path: None,
                     line: None,
@@ -15066,6 +15718,7 @@ mod tests {
         let v = jv(
             server.edit_context(rmcp::handler::server::wrapper::Parameters(
                 EditContextParams {
+                    qualified_name: None,
                     symbol: "foo".into(),
                     path: None,
                     line: None,
@@ -15111,6 +15764,7 @@ mod tests {
         let v = jv(
             server.edit_context(rmcp::handler::server::wrapper::Parameters(
                 EditContextParams {
+                    qualified_name: None,
                     symbol: "foo".into(),
                     path: None,
                     line: None,
@@ -15153,6 +15807,7 @@ mod tests {
         let v = jv(
             server.edit_context(rmcp::handler::server::wrapper::Parameters(
                 EditContextParams {
+                    qualified_name: None,
                     symbol: "foo".into(),
                     path: None,
                     line: None,
@@ -15333,6 +15988,7 @@ mod tests {
 
         server.edit_context(rmcp::handler::server::wrapper::Parameters(
             EditContextParams {
+                qualified_name: None,
                 symbol: "helper".into(),
                 path: None,
                 line: None,
@@ -15347,6 +16003,7 @@ mod tests {
         let generic = jv(
             server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
                 EditSymbolParams {
+                    qualified_name: None,
                     change_id: None,
                     authority_id: None,
                     symbol: "helper".into(),
@@ -15375,6 +16032,7 @@ mod tests {
         let grounded = jv(
             server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
                 EditSymbolParams {
+                    qualified_name: None,
                     change_id: None,
                     authority_id: None,
                     symbol: "helper".into(),
@@ -15429,6 +16087,7 @@ mod tests {
 
         server.edit_context(rmcp::handler::server::wrapper::Parameters(
             EditContextParams {
+                qualified_name: None,
                 symbol: "helper".into(),
                 path: None,
                 line: None,
@@ -15442,6 +16101,7 @@ mod tests {
         let false_positive = jv(
             server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
                 EditSymbolParams {
+                    qualified_name: None,
                     change_id: None,
                     authority_id: None,
                     symbol: "helper".into(),
@@ -15466,6 +16126,7 @@ mod tests {
         let grounded = jv(
             server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
                 EditSymbolParams {
+                    qualified_name: None,
                     change_id: None,
                     authority_id: None,
                     symbol: "helper".into(),
@@ -15509,6 +16170,7 @@ mod tests {
 
         server.edit_context(rmcp::handler::server::wrapper::Parameters(
             EditContextParams {
+                qualified_name: None,
                 symbol: "helper".into(),
                 path: None,
                 line: None,
@@ -15522,6 +16184,7 @@ mod tests {
         let out = jv(
             server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
                 EditSymbolParams {
+                    qualified_name: None,
                     change_id: None,
                     authority_id: None,
                     symbol: "helper".into(),
@@ -15565,6 +16228,7 @@ mod tests {
 
         server.edit_context(rmcp::handler::server::wrapper::Parameters(
             EditContextParams {
+                qualified_name: None,
                 symbol: "helper".into(),
                 path: None,
                 line: None,
@@ -15580,6 +16244,7 @@ mod tests {
         let out = jv(
             server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
                 EditSymbolParams {
+                    qualified_name: None,
                     change_id: None,
                     authority_id: None,
                     symbol: "helper".into(),
@@ -15626,6 +16291,7 @@ mod tests {
 
         server.edit_context(rmcp::handler::server::wrapper::Parameters(
             EditContextParams {
+                qualified_name: None,
                 symbol: "helper".into(),
                 path: None,
                 line: None,
@@ -15641,6 +16307,7 @@ mod tests {
         let out = jv(
             server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
                 EditSymbolParams {
+                    qualified_name: None,
                     change_id: None,
                     authority_id: None,
                     symbol: "helper".into(),
@@ -15691,6 +16358,7 @@ mod tests {
 
         server.edit_context(rmcp::handler::server::wrapper::Parameters(
             EditContextParams {
+                qualified_name: None,
                 symbol: "helper".into(),
                 path: None,
                 line: None,
@@ -15704,6 +16372,7 @@ mod tests {
         let boundary = jv(
             server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
                 EditSymbolParams {
+                    qualified_name: None,
                     change_id: None,
                     authority_id: None,
                     symbol: "helper".into(),
@@ -15729,6 +16398,7 @@ mod tests {
         let grounded = jv(
             server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
                 EditSymbolParams {
+                    qualified_name: None,
                     change_id: None,
                     authority_id: None,
                     symbol: "helper".into(),
@@ -15779,6 +16449,7 @@ mod tests {
 
         server.edit_context(rmcp::handler::server::wrapper::Parameters(
             EditContextParams {
+                qualified_name: None,
                 symbol: "helper".into(),
                 path: None,
                 line: None,
@@ -15794,6 +16465,7 @@ mod tests {
         let bare_denied = jv(
             server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
                 EditSymbolParams {
+                    qualified_name: None,
                     change_id: None,
                     authority_id: None,
                     symbol: "helper".into(),
@@ -15818,6 +16490,7 @@ mod tests {
         let full_qn_passes = jv(
             server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
                 EditSymbolParams {
+                    qualified_name: None,
                     change_id: None,
                     authority_id: None,
                     symbol: "helper".into(),
@@ -15870,6 +16543,7 @@ mod tests {
 
         conn_a.edit_context(rmcp::handler::server::wrapper::Parameters(
             EditContextParams {
+                qualified_name: None,
                 symbol: "helper".into(),
                 path: None,
                 line: None,

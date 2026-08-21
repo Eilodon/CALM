@@ -586,6 +586,14 @@ pub(crate) enum SymbolResolution {
     ReadFailed(ErrorDetail),
 }
 
+// 5.2 (Wave 5, truth-kernel-hardening plan): resolve_symbol's cap on how
+// many DB-ambiguous candidates it will live-verify (one file read + hash
+// each) before degrading back to today's un-reverified Ambiguous. Matches
+// this crate's existing cap convention (callers/callees/skipped_files
+// truncate at a similar order of magnitude, always with the true count
+// preserved rather than silently dropped).
+const MAX_LIVE_VERIFIED_CANDIDATES: usize = 20;
+
 /// Resolve a bare symbol name (+ optional path, + optional disambiguating
 /// `line`) to exactly one row. `path` narrows the candidate set (see
 /// `resolve_symbol_candidates`) but does not by itself guarantee a unique
@@ -632,10 +640,34 @@ pub(crate) fn resolve_symbol(
     if candidates.is_empty() {
         return Ok(SymbolResolution::NotFound);
     }
-    if candidates.len() > 1 {
+    if candidates.len() == 1 {
+        return Ok(verify_live(conn, project_root, candidates.remove(0)));
+    }
+    // 5.2 (Wave 5, Wave-1 residual): a DB-ambiguous result is no longer
+    // trusted as-is -- each candidate is live-verified the same way a lone
+    // Found candidate always has been. A candidate that's vanished from
+    // disk since indexing no longer poisons the whole ambiguity; if
+    // verification narrows the set to exactly one survivor, this now
+    // returns Found instead of a stale Ambiguous.
+    if candidates.len() > MAX_LIVE_VERIFIED_CANDIDATES {
         return Ok(SymbolResolution::Ambiguous(candidates));
     }
-    Ok(verify_live(conn, project_root, candidates.remove(0)))
+    let mut still_live = Vec::with_capacity(candidates.len());
+    for c in candidates {
+        match verify_live(conn, project_root, c) {
+            SymbolResolution::Found(c) => still_live.push(*c),
+            SymbolResolution::NotFound => {}
+            // Fail closed: can't be sure of the whole set if even one
+            // candidate's live-check itself failed to read/re-parse.
+            SymbolResolution::ReadFailed(e) => return Ok(SymbolResolution::ReadFailed(e)),
+            SymbolResolution::Ambiguous(_) => unreachable!("verify_live never returns Ambiguous"),
+        }
+    }
+    match still_live.len() {
+        0 => Ok(SymbolResolution::NotFound),
+        1 => Ok(SymbolResolution::Found(Box::new(still_live.remove(0)))),
+        _ => Ok(SymbolResolution::Ambiguous(still_live)),
+    }
 }
 
 /// Live-verifies a single DB-resolved candidate against disk before

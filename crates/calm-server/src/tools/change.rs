@@ -664,6 +664,9 @@ impl CalmServer {
                                         &self.config().risk_rules,
                                         &[],
                                         &calm_core::policy::Policy::default(),
+                                        false, // Wave 5, 5.1b: no live diff exists yet
+                                               // at review_change time (see comment
+                                               // above this block)
                                     );
                                 uncertain_zero_caller = sym_uncertain.is_some();
                             }

@@ -447,7 +447,7 @@ pub fn insertion_hunk(
 /// is explicitly meant to also work on files the indexer never parses.
 pub fn validate_syntax(new_content: &str, extension: &str) -> Option<bool> {
     let language = language_for_extension(extension)?;
-    let tree = parse_tree(new_content, language)?;
+    let tree = parse_tree(new_content, language).ok()?;
     Some(!tree.root_node().has_error())
 }
 
@@ -526,7 +526,7 @@ pub fn validate_syntax_diff(
     touched_new_lines: &[(i64, i64)],
 ) -> Option<bool> {
     let language = language_for_extension(extension)?;
-    let new_tree = parse_tree(new_content, language)?;
+    let new_tree = parse_tree(new_content, language).ok()?;
     let mut new_errors = Vec::new();
     collect_error_line_ranges(new_tree.root_node(), &mut new_errors);
     if new_errors.is_empty() {
@@ -549,7 +549,7 @@ pub fn validate_syntax_diff(
         return Some(false);
     }
 
-    let original_errors_all = parse_tree(original, language).map(|t| {
+    let original_errors_all = parse_tree(original, language).ok().map(|t| {
         let mut v = Vec::new();
         collect_error_line_ranges(t.root_node(), &mut v);
         v

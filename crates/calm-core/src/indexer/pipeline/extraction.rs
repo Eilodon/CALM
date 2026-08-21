@@ -151,9 +151,18 @@ pub(super) fn extract_file_data(
         };
     }
 
-    let Some(tree) = parse_tree(source, lang) else {
-        // Tier-0.5: no tree-sitter grammar for this language — extract symbols
+    let Ok(tree) = parse_tree(source, lang) else {
+        // Tier-0.5: no tree-sitter grammar for this language -- extract symbols
         // via lightweight line-scan (no calls, no imports, no resolver tiers).
+        // Wave 5 item 5.7: the `ParseFailure` reason (unsupported language /
+        // ABI mismatch / timeout) is deliberately discarded here, not threaded
+        // into `file_index.skip_reason` the way `read_source_capped`'s failure
+        // is (see `driver.rs`'s `WalkOutcome::Skipped`) -- this path is NOT a
+        // skip. It still produces a populated `ExtractedFile` below (real
+        // symbols, just via a lower-fidelity extractor), so writing a
+        // `skip_reason` here would falsely claim this file has nothing, the
+        // exact meaning that column already carries for a genuinely-empty
+        // `file_index` row elsewhere in the pipeline.
         let symbols = extract_symbols_shallow(source, lang, rel);
         let symbol_count = symbols.len();
         let chunks = chunk_pending(source, &symbols);
