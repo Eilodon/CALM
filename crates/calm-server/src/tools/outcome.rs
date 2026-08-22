@@ -162,31 +162,54 @@ fn classify_error_state(code: &str, recoverable: bool) -> &'static str {
         // substitutes for that.
         "HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW"
         | "CONFIRM_REQUIRED"
-        | "REASON_NOT_GROUNDED"
         | "APPROVAL_REQUIRED"
         | "INDEPENDENT_REVIEW_NOT_AVAILABLE_HERE"
         | "ELICITATION_PENDING"
         | "ELICITATION_TIMEOUT"
         | "ELICITATION_FAILED"
         | "AGENT_RELAY_DISABLED"
-        | "USER_DECLINED"
-        | "REVIEW_ALREADY_DECIDED"
-        | "DIFF_DIGEST_MISMATCH" => "needs_human_review",
+        | "REVIEW_ALREADY_DECIDED" => "needs_human_review",
+
+        // The human side of this already happened -- a real reviewer
+        // declined, or forged/tampered evidence was caught. Retrying,
+        // gathering context, or asking for review again is not the fix;
+        // audit follow-up (2026-08-23) moved USER_DECLINED here from
+        // needs_human_review (its own message says "do not retry ...
+        // let them decide", which is a hard stop, not a pending review)
+        // and added AUTHORITY_FORGED_SIGNATURE (a security-relevant
+        // refusal, not a param the caller can just fix).
+        "USER_DECLINED" | "AUTHORITY_FORGED_SIGNATURE" => "blocked",
 
         // Evidence/authority this call relied on is stale, unconfirmed, or
         // has drifted since it was gathered -- re-derive fresh state
         // (re-run edit_context, re-mint, re-check), not a blind retry.
+        // Audit follow-up (2026-08-23): DIFF_DIGEST_MISMATCH moved here
+        // from needs_human_review -- its own message says "fetch it fresh
+        // ... and echo hash_content of THAT exact text", a caller-side
+        // refetch-and-recompute action, not a human decision. The
+        // AUTHORITY_STALE_* family below are the same AuthorityError
+        // variants STALE_GRAPH_AUTHORITY/STALE_CALLER_SET already sit
+        // next to, just reached via a different call site (edit.rs's
+        // AuthorityError match, not classify_gate's own staleness checks)
+        // -- they were previously falling through to the `recoverable`
+        // default below, which is unlabeled and easy to lose track of.
         "STALE_GRAPH_AUTHORITY"
         | "STALE_CALLER_SET"
         | "STALE_SYMBOL"
         | "STALE_AMBIGUOUS"
         | "AUTHORITY_SNAPSHOT_CHECK_FAILED"
         | "AUTHORITY_SNAPSHOT_DEGRADED_SINCE_MINT"
+        | "AUTHORITY_STALE_SNAPSHOT"
+        | "AUTHORITY_STALE_ANALYSIS_VERSION"
+        | "AUTHORITY_STALE_POLICY"
+        | "AUTHORITY_STALE_RISK_VECTOR"
+        | "AUTHORITY_STALE_POLICY_DECISION"
         | "EVIDENCE_NOT_FRESH"
         | "VERIFICATION_SNAPSHOT_CHANGED"
         | "VERIFICATION_SNAPSHOT_UNREADABLE"
         | "INTENT_SUPERSEDED"
         | "UNCERTAIN_ZERO_CALLER"
+        | "DIFF_DIGEST_MISMATCH"
         | "FITNESS_CHECK_FAILED" => "needs_verification",
 
         // Hard stop: an infra failure, a security/containment boundary, or
@@ -200,7 +223,6 @@ fn classify_error_state(code: &str, recoverable: bool) -> &'static str {
         | "READ_FAILED"
         | "WRITE_FAILED"
         | "FILE_NOT_READABLE"
-        | "PARSE_ERROR"
         | "REPARSE_FAILED"
         | "SNAPSHOT_ERROR"
         | "CARGO_SPAWN_FAILED"
@@ -220,8 +242,26 @@ fn classify_error_state(code: &str, recoverable: bool) -> &'static str {
         // The majority bucket: malformed/incomplete params, an unresolved
         // or ambiguous name, or a lookup that needs a different query --
         // fixable by the caller supplying more/different input and calling
-        // again, no review or fresh-evidence round-trip needed.
+        // again, no review or fresh-evidence round-trip needed. Audit
+        // follow-up (2026-08-23): PARSE_ERROR moved here from blocked (its
+        // own message says "nothing written", i.e. the caller just needs
+        // to fix the proposed content and resubmit) and REASON_NOT_GROUNDED
+        // moved here from needs_human_review (its own message tells the
+        // caller exactly which param to fix -- `cites`/`reason` -- not a
+        // human decision). The AUTHORITY_* family below are AuthorityError
+        // variants (edit.rs's authority match) that fell through to the
+        // `recoverable` default before this audit -- each is fixable by
+        // the caller re-deriving/re-minting the right authority, same as
+        // the existing STALE_SYMBOL-style entries above, just not stale
+        // evidence specifically (a wrong/expired/consumed/mismatched-scope
+        // authority instead).
         "AMBIGUOUS_MATCH"
+        | "AUTHORITY_ALREADY_CONSUMED"
+        | "AUTHORITY_EXPIRED"
+        | "AUTHORITY_NOT_FOUND"
+        | "AUTHORITY_WRONG_INTENT"
+        | "AUTHORITY_WRONG_PRINCIPAL"
+        | "AUTHORITY_WRONG_TARGET_SCOPE"
         | "BOUNDARY_AMBIGUOUS"
         | "CHANGE_NOT_FOUND"
         | "INVALID_AUTHORITY_PARAMS"
@@ -239,8 +279,10 @@ fn classify_error_state(code: &str, recoverable: bool) -> &'static str {
         | "NO_CARGO_MANIFEST"
         | "NO_TARGETS"
         | "ORIENTATION_REQUIRED"
+        | "PARSE_ERROR"
         | "PATH_REQUIRED"
         | "PATH_RESOLUTION_FAILED"
+        | "REASON_NOT_GROUNDED"
         | "REVIEW_NOT_FOUND"
         | "TARGETS_REQUIRED"
         | "TX_NOT_FOUND"
@@ -969,4 +1011,55 @@ pub(crate) fn match_live_symbol<'a>(
             s.name == name && s.kind.as_str() == kind && s.class_context.as_deref() == class_context
         })
         .collect()
+}
+
+#[cfg(test)]
+mod classify_error_state_tests {
+    use super::classify_error_state;
+
+    // Wave 2 (audit follow-up, 2026-08-23): the 12 AuthorityError-derived
+    // codes (edit.rs's `AE` match) that used to fall through to the
+    // generic `recoverable` default -- each now has an explicit,
+    // semantics-matched bucket.
+    #[test]
+    fn authority_error_codes_are_explicitly_classified() {
+        let cases: &[(&str, &str)] = &[
+            ("AUTHORITY_FORGED_SIGNATURE", "blocked"),
+            ("AUTHORITY_NOT_FOUND", "needs_context"),
+            ("AUTHORITY_EXPIRED", "needs_context"),
+            ("AUTHORITY_ALREADY_CONSUMED", "needs_context"),
+            ("AUTHORITY_WRONG_INTENT", "needs_context"),
+            ("AUTHORITY_WRONG_TARGET_SCOPE", "needs_context"),
+            ("AUTHORITY_WRONG_PRINCIPAL", "needs_context"),
+            ("AUTHORITY_STALE_SNAPSHOT", "needs_verification"),
+            ("AUTHORITY_STALE_ANALYSIS_VERSION", "needs_verification"),
+            ("AUTHORITY_STALE_POLICY", "needs_verification"),
+            ("AUTHORITY_STALE_RISK_VECTOR", "needs_verification"),
+            ("AUTHORITY_STALE_POLICY_DECISION", "needs_verification"),
+        ];
+        for (code, expected) in cases {
+            assert_eq!(
+                classify_error_state(code, true),
+                *expected,
+                "code {code} should classify as {expected}"
+            );
+        }
+    }
+
+    // Wave 2: 4 codes whose own error message contradicted their previous
+    // bucket -- see each arm's own doc comment in classify_error_state for
+    // the message quoted as evidence.
+    #[test]
+    fn previously_mismapped_codes_now_match_their_own_message() {
+        assert_eq!(classify_error_state("PARSE_ERROR", true), "needs_context");
+        assert_eq!(
+            classify_error_state("REASON_NOT_GROUNDED", true),
+            "needs_context"
+        );
+        assert_eq!(
+            classify_error_state("DIFF_DIGEST_MISMATCH", true),
+            "needs_verification"
+        );
+        assert_eq!(classify_error_state("USER_DECLINED", false), "blocked");
+    }
 }
