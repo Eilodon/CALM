@@ -13527,6 +13527,107 @@ mod tests {
     }
 
     #[test]
+    fn high_risk_refusal_carries_review_packet_and_agent_relay_can_approve_using_it() {
+        // Wave 3 (audit follow-up, 2026-08-23): the caller must never have
+        // to read pending_reviews or reimplement hash_content itself --
+        // this test copies review_id/diff_digest VERBATIM from the refusal
+        // response and hands them straight to review_decide_via_agent_relay.
+        let (dir, server) = test_server("high_risk_review_packet_relay");
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"edit": {"elicit_via_agent_relay": true}}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("a.py"), "def helper():\n    return 1\n").unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.py::helper', 'helper', 'function', 'python', 'a.py', 1, 2, '', '', 'helper', 11, 0, 0)",
+                [],
+            )
+            .unwrap();
+        }
+        server.edit_context(rmcp::handler::server::wrapper::Parameters(
+            EditContextParams {
+                qualified_name: None,
+                symbol: Some("helper".into()),
+                end_line: None,
+                path: None,
+                line: None,
+                if_none_match: None,
+            },
+        ));
+        let hash = calm_core::edit::range_checksum("def helper():\n    return 1\n", 2, 2).unwrap();
+        let params = EditLinesParams {
+            change_id: None,
+            authority_id: None,
+            path: "a.py".into(),
+            edits: vec![EditHunkParam {
+                old_text: None,
+                start_line: 2,
+                end_line: 2,
+                expected_hash: Some(hash),
+                new_text: "    return 2\n".into(),
+            }],
+            confirm: true,
+            reason: Some("checked -- safe, no elicitation available in this environment".into()),
+            cites: None,
+        };
+
+        use super::edit::ElicitGate;
+        let mut ask = None;
+        let first = server.edit_lines_flow(&params, ElicitGate::Off, &mut ask);
+        let v = serde_json::to_value(&first).unwrap();
+        assert_eq!(
+            v["error"]["code"], "HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW",
+            "response: {v}"
+        );
+        let review_id = v["error"]["review"]["review_id"]
+            .as_str()
+            .expect("review.review_id present")
+            .to_string();
+        let diff_digest = v["error"]["review"]["diff_digest"]
+            .as_str()
+            .expect("review.diff_digest present")
+            .to_string();
+        assert!(
+            v["error"]["review"]["diff_preview"]
+                .as_str()
+                .unwrap()
+                .contains("return 2"),
+            "response: {v}"
+        );
+        assert_eq!(
+            v["error"]["next_call"]["tool"], "review_decide_via_agent_relay",
+            "response: {v}"
+        );
+        assert_eq!(v["error"]["next_call"]["args"]["review_id"], review_id);
+        assert_eq!(v["error"]["next_call"]["args"]["diff_digest"], diff_digest);
+
+        // Relay-approve using ONLY what the refusal response handed back --
+        // no read of pending_reviews, no local hash_content call.
+        let decide = jv(server.review_decide_via_agent_relay(
+            rmcp::handler::server::wrapper::Parameters(ReviewDecideParams {
+                review_id: review_id.clone(),
+                diff_digest,
+                approve: true,
+            }),
+        ));
+        assert_eq!(decide["status"], "approved", "response: {decide}");
+
+        let second = server.edit_lines_flow(&params, ElicitGate::Off, &mut None);
+        let v2 = serde_json::to_value(&second).unwrap();
+        assert_eq!(v2["applied"], true, "response: {v2}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.py")).unwrap(),
+            "def helper():\n    return 2\n"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn high_risk_edit_can_pass_via_elicitation_ask_then_approved() {
         use super::edit::{ElicitGate, HubAskContext};
         // Same fixture as the Off-gate test above, exercised through

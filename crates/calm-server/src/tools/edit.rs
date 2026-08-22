@@ -1829,6 +1829,13 @@ impl CalmServer {
                 // Open (or reuse an existing pending) review row -- de-duped by
                 // (path, fingerprint) so an agent retrying the same refused edit
                 // doesn't spawn a fresh row, and hence a fresh review_id, every time.
+                // Wave 3 (audit follow-up, 2026-08-23): keep the full
+                // PendingReview row (not just its id) so the error below can
+                // attach a structured `review` packet + `next_call` via
+                // `ErrorDetail::with_review` -- an agent no longer has to
+                // read pending_reviews or hash_content itself to relay a
+                // decision. `review_hint` stays as the human-facing CLI text.
+                let mut pending_for_packet: Option<calm_core::authority::PendingReview> = None;
                 let review_hint = match calm_core::db::conn::open_state_writer(&self.state_db_path)
                 {
                     Ok(state_conn) => {
@@ -1841,8 +1848,8 @@ impl CalmServer {
                             rows.into_iter()
                                 .find(|r| r.path == path && r.fingerprint == review_fingerprint)
                         });
-                        let review_id = match existing {
-                            Some(r) => Some(r.review_id),
+                        let pending = match existing {
+                            Some(r) => Some(r),
                             None => {
                                 let diff_preview = diff_preview_for_hunks(&outcome.results, &hunks);
                                 let tool_name = if anchor_qualified_name.is_some() {
@@ -1865,28 +1872,41 @@ impl CalmServer {
                                     },
                                 )
                                 .ok()
+                                .and_then(|id| {
+                                    calm_core::authority::get_pending_review(&state_conn, &id)
+                                        .ok()
+                                        .flatten()
+                                })
                             }
                         };
-                        match review_id {
-                            Some(id) => format!(
+                        let hint = match &pending {
+                            Some(p) => format!(
                                 " A human can independently review this out-of-band: run \
-                                 `calm review show {id}` in a terminal in this project to see \
-                                 exactly what's proposed, then `calm review approve {id}` (or \
-                                 `decline`)."
+                                 `calm review show {}` in a terminal in this project to see \
+                                 exactly what's proposed, then `calm review approve {}` (or \
+                                 `decline`).",
+                                p.review_id, p.review_id
                             ),
                             None => String::new(),
-                        }
+                        };
+                        pending_for_packet = pending;
+                        hint
                     }
                     Err(_) => String::new(),
                 };
-                return ToolOutcome::error(error_detail(
+                let detail = error_detail(
                     "HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW",
                     &format!(
                         "this symbol is \"high\" risk -- neither a spent ReviewAuthority nor a \
                          cited reason is independent review at this tier. {remediation}{review_hint}"
                     ),
                     true,
-                ));
+                );
+                let detail = match &pending_for_packet {
+                    Some(p) => detail.with_review(p),
+                    None => detail,
+                };
+                return ToolOutcome::error(detail);
             }
         }
         if !authority_already_validated && gate_classification.will_block_without_confirm {
@@ -3212,14 +3232,29 @@ impl CalmServer {
                     ),
                     false,
                 )),
-                Ok(Outcome::DigestMismatch) => ToolOutcome::error(error_detail(
-                    "DIFF_DIGEST_MISMATCH",
-                    "the echoed diff_digest does not match this review's actual current \
-                     diff_preview -- fetch it fresh (get_pending_review's diff_preview, or `calm \
-                     review show`) and echo hash_content of THAT exact text; do not guess or \
-                     reuse a stale digest",
-                    true,
-                )),
+                Ok(Outcome::DigestMismatch) => {
+                    // Wave 3 (audit follow-up, 2026-08-23): attach the
+                    // review's CURRENT diff_preview/diff_digest directly --
+                    // the caller never has to read pending_reviews or the
+                    // CLI to recover from this, just retry with the
+                    // review/next_call fields from this exact response.
+                    let detail = error_detail(
+                        "DIFF_DIGEST_MISMATCH",
+                        "the echoed diff_digest does not match this review's actual current \
+                         diff_preview -- this response's own `review.diff_digest` is the \
+                         correct current value; echo it back verbatim (or use `next_call`), do \
+                         not guess or reuse a stale digest",
+                        true,
+                    );
+                    let fresh = calm_core::authority::get_pending_review(&conn, &p.review_id)
+                        .ok()
+                        .flatten();
+                    let detail = match &fresh {
+                        Some(r) => detail.with_review(r),
+                        None => detail,
+                    };
+                    ToolOutcome::error(detail)
+                }
                 Ok(Outcome::Race) => ToolOutcome::error(error_detail(
                     "REVIEW_ALREADY_DECIDED",
                     "the review was decided or expired between the check above and this write \

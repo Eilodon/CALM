@@ -93,11 +93,7 @@ pub(crate) fn filter_suggested_next(
 /// Typed `{"error": {"code","message","recoverable"}}` envelope.
 pub(crate) fn error_output(code: &str, message: &str, recoverable: bool) -> ErrorOutput {
     ErrorOutput {
-        error: ErrorDetail {
-            code: code.into(),
-            message: message.into(),
-            recoverable,
-        },
+        error: error_detail(code, message, recoverable),
     }
 }
 
@@ -106,11 +102,52 @@ pub(crate) struct ErrorOutput {
     pub(crate) error: ErrorDetail,
 }
 
+/// Wave 3 (audit follow-up, 2026-08-23): the structured shape of a
+/// `HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW`/`DIFF_DIGEST_MISMATCH` error's
+/// `review` field -- lets a calling agent relay-approve/decline without
+/// ever reading `pending_reviews` directly or reimplementing
+/// `hash_content` itself. `diff_digest` is always `hash_content(&diff_preview)`,
+/// computed server-side at the moment this packet is built -- never a
+/// value the caller supplied or guessed.
+#[derive(Serialize, JsonSchema)]
+pub(crate) struct PendingReviewPacket {
+    pub(crate) review_id: String,
+    pub(crate) diff_preview: String,
+    pub(crate) diff_digest: String,
+    pub(crate) expires_at: f64,
+}
+
+impl PendingReviewPacket {
+    pub(crate) fn from_pending(review: &calm_core::authority::PendingReview) -> Self {
+        let diff_digest = calm_core::indexer::pipeline::hash_content(&review.diff_preview);
+        PendingReviewPacket {
+            review_id: review.review_id.clone(),
+            diff_preview: review.diff_preview.clone(),
+            diff_digest,
+            expires_at: review.expires_at,
+        }
+    }
+}
+
 #[derive(Serialize, JsonSchema)]
 pub(crate) struct ErrorDetail {
     pub(crate) code: String,
     pub(crate) message: String,
     pub(crate) recoverable: bool,
+    /// Wave 3: set only on `HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW` (the
+    /// initial refusal) and `DIFF_DIGEST_MISMATCH` (the refetch-and-retry
+    /// case) -- everything an agent needs to relay-approve/decline via
+    /// `review_decide_via_agent_relay` without a separate read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) review: Option<Box<PendingReviewPacket>>,
+    /// Wave 3: the exact next tool call this error implies, when there is
+    /// one unambiguous next step -- reuses `SuggestedNext` so a caller
+    /// already handling `suggested_next` elsewhere needs no new shape.
+    /// Boxed (like `review` above) so this rarely-populated pair doesn't
+    /// inflate every `ErrorDetail`/`Result<_, ErrorDetail>` on the hot,
+    /// common path -- clippy's `result_large_err` flagged the unboxed form.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) next_call: Option<Box<SuggestedNext>>,
 }
 
 /// Typed not-found envelope for `ResolvedOutcome::not_found`.
@@ -124,12 +161,39 @@ pub(crate) fn not_found_error(symbol: &str) -> ErrorOutput {
 
 /// Typed `{"error": {"code": "DB_ERROR", ...}}` for the read-connection
 /// failure every read-only tool guards against. All tools now emit this
-/// shape via `ToolOutcome::error` / `ResolvedOutcome::error`.
+/// shape via `ToolOutcome::error` / `ResolvedOutcome::error`. `review`/
+/// `next_call` default to `None` -- use `ErrorDetail::with_review` to
+/// attach them at the 2 call sites that have a real pending review.
 pub(crate) fn error_detail(code: &str, message: &str, recoverable: bool) -> ErrorDetail {
     ErrorDetail {
         code: code.into(),
         message: message.into(),
         recoverable,
+        review: None,
+        next_call: None,
+    }
+}
+
+impl ErrorDetail {
+    /// Wave 3: attaches a structured review packet + the exact next call
+    /// (`review_decide_via_agent_relay` with `review_id` prefilled) to an
+    /// already-built `ErrorDetail` -- chains onto `error_detail(...)` at
+    /// the `HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW`/`DIFF_DIGEST_MISMATCH`
+    /// call sites only.
+    pub(crate) fn with_review(mut self, review: &calm_core::authority::PendingReview) -> Self {
+        let packet = PendingReviewPacket::from_pending(review);
+        self.next_call = suggested_with_args(
+            "review_decide_via_agent_relay",
+            "Relay this review's approve/decline decision -- diff_digest is already the \
+             correct current value, echo it back verbatim",
+            serde_json::json!({
+                "review_id": packet.review_id,
+                "diff_digest": packet.diff_digest,
+            }),
+        )
+        .map(Box::new);
+        self.review = Some(Box::new(packet));
+        self
     }
 }
 

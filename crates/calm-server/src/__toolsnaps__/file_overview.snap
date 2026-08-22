@@ -28,12 +28,82 @@
           },
           "recoverable": {
             "type": "boolean"
+          },
+          "review": {
+            "description": "Wave 3: set only on `HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW` (the\ninitial refusal) and `DIFF_DIGEST_MISMATCH` (the refetch-and-retry\ncase) -- everything an agent needs to relay-approve/decline via\n`review_decide_via_agent_relay` without a separate read.",
+            "anyOf": [
+              {
+                "$ref": "#/$defs/PendingReviewPacket"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "next_call": {
+            "description": "Wave 3: the exact next tool call this error implies, when there is\none unambiguous next step -- reuses `SuggestedNext` so a caller\nalready handling `suggested_next` elsewhere needs no new shape.\nBoxed (like `review` above) so this rarely-populated pair doesn't\ninflate every `ErrorDetail`/`Result<_, ErrorDetail>` on the hot,\ncommon path -- clippy's `result_large_err` flagged the unboxed form.",
+            "anyOf": [
+              {
+                "$ref": "#/$defs/SuggestedNext"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": [
           "code",
           "message",
           "recoverable"
+        ]
+      },
+      "PendingReviewPacket": {
+        "description": "Wave 3 (audit follow-up, 2026-08-23): the structured shape of a\n`HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW`/`DIFF_DIGEST_MISMATCH` error's\n`review` field -- lets a calling agent relay-approve/decline without\never reading `pending_reviews` directly or reimplementing\n`hash_content` itself. `diff_digest` is always `hash_content(&diff_preview)`,\ncomputed server-side at the moment this packet is built -- never a\nvalue the caller supplied or guessed.",
+        "type": "object",
+        "properties": {
+          "review_id": {
+            "type": "string"
+          },
+          "diff_preview": {
+            "type": "string"
+          },
+          "diff_digest": {
+            "type": "string"
+          },
+          "expires_at": {
+            "type": "number",
+            "format": "double"
+          }
+        },
+        "required": [
+          "review_id",
+          "diff_preview",
+          "diff_digest",
+          "expires_at"
+        ]
+      },
+      "SuggestedNext": {
+        "type": "object",
+        "properties": {
+          "tool": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "args": true,
+          "gate": {
+            "description": "Plan 3 §3.5(b): `Some(true)` iff skipping `tool` is actually\nhook-enforced (currently only the edit_context/edit_lines/edit_symbol\n→ diff_impact hints set this, via `suggested_gated`) — every other\nhint is left unset (`None`), meaning advisory-only. Lets an agent\ntell \"you'll be blocked if you skip this\" apart from \"you probably\nwant this next\" without re-deriving it from AGENTS.md prose each time.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "tool",
+          "reason"
         ]
       },
       "FileOverviewSymbol": {
@@ -76,29 +146,6 @@
           "caller_count",
           "is_hub",
           "signature"
-        ]
-      },
-      "SuggestedNext": {
-        "type": "object",
-        "properties": {
-          "tool": {
-            "type": "string"
-          },
-          "reason": {
-            "type": "string"
-          },
-          "args": true,
-          "gate": {
-            "description": "Plan 3 §3.5(b): `Some(true)` iff skipping `tool` is actually\nhook-enforced (currently only the edit_context/edit_lines/edit_symbol\n→ diff_impact hints set this, via `suggested_gated`) — every other\nhint is left unset (`None`), meaning advisory-only. Lets an agent\ntell \"you'll be blocked if you skip this\" apart from \"you probably\nwant this next\" without re-deriving it from AGENTS.md prose each time.",
-            "type": [
-              "boolean",
-              "null"
-            ]
-          }
-        },
-        "required": [
-          "tool",
-          "reason"
         ]
       }
     },
