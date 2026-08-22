@@ -6616,7 +6616,7 @@ mod tests {
                 if_none_match: None,
             })),
         );
-        assert_eq!(ok["state"], "ready", "response: {ok}");
+        assert_eq!(ok["flow_state"], "ready", "response: {ok}");
 
         let bad = jv(
             server.source(rmcp::handler::server::wrapper::Parameters(SourceParams {
@@ -6634,7 +6634,7 @@ mod tests {
         );
         assert_eq!(bad["error"]["code"], "INVALID_PARAMS");
         assert_eq!(
-            bad["state"], "needs_context",
+            bad["flow_state"], "needs_context",
             "an INVALID_PARAMS error is caller-fixable, not a hard stop: {bad}"
         );
 
@@ -14812,6 +14812,18 @@ mod tests {
         })));
         assert_eq!(out["applied"], true, "response: {out}");
         let tx_id = out["tx_id"].as_str().expect("tx_id present").to_string();
+        // Wave 1b (audit follow-up, 2026-08-23): a transaction parked at
+        // VerifyPending must point the caller at verify_change, not
+        // diff_impact -- diff_impact has nothing to do with an unresolved
+        // verification.
+        assert_eq!(
+            out["suggested_next"]["tool"], "verify_change",
+            "response: {out}"
+        );
+        assert_eq!(
+            out["suggested_next"]["args"]["tx_id"], tx_id,
+            "response: {out}"
+        );
 
         let status = jv(
             server.edit_transaction_status(Parameters(EditTransactionStatusParams {

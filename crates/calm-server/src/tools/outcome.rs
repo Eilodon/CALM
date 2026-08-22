@@ -296,7 +296,18 @@ pub(crate) struct ToolOutcome<T> {
     /// Lets an agent dispatch on ONE top-level field instead of
     /// maintaining its own per-`code` remediation table across ~70
     /// distinct codes.
-    pub(crate) state: &'static str,
+    ///
+    /// Named `flow_state`, not the more obvious `state` (audit follow-up,
+    /// 2026-08-23): several tool-specific success structs (e.g.
+    /// `EditTransactionStatusOutput`, `VerifyChangeOutput` in txn.rs) have
+    /// their own unrelated `state` field, and this struct's `success: T` is
+    /// `#[serde(flatten)]`ed -- a same-named field there would silently
+    /// serialize as a SECOND `"state"` JSON key (serde's flatten writes
+    /// each field independently; nothing dedupes it), with most JSON
+    /// parsers then last-write-wins-ing over whichever value serialized
+    /// second. `flow_state` is deliberately namespaced so no domain output
+    /// struct will ever pick the same name by coincidence again.
+    pub(crate) flow_state: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<ErrorDetail>,
     #[serde(flatten, skip_serializing_if = "Option::is_none")]
@@ -305,9 +316,9 @@ pub(crate) struct ToolOutcome<T> {
 
 impl<T> ToolOutcome<T> {
     pub(crate) fn error(detail: ErrorDetail) -> Self {
-        let state = classify_error_state(&detail.code, detail.recoverable);
+        let flow_state = classify_error_state(&detail.code, detail.recoverable);
         ToolOutcome {
-            state,
+            flow_state,
             error: Some(detail),
             success: None,
         }
@@ -315,7 +326,7 @@ impl<T> ToolOutcome<T> {
 
     pub(crate) fn success(value: T) -> Self {
         ToolOutcome {
-            state: "ready",
+            flow_state: "ready",
             error: None,
             success: Some(value),
         }
@@ -469,11 +480,12 @@ impl Caveat {
 /// root-`type:object` reasoning as `ToolOutcome<T>` above.
 #[derive(Serialize, JsonSchema)]
 pub(crate) struct ResolvedOutcome<T> {
-    /// See `ToolOutcome::state`'s own doc comment -- same contract, plus
+    /// See `ToolOutcome::flow_state`'s own doc comment -- same contract
+    /// (including why it's named `flow_state`, not `state`), plus
     /// `ambiguous`/`not_found` both map onto `needs_context` (the caller
     /// needs one more piece of information: which candidate, or a
     /// different query).
-    pub(crate) state: &'static str,
+    pub(crate) flow_state: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<ErrorDetail>,
     #[serde(flatten, skip_serializing_if = "Option::is_none")]
@@ -489,9 +501,9 @@ pub(crate) struct ResolvedOutcome<T> {
 
 impl<T> ResolvedOutcome<T> {
     pub(crate) fn error(detail: ErrorDetail) -> Self {
-        let state = classify_error_state(&detail.code, detail.recoverable);
+        let flow_state = classify_error_state(&detail.code, detail.recoverable);
         ResolvedOutcome {
-            state,
+            flow_state,
             error: Some(detail),
             ambiguous: None,
             success: None,
@@ -511,7 +523,7 @@ impl<T> ResolvedOutcome<T> {
 
     pub(crate) fn ambiguous(candidates: &[CandidateRow]) -> Self {
         ResolvedOutcome {
-            state: "needs_context",
+            flow_state: "needs_context",
             error: None,
             ambiguous: Some(to_ambiguous(candidates)),
             success: None,
@@ -521,7 +533,7 @@ impl<T> ResolvedOutcome<T> {
 
     pub(crate) fn success(value: T) -> Self {
         ResolvedOutcome {
-            state: "ready",
+            flow_state: "ready",
             error: None,
             ambiguous: None,
             success: Some(value),

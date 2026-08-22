@@ -136,12 +136,12 @@
       }
     },
     "required": [
-      "state"
+      "flow_state"
     ],
     "type": "object",
     "properties": {
-      "state": {
-        "description": "Wave 11 (item 3, \"unified continuation state machine\"): present on\nevery response regardless of success/error -- `\"ready\"` on success,\nor one of `needs_context`/`needs_human_review`/`needs_verification`/\n`blocked` on error (see `classify_error_state`'s own doc comment).\nLets an agent dispatch on ONE top-level field instead of\nmaintaining its own per-`code` remediation table across ~70\ndistinct codes.",
+      "flow_state": {
+        "description": "Wave 11 (item 3, \"unified continuation state machine\"): present on\nevery response regardless of success/error -- `\"ready\"` on success,\nor one of `needs_context`/`needs_human_review`/`needs_verification`/\n`blocked` on error (see `classify_error_state`'s own doc comment).\nLets an agent dispatch on ONE top-level field instead of\nmaintaining its own per-`code` remediation table across ~70\ndistinct codes.\n\nNamed `flow_state`, not the more obvious `state` (audit follow-up,\n2026-08-23): several tool-specific success structs (e.g.\n`EditTransactionStatusOutput`, `VerifyChangeOutput` in txn.rs) have\ntheir own unrelated `state` field, and this struct's `success: T` is\n`#[serde(flatten)]`ed -- a same-named field there would silently\nserialize as a SECOND `\"state\"` JSON key (serde's flatten writes\neach field independently; nothing dedupes it), with most JSON\nparsers then last-write-wins-ing over whichever value serialized\nsecond. `flow_state` is deliberately namespaced so no domain output\nstruct will ever pick the same name by coincidence again.",
         "type": "string"
       },
       "error": {

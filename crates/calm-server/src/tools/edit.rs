@@ -2721,6 +2721,12 @@ impl CalmServer {
         // warning on a success response instead.
         let mut index_stale: Option<String> = None;
         let mut should_embed_bg = false;
+        // Wave 1b (audit follow-up, 2026-08-23): set below when this edit's
+        // shadow transaction lands on VerifyPending (rust_check_on_write is
+        // on and the file is verifiable) -- lets the final response point
+        // at verify_change instead of always suggesting diff_impact, which
+        // has nothing to do with an unresolved VerifyPending transaction.
+        let mut awaiting_verify_tx_id: Option<String> = None;
         {
             let reindex_start = std::time::Instant::now();
             let reindex_result = calm_core::indexer::pipeline::reindex_paths(
@@ -2873,6 +2879,12 @@ impl CalmServer {
                     };
                     let _ =
                         calm_core::txn::advance(&state_conn, tx_id, next, "system", next_reason);
+                    // Wave 1b: record so the final response below can point
+                    // at verify_change instead of unconditionally suggesting
+                    // diff_impact -- see awaiting_verify_tx_id's own decl.
+                    if next == calm_core::txn::TxState::VerifyPending {
+                        awaiting_verify_tx_id = Some(tx_id.clone());
+                    }
                 }
                 Ok(()) => {}
                 Err(e) => {
@@ -3042,6 +3054,22 @@ impl CalmServer {
             (None, Some(d)) => Some(d.clone()),
             (None, None) => None,
         };
+        // Wave 1b (audit follow-up, 2026-08-23): a transaction that landed
+        // on VerifyPending above has nothing left for diff_impact to do --
+        // point at verify_change(tx_id) instead so the response doesn't
+        // send the caller toward the wrong next tool.
+        let sn = match &awaiting_verify_tx_id {
+            Some(tx_id) => suggested_with_args(
+                "verify_change",
+                "This transaction is awaiting verification (VerifyPending) -- \
+                 run verify_change before treating this write as fully settled",
+                serde_json::json!({"tx_id": tx_id}),
+            ),
+            None => suggested_gated(
+                "diff_impact",
+                "Verify wider blast radius, especially if this touched a hub/high-risk symbol",
+            ),
+        };
         ToolOutcome::success(EditLinesOutput {
             path: path.to_string(),
             applied: true,
@@ -3052,10 +3080,7 @@ impl CalmServer {
             index_stale: None,
             tx_id: shadow_tx_id.clone(),
             note,
-            suggested_next: self.filter_sn(suggested_gated(
-                "diff_impact",
-                "Verify wider blast radius, especially if this touched a hub/high-risk symbol",
-            )),
+            suggested_next: self.filter_sn(sn),
         })
     }
 
