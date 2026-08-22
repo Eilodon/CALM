@@ -191,7 +191,7 @@ pub struct MintParams<'a> {
     /// `target_scope_digest`-style staleness check across these three is a
     /// natural follow-up, not done in this pass).
     pub policy_decision_digest: &'a str,
-    pub risk_vector_digest: &'a str,
+    pub risk_vector: &'a crate::policy::RiskVector,
     pub required_approver_class: crate::policy::ApproverClass,
 }
 
@@ -222,7 +222,7 @@ pub struct CurrentState<'a> {
     /// a real body edit), the same way `target_scope_digest` already
     /// catches a touch outside the reviewed scope.
     pub policy_decision_digest: &'a str,
-    pub risk_vector_digest: &'a str,
+    pub risk_vector: &'a crate::policy::RiskVector,
 }
 
 #[derive(Debug, PartialEq)]
@@ -335,6 +335,17 @@ pub struct ReviewAuthority {
     pub policy_decision_digest: String,
     pub risk_vector_digest: String,
     pub required_approver_class: crate::policy::ApproverClass,
+    /// Wave 10 (item 2/3): the raw `RiskVector` `risk_vector_digest` above
+    /// is a hash OF, reconstructed by `load` from `review_authorities`'
+    /// `mint_*` columns. NOT itself part of the signed payload -- always
+    /// re-verify `self.minted_risk_vector.digest() ==
+    /// self.risk_vector_digest` (the signature-covered field) before
+    /// trusting it for anything, since these columns alone could be
+    /// tampered with independently of the signature. A pre-migration or
+    /// otherwise-untrustworthy row reconstructs to a best-effort (usually
+    /// weakest-possible) vector that legitimately fails that check --
+    /// treat that as "raw fields unavailable", not as a real claim.
+    pub minted_risk_vector: crate::policy::RiskVector,
 }
 
 fn now_epoch_secs() -> f64 {
@@ -403,6 +414,9 @@ impl ReviewAuthority {
         let expires_at = created_at + params.ttl_secs.as_secs();
         let analysis_version = current_analysis_version();
         let target_scope_digest = target_scope_digest(params.targets);
+        // Wave 10 (item 2/3): derived here, not caller-supplied, so it can
+        // never drift from the raw RiskVector persisted below.
+        let risk_vector_digest = params.risk_vector.digest();
 
         let signature = sign(
             &key,
@@ -420,7 +434,7 @@ impl ReviewAuthority {
                 &nonce,
                 expires_at,
                 params.policy_decision_digest,
-                params.risk_vector_digest,
+                &risk_vector_digest,
                 params.required_approver_class.as_str(),
             ),
         );
@@ -440,8 +454,9 @@ impl ReviewAuthority {
             signature,
             created_at,
             policy_decision_digest: params.policy_decision_digest.to_string(),
-            risk_vector_digest: params.risk_vector_digest.to_string(),
+            risk_vector_digest,
             required_approver_class: params.required_approver_class,
+            minted_risk_vector: params.risk_vector.clone(),
         };
 
         // CCK-R5: snapshot persist + intent insert (by the caller, before
@@ -464,8 +479,12 @@ impl ReviewAuthority {
              (authority_id, intent_id, snapshot_id, graph_generation, caller_set_digest, \
               analysis_version, policy_digest, principal, target_scope_digest, nonce, \
               expires_at, signature, created_at, consumed_at, \
-              policy_decision_digest, risk_vector_digest, required_approver_class) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, NULL, ?14, ?15, ?16)",
+              policy_decision_digest, risk_vector_digest, required_approver_class, \
+              mint_caller_count_level, mint_is_hub, mint_hub_kind, mint_signature_changed, \
+              mint_uncertain_zero_caller, mint_risk_rule_floor, mint_kind_mismatch, \
+              mint_touches_manifest, mint_touches_uncovered_code) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, NULL, ?14, ?15, ?16, \
+                     ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)",
             params![
                 self.authority_id,
                 self.intent_id,
@@ -483,6 +502,15 @@ impl ReviewAuthority {
                 self.policy_decision_digest,
                 self.risk_vector_digest,
                 self.required_approver_class.as_str(),
+                self.minted_risk_vector.caller_count_level.as_str(),
+                self.minted_risk_vector.is_hub,
+                self.minted_risk_vector.hub_kind,
+                self.minted_risk_vector.signature_changed,
+                self.minted_risk_vector.uncertain_zero_caller,
+                self.minted_risk_vector.risk_rule_floor.map(|l| l.as_str()),
+                self.minted_risk_vector.kind_mismatch,
+                self.minted_risk_vector.touches_manifest,
+                self.minted_risk_vector.touches_uncovered_code,
             ],
         )?;
         for target in targets {
@@ -495,104 +523,79 @@ impl ReviewAuthority {
     }
 
     fn load(state_conn: &Connection, authority_id: &str) -> Result<Option<Self>, AuthorityError> {
-        #[allow(clippy::type_complexity)]
-        let row: Option<(
-            String,
-            String,
-            String,
-            i64,
-            String,
-            String,
-            String,
-            String,
-            String,
-            f64,
-            String,
-            f64,
-            String,
-            String,
-            String,
-            String,
-        )> = state_conn
+        state_conn
             .query_row(
                 "SELECT authority_id, intent_id, snapshot_id, graph_generation, caller_set_digest, \
                  analysis_version, policy_digest, principal, nonce, expires_at, signature, \
                  created_at, target_scope_digest, policy_decision_digest, risk_vector_digest, \
-                 required_approver_class \
+                 required_approver_class, mint_caller_count_level, mint_is_hub, mint_hub_kind, \
+                 mint_signature_changed, mint_uncertain_zero_caller, mint_risk_rule_floor, \
+                 mint_kind_mismatch, mint_touches_manifest, mint_touches_uncovered_code \
                  FROM review_authorities WHERE authority_id = ?1",
                 params![authority_id],
-                |r| {
-                    Ok((
-                        r.get(0)?,
-                        r.get(1)?,
-                        r.get(2)?,
-                        r.get(3)?,
-                        r.get(4)?,
-                        r.get(5)?,
-                        r.get(6)?,
-                        r.get(7)?,
-                        r.get(8)?,
-                        r.get(9)?,
-                        r.get(10)?,
-                        r.get(11)?,
-                        r.get(12)?,
-                        r.get(13)?,
-                        r.get(14)?,
-                        r.get(15)?,
-                    ))
-                },
-            )
-            .optional()?;
-        row.map(
-            |(
-                authority_id,
-                intent_id,
-                snapshot_id,
-                graph_generation,
-                caller_set_digest,
-                analysis_version,
-                policy_digest,
-                principal,
-                nonce,
-                expires_at,
-                signature,
-                created_at,
-                target_scope_digest,
-                policy_decision_digest,
-                risk_vector_digest,
-                required_approver_class,
-            )| {
-                let required_approver_class = crate::policy::ApproverClass::parse(
-                    &required_approver_class,
-                )
-                .ok_or_else(|| {
-                    AuthorityError::Db(rusqlite::Error::InvalidColumnType(
+                |r| -> rusqlite::Result<Self> {
+                    let required_approver_class_raw: String = r.get("required_approver_class")?;
+                    let required_approver_class = crate::policy::ApproverClass::parse(
+                        &required_approver_class_raw,
+                    )
+                    .ok_or(rusqlite::Error::InvalidColumnType(
                         15,
                         "required_approver_class".to_string(),
                         rusqlite::types::Type::Text,
-                    ))
-                })?;
-                Ok(Self {
-                    authority_id,
-                    intent_id,
-                    snapshot_id,
-                    graph_generation,
-                    caller_set_digest,
-                    analysis_version,
-                    policy_digest,
-                    principal,
-                    target_scope_digest,
-                    nonce,
-                    expires_at,
-                    signature,
-                    created_at,
-                    policy_decision_digest,
-                    risk_vector_digest,
-                    required_approver_class,
-                })
-            },
-        )
-        .transpose()
+                    ))?;
+                    // Wave 10 (item 2/3): best-effort reconstruction -- an
+                    // unparseable mint_caller_count_level (a pre-migration
+                    // row, still at its DEFAULT '' from the ALTER) falls
+                    // back to the WEAKEST level rather than erroring the
+                    // whole load. Safe by construction: `verify_only`'s own
+                    // fallback path independently re-derives THIS
+                    // reconstruction's digest and refuses to trust it
+                    // unless that matches the SIGNED `risk_vector_digest` --
+                    // a default/bogus reconstruction can never
+                    // coincidentally produce that digest, so it just falls
+                    // through to the existing strict-equality behavior
+                    // instead of ever being treated as a real, weaker-than-
+                    // actual mint-time claim.
+                    let mint_caller_count_level_raw: String = r.get("mint_caller_count_level")?;
+                    let mint_risk_rule_floor_raw: Option<String> = r.get("mint_risk_rule_floor")?;
+                    let minted_risk_vector = crate::policy::RiskVector {
+                        caller_count_level: crate::policy::RiskLevel::parse(
+                            &mint_caller_count_level_raw,
+                        )
+                        .unwrap_or(crate::policy::RiskLevel::Low),
+                        is_hub: r.get("mint_is_hub")?,
+                        hub_kind: r.get("mint_hub_kind")?,
+                        signature_changed: r.get("mint_signature_changed")?,
+                        uncertain_zero_caller: r.get("mint_uncertain_zero_caller")?,
+                        risk_rule_floor: mint_risk_rule_floor_raw
+                            .and_then(|s| crate::policy::RiskLevel::parse(&s)),
+                        kind_mismatch: r.get("mint_kind_mismatch")?,
+                        touches_manifest: r.get("mint_touches_manifest")?,
+                        touches_uncovered_code: r.get("mint_touches_uncovered_code")?,
+                    };
+                    Ok(Self {
+                        authority_id: r.get("authority_id")?,
+                        intent_id: r.get("intent_id")?,
+                        snapshot_id: r.get("snapshot_id")?,
+                        graph_generation: r.get("graph_generation")?,
+                        caller_set_digest: r.get("caller_set_digest")?,
+                        analysis_version: r.get("analysis_version")?,
+                        policy_digest: r.get("policy_digest")?,
+                        principal: r.get("principal")?,
+                        target_scope_digest: r.get("target_scope_digest")?,
+                        nonce: r.get("nonce")?,
+                        expires_at: r.get("expires_at")?,
+                        signature: r.get("signature")?,
+                        created_at: r.get("created_at")?,
+                        policy_decision_digest: r.get("policy_decision_digest")?,
+                        risk_vector_digest: r.get("risk_vector_digest")?,
+                        required_approver_class,
+                        minted_risk_vector,
+                    })
+                },
+            )
+            .optional()
+            .map_err(AuthorityError::from)
     }
 
     /// Verifies `authority_id` against `current`, then atomically consumes
@@ -699,13 +702,76 @@ impl ReviewAuthority {
         // change spent as a real body edit), which `target_scope_digest`
         // alone cannot: that digest only binds WHICH symbols/files were
         // touched, never WHAT KIND of change was made to them.
-        if authority.risk_vector_digest != current.risk_vector_digest {
-            return Err(AuthorityError::StaleRiskVector);
+        let current_risk_vector_digest = current.risk_vector.digest();
+        let risk_vector_exact_match = authority.risk_vector_digest == current_risk_vector_digest;
+        if !risk_vector_exact_match {
+            // Wave 10 (item 2): an exact-digest mismatch used to always
+            // fail outright, even when the real drift only ever made the
+            // spend LESS risky than what was already reviewed and
+            // approved. Fall back to a sound per-field `spend ⊑ mint`
+            // comparison (`RiskVector::is_covered_by`) -- but only once the
+            // persisted mint-time raw fields are confirmed trustworthy:
+            // `load` reconstructs `minted_risk_vector` from columns that
+            // are NOT themselves part of the signed payload, so re-deriving
+            // ITS digest and requiring it match the signature-covered
+            // `risk_vector_digest` is what closes that gap (a pre-
+            // migration row, or a tampered column, fails this and
+            // correctly falls through to the strict denial below, same as
+            // before this fallback existed).
+            let minted_fields_trustworthy =
+                authority.minted_risk_vector.digest() == authority.risk_vector_digest;
+            if !minted_fields_trustworthy
+                || !current
+                    .risk_vector
+                    .is_covered_by(&authority.minted_risk_vector)
+            {
+                return Err(AuthorityError::StaleRiskVector);
+            }
         }
-        if authority.policy_decision_digest != current.policy_decision_digest {
+        // Wave 10 (item 2): only enforced on the EXACT-match path above --
+        // once risk_vector_digest matches AND policy_digest already
+        // matched (checked earlier), `evaluate` being a pure function of
+        // (risk_vector, policy) means policy_decision_digest is already
+        // guaranteed identical by construction; this check exists to catch
+        // a caller that supplied a policy_decision_digest it didn't
+        // actually derive that way. On the ⊑ fallback path just above,
+        // `current`'s decision is provably no MORE demanding than
+        // `minted`'s (`RiskVector::is_covered_by`'s own doc comment:
+        // covered implies `aggregate_risk` is no higher, and
+        // `ApproverClass::from_risk` is monotone in that same level) --
+        // whatever approval class was already satisfied for the minted
+        // authority already covers a same-or-lower-risk spend, so
+        // re-checking the exact decision digest here would just reject
+        // spends this fallback already proved safe.
+        if risk_vector_exact_match
+            && authority.policy_decision_digest != current.policy_decision_digest
+        {
             return Err(AuthorityError::StalePolicyDecision);
         }
         Ok(())
+    }
+
+    /// Wave 9 (audit follow-up, "doable now" per the WrongTargetScope vs
+    /// StaleRiskVector split): unlike every other field folded into a
+    /// digest-only `AuthorityError` variant, `target_scope_digest`'s raw
+    /// inputs ARE recoverable without a schema migration -- every mint call
+    /// site persists the exact same `targets` it minted against as a
+    /// `ChangeIntent` row (`intent.targets`, see e.g.
+    /// `mint_review_authority_for_edit_context` in calm-server) before ever
+    /// calling `mint`, and `intent_id` is a bound, signed field on the
+    /// authority itself. Best-effort/read-only: `None` on any lookup
+    /// failure (authority gone, intent gone) rather than an error -- this
+    /// is purely diagnostic enrichment for a WRONG_TARGET_SCOPE message,
+    /// never itself a source of truth for authorization.
+    pub fn minted_targets_for_mismatch_detail(
+        state_conn: &Connection,
+        authority_id: &str,
+    ) -> Option<Vec<crate::change::ChangeIntentTarget>> {
+        let authority = Self::load(state_conn, authority_id).ok().flatten()?;
+        let intent = crate::change::get_change_intent(state_conn, &authority.intent_id)
+            .ok()
+            .flatten()?;
+        Some(intent.targets)
     }
 
     /// CCK-25: the atomic single-use consume, split out of
@@ -862,6 +928,28 @@ mod tests {
         .unwrap();
     }
 
+    /// Wave 10 (item 2/3): a single, process-wide fixture `RiskVector`
+    /// both `mint_params()` and `base_current()` bind a `&'static`
+    /// reference to -- gives every existing test a MATCHING risk vector on
+    /// both mint and spend sides by default (so the exact-digest fast path
+    /// in `verify_only` still applies, unchanged, for every test that
+    /// doesn't deliberately vary it), without needing to thread a
+    /// caller-supplied `RiskVector` through 40+ call sites.
+    fn base_risk_vector() -> &'static crate::policy::RiskVector {
+        static VECTOR: std::sync::OnceLock<crate::policy::RiskVector> = std::sync::OnceLock::new();
+        VECTOR.get_or_init(|| crate::policy::RiskVector {
+            caller_count_level: crate::policy::RiskLevel::Low,
+            is_hub: false,
+            hub_kind: None,
+            signature_changed: false,
+            uncertain_zero_caller: false,
+            risk_rule_floor: None,
+            kind_mismatch: false,
+            touches_manifest: false,
+            touches_uncovered_code: false,
+        })
+    }
+
     /// Every existing test in this module mints/verifies with an empty
     /// target scope by default (`mint_params(&[])` paired with this) --
     /// `wrong_target_scope_is_rejected` below is the one that varies it.
@@ -878,7 +966,7 @@ mod tests {
             // wants a real mismatch overrides just this field via
             // `..base_current()`, same pattern every other field here uses.
             policy_decision_digest: "policy-decision-1",
-            risk_vector_digest: "risk-vector-1",
+            risk_vector: base_risk_vector(),
         }
     }
 
@@ -893,7 +981,7 @@ mod tests {
             ttl_secs: AuthorityTtl::from_secs(300.0).unwrap(),
             targets,
             policy_decision_digest: "policy-decision-1",
-            risk_vector_digest: "risk-vector-1",
+            risk_vector: base_risk_vector(),
             required_approver_class: crate::policy::ApproverClass::SelfReviewed,
         }
     }
@@ -1197,12 +1285,79 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let conn = real_state_conn(dir.path());
         seed_intent_and_snapshot(&conn);
+        // Mint against the weakest possible vector (base_risk_vector) --
+        // a spend that's genuinely RISKIER (is_hub=true, which the mint
+        // never saw) must still be rejected: not just a different digest,
+        // but a real, uncovered escalation the Wave 10 fallback correctly
+        // refuses to paper over.
         let authority = ReviewAuthority::mint(&conn, mint_params(&[])).unwrap();
         let mut current = base_current();
-        current.risk_vector_digest = "risk-vector-2";
+        let mut riskier_vector = base_risk_vector().clone();
+        riskier_vector.is_hub = true;
+        current.risk_vector = &riskier_vector;
         assert_eq!(
             ReviewAuthority::verify_and_consume(&conn, &authority.authority_id, &current),
             Err(AuthorityError::StaleRiskVector)
+        );
+    }
+
+    #[test]
+    fn spend_less_risky_than_mint_is_covered_by_the_fallback_check() {
+        // Wave 10 (item 2): before this fallback existed, ANY digest
+        // mismatch failed outright -- even when the real drift only ever
+        // made the spend safer than what was already reviewed. Mint
+        // against a MORE risky vector than what's actually spent; the
+        // fallback must accept it since it's providably no riskier.
+        let dir = tempfile::tempdir().unwrap();
+        let conn = real_state_conn(dir.path());
+        seed_intent_and_snapshot(&conn);
+        let mut riskier_mint_vector = base_risk_vector().clone();
+        riskier_mint_vector.touches_uncovered_code = true;
+        let mut params = mint_params(&[]);
+        params.risk_vector = &riskier_mint_vector;
+        let authority = ReviewAuthority::mint(&conn, params).unwrap();
+
+        // Spend with the weaker, base vector -- digest differs from what
+        // was minted, but is provably no riskier.
+        let current = base_current();
+        assert_eq!(
+            ReviewAuthority::verify_and_consume(&conn, &authority.authority_id, &current),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn tampered_mint_columns_are_not_trusted_by_the_fallback_check() {
+        // Wave 10 (item 2/3): the mint_* columns are NOT part of the
+        // signed payload -- simulates an out-of-band tamper (or a
+        // pre-migration row) that claims a MORE permissive mint than was
+        // actually signed. The fallback must never trust this: it re-
+        // derives the reconstructed vector's own digest and requires it
+        // match the SIGNED risk_vector_digest before using it at all.
+        let dir = tempfile::tempdir().unwrap();
+        let conn = real_state_conn(dir.path());
+        seed_intent_and_snapshot(&conn);
+        let authority = ReviewAuthority::mint(&conn, mint_params(&[])).unwrap();
+
+        conn.execute(
+            "UPDATE review_authorities SET mint_is_hub = 1 WHERE authority_id = ?1",
+            rusqlite::params![authority.authority_id],
+        )
+        .unwrap();
+
+        let mut current = base_current();
+        // Would be "covered" by the tampered claim (mint_is_hub = 1) if it
+        // were trusted -- must NOT be, since the signed digest still says
+        // the mint's real is_hub was false.
+        let mut spend_vector = base_risk_vector().clone();
+        spend_vector.is_hub = true;
+        current.risk_vector = &spend_vector;
+
+        assert_eq!(
+            ReviewAuthority::verify_and_consume(&conn, &authority.authority_id, &current),
+            Err(AuthorityError::StaleRiskVector),
+            "a mint_* column that doesn't match the signed risk_vector_digest must never be \
+             trusted for the fallback check"
         );
     }
 

@@ -51,9 +51,13 @@ impl RiskLevel {
 }
 
 /// 9 independently-inspectable risk signals for one proposed touch.
-/// Compute-only, like `EvidenceSnapshot` (CCK-06) -- nothing here is
-/// persisted yet.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+/// Mostly compute-only, like `EvidenceSnapshot` (CCK-06) -- but as of Wave
+/// 10 item 3, the raw fields of a MINT-time vector are also persisted
+/// (`review_authorities.mint_*`, `authority::review::ReviewAuthority::
+/// minted_risk_vector`) so `verify_only`'s asymmetric `spend ⊑ mint` check
+/// (`is_covered_by`) has something concrete to compare a spend-time vector
+/// against, not just its digest.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RiskVector {
     /// From the touched symbol(s)' max caller count, via whatever scale
     /// the caller already uses (mirrors `risk_level_from_caller_count` in

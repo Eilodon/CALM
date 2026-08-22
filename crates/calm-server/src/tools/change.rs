@@ -654,7 +654,7 @@ impl CalmServer {
                                 }
                             }
                             if !uncertain_zero_caller {
-                                let (_, _, _, sym_uncertain, _, _) =
+                                let (_, _, _, sym_uncertain, _, _, _) =
                                     super::edit::compute_touch_risk(
                                         &conn,
                                         &self.project_root,
@@ -781,7 +781,6 @@ impl CalmServer {
                 return ToolOutcome::error(error_detail("STATE_DB_ERROR", &e.to_string(), true));
             }
             let policy_decision_digest = policy_decision.digest();
-            let risk_vector_digest = risk_vector.digest();
             let authority = match calm_core::authority::ReviewAuthority::mint(
                 &tx,
                 calm_core::authority::MintParams {
@@ -794,7 +793,7 @@ impl CalmServer {
                     ttl_secs: ttl,
                     targets: &intent.targets,
                     policy_decision_digest: &policy_decision_digest,
-                    risk_vector_digest: &risk_vector_digest,
+                    risk_vector: &risk_vector,
                     required_approver_class: policy_decision.required_approver_class,
                 },
             ) {

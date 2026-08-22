@@ -6379,6 +6379,7 @@ mod tests {
                     reason: None,
                     cites: None,
                     old_text: None,
+                    scope: None,
                 },
             )),
         );
@@ -11075,6 +11076,7 @@ mod tests {
                 reason: None,
                 cites: None,
                 old_text: None,
+                scope: None,
             },
         ));
         assert_eq!(jv(out2)["applied"], true);
@@ -11637,7 +11639,7 @@ mod tests {
         // signature (`signature = ''` here still spans line_start=1 with 0
         // embedded newlines), and touching it would trip the separate
         // signature-escalation signal this test isn't exercising.
-        let (risk, _, _, _, _, reason) = compute_touch_risk(
+        let (risk, _, _, _, _, reason, _) = compute_touch_risk(
             &conn,
             &dir,
             "a.py",
@@ -11657,7 +11659,7 @@ mod tests {
             glob: "a.py".to_string(),
             minimum: "high".to_string(),
         }];
-        let (risk, _, _, _, _, reason) = compute_touch_risk(
+        let (risk, _, _, _, _, reason, _) = compute_touch_risk(
             &conn,
             &dir,
             "a.py",
@@ -11697,7 +11699,7 @@ mod tests {
             glob: "a.py".to_string(),
             minimum: "low".to_string(),
         }];
-        let (risk, _, _, _, _, reason) = compute_touch_risk(
+        let (risk, _, _, _, _, reason, _) = compute_touch_risk(
             &conn,
             &dir,
             "a.py",
@@ -11742,7 +11744,7 @@ mod tests {
         // different text ("def helper():" -> "def helper(x):") must
         // escalate "low" to "high", same ceiling
         // escalate_risk_if_signature_changed uses.
-        let (risk, _, _, _, _, reason) = compute_touch_risk(
+        let (risk, _, _, _, _, reason, _) = compute_touch_risk(
             &conn,
             &dir,
             "a.py",
@@ -11785,7 +11787,7 @@ mod tests {
         // The hunk only covers the body line (2, 2), never the line-1
         // signature range -- must stay at the plain structural "low" signal
         // even though its new text obviously differs from the old body.
-        let (risk, _, _, _, _, reason) = compute_touch_risk(
+        let (risk, _, _, _, _, reason, _) = compute_touch_risk(
             &conn,
             &dir,
             "a.py",
@@ -11826,7 +11828,7 @@ mod tests {
         // was actually escalated, so there's nothing new to attribute a
         // reason to (avoids implying a rule or signature change did work
         // that caller count already did).
-        let (risk, _, _, _, _, reason) = compute_touch_risk(
+        let (risk, _, _, _, _, reason, _) = compute_touch_risk(
             &conn,
             &dir,
             "a.py",
@@ -11854,7 +11856,7 @@ mod tests {
         // Cargo.toml has zero indexed symbols -- caller_count-based
         // structural risk is `None`, so this isolates the manifest-floor
         // escalation as the ONLY signal at play.
-        let (risk, _, _, _, _, reason) = compute_touch_risk(
+        let (risk, _, _, _, _, reason, _) = compute_touch_risk(
             &conn,
             &dir,
             "Cargo.toml",
@@ -11894,7 +11896,7 @@ mod tests {
         // .calm/policy.toml must see that floor honored here exactly like
         // `policy::evaluate()` already does for a ChangeIntent-backed
         // RiskVector.
-        let (risk, _, _, _, _, _) = compute_touch_risk(
+        let (risk, _, _, _, _, _, _) = compute_touch_risk(
             &conn,
             &dir,
             "package.json",
@@ -11937,7 +11939,7 @@ mod tests {
             covered_lines,
         };
 
-        let (risk, _, _, _, _, reason) = compute_touch_risk(
+        let (risk, _, _, _, _, reason, _) = compute_touch_risk(
             &conn,
             &dir,
             "a.py",
@@ -11989,7 +11991,7 @@ mod tests {
         // real_hunks=false instead -- see
         // compute_touch_risk_placeholder_hunk_activates_coverage_probe_
         // without_a_false_signature_escalation below for that case).
-        let (risk, _, _, _, _, _) = compute_touch_risk(
+        let (risk, _, _, _, _, _, _) = compute_touch_risk(
             &conn,
             &dir,
             "a.py",
@@ -12031,7 +12033,7 @@ mod tests {
             source: "lcov".to_string(),
             covered_lines: std::collections::HashMap::new(),
         };
-        let (risk, _, _, _, _, reason) = compute_touch_risk(
+        let (risk, _, _, _, _, reason, _) = compute_touch_risk(
             &conn,
             &dir,
             "a.py",
@@ -12079,7 +12081,7 @@ mod tests {
             source: "lcov".to_string(),
             covered_lines: std::collections::HashMap::new(),
         };
-        let (risk, _, _, _, _, reason) = compute_touch_risk(
+        let (risk, _, _, _, _, reason, _) = compute_touch_risk(
             &conn,
             &dir,
             "a.py",
@@ -13508,6 +13510,7 @@ mod tests {
             reason: None,
             cites: None,
             old_text: None,
+            scope: None,
         };
         let mut ask: Option<HubAskContext> = None;
         let out = server.edit_symbol_flow(&params, ElicitGate::Off, &mut ask);
@@ -13718,6 +13721,103 @@ mod tests {
     }
 
     #[test]
+    fn edit_context_mint_now_carries_the_real_touches_uncovered_code_value() {
+        // Wave 10 (item 1): before this fix, mint_review_authority_for_edit_context
+        // ALWAYS hardcoded touches_uncovered_code: false in the RiskVector it
+        // minted, even though edit_context's own gate_prediction had already
+        // computed the real value via a placeholder hunk over the same
+        // range. A real spend against genuinely uncovered code always
+        // computes it correctly as `true` -- so the two RiskVector digests
+        // silently diverged on this one field, and the freshly-minted
+        // authority failed AUTHORITY_STALE_RISK_VECTOR every single time it
+        // was used for a symbol touching uncovered code, no matter how
+        // fresh it was. ElicitGate::Approved isolates that from CCK-23's
+        // separate, unconditional high-risk independent-review requirement
+        // (same technique the hub-symbol sibling test above uses).
+        use super::edit::{ElicitGate, HubAskContext};
+        let (dir, server) = test_server("mint_carries_real_touches_uncovered_code");
+        let original = "def helper():\n    return 1\n";
+        std::fs::write(dir.join("a.py"), original).unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.py::helper', 'helper', 'function', 'python', 'a.py', 1, 2, 'def helper():', '', 'helper', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+            let catalog = calm_core::indexer::refresh::InputCatalog::for_project(&dir);
+            calm_core::indexer::refresh::persist_index_input_snapshot(&conn, &catalog).unwrap();
+
+            let state_conn = server.state_write_conn().unwrap();
+            let reconciled =
+                calm_core::authority::EvidenceSnapshot::compute_after_reconciliation(&conn, &dir)
+                    .unwrap();
+            reconciled.persist(&state_conn).unwrap();
+        }
+        // Real coverage data loaded, nothing covered -- `helper` is
+        // genuinely untested, so both mint and spend must see
+        // touches_uncovered_code == true for this range.
+        *server.coverage.write_ok() = calm_core::analysis::coverage::CoverageData {
+            source: "lcov".to_string(),
+            covered_lines: std::collections::HashMap::new(),
+        };
+
+        let ctx_out = server.edit_context(rmcp::handler::server::wrapper::Parameters(
+            EditContextParams {
+                qualified_name: None,
+                symbol: Some("helper".into()),
+                end_line: None,
+                path: None,
+                line: None,
+                if_none_match: None,
+            },
+        ));
+        let ctx_v = serde_json::to_value(&ctx_out.0).unwrap();
+        let change_id = ctx_v["change_id"]
+            .as_str()
+            .expect("edit_context must mint a change_id even for an uncovered-code target")
+            .to_string();
+        let authority_id = ctx_v["authority_id"]
+            .as_str()
+            .expect("edit_context must mint an authority_id even for an uncovered-code target")
+            .to_string();
+
+        let hash = calm_core::edit::range_checksum(original, 1, 2).unwrap();
+        let params = EditLinesParams {
+            path: "a.py".into(),
+            edits: vec![EditHunkParam {
+                start_line: 1,
+                end_line: 2,
+                expected_hash: Some(hash),
+                old_text: None,
+                new_text: "def helper():\n    return 2\n".into(),
+            }],
+            confirm: false,
+            reason: None,
+            cites: None,
+            change_id: Some(change_id),
+            authority_id: Some(authority_id),
+        };
+        let mut ask: Option<HubAskContext> = None;
+        let out = server.edit_lines_flow(&params, ElicitGate::Approved, &mut ask);
+        let v = serde_json::to_value(&out).unwrap();
+        assert!(
+            v.get("error").is_none(),
+            "authority-path spend on an uncovered-code target must succeed once \
+             touches_uncovered_code matches on both sides -- a stale digest mismatch here \
+             (AUTHORITY_STALE_RISK_VECTOR) would mean the mint-time fix regressed, got: {v}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.py")).unwrap(),
+            "def helper():\n    return 2\n",
+            "the edit must actually have been applied, not just report no error"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn edit_lines_symbol_less_region_denied_under_strict_mode_then_succeeds_via_minted_range_authority()
      {
         use super::edit::{ElicitGate, HubAskContext};
@@ -13908,6 +14008,101 @@ mod tests {
             "before this fix, the structural gate unconditionally rejected \
              pre_touched.is_empty() regardless of what was reviewed this session -- must now \
              succeed once edit_context's range mode reviewed this exact path: {v}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_context_mint_binds_full_touched_set_for_a_nested_method_in_a_class() {
+        use super::edit::{ElicitGate, HubAskContext};
+        let (dir, server) = test_server("nested_symbol_wrong_target_scope_regression");
+        // Wave 9 (audit follow-up, finding #4): a method inside a class
+        // always has its own indexed range fully contained within the
+        // class's own range (the class row spans its whole body) --
+        // compute_touch_risk's symbols_overlapping_ranges scan over the
+        // method's own [line_start, line_end] therefore ALWAYS also finds
+        // the enclosing class. Before this wave,
+        // mint_review_authority_for_edit_context bound only the resolved
+        // candidate (the method) as the authority's target scope, so a
+        // real spend against the exact same range -- which unavoidably
+        // also touches the class -- deterministically failed
+        // AUTHORITY_WRONG_TARGET_SCOPE, even though the agent only ever
+        // touched what edit_context reviewed. This proves the fix: mint
+        // now binds the full touched set (method + class), matching what
+        // a real spend independently recomputes.
+        let original = "class Foo:\n    \"\"\"doc\"\"\"\n    def helper(self):\n        return 1\n";
+        std::fs::write(dir.join("a.py"), original).unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, hub_kind, is_entry_point)
+                 VALUES ('a.py::Foo', 'Foo', 'class', 'python', 'a.py', 1, 4, '', '', 'Foo', 0, 0, NULL, 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, hub_kind, is_entry_point)
+                 VALUES ('a.py::Foo.helper', 'helper', 'method', 'python', 'a.py', 3, 4, '', '', 'helper', 0, 0, NULL, 0)",
+                [],
+            )
+            .unwrap();
+            let catalog = calm_core::indexer::refresh::InputCatalog::for_project(&dir);
+            calm_core::indexer::refresh::persist_index_input_snapshot(&conn, &catalog).unwrap();
+        }
+
+        let ctx_out = server.edit_context(rmcp::handler::server::wrapper::Parameters(
+            EditContextParams {
+                qualified_name: None,
+                symbol: Some("helper".into()),
+                end_line: None,
+                path: None,
+                line: None,
+                if_none_match: None,
+            },
+        ));
+        let ctx_v = serde_json::to_value(&ctx_out.0).unwrap();
+        assert!(
+            ctx_v["error"].is_null(),
+            "edit_context on the nested method must succeed: {ctx_v}"
+        );
+        let change_id = ctx_v["change_id"]
+            .as_str()
+            .expect("edit_context must mint a change_id for a low-risk nested method")
+            .to_string();
+        let authority_id = ctx_v["authority_id"]
+            .as_str()
+            .expect("edit_context must mint an authority_id")
+            .to_string();
+
+        let hash = calm_core::edit::range_checksum(original, 3, 4).unwrap();
+        let params = EditLinesParams {
+            path: "a.py".into(),
+            edits: vec![EditHunkParam {
+                start_line: 3,
+                end_line: 4,
+                expected_hash: Some(hash),
+                old_text: None,
+                new_text: "    def helper(self):\n        return 2\n".into(),
+            }],
+            confirm: false,
+            reason: None,
+            cites: None,
+            change_id: Some(change_id),
+            authority_id: Some(authority_id),
+        };
+        let mut ask: Option<HubAskContext> = None;
+        let out = server.edit_lines_flow(&params, ElicitGate::Off, &mut ask);
+        let v = serde_json::to_value(&out).unwrap();
+        assert!(
+            v.get("error").is_none(),
+            "authority-path spend touching both the method and its enclosing class must \
+             succeed now that mint binds the full touched set, got: {v}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.py")).unwrap(),
+            "class Foo:\n    \"\"\"doc\"\"\"\n    def helper(self):\n        return 2\n",
+            "the edit must actually have been applied, not just report no error"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -15331,6 +15526,7 @@ mod tests {
                 reason: None,
                 cites: None,
                 old_text: None,
+                scope: None,
             },
         ));
         let v = jv(out);
@@ -15341,6 +15537,163 @@ mod tests {
             std::fs::read_to_string(dir.join("a.py")).unwrap(),
             "def helper():\n    return 42\n"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_symbol_default_scope_warns_on_duplicate_decoration_but_still_applies() {
+        // Wave 10 (Item 4 companion): a whole-symbol replace under the
+        // default scope="node" never includes leading decorators/
+        // attributes in its own range (see decorated_declaration_start's
+        // doc comment) -- so new_text repeating one verbatim silently
+        // duplicates it. Must warn, not block: this is exactly the bug
+        // class this session's own BlastRadiusInfo edit hit live.
+        let (dir, server) = test_server("edit_symbol_duplicate_decoration_warns");
+        std::fs::write(
+            dir.join("a.rs"),
+            "#[inline]\nfn helper() -> i32 {\n    1\n}\n",
+        )
+        .unwrap();
+
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.rs::helper', 'helper', 'function', 'rust', 'a.rs', 2, 4, '', '', 'helper', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        }
+        let hash =
+            calm_core::edit::range_checksum("#[inline]\nfn helper() -> i32 {\n    1\n}\n", 2, 4)
+                .unwrap();
+
+        let out = server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
+            EditSymbolParams {
+                qualified_name: None,
+                change_id: None,
+                authority_id: None,
+                symbol: "helper".into(),
+                path: None,
+                line: None,
+                expected_hash: Some(hash),
+                new_text: "#[inline]\nfn helper() -> i32 {\n    2\n}\n".into(),
+                position: None,
+                confirm: false,
+                reason: None,
+                cites: None,
+                old_text: None,
+                scope: None,
+            },
+        ));
+        let v = jv(out);
+        assert_eq!(v["applied"], true, "response: {v}");
+        let note = v["note"].as_str().unwrap_or("");
+        assert!(
+            note.contains("duplicate decoration risk"),
+            "expected a duplicate-decoration warning, got: {v}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.rs")).unwrap(),
+            "#[inline]\n#[inline]\nfn helper() -> i32 {\n    2\n}\n",
+            "the warning does not block the write -- content really is duplicated, matching \
+             this session's own live bug"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_symbol_decorated_declaration_scope_widens_replace_to_include_leading_decorator() {
+        // Wave 10 (Item 4): opt-in scope="decorated_declaration" re-parses
+        // the live file fresh and widens the replaced range upward through
+        // a leading decorator -- the complementary fix to the warning
+        // above: this lets a caller swap the decorator and body together
+        // in one hunk instead of leaving the old decorator behind.
+        let (dir, server) = test_server("edit_symbol_decorated_declaration_scope");
+        let original = "@app.route('/x')\ndef helper():\n    return 1\n";
+        std::fs::write(dir.join("a.py"), original).unwrap();
+
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.py::helper', 'helper', 'function', 'python', 'a.py', 2, 3, '', '', 'helper', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        }
+        // The widened range covers lines 1..3 (decorator + def), not the
+        // indexed [2, 3] -- expected_hash must match what scope=
+        // "decorated_declaration" will actually replace.
+        let hash = calm_core::edit::range_checksum(original, 1, 3).unwrap();
+
+        let out = server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
+            EditSymbolParams {
+                qualified_name: None,
+                change_id: None,
+                authority_id: None,
+                symbol: "helper".into(),
+                path: None,
+                line: None,
+                expected_hash: Some(hash),
+                new_text: "@app.route('/y')\ndef helper():\n    return 2\n".into(),
+                position: None,
+                confirm: false,
+                reason: None,
+                cites: None,
+                old_text: None,
+                scope: Some("decorated_declaration".into()),
+            },
+        ));
+        let v = jv(out);
+        assert_eq!(v["applied"], true, "response: {v}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.py")).unwrap(),
+            "@app.route('/y')\ndef helper():\n    return 2\n",
+            "scope=\"decorated_declaration\" must replace the decorator together with the \
+             body, not leave the old @app.route('/x') behind"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_symbol_unknown_scope_value_is_rejected() {
+        let (dir, server) = test_server("edit_symbol_invalid_scope");
+        std::fs::write(dir.join("a.py"), "def helper():\n    return 1\n").unwrap();
+
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.py::helper', 'helper', 'function', 'python', 'a.py', 1, 2, '', '', 'helper', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let out = server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
+            EditSymbolParams {
+                qualified_name: None,
+                change_id: None,
+                authority_id: None,
+                symbol: "helper".into(),
+                path: None,
+                line: None,
+                expected_hash: None,
+                new_text: "def helper():\n    return 42\n".into(),
+                position: None,
+                confirm: false,
+                reason: None,
+                cites: None,
+                old_text: None,
+                scope: Some("bogus".into()),
+            },
+        ));
+        let v = jv(out);
+        assert_eq!(v["error"]["code"], "INVALID_SCOPE", "response: {v}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -15379,6 +15732,7 @@ mod tests {
                 reason: None,
                 cites: None,
                 old_text: None,
+                scope: None,
             },
         ));
         let v = jv(out);
@@ -15421,6 +15775,7 @@ mod tests {
                 reason: None,
                 cites: None,
                 old_text: Some("let x = 1;".into()),
+                scope: None,
             },
         ));
         let v = jv(out);
@@ -15466,6 +15821,7 @@ mod tests {
                 reason: None,
                 cites: None,
                 old_text: Some("let x".into()),
+                scope: None,
             },
         ));
         let v = jv(out);
@@ -15515,6 +15871,7 @@ mod tests {
                 reason: None,
                 cites: None,
                 old_text: Some("1".into()),
+                scope: None,
             },
         ));
         let v = jv(out);
@@ -15558,6 +15915,7 @@ mod tests {
                 reason: None,
                 cites: None,
                 old_text: None,
+                scope: None,
             },
         ));
         let v = jv(out);
@@ -16215,6 +16573,7 @@ mod tests {
                     reason: None,
                     cites: None,
                     old_text: None,
+                    scope: None,
                     change_id: None,
                     authority_id: None,
                 },
@@ -16274,6 +16633,7 @@ mod tests {
                     reason: None,
                     cites: None,
                     old_text: None,
+                    scope: None,
                     change_id: None,
                     authority_id: None,
                 },
@@ -16430,6 +16790,7 @@ mod tests {
                 reason: None,
                 cites: None,
                 old_text: None,
+                scope: None,
             },
         ));
         let v = jv(out);
@@ -16482,6 +16843,7 @@ mod tests {
                 reason: None,
                 cites: None,
                 old_text: None,
+                scope: None,
             },
         ));
         let v = jv(out);
@@ -16544,6 +16906,7 @@ mod tests {
                 reason: None,
                 cites: None,
                 old_text: None,
+                scope: None,
             },
         ));
         let v = jv(out);
@@ -16590,6 +16953,7 @@ mod tests {
                 reason: None,
                 cites: None,
                 old_text: None,
+                scope: None,
             },
         ));
         let v = jv(out);
@@ -16636,6 +17000,7 @@ mod tests {
                 reason: None,
                 cites: None,
                 old_text: None,
+                scope: None,
             },
         ));
         let v = jv(out);
@@ -16665,6 +17030,7 @@ mod tests {
                 reason: None,
                 cites: None,
                 old_text: None,
+                scope: None,
             },
         ));
         let v = jv(out);
@@ -16697,6 +17063,7 @@ mod tests {
                 reason: None,
                 cites: None,
                 old_text: None,
+                scope: None,
             },
         ));
         let v = jv(out);
@@ -16729,6 +17096,7 @@ mod tests {
                 reason: None,
                 cites: None,
                 old_text: None,
+                scope: None,
             },
         ));
         let v = jv(out);
@@ -17400,6 +17768,7 @@ mod tests {
                     reason: Some("this should be safe, low risk, no problem".into()),
                     cites: None,
                     old_text: None,
+                    scope: None,
                 },
             )),
         );
@@ -17431,6 +17800,7 @@ mod tests {
                     ),
                     cites: None,
                     old_text: None,
+                    scope: None,
                 },
             )),
         );
@@ -17499,6 +17869,7 @@ mod tests {
                     reason: Some("renewed the flow, still correct".into()),
                     cites: None,
                     old_text: None,
+                    scope: None,
                 },
             )),
         );
@@ -17524,6 +17895,7 @@ mod tests {
                     reason: Some("checked CalmServer::new — return shape unchanged".into()),
                     cites: None,
                     old_text: None,
+                    scope: None,
                 },
             )),
         );
@@ -17583,6 +17955,7 @@ mod tests {
                     reason: None,
                     cites: Some("a.py::CalmServer::new".into()),
                     old_text: None,
+                    scope: None,
                 },
             )),
         );
@@ -17644,6 +18017,7 @@ mod tests {
                     reason: Some("checked new — still correct".into()),
                     cites: Some("new".into()),
                     old_text: None,
+                    scope: None,
                 },
             )),
         );
@@ -17708,6 +18082,7 @@ mod tests {
                     reason: Some("checked a.py::CalmServer::new — still correct".into()),
                     cites: Some("not::a::real::caller".into()),
                     old_text: None,
+                    scope: None,
                 },
             )),
         );
@@ -17774,6 +18149,7 @@ mod tests {
                     reason: Some("xrefresh_caller_countsy still fine".into()),
                     cites: None,
                     old_text: None,
+                    scope: None,
                 },
             )),
         );
@@ -17800,6 +18176,7 @@ mod tests {
                     reason: Some("cites refresh_caller_counts directly, unaffected".into()),
                     cites: None,
                     old_text: None,
+                    scope: None,
                 },
             )),
         );
@@ -17868,6 +18245,7 @@ mod tests {
                     reason: Some("checked run(), looks fine".into()),
                     cites: None,
                     old_text: None,
+                    scope: None,
                 },
             )),
         );
@@ -17893,6 +18271,7 @@ mod tests {
                     reason: Some("checked a.py::run, unaffected".into()),
                     cites: None,
                     old_text: None,
+                    scope: None,
                 },
             )),
         );

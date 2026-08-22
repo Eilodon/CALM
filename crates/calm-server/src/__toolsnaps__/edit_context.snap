@@ -224,6 +224,13 @@
             "items": {
               "type": "string"
             }
+          },
+          "capped": {
+            "description": "Wave 9 (audit follow-up, finding #5): whether the transitive BFS hit\n`callers.max_depth_cap`/`callers.transitive_timeout_ms` before\nfinishing -- `transitive`/`files_affected` are then a LOWER bound,\nnot the true blast radius, same \"truncated, don't trust as exact\"\nmeaning `callers_truncated`/`callees_truncated` already carry on\nthis same output. Previously computed (`transitive_bfs`'s second\nreturn value) but silently discarded as `_capped`. `Some(true)`\nwhen capped, absent otherwise -- never `Some(false)`.",
+            "type": [
+              "boolean",
+              "null"
+            ]
           }
         },
         "required": [

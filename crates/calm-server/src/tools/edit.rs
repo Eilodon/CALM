@@ -447,31 +447,87 @@ impl CalmServer {
             );
             let mut insertion_note: Option<String> = None;
             let hunk = match p.position.as_deref().unwrap_or("replace") {
-                "replace" => match &p.old_text {
-                    None => calm_core::edit::HunkRequest {
-                        start_line: c.line_start as usize,
-                        end_line: c.line_end as usize,
-                        expected_hash: p.expected_hash.clone(),
-                        new_text: p.new_text.clone(),
-                    },
-                    Some(old_text) => {
-                        let full_path = match resolve_repo_path(&self.project_root, &c.path) {
-                            Ok(p) => p,
-                            Err(e) => return ResolvedOutcome::error(e),
-                        };
-                        let live = match std::fs::read_to_string(&full_path) {
-                            Ok(s) => s,
-                            Err(e) => {
-                                return ResolvedOutcome::error(error_detail(
-                                    "READ_FAILED",
-                                    &format!("could not read {}: {e}", c.path),
-                                    false,
-                                ));
+                "replace" => {
+                    let full_path = match resolve_repo_path(&self.project_root, &c.path) {
+                        Ok(p) => p,
+                        Err(e) => return ResolvedOutcome::error(e),
+                    };
+                    let live = match std::fs::read_to_string(&full_path) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            return ResolvedOutcome::error(error_detail(
+                                "READ_FAILED",
+                                &format!("could not read {}: {e}", c.path),
+                                false,
+                            ));
+                        }
+                    };
+                    // Wave 10 (Item 4): opt-in scope="decorated_declaration"
+                    // widens the replaced range upward through leading
+                    // decorators/attributes/annotations, re-derived fresh
+                    // each call (never trusted from the index) -- see
+                    // decorated_declaration_start's doc comment. Default
+                    // scope="node"/unset keeps today's behavior unchanged.
+                    let effective_line_start = match p.scope.as_deref() {
+                        None | Some("node") => c.line_start as usize,
+                        Some("decorated_declaration") => {
+                            match calm_core::indexer::parser::decorated_declaration_start(
+                                &live,
+                                &c.language,
+                                c.line_start as usize,
+                                c.line_end as usize,
+                            ) {
+                                Some(widened) => widened,
+                                None => {
+                                    return ResolvedOutcome::error(error_detail(
+                                        "STALE_SYMBOL",
+                                        &format!(
+                                            "'{}' was not found at its indexed range in a \
+                                             fresh parse of {} — the index entry is stale; \
+                                             call indexing_status, then re-resolve the symbol",
+                                            p.symbol, c.path
+                                        ),
+                                        true,
+                                    ));
+                                }
                             }
-                        };
-                        match calm_core::edit::find_and_replace_hunk(
+                        }
+                        Some(other) => {
+                            return ResolvedOutcome::error(error_detail(
+                                "INVALID_SCOPE",
+                                &format!(
+                                    "unknown scope {other:?} — use \"node\" (default) or \
+                                     \"decorated_declaration\""
+                                ),
+                                false,
+                            ));
+                        }
+                    };
+                    match &p.old_text {
+                        None => {
+                            // Wave 10 (Item 4 companion): warn (never block)
+                            // when new_text's leading line duplicates a
+                            // decorator/attribute/annotation that already
+                            // sits, unedited, immediately above this
+                            // replace's OLD range on disk -- catches this
+                            // session's own live BlastRadiusInfo bug class.
+                            // See duplicate_decoration_risk_note's doc
+                            // comment.
+                            insertion_note = duplicate_decoration_risk_note(
+                                &live,
+                                effective_line_start,
+                                &p.new_text,
+                            );
+                            calm_core::edit::HunkRequest {
+                                start_line: effective_line_start,
+                                end_line: c.line_end as usize,
+                                expected_hash: p.expected_hash.clone(),
+                                new_text: p.new_text.clone(),
+                            }
+                        }
+                        Some(old_text) => match calm_core::edit::find_and_replace_hunk(
                             &live,
-                            c.line_start as usize,
+                            effective_line_start,
                             c.line_end as usize,
                             old_text,
                             &p.new_text,
@@ -483,7 +539,7 @@ impl CalmServer {
                                     &format!(
                                         "old_text {old_text:?} was not found within '{}' \
                                          ({}..{}) on disk",
-                                        p.symbol, c.line_start, c.line_end
+                                        p.symbol, effective_line_start, c.line_end
                                     ),
                                     true,
                                 ));
@@ -506,9 +562,9 @@ impl CalmServer {
                                     true,
                                 ));
                             }
-                        }
+                        },
                     }
-                },
+                }
                 pos @ ("before" | "after" | "append_inside") => {
                     let position = match pos {
                         "before" => calm_core::edit::InsertPosition::Before,
@@ -1048,12 +1104,17 @@ impl CalmServer {
         // line has dozens of twins), a stale line number can still hash-match
         // and the edit lands at the wrong spot. Surface that on every
         // response that reports such a hunk — preview AND applied.
-        let ambiguity_note = if position_anchored {
-            // 2026-07-14 backlog B1: insertion modes can carry their own
-            // warning computed by the caller (e.g. insertion_hunk_for's
-            // doc-comment-sandwich note) -- distinct from the hash-ambiguity
-            // note below, which only applies to line-range replace hunks.
-            extra_note
+        // 2026-07-14 backlog B1 (extended Wave 10 -- Item 4 companion):
+        // insertion modes AND whole-symbol "replace" calls can carry their
+        // own warning computed by the caller (e.g. insertion_hunk_for's
+        // doc-comment-sandwich note, or edit_symbol_flow's
+        // duplicate_decoration_risk_note) -- distinct from the
+        // hash-ambiguity note below, which only applies to line-range
+        // replace hunks. Both can legitimately fire together, so combine
+        // rather than let position_anchored silently discard extra_note for
+        // the non-anchored (default "replace") path.
+        let hash_ambiguity_note = if position_anchored {
+            None
         } else {
             let flagged: Vec<String> = outcome
                 .results
@@ -1077,6 +1138,12 @@ impl CalmServer {
                     flagged.join(", ")
                 )
             })
+        };
+        let ambiguity_note = match (extra_note, hash_ambiguity_note) {
+            (Some(a), Some(b)) => Some(format!("{a} | {b}")),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
         };
 
         if !outcome.all_applied {
@@ -1209,7 +1276,7 @@ impl CalmServer {
                 .collect();
             let coverage = self.coverage.read_ok();
             let policy = calm_core::policy::loader::load_policy_or_warn(&self.project_root);
-            let (risk, hub_hit, hub_kind, uncertain_zero_caller, touched, risk_rule_reason) =
+            let (risk, hub_hit, hub_kind, uncertain_zero_caller, touched, risk_rule_reason, _) =
                 compute_touch_risk(
                     &conn,
                     &self.project_root,
@@ -1314,112 +1381,128 @@ impl CalmServer {
         // still match, but the real kind_mismatch flips true here, changing
         // this digest and failing verify_only's new StaleRiskVector/
         // StalePolicyDecision checks.
-        let spend_risk_digests: Option<(String, String)> = if let (Some(spend_change_id), Some(_)) =
-            (change_id, authority_id)
-        {
-            let caller_count_level = pre_touched
-                .iter()
-                .filter_map(|t| {
-                    calm_core::policy::RiskLevel::parse(
-                        super::detail::risk_level_from_caller_count(t.caller_count),
-                    )
-                })
-                .max()
-                .unwrap_or(calm_core::policy::RiskLevel::Low);
-            let loaded = self
-                .make_state_read_conn()
-                .map_err(|e| e.to_string())
-                .and_then(|state_read_conn| {
-                    calm_core::change::get_change_intent(&state_read_conn, spend_change_id)
-                        .map_err(|e| e.to_string())
-                })
-                .and_then(|opt| {
-                    opt.ok_or_else(|| {
-                        format!("no plan_change intent with change_id {spend_change_id}")
+        let spend_risk_digests: Option<(calm_core::policy::RiskVector, String)> =
+            if let (Some(spend_change_id), Some(_)) = (change_id, authority_id) {
+                let caller_count_level = pre_touched
+                    .iter()
+                    .filter_map(|t| {
+                        calm_core::policy::RiskLevel::parse(
+                            super::detail::risk_level_from_caller_count(t.caller_count),
+                        )
                     })
-                });
-            match loaded {
-                Ok(intent) => {
-                    let ext = std::path::Path::new(path)
-                        .extension()
-                        .and_then(|e| e.to_str())
-                        .unwrap_or("");
-                    let language = calm_core::indexer::lang_constants::language_for_extension(ext)
-                        .unwrap_or("");
-                    let observed = calm_core::change::classify::classify_observed_change(
-                        &calm_core::change::ObservedChangeInput {
+                    .max()
+                    .unwrap_or(calm_core::policy::RiskLevel::Low);
+                let loaded = self
+                    .make_state_read_conn()
+                    .map_err(|e| e.to_string())
+                    .and_then(|state_read_conn| {
+                        calm_core::change::get_change_intent(&state_read_conn, spend_change_id)
+                            .map_err(|e| e.to_string())
+                    })
+                    .and_then(|opt| {
+                        opt.ok_or_else(|| {
+                            format!("no plan_change intent with change_id {spend_change_id}")
+                        })
+                    });
+                match loaded {
+                    Ok(intent) => {
+                        let ext = std::path::Path::new(path)
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .unwrap_or("");
+                        let language =
+                            calm_core::indexer::lang_constants::language_for_extension(ext)
+                                .unwrap_or("");
+                        let observed = calm_core::change::classify::classify_observed_change(
+                            &calm_core::change::ObservedChangeInput {
+                                path,
+                                language,
+                                is_test: false,
+                                old_text: Some(&original),
+                                new_text: Some(&new_content),
+                                old_signature: None,
+                                new_signature: None,
+                            },
+                        );
+                        // `Body` is the declared-kind fallback both a real
+                        // plan_change(kind="body") caller and, notably,
+                        // guardrails.rs::mint_review_authority_for_edit_context
+                        // ALWAYS use (that compat wrapper has no real
+                        // "declared kind" concept -- it picks Body as a
+                        // generic placeholder, never a human's actual
+                        // claim). Per ChangeKind::Body's own doc comment
+                        // ("the conservative fallback"), nothing can
+                        // meaningfully violate it -- only a declared kind
+                        // NARROWER than reality (e.g. doc_only spent as a
+                        // real body edit) is a real mismatch worth
+                        // escalating over.
+                        let kind_mismatch = intent.kind.0 != calm_core::change::ChangeKind::Body
+                            && calm_core::change::kinds_mismatch(intent.kind, observed);
+                        let touches_manifest = calm_core::change::classify::is_manifest_path(path);
+                        let risk_rule_floor =
+                            calm_core::config::risk_floor_for_path(&self.config().risk_rules, path)
+                                .and_then(|(level_str, _glob)| {
+                                    calm_core::policy::RiskLevel::parse(level_str)
+                                });
+                        // CCK-29d (audit 2026-08-10): wired at the one production
+                        // call site with both a live diff (`hunks`) and coverage
+                        // data already loaded -- `mint_review_authority_for_edit_context`
+                        // and `review_change` mint BEFORE any diff exists, so they
+                        // structurally cannot compute this (documented gap, stays
+                        // `false` there).
+                        let touches_uncovered_code = hunks_touch_uncovered_code(
+                            &self.coverage.read_ok(),
+                            &self.project_root,
                             path,
-                            language,
-                            is_test: false,
-                            old_text: Some(&original),
-                            new_text: Some(&new_content),
-                            old_signature: None,
-                            new_signature: None,
-                        },
-                    );
-                    // `Body` is the declared-kind fallback both a real
-                    // plan_change(kind="body") caller and, notably,
-                    // guardrails.rs::mint_review_authority_for_edit_context
-                    // ALWAYS use (that compat wrapper has no real
-                    // "declared kind" concept -- it picks Body as a
-                    // generic placeholder, never a human's actual
-                    // claim). Per ChangeKind::Body's own doc comment
-                    // ("the conservative fallback"), nothing can
-                    // meaningfully violate it -- only a declared kind
-                    // NARROWER than reality (e.g. doc_only spent as a
-                    // real body edit) is a real mismatch worth
-                    // escalating over.
-                    let kind_mismatch = intent.kind.0 != calm_core::change::ChangeKind::Body
-                        && calm_core::change::kinds_mismatch(intent.kind, observed);
-                    let touches_manifest = calm_core::change::classify::is_manifest_path(path);
-                    let risk_rule_floor =
-                        calm_core::config::risk_floor_for_path(&self.config().risk_rules, path)
-                            .and_then(|(level_str, _glob)| {
-                                calm_core::policy::RiskLevel::parse(level_str)
-                            });
-                    // CCK-29d (audit 2026-08-10): wired at the one production
-                    // call site with both a live diff (`hunks`) and coverage
-                    // data already loaded -- `mint_review_authority_for_edit_context`
-                    // and `review_change` mint BEFORE any diff exists, so they
-                    // structurally cannot compute this (documented gap, stays
-                    // `false` there).
-                    let touches_uncovered_code = hunks_touch_uncovered_code(
-                        &self.coverage.read_ok(),
-                        &self.project_root,
-                        path,
-                        &hunks,
-                    );
-                    let risk_vector = calm_core::policy::RiskVector {
-                        caller_count_level,
-                        is_hub: hub_hit,
-                        hub_kind: hub_kind.clone(),
-                        signature_changed: false,
-                        uncertain_zero_caller: uncertain_zero_caller.is_some(),
-                        risk_rule_floor,
-                        kind_mismatch,
-                        touches_manifest,
-                        touches_uncovered_code,
-                    };
-                    let policy = calm_core::policy::loader::load_policy_or_warn(&self.project_root);
-                    let policy_decision = calm_core::policy::evaluate(&risk_vector, &policy);
-                    Some((risk_vector.digest(), policy_decision.digest()))
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "could not load ChangeIntent {spend_change_id} to recompute \
+                            &hunks,
+                        );
+                        let risk_vector = calm_core::policy::RiskVector {
+                            caller_count_level,
+                            is_hub: hub_hit,
+                            hub_kind: hub_kind.clone(),
+                            signature_changed: false,
+                            uncertain_zero_caller: uncertain_zero_caller.is_some(),
+                            risk_rule_floor,
+                            kind_mismatch,
+                            touches_manifest,
+                            touches_uncovered_code,
+                        };
+                        let policy =
+                            calm_core::policy::loader::load_policy_or_warn(&self.project_root);
+                        let policy_decision = calm_core::policy::evaluate(&risk_vector, &policy);
+                        Some((risk_vector, policy_decision.digest()))
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "could not load ChangeIntent {spend_change_id} to recompute \
                              spend-time risk: {e}"
-                    );
-                    // Fail closed: a digest that can never legitimately
-                    // match anything ReviewAuthority::mint signed, so a
-                    // lookup failure denies the spend instead of
-                    // silently treating "unknown real risk" as "risk
-                    // unchanged".
-                    Some((format!("UNRESOLVED:{e}"), format!("UNRESOLVED:{e}")))
+                        );
+                        // Fail closed: every axis maxed out so `is_covered_by`
+                        // (Wave 10 item 2's fallback check) can only pass
+                        // against a mint that was ALSO maximally risky --
+                        // which would already require Human-tier approval --
+                        // and a policy_decision_digest that can never equal
+                        // what ReviewAuthority::mint signed either, so a
+                        // lookup failure denies the spend on both the exact-
+                        // match and the fallback path, instead of silently
+                        // treating "unknown real risk" as "risk unchanged".
+                        let fail_closed_vector = calm_core::policy::RiskVector {
+                            caller_count_level: calm_core::policy::RiskLevel::High,
+                            is_hub: true,
+                            hub_kind: None,
+                            signature_changed: true,
+                            uncertain_zero_caller: true,
+                            risk_rule_floor: Some(calm_core::policy::RiskLevel::High),
+                            kind_mismatch: true,
+                            touches_manifest: true,
+                            touches_uncovered_code: true,
+                        };
+                        Some((fail_closed_vector, format!("UNRESOLVED:{e}")))
+                    }
                 }
-            }
-        } else {
-            None
-        };
+            } else {
+                None
+            };
         // `always_require_edit_context` (Config.edit) widens this gate to
         // every touched symbol regardless of risk -- see OrientationConfig/
         // EditConfig's own doc comments (config.rs) for why this exists as a
@@ -1537,7 +1620,7 @@ impl CalmServer {
                         qualified_name: None,
                     });
                 }
-                let (spend_risk_vector_digest, spend_policy_decision_digest) =
+                let (spend_risk_vector, spend_policy_decision_digest) =
                     spend_risk_digests.clone().expect(
                         "spend_risk_digests is Some whenever change_id/authority_id are both Some",
                     );
@@ -1555,7 +1638,7 @@ impl CalmServer {
                     principal: &principal,
                     targets: &current_targets,
                     policy_decision_digest: &spend_policy_decision_digest,
-                    risk_vector_digest: &spend_risk_vector_digest,
+                    risk_vector: &spend_risk_vector,
                 };
                 let state_conn = match calm_core::db::conn::open_state_writer(&self.state_db_path) {
                     Ok(c) => c,
@@ -1626,7 +1709,19 @@ impl CalmServer {
                             change_id,
                             authority_id,
                         );
-                        return ToolOutcome::error(error_detail(reason_code, &e.to_string(), true));
+                        // Wave 9 (audit follow-up): WRONG_TARGET_SCOPE is the one
+                        // AuthorityError variant whose raw mismatch inputs are
+                        // recoverable without a schema migration (see
+                        // wrong_target_scope_detail's own doc comment) -- every other
+                        // variant stays a plain digest-equality message, unchanged.
+                        let message = if matches!(e, AE::WrongTargetScope) {
+                            wrong_target_scope_detail(&state_conn, authority_id, current.targets)
+                                .map(|detail| format!("{e} -- {detail}"))
+                                .unwrap_or_else(|| e.to_string())
+                        } else {
+                            e.to_string()
+                        };
+                        return ToolOutcome::error(error_detail(reason_code, &message, true));
                     }
                 }
             }
@@ -1691,7 +1786,17 @@ impl CalmServer {
                     review_id = %pending.review_id,
                 );
                 gate = ElicitGate::Approved;
-                approval_mechanism = "cli_manual_review";
+                // Immediate hotfix (2026-08-22, audit follow-up to Wave 8): this used to
+                // hardcode "cli_manual_review" unconditionally, even when `pending` was
+                // actually decided via the weaker agent-relay channel -- `decided_by`
+                // already distinguishes the two (see `PendingReview::decided_by`), it was
+                // just discarded here. The approval receipt's `mechanism` field is the
+                // audit trail's only record of which channel actually approved a write;
+                // it must reflect the true channel, not a channel-blind guess.
+                approval_mechanism = match pending.decided_by.as_deref() {
+                    Some("agent_relay_after_elicitation") => "agent_relay_after_elicitation",
+                    _ => "cli_manual_review",
+                };
             } else {
                 tracing::info!(
                     target: crate::telemetry::AUDIT_TARGET,
@@ -2405,7 +2510,7 @@ impl CalmServer {
                     qualified_name: None,
                 });
             }
-            let (spend_risk_vector_digest, spend_policy_decision_digest) = spend_risk_digests
+            let (spend_risk_vector, spend_policy_decision_digest) = spend_risk_digests
                 .clone()
                 .expect("spend_risk_digests is Some whenever change_id/authority_id are both Some");
             let current = calm_core::authority::CurrentState {
@@ -2421,7 +2526,7 @@ impl CalmServer {
                 principal: &principal,
                 targets: &current_targets,
                 policy_decision_digest: &spend_policy_decision_digest,
-                risk_vector_digest: &spend_risk_vector_digest,
+                risk_vector: &spend_risk_vector,
             };
             match calm_core::authority::ReviewAuthority::authorize_and_begin_edit(
                 &state_conn,
@@ -2499,7 +2604,17 @@ impl CalmServer {
                         change_id,
                         authority_id,
                     );
-                    return ToolOutcome::error(error_detail(reason_code, &e.to_string(), true));
+                    // Wave 9 (audit follow-up): same WRONG_TARGET_SCOPE enrichment as
+                    // the preliminary verify_only check site above -- see
+                    // wrong_target_scope_detail's own doc comment.
+                    let message = if matches!(e, AEE::Authority(AE::WrongTargetScope)) {
+                        wrong_target_scope_detail(&state_conn, authority_id, &current_targets)
+                            .map(|detail| format!("{e} -- {detail}"))
+                            .unwrap_or_else(|| e.to_string())
+                    } else {
+                        e.to_string()
+                    };
+                    return ToolOutcome::error(error_detail(reason_code, &message, true));
                 }
             }
         } else {
@@ -2906,7 +3021,7 @@ impl CalmServer {
                 .map(|r| (r.start_line as i64, r.new_end_line as i64))
                 .collect();
             let coverage = self.coverage.read_ok();
-            let (_, _, _, _, touched, _) = compute_touch_risk(
+            let (_, _, _, _, touched, _, _) = compute_touch_risk(
                 &conn,
                 &self.project_root,
                 path,
@@ -3017,49 +3132,29 @@ impl CalmServer {
                 Ok(c) => c,
                 Err(e) => return db_error(e),
             };
-            let review = match calm_core::authority::get_pending_review(&conn, &p.review_id) {
-                Ok(Some(r)) => r,
-                Ok(None) => {
-                    return ToolOutcome::error(error_detail(
-                        "REVIEW_NOT_FOUND",
-                        &format!(
-                            "no review {} -- never existed, already decided, or expired",
-                            p.review_id
-                        ),
-                        false,
-                    ));
-                }
-                Err(e) => return db_error(e),
-            };
-            if review.status != "pending" {
-                return ToolOutcome::error(error_detail(
-                    "REVIEW_ALREADY_DECIDED",
-                    &format!(
-                        "review {} is already '{}' -- do not re-decide it",
-                        p.review_id, review.status
-                    ),
-                    false,
-                ));
-            }
-            let expected_digest = calm_core::indexer::pipeline::hash_content(&review.diff_preview);
-            if p.diff_digest != expected_digest {
-                return ToolOutcome::error(error_detail(
-                    "DIFF_DIGEST_MISMATCH",
-                    "the echoed diff_digest does not match this review's actual current \
-                     diff_preview -- fetch it fresh (get_pending_review's diff_preview, or `calm \
-                     review show`) and echo hash_content of THAT exact text; do not guess or \
-                     reuse a stale digest",
-                    true,
-                ));
-            }
-            let decided_by = "agent_relay_after_elicitation";
-            let outcome = if p.approve {
-                calm_core::authority::approve_pending_review(&conn, &p.review_id, decided_by)
-            } else {
-                calm_core::authority::decline_pending_review(&conn, &p.review_id, decided_by)
-            };
-            match outcome {
-                Ok(true) => {
+            // Immediate hotfix (2026-08-22, audit follow-up to Wave 8): this used to inline
+            // its own copy of get_pending_review/status-check/digest-check/approve-or-decline
+            // instead of calling the shared `decide_via_agent_relay` below -- the one
+            // safety-relevant check it performs (diff_digest == hash_content(diff_preview))
+            // lived in two places that could silently drift apart. Now this MCP tool and the
+            // CLI's `calm review *-via-agent-relay` subcommands both call the exact same core
+            // function, matching what that function's own doc comment already claimed.
+            use calm_core::authority::AgentRelayOutcome as Outcome;
+            match calm_core::authority::decide_via_agent_relay(
+                &conn,
+                &p.review_id,
+                &p.diff_digest,
+                p.approve,
+            ) {
+                Ok(Outcome::Decided(status)) => {
+                    // Best-effort, read-only: the row survives its own status update (an
+                    // UPDATE, not a DELETE), so this is safe to fetch after deciding purely
+                    // to enrich the audit-log line below with the path that was touched.
+                    let path = calm_core::authority::get_pending_review(&conn, &p.review_id)
+                        .ok()
+                        .flatten()
+                        .map(|r| r.path)
+                        .unwrap_or_default();
                     tracing::info!(
                         target: crate::telemetry::AUDIT_TARGET,
                         session_id = self.session_id,
@@ -3069,14 +3164,38 @@ impl CalmServer {
                             "agent_relay_declined"
                         },
                         review_id = %p.review_id,
-                        path = %review.path,
+                        path = %path,
                     );
                     ToolOutcome::success(ReviewDecideOutput {
                         review_id: p.review_id,
-                        status: if p.approve { "approved" } else { "declined" }.to_string(),
+                        status: status.to_string(),
                     })
                 }
-                Ok(false) => ToolOutcome::error(error_detail(
+                Ok(Outcome::NotFound) => ToolOutcome::error(error_detail(
+                    "REVIEW_NOT_FOUND",
+                    &format!(
+                        "no review {} -- never existed, already decided, or expired",
+                        p.review_id
+                    ),
+                    false,
+                )),
+                Ok(Outcome::AlreadyDecided(status)) => ToolOutcome::error(error_detail(
+                    "REVIEW_ALREADY_DECIDED",
+                    &format!(
+                        "review {} is already '{}' -- do not re-decide it",
+                        p.review_id, status
+                    ),
+                    false,
+                )),
+                Ok(Outcome::DigestMismatch) => ToolOutcome::error(error_detail(
+                    "DIFF_DIGEST_MISMATCH",
+                    "the echoed diff_digest does not match this review's actual current \
+                     diff_preview -- fetch it fresh (get_pending_review's diff_preview, or `calm \
+                     review show`) and echo hash_content of THAT exact text; do not guess or \
+                     reuse a stale digest",
+                    true,
+                )),
+                Ok(Outcome::Race) => ToolOutcome::error(error_detail(
                     "REVIEW_ALREADY_DECIDED",
                     "the review was decided or expired between the check above and this write \
                      -- race, re-fetch and retry",
@@ -3742,6 +3861,104 @@ fn fingerprint_hunks(path: &str, hunks: &[calm_core::edit::HunkRequest]) -> Stri
     calm_core::digest::evidence_digest(material.as_bytes())
 }
 
+/// Wave 9 (audit follow-up): human-readable rendering of a
+/// `ChangeIntentTarget` list for a WRONG_TARGET_SCOPE mismatch message --
+/// `path::qualified_name` when scoped to a symbol, `path (path-only)`
+/// otherwise.
+fn format_targets_for_mismatch(targets: &[calm_core::change::ChangeIntentTarget]) -> String {
+    targets
+        .iter()
+        .map(|t| match &t.qualified_name {
+            Some(qn) => qn.clone(),
+            None => format!("{} (path-only)", t.path),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Wave 9 (audit follow-up): best-effort WRONG_TARGET_SCOPE enrichment --
+/// recovers the raw target list the authority was actually minted for (via
+/// `ReviewAuthority::minted_targets_for_mismatch_detail`) and compares it
+/// against what this edit, as proposed, actually touches. `None` when the
+/// lookup itself fails (authority/intent gone) -- the caller falls back to
+/// the plain `AuthorityError::WrongTargetScope` message in that case, same
+/// as before this existed.
+fn wrong_target_scope_detail(
+    state_conn: &rusqlite::Connection,
+    authority_id: &str,
+    current_targets: &[calm_core::change::ChangeIntentTarget],
+) -> Option<String> {
+    let minted = calm_core::authority::ReviewAuthority::minted_targets_for_mismatch_detail(
+        state_conn,
+        authority_id,
+    )?;
+    Some(format!(
+        "minted for: [{}]; this edit as proposed touches: [{}]",
+        format_targets_for_mismatch(&minted),
+        format_targets_for_mismatch(current_targets),
+    ))
+}
+
+/// Wave 10 (Item 4 companion, standalone warning -- see the
+/// `calm-item4-wave10-deep-research-2026-08-22` research note): after a
+/// whole-symbol `edit_symbol` "replace" (position unset/"replace",
+/// `old_text: None`), warn when `new_text`'s leading non-blank line
+/// duplicates a line that already sits, unedited, immediately above the
+/// OLD `[line_start, line_end]` range on disk.
+///
+/// This is the exact bug class this session's own `BlastRadiusInfo` edit
+/// hit live: a whole-struct replace's `new_text` redundantly re-included
+/// `#[derive(Serialize, JsonSchema)]`, which was never part of the
+/// replaced range in the first place -- `edit_symbol`'s "replace" range is
+/// a symbol's own indexed `[line_start, line_end]`, and
+/// `collect_decorators`/`container_decorators_of` confirm decorators/
+/// attributes/annotations are ALWAYS separate preceding sibling nodes,
+/// never folded into that span, for any of the 24 supported languages
+/// (`parser.rs`'s `walk_symbols`). The result is a silent duplicate line,
+/// not necessarily a compile error every language's toolchain would catch
+/// (Rust's `E0119` duplicate-derive is the exception, not the rule).
+///
+/// Warns only -- never blocks -- since legitimately touching/repeating a
+/// decorator line one edit at a time is a real, valid pattern (e.g.
+/// widening `#[derive(Debug)]` to `#[derive(Debug, Clone)]` while the
+/// symbol body itself is replaced separately).
+fn duplicate_decoration_risk_note(live: &str, line_start: usize, new_text: &str) -> Option<String> {
+    let new_first = new_text.lines().find(|l| !l.trim().is_empty())?.trim();
+    if new_first.is_empty() {
+        return None;
+    }
+    let live_lines: Vec<&str> = live.lines().collect();
+    // 0-indexed line directly above line_start (1-indexed); None if
+    // line_start is at or above the top of the file.
+    let mut idx = line_start.checked_sub(2)?;
+    const MAX_SCAN: usize = 20; // generous cap on stacked decorators/attrs
+    for _ in 0..MAX_SCAN {
+        let Some(existing) = live_lines.get(idx) else {
+            break;
+        };
+        let trimmed = existing.trim();
+        if trimmed.is_empty() {
+            break;
+        }
+        if trimmed == new_first {
+            return Some(format!(
+                "duplicate decoration risk — new_text's first line ({new_first:?}) already \
+                 appears, unedited, immediately above this replace's range (line {}); a \
+                 symbol's range never includes its own leading decorators/attributes/\
+                 annotations, so writing it again in new_text will leave two copies. If it \
+                 was meant to UPDATE that line, edit it directly with edit_lines on the wider \
+                 range instead of repeating it inside new_text",
+                idx + 1
+            ));
+        }
+        if idx == 0 {
+            break;
+        }
+        idx -= 1;
+    }
+    None
+}
+
 /// One `symbols` row overlapping an edit's touched ranges — enough fields
 /// to compute both the raw caller_count/hub risk tier and (when
 /// `caller_count == 0`) the same `is_entry_point`-aware dead-code signal
@@ -3868,13 +4085,22 @@ fn hub_kind_strength(kind: &str) -> u8 {
 /// force the full write gate on nearly every struct/enum edit in this
 /// codebase for no real reason.
 /// `compute_touch_risk`'s return: `(risk, hub_hit, strongest_hub_kind,
-/// uncertain_zero_caller, touched, risk_rule_reason)`. The 6th element,
-/// `risk_rule_reason`, is `Some(human-readable reason)` iff either a
-/// `risk_rules` entry, OR the edit overlapping a touched symbol's own
-/// signature line range, raised `risk` above what the structural
+/// uncertain_zero_caller, touched, risk_rule_reason, touches_uncovered_code)`.
+/// The 6th element, `risk_rule_reason`, is `Some(human-readable reason)` iff
+/// either a `risk_rules` entry, OR the edit overlapping a touched symbol's
+/// own signature line range, raised `risk` above what the structural
 /// (caller-count/hub) signal alone would have produced -- `classify_gate`
 /// uses this instead of its generic ">10 callers" explanation when present,
 /// so the gate's stated reason stays accurate to what actually triggered it.
+/// The 7th element, `touches_uncovered_code` (Wave 10, item 1): the same
+/// boolean already folded into `risk`/`risk_rule_reason` below, exposed
+/// discretely so a caller that only has a *speculative* placeholder hunk
+/// (`real_hunks=false` -- `edit_context`'s `gate_prediction`,
+/// `edit_context_range`) can still learn the real value at mint time
+/// instead of hardcoding `false` in its own `RiskVector` -- CCK-29d's
+/// original comment called this "structurally uncomputable" before mint
+/// existed, but the placeholder-hunk callers already reach this exact
+/// computation; it was just being discarded, not actually unknowable.
 type TouchRiskResult = (
     Option<String>,
     bool,
@@ -3882,6 +4108,7 @@ type TouchRiskResult = (
     Option<UncertainZeroCallerReason>,
     Vec<TouchedSymbolOutput>,
     Option<String>,
+    bool,
 );
 
 // 8 params: each is an independently meaningful input (conn, project_root,
@@ -4149,6 +4376,7 @@ pub(crate) fn compute_touch_risk(
         uncertain_zero_caller,
         touched,
         risk_rule_reason,
+        touches_uncovered_code,
     )
 }
 
@@ -4911,6 +5139,25 @@ pub(crate) struct EditSymbolParams {
     /// `position` is not `"replace"`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) old_text: Option<String>,
+    /// Wave 10 (Item 4): `"node"` (default) or `"decorated_declaration"`.
+    /// Only meaningful when `position` is unset/`"replace"`
+    /// (`SCOPE_REQUIRES_REPLACE` otherwise). `"node"` keeps today's
+    /// behavior: the symbol's own indexed `[line_start, line_end]`, which
+    /// never includes leading decorators/attributes/annotations (they are
+    /// always separate preceding sibling nodes in every supported
+    /// language's grammar). `"decorated_declaration"` widens the replaced
+    /// range upward through those, re-derived from a fresh parse each
+    /// call (never trusted from the index) -- so replacing a decorated
+    /// symbol can swap its decorators/attributes along with its body in
+    /// one hunk instead of leaving them behind (see
+    /// `duplicate_decoration_risk_note` for what happens if `new_text`
+    /// repeats them under the default `"node"` scope instead). With
+    /// `expected_hash: None` this previews the WIDENED range's current
+    /// hash/content, same round-trip `edit_lines`/`edit_symbol` already
+    /// use elsewhere -- learn the hash for the wider range before writing
+    /// it for real.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) scope: Option<String>,
     /// See `EditLinesParams::change_id`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) change_id: Option<String>,

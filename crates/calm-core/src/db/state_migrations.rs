@@ -167,6 +167,12 @@ pub const STATE_MIGRATIONS: &[StateMigration] = &[
         name: "v11_pending_reviews",
         apply: v10_to_v11_pending_reviews,
     },
+    StateMigration {
+        from: 11,
+        to: 12,
+        name: "v12_authority_risk_vector_fields",
+        apply: v11_to_v12_authority_risk_vector_fields,
+    },
 ];
 
 /// v1->v2 (CCK-07): adds `evidence_snapshots`, `change_intents`,
@@ -842,6 +848,71 @@ fn v10_to_v11_pending_reviews(conn: &Connection) -> Result<(), StateMigrationErr
     Ok(())
 }
 
+/// v11->v12 (Wave 10, item 3): adds `review_authorities.mint_*` columns --
+/// the raw `RiskVector` fields a mint actually decided against, not just
+/// their digest. Before this, `RiskVector` was "compute-only... nothing
+/// persisted yet" (see `policy/model.rs`'s own module doc comment) -- a
+/// spend-time recomputation that legitimately differs from mint time on
+/// even one field (e.g. `touches_uncovered_code`, closed for two of three
+/// mint paths by Wave 10 item 1) changed `risk_vector_digest` and failed
+/// `StaleRiskVector` outright, with no way to tell whether the drift made
+/// the spend MORE risky than what was reviewed, or just DIFFERENT.
+/// Storing the raw fields lets `verify_only` fall back to a sound,
+/// per-field `spend ⊑ mint` comparison (`RiskVector::is_covered_by`) when
+/// the digests don't match outright -- grounded in `policy::evaluate`'s
+/// own provable monotonicity (every axis only ever RAISES the decided
+/// risk level, never lowers it), so `current ⊑ minted` implies
+/// `evaluate(current)` cannot be riskier than what was already approved.
+/// `mint_hub_kind`/`mint_risk_rule_floor` are nullable (mirrors
+/// `RiskVector`'s own `Option<...>` shape); every other new column is a
+/// 0/1 bool or the empty-string default the existing digest columns
+/// already use the same pattern for.
+fn v11_to_v12_authority_risk_vector_fields(conn: &Connection) -> Result<(), StateMigrationError> {
+    let mut stmt = conn.prepare("PRAGMA table_info(review_authorities)")?;
+    let existing_columns: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(|r| r.ok())
+        .collect();
+    let new_columns: &[(&str, &str)] = &[
+        ("mint_caller_count_level", "TEXT NOT NULL DEFAULT ''"),
+        ("mint_is_hub", "INTEGER NOT NULL DEFAULT 0"),
+        ("mint_hub_kind", "TEXT"),
+        ("mint_signature_changed", "INTEGER NOT NULL DEFAULT 0"),
+        ("mint_uncertain_zero_caller", "INTEGER NOT NULL DEFAULT 0"),
+        ("mint_risk_rule_floor", "TEXT"),
+        ("mint_kind_mismatch", "INTEGER NOT NULL DEFAULT 0"),
+        ("mint_touches_manifest", "INTEGER NOT NULL DEFAULT 0"),
+        ("mint_touches_uncovered_code", "INTEGER NOT NULL DEFAULT 0"),
+    ];
+    for (name, ddl) in new_columns {
+        if !existing_columns.iter().any(|c| c == name) {
+            conn.execute_batch(&format!(
+                "ALTER TABLE review_authorities ADD COLUMN {name} {ddl};"
+            ))?;
+        }
+    }
+
+    let mut stmt = conn.prepare("PRAGMA table_info(review_authorities)")?;
+    let now_has_all = {
+        let cols: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .filter_map(|r| r.ok())
+            .collect();
+        new_columns
+            .iter()
+            .all(|(name, _)| cols.iter().any(|c| c == name))
+    };
+    if !now_has_all {
+        return Err(StateMigrationError::PostconditionFailed {
+            migration: "v12_authority_risk_vector_fields",
+            detail: "review_authorities is missing one or more mint_* RiskVector columns \
+                      after this step's own DDL ran"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// A DB stamped 0 (created before `b677a9e`'s downgrade guard existed, or
 /// never opened by a versioned entry point) and one stamped 1 (the only
 /// version that has ever shipped) both mean "v1 baseline" -- see the
@@ -1253,6 +1324,40 @@ mod tests {
             "policy_decision_digest",
             "risk_vector_digest",
             "required_approver_class",
+        ] {
+            assert!(
+                columns.iter().any(|c| c == expected),
+                "review_authorities.{expected} should exist"
+            );
+        }
+    }
+
+    #[test]
+    fn registered_v11_to_v12_migration_adds_mint_risk_vector_columns() {
+        let conn = fresh_conn();
+        conn.pragma_update(None, "user_version", 11).unwrap();
+        migrate_state_db_to_current(&conn).unwrap();
+        assert_eq!(
+            user_version(&conn),
+            super::super::schema::STATE_DB_SCHEMA_VERSION
+        );
+        let columns: Vec<String> = conn
+            .prepare("PRAGMA table_info(review_authorities)")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        for expected in [
+            "mint_caller_count_level",
+            "mint_is_hub",
+            "mint_hub_kind",
+            "mint_signature_changed",
+            "mint_uncertain_zero_caller",
+            "mint_risk_rule_floor",
+            "mint_kind_mismatch",
+            "mint_touches_manifest",
+            "mint_touches_uncovered_code",
         ] {
             assert!(
                 columns.iter().any(|c| c == expected),

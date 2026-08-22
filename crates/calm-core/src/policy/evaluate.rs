@@ -173,6 +173,43 @@ impl RiskVector {
         let material = serde_json::to_string(self).unwrap_or_else(|_| format!("{:?}", self));
         crate::digest::evidence_digest(format!("risk-vector-v1\n{material}").as_bytes())
     }
+
+    /// Wave 10 (item 2): a formally-grounded, per-field "no riskier than"
+    /// check -- `self` (the current, spend-time vector) is covered by
+    /// `minted` (the vector `evaluate()` already approved at mint time)
+    /// iff every axis `evaluate()` itself reads is no more escalatory in
+    /// `self` than in `minted`. Because `evaluate()` (above) is provably
+    /// monotone -- it starts from `caller_count_level` and every
+    /// subsequent axis only ever RAISES the running level via `.max(...)`,
+    /// never lowers it -- `self.is_covered_by(minted) == true` proves
+    /// `evaluate(self, policy).aggregate_risk <= evaluate(minted,
+    /// policy).aggregate_risk` for any single `policy` both vectors are
+    /// judged under (`kind_mismatch_floor`/`manifest_floor`/
+    /// `uncovered_code_floor` come from `policy`, not the vector, so this
+    /// alone doesn't prove anything across a policy change -- callers must
+    /// independently confirm the policy digest still matches, exactly as
+    /// `verify_only` already does via its own `StalePolicy` check).
+    /// `risk_rule_floor` compares via `Option<RiskLevel>`'s own derived
+    /// `Ord` (`None` sorts below every `Some(_)`), which already matches
+    /// `evaluate()`'s "no floor configured contributes nothing" reading.
+    ///
+    /// `hub_kind` is deliberately excluded: `evaluate()` never reads its
+    /// STRING value for the risk level, only `is_hub`'s bool (`hub_kind`
+    /// only feeds `evaluate()`'s own human-readable `reasons` text, plus a
+    /// separate, independently-and-freshly-recomputed bridge-downgrade
+    /// eligibility check in calm-server that never trusts a stored
+    /// authority's claimed `hub_kind` in the first place) -- including it
+    /// here would reject spends `evaluate()` itself would judge identical.
+    pub fn is_covered_by(&self, minted: &RiskVector) -> bool {
+        self.caller_count_level <= minted.caller_count_level
+            && self.risk_rule_floor <= minted.risk_rule_floor
+            && (!self.is_hub || minted.is_hub)
+            && (!self.signature_changed || minted.signature_changed)
+            && (!self.uncertain_zero_caller || minted.uncertain_zero_caller)
+            && (!self.kind_mismatch || minted.kind_mismatch)
+            && (!self.touches_manifest || minted.touches_manifest)
+            && (!self.touches_uncovered_code || minted.touches_uncovered_code)
+    }
 }
 
 #[cfg(test)]
@@ -308,6 +345,132 @@ mod tests {
         b.touches_manifest = true;
         assert_ne!(a.digest(), b.digest());
         assert_eq!(a.digest(), base_vector().digest());
+    }
+
+    #[test]
+    fn is_covered_by_is_reflexive() {
+        let v = base_vector();
+        assert!(v.is_covered_by(&v));
+    }
+
+    #[test]
+    fn is_covered_by_true_when_spend_is_strictly_less_risky_on_every_axis() {
+        let spend = base_vector(); // everything at its weakest
+        let mut mint = base_vector();
+        mint.caller_count_level = RiskLevel::High;
+        mint.is_hub = true;
+        mint.signature_changed = true;
+        mint.uncertain_zero_caller = true;
+        mint.risk_rule_floor = Some(RiskLevel::High);
+        mint.kind_mismatch = true;
+        mint.touches_manifest = true;
+        mint.touches_uncovered_code = true;
+        assert!(
+            spend.is_covered_by(&mint),
+            "a strictly weaker spend must be covered by a strictly stronger mint"
+        );
+    }
+
+    #[test]
+    fn is_covered_by_false_when_spend_caller_count_level_exceeds_mint() {
+        let mut spend = base_vector();
+        spend.caller_count_level = RiskLevel::High;
+        let mut mint = base_vector();
+        mint.caller_count_level = RiskLevel::Low;
+        assert!(!spend.is_covered_by(&mint));
+    }
+
+    #[test]
+    fn is_covered_by_false_when_spend_has_a_bool_axis_mint_lacks() {
+        let mut spend = base_vector();
+        spend.touches_uncovered_code = true;
+        let mint = base_vector(); // touches_uncovered_code still false
+        assert!(
+            !spend.is_covered_by(&mint),
+            "spend touching uncovered code must not be covered by a mint that never saw it"
+        );
+    }
+
+    #[test]
+    fn is_covered_by_respects_risk_rule_floor_ordering() {
+        let mut spend_high_floor = base_vector();
+        spend_high_floor.risk_rule_floor = Some(RiskLevel::High);
+        let mint_no_floor = base_vector();
+        assert!(
+            !spend_high_floor.is_covered_by(&mint_no_floor),
+            "a spend-time floor absent at mint time must not be covered"
+        );
+
+        let spend_no_floor = base_vector();
+        let mut mint_low_floor = base_vector();
+        mint_low_floor.risk_rule_floor = Some(RiskLevel::Low);
+        assert!(
+            spend_no_floor.is_covered_by(&mint_low_floor),
+            "no spend-time floor is covered by any mint-time floor, including none at all"
+        );
+    }
+
+    #[test]
+    fn is_covered_by_ignores_hub_kind_text_when_is_hub_agrees() {
+        let mut spend = base_vector();
+        spend.is_hub = true;
+        spend.hub_kind = Some("bridge".to_string());
+        let mut mint = base_vector();
+        mint.is_hub = true;
+        mint.hub_kind = Some("degree".to_string());
+        assert!(
+            spend.is_covered_by(&mint),
+            "hub_kind text drift alone must not block coverage -- evaluate() never reads it \
+             for the risk level, only is_hub's bool"
+        );
+    }
+
+    #[test]
+    fn is_covered_by_soundly_implies_evaluate_is_no_riskier() {
+        // Direct check of the property is_covered_by's own doc comment
+        // claims: for a handful of concrete (spend, mint) pairs where
+        // is_covered_by holds, evaluate(spend) really is <= evaluate(mint)
+        // under the same policy -- not just asserted, verified.
+        let policy = Policy {
+            kind_mismatch_floor: RiskLevel::Medium,
+            manifest_floor: RiskLevel::Medium,
+            uncovered_code_floor: RiskLevel::High,
+        };
+        let pairs: Vec<(RiskVector, RiskVector)> = vec![
+            (base_vector(), {
+                let mut m = base_vector();
+                m.touches_uncovered_code = true;
+                m
+            }),
+            (
+                {
+                    let mut s = base_vector();
+                    s.caller_count_level = RiskLevel::Medium;
+                    s
+                },
+                {
+                    let mut m = base_vector();
+                    m.caller_count_level = RiskLevel::Medium;
+                    m.is_hub = true;
+                    m
+                },
+            ),
+            (base_vector(), base_vector()),
+        ];
+        for (spend, mint) in pairs {
+            assert!(
+                spend.is_covered_by(&mint),
+                "test fixture itself must be covered"
+            );
+            let spend_decision = evaluate(&spend, &policy);
+            let mint_decision = evaluate(&mint, &policy);
+            assert!(
+                spend_decision.aggregate_risk <= mint_decision.aggregate_risk,
+                "is_covered_by held but evaluate(spend)={:?} > evaluate(mint)={:?}",
+                spend_decision.aggregate_risk,
+                mint_decision.aggregate_risk
+            );
+        }
     }
 
     #[test]

@@ -1073,6 +1073,79 @@ fn collect_decorators<'a>(
     out
 }
 
+/// Wave 10 (Item 4, opt-in `edit_symbol` `scope="decorated_declaration"`):
+/// re-parses `source` fresh (same "never trust the DB for structural
+/// anchoring" discipline `extract_symbols`/`insertion_hunk_for` already
+/// follow) and returns the widened 1-indexed start line for the symbol
+/// whose own span is exactly `[line_start, line_end]` -- walking upward
+/// through leading decorator/attribute/comment sibling nodes exactly like
+/// `collect_decorators`, but returning the EARLIEST such sibling's own
+/// start line instead of its text.
+///
+/// For grammars where a decorator is a CHILD or FIELD of the declaration
+/// itself rather than a preceding sibling (Java annotations, a TS/JS
+/// class's own `decorator` field -- see `container_decorators_of`'s doc
+/// comment) this is a safe no-op: such a decorator sits INSIDE the node's
+/// own span already, so `line_start` already covers it and there is
+/// nothing left to widen.
+///
+/// Returns `None` if no node with that exact `[line_start, line_end]` span
+/// exists in the fresh parse (stale symbol -- caller should treat the same
+/// as `insertion_hunk_for`'s `STALE_SYMBOL`).
+pub fn decorated_declaration_start(
+    source: &str,
+    language: &str,
+    line_start: usize,
+    line_end: usize,
+) -> Option<usize> {
+    let tree = parse_tree(source, language).ok()?;
+    let kinds = decorator_node_kinds(language);
+    let target = find_exact_span_node(tree.root_node(), line_start, line_end)?;
+    let mut earliest = target.start_position().row + 1;
+    let mut sib = target.prev_named_sibling();
+    while let Some(s) = sib {
+        if matches!(s.kind(), "line_comment" | "block_comment" | "comment") {
+            earliest = s.start_position().row + 1;
+            sib = s.prev_named_sibling();
+            continue;
+        }
+        if !kinds.contains(&s.kind()) {
+            break;
+        }
+        earliest = s.start_position().row + 1;
+        sib = s.prev_named_sibling();
+    }
+    Some(earliest)
+}
+
+/// The shallowest (outermost) NAMED node whose own span is exactly
+/// `[line_start, line_end]` (1-indexed, inclusive) -- pre-order DFS,
+/// returns on first match without descending further, so a one-line
+/// declaration whose body happens to share the same start/end row (e.g.
+/// `def foo(): return 1`) resolves to the declaration node itself rather
+/// than an inner statement that coincidentally shares its span. Mirrors
+/// which node `walk_symbols` itself would have pushed a `ParsedSymbol`
+/// for.
+fn find_exact_span_node(
+    node: tree_sitter::Node,
+    line_start: usize,
+    line_end: usize,
+) -> Option<tree_sitter::Node> {
+    if node.is_named()
+        && node.start_position().row + 1 == line_start
+        && node.end_position().row + 1 == line_end
+    {
+        return Some(node);
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if let Some(found) = find_exact_span_node(child, line_start, line_end) {
+            return Some(found);
+        }
+    }
+    None
+}
+
 /// Whether `d` (a Rust `#[attr]`/`#[attr(...)]`/`#[path::attr]` source
 /// string) is a strong, general signal that something other than an
 /// ordinary call site invokes or registers whatever it's attached to —

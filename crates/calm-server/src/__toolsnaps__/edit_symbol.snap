@@ -79,6 +79,13 @@
           "null"
         ]
       },
+      "scope": {
+        "description": "Wave 10 (Item 4): `\"node\"` (default) or `\"decorated_declaration\"`.\nOnly meaningful when `position` is unset/`\"replace\"`\n(`SCOPE_REQUIRES_REPLACE` otherwise). `\"node\"` keeps today's\nbehavior: the symbol's own indexed `[line_start, line_end]`, which\nnever includes leading decorators/attributes/annotations (they are\nalways separate preceding sibling nodes in every supported\nlanguage's grammar). `\"decorated_declaration\"` widens the replaced\nrange upward through those, re-derived from a fresh parse each\ncall (never trusted from the index) -- so replacing a decorated\nsymbol can swap its decorators/attributes along with its body in\none hunk instead of leaving them behind (see\n`duplicate_decoration_risk_note` for what happens if `new_text`\nrepeats them under the default `\"node\"` scope instead). With\n`expected_hash: None` this previews the WIDENED range's current\nhash/content, same round-trip `edit_lines`/`edit_symbol` already\nuse elsewhere -- learn the hash for the wider range before writing\nit for real.",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
       "change_id": {
         "description": "See `EditLinesParams::change_id`.",
         "type": [

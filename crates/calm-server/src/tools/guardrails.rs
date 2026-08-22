@@ -198,7 +198,7 @@ impl CalmServer {
             };
 
             let blast_radius = {
-                let (entries, _capped) = transitive_bfs(
+                let (entries, capped) = transitive_bfs(
                     &conn,
                     &c.qualified_name,
                     EdgeDirection::Callers,
@@ -225,6 +225,7 @@ impl CalmServer {
                 BlastRadiusInfo {
                     transitive,
                     files_affected,
+                    capped: capped.then_some(true),
                 }
             };
 
@@ -345,7 +346,14 @@ impl CalmServer {
             // includes an enclosing class when this symbol sits inside one
             // (closes F2b, not just F2). Single source of truth with the
             // real gate -- see classify_gate's doc comment.
-            let gate_prediction = {
+            // Wave 9 (audit follow-up, finding #4 -- nested-symbol
+            // WRONG_TARGET_SCOPE): `gate_touched` is also returned now so
+            // mint_review_authority_for_edit_context below can bind the
+            // SAME touched-symbol set (method + any enclosing class/struct
+            // whose own range overlaps [c.line_start, c.line_end]) that a
+            // real edit_lines/edit_symbol spend against this range will
+            // compute for itself -- see that function's own doc comment.
+            let (gate_prediction, gate_touched, gate_touches_uncovered_code) = {
                 let gate_policy = calm_core::policy::loader::load_policy_or_warn(&self.project_root);
                 let (
                     gate_risk,
@@ -354,6 +362,7 @@ impl CalmServer {
                     gate_uncertain_zero_caller,
                     gate_touched,
                     gate_risk_rule_reason,
+                    gate_touches_uncovered_code,
                 ) = edit::compute_touch_risk(
                     &conn,
                     &self.project_root,
@@ -403,14 +412,18 @@ impl CalmServer {
                     .filter(|t| t.is_hub)
                     .map(|t| t.qualified_name.clone())
                     .collect();
-                GatePredictionOutput {
-                    will_block: classification.will_block_without_confirm,
-                    is_hub: c.is_hub,
-                    hub_kind: gate_hub_kind,
-                    blocking_symbols,
-                    requires: classification.requirement.as_str().to_string(),
-                    reason: classification.why,
-                }
+                (
+                    GatePredictionOutput {
+                        will_block: classification.will_block_without_confirm,
+                        is_hub: c.is_hub,
+                        hub_kind: gate_hub_kind,
+                        blocking_symbols,
+                        requires: classification.requirement.as_str().to_string(),
+                        reason: classification.why,
+                    },
+                    gate_touched,
+                    gate_touches_uncovered_code,
+                )
             };
 
             // Structural half of edit_symbol/edit_lines' confirm gate (docs/
@@ -451,6 +464,8 @@ impl CalmServer {
                 &c,
                 &caller_set_digest,
                 graph_generation,
+                &gate_touched,
+                gate_touches_uncovered_code,
             );
             self.record_edit_context_review(
                 &c.qualified_name,
@@ -1018,6 +1033,16 @@ pub(crate) struct EditContextParams {
 pub(crate) struct BlastRadiusInfo {
     pub(crate) transitive: i64,
     pub(crate) files_affected: Vec<String>,
+    /// Wave 9 (audit follow-up, finding #5): whether the transitive BFS hit
+    /// `callers.max_depth_cap`/`callers.transitive_timeout_ms` before
+    /// finishing -- `transitive`/`files_affected` are then a LOWER bound,
+    /// not the true blast radius, same "truncated, don't trust as exact"
+    /// meaning `callers_truncated`/`callees_truncated` already carry on
+    /// this same output. Previously computed (`transitive_bfs`'s second
+    /// return value) but silently discarded as `_capped`. `Some(true)`
+    /// when capped, absent otherwise -- never `Some(false)`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) capped: Option<bool>,
 }
 
 /// How much `caller_count`/`coreness`/`is_hub` moved since the oldest snapshot
@@ -1302,6 +1327,12 @@ impl CalmServer {
         c: &CandidateRow,
         caller_set_digest: &str,
         graph_generation: i64,
+        gate_touched: &[edit::TouchedSymbolOutput],
+        // Wave 10 (item 1): the real value, straight from gate_prediction's
+        // own compute_touch_risk call (a placeholder full-range hunk over
+        // [c.line_start, c.line_end] already makes this computable there --
+        // see TouchRiskResult's doc comment). Was hardcoded `false` here.
+        touches_uncovered_code: bool,
     ) -> Option<MintedAuthorityOutput> {
         // WS2b (audit follow-up, gap #1): opened before `compute` so a
         // past full reconciliation recorded via
@@ -1372,11 +1403,10 @@ impl CalmServer {
             .and_then(|(level, _glob)| calm_core::policy::RiskLevel::parse(level)),
             kind_mismatch: false,
             touches_manifest: calm_core::change::classify::is_manifest_path(&c.path),
-            touches_uncovered_code: false,
+            touches_uncovered_code,
         };
         let policy_decision = calm_core::policy::evaluate(&risk_vector, &policy);
         let policy_decision_digest = policy_decision.digest();
-        let risk_vector_digest = risk_vector.digest();
 
         // CCK-23/WS2 (audit follow-up): mirror the same tiered freshness
         // gate review_change now applies -- see FreshnessClass::meets_bar_for's
@@ -1400,15 +1430,38 @@ impl CalmServer {
 
         snapshot.persist(&tx).ok()?;
 
-        let target = calm_core::change::ChangeIntentTarget {
-            path: c.path.clone(),
-            qualified_name: Some(c.qualified_name.clone()),
-        };
+        // Wave 9 (audit follow-up, finding #4 -- nested-symbol
+        // WRONG_TARGET_SCOPE): bind EVERY symbol this range touches, not
+        // just the resolved candidate `c` -- `gate_touched` is the exact
+        // same compute_touch_risk scan gate_prediction already ran over
+        // [c.line_start, c.line_end], so it already includes any enclosing
+        // class/struct whose own indexed range overlaps this one. A real
+        // edit_lines/edit_symbol spend against this same range
+        // independently recomputes the identical touched-symbol set
+        // (edit_lines_impl_gated's own compute_touch_risk call) -- binding
+        // only `c` here meant a spend that also (unavoidably) touched the
+        // enclosing symbol always failed WRONG_TARGET_SCOPE, even though
+        // nothing outside what edit_context reviewed was ever touched.
+        let mut seen_qns = std::collections::HashSet::new();
+        let mut targets: Vec<calm_core::change::ChangeIntentTarget> = gate_touched
+            .iter()
+            .filter(|t| seen_qns.insert(t.qualified_name.clone()))
+            .map(|t| calm_core::change::ChangeIntentTarget {
+                path: c.path.clone(),
+                qualified_name: Some(t.qualified_name.clone()),
+            })
+            .collect();
+        if seen_qns.insert(c.qualified_name.clone()) {
+            targets.push(calm_core::change::ChangeIntentTarget {
+                path: c.path.clone(),
+                qualified_name: Some(c.qualified_name.clone()),
+            });
+        }
         let intent = calm_core::change::ChangeIntent::new(
             calm_core::change::ChangeIntentKind(calm_core::change::ChangeKind::Body),
             "edit_context compat wrapper: single-symbol review (CCK-10)",
             snapshot.snapshot_id.clone(),
-            vec![target.clone()],
+            targets.clone(),
         );
         calm_core::change::insert_change_intent(&tx, &intent, None).ok()?;
 
@@ -1422,9 +1475,9 @@ impl CalmServer {
                 policy_digest: &policy_digest,
                 principal: &principal,
                 ttl_secs: authority_ttl,
-                targets: &[target],
+                targets: &targets,
                 policy_decision_digest: &policy_decision_digest,
-                risk_vector_digest: &risk_vector_digest,
+                risk_vector: &risk_vector,
                 required_approver_class: policy_decision.required_approver_class,
             },
         )
@@ -1495,18 +1548,25 @@ impl CalmServer {
 
         let config = self.config();
         let policy = calm_core::policy::loader::load_policy_or_warn(&self.project_root);
-        let (risk, hub_hit, hub_kind, uncertain_zero_caller, touched, risk_rule_reason) =
-            edit::compute_touch_risk(
-                conn,
-                &self.project_root,
-                path,
-                &[(start, end)],
-                &self.coverage.read_ok(),
-                &config.risk_rules,
-                &[(start, end, "")],
-                &policy,
-                false,
-            );
+        let (
+            risk,
+            hub_hit,
+            hub_kind,
+            uncertain_zero_caller,
+            touched,
+            risk_rule_reason,
+            range_touches_uncovered_code,
+        ) = edit::compute_touch_risk(
+            conn,
+            &self.project_root,
+            path,
+            &[(start, end)],
+            &self.coverage.read_ok(),
+            &config.risk_rules,
+            &[(start, end, "")],
+            &policy,
+            false,
+        );
 
         let bridge_downgrade_eligible = hub_kind.as_deref() == Some("bridge")
             && risk.as_deref() != Some("high")
@@ -1573,6 +1633,7 @@ impl CalmServer {
             uncertain_zero_caller.is_some(),
             &caller_set_digest,
             graph_generation,
+            range_touches_uncovered_code,
         );
         // Structural half of the legacy confirm/reason gate
         // (edit_lines_impl_gated, edit.rs): record that this path's
@@ -1607,6 +1668,7 @@ impl CalmServer {
             blast_radius: BlastRadiusInfo {
                 transitive: 0,
                 files_affected: Vec::new(),
+                capped: None,
             },
             range_checksum,
             risk_assessment: risk.map(|level| RiskAssessmentOutput {
@@ -1657,6 +1719,10 @@ impl CalmServer {
         uncertain_zero_caller: bool,
         caller_set_digest: &str,
         graph_generation: i64,
+        // Wave 10 (item 1): real value from edit_context_range's own
+        // compute_touch_risk call (placeholder full-range hunk) -- was
+        // hardcoded `false` here, same fix as the single-symbol mint path.
+        touches_uncovered_code: bool,
     ) -> Option<MintedAuthorityOutput> {
         let mut state_conn = calm_core::db::conn::open_state_writer(&self.state_db_path).ok()?;
         let snapshot = calm_core::authority::EvidenceSnapshot::compute_with_recorded_freshness(
@@ -1694,11 +1760,10 @@ impl CalmServer {
             .and_then(|(level, _glob)| calm_core::policy::RiskLevel::parse(level)),
             kind_mismatch: false,
             touches_manifest: calm_core::change::classify::is_manifest_path(path),
-            touches_uncovered_code: false,
+            touches_uncovered_code,
         };
         let policy_decision = calm_core::policy::evaluate(&risk_vector, &policy);
         let policy_decision_digest = policy_decision.digest();
-        let risk_vector_digest = risk_vector.digest();
 
         if !snapshot
             .freshness_class
@@ -1748,7 +1813,7 @@ impl CalmServer {
                 ttl_secs: authority_ttl,
                 targets: &targets,
                 policy_decision_digest: &policy_decision_digest,
-                risk_vector_digest: &risk_vector_digest,
+                risk_vector: &risk_vector,
                 required_approver_class: policy_decision.required_approver_class,
             },
         )

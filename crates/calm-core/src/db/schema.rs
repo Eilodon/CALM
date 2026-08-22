@@ -60,7 +60,13 @@ pub const INDEX_DB_SCHEMA_VERSION: i64 = 1;
 // connected MCP client completes the elicitation round-trip without ever
 // showing anything to an actual human. See db/state_migrations.rs's
 // registered v10->v11 step for the full rationale.
-pub const STATE_DB_SCHEMA_VERSION: i64 = 11;
+// v12 (Wave 10, item 3): adds review_authorities.mint_* columns -- the raw
+// RiskVector fields a mint actually decided against, not just their
+// digest, so a spend-time staleness check can fall back to a sound
+// per-field spend<=mint comparison instead of only exact digest equality.
+// See db/state_migrations.rs's registered v11->v12 step for the full
+// rationale.
+pub const STATE_DB_SCHEMA_VERSION: i64 = 12;
 
 /// Refuses to proceed if `conn`'s stamped `PRAGMA user_version` is HIGHER
 /// than `expected` -- meaning a newer CALM binary already created or
@@ -848,13 +854,27 @@ CREATE TABLE IF NOT EXISTS review_authorities (
     -- v5 / CCK-26 (audit follow-up): what a REAL PolicyEngine::evaluate()
     -- run actually decided for this authority, not just a policy-config
     -- digest -- policy_decision_digest/risk_vector_digest are audit/
-    -- provenance (bound+signed, not yet re-verified fresh at spend time --
-    -- that staleness check is a follow-up, same shape as target_scope_digest's).
-    -- required_approver_class is what review_change actually gates minting
-    -- on: 'human' cannot be satisfied by self-attested approved:true alone.
+    -- provenance (bound+signed). required_approver_class is what
+    -- review_change actually gates minting on: 'human' cannot be satisfied
+    -- by self-attested approved:true alone.
     policy_decision_digest  TEXT NOT NULL DEFAULT '',
     risk_vector_digest      TEXT NOT NULL DEFAULT '',
-    required_approver_class TEXT NOT NULL DEFAULT 'self_reviewed'
+    required_approver_class TEXT NOT NULL DEFAULT 'self_reviewed',
+    -- v12 / Wave 10 item 3: the raw RiskVector fields risk_vector_digest
+    -- is a hash OF -- re-verified against that (signed) digest before ever
+    -- being trusted, so tampering with these columns alone (without also
+    -- forging the signature) is detected, not silently accepted. Lets
+    -- verify_only fall back to a sound spend<=mint comparison instead of
+    -- only exact digest equality when the digests themselves don't match.
+    mint_caller_count_level    TEXT NOT NULL DEFAULT '',
+    mint_is_hub                INTEGER NOT NULL DEFAULT 0,
+    mint_hub_kind               TEXT,
+    mint_signature_changed      INTEGER NOT NULL DEFAULT 0,
+    mint_uncertain_zero_caller  INTEGER NOT NULL DEFAULT 0,
+    mint_risk_rule_floor        TEXT,
+    mint_kind_mismatch          INTEGER NOT NULL DEFAULT 0,
+    mint_touches_manifest       INTEGER NOT NULL DEFAULT 0,
+    mint_touches_uncovered_code INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_review_authorities_intent ON review_authorities(intent_id);
 
