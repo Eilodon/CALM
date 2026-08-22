@@ -358,6 +358,29 @@
               "null"
             ]
           },
+          "truncated": {
+            "description": "Wave 11 (item 1): `Some(true)` only when `max_lines` cut this\nresponse short of the full resolved range -- mirrors the existing\n`callers_truncated`/`callees_truncated` pattern. Omitted entirely\n(not `Some(false)`) when the full range was returned.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "omitted_lines": {
+            "description": "How many lines past `next_cursor` were left out of this response.\nOnly set alongside `truncated: Some(true)`.",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "next_cursor": {
+            "description": "Absolute 1-indexed line to pass as `resume_from_line` on the next\ncall to continue reading where this response left off. Only set\nalongside `truncated: Some(true)`.",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
           "suggested_next": {
             "anyOf": [
               {
@@ -510,7 +533,15 @@
         ]
       }
     },
+    "required": [
+      "state"
+    ],
+    "type": "object",
     "properties": {
+      "state": {
+        "description": "Wave 11 (item 3, \"unified continuation state machine\"): present on\nevery response regardless of success/error -- `\"ready\"` on success,\nor one of `needs_context`/`needs_human_review`/`needs_verification`/\n`blocked` on error (see `classify_error_state`'s own doc comment).\nLets an agent dispatch on ONE top-level field instead of\nmaintaining its own per-`code` remediation table across ~70\ndistinct codes.",
+        "type": "string"
+      },
       "error": {
         "anyOf": [
           {
@@ -595,8 +626,7 @@
           "$ref": "#/$defs/UnderstandAlternative"
         }
       }
-    },
-    "type": "object"
+    }
   },
   "annotations": {
     "readOnlyHint": true,

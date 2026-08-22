@@ -258,7 +258,15 @@ impl CalmServer {
             // `c.line_start`/`c.line_end`). `verified_bytes` is `None` only
             // when verify_live's own read failed (rare: TOCTOU delete,
             // permission change) -- same "unreadable" outcome as before.
-            let (raw_source, data_source, etag) = match verified_bytes {
+            let (
+                raw_source,
+                data_source,
+                etag,
+                truncated,
+                omitted_lines,
+                next_cursor,
+                rendered_start_line,
+            ) = match verified_bytes {
                 Some(content) => {
                     let lines: Vec<&str> = content.lines().collect();
                     // Both ends clamped to lines.len() (2026-08-20
@@ -276,9 +284,51 @@ impl CalmServer {
                         c.line_start as usize,
                         c.line_end as usize,
                     );
-                    (lines[start..end].join("\n"), "disk", etag)
+                    // Wave 11 (item 1, "response budget"): `etag` above
+                    // always covers the FULL [c.line_start, c.line_end]
+                    // range regardless of pagination below -- it's a
+                    // range-identity signal, not tied to how much of the
+                    // range was actually rendered in `source`.
+                    let (truncated, omitted_lines, next_cursor, slice_start, slice_end) =
+                        if end > start {
+                            let (p_start, p_end, truncated, omitted_lines, next_cursor) =
+                                Self::paginate_range(
+                                    start as i64 + 1,
+                                    end as i64,
+                                    p.resume_from_line,
+                                    p.max_lines,
+                                );
+                            let slice_start = (p_start as usize).saturating_sub(1).min(lines.len());
+                            let slice_end = (p_end as usize).min(lines.len()).max(slice_start);
+                            (
+                                truncated,
+                                omitted_lines,
+                                next_cursor,
+                                slice_start,
+                                slice_end,
+                            )
+                        } else {
+                            (None, None, None, start, end)
+                        };
+                    (
+                        lines[slice_start..slice_end].join("\n"),
+                        "disk",
+                        etag,
+                        truncated,
+                        omitted_lines,
+                        next_cursor,
+                        slice_start as i64 + 1,
+                    )
                 }
-                None => ("(source file not readable)".into(), "unavailable", None),
+                None => (
+                    "(source file not readable)".into(),
+                    "unavailable",
+                    None,
+                    None,
+                    None,
+                    None,
+                    c.line_start,
+                ),
             };
 
             // A non-hub symbol read fresh from disk is directly edit-ready:
@@ -327,6 +377,9 @@ impl CalmServer {
                     content_warning: None,
                     etag,
                     not_modified: Some(true),
+                    truncated: None,
+                    omitted_lines: None,
+                    next_cursor: None,
                     suggested_next: sn,
                 });
             }
@@ -337,7 +390,7 @@ impl CalmServer {
             let sanitized = sanitize_source_output(&raw_source);
             let content_warning = injection_warning(&sanitized);
             let rendered = if p.line_numbers {
-                calm_core::edit::with_line_gutters(&sanitized, c.line_start)
+                calm_core::edit::with_line_gutters(&sanitized, rendered_start_line)
             } else {
                 sanitized
             };
@@ -365,9 +418,51 @@ impl CalmServer {
                 content_warning,
                 etag,
                 not_modified: None,
+                truncated,
+                omitted_lines,
+                next_cursor,
                 suggested_next: sn,
             })
         }))
+    }
+
+    /// Wave 11 (item 1, "response budget"): applies `resume_from_line`/
+    /// `max_lines` pagination to an already-resolved `[start, end]` 1-indexed
+    /// inclusive line range -- lets a huge symbol/range body be split across
+    /// multiple `source` calls instead of overflowing one response (the
+    /// concrete motivating case: a single `source` call on a large symbol
+    /// returning well over 100K characters with no way to ask for less). Both
+    /// params are opt-in (`None`/unset = today's unlimited behavior, zero risk
+    /// to existing callers). Returns the (possibly narrowed) `[start, end]` to
+    /// actually slice, plus the truncation signal for the response --
+    /// `etag`/`range_checksum` are computed by the CALLER over the full
+    /// original `[start, end]`, never this narrowed one, since pagination is a
+    /// display-size concern, not a different range identity. Caller must only
+    /// invoke this when `end > start` (a genuinely non-empty range).
+    fn paginate_range(
+        start: i64,
+        end: i64,
+        resume_from_line: Option<i64>,
+        max_lines: Option<i64>,
+    ) -> (i64, i64, Option<bool>, Option<i64>, Option<i64>) {
+        let eff_start = resume_from_line
+            .map(|r| r.clamp(start, end))
+            .unwrap_or(start);
+        let eff_end = match max_lines {
+            Some(m) if m > 0 => (eff_start + m - 1).min(end),
+            _ => end,
+        };
+        if eff_end < end {
+            (
+                eff_start,
+                eff_end,
+                Some(true),
+                Some(end - eff_end),
+                Some(eff_end + 1),
+            )
+        } else {
+            (eff_start, eff_end, None, None, None)
+        }
     }
 
     /// Range mode for `source`: read a raw `[line, end_line]` window from a
@@ -436,8 +531,21 @@ impl CalmServer {
         }
         let s = start as usize - 1;
         let e = (end_req as usize).min(lines.len());
-        let raw = lines[s..e].join("\n");
         let etag = calm_core::edit::range_checksum(&content, start as usize, e);
+        // Wave 11 (item 1, "response budget"): same pagination `source()`
+        // applies in symbol mode -- `etag` above always covers the FULL
+        // requested [start, e] range regardless of pagination below.
+        let (truncated, omitted_lines, next_cursor, slice_s, slice_e) = if e as i64 > start {
+            let (p_start, p_end, truncated, omitted_lines, next_cursor) =
+                Self::paginate_range(start, e as i64, p.resume_from_line, p.max_lines);
+            let slice_s = (p_start as usize).saturating_sub(1).min(lines.len());
+            let slice_e = (p_end as usize).min(lines.len()).max(slice_s);
+            (truncated, omitted_lines, next_cursor, slice_s, slice_e)
+        } else {
+            (None, None, None, s, e)
+        };
+        let raw = lines[slice_s..slice_e].join("\n");
+        let rendered_start_line = slice_s as i64 + 1;
         // Reuse whatever language the file's symbols were indexed as (any row
         // for this path); empty if the file has no indexed symbols.
         let language: String = conn
@@ -451,7 +559,7 @@ impl CalmServer {
         let sanitized = sanitize_source_output(&raw);
         let content_warning = injection_warning(&sanitized);
         let rendered = if p.line_numbers {
-            calm_core::edit::with_line_gutters(&sanitized, start)
+            calm_core::edit::with_line_gutters(&sanitized, rendered_start_line)
         } else {
             sanitized
         };
@@ -481,6 +589,9 @@ impl CalmServer {
             content_warning,
             etag,
             not_modified: None,
+            truncated,
+            omitted_lines,
+            next_cursor,
             suggested_next: sn,
         })
     }
@@ -692,6 +803,9 @@ impl CalmServer {
                     content_warning,
                     etag: None,
                     not_modified: None,
+                    truncated: None,
+                    omitted_lines: None,
+                    next_cursor: None,
                     suggested_next: None,
                 })
             });
@@ -1360,6 +1474,23 @@ pub(crate) struct SourceParams {
     /// `not_modified: true` instead of re-sending the body.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) if_none_match: Option<String>,
+    /// Wave 11 (item 1, "response budget"): 1-indexed absolute line number
+    /// to resume reading from within the resolved range -- pairs with a
+    /// prior truncated response's `next_cursor`. Ignored (starts from the
+    /// range's own first line) when omitted. Clamped into
+    /// `[line_start, line_end]` if out of bounds rather than erroring.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) resume_from_line: Option<i64>,
+    /// Wave 11 (item 1, "response budget"): caps how many lines of `source`
+    /// come back in one call -- `None` (default) is today's unlimited
+    /// behavior. When the resolved range has more lines than this, the
+    /// response is cut short and carries `truncated: true`/`next_cursor`
+    /// (pass that back as `resume_from_line` to continue). Purely opt-in:
+    /// omitting it changes nothing about existing behavior. `etag` is
+    /// always the hash of the FULL range regardless of pagination -- it's
+    /// a range-identity signal, not tied to how much of it was rendered.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) max_lines: Option<i64>,
 }
 
 /// serde default for `SourceParams::line_numbers`: numbered output is the
@@ -1411,6 +1542,21 @@ pub(crate) struct SourceOutput {
     /// already has the unchanged content.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) not_modified: Option<bool>,
+    /// Wave 11 (item 1): `Some(true)` only when `max_lines` cut this
+    /// response short of the full resolved range -- mirrors the existing
+    /// `callers_truncated`/`callees_truncated` pattern. Omitted entirely
+    /// (not `Some(false)`) when the full range was returned.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) truncated: Option<bool>,
+    /// How many lines past `next_cursor` were left out of this response.
+    /// Only set alongside `truncated: Some(true)`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) omitted_lines: Option<i64>,
+    /// Absolute 1-indexed line to pass as `resume_from_line` on the next
+    /// call to continue reading where this response left off. Only set
+    /// alongside `truncated: Some(true)`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) next_cursor: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) suggested_next: Option<SuggestedNext>,
 }

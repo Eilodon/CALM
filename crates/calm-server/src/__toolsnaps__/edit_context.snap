@@ -415,7 +415,15 @@
         ]
       }
     },
+    "required": [
+      "state"
+    ],
+    "type": "object",
     "properties": {
+      "state": {
+        "description": "See `ToolOutcome::state`'s own doc comment -- same contract, plus\n`ambiguous`/`not_found` both map onto `needs_context` (the caller\nneeds one more piece of information: which candidate, or a\ndifferent query).",
+        "type": "string"
+      },
       "error": {
         "anyOf": [
           {
@@ -590,8 +598,7 @@
           }
         ]
       }
-    },
-    "type": "object"
+    }
   },
   "annotations": {
     "readOnlyHint": false,

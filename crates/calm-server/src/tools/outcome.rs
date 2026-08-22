@@ -132,6 +132,131 @@ pub(crate) fn error_detail(code: &str, message: &str, recoverable: bool) -> Erro
         recoverable,
     }
 }
+
+/// Wave 11 (item 3, "unified continuation state machine"): classifies an
+/// error `code` into the vocabulary `ToolOutcome`/`ResolvedOutcome` expose
+/// on every response's top-level `state` field -- `needs_context` (fix/
+/// supply missing input, disambiguate, or resolve a different way),
+/// `needs_human_review` (a human or independent reviewer must act before
+/// this can proceed), `needs_verification` (evidence/authority is stale --
+/// re-derive fresh state, don't just retry blindly), or `blocked` (a hard
+/// stop: infra failure, security boundary, or integrity refusal not
+/// fixable by supplying different params). `ready` (success, no `error`)
+/// is set directly by `ToolOutcome::success`/`ResolvedOutcome::success`,
+/// never by this function.
+///
+/// Every code this codebase currently emits (grepped from every
+/// `error_detail`/`error_output`/`ErrorDetail{..}` call site, 2026-08-22)
+/// has an explicit arm below -- not left to guess from `recoverable` alone,
+/// which turned out NOT to reliably predict the right bucket (most
+/// `INVALID_*`/`*_REQUIRED` codes are `recoverable: false` yet are exactly
+/// "fix your params and retry", i.e. `needs_context`, not `blocked`). A
+/// code added later that isn't listed here falls through to the `_` arm,
+/// which reuses `recoverable`'s own existing per-call-site meaning as a
+/// conservative (not necessarily precise) default rather than panicking.
+fn classify_error_state(code: &str, recoverable: bool) -> &'static str {
+    match code {
+        // A human or independent reviewer must act (approve/decline,
+        // confirm, complete an elicitation round-trip) before this can
+        // proceed -- no amount of retrying or gathering more context
+        // substitutes for that.
+        "HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW"
+        | "CONFIRM_REQUIRED"
+        | "REASON_NOT_GROUNDED"
+        | "APPROVAL_REQUIRED"
+        | "INDEPENDENT_REVIEW_NOT_AVAILABLE_HERE"
+        | "ELICITATION_PENDING"
+        | "ELICITATION_TIMEOUT"
+        | "ELICITATION_FAILED"
+        | "AGENT_RELAY_DISABLED"
+        | "USER_DECLINED"
+        | "REVIEW_ALREADY_DECIDED"
+        | "DIFF_DIGEST_MISMATCH" => "needs_human_review",
+
+        // Evidence/authority this call relied on is stale, unconfirmed, or
+        // has drifted since it was gathered -- re-derive fresh state
+        // (re-run edit_context, re-mint, re-check), not a blind retry.
+        "STALE_GRAPH_AUTHORITY"
+        | "STALE_CALLER_SET"
+        | "STALE_SYMBOL"
+        | "STALE_AMBIGUOUS"
+        | "AUTHORITY_SNAPSHOT_CHECK_FAILED"
+        | "AUTHORITY_SNAPSHOT_DEGRADED_SINCE_MINT"
+        | "EVIDENCE_NOT_FRESH"
+        | "VERIFICATION_SNAPSHOT_CHANGED"
+        | "VERIFICATION_SNAPSHOT_UNREADABLE"
+        | "INTENT_SUPERSEDED"
+        | "UNCERTAIN_ZERO_CALLER"
+        | "FITNESS_CHECK_FAILED" => "needs_verification",
+
+        // Hard stop: an infra failure, a security/containment boundary, or
+        // a data-integrity refusal -- not fixable by supplying different
+        // params or gathering more context.
+        "DB_ERROR"
+        | "DB_LOCKED"
+        | "STATE_DB_ERROR"
+        | "AUTHORITY_DB_ERROR"
+        | "INTERNAL"
+        | "READ_FAILED"
+        | "WRITE_FAILED"
+        | "FILE_NOT_READABLE"
+        | "PARSE_ERROR"
+        | "REPARSE_FAILED"
+        | "SNAPSHOT_ERROR"
+        | "CARGO_SPAWN_FAILED"
+        | "LSP_REFRESH_FAILED"
+        | "SCIP_REFRESH_FAILED"
+        | "MAINTENANCE_RETRY_FAILED"
+        | "TRANSACTION_INIT_FAILED"
+        | "TX_JOURNAL_ERROR"
+        | "EDIT_LOCK_FAILED"
+        | "MINT_FAILED"
+        | "QUERY_FAILED"
+        | "FEATURE_UNAVAILABLE"
+        | "EMBEDDINGS_NOT_READY"
+        | "PATH_ESCAPES_PROJECT_ROOT"
+        | "LOSSY_WRITE_REJECTED" => "blocked",
+
+        // The majority bucket: malformed/incomplete params, an unresolved
+        // or ambiguous name, or a lookup that needs a different query --
+        // fixable by the caller supplying more/different input and calling
+        // again, no review or fresh-evidence round-trip needed.
+        "AMBIGUOUS_MATCH"
+        | "BOUNDARY_AMBIGUOUS"
+        | "CHANGE_NOT_FOUND"
+        | "INVALID_AUTHORITY_PARAMS"
+        | "INVALID_CHANGE_KIND"
+        | "INVALID_HUNKS"
+        | "INVALID_INPUT"
+        | "INVALID_PARAMS"
+        | "INVALID_POSITION"
+        | "INVALID_RANGE"
+        | "INVALID_SCOPE"
+        | "INVALID_TTL"
+        | "MATCH_NOT_FOUND"
+        | "MISSING_TARGET"
+        | "NOT_FOUND"
+        | "NO_CARGO_MANIFEST"
+        | "NO_TARGETS"
+        | "ORIENTATION_REQUIRED"
+        | "PATH_REQUIRED"
+        | "PATH_RESOLUTION_FAILED"
+        | "REVIEW_NOT_FOUND"
+        | "TARGETS_REQUIRED"
+        | "TX_NOT_FOUND"
+        | "UNKNOWN_JOB_KIND"
+        | "UNKNOWN_TOOLSET"
+        | "EDIT_CONTEXT_REQUIRED" => "needs_context",
+
+        _ => {
+            if recoverable {
+                "needs_context"
+            } else {
+                "blocked"
+            }
+        }
+    }
+}
 pub(crate) fn db_error<T>(e: impl std::fmt::Display) -> ToolOutcome<T> {
     ToolOutcome::error(error_detail(
         "DB_ERROR",
@@ -164,6 +289,14 @@ pub(crate) fn db_error_resolved<T>(e: impl std::fmt::Display) -> ResolvedOutcome
 /// existed (`{"error": {...}}` or `T`'s fields directly at the root).
 #[derive(Serialize, JsonSchema)]
 pub(crate) struct ToolOutcome<T> {
+    /// Wave 11 (item 3, "unified continuation state machine"): present on
+    /// every response regardless of success/error -- `"ready"` on success,
+    /// or one of `needs_context`/`needs_human_review`/`needs_verification`/
+    /// `blocked` on error (see `classify_error_state`'s own doc comment).
+    /// Lets an agent dispatch on ONE top-level field instead of
+    /// maintaining its own per-`code` remediation table across ~70
+    /// distinct codes.
+    pub(crate) state: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<ErrorDetail>,
     #[serde(flatten, skip_serializing_if = "Option::is_none")]
@@ -172,7 +305,9 @@ pub(crate) struct ToolOutcome<T> {
 
 impl<T> ToolOutcome<T> {
     pub(crate) fn error(detail: ErrorDetail) -> Self {
+        let state = classify_error_state(&detail.code, detail.recoverable);
         ToolOutcome {
+            state,
             error: Some(detail),
             success: None,
         }
@@ -180,6 +315,7 @@ impl<T> ToolOutcome<T> {
 
     pub(crate) fn success(value: T) -> Self {
         ToolOutcome {
+            state: "ready",
             error: None,
             success: Some(value),
         }
@@ -333,6 +469,11 @@ impl Caveat {
 /// root-`type:object` reasoning as `ToolOutcome<T>` above.
 #[derive(Serialize, JsonSchema)]
 pub(crate) struct ResolvedOutcome<T> {
+    /// See `ToolOutcome::state`'s own doc comment -- same contract, plus
+    /// `ambiguous`/`not_found` both map onto `needs_context` (the caller
+    /// needs one more piece of information: which candidate, or a
+    /// different query).
+    pub(crate) state: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<ErrorDetail>,
     #[serde(flatten, skip_serializing_if = "Option::is_none")]
@@ -348,7 +489,9 @@ pub(crate) struct ResolvedOutcome<T> {
 
 impl<T> ResolvedOutcome<T> {
     pub(crate) fn error(detail: ErrorDetail) -> Self {
+        let state = classify_error_state(&detail.code, detail.recoverable);
         ResolvedOutcome {
+            state,
             error: Some(detail),
             ambiguous: None,
             success: None,
@@ -368,6 +511,7 @@ impl<T> ResolvedOutcome<T> {
 
     pub(crate) fn ambiguous(candidates: &[CandidateRow]) -> Self {
         ResolvedOutcome {
+            state: "needs_context",
             error: None,
             ambiguous: Some(to_ambiguous(candidates)),
             success: None,
@@ -377,6 +521,7 @@ impl<T> ResolvedOutcome<T> {
 
     pub(crate) fn success(value: T) -> Self {
         ResolvedOutcome {
+            state: "ready",
             error: None,
             ambiguous: None,
             success: Some(value),

@@ -60,7 +60,14 @@
         ]
       }
     },
+    "required": [
+      "state"
+    ],
+    "type": "object",
     "properties": {
+      "state": {
+        "type": "string"
+      },
       "error": {
         "anyOf": [
           {
@@ -75,9 +82,6 @@
         "type": "string"
       },
       "path": {
-        "type": "string"
-      },
-      "state": {
         "type": "string"
       },
       "replay_state": {
@@ -102,8 +106,7 @@
           }
         ]
       }
-    },
-    "type": "object"
+    }
   },
   "annotations": {
     "readOnlyHint": true,

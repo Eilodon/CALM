@@ -60,7 +60,15 @@
         ]
       }
     },
+    "required": [
+      "state"
+    ],
+    "type": "object",
     "properties": {
+      "state": {
+        "description": "The transaction's state after this call: unchanged when `tier` is\n\"none\"/\"unsupported\", else DONE or FAILED depending on the check\nresult.",
+        "type": "string"
+      },
       "error": {
         "anyOf": [
           {
@@ -88,10 +96,6 @@
           "null"
         ]
       },
-      "state": {
-        "description": "The transaction's state after this call: unchanged when `tier` is\n\"none\"/\"unsupported\", else DONE or FAILED depending on the check\nresult.",
-        "type": "string"
-      },
       "diagnostics": {
         "type": "array",
         "items": {
@@ -117,8 +121,7 @@
           }
         ]
       }
-    },
-    "type": "object"
+    }
   },
   "annotations": {
     "readOnlyHint": false,
