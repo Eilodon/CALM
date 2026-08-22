@@ -3,24 +3,23 @@
   "description": "ALWAYS CALL THIS before any code modification — mandatory, never skip. USE WHEN: you are about to edit, refactor, or delete a symbol. NOT FOR: read-only inspection (use symbol_info + source). NOT post-edit (use diff_impact).",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "required": [
-      "symbol"
-    ],
-    "type": "object",
     "properties": {
       "symbol": {
-        "description": "Bare symbol name (not a `path::name` qualified name) — e.g. `load`,\nnot `crates/calm-core/src/embedding.rs::Embedder::load`.",
-        "type": "string"
+        "description": "Bare symbol name (not a `path::name` qualified name) — e.g. `load`,\nnot `crates/calm-core/src/embedding.rs::Embedder::load`. Omit ONLY\nin range mode (see `end_line`), where a raw `[line, end_line]`\nwindow is reviewed directly with no symbol resolution — mirrors\n`source`'s own `symbol`-omitted range mode (Wave 8 audit follow-up,\nP0-A).",
+        "type": [
+          "string",
+          "null"
+        ]
       },
       "path": {
-        "description": "Narrows the search to one file when `symbol` alone is ambiguous\nacross the repo. Repo-relative, e.g. `crates/calm-core/src/embedding.rs`.",
+        "description": "Narrows the search to one file when `symbol` alone is ambiguous\nacross the repo. Repo-relative, e.g. `crates/calm-core/src/embedding.rs`.\nRequired in range mode.",
         "type": [
           "string",
           "null"
         ]
       },
       "line": {
-        "description": "Disambiguates same-named symbols in the same file (e.g. a\n`#[cfg(feature)]` real impl vs. its stub) — any line within the\nintended candidate's range, as echoed in an earlier `ambiguous`\nresponse's `line_start`/`line_end`.",
+        "description": "Disambiguates same-named symbols in the same file (e.g. a\n`#[cfg(feature)]` real impl vs. its stub) — any line within the\nintended candidate's range, as echoed in an earlier `ambiguous`\nresponse's `line_start`/`line_end`. In range mode (symbol omitted)\nthis is the 1-indexed START line of the window to review.",
         "type": [
           "integer",
           "null"
@@ -28,11 +27,19 @@
         "format": "int64"
       },
       "qualified_name": {
-        "description": "5.3 (Wave 5): exact `qualified_name` from a prior `search`/`locate`\nresult — when set, resolves directly by identity and `path`/`line`\nare ignored, so this can never come back ambiguous even for a\nglobally-common bare `symbol` name. Still flows through the same\nlive-verification every resolution does (Wave 1's `verify_live`).",
+        "description": "5.3 (Wave 5): exact `qualified_name` from a prior `search`/`locate`\nresult — when set, resolves directly by identity and `path`/`line`\nare ignored, so this can never come back ambiguous even for a\nglobally-common bare `symbol` name. Still flows through the same\nlive-verification every resolution does (Wave 1's `verify_live`).\nIgnored in range mode.",
         "type": [
           "string",
           "null"
         ]
+      },
+      "end_line": {
+        "description": "Range mode: 1-indexed, inclusive END line of a raw window to\nreview directly from `path` with no symbol resolution — for\nmodule-level or between-symbol code no symbol range covers (pure\nwhitespace/comment/module-constant/gap regions). Requires `path` +\n`line` (the start) and `symbol` omitted. Ignored in symbol mode.\nWave 8 (audit follow-up, P0-A): before this, Strict mode had no\nsuccess path at all for editing such a region — neither the\nconfirm/reason gate nor the full ReviewAuthority path could ever\nclear, because nothing could review it first.",
+        "type": [
+          "integer",
+          "null"
+        ],
+        "format": "int64"
       },
       "if_none_match": {
         "description": "`edges_etag` from a prior `edit_context` call on this exact symbol —\nif the caller/callee lists haven't changed since, the response omits\n`callers`/`callees` and sets `edges_not_modified: true`. Every other\nfield (`risk_assessment`, `dead_code_confidence`, `blast_radius`,\n`trend`, `co_changed_files`, `range_checksum`) is always recomputed\nand returned in full regardless — never gated behind this etag, since\nthis is the mandatory pre-edit safety tool and none of those may go\nsilently stale.",
@@ -41,7 +48,8 @@
           "null"
         ]
       }
-    }
+    },
+    "type": "object"
   },
   "outputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",

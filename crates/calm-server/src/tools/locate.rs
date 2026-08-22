@@ -341,7 +341,18 @@ impl CalmServer {
                     name: r.name.clone(),
                     path: r.path.clone(),
                     // 3.4 (Wave 3, P1-3): see search()'s own identical hunk.
-                    qualified_name: Some(r.qualified_name.clone()),
+                    // Wave 8 (audit follow-up): only a real, resolvable
+                    // symbol identity gets a `qualified_name` here now --
+                    // `r.kind` is `None` for a gap chunk (no enclosing
+                    // symbol, see chunk_hit_to_result in search.rs) and for
+                    // kind="file"/"grep" hits (also not symbol-backed), the
+                    // same cases whose synthesized stand-in `r.qualified_name`
+                    // (e.g. a bare filename or a `path#chunk:N-M` marker) is
+                    // not a real identity `source`/`edit_context` can resolve
+                    // -- this used to be an unconditional Some(...), which
+                    // made the dedicated gap-chunk branch below permanently
+                    // unreachable.
+                    qualified_name: r.kind.is_some().then(|| r.qualified_name.clone()),
                     kind: r.kind.clone(),
                     line_start: r.line_start,
                     line_end: r.line_end,
@@ -466,16 +477,29 @@ impl CalmServer {
                 // is a synthesized stand-in (e.g. the bare filename for a
                 // gap chunk, see chunk_hit_to_result in search.rs), so
                 // suggesting source(symbol=...) against it is a guaranteed
-                // NotFound. Use source's range mode (path+line, no symbol
-                // resolution) when a line is known, else fall back to
-                // file_overview.
-                match results[0].line_start {
-                    Some(line) => suggested_with_args(
+                // NotFound. Use source's range mode (path+line+end_line, no
+                // symbol resolution) when both ends are known, else fall
+                // back to file_overview.
+                //
+                // Wave 8 (audit follow-up): this branch is reachable now
+                // that `qualified_name` above is no longer unconditionally
+                // `Some(...)`. Also fixed: source's range mode
+                // (inspect.rs::source_range) requires BOTH `line` and
+                // `end_line` -- the previous args here supplied only `line`,
+                // which would have hit INVALID_PARAMS even once this branch
+                // became reachable.
+                match (results[0].line_start, results[0].line_end) {
+                    (Some(line), Some(end_line)) => suggested_with_args(
                         "source",
                         "Read implementation (body match, not a named symbol)",
-                        serde_json::json!({"path": results[0].path, "line": line}),
+                        serde_json::json!({"path": results[0].path, "line": line, "end_line": end_line}),
                     ),
-                    None => suggested_with_args(
+                    (Some(line), None) => suggested_with_args(
+                        "source",
+                        "Read implementation (body match, not a named symbol)",
+                        serde_json::json!({"path": results[0].path, "line": line, "end_line": line}),
+                    ),
+                    _ => suggested_with_args(
                         "file_overview",
                         "No symbol or line to anchor on — see the file's structure",
                         serde_json::json!({"path": results[0].path}),

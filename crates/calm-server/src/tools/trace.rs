@@ -226,10 +226,24 @@ impl CalmServer {
                     "High blast radius or uncertain edges — verify before modifying",
                 )
             } else if count > 0 {
+                // Wave 8 (audit follow-up): `direct[0].symbol` is
+                // `call_edges.from_symbol`, confirmed a qualified name (it's
+                // selected alongside `LEFT JOIN symbols s ON s.qualified_name
+                // = ce.from_symbol` above) -- passing it bare into `source`'s
+                // `symbol` param used to guarantee NotFound, since
+                // resolve_symbol_candidates falls back to `WHERE name = ?1`
+                // (a bare-name match) whenever `qualified_name` isn't also
+                // set. Supply both: a real bare leaf name for `symbol` (also
+                // required so `source` doesn't fall into its own range-mode
+                // gate, which keys on `symbol` being non-empty regardless of
+                // `qualified_name`), plus the exact `qualified_name` so
+                // resolution can never land on the wrong same-named symbol.
+                let qn = direct[0].symbol.as_str();
+                let bare = qn.rsplit("::").next().unwrap_or(qn);
                 suggested_with_args(
                     "source",
                     "Read top caller implementation",
-                    serde_json::json!({"symbol": direct[0].symbol}),
+                    serde_json::json!({"symbol": bare, "qualified_name": qn}),
                 )
             } else if ambiguous_count > 0 {
                 suggested(

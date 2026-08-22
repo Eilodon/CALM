@@ -35,10 +35,20 @@ impl CalmServer {
                 Ok(c) => c,
                 Err(e) => return db_error_resolved(e),
             };
+            // Range mode: `symbol` omitted -> review a raw [line, end_line]
+            // window straight from `path`, no symbol resolution. Mirrors
+            // `source`'s own range-mode dispatch (inspect.rs). Wave 8 (audit
+            // follow-up, P0-A): before this, a pure whitespace/comment/
+            // module-level/gap region had no way to be reviewed at all, so
+            // Strict mode's edit gate had no success path for editing one.
+            let symbol_name = match p.symbol.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                Some(s) => s.to_string(),
+                None => return self.edit_context_range(&conn, &p),
+            };
             let resolution = match resolve_symbol(
                 &conn,
                 &self.project_root,
-                &p.symbol,
+                &symbol_name,
                 p.path.as_deref(),
                 p.line,
                 p.qualified_name.as_deref(),
@@ -47,7 +57,7 @@ impl CalmServer {
                 Err(e) => return db_error_resolved(e),
             };
             let (c, verified_bytes) = match resolution {
-                SymbolResolution::NotFound => return ResolvedOutcome::not_found(&p.symbol),
+                SymbolResolution::NotFound => return ResolvedOutcome::not_found(&symbol_name),
                 SymbolResolution::Ambiguous(candidates) => {
                     return ResolvedOutcome::ambiguous(&candidates);
                 }
@@ -496,7 +506,7 @@ impl CalmServer {
             };
 
             ResolvedOutcome::success(EditContextOutput {
-                symbol: p.symbol,
+                symbol: symbol_name,
                 edges_ready: self.edges_ready(),
                 index_freshness: self.phase_str(),
                 callers,
@@ -954,16 +964,23 @@ impl CalmServer {
 #[allow(dead_code)]
 pub(crate) struct EditContextParams {
     /// Bare symbol name (not a `path::name` qualified name) — e.g. `load`,
-    /// not `crates/calm-core/src/embedding.rs::Embedder::load`.
-    pub(crate) symbol: String,
+    /// not `crates/calm-core/src/embedding.rs::Embedder::load`. Omit ONLY
+    /// in range mode (see `end_line`), where a raw `[line, end_line]`
+    /// window is reviewed directly with no symbol resolution — mirrors
+    /// `source`'s own `symbol`-omitted range mode (Wave 8 audit follow-up,
+    /// P0-A).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) symbol: Option<String>,
     /// Narrows the search to one file when `symbol` alone is ambiguous
     /// across the repo. Repo-relative, e.g. `crates/calm-core/src/embedding.rs`.
+    /// Required in range mode.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) path: Option<String>,
     /// Disambiguates same-named symbols in the same file (e.g. a
     /// `#[cfg(feature)]` real impl vs. its stub) — any line within the
     /// intended candidate's range, as echoed in an earlier `ambiguous`
-    /// response's `line_start`/`line_end`.
+    /// response's `line_start`/`line_end`. In range mode (symbol omitted)
+    /// this is the 1-indexed START line of the window to review.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) line: Option<i64>,
     /// 5.3 (Wave 5): exact `qualified_name` from a prior `search`/`locate`
@@ -971,8 +988,20 @@ pub(crate) struct EditContextParams {
     /// are ignored, so this can never come back ambiguous even for a
     /// globally-common bare `symbol` name. Still flows through the same
     /// live-verification every resolution does (Wave 1's `verify_live`).
+    /// Ignored in range mode.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) qualified_name: Option<String>,
+    /// Range mode: 1-indexed, inclusive END line of a raw window to
+    /// review directly from `path` with no symbol resolution — for
+    /// module-level or between-symbol code no symbol range covers (pure
+    /// whitespace/comment/module-constant/gap regions). Requires `path` +
+    /// `line` (the start) and `symbol` omitted. Ignored in symbol mode.
+    /// Wave 8 (audit follow-up, P0-A): before this, Strict mode had no
+    /// success path at all for editing such a region — neither the
+    /// confirm/reason gate nor the full ReviewAuthority path could ever
+    /// clear, because nothing could review it first.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) end_line: Option<i64>,
     /// `edges_etag` from a prior `edit_context` call on this exact symbol —
     /// if the caller/callee lists haven't changed since, the response omits
     /// `callers`/`callees` and sets `edges_not_modified: true`. Every other
@@ -1304,13 +1333,36 @@ impl CalmServer {
         // of what this authority claims. Computed BEFORE the freshness gate
         // below (WS2, audit follow-up) -- that gate now needs
         // `required_approver_class` to know which freshness bar applies.
+        // Wave 8 (audit follow-up, P0-E): real hub_kind, straight from
+        // `symbols` -- mirrors review_change's own CCK-26/WS1 fix
+        // (change.rs), which this auto-mint path never received. Left as
+        // `hub_kind: None` unconditionally, this authority's risk_vector
+        // digest could never match the real spend-time digest
+        // (edit_lines_impl_gated computes hub_kind for real via
+        // compute_touch_risk) for ANY actual hub symbol -- so every
+        // authority minted here for a hub target was unspendable via the
+        // authority path, deterministically, not as a race: spend always
+        // failed closed with AUTHORITY_STALE_RISK_VECTOR, forcing every
+        // hub edit back onto the legacy confirm/reason/cites gate
+        // regardless of whether the caller had a valid authority in hand.
+        let hub_kind: Option<String> = if c.is_hub {
+            conn.query_row(
+                "SELECT hub_kind FROM symbols WHERE qualified_name = ?1",
+                rusqlite::params![c.qualified_name],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .ok()
+            .flatten()
+        } else {
+            None
+        };
         let risk_vector = calm_core::policy::RiskVector {
             caller_count_level: calm_core::policy::RiskLevel::parse(
                 super::detail::risk_level_from_caller_count(c.caller_count),
             )
             .unwrap_or(calm_core::policy::RiskLevel::Low),
             is_hub: c.is_hub,
-            hub_kind: None,
+            hub_kind,
             signature_changed: false,
             uncertain_zero_caller: false,
             risk_rule_floor: calm_core::config::risk_floor_for_path(
@@ -1371,6 +1423,330 @@ impl CalmServer {
                 principal: &principal,
                 ttl_secs: authority_ttl,
                 targets: &[target],
+                policy_decision_digest: &policy_decision_digest,
+                risk_vector_digest: &risk_vector_digest,
+                required_approver_class: policy_decision.required_approver_class,
+            },
+        )
+        .ok()?;
+
+        tx.commit().ok()?;
+
+        Some(MintedAuthorityOutput {
+            change_id: intent.intent_id,
+            authority_id: authority.authority_id,
+            authority_expires_at: authority.expires_at,
+        })
+    }
+
+    /// Range mode for `edit_context`: review a raw `[line, end_line]`
+    /// window with no symbol resolution -- mirrors `source`'s own range
+    /// mode (`source_range`, inspect.rs). Wave 8 (audit follow-up, P0-A):
+    /// gives a pure whitespace/comment/module-level/gap region -- exactly
+    /// the content `edit_lines` touches when no indexed symbol's range
+    /// covers the hunk -- a real review to point back to, on both the
+    /// legacy confirm/reason gate (`record_path_context_review`) and the
+    /// full ReviewAuthority mint+spend path
+    /// (`mint_review_authority_for_edit_context_range`). Before this,
+    /// neither existed for such a region and Strict mode had no success
+    /// path at all for editing one.
+    fn edit_context_range(
+        &self,
+        conn: &rusqlite::Connection,
+        p: &EditContextParams,
+    ) -> ResolvedOutcome<EditContextOutput> {
+        let path = match p.path.as_deref() {
+            Some(pth) if !pth.is_empty() => pth,
+            _ => {
+                return ResolvedOutcome::error(error_detail(
+                    "INVALID_PARAMS",
+                    "range mode needs `path` (plus `line` and `end_line`) when `symbol` is omitted",
+                    false,
+                ));
+            }
+        };
+        let (start, end) = match (p.line, p.end_line) {
+            (Some(s), Some(e)) if s >= 1 && e >= s => (s, e),
+            _ => {
+                return ResolvedOutcome::error(error_detail(
+                    "INVALID_PARAMS",
+                    "range mode needs `line` (start) and `end_line` (end), 1-indexed with end >= start",
+                    false,
+                ));
+            }
+        };
+        self.track_file(path);
+        let full_path = match edit::resolve_repo_path(&self.project_root, path) {
+            Ok(fp) => fp,
+            Err(e) => return ResolvedOutcome::error(e),
+        };
+        let content = match std::fs::read_to_string(&full_path) {
+            Ok(c) => c,
+            Err(_) => {
+                return ResolvedOutcome::error(error_detail(
+                    "FILE_NOT_READABLE",
+                    &format!("could not read {path}"),
+                    false,
+                ));
+            }
+        };
+        let range_checksum =
+            calm_core::edit::range_checksum(&content, start as usize, end as usize);
+
+        let config = self.config();
+        let policy = calm_core::policy::loader::load_policy_or_warn(&self.project_root);
+        let (risk, hub_hit, hub_kind, uncertain_zero_caller, touched, risk_rule_reason) =
+            edit::compute_touch_risk(
+                conn,
+                &self.project_root,
+                path,
+                &[(start, end)],
+                &self.coverage.read_ok(),
+                &config.risk_rules,
+                &[(start, end, "")],
+                &policy,
+                false,
+            );
+
+        let bridge_downgrade_eligible = hub_kind.as_deref() == Some("bridge")
+            && risk.as_deref() != Some("high")
+            && uncertain_zero_caller.is_none()
+            && edit::all_caller_edges_confident(
+                conn,
+                &touched
+                    .iter()
+                    .filter(|t| t.hub_kind.is_some())
+                    .map(|t| t.qualified_name.clone())
+                    .collect::<Vec<_>>(),
+            );
+        let classification = edit::classify_gate(
+            hub_hit,
+            risk.as_deref(),
+            uncertain_zero_caller,
+            bridge_downgrade_eligible,
+            config.edit.always_require_edit_context_effective(),
+            risk_rule_reason.as_deref(),
+        );
+        let blocking_symbols: Vec<String> = touched
+            .iter()
+            .filter(|t| t.is_hub)
+            .map(|t| t.qualified_name.clone())
+            .collect();
+        let gate_prediction = GatePredictionOutput {
+            will_block: classification.will_block_without_confirm,
+            is_hub: hub_hit,
+            hub_kind: hub_kind.clone(),
+            blocking_symbols,
+            requires: classification.requirement.as_str().to_string(),
+            reason: classification.why,
+        };
+
+        // Union of every touched symbol's live callers, same shape as
+        // edit_lines_impl_gated's own union_caller_set_digest (edit.rs) --
+        // empty when the range genuinely touches no indexed symbol, the
+        // common case this fix exists for. Kept identical to the
+        // spend-time computation (same query, same digest function) so a
+        // range authority minted here matches what edit_lines_impl_gated
+        // recomputes for the real hunks being written.
+        let mut union_callers: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+        for t in &touched {
+            union_callers.extend(edit::caller_symbol_set(conn, &t.qualified_name));
+        }
+        let caller_set_digest =
+            Self::caller_set_digest(&union_callers.into_iter().collect::<Vec<_>>());
+
+        let graph_generation: i64 = conn
+            .query_row(
+                "SELECT generation FROM graph_generation_state WHERE id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+
+        let minted = self.mint_review_authority_for_edit_context_range(
+            conn,
+            path,
+            &touched,
+            hub_hit,
+            hub_kind.clone(),
+            uncertain_zero_caller.is_some(),
+            &caller_set_digest,
+            graph_generation,
+        );
+        // Structural half of the legacy confirm/reason gate
+        // (edit_lines_impl_gated, edit.rs): record that this path's
+        // symbol-less region was reviewed this session, mirroring
+        // record_edit_context_review's per-symbol bookkeeping -- see
+        // record_path_context_review's own doc comment (common.rs) for
+        // why a separate path-keyed store, not a repurposed
+        // qualified_name key.
+        self.record_path_context_review(
+            path,
+            risk.as_deref().unwrap_or("unknown"),
+            graph_generation,
+        );
+
+        let (change_id, authority_id, authority_expires_at) = match minted {
+            Some(m) => (
+                Some(m.change_id),
+                Some(m.authority_id),
+                Some(m.authority_expires_at),
+            ),
+            None => (None, None, None),
+        };
+
+        ResolvedOutcome::success(EditContextOutput {
+            symbol: String::new(),
+            edges_ready: self.edges_ready(),
+            index_freshness: self.phase_str(),
+            callers: Vec::new(),
+            callees: Vec::new(),
+            callers_truncated: None,
+            callees_truncated: None,
+            blast_radius: BlastRadiusInfo {
+                transitive: 0,
+                files_affected: Vec::new(),
+            },
+            range_checksum,
+            risk_assessment: risk.map(|level| RiskAssessmentOutput {
+                level,
+                reasons: Vec::new(),
+            }),
+            gate_prediction,
+            // "Dead code" isn't a meaningful concept for a symbol-less
+            // range (no single declaration to judge) -- these two fields
+            // are placeholders, not a real analysis, unlike symbol mode.
+            dead_code_confidence: "none".to_string(),
+            dead_code_source: "static".to_string(),
+            trend: None,
+            co_changed_files: Vec::new(),
+            related_notes: Vec::new(),
+            edges_etag: None,
+            edges_not_modified: None,
+            suggested_next: self.filter_sn(suggested_gated(
+                "diff_impact",
+                "MANDATORY after changes — verify blast radius",
+            )),
+            change_id,
+            authority_id,
+            authority_expires_at,
+        })
+    }
+
+    /// Range-mode analog of `mint_review_authority_for_edit_context` --
+    /// mints a `ReviewAuthority` for a symbol-less `[line, end_line]`
+    /// window instead of a resolved symbol candidate. Wave 8 (audit
+    /// follow-up, P0-A): `target_scope_digest` (calm-core) already
+    /// canonicalizes a `ChangeIntentTarget` with `qualified_name: None` as
+    /// `(path, "")` -- no calm_core changes needed, this reuses that
+    /// exact encoding. Any symbol the range DOES happen to overlap
+    /// (`touched`, non-empty when the caller's range wasn't actually
+    /// symbol-less) is bound as its own additional target too, the same
+    /// way a real per-symbol review would -- this generalizes rather than
+    /// assumes `touched` is empty. Deliberately fail-open (`None` on any
+    /// error), matching the symbol-mode function's own contract.
+    #[allow(clippy::too_many_arguments)]
+    fn mint_review_authority_for_edit_context_range(
+        &self,
+        conn: &rusqlite::Connection,
+        path: &str,
+        touched: &[edit::TouchedSymbolOutput],
+        hub_hit: bool,
+        hub_kind: Option<String>,
+        uncertain_zero_caller: bool,
+        caller_set_digest: &str,
+        graph_generation: i64,
+    ) -> Option<MintedAuthorityOutput> {
+        let mut state_conn = calm_core::db::conn::open_state_writer(&self.state_db_path).ok()?;
+        let snapshot = calm_core::authority::EvidenceSnapshot::compute_with_recorded_freshness(
+            conn,
+            &self.project_root,
+            &state_conn,
+        )
+        .ok()?;
+
+        let policy = calm_core::policy::loader::load_policy_or_warn(&self.project_root);
+        let policy_digest = policy.digest();
+        let principal = format!("session:{}", self.session_id);
+        let authority_ttl = calm_core::authority::AuthorityTtl::from_secs(1800.0)
+            .expect("30 minutes is within AuthorityTtl's valid range");
+
+        let caller_count_level = touched
+            .iter()
+            .filter_map(|t| {
+                calm_core::policy::RiskLevel::parse(super::detail::risk_level_from_caller_count(
+                    t.caller_count,
+                ))
+            })
+            .max()
+            .unwrap_or(calm_core::policy::RiskLevel::Low);
+        let risk_vector = calm_core::policy::RiskVector {
+            caller_count_level,
+            is_hub: hub_hit,
+            hub_kind,
+            signature_changed: false,
+            uncertain_zero_caller,
+            risk_rule_floor: calm_core::config::risk_floor_for_path(
+                &self.config().risk_rules,
+                path,
+            )
+            .and_then(|(level, _glob)| calm_core::policy::RiskLevel::parse(level)),
+            kind_mismatch: false,
+            touches_manifest: calm_core::change::classify::is_manifest_path(path),
+            touches_uncovered_code: false,
+        };
+        let policy_decision = calm_core::policy::evaluate(&risk_vector, &policy);
+        let policy_decision_digest = policy_decision.digest();
+        let risk_vector_digest = risk_vector.digest();
+
+        if !snapshot
+            .freshness_class
+            .meets_bar_for(policy_decision.required_approver_class)
+        {
+            return None;
+        }
+        let tx = state_conn.transaction().ok()?;
+
+        snapshot.persist(&tx).ok()?;
+
+        // Every symbol the range actually overlaps, PLUS a path-only
+        // target (qualified_name: None) covering the symbol-less portion
+        // -- target_scope_digest treats the latter as (path, ""), and
+        // edit_lines_impl_gated's current_targets construction pushes the
+        // same fallback when a hunk touches nothing indexed, so the two
+        // sides always have a matching target to check against.
+        let mut targets: Vec<calm_core::change::ChangeIntentTarget> = touched
+            .iter()
+            .map(|t| calm_core::change::ChangeIntentTarget {
+                path: path.to_string(),
+                qualified_name: Some(t.qualified_name.clone()),
+            })
+            .collect();
+        targets.push(calm_core::change::ChangeIntentTarget {
+            path: path.to_string(),
+            qualified_name: None,
+        });
+
+        let intent = calm_core::change::ChangeIntent::new(
+            calm_core::change::ChangeIntentKind(calm_core::change::ChangeKind::Body),
+            "edit_context compat wrapper: range review, no single symbol (Wave 8 P0-A)",
+            snapshot.snapshot_id.clone(),
+            targets.clone(),
+        );
+        calm_core::change::insert_change_intent(&tx, &intent, None).ok()?;
+
+        let authority = calm_core::authority::ReviewAuthority::mint(
+            &tx,
+            calm_core::authority::MintParams {
+                intent_id: &intent.intent_id,
+                snapshot_id: &snapshot.snapshot_id,
+                graph_generation,
+                caller_set_digest,
+                policy_digest: &policy_digest,
+                principal: &principal,
+                ttl_secs: authority_ttl,
+                targets: &targets,
                 policy_decision_digest: &policy_decision_digest,
                 risk_vector_digest: &risk_vector_digest,
                 required_approver_class: policy_decision.required_approver_class,

@@ -471,6 +471,51 @@ impl CalmServer {
         }
     }
 
+    /// Wave 8 (audit follow-up, P0-A): range-mode analog of
+    /// `edit_context_review` above -- looks up the most recent
+    /// `edit_context` range-mode review of `path`'s symbol-less region
+    /// this session, if any. `None` when this exact path was never
+    /// reviewed in range mode this session (a per-symbol review doesn't
+    /// count here, and vice versa -- see `path_context_reviewed`'s own doc
+    /// comment on `SessionLog` for why the two stores are kept separate).
+    pub(crate) fn path_context_review(&self, path: &str) -> Option<EditContextReview> {
+        self.session_log
+            .lock()
+            .ok()
+            .and_then(|log| log.path_context_reviewed.get(path).cloned())
+    }
+
+    /// Wave 8 (audit follow-up, P0-A): range-mode analog of
+    /// `record_edit_context_review` above -- records that `edit_context`'s
+    /// range mode just reviewed `path`'s symbol-less region. No
+    /// `caller_qns`/`caller_set_digest` inputs (unlike the per-symbol
+    /// version): a genuinely symbol-less range has no callers by
+    /// construction, so this always stores the empty-set digest -- the
+    /// exact value `edit_lines_impl_gated`'s own `union_caller_set_digest`
+    /// independently recomputes when `pre_touched` is empty (edit.rs), so
+    /// the two sides always agree without either one hard-coding a shared
+    /// constant.
+    pub(crate) fn record_path_context_review(
+        &self,
+        path: &str,
+        risk_level: &str,
+        graph_generation: i64,
+    ) {
+        if let Ok(mut log) = self.session_log.lock() {
+            let at = log.tool_calls;
+            log.path_context_reviewed.insert(
+                path.to_string(),
+                EditContextReview {
+                    at,
+                    caller_qns: Vec::new(),
+                    risk_level: risk_level.to_string(),
+                    caller_set_digest: Self::caller_set_digest(&[]),
+                    graph_generation,
+                },
+            );
+        }
+    }
+
     /// WS-2 Phase 2: SHA-256 digest of a caller set's IDENTITY, independent
     /// of ordering/duplicates/call-site multiplicity — dedupes via
     /// `BTreeSet` (also sorts, for determinism) before hashing, so a caller

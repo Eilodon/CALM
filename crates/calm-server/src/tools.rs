@@ -213,6 +213,16 @@ struct SessionLog {
     session_started_at: String,
     /// See `EditContextReview`. Keyed by qualified_name.
     edit_context_reviewed: std::collections::HashMap<String, EditContextReview>,
+    /// Wave 8 (audit follow-up, P0-A): the range-mode analog of
+    /// `edit_context_reviewed` above, for `edit_context`'s range-mode
+    /// reviews of a symbol-less (pure whitespace/comment/module-level/gap)
+    /// region -- keyed by bare `path`, not `qualified_name`, since there is
+    /// no symbol identity to key on. A separate map rather than reusing
+    /// `edit_context_reviewed` with the path as a fake qualified_name key:
+    /// keeps the two identity spaces (real qualified_name vs. bare path)
+    /// structurally incapable of colliding, rather than relying on the fact
+    /// that a real qualified_name always happens to contain `::`.
+    path_context_reviewed: std::collections::HashMap<String, EditContextReview>,
     /// Hub edits a human already vetoed via elicitation this session, keyed
     /// by `(path, hunk-content fingerprint)` — content-hash keyed on purpose
     /// (NOT path alone): the same path with changed hunks is a different
@@ -232,6 +242,7 @@ impl Default for SessionLog {
             last_progress_at: 0,
             session_started_at: utc_now_iso8601(),
             edit_context_reviewed: std::collections::HashMap::new(),
+            path_context_reviewed: std::collections::HashMap::new(),
             elicit_declined: std::collections::HashSet::new(),
         }
     }
@@ -2737,6 +2748,84 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Wave 8 (audit follow-up): the `source` suggestion `callers()` emits
+    /// used to pass a full qualified name into `symbol` alone -- schema-
+    /// valid JSON, but `resolve_symbol_candidates` falls back to a bare
+    /// `name = ?1` match whenever `qualified_name` isn't ALSO set, so it
+    /// silently resolved to nothing (or the wrong same-named symbol) every
+    /// time. Chains the actual suggested args into a real `source()` call,
+    /// not just schema-checking them -- the gap a schema-only check
+    /// (`locate_source_suggestion_args_deserialize_as_source_params`, which
+    /// only asserts `Ok(SourceParams)`) would not have caught.
+    #[test]
+    fn callers_source_suggestion_args_resolve_to_the_real_caller() {
+        let dir = std::env::temp_dir().join(format!("ci_callers_sn_source_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/caller.rs"), "fn bar() {\n    foo();\n}\n").unwrap();
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('mod.foo', 'foo', 'function', 'rust', 'src/lib.rs', 1, 1, 'fn foo()', '', 'foo', 1, 0, 0)",
+                [],
+            ).unwrap();
+            // The caller is also a real, resolvable symbol -- from_symbol
+            // below is exactly this qualified_name, matching production
+            // shape (call_edges.from_symbol IS a qualified_name, joined
+            // against symbols.qualified_name in callers()'s own query).
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('src/caller.rs::bar', 'bar', 'function', 'rust', 'src/caller.rs', 1, 3, 'fn bar()', '', 'bar', 0, 0, 0)",
+                [],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO call_edges (from_symbol, to_symbol, from_path, to_path, edge_confidence, call_site_line)
+                 VALUES ('src/caller.rs::bar', 'mod.foo', 'src/caller.rs', 'src/lib.rs', 'resolved', 2)",
+                [],
+            ).unwrap();
+        }
+
+        let v = jv(
+            server.callers(rmcp::handler::server::wrapper::Parameters(CallersParams {
+                qualified_name: None,
+                symbol: "foo".into(),
+                path: None,
+                line: None,
+                transitive: false,
+                max_depth: None,
+                if_none_match: None,
+            })),
+        );
+        let sn = &v["suggested_next"];
+        assert_eq!(
+            sn["tool"], "source",
+            "expected source suggestion, got: {sn}"
+        );
+        let args = sn["args"].clone();
+        assert_eq!(
+            args["symbol"], "bar",
+            "expected bare leaf name, got: {args}"
+        );
+        assert_eq!(
+            args["qualified_name"], "src/caller.rs::bar",
+            "expected the exact qualified name, got: {args}"
+        );
+
+        // The real regression: follow the suggestion into an actual
+        // source() call and assert it resolves -- not just that the args
+        // are schema-valid.
+        let source_out = assert_suggested_next_resolves(&server, sn);
+        assert_eq!(
+            source_out["path"], "src/caller.rs",
+            "suggested_next chain must resolve to the real caller, got: {source_out}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// D2 (2026-07-30 stack-graphs-demotion-lever): `formal_source` is
     /// surfaced per-edge on `callers` -- present (and correct) when the edge
     /// is `formal`, absent (skip_serializing_if) when it isn't.
@@ -3044,7 +3133,8 @@ mod tests {
         let output = server.edit_context(rmcp::handler::server::wrapper::Parameters(
             EditContextParams {
                 qualified_name: None,
-                symbol: "a".into(),
+                symbol: Some("a".into()),
+                end_line: None,
                 path: None,
                 line: None,
                 if_none_match: None,
@@ -3107,7 +3197,8 @@ mod tests {
         let output = server.edit_context(rmcp::handler::server::wrapper::Parameters(
             EditContextParams {
                 qualified_name: None,
-                symbol: "a".into(),
+                symbol: Some("a".into()),
+                end_line: None,
                 path: None,
                 line: None,
                 if_none_match: None,
@@ -3397,7 +3488,8 @@ mod tests {
         let output = server.edit_context(rmcp::handler::server::wrapper::Parameters(
             EditContextParams {
                 qualified_name: None,
-                symbol: "has".into(),
+                symbol: Some("has".into()),
+                end_line: None,
                 path: None,
                 line: None,
                 if_none_match: None,
@@ -3451,7 +3543,8 @@ mod tests {
             server.edit_context(rmcp::handler::server::wrapper::Parameters(
                 EditContextParams {
                     qualified_name: None,
-                    symbol: "hub".into(),
+                    symbol: Some("hub".into()),
+                    end_line: None,
                     path: None,
                     line: None,
                     if_none_match: None,
@@ -3528,7 +3621,8 @@ mod tests {
             server.edit_context(rmcp::handler::server::wrapper::Parameters(
                 EditContextParams {
                     qualified_name: None,
-                    symbol: "helper".into(),
+                    symbol: Some("helper".into()),
+                    end_line: None,
                     path: None,
                     line: None,
                     if_none_match: None,
@@ -3604,7 +3698,8 @@ mod tests {
             server.edit_context(rmcp::handler::server::wrapper::Parameters(
                 EditContextParams {
                     qualified_name: None,
-                    symbol: "helper".into(),
+                    symbol: Some("helper".into()),
+                    end_line: None,
                     path: None,
                     line: None,
                     if_none_match: None,
@@ -3654,7 +3749,8 @@ mod tests {
             server.edit_context(rmcp::handler::server::wrapper::Parameters(
                 EditContextParams {
                     qualified_name: None,
-                    symbol: "helper".into(),
+                    symbol: Some("helper".into()),
+                    end_line: None,
                     path: None,
                     line: None,
                     if_none_match: None,
@@ -3724,7 +3820,8 @@ mod tests {
             server.edit_context(rmcp::handler::server::wrapper::Parameters(
                 EditContextParams {
                     qualified_name: None,
-                    symbol: "hub".into(),
+                    symbol: Some("hub".into()),
+                    end_line: None,
                     path: None,
                     line: None,
                     if_none_match: None,
@@ -3769,7 +3866,8 @@ mod tests {
             server.edit_context(rmcp::handler::server::wrapper::Parameters(
                 EditContextParams {
                     qualified_name: None,
-                    symbol: "foo".into(),
+                    symbol: Some("foo".into()),
+                    end_line: None,
                     path: None,
                     line: None,
                     if_none_match: None,
@@ -3788,7 +3886,8 @@ mod tests {
             server.edit_context(rmcp::handler::server::wrapper::Parameters(
                 EditContextParams {
                     qualified_name: None,
-                    symbol: "foo".into(),
+                    symbol: Some("foo".into()),
+                    end_line: None,
                     path: None,
                     line: None,
                     if_none_match: Some(etag),
@@ -3867,7 +3966,8 @@ mod tests {
         let output = server.edit_context(rmcp::handler::server::wrapper::Parameters(
             EditContextParams {
                 qualified_name: None,
-                symbol: "model_fn".into(),
+                symbol: Some("model_fn".into()),
+                end_line: None,
                 path: None,
                 line: None,
                 if_none_match: None,
@@ -3906,7 +4006,8 @@ mod tests {
         let output = server.edit_context(rmcp::handler::server::wrapper::Parameters(
             EditContextParams {
                 qualified_name: None,
-                symbol: "a".into(),
+                symbol: Some("a".into()),
+                end_line: None,
                 path: None,
                 line: None,
                 if_none_match: None,
@@ -3952,7 +4053,8 @@ mod tests {
         let output = server.edit_context(rmcp::handler::server::wrapper::Parameters(
             EditContextParams {
                 qualified_name: None,
-                symbol: "a".into(),
+                symbol: Some("a".into()),
+                end_line: None,
                 path: None,
                 line: None,
                 if_none_match: None,
@@ -4740,7 +4842,8 @@ mod tests {
         conn_b.edit_context(rmcp::handler::server::wrapper::Parameters(
             EditContextParams {
                 qualified_name: None,
-                symbol: "reviewed_fn".into(),
+                symbol: Some("reviewed_fn".into()),
+                end_line: None,
                 path: None,
                 line: None,
                 if_none_match: None,
@@ -9220,6 +9323,179 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Wave 8 (audit follow-up): the gap-chunk branch this exact suggestion
+    /// comes from (`qualified_name.is_none()` at locate.rs) used to be
+    /// unreachable (locate.rs always wrapped `qualified_name` in `Some(...)`
+    /// regardless of `kind`), and even if reached, its args omitted
+    /// `end_line`, which `source`'s range mode requires. `kind="text"` is a
+    /// deterministic way to produce a real symbol-less hit with no embedder
+    /// needed: `search_text` (search.rs) merges in `chunk_text_results`, a
+    /// pure FTS5 lexical match over `code_chunks`/`fts_chunks` -- a chunk
+    /// row with `symbol_qn = NULL` goes through `chunk_hit_to_result`'s gap
+    /// path (`kind: None`, `line_start`/`line_end` both `Some`), exactly the
+    /// shape this test targets. Chains the actual suggested args into a
+    /// real `source()` call.
+    #[test]
+    fn locate_text_gap_hit_source_suggestion_resolves_via_range_mode() {
+        let dir = std::env::temp_dir().join(format!("ci_locate_sn_gap_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("src/notes.txt"),
+            "line one\nUNIQUE_GAP_MARKER_9f3 a note with no symbol\nline three\n",
+        )
+        .unwrap();
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        {
+            let conn = server.db();
+            // symbol_qn = NULL (omitted) -- the exact shape chunk_hit_to_result
+            // treats as a gap chunk (no enclosing symbol). The AFTER INSERT
+            // trigger on code_chunks auto-populates fts_chunks, so no
+            // separate FTS insert is needed (see schema.rs's own trigger).
+            conn.execute(
+                "INSERT INTO code_chunks (path, line_start, line_end, chunk_text, file_hash)
+                 VALUES ('src/notes.txt', 2, 2, 'UNIQUE_GAP_MARKER_9f3 a note with no symbol', 'deadbeef')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let output = server.locate(rmcp::handler::server::wrapper::Parameters(LocateParams {
+            query: "UNIQUE_GAP_MARKER_9f3".into(),
+            kind: Some("text".into()),
+            depth: None,
+            limit: None,
+        }));
+        let v = jv(output);
+        assert_eq!(
+            v["results"][0]["qualified_name"],
+            serde_json::Value::Null,
+            "a symbol-less chunk hit must not carry a synthesized qualified_name, got: {v}"
+        );
+        let sn = &v["suggested_next"];
+        assert_eq!(
+            sn["tool"], "source",
+            "expected source suggestion, got: {sn}"
+        );
+        let args = sn["args"].clone();
+        assert_eq!(args["path"], "src/notes.txt");
+        assert_eq!(args["line"], 2);
+        assert_eq!(
+            args["end_line"], 2,
+            "range mode requires end_line, must be present, got: {args}"
+        );
+
+        // The real regression: follow the suggestion into an actual
+        // source() call in range mode and assert it resolves the exact
+        // matched line, not just that the args are schema-valid.
+        let parsed: SourceParams = serde_json::from_value(args).unwrap();
+        let source_out = jv(server.source(rmcp::handler::server::wrapper::Parameters(parsed)));
+        assert!(
+            source_out["error"].is_null(),
+            "source() must not error following locate()'s own gap-chunk suggestion, got: {source_out}"
+        );
+        assert!(
+            source_out["source"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("UNIQUE_GAP_MARKER_9f3"),
+            "resolved range must contain the matched line, got: {source_out}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Wave 8 (audit follow-up, P0-D): follows a `suggested_next` value
+    /// into the target tool it names and asserts the call actually
+    /// resolves -- schema-valid `args` alone (what a bare
+    /// `serde_json::from_value::<T>` check proves) is a strictly weaker
+    /// guarantee, and already missed two real bugs this wave: locate()'s
+    /// gap-chunk branch (dead code, so never even reached) and callers()'s
+    /// suggested `source` call (schema-valid JSON that resolved to nothing,
+    /// or the wrong symbol, because a qualified name was passed into a bare
+    /// `symbol` param). Covers the read-only tools most commonly named in a
+    /// `suggested_next` payload; panics with a clear message for an
+    /// unhandled tool name rather than silently no-op'ing, so a new
+    /// suggestion site missing from this table is visible immediately
+    /// instead of quietly going untested.
+    fn assert_suggested_next_resolves(
+        server: &CalmServer,
+        sn: &serde_json::Value,
+    ) -> serde_json::Value {
+        let tool = sn["tool"]
+            .as_str()
+            .unwrap_or_else(|| panic!("suggested_next has no tool field: {sn}"));
+        let args = sn["args"].clone();
+        let out = match tool {
+            "source" => {
+                let parsed: SourceParams = serde_json::from_value(args.clone())
+                    .unwrap_or_else(|e| {
+                        panic!("suggested_next args for `source` don't deserialize as SourceParams: {args} ({e})")
+                    });
+                jv(server.source(rmcp::handler::server::wrapper::Parameters(parsed)))
+            }
+            "search" => {
+                let parsed: SearchParams = serde_json::from_value(args.clone())
+                    .unwrap_or_else(|e| {
+                        panic!("suggested_next args for `search` don't deserialize as SearchParams: {args} ({e})")
+                    });
+                jv(server.search(rmcp::handler::server::wrapper::Parameters(parsed)))
+            }
+            "locate" => {
+                let parsed: LocateParams = serde_json::from_value(args.clone())
+                    .unwrap_or_else(|e| {
+                        panic!("suggested_next args for `locate` don't deserialize as LocateParams: {args} ({e})")
+                    });
+                jv(server.locate(rmcp::handler::server::wrapper::Parameters(parsed)))
+            }
+            "callers" => {
+                let parsed: CallersParams = serde_json::from_value(args.clone())
+                    .unwrap_or_else(|e| {
+                        panic!("suggested_next args for `callers` don't deserialize as CallersParams: {args} ({e})")
+                    });
+                jv(server.callers(rmcp::handler::server::wrapper::Parameters(parsed)))
+            }
+            "edit_context" => {
+                let parsed: EditContextParams = serde_json::from_value(args.clone())
+                    .unwrap_or_else(|e| {
+                        panic!("suggested_next args for `edit_context` don't deserialize as EditContextParams: {args} ({e})")
+                    });
+                jv(server.edit_context(rmcp::handler::server::wrapper::Parameters(parsed)))
+            }
+            "symbol_info" => {
+                let parsed: SymbolInfoParams = serde_json::from_value(args.clone())
+                    .unwrap_or_else(|e| {
+                        panic!("suggested_next args for `symbol_info` don't deserialize as SymbolInfoParams: {args} ({e})")
+                    });
+                jv(server.symbol_info(rmcp::handler::server::wrapper::Parameters(parsed)))
+            }
+            "file_overview" => {
+                let parsed: FileOverviewParams = serde_json::from_value(args.clone())
+                    .unwrap_or_else(|e| {
+                        panic!("suggested_next args for `file_overview` don't deserialize as FileOverviewParams: {args} ({e})")
+                    });
+                jv(server.file_overview(rmcp::handler::server::wrapper::Parameters(parsed)))
+            }
+            "understand" => {
+                let parsed: UnderstandParams = serde_json::from_value(args.clone())
+                    .unwrap_or_else(|e| {
+                        panic!("suggested_next args for `understand` don't deserialize as UnderstandParams: {args} ({e})")
+                    });
+                jv(server.understand(rmcp::handler::server::wrapper::Parameters(parsed)))
+            }
+            other => panic!(
+                "assert_suggested_next_resolves has no dispatch entry for tool {other:?} -- add \
+                 one instead of skipping the check (sn: {sn})"
+            ),
+        };
+        assert!(
+            out["error"].is_null(),
+            "suggested_next chain to `{tool}` must not error, got: {out} (args were: {args})"
+        );
+        out
+    }
+
     #[test]
     fn locate_boosts_result_near_recently_explored_file() {
         let dir =
@@ -11967,7 +12243,8 @@ mod tests {
         server.edit_context(rmcp::handler::server::wrapper::Parameters(
             EditContextParams {
                 qualified_name: None,
-                symbol: "helper".into(),
+                symbol: Some("helper".into()),
+                end_line: None,
                 path: None,
                 line: None,
                 if_none_match: None,
@@ -12070,7 +12347,8 @@ mod tests {
         let ctx = server.edit_context(rmcp::handler::server::wrapper::Parameters(
             EditContextParams {
                 qualified_name: None,
-                symbol: "helper".into(),
+                symbol: Some("helper".into()),
+                end_line: None,
                 path: None,
                 line: None,
                 if_none_match: None,
@@ -12145,7 +12423,8 @@ mod tests {
         let ctx = server.edit_context(rmcp::handler::server::wrapper::Parameters(
             EditContextParams {
                 qualified_name: None,
-                symbol: "helper".into(),
+                symbol: Some("helper".into()),
+                end_line: None,
                 path: None,
                 line: None,
                 if_none_match: None,
@@ -12227,7 +12506,8 @@ mod tests {
         let ctx = server.edit_context(rmcp::handler::server::wrapper::Parameters(
             EditContextParams {
                 qualified_name: None,
-                symbol: "helper".into(),
+                symbol: Some("helper".into()),
+                end_line: None,
                 path: None,
                 line: None,
                 if_none_match: None,
@@ -12327,7 +12607,8 @@ mod tests {
         server.edit_context(rmcp::handler::server::wrapper::Parameters(
             EditContextParams {
                 qualified_name: None,
-                symbol: "mcp_tool_handler".into(),
+                symbol: Some("mcp_tool_handler".into()),
+                end_line: None,
                 path: None,
                 line: None,
                 if_none_match: None,
@@ -12445,7 +12726,8 @@ mod tests {
         server.edit_context(rmcp::handler::server::wrapper::Parameters(
             EditContextParams {
                 qualified_name: None,
-                symbol: "mystery_fn".into(),
+                symbol: Some("mystery_fn".into()),
+                end_line: None,
                 path: None,
                 line: None,
                 if_none_match: None,
@@ -12509,7 +12791,8 @@ mod tests {
         server.edit_context(rmcp::handler::server::wrapper::Parameters(
             EditContextParams {
                 qualified_name: None,
-                symbol: "mystery_fn".into(),
+                symbol: Some("mystery_fn".into()),
+                end_line: None,
                 path: None,
                 line: None,
                 if_none_match: None,
@@ -12583,7 +12866,8 @@ mod tests {
         server.edit_context(rmcp::handler::server::wrapper::Parameters(
             EditContextParams {
                 qualified_name: None,
-                symbol: "target".into(),
+                symbol: Some("target".into()),
+                end_line: None,
                 path: None,
                 line: None,
                 if_none_match: None,
@@ -12659,7 +12943,8 @@ mod tests {
         server.edit_context(rmcp::handler::server::wrapper::Parameters(
             EditContextParams {
                 qualified_name: None,
-                symbol: "target".into(),
+                symbol: Some("target".into()),
+                end_line: None,
                 path: None,
                 line: None,
                 if_none_match: None,
@@ -12728,7 +13013,8 @@ mod tests {
         server.edit_context(rmcp::handler::server::wrapper::Parameters(
             EditContextParams {
                 qualified_name: None,
-                symbol: "target".into(),
+                symbol: Some("target".into()),
+                end_line: None,
                 path: None,
                 line: None,
                 if_none_match: None,
@@ -12802,7 +13088,8 @@ mod tests {
         server.edit_context(rmcp::handler::server::wrapper::Parameters(
             EditContextParams {
                 qualified_name: None,
-                symbol: "target".into(),
+                symbol: Some("target".into()),
+                end_line: None,
                 path: None,
                 line: None,
                 if_none_match: None,
@@ -12865,7 +13152,8 @@ mod tests {
         server.edit_context(rmcp::handler::server::wrapper::Parameters(
             EditContextParams {
                 qualified_name: None,
-                symbol: "helper".into(),
+                symbol: Some("helper".into()),
+                end_line: None,
                 path: None,
                 line: None,
                 if_none_match: None,
@@ -12994,7 +13282,8 @@ mod tests {
         server.edit_context(rmcp::handler::server::wrapper::Parameters(
             EditContextParams {
                 qualified_name: None,
-                symbol: "helper".into(),
+                symbol: Some("helper".into()),
+                end_line: None,
                 path: None,
                 line: None,
                 if_none_match: None,
@@ -13100,7 +13389,8 @@ mod tests {
         server.edit_context(rmcp::handler::server::wrapper::Parameters(
             EditContextParams {
                 qualified_name: None,
-                symbol: "helper".into(),
+                symbol: Some("helper".into()),
+                end_line: None,
                 path: None,
                 line: None,
                 if_none_match: None,
@@ -13187,7 +13477,8 @@ mod tests {
         let ctx_out = server.edit_context(rmcp::handler::server::wrapper::Parameters(
             EditContextParams {
                 qualified_name: None,
-                symbol: "helper".into(),
+                symbol: Some("helper".into()),
+                end_line: None,
                 path: None,
                 line: None,
                 if_none_match: None,
@@ -13264,7 +13555,8 @@ mod tests {
         let ctx_out = server.edit_context(rmcp::handler::server::wrapper::Parameters(
             EditContextParams {
                 qualified_name: None,
-                symbol: "helper".into(),
+                symbol: Some("helper".into()),
+                end_line: None,
                 path: None,
                 line: None,
                 if_none_match: None,
@@ -13323,6 +13615,387 @@ mod tests {
         );
         // The authority must not have been spent -- the file untouched by
         // the rejected edit.
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.py")).unwrap(),
+            "def helper():\n    return 1\n"
+        );
+    }
+
+    /// Wave 8 (audit follow-up, P0-E): `mint_review_authority_for_edit_context`
+    /// used to hardcode `hub_kind: None` while `edit_lines_impl_gated`'s
+    /// spend-time `RiskVector` computes the real `hub_kind` via
+    /// `compute_touch_risk` -- for ANY hub target, the two `risk_vector`
+    /// digests could never match, so `authorize_and_begin_edit` always
+    /// rejected with `AUTHORITY_STALE_RISK_VECTOR`, deterministically, not
+    /// as a race. This is the success path the freshness-drift test above
+    /// deliberately does NOT exercise (it fails earlier, on freshness,
+    /// before ever reaching the risk-vector comparison this test targets).
+    #[test]
+    fn edit_context_authority_spends_successfully_on_a_hub_symbol() {
+        use super::edit::{ElicitGate, HubAskContext};
+        let (dir, server) = test_server("hub_kind_authority_mint_and_spend");
+        let original = "def helper():\n    return 1\n";
+        std::fs::write(dir.join("a.py"), original).unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, hub_kind, is_entry_point)
+                 VALUES ('a.py::helper', 'helper', 'function', 'python', 'a.py', 1, 2, '', '', 'helper', 0, 1, 'bridge', 0)",
+                [],
+            )
+            .unwrap();
+            let catalog = calm_core::indexer::refresh::InputCatalog::for_project(&dir);
+            calm_core::indexer::refresh::persist_index_input_snapshot(&conn, &catalog).unwrap();
+
+            // A hub target's policy decision requires Reconciled evidence,
+            // not just Current -- mint_review_authority_for_edit_context
+            // fails open (mints nothing) below that bar. Same fixture step
+            // edit_context_mints_human_tier_authority_after_a_recorded_
+            // reconciliation_and_spend_persists_a_receipt already uses.
+            let state_conn = server.state_write_conn().unwrap();
+            let reconciled =
+                calm_core::authority::EvidenceSnapshot::compute_after_reconciliation(&conn, &dir)
+                    .unwrap();
+            reconciled.persist(&state_conn).unwrap();
+        }
+
+        let ctx_out = server.edit_context(rmcp::handler::server::wrapper::Parameters(
+            EditContextParams {
+                qualified_name: None,
+                symbol: Some("helper".into()),
+                end_line: None,
+                path: None,
+                line: None,
+                if_none_match: None,
+            },
+        ));
+        let ctx_v = serde_json::to_value(&ctx_out.0).unwrap();
+        let change_id = ctx_v["change_id"]
+            .as_str()
+            .expect("edit_context must mint a change_id for a hub target")
+            .to_string();
+        let authority_id = ctx_v["authority_id"]
+            .as_str()
+            .expect("edit_context must mint an authority_id for a hub target")
+            .to_string();
+
+        let hash = calm_core::edit::range_checksum(original, 1, 2).unwrap();
+        let params = EditLinesParams {
+            path: "a.py".into(),
+            edits: vec![EditHunkParam {
+                start_line: 1,
+                end_line: 2,
+                expected_hash: Some(hash),
+                old_text: None,
+                new_text: "def helper():\n    return 2\n".into(),
+            }],
+            confirm: false,
+            reason: None,
+            cites: None,
+            change_id: Some(change_id.clone()),
+            authority_id: Some(authority_id.clone()),
+        };
+        let mut ask: Option<HubAskContext> = None;
+        // A hub/high-risk symbol also requires the independent-review leg
+        // (CCK-23) -- ElicitGate::Approved simulates that human approval
+        // already having happened, same seam the reconciliation test above
+        // uses, so this test isolates the risk_vector/hub_kind match this
+        // wave actually fixed instead of also exercising CCK-23.
+        let out = server.edit_lines_flow(&params, ElicitGate::Approved, &mut ask);
+        let v = serde_json::to_value(&out).unwrap();
+        assert!(
+            v.get("error").is_none(),
+            "authority-path spend on a hub symbol must succeed once hub_kind matches on both \
+             sides, got: {v}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.py")).unwrap(),
+            "def helper():\n    return 2\n",
+            "the edit must actually have been applied, not just report no error"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_lines_symbol_less_region_denied_under_strict_mode_then_succeeds_via_minted_range_authority()
+     {
+        use super::edit::{ElicitGate, HubAskContext};
+        let (dir, server) = test_server("p0a_symbol_less_deny_then_range_authority");
+        // Strict mode (`always_require_edit_context`) is required to reach
+        // the pre_touched.is_empty() gated branch with hub_hit=false and
+        // risk=None (a plain comment edit is neither hub nor high-risk) --
+        // default config never gates a symbol-less edit at all, so this
+        // reproduces the audited Strict-mode scenario specifically.
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"edit": {"always_require_edit_context": true}}"#,
+        )
+        .unwrap();
+        let original =
+            "# a module comment, not attached to any symbol\n\ndef helper():\n    return 1\n";
+        std::fs::write(dir.join("a.py"), original).unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, hub_kind, is_entry_point)
+                 VALUES ('a.py::helper', 'helper', 'function', 'python', 'a.py', 3, 4, '', '', 'helper', 0, 0, NULL, 0)",
+                [],
+            )
+            .unwrap();
+            let catalog = calm_core::indexer::refresh::InputCatalog::for_project(&dir);
+            calm_core::indexer::refresh::persist_index_input_snapshot(&conn, &catalog).unwrap();
+        }
+
+        let hash = calm_core::edit::range_checksum(original, 1, 1).unwrap();
+        let new_text = "# an updated module comment, still not attached to any symbol\n";
+
+        // Deny: Strict mode, nothing reviewed yet this session, no
+        // authority supplied -- line 1 sits outside helper's [3, 4] range
+        // so pre_touched stays empty. Before Wave 8 this was an
+        // UNCONDITIONAL reject with no escape at all; it must still deny
+        // here (nothing was reviewed yet), proving the gate wasn't simply
+        // removed.
+        let deny_params = EditLinesParams {
+            path: "a.py".into(),
+            edits: vec![EditHunkParam {
+                start_line: 1,
+                end_line: 1,
+                expected_hash: Some(hash.clone()),
+                old_text: None,
+                new_text: new_text.into(),
+            }],
+            confirm: true,
+            reason: Some("updating the module comment".into()),
+            cites: None,
+            change_id: None,
+            authority_id: None,
+        };
+        let mut ask: Option<HubAskContext> = None;
+        let deny_out = server.edit_lines_flow(&deny_params, ElicitGate::Off, &mut ask);
+        let deny_v = serde_json::to_value(&deny_out).unwrap();
+        assert_eq!(
+            deny_v["error"]["code"].as_str(),
+            Some("EDIT_CONTEXT_REQUIRED"),
+            "symbol-less edit under Strict mode, nothing reviewed yet, must still deny: {deny_v}"
+        );
+
+        // Mint: edit_context's range mode (Wave 8, P0-A) -- the fix under
+        // test. Before this wave, edit_context required `symbol` and had
+        // no way to review a symbol-less region at all.
+        let ctx_out = server.edit_context(rmcp::handler::server::wrapper::Parameters(
+            EditContextParams {
+                symbol: None,
+                path: Some("a.py".into()),
+                line: Some(1),
+                end_line: Some(1),
+                qualified_name: None,
+                if_none_match: None,
+            },
+        ));
+        let ctx_v = serde_json::to_value(&ctx_out.0).unwrap();
+        assert!(
+            ctx_v["error"].is_null(),
+            "range-mode edit_context call itself must succeed: {ctx_v}"
+        );
+        let change_id = ctx_v["change_id"]
+            .as_str()
+            .unwrap_or_else(|| {
+                panic!(
+                    "range-mode edit_context must mint a change_id for a low-risk \
+                     symbol-less region: {ctx_v}"
+                )
+            })
+            .to_string();
+        let authority_id = ctx_v["authority_id"]
+            .as_str()
+            .expect("range-mode edit_context must mint an authority_id")
+            .to_string();
+
+        // Retry via the minted authority (not confirm/reason) -- the
+        // non-negotiable form of this test per the Wave 8 plan doc: before
+        // this fix, current_targets stayed empty regardless of
+        // change_id/authority_id, so ReviewAuthority::verify_only's
+        // target_scope_digest check could never match and this failed
+        // closed with AUTHORITY_WRONG_TARGET_SCOPE, every time, for every
+        // symbol-less region, with no escape at all.
+        let retry_params = EditLinesParams {
+            change_id: Some(change_id),
+            authority_id: Some(authority_id),
+            ..deny_params
+        };
+        let retry_out = server.edit_lines_flow(&retry_params, ElicitGate::Off, &mut ask);
+        let retry_v = serde_json::to_value(&retry_out).unwrap();
+        assert!(
+            retry_v.get("error").is_none(),
+            "the SAME edit must now succeed via the minted range authority: {retry_v}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.py")).unwrap(),
+            format!("{new_text}\ndef helper():\n    return 1\n"),
+            "the edit must actually have been applied, not just report no error"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_lines_symbol_less_region_succeeds_via_confirm_reason_once_range_reviewed_this_session()
+    {
+        use super::edit::{ElicitGate, HubAskContext};
+        let (dir, server) = test_server("p0a_symbol_less_legacy_gate_after_range_review");
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"edit": {"always_require_edit_context": true}}"#,
+        )
+        .unwrap();
+        let original =
+            "# a module comment, not attached to any symbol\n\ndef helper():\n    return 1\n";
+        std::fs::write(dir.join("a.py"), original).unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, hub_kind, is_entry_point)
+                 VALUES ('a.py::helper', 'helper', 'function', 'python', 'a.py', 3, 4, '', '', 'helper', 0, 0, NULL, 0)",
+                [],
+            )
+            .unwrap();
+            let catalog = calm_core::indexer::refresh::InputCatalog::for_project(&dir);
+            calm_core::indexer::refresh::persist_index_input_snapshot(&conn, &catalog).unwrap();
+        }
+
+        // Review the range via edit_context's range mode WITHOUT ever
+        // spending the authority it mints -- the structural (no-authority)
+        // gate must accept this on its own, via record_path_context_review,
+        // not just the authority-verified path tested separately above.
+        let ctx_out = server.edit_context(rmcp::handler::server::wrapper::Parameters(
+            EditContextParams {
+                symbol: None,
+                path: Some("a.py".into()),
+                line: Some(1),
+                end_line: Some(1),
+                qualified_name: None,
+                if_none_match: None,
+            },
+        ));
+        let ctx_v = serde_json::to_value(&ctx_out.0).unwrap();
+        assert!(
+            ctx_v["error"].is_null(),
+            "range-mode edit_context call itself must succeed: {ctx_v}"
+        );
+
+        let hash = calm_core::edit::range_checksum(original, 1, 1).unwrap();
+        let params = EditLinesParams {
+            path: "a.py".into(),
+            edits: vec![EditHunkParam {
+                start_line: 1,
+                end_line: 1,
+                expected_hash: Some(hash),
+                old_text: None,
+                new_text: "# an updated module comment, still not attached to any symbol\n".into(),
+            }],
+            confirm: true,
+            reason: Some("updating the module comment".into()),
+            cites: None,
+            change_id: None,
+            authority_id: None,
+        };
+        let mut ask: Option<HubAskContext> = None;
+        let out = server.edit_lines_flow(&params, ElicitGate::Off, &mut ask);
+        let v = serde_json::to_value(&out).unwrap();
+        assert!(
+            v.get("error").is_none(),
+            "before this fix, the structural gate unconditionally rejected \
+             pre_touched.is_empty() regardless of what was reviewed this session -- must now \
+             succeed once edit_context's range mode reviewed this exact path: {v}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Wave 8 (audit follow-up, P1-A): `observe_spend_snapshot` used to
+    /// collapse every DB-open/compute error into `None`, which fell
+    /// through to the exact same code path a genuinely-absent snapshot
+    /// takes (empty `snapshot_id`, `graph_generation: 0`) -- an infra
+    /// hiccup and "no snapshot at all" were indistinguishable to the
+    /// caller. Forces a real failure by deleting the state DB's directory
+    /// out from under a minted authority right before spend, and asserts
+    /// the DB error is actually named in the response.
+    #[test]
+    fn spend_time_state_db_open_failure_reports_the_real_error_not_a_generic_staleness_message() {
+        use super::edit::{ElicitGate, HubAskContext};
+        let (dir, server) = test_server("spend_time_state_db_open_failure");
+        std::fs::write(dir.join("a.py"), "def helper():\n    return 1\n").unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.py::helper', 'helper', 'function', 'python', 'a.py', 1, 2, '', '', 'helper', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+            let catalog = calm_core::indexer::refresh::InputCatalog::for_project(&dir);
+            calm_core::indexer::refresh::persist_index_input_snapshot(&conn, &catalog).unwrap();
+        }
+
+        let ctx_out = server.edit_context(rmcp::handler::server::wrapper::Parameters(
+            EditContextParams {
+                qualified_name: None,
+                symbol: Some("helper".into()),
+                end_line: None,
+                path: None,
+                line: None,
+                if_none_match: None,
+            },
+        ));
+        let ctx_v = serde_json::to_value(&ctx_out.0).unwrap();
+        let change_id = ctx_v["change_id"]
+            .as_str()
+            .expect("edit_context must mint a change_id")
+            .to_string();
+        let authority_id = ctx_v["authority_id"]
+            .as_str()
+            .expect("edit_context must mint an authority_id")
+            .to_string();
+
+        // The authority is real and minted -- now make the state DB
+        // unreachable, simulating a real infra failure (disk issue,
+        // permissions, concurrent maintenance) between mint and spend.
+        // rusqlite::Connection::open fails deterministically when the
+        // target path's parent directory doesn't exist.
+        std::fs::remove_dir_all(dir.join(".calm")).unwrap();
+
+        let params = EditLinesParams {
+            path: "a.py".into(),
+            edits: vec![EditHunkParam {
+                start_line: 1,
+                end_line: 2,
+                expected_hash: None,
+                old_text: Some("def helper():\n    return 1\n".into()),
+                new_text: "def helper():\n    return 2\n".into(),
+            }],
+            confirm: false,
+            reason: None,
+            cites: None,
+            change_id: Some(change_id),
+            authority_id: Some(authority_id),
+        };
+        let mut ask: Option<HubAskContext> = None;
+        let out = server.edit_lines_flow(&params, ElicitGate::Off, &mut ask);
+        let v = serde_json::to_value(&out).unwrap();
+        assert_eq!(
+            v["error"]["code"], "AUTHORITY_SNAPSHOT_CHECK_FAILED",
+            "a real state-DB-open failure must be named as such, not collapsed into a \
+             staleness-flavored or empty-snapshot symptom, got: {v}"
+        );
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("could not verify evidence freshness"),
+            "response: {v}"
+        );
+        // The authority must not have been spent -- the file untouched.
         assert_eq!(
             std::fs::read_to_string(dir.join("a.py")).unwrap(),
             "def helper():\n    return 1\n"
@@ -13416,7 +14089,8 @@ mod tests {
         let ctx_out = server.edit_context(rmcp::handler::server::wrapper::Parameters(
             EditContextParams {
                 qualified_name: None,
-                symbol: "check_token".into(),
+                symbol: Some("check_token".into()),
+                end_line: None,
                 path: None,
                 line: None,
                 if_none_match: None,
@@ -13511,7 +14185,8 @@ mod tests {
         let ctx_out = server.edit_context(rmcp::handler::server::wrapper::Parameters(
             EditContextParams {
                 qualified_name: None,
-                symbol: "check_token".into(),
+                symbol: Some("check_token".into()),
+                end_line: None,
                 path: None,
                 line: None,
                 if_none_match: None,
@@ -14059,7 +14734,8 @@ mod tests {
         server.edit_context(rmcp::handler::server::wrapper::Parameters(
             EditContextParams {
                 qualified_name: None,
-                symbol: "test_something".into(),
+                symbol: Some("test_something".into()),
+                end_line: None,
                 path: None,
                 line: None,
                 if_none_match: None,
@@ -14138,7 +14814,8 @@ mod tests {
         server.edit_context(rmcp::handler::server::wrapper::Parameters(
             EditContextParams {
                 qualified_name: None,
-                symbol: "helper".into(),
+                symbol: Some("helper".into()),
+                end_line: None,
                 path: None,
                 line: None,
                 if_none_match: None,
@@ -15506,7 +16183,8 @@ mod tests {
         let ctx = jv(
             server.edit_context(rmcp::handler::server::wrapper::Parameters(
                 EditContextParams {
-                    symbol: "new".into(),
+                    symbol: Some("new".into()),
+                    end_line: None,
                     path: None,
                     line: None,
                     qualified_name: Some("src/b.rs::new".into()),
@@ -16367,7 +17045,8 @@ mod tests {
             server.edit_context(rmcp::handler::server::wrapper::Parameters(
                 EditContextParams {
                     qualified_name: None,
-                    symbol: "foo".into(),
+                    symbol: Some("foo".into()),
+                    end_line: None,
                     path: None,
                     line: None,
                     if_none_match: None,
@@ -16420,7 +17099,8 @@ mod tests {
             server.edit_context(rmcp::handler::server::wrapper::Parameters(
                 EditContextParams {
                     qualified_name: None,
-                    symbol: "foo".into(),
+                    symbol: Some("foo".into()),
+                    end_line: None,
                     path: None,
                     line: None,
                     if_none_match: None,
@@ -16466,7 +17146,8 @@ mod tests {
             server.edit_context(rmcp::handler::server::wrapper::Parameters(
                 EditContextParams {
                     qualified_name: None,
-                    symbol: "foo".into(),
+                    symbol: Some("foo".into()),
+                    end_line: None,
                     path: None,
                     line: None,
                     if_none_match: None,
@@ -16509,7 +17190,8 @@ mod tests {
             server.edit_context(rmcp::handler::server::wrapper::Parameters(
                 EditContextParams {
                     qualified_name: None,
-                    symbol: "foo".into(),
+                    symbol: Some("foo".into()),
+                    end_line: None,
                     path: None,
                     line: None,
                     if_none_match: None,
@@ -16690,7 +17372,8 @@ mod tests {
         server.edit_context(rmcp::handler::server::wrapper::Parameters(
             EditContextParams {
                 qualified_name: None,
-                symbol: "helper".into(),
+                symbol: Some("helper".into()),
+                end_line: None,
                 path: None,
                 line: None,
                 if_none_match: None,
@@ -16789,7 +17472,8 @@ mod tests {
         server.edit_context(rmcp::handler::server::wrapper::Parameters(
             EditContextParams {
                 qualified_name: None,
-                symbol: "helper".into(),
+                symbol: Some("helper".into()),
+                end_line: None,
                 path: None,
                 line: None,
                 if_none_match: None,
@@ -16872,7 +17556,8 @@ mod tests {
         server.edit_context(rmcp::handler::server::wrapper::Parameters(
             EditContextParams {
                 qualified_name: None,
-                symbol: "helper".into(),
+                symbol: Some("helper".into()),
+                end_line: None,
                 path: None,
                 line: None,
                 if_none_match: None,
@@ -16930,7 +17615,8 @@ mod tests {
         server.edit_context(rmcp::handler::server::wrapper::Parameters(
             EditContextParams {
                 qualified_name: None,
-                symbol: "helper".into(),
+                symbol: Some("helper".into()),
+                end_line: None,
                 path: None,
                 line: None,
                 if_none_match: None,
@@ -16993,7 +17679,8 @@ mod tests {
         server.edit_context(rmcp::handler::server::wrapper::Parameters(
             EditContextParams {
                 qualified_name: None,
-                symbol: "helper".into(),
+                symbol: Some("helper".into()),
+                end_line: None,
                 path: None,
                 line: None,
                 if_none_match: None,
@@ -17060,7 +17747,8 @@ mod tests {
         server.edit_context(rmcp::handler::server::wrapper::Parameters(
             EditContextParams {
                 qualified_name: None,
-                symbol: "helper".into(),
+                symbol: Some("helper".into()),
+                end_line: None,
                 path: None,
                 line: None,
                 if_none_match: None,
@@ -17151,7 +17839,8 @@ mod tests {
         server.edit_context(rmcp::handler::server::wrapper::Parameters(
             EditContextParams {
                 qualified_name: None,
-                symbol: "helper".into(),
+                symbol: Some("helper".into()),
+                end_line: None,
                 path: None,
                 line: None,
                 if_none_match: None,
@@ -17245,7 +17934,8 @@ mod tests {
         conn_a.edit_context(rmcp::handler::server::wrapper::Parameters(
             EditContextParams {
                 qualified_name: None,
-                symbol: "helper".into(),
+                symbol: Some("helper".into()),
+                end_line: None,
                 path: None,
                 line: None,
                 if_none_match: None,

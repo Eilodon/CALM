@@ -1458,9 +1458,28 @@ impl CalmServer {
                 // `compute_with_recorded_freshness` (not bare `compute`)
                 // additionally protects against the P0-A sibling bug this
                 // spend-time check would otherwise reintroduce.
-                let spend_snapshot = self.observe_spend_snapshot();
-                if let Some(snap) = &spend_snapshot
-                    && snap.freshness_class == calm_core::authority::FreshnessClass::Degraded
+                // Wave 8 (audit follow-up, P1-A): observe_spend_snapshot
+                // now surfaces the real DB/compute error instead of
+                // collapsing it into the same empty-snapshot_id path a
+                // genuinely-absent (never-existed) snapshot would take --
+                // an infra hiccup here used to report a misleading
+                // staleness-flavored symptom (or an empty snapshot_id no
+                // real authority could ever match) instead of naming what
+                // actually failed.
+                let spend_snapshot = match self.observe_spend_snapshot() {
+                    Ok(s) => s,
+                    Err(e) => {
+                        return ToolOutcome::error(error_detail(
+                            "AUTHORITY_SNAPSHOT_CHECK_FAILED",
+                            &format!(
+                                "could not verify evidence freshness before spending this \
+                                 authority: {e}"
+                            ),
+                            true,
+                        ));
+                    }
+                };
+                if spend_snapshot.freshness_class == calm_core::authority::FreshnessClass::Degraded
                 {
                     return ToolOutcome::error(error_detail(
                         "AUTHORITY_SNAPSHOT_DEGRADED_SINCE_MINT",
@@ -1470,14 +1489,8 @@ impl CalmServer {
                         true,
                     ));
                 }
-                let snapshot_id = spend_snapshot
-                    .as_ref()
-                    .map(|s| s.snapshot_id.clone())
-                    .unwrap_or_default();
-                let current_graph_generation: i64 = spend_snapshot
-                    .as_ref()
-                    .map(|s| s.graph_generation)
-                    .unwrap_or(0);
+                let snapshot_id = spend_snapshot.snapshot_id.clone();
+                let current_graph_generation: i64 = spend_snapshot.graph_generation;
                 let policy = calm_core::policy::loader::load_policy_or_warn(&self.project_root);
                 let policy_digest = policy.digest();
                 let principal = format!("session:{}", self.session_id);
@@ -1506,6 +1519,23 @@ impl CalmServer {
                             qualified_name: Some(anchor.to_string()),
                         });
                     }
+                }
+                // Wave 8 (audit follow-up, P0-A): a hunk range with no
+                // overlapping indexed symbol and no resolved anchor (pure
+                // whitespace/comment/module-level/gap-region edit via
+                // edit_lines) still needs a target for verify_only's scope
+                // digest to match against -- otherwise `current_targets`
+                // stays empty and no authority, however legitimately
+                // reviewed via edit_context's range mode, can ever satisfy
+                // AUTHORITY_WRONG_TARGET_SCOPE. A path-only target
+                // (qualified_name: None) is target_scope_digest's
+                // existing, already-null-safe encoding for exactly this
+                // case (calm-core needed no changes for this).
+                if current_targets.is_empty() {
+                    current_targets.push(calm_core::change::ChangeIntentTarget {
+                        path: path.to_string(),
+                        qualified_name: None,
+                    });
                 }
                 let (spend_risk_vector_digest, spend_policy_decision_digest) =
                     spend_risk_digests.clone().expect(
@@ -1857,34 +1887,67 @@ impl CalmServer {
                         _ => missing.push(t.qualified_name.as_str()),
                     }
                 }
-                // Wave 7 (audit follow-up): pre_touched.is_empty() can only
-                // reach this branch via force_gate_always (mode="strict")
-                // -- a real hub_hit/risk="high"/uncertain_zero_caller
-                // reason always implies at least one touched symbol. The
-                // loop above is vacuously satisfied when there's nothing to
-                // iterate, so without this check a symbol-less edit (pure
-                // whitespace/comments/module-level code) would silently
-                // skip the structural half of Strict mode's own gate.
                 if pre_touched.is_empty() {
-                    tracing::info!(
-                        target: crate::telemetry::AUDIT_TARGET,
-                        session_id = self.session_id,
-                        decision = "denied",
-                        reason_code = "EDIT_CONTEXT_REQUIRED",
-                        path,
-                        risk = risk.as_deref().unwrap_or("none"),
-                        hub_hit,
-                    );
-                    return ToolOutcome::error(error_detail(
-                        "EDIT_CONTEXT_REQUIRED",
-                        &format!(
-                            "{why} and this edit touches no indexed symbol (pure \
-                             whitespace/comment/module-level region) -- call \
-                             edit_context on a symbol in {path} first THIS session before \
-                             editing, even though no single symbol's range covers this edit"
+                    // Wave 8 (audit follow-up, P0-A): a pure whitespace/
+                    // comment/module-level/gap-region edit can never
+                    // populate pre_touched by construction (compute_touch_risk
+                    // only reports symbols an indexed range actually
+                    // overlaps) -- unconditionally rejecting here, regardless
+                    // of what was reviewed this session, left Strict mode
+                    // with NO success path at all for such an edit, not even
+                    // after a real edit_context review. Two sub-cases: an
+                    // edit_symbol insertion anchored on a real symbol whose
+                    // own indexed range the hunk still didn't overlap
+                    // (CCK-R5.9's doc-comment-anchored-insertion case --
+                    // check the EXISTING per-symbol edit_context_review, keyed
+                    // on the anchor, same freshness/graph-generation bar as
+                    // the loop above uses); or a plain edit_lines hunk with
+                    // no anchor at all -- check the range-mode
+                    // path_context_review edit_context's range mode records
+                    // (common.rs).
+                    let (reviewed_fresh, remedy) = match anchor_qualified_name {
+                        Some(anchor) => (
+                            matches!(
+                                self.edit_context_review(anchor),
+                                Some(r) if now.saturating_sub(r.at) <= FRESHNESS_WINDOW_CALLS
+                                    && current_graph_generation.is_none_or(|g| g == r.graph_generation)
+                            ),
+                            format!("call edit_context(\"{anchor}\")"),
                         ),
-                        true,
-                    ));
+                        None => (
+                            matches!(
+                                self.path_context_review(path),
+                                Some(r) if now.saturating_sub(r.at) <= FRESHNESS_WINDOW_CALLS
+                                    && current_graph_generation.is_none_or(|g| g == r.graph_generation)
+                            ),
+                            format!(
+                                "call edit_context(path={path:?}, line=<start>, end_line=<end>) \
+                                 on this range"
+                            ),
+                        ),
+                    };
+                    if !reviewed_fresh {
+                        tracing::info!(
+                            target: crate::telemetry::AUDIT_TARGET,
+                            session_id = self.session_id,
+                            decision = "denied",
+                            reason_code = "EDIT_CONTEXT_REQUIRED",
+                            path,
+                            risk = risk.as_deref().unwrap_or("none"),
+                            hub_hit,
+                        );
+                        return ToolOutcome::error(error_detail(
+                            "EDIT_CONTEXT_REQUIRED",
+                            &format!(
+                                "{why} and this edit touches no indexed symbol (pure \
+                                 whitespace/comment/module-level region) -- {remedy} first \
+                                 THIS session before editing (a prior session's review, or \
+                                 one older than {FRESHNESS_WINDOW_CALLS} tool calls, doesn't \
+                                 count)"
+                            ),
+                            true,
+                        ));
+                    }
                 }
                 if !missing.is_empty() {
                     tracing::info!(
@@ -2285,10 +2348,22 @@ impl CalmServer {
         let shadow_tx_id: Option<String> = if let (Some(change_id), Some(authority_id)) =
             (change_id, authority_id)
         {
-            let spend_snapshot = self.observe_spend_snapshot();
-            if let Some(snap) = &spend_snapshot
-                && snap.freshness_class == calm_core::authority::FreshnessClass::Degraded
-            {
+            // Wave 8 (audit follow-up, P1-A): see the identical comment at
+            // the preliminary check site above -- same fix, same reason.
+            let spend_snapshot = match self.observe_spend_snapshot() {
+                Ok(s) => s,
+                Err(e) => {
+                    return ToolOutcome::error(error_detail(
+                        "AUTHORITY_SNAPSHOT_CHECK_FAILED",
+                        &format!(
+                            "could not verify evidence freshness before spending this \
+                             authority: {e}"
+                        ),
+                        true,
+                    ));
+                }
+            };
+            if spend_snapshot.freshness_class == calm_core::authority::FreshnessClass::Degraded {
                 return ToolOutcome::error(error_detail(
                     "AUTHORITY_SNAPSHOT_DEGRADED_SINCE_MINT",
                     "source content on disk changed since this authority was minted \
@@ -2297,14 +2372,8 @@ impl CalmServer {
                     true,
                 ));
             }
-            let snapshot_id = spend_snapshot
-                .as_ref()
-                .map(|s| s.snapshot_id.clone())
-                .unwrap_or_default();
-            let current_graph_generation: i64 = spend_snapshot
-                .as_ref()
-                .map(|s| s.graph_generation)
-                .unwrap_or(0);
+            let snapshot_id = spend_snapshot.snapshot_id.clone();
+            let current_graph_generation: i64 = spend_snapshot.graph_generation;
             let policy = calm_core::policy::loader::load_policy_or_warn(&self.project_root);
             let policy_digest = policy.digest();
             let principal = format!("session:{}", self.session_id);
@@ -2325,6 +2394,16 @@ impl CalmServer {
                         qualified_name: Some(anchor.to_string()),
                     });
                 }
+            }
+            // Wave 8 (audit follow-up, P0-A): see the identical fallback
+            // at the preliminary check site above -- same fix, same
+            // reason (this is the final-spend site, right before
+            // authorize_and_begin_edit).
+            if current_targets.is_empty() {
+                current_targets.push(calm_core::change::ChangeIntentTarget {
+                    path: path.to_string(),
+                    qualified_name: None,
+                });
             }
             let (spend_risk_vector_digest, spend_policy_decision_digest) = spend_risk_digests
                 .clone()
@@ -2465,11 +2544,26 @@ impl CalmServer {
             } else {
                 "WRITE_FAILED"
             };
-            return ToolOutcome::error(error_detail(
-                reason_code,
-                &format!("failed to write {path}: {e}"),
-                recoverable,
-            ));
+            // Wave 8 (audit follow-up, P1-B): on the authority path, the
+            // authority tied to this attempt was already atomically
+            // consumed by authorize_and_begin_edit above, BEFORE this write
+            // (and its stale-base recheck) ever ran -- "re-read and retry"
+            // alone doesn't tell the caller that reusing the same
+            // authority_id on retry will additionally fail with
+            // AUTHORITY_ALREADY_CONSUMED. Only appended on the authority
+            // path (change_id/authority_id both Some here, same precondition
+            // authorize_and_begin_edit itself required) -- the legacy
+            // confirm/reason/cites path has no authority to re-mint.
+            let detail = if recoverable && authority_id.is_some() {
+                format!(
+                    "failed to write {path}: {e} -- the authority tied to this attempt was \
+                     already consumed and cannot be reused; call edit_context again to mint a \
+                     fresh one before retrying"
+                )
+            } else {
+                format!("failed to write {path}: {e}")
+            };
+            return ToolOutcome::error(error_detail(reason_code, &detail, recoverable));
         }
         if let Some(tx_id) = &shadow_tx_id {
             let _ = calm_core::txn::advance(
@@ -2862,15 +2956,14 @@ impl CalmServer {
     /// observation -- callers own the `Degraded` rejection themselves,
     /// since the pre-check and the final spend want different error
     /// framing around the same verdict.
-    fn observe_spend_snapshot(&self) -> Option<calm_core::authority::EvidenceSnapshot> {
-        let state_conn = self.make_state_read_conn().ok()?;
-        let conn = self.make_read_conn().ok()?;
+    fn observe_spend_snapshot(&self) -> rusqlite::Result<calm_core::authority::EvidenceSnapshot> {
+        let state_conn = self.make_state_read_conn()?;
+        let conn = self.make_read_conn()?;
         calm_core::authority::EvidenceSnapshot::compute_with_recorded_freshness(
             &conn,
             &self.project_root,
             &state_conn,
         )
-        .ok()
     }
 
     /// WS-Auth (2026-08-19, requested and explicitly confirmed by the
