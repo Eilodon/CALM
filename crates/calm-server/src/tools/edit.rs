@@ -739,6 +739,7 @@ impl CalmServer {
                 &full_path,
                 &formatted,
                 self.config().edit.kernel_enforced_writes_effective(),
+                &base_digest,
             ) {
                 let _ = calm_core::txn::advance(
                     &file_conn,
@@ -747,9 +748,20 @@ impl CalmServer {
                     "system",
                     &e.to_string(),
                 );
+                // Wave 7 (audit follow-up, P0-B): rustfmt runs between the
+                // `original` read above and this write, an even wider gap
+                // than edit_lines/edit_symbol -- a StaleBase here means
+                // something changed the file on disk during formatting,
+                // distinct enough from an ordinary write failure to get
+                // its own status.
+                let status = if matches!(e, WriteBackendError::StaleBase) {
+                    "stale_file"
+                } else {
+                    "error"
+                };
                 results.push(FormatFileResult {
                     path: path.clone(),
-                    status: "error".to_string(),
+                    status: status.to_string(),
                     detail: Some(format!("failed to write {path}: {e}")),
                 });
                 continue;
@@ -1446,17 +1458,7 @@ impl CalmServer {
                 // `compute_with_recorded_freshness` (not bare `compute`)
                 // additionally protects against the P0-A sibling bug this
                 // spend-time check would otherwise reintroduce.
-                let state_read_conn_for_freshness = self.make_state_read_conn().ok();
-                let spend_snapshot = self.make_read_conn().ok().and_then(|c| {
-                    state_read_conn_for_freshness.as_ref().and_then(|sc| {
-                        calm_core::authority::EvidenceSnapshot::compute_with_recorded_freshness(
-                            &c,
-                            &self.project_root,
-                            sc,
-                        )
-                        .ok()
-                    })
-                });
+                let spend_snapshot = self.observe_spend_snapshot();
                 if let Some(snap) = &spend_snapshot
                     && snap.freshness_class == calm_core::authority::FreshnessClass::Degraded
                 {
@@ -1468,18 +1470,13 @@ impl CalmServer {
                         true,
                     ));
                 }
-                let snapshot_id = spend_snapshot.map(|s| s.snapshot_id).unwrap_or_default();
-                let current_graph_generation: i64 = self
-                    .make_read_conn()
-                    .ok()
-                    .and_then(|c| {
-                        c.query_row(
-                            "SELECT generation FROM graph_generation_state WHERE id = 1",
-                            [],
-                            |r| r.get(0),
-                        )
-                        .ok()
-                    })
+                let snapshot_id = spend_snapshot
+                    .as_ref()
+                    .map(|s| s.snapshot_id.clone())
+                    .unwrap_or_default();
+                let current_graph_generation: i64 = spend_snapshot
+                    .as_ref()
+                    .map(|s| s.graph_generation)
                     .unwrap_or(0);
                 let policy = calm_core::policy::loader::load_policy_or_warn(&self.project_root);
                 let policy_digest = policy.digest();
@@ -1859,6 +1856,35 @@ impl CalmServer {
                         }
                         _ => missing.push(t.qualified_name.as_str()),
                     }
+                }
+                // Wave 7 (audit follow-up): pre_touched.is_empty() can only
+                // reach this branch via force_gate_always (mode="strict")
+                // -- a real hub_hit/risk="high"/uncertain_zero_caller
+                // reason always implies at least one touched symbol. The
+                // loop above is vacuously satisfied when there's nothing to
+                // iterate, so without this check a symbol-less edit (pure
+                // whitespace/comments/module-level code) would silently
+                // skip the structural half of Strict mode's own gate.
+                if pre_touched.is_empty() {
+                    tracing::info!(
+                        target: crate::telemetry::AUDIT_TARGET,
+                        session_id = self.session_id,
+                        decision = "denied",
+                        reason_code = "EDIT_CONTEXT_REQUIRED",
+                        path,
+                        risk = risk.as_deref().unwrap_or("none"),
+                        hub_hit,
+                    );
+                    return ToolOutcome::error(error_detail(
+                        "EDIT_CONTEXT_REQUIRED",
+                        &format!(
+                            "{why} and this edit touches no indexed symbol (pure \
+                             whitespace/comment/module-level region) -- call \
+                             edit_context on a symbol in {path} first THIS session before \
+                             editing, even though no single symbol's range covers this edit"
+                        ),
+                        true,
+                    ));
                 }
                 if !missing.is_empty() {
                     tracing::info!(
@@ -2259,25 +2285,25 @@ impl CalmServer {
         let shadow_tx_id: Option<String> = if let (Some(change_id), Some(authority_id)) =
             (change_id, authority_id)
         {
-            let snapshot_id = self
-                .make_read_conn()
-                .ok()
-                .and_then(|c| {
-                    calm_core::authority::EvidenceSnapshot::compute(&c, &self.project_root).ok()
-                })
-                .map(|s| s.snapshot_id)
+            let spend_snapshot = self.observe_spend_snapshot();
+            if let Some(snap) = &spend_snapshot
+                && snap.freshness_class == calm_core::authority::FreshnessClass::Degraded
+            {
+                return ToolOutcome::error(error_detail(
+                    "AUTHORITY_SNAPSHOT_DEGRADED_SINCE_MINT",
+                    "source content on disk changed since this authority was minted \
+                     (edit_context) and has not yet been reindexed -- re-run edit_context \
+                     to mint a fresh authority against current content",
+                    true,
+                ));
+            }
+            let snapshot_id = spend_snapshot
+                .as_ref()
+                .map(|s| s.snapshot_id.clone())
                 .unwrap_or_default();
-            let current_graph_generation: i64 = self
-                .make_read_conn()
-                .ok()
-                .and_then(|c| {
-                    c.query_row(
-                        "SELECT generation FROM graph_generation_state WHERE id = 1",
-                        [],
-                        |r| r.get(0),
-                    )
-                    .ok()
-                })
+            let current_graph_generation: i64 = spend_snapshot
+                .as_ref()
+                .map(|s| s.graph_generation)
                 .unwrap_or(0);
             let policy = calm_core::policy::loader::load_policy_or_warn(&self.project_root);
             let policy_digest = policy.digest();
@@ -2416,6 +2442,7 @@ impl CalmServer {
             &full_path,
             &new_content,
             self.config().edit.kernel_enforced_writes_effective(),
+            &base_digest,
         ) {
             if let Some(tx_id) = &shadow_tx_id {
                 let _ = calm_core::txn::advance(
@@ -2428,10 +2455,20 @@ impl CalmServer {
             }
             drop(_cross_guard);
             drop(_guard);
+            // Wave 7 (audit follow-up, P0-B): StaleBase is recoverable by
+            // construction -- re-reading and retrying the edit against
+            // current content is exactly the right next step, unlike a
+            // generic IO failure.
+            let recoverable = matches!(e, WriteBackendError::StaleBase);
+            let reason_code = if recoverable {
+                "STALE_FILE"
+            } else {
+                "WRITE_FAILED"
+            };
             return ToolOutcome::error(error_detail(
-                "WRITE_FAILED",
+                reason_code,
                 &format!("failed to write {path}: {e}"),
-                false,
+                recoverable,
             ));
         }
         if let Some(tx_id) = &shadow_tx_id {
@@ -2811,6 +2848,29 @@ impl CalmServer {
                 "Verify wider blast radius, especially if this touched a hub/high-risk symbol",
             )),
         })
+    }
+
+    /// Wave 7 (audit follow-up, P0-A.4): single source of truth for "what
+    /// does an authority spend see as current, right now" -- both the
+    /// preliminary gate check and the actual spend site now call this SAME
+    /// function, so there is no way for one to observe a freshness class
+    /// the other doesn't. Always uses `compute_with_recorded_freshness`
+    /// (never bare `compute`), so a `Degraded` verdict here reflects both
+    /// `index_input_drift` and the live-mtime spot-check, with a stale
+    /// recorded snapshot never able to silently override a live-observed
+    /// drift (see that function's own doc comment). Deliberately just an
+    /// observation -- callers own the `Degraded` rejection themselves,
+    /// since the pre-check and the final spend want different error
+    /// framing around the same verdict.
+    fn observe_spend_snapshot(&self) -> Option<calm_core::authority::EvidenceSnapshot> {
+        let state_conn = self.make_state_read_conn().ok()?;
+        let conn = self.make_read_conn().ok()?;
+        calm_core::authority::EvidenceSnapshot::compute_with_recorded_freshness(
+            &conn,
+            &self.project_root,
+            &state_conn,
+        )
+        .ok()
     }
 
     /// WS-Auth (2026-08-19, requested and explicitly confirmed by the
@@ -4214,6 +4274,33 @@ pub(crate) fn caller_symbol_set(conn: &rusqlite::Connection, qualified_name: &st
     }
 }
 
+/// Wave 7 (audit follow-up, P0-B): distinguishes "the file changed on disk
+/// since we read it" from an ordinary IO failure, so callers can react
+/// differently (a `STALE_FILE` reason code vs a generic write failure).
+#[derive(Debug)]
+pub(crate) enum WriteBackendError {
+    /// Live on-disk content no longer matches the caller's
+    /// `expected_base_digest` -- something (an external editor, another
+    /// process) wrote this file after it was read for this edit and
+    /// before this write landed.
+    StaleBase,
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for WriteBackendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WriteBackendError::StaleBase => write!(
+                f,
+                "file changed on disk since it was read for this edit -- re-read and retry"
+            ),
+            WriteBackendError::Io(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for WriteBackendError {}
+
 /// Writes `content` to `path` (repo-relative, already resolved to
 /// `full_path` via `resolve_repo_path`) using whichever write path
 /// `[edit].kernel_enforced_writes` (CCK-05B) selects: `atomic_write`'s
@@ -4224,20 +4311,39 @@ pub(crate) fn caller_symbol_set(conn: &rusqlite::Connection, qualified_name: &st
 /// this write for a symlink to be swapped in). Both paths keep the exact
 /// same temp-file-then-rename/fsync contract -- opting in only changes
 /// what backs the containment guarantee, not the write's atomicity.
+///
+/// Wave 7 (audit follow-up, P0-B/CAS): re-reads `full_path` immediately
+/// before writing and compares its `evidence_digest` against
+/// `expected_base_digest` -- the same SHA-256 digest already computed for
+/// the transaction/authority record at both call sites, now also checked
+/// at the moment bytes actually hit disk, not just recorded alongside the
+/// transaction. Best-effort, not a true atomic compare-and-swap (a write
+/// can still land in the gap between this read and the rename below --
+/// closing that fully would need OS-level locking external editors won't
+/// respect anyway), but it shrinks the race window from "the whole
+/// authorize/elicit/transaction pipeline" down to one read + one compare,
+/// closing the lost-update case where an external editor's change would
+/// otherwise be silently overwritten by this write.
 fn write_via_configured_backend(
     project_root: &std::path::Path,
     path: &str,
     full_path: &std::path::Path,
     content: &str,
     kernel_enforced_writes: bool,
-) -> std::io::Result<()> {
+    expected_base_digest: &str,
+) -> Result<(), WriteBackendError> {
+    let live = std::fs::read_to_string(full_path).map_err(WriteBackendError::Io)?;
+    if calm_core::digest::evidence_digest(live.as_bytes()) != expected_base_digest {
+        return Err(WriteBackendError::StaleBase);
+    }
     if kernel_enforced_writes {
-        let fs = calm_core::fs::RootedFilesystem::open(project_root)?;
+        let fs =
+            calm_core::fs::RootedFilesystem::open(project_root).map_err(WriteBackendError::Io)?;
         fs.write_atomic_beneath(path, content)
             .map(|_| ())
-            .map_err(std::io::Error::other)
+            .map_err(|e| WriteBackendError::Io(std::io::Error::other(e)))
     } else {
-        calm_core::edit::atomic_write(full_path, content)
+        calm_core::edit::atomic_write(full_path, content).map_err(WriteBackendError::Io)
     }
 }
 
@@ -4971,6 +5077,51 @@ mod elicit_tests {
             "a.py",
             &[hunk(2, 2)]
         ));
+    }
+
+    #[test]
+    fn write_via_configured_backend_rejects_when_disk_no_longer_matches_expected_base_digest() {
+        let dir = uncovered_code_test_dir("write_backend_cas_stale");
+        let full_path = dir.join("a.txt");
+        std::fs::write(&full_path, "original").unwrap();
+        // Deliberately wrong digest -- simulates an external write landing
+        // between the caller's original read and this write.
+        let stale_digest = calm_core::digest::evidence_digest(b"not what's actually on disk");
+
+        let result = write_via_configured_backend(
+            &dir,
+            "a.txt",
+            &full_path,
+            "attempted new content",
+            false,
+            &stale_digest,
+        );
+        assert!(
+            matches!(result, Err(WriteBackendError::StaleBase)),
+            "{result:?}"
+        );
+        // The whole point of the CAS check: the on-disk content the
+        // "external editor" wrote must survive completely untouched.
+        assert_eq!(std::fs::read_to_string(&full_path).unwrap(), "original");
+    }
+
+    #[test]
+    fn write_via_configured_backend_writes_when_expected_base_digest_matches() {
+        let dir = uncovered_code_test_dir("write_backend_cas_ok");
+        let full_path = dir.join("a.txt");
+        std::fs::write(&full_path, "original").unwrap();
+        let correct_digest = calm_core::digest::evidence_digest(b"original");
+
+        write_via_configured_backend(
+            &dir,
+            "a.txt",
+            &full_path,
+            "new content",
+            false,
+            &correct_digest,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&full_path).unwrap(), "new content");
     }
 
     fn lines_params(new_text: &str) -> EditLinesParams {

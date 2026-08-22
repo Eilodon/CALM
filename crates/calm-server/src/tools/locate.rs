@@ -458,6 +458,29 @@ impl CalmServer {
                 suggested_with_args("search", "No match — broaden with hybrid search", serde_json::json!({"query": p.query, "kind": "hybrid"}))
             } else if results.len() > 1 && results[0].name == results[1].name {
                 suggested_with_args("symbol_info", "Multiple matches for same name — disambiguate", serde_json::json!({"symbol": results[0].name, "path": results[0].path}))
+            } else if results[0].qualified_name.is_none() {
+                // Wave 7 (audit follow-up): a result with no backing symbol
+                // (a gap chunk with no enclosing symbol, a kind="file" path
+                // hit, or a kind="grep" match outside any symbol body) has
+                // no real qualified_name -- `results[0].name` in that case
+                // is a synthesized stand-in (e.g. the bare filename for a
+                // gap chunk, see chunk_hit_to_result in search.rs), so
+                // suggesting source(symbol=...) against it is a guaranteed
+                // NotFound. Use source's range mode (path+line, no symbol
+                // resolution) when a line is known, else fall back to
+                // file_overview.
+                match results[0].line_start {
+                    Some(line) => suggested_with_args(
+                        "source",
+                        "Read implementation (body match, not a named symbol)",
+                        serde_json::json!({"path": results[0].path, "line": line}),
+                    ),
+                    None => suggested_with_args(
+                        "file_overview",
+                        "No symbol or line to anchor on — see the file's structure",
+                        serde_json::json!({"path": results[0].path}),
+                    ),
+                }
             } else {
                 suggested_with_args("source", "Read implementation", serde_json::json!({"symbol": results[0].name, "path": results[0].path}))
             };

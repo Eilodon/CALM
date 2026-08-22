@@ -175,7 +175,7 @@ impl CalmServer {
                     } else if health.test_files.is_empty() {
                         suggested_with_args("search", "No tests found — search for coverage", serde_json::json!({"query": format!("{} test", c.name), "kind": "text"}))
                     } else {
-                        suggested_with_args("source", "Read implementation", serde_json::json!({"target": c.name}))
+                        suggested_with_args("source", "Read implementation", serde_json::json!({"symbol": c.name}))
                     };
                     out.health = Some(health);
                     // Tier 1 semantic facts (2026-08-07 roadmap T1) --
@@ -911,11 +911,11 @@ impl CalmServer {
             // that's vanished/moved-ambiguous/unreadable since indexing is
             // dropped from `found` entirely -- it reports `found: false`
             // below rather than confidently returning stale content.
-            let found: std::collections::HashMap<String, CandidateRow> = found
+            let found: std::collections::HashMap<String, (CandidateRow, Option<String>)> = found
                 .into_iter()
                 .filter_map(
                     |(qn, row)| match verify_live(&conn, &self.project_root, row) {
-                        SymbolResolution::Found(c, _) => Some((qn, *c)),
+                        SymbolResolution::Found(c, bytes) => Some((qn, (*c, bytes))),
                         _ => None,
                     },
                 )
@@ -1011,7 +1011,7 @@ impl CalmServer {
                     .iter()
                     .map(|(from_symbol, _, _, _, _, line, _)| {
                         (
-                            found.get(from_symbol).map(|c| c.path.clone()).unwrap_or_default(),
+                            found.get(from_symbol).map(|c| c.0.path.clone()).unwrap_or_default(),
                             *line,
                         )
                     })
@@ -1039,14 +1039,22 @@ impl CalmServer {
             let mut missing: Vec<String> = Vec::new();
 
             for qn in &ids {
-                if let Some(row) = found.get(qn) {
+                if let Some((row, verified_bytes)) = found.get(qn) {
                     found_count += 1;
                     self.track_symbol(&row.qualified_name);
                     self.track_file(&row.path);
 
+                    // Wave 7 (audit follow-up, P0-C): reuse the bytes
+                    // verify_live already read above instead of a second,
+                    // independent read here -- same TOCTOU close as
+                    // source()/edit_context. Falls back to a fresh read
+                    // only when verify_live's own read failed.
                     let full_path = self.project_root.join(&row.path);
-                    let (source, token_estimate, content_warning) = match std::fs::read_to_string(&full_path) {
-                        Ok(content) => {
+                    let (source, token_estimate, content_warning) = match verified_bytes
+                        .clone()
+                        .or_else(|| std::fs::read_to_string(&full_path).ok())
+                    {
+                        Some(content) => {
                             let lines: Vec<&str> = content.lines().collect();
                             // Both ends clamped to lines.len() -- same
                             // P0-1e defensive fix as source() (2026-08-20
@@ -1060,7 +1068,7 @@ impl CalmServer {
                             let warn = injection_warning(&sanitized);
                             (Some(sanitized), Some(tok), warn)
                         }
-                        Err(_) => (None, None, None),
+                        None => (None, None, None),
                     };
 
                     results.push(SymbolsBatchEntry {

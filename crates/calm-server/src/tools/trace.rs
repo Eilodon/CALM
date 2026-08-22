@@ -229,7 +229,7 @@ impl CalmServer {
                 suggested_with_args(
                     "source",
                     "Read top caller implementation",
-                    serde_json::json!({"target": direct[0].symbol}),
+                    serde_json::json!({"symbol": direct[0].symbol}),
                 )
             } else if ambiguous_count > 0 {
                 suggested(

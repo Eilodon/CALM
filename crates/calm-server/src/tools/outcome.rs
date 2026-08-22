@@ -719,6 +719,25 @@ pub(crate) fn verify_live(
     // bytes instead of re-reading the file itself a second time -- a
     // second, independent read would reopen its own TOCTOU window even
     // though this escape hatch already can't verify identity.
+    //
+    // Wave 7 (audit follow-up, P0-C): DOCUMENTED RESIDUAL, not silently
+    // dropped -- this branch still returns `Found` for a row whose
+    // identity was never hash-verified against `file_index` (trusted
+    // DB coordinates, not a proven match, and `bytes: None` on a read
+    // failure is silently indistinguishable from a verified match with
+    // no readable content), which an external audit correctly flagged.
+    // Tried tightening this to `ReadFailed` on read failure and reverted
+    // it the same day: it broke 39+ existing tests (symbol_info/
+    // callers/pattern_debt/path/etc.) that legitimately insert a
+    // `symbols` row with no backing file on disk and rely on this exact
+    // escape hatch still returning DB-only metadata (coreness,
+    // caller_count, type_relations -- none of which need file bytes) --
+    // a real, intentional graceful-degradation path, not an oversight.
+    // Closing the identity gap properly needs a typed signal (a new
+    // `SymbolResolution` variant, or an explicit `verified` flag on
+    // `CandidateRow`) threaded through every one of this type's ~16 call
+    // sites so each can choose degrade-with-a-flag vs fail-closed for
+    // itself -- scoped as follow-up, not done this wave.
     let Some(indexed_hash) = indexed_hash else {
         let bytes = std::fs::read_to_string(project_root.join(&c.path)).ok();
         return SymbolResolution::Found(Box::new(c), bytes);

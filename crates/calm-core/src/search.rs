@@ -200,6 +200,24 @@ fn rank_multiplier(path: &str, is_test: bool, churn_score: Option<f64>) -> f64 {
 /// floored to `NOISE_PENALTY` is never resurrected by a high coreness value
 /// (50 * `CORENESS_WEIGHT` alone would multiply a score by 4.0x — comfortably
 /// enough to override `NOISE_PENALTY`'s 0.6x demotion if left ungated).
+///
+/// Wave 7 (audit follow-up): `coreness` (`symbols.coreness`) is computed by
+/// `graph::coreness` with a DELIBERATE fail-open policy for its primary
+/// consumer, the hub/bridge-hub safety gate -- `rank() > 0` counts
+/// `Textual`/`Inferred` edges as "confirmed", and an unparseable confidence
+/// string also counts as confirmed (see that module's own Wave 6 doc
+/// comment: reviewed and deliberately kept, since over-gating a symbol as a
+/// hub is the safe direction for a false-negative guard). This function
+/// reuses that SAME value for a different purpose -- ranking, not gating --
+/// where fail-open cuts the opposite way: an uncertain edge inflating a
+/// symbol's apparent centrality also makes it look more RELEVANT here, which
+/// isn't the conservative direction for search quality. Recorded here as an
+/// explicit, known tradeoff rather than left silent; a stricter
+/// verified-only coreness (mirroring `verified_caller_count`'s
+/// Formal/Resolved-only filter, see `refresh_caller_counts` in
+/// indexer/pipeline/graph.rs) would decouple the two, but is a real schema
+/// addition (new column + k-core pass) scoped as backlog, not built this
+/// wave.
 fn coreness_boost(path: &str, is_test: bool, coreness: Option<i64>) -> f64 {
     if is_test || is_noisy_path(path) {
         return 1.0;

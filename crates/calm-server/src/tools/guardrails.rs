@@ -46,24 +46,32 @@ impl CalmServer {
                 Ok(r) => r,
                 Err(e) => return db_error_resolved(e),
             };
-            let c = match resolution {
+            let (c, verified_bytes) = match resolution {
                 SymbolResolution::NotFound => return ResolvedOutcome::not_found(&p.symbol),
                 SymbolResolution::Ambiguous(candidates) => {
                     return ResolvedOutcome::ambiguous(&candidates);
                 }
                 SymbolResolution::ReadFailed(e) => return ResolvedOutcome::error(e),
-                SymbolResolution::Found(c, _) => *c,
+                SymbolResolution::Found(c, bytes) => (*c, bytes),
             };
             self.track_symbol(&c.qualified_name);
             self.track_file(&c.path);
 
             let config = self.config();
 
+            // Wave 7 (audit follow-up, P0-C): slice the checksum from the
+            // EXACT bytes verify_live just read, instead of a second,
+            // independent read here -- edit_context MINTS authority, so a
+            // separate read reopens the same TOCTOU window Wave 6 already
+            // closed for source()/understand() (see resolve_symbol/
+            // verify_live in outcome.rs). Falls back to a fresh read only
+            // when verify_live's own read failed (bytes is None) -- the
+            // same rare "unreadable" case source() falls back for.
             // For edit_lines/edit_symbol's expected_hash — computed the same
             // way apply_hunks hashes a range, so this checksum is directly
             // usable without a separate round trip to learn it.
-            let range_checksum = std::fs::read_to_string(self.project_root.join(&c.path))
-                .ok()
+            let range_checksum = verified_bytes
+                .or_else(|| std::fs::read_to_string(self.project_root.join(&c.path)).ok())
                 .and_then(|content| {
                     calm_core::edit::range_checksum(
                         &content,
