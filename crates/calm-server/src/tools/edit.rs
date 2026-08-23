@@ -505,19 +505,38 @@ impl CalmServer {
                     };
                     match &p.old_text {
                         None => {
-                            // Wave 10 (Item 4 companion): warn (never block)
-                            // when new_text's leading line duplicates a
-                            // decorator/attribute/annotation that already
-                            // sits, unedited, immediately above this
-                            // replace's OLD range on disk -- catches this
-                            // session's own live BlastRadiusInfo bug class.
-                            // See duplicate_decoration_risk_note's doc
-                            // comment.
-                            insertion_note = duplicate_decoration_risk_note(
+                            // Wave 4b (audit follow-up, 2026-08-23):
+                            // upgraded from a post-hoc warning to a
+                            // preflight refusal for the default scope=
+                            // "node" -- that scope's own range never
+                            // includes the decorator/attribute, so a
+                            // duplicate here is never intentional (unlike
+                            // scope="decorated_declaration", whose widened
+                            // range legitimately covers the same line and
+                            // is deliberately exempted below). Two real
+                            // escape hatches, no new param: drop the
+                            // duplicated line from new_text, or switch to
+                            // scope="decorated_declaration".
+                            let risk_note = duplicate_decoration_risk_note(
                                 &live,
                                 effective_line_start,
                                 &p.new_text,
                             );
+                            if let Some(note) = &risk_note
+                                && matches!(p.scope.as_deref(), None | Some("node"))
+                            {
+                                return ResolvedOutcome::error(error_detail(
+                                    "DUPLICATE_DECORATION_RISK",
+                                    &format!(
+                                        "{note} -- refusing to write under the default \
+                                         scope=\"node\" (which never includes decorators/\
+                                         attributes in its own range); this write would leave \
+                                         two copies"
+                                    ),
+                                    true,
+                                ));
+                            }
+                            insertion_note = risk_note;
                             calm_core::edit::HunkRequest {
                                 start_line: effective_line_start,
                                 end_line: c.line_end as usize,

@@ -15819,14 +15819,15 @@ mod tests {
     }
 
     #[test]
-    fn edit_symbol_default_scope_warns_on_duplicate_decoration_but_still_applies() {
-        // Wave 10 (Item 4 companion): a whole-symbol replace under the
-        // default scope="node" never includes leading decorators/
+    fn edit_symbol_default_scope_refuses_duplicate_decoration_with_escape_hatches() {
+        // Wave 4b (audit follow-up, 2026-08-23): upgraded from a post-hoc
+        // warning to a preflight refusal -- a whole-symbol replace under
+        // the default scope="node" never includes leading decorators/
         // attributes in its own range (see decorated_declaration_start's
-        // doc comment) -- so new_text repeating one verbatim silently
-        // duplicates it. Must warn, not block: this is exactly the bug
-        // class this session's own BlastRadiusInfo edit hit live.
-        let (dir, server) = test_server("edit_symbol_duplicate_decoration_warns");
+        // doc comment), so new_text repeating one verbatim would silently
+        // duplicate it. This is exactly the bug class this session's own
+        // BlastRadiusInfo edit hit live; must now refuse, not apply.
+        let (dir, server) = test_server("edit_symbol_duplicate_decoration_refuses");
         std::fs::write(
             dir.join("a.rs"),
             "#[inline]\nfn helper() -> i32 {\n    1\n}\n",
@@ -15854,7 +15855,7 @@ mod tests {
                 symbol: "helper".into(),
                 path: None,
                 line: None,
-                expected_hash: Some(hash),
+                expected_hash: Some(hash.clone()),
                 new_text: "#[inline]\nfn helper() -> i32 {\n    2\n}\n".into(),
                 position: None,
                 confirm: false,
@@ -15865,17 +15866,47 @@ mod tests {
             },
         ));
         let v = jv(out);
-        assert_eq!(v["applied"], true, "response: {v}");
-        let note = v["note"].as_str().unwrap_or("");
-        assert!(
-            note.contains("duplicate decoration risk"),
-            "expected a duplicate-decoration warning, got: {v}"
+        assert_eq!(v["applied"].as_bool(), None, "must not have applied: {v}");
+        assert_eq!(
+            v["error"]["code"], "DUPLICATE_DECORATION_RISK",
+            "response: {v}"
         );
         assert_eq!(
             std::fs::read_to_string(dir.join("a.rs")).unwrap(),
-            "#[inline]\n#[inline]\nfn helper() -> i32 {\n    2\n}\n",
-            "the warning does not block the write -- content really is duplicated, matching \
-             this session's own live bug"
+            "#[inline]\nfn helper() -> i32 {\n    1\n}\n",
+            "refused write must leave the file untouched"
+        );
+
+        // Escape hatch 1: scope="decorated_declaration" widens the range to
+        // legitimately include the decorator, so repeating it is not a
+        // duplicate and the write succeeds.
+        let widened_hash =
+            calm_core::edit::range_checksum("#[inline]\nfn helper() -> i32 {\n    1\n}\n", 1, 4)
+                .unwrap();
+        let out2 = server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
+            EditSymbolParams {
+                qualified_name: None,
+                change_id: None,
+                authority_id: None,
+                symbol: "helper".into(),
+                path: None,
+                line: None,
+                expected_hash: Some(widened_hash),
+                new_text: "#[inline]\nfn helper() -> i32 {\n    2\n}\n".into(),
+                position: None,
+                confirm: false,
+                reason: None,
+                cites: None,
+                old_text: None,
+                scope: Some("decorated_declaration".into()),
+            },
+        ));
+        let v2 = jv(out2);
+        assert_eq!(v2["applied"], true, "response: {v2}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.rs")).unwrap(),
+            "#[inline]\nfn helper() -> i32 {\n    2\n}\n",
+            "scope=\"decorated_declaration\" must not duplicate the attribute"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

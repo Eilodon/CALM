@@ -352,7 +352,11 @@ fn classify_error_state(code: &str, recoverable: bool) -> &'static str {
         | "TX_NOT_FOUND"
         | "UNKNOWN_JOB_KIND"
         | "UNKNOWN_TOOLSET"
-        | "EDIT_CONTEXT_REQUIRED" => "needs_context",
+        | "EDIT_CONTEXT_REQUIRED"
+        // Wave 4b (audit follow-up, 2026-08-23): fixable by removing the
+        // duplicated line from new_text, or switching to scope=
+        // "decorated_declaration" -- both caller-side, no review needed.
+        | "DUPLICATE_DECORATION_RISK" => "needs_context",
 
         _ => {
             if recoverable {
