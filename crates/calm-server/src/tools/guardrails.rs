@@ -353,7 +353,13 @@ impl CalmServer {
             // whose own range overlaps [c.line_start, c.line_end]) that a
             // real edit_lines/edit_symbol spend against this range will
             // compute for itself -- see that function's own doc comment.
-            let (gate_prediction, gate_touched, gate_touches_uncovered_code) = {
+            let (
+                gate_prediction,
+                gate_touched,
+                gate_touches_uncovered_code,
+                gate_uncertain_zero_caller_bool,
+                gate_signature_touch_bool,
+            ) = {
                 let gate_policy = calm_core::policy::loader::load_policy_or_warn(&self.project_root);
                 let (
                     gate_risk,
@@ -363,6 +369,7 @@ impl CalmServer {
                     gate_touched,
                     gate_risk_rule_reason,
                     gate_touches_uncovered_code,
+                    gate_signature_touch,
                 ) = edit::compute_touch_risk(
                     &conn,
                     &self.project_root,
@@ -378,7 +385,11 @@ impl CalmServer {
                     // reads hunk start/end, never text). real_hunks=false
                     // below ensures the placeholder's empty text is never
                     // misread as a real signature change by the (separate)
-                    // signature-escalation check inside compute_touch_risk.
+                    // signature-escalation check inside compute_touch_risk --
+                    // gate_signature_touch is therefore always None here (see
+                    // TouchRiskResult's own doc comment on its 8th element),
+                    // captured anyway so mint below threads the real
+                    // mechanism through rather than a bare literal.
                     &[(c.line_start, c.line_end, "")],
                     &gate_policy,
                     false,
@@ -423,6 +434,8 @@ impl CalmServer {
                     },
                     gate_touched,
                     gate_touches_uncovered_code,
+                    gate_uncertain_zero_caller.is_some(),
+                    gate_signature_touch.is_some(),
                 )
             };
 
@@ -466,6 +479,8 @@ impl CalmServer {
                 graph_generation,
                 &gate_touched,
                 gate_touches_uncovered_code,
+                gate_uncertain_zero_caller_bool,
+                gate_signature_touch_bool,
             );
             self.record_edit_context_review(
                 &c.qualified_name,
@@ -1321,6 +1336,9 @@ impl CalmServer {
     /// confirm/reason/cites path stays fully usable either way, since
     /// `edit_lines_impl_gated` only takes the new authority path when a
     /// caller explicitly supplies both `change_id` and `authority_id`.
+    // 9 params: each is an independently meaningful input, same rationale
+    // as compute_touch_risk's own #[allow] just above its definition.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn mint_review_authority_for_edit_context(
         &self,
         conn: &rusqlite::Connection,
@@ -1333,6 +1351,21 @@ impl CalmServer {
         // [c.line_start, c.line_end] already makes this computable there --
         // see TouchRiskResult's doc comment). Was hardcoded `false` here.
         touches_uncovered_code: bool,
+        // Wave 5 (audit follow-up, 2026-08-23): same pattern as
+        // touches_uncovered_code above -- gate_prediction's compute_touch_risk
+        // call already computes this (position 4 of TouchRiskResult), it was
+        // just being discarded before reaching this function.
+        uncertain_zero_caller: bool,
+        // Wave 5: ALWAYS `false` at this call site by construction --
+        // edit_context has no real proposed edit content yet (its
+        // compute_touch_risk call passes real_hunks=false), so there is no
+        // future signature to compare against. This is genuinely
+        // structural, unlike uncertain_zero_caller/touches_uncovered_code
+        // above (both purely properties of the symbol today, not of a
+        // not-yet-written edit) -- kept as an explicit parameter rather
+        // than a bare `false` in the RiskVector literal below so the two
+        // axes aren't silently conflated by a future reader.
+        signature_changed: bool,
     ) -> Option<MintedAuthorityOutput> {
         // WS2b (audit follow-up, gap #1): opened before `compute` so a
         // past full reconciliation recorded via
@@ -1394,8 +1427,8 @@ impl CalmServer {
             .unwrap_or(calm_core::policy::RiskLevel::Low),
             is_hub: c.is_hub,
             hub_kind,
-            signature_changed: false,
-            uncertain_zero_caller: false,
+            signature_changed,
+            uncertain_zero_caller,
             risk_rule_floor: calm_core::config::risk_floor_for_path(
                 &self.config().risk_rules,
                 &c.path,
@@ -1556,6 +1589,11 @@ impl CalmServer {
             touched,
             risk_rule_reason,
             range_touches_uncovered_code,
+            // Wave 5 (audit follow-up, 2026-08-23): always None here
+            // (real_hunks=false below, no real proposed edit content yet)
+            // -- captured anyway so the mint call further down threads the
+            // real mechanism through rather than a bare false literal.
+            range_signature_touch,
         ) = edit::compute_touch_risk(
             conn,
             &self.project_root,
@@ -1634,6 +1672,7 @@ impl CalmServer {
             &caller_set_digest,
             graph_generation,
             range_touches_uncovered_code,
+            range_signature_touch.is_some(),
         );
         // Structural half of the legacy confirm/reason gate
         // (edit_lines_impl_gated, edit.rs): record that this path's
@@ -1723,6 +1762,13 @@ impl CalmServer {
         // compute_touch_risk call (placeholder full-range hunk) -- was
         // hardcoded `false` here, same fix as the single-symbol mint path.
         touches_uncovered_code: bool,
+        // Wave 5 (audit follow-up, 2026-08-23): same pattern -- always
+        // false at this call site (no real edit content yet), kept as an
+        // explicit param rather than a bare literal so it isn't silently
+        // conflated with uncertain_zero_caller/touches_uncovered_code
+        // above (which ARE properties of the symbol today, not of a
+        // not-yet-written edit).
+        signature_changed: bool,
     ) -> Option<MintedAuthorityOutput> {
         let mut state_conn = calm_core::db::conn::open_state_writer(&self.state_db_path).ok()?;
         let snapshot = calm_core::authority::EvidenceSnapshot::compute_with_recorded_freshness(
@@ -1751,7 +1797,7 @@ impl CalmServer {
             caller_count_level,
             is_hub: hub_hit,
             hub_kind,
-            signature_changed: false,
+            signature_changed,
             uncertain_zero_caller,
             risk_rule_floor: calm_core::config::risk_floor_for_path(
                 &self.config().risk_rules,

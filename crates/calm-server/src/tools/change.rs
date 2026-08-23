@@ -654,7 +654,7 @@ impl CalmServer {
                                 }
                             }
                             if !uncertain_zero_caller {
-                                let (_, _, _, sym_uncertain, _, _, _) =
+                                let (_, _, _, sym_uncertain, _, _, _, _) =
                                     super::edit::compute_touch_risk(
                                         &conn,
                                         &self.project_root,

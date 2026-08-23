@@ -354,6 +354,23 @@ mod tests {
     }
 
     #[test]
+    fn is_covered_by_is_false_when_spend_signature_changed_but_mint_did_not() {
+        // Wave 5 (audit follow-up, 2026-08-23): before the fix, both mint
+        // and spend hardcoded signature_changed to false, so this axis of
+        // is_covered_by could never fire even for a real signature change
+        // -- a minted authority would silently cover a spend that actually
+        // changed the touched symbol's signature.
+        let mint = base_vector(); // signature_changed: false
+        let mut spend = base_vector();
+        spend.signature_changed = true;
+        assert!(
+            !spend.is_covered_by(&mint),
+            "a spend that changed the signature must NOT be covered by an authority \
+             minted before any signature change was known"
+        );
+    }
+
+    #[test]
     fn is_covered_by_true_when_spend_is_strictly_less_risky_on_every_axis() {
         let spend = base_vector(); // everything at its weakest
         let mut mint = base_vector();

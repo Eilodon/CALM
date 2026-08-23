@@ -11803,7 +11803,7 @@ mod tests {
         // signature (`signature = ''` here still spans line_start=1 with 0
         // embedded newlines), and touching it would trip the separate
         // signature-escalation signal this test isn't exercising.
-        let (risk, _, _, _, _, reason, _) = compute_touch_risk(
+        let (risk, _, _, _, _, reason, _, _) = compute_touch_risk(
             &conn,
             &dir,
             "a.py",
@@ -11823,7 +11823,7 @@ mod tests {
             glob: "a.py".to_string(),
             minimum: "high".to_string(),
         }];
-        let (risk, _, _, _, _, reason, _) = compute_touch_risk(
+        let (risk, _, _, _, _, reason, _, _) = compute_touch_risk(
             &conn,
             &dir,
             "a.py",
@@ -11863,7 +11863,7 @@ mod tests {
             glob: "a.py".to_string(),
             minimum: "low".to_string(),
         }];
-        let (risk, _, _, _, _, reason, _) = compute_touch_risk(
+        let (risk, _, _, _, _, reason, _, _) = compute_touch_risk(
             &conn,
             &dir,
             "a.py",
@@ -11908,7 +11908,7 @@ mod tests {
         // different text ("def helper():" -> "def helper(x):") must
         // escalate "low" to "high", same ceiling
         // escalate_risk_if_signature_changed uses.
-        let (risk, _, _, _, _, reason, _) = compute_touch_risk(
+        let (risk, _, _, _, _, reason, _, _) = compute_touch_risk(
             &conn,
             &dir,
             "a.py",
@@ -11951,7 +11951,7 @@ mod tests {
         // The hunk only covers the body line (2, 2), never the line-1
         // signature range -- must stay at the plain structural "low" signal
         // even though its new text obviously differs from the old body.
-        let (risk, _, _, _, _, reason, _) = compute_touch_risk(
+        let (risk, _, _, _, _, reason, _, _) = compute_touch_risk(
             &conn,
             &dir,
             "a.py",
@@ -11992,7 +11992,7 @@ mod tests {
         // was actually escalated, so there's nothing new to attribute a
         // reason to (avoids implying a rule or signature change did work
         // that caller count already did).
-        let (risk, _, _, _, _, reason, _) = compute_touch_risk(
+        let (risk, _, _, _, _, reason, _, _) = compute_touch_risk(
             &conn,
             &dir,
             "a.py",
@@ -12020,7 +12020,7 @@ mod tests {
         // Cargo.toml has zero indexed symbols -- caller_count-based
         // structural risk is `None`, so this isolates the manifest-floor
         // escalation as the ONLY signal at play.
-        let (risk, _, _, _, _, reason, _) = compute_touch_risk(
+        let (risk, _, _, _, _, reason, _, _) = compute_touch_risk(
             &conn,
             &dir,
             "Cargo.toml",
@@ -12060,7 +12060,7 @@ mod tests {
         // .calm/policy.toml must see that floor honored here exactly like
         // `policy::evaluate()` already does for a ChangeIntent-backed
         // RiskVector.
-        let (risk, _, _, _, _, _, _) = compute_touch_risk(
+        let (risk, _, _, _, _, _, _, _) = compute_touch_risk(
             &conn,
             &dir,
             "package.json",
@@ -12103,7 +12103,7 @@ mod tests {
             covered_lines,
         };
 
-        let (risk, _, _, _, _, reason, _) = compute_touch_risk(
+        let (risk, _, _, _, _, reason, _, _) = compute_touch_risk(
             &conn,
             &dir,
             "a.py",
@@ -12155,7 +12155,7 @@ mod tests {
         // real_hunks=false instead -- see
         // compute_touch_risk_placeholder_hunk_activates_coverage_probe_
         // without_a_false_signature_escalation below for that case).
-        let (risk, _, _, _, _, _, _) = compute_touch_risk(
+        let (risk, _, _, _, _, _, _, _) = compute_touch_risk(
             &conn,
             &dir,
             "a.py",
@@ -12197,7 +12197,7 @@ mod tests {
             source: "lcov".to_string(),
             covered_lines: std::collections::HashMap::new(),
         };
-        let (risk, _, _, _, _, reason, _) = compute_touch_risk(
+        let (risk, _, _, _, _, reason, _, _) = compute_touch_risk(
             &conn,
             &dir,
             "a.py",
@@ -12245,7 +12245,7 @@ mod tests {
             source: "lcov".to_string(),
             covered_lines: std::collections::HashMap::new(),
         };
-        let (risk, _, _, _, _, reason, _) = compute_touch_risk(
+        let (risk, _, _, _, _, reason, _, _) = compute_touch_risk(
             &conn,
             &dir,
             "a.py",

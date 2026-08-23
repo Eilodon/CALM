@@ -1280,6 +1280,13 @@ impl CalmServer {
             fresh_caller_digests,
             risk_rule_reason,
             union_caller_set_digest,
+            // Wave 5 (audit follow-up, 2026-08-23): the real value, from
+            // this same call (real_hunks=true below, a genuine write) --
+            // was discarded via `_` here before reaching the spend-time
+            // RiskVector, which hardcoded signature_changed: false as a
+            // result even though the real signature-change detection had
+            // already run for the gate's own escalation logic.
+            signature_touch,
         ) = {
             let conn = match self.make_read_conn() {
                 Ok(c) => c,
@@ -1295,18 +1302,26 @@ impl CalmServer {
                 .collect();
             let coverage = self.coverage.read_ok();
             let policy = calm_core::policy::loader::load_policy_or_warn(&self.project_root);
-            let (risk, hub_hit, hub_kind, uncertain_zero_caller, touched, risk_rule_reason, _) =
-                compute_touch_risk(
-                    &conn,
-                    &self.project_root,
-                    path,
-                    &ranges,
-                    &coverage,
-                    &self.config().risk_rules,
-                    &proposed_hunks,
-                    &policy,
-                    true, // Wave 5, 5.1b: real proposed hunks from a genuine write
-                );
+            let (
+                risk,
+                hub_hit,
+                hub_kind,
+                uncertain_zero_caller,
+                touched,
+                risk_rule_reason,
+                _,
+                signature_touch,
+            ) = compute_touch_risk(
+                &conn,
+                &self.project_root,
+                path,
+                &ranges,
+                &coverage,
+                &self.config().risk_rules,
+                &proposed_hunks,
+                &policy,
+                true, // Wave 5, 5.1b: real proposed hunks from a genuine write
+            );
             // Plan 3 §3.3 (F10): a bridge-only touch (never degree/both) at
             // risk ≤ medium MAY use the lighter CONFIRM_REQUIRED-only tier
             // below — but ONLY if every touched hub's caller edges are all
@@ -1387,6 +1402,7 @@ impl CalmServer {
                 fresh_caller_digests,
                 risk_rule_reason,
                 union_caller_set_digest,
+                signature_touch,
             )
         };
         // WS1 (audit follow-up): the REAL RiskVector/PolicyDecision for
@@ -1479,7 +1495,13 @@ impl CalmServer {
                             caller_count_level,
                             is_hub: hub_hit,
                             hub_kind: hub_kind.clone(),
-                            signature_changed: false,
+                            // Wave 5 (audit follow-up, 2026-08-23): real
+                            // value, threaded from the same real_hunks=true
+                            // compute_touch_risk call the gate itself
+                            // already used above (was hardcoded false,
+                            // silently making this axis of is_covered_by
+                            // dead on the spend side).
+                            signature_changed: signature_touch.is_some(),
                             uncertain_zero_caller: uncertain_zero_caller.is_some(),
                             risk_rule_floor,
                             kind_mismatch,
@@ -3072,7 +3094,7 @@ impl CalmServer {
                 .map(|r| (r.start_line as i64, r.new_end_line as i64))
                 .collect();
             let coverage = self.coverage.read_ok();
-            let (_, _, _, _, touched, _, _) = compute_touch_risk(
+            let (_, _, _, _, touched, _, _, _) = compute_touch_risk(
                 &conn,
                 &self.project_root,
                 path,
@@ -4188,6 +4210,17 @@ type TouchRiskResult = (
     Vec<TouchedSymbolOutput>,
     Option<String>,
     bool,
+    // Wave 5 (audit follow-up, 2026-08-23): the qualified_name of the
+    // first touched function/method whose own signature is semantically
+    // changed (`is_signature_semantically_changed`), if any -- already
+    // computed internally (see `signature_touch` below) to drive the
+    // structural-risk escalation, but previously discarded rather than
+    // exposed. `None` at any `real_hunks=false` (placeholder-hunk) call
+    // site by construction (no real proposed text to compare against yet
+    // -- structurally unknowable pre-edit, not a bug, unlike
+    // `touches_uncovered_code` above which only needs the touched LINES,
+    // not their future content).
+    Option<String>,
 );
 
 // 8 params: each is an independently meaningful input (conn, project_root,
@@ -4456,6 +4489,7 @@ pub(crate) fn compute_touch_risk(
         touched,
         risk_rule_reason,
         touches_uncovered_code,
+        signature_touch,
     )
 }
 
