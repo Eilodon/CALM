@@ -25,8 +25,22 @@ pub(crate) struct SuggestedNext {
     /// hint is left unset (`None`), meaning advisory-only. Lets an agent
     /// tell "you'll be blocked if you skip this" apart from "you probably
     /// want this next" without re-deriving it from AGENTS.md prose each time.
+    #[schemars(description = "true iff skipping `tool` is hook-enforced, not just advisory.")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) gate: Option<bool>,
+    /// P1 (audit follow-up, 2026-08-23): names any `tool` param that is
+    /// deliberately left OUT of `args` because this call site has no safe
+    /// value to prefill it with (e.g. `review_decide_via_agent_relay`'s
+    /// `approve` -- only a real human decision belongs there, never a
+    /// guess). `None` means `args` (if present) is already directly
+    /// callable as-is. Sparing an agent that dispatches on `tool` name
+    /// alone from treating an incomplete `args` object as a ready-to-call
+    /// "exact next call" when a required field is still missing.
+    #[schemars(
+        description = "Names any `tool` param intentionally left out of `args` because only a human can safely supply it (e.g. `approve`). Absent means `args` is already complete."
+    )]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) required_user_input: Option<Vec<String>>,
 }
 
 pub(crate) fn suggested(tool: &str, reason: &str) -> Option<SuggestedNext> {
@@ -35,6 +49,7 @@ pub(crate) fn suggested(tool: &str, reason: &str) -> Option<SuggestedNext> {
         reason: reason.into(),
         args: None,
         gate: None,
+        required_user_input: None,
     })
 }
 
@@ -48,6 +63,26 @@ pub(crate) fn suggested_with_args(
         reason: reason.into(),
         args: Some(args),
         gate: None,
+        required_user_input: None,
+    })
+}
+
+/// P1 (audit follow-up, 2026-08-23): like `suggested_with_args`, but for
+/// the rare call site whose `args` is missing a field that must come from
+/// a real human decision, never a guess -- see `SuggestedNext::
+/// required_user_input`'s own doc comment.
+pub(crate) fn suggested_with_args_requiring(
+    tool: &str,
+    reason: &str,
+    args: serde_json::Value,
+    required_user_input: &[&str],
+) -> Option<SuggestedNext> {
+    Some(SuggestedNext {
+        tool: tool.into(),
+        reason: reason.into(),
+        args: Some(args),
+        gate: None,
+        required_user_input: Some(required_user_input.iter().map(|s| s.to_string()).collect()),
     })
 }
 
@@ -61,6 +96,7 @@ pub(crate) fn suggested_gated(tool: &str, reason: &str) -> Option<SuggestedNext>
         reason: reason.into(),
         args: None,
         gate: Some(true),
+        required_user_input: None,
     })
 }
 
@@ -138,6 +174,9 @@ pub(crate) struct ErrorDetail {
     /// initial refusal) and `DIFF_DIGEST_MISMATCH` (the refetch-and-retry
     /// case) -- everything an agent needs to relay-approve/decline via
     /// `review_decide_via_agent_relay` without a separate read.
+    #[schemars(
+        description = "Set only on HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW / DIFF_DIGEST_MISMATCH — everything needed to relay-approve/decline via review_decide_via_agent_relay."
+    )]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) review: Option<Box<PendingReviewPacket>>,
     /// Wave 3: the exact next tool call this error implies, when there is
@@ -146,6 +185,9 @@ pub(crate) struct ErrorDetail {
     /// Boxed (like `review` above) so this rarely-populated pair doesn't
     /// inflate every `ErrorDetail`/`Result<_, ErrorDetail>` on the hot,
     /// common path -- clippy's `result_large_err` flagged the unboxed form.
+    #[schemars(
+        description = "The exact next tool call this error implies, if unambiguous — same shape as suggested_next."
+    )]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) next_call: Option<Box<SuggestedNext>>,
 }
@@ -182,14 +224,21 @@ impl ErrorDetail {
     /// call sites only.
     pub(crate) fn with_review(mut self, review: &calm_core::authority::PendingReview) -> Self {
         let packet = PendingReviewPacket::from_pending(review);
-        self.next_call = suggested_with_args(
+        // P1 (audit follow-up, 2026-08-23): `review_id`/`diff_digest` are
+        // the only 2 fields this call site can safely prefill -- `approve`
+        // is a real human decision, never a guess, so it's named in
+        // `required_user_input` instead of silently omitted from an
+        // otherwise ready-looking `args` object.
+        self.next_call = suggested_with_args_requiring(
             "review_decide_via_agent_relay",
             "Relay this review's approve/decline decision -- diff_digest is already the \
-             correct current value, echo it back verbatim",
+             correct current value, echo it back verbatim, and approve must be filled in with \
+             the human's real decision",
             serde_json::json!({
                 "review_id": packet.review_id,
                 "diff_digest": packet.diff_digest,
             }),
+            &["approve"],
         )
         .map(Box::new);
         self.review = Some(Box::new(packet));
@@ -442,6 +491,25 @@ impl<T> ToolOutcome<T> {
     pub(crate) fn success(value: T) -> Self {
         ToolOutcome {
             flow_state: "ready",
+            error: None,
+            success: Some(value),
+        }
+    }
+
+    /// P1 (audit follow-up, 2026-08-23): like `success`, but for the rare
+    /// call site whose `T` carries its own real mid-flow state (e.g.
+    /// `EditTransactionStatusOutput`/`VerifyChangeOutput`'s `state` field
+    /// reporting `VerifyPending`/`Failed`) that the flat `"ready"` default
+    /// would otherwise contradict -- an agent dispatching on the top-level
+    /// `flow_state` alone (the whole point of Wave 11 item 3) would
+    /// wrongly read "nothing more to do" for a transaction still awaiting
+    /// `verify_change`, or one that already failed. `flow_state` should
+    /// still be drawn from the same `classify_error_state` vocabulary
+    /// (`needs_verification`/`blocked`/etc.) for consistency with the
+    /// error side.
+    pub(crate) fn success_with_flow_state(value: T, flow_state: &'static str) -> Self {
+        ToolOutcome {
+            flow_state,
             error: None,
             success: Some(value),
         }

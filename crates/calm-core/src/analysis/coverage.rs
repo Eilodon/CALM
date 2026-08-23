@@ -21,6 +21,31 @@ impl CoverageData {
         };
         (line_start..=line_end).any(|ln| file_cov.contains(&ln))
     }
+
+    /// P1 (audit follow-up, 2026-08-23): fraction of `[line_start,
+    /// line_end]` (inclusive) that has SOME recorded execution, as
+    /// `covered / total_lines_in_range`. `0.0` when the file has no
+    /// coverage data at all or the range is empty/inverted. Distinct from
+    /// `is_covered`'s any-line-at-all question -- that answers "did this
+    /// range ever run", correct for `compute_dead_code_confidence`'s
+    /// liveness check, but too lenient for a caller asking "is this edit
+    /// adequately tested": a 50-line range with exactly 1 covered line
+    /// reads as fully `is_covered`, hiding that the other 49 lines are
+    /// genuinely untested. Callers deciding whether to escalate risk
+    /// should compare this ratio against their own threshold instead.
+    pub fn coverage_ratio(&self, abs_path: &str, line_start: i64, line_end: i64) -> f64 {
+        if line_end < line_start {
+            return 0.0;
+        }
+        let total = (line_end - line_start + 1) as f64;
+        let Some(file_cov) = self.covered_lines.get(abs_path) else {
+            return 0.0;
+        };
+        let covered = (line_start..=line_end)
+            .filter(|ln| file_cov.contains(ln))
+            .count() as f64;
+        covered / total
+    }
 }
 
 // Defined in `indexer::coverage_paths`, not here: `indexer::refresh` also
@@ -330,6 +355,32 @@ mod tests {
         assert!(cov.is_covered("/foo.py", 10, 10));
         assert!(!cov.is_covered("/foo.py", 6, 9));
         assert!(!cov.is_covered("/bar.py", 1, 100));
+    }
+
+    /// P1 (audit follow-up, 2026-08-23): coverage_ratio must report the
+    /// real fraction, not just any-line-at-all -- this is the fact
+    /// touches_uncovered_code's threshold check now relies on to catch a
+    /// mostly-untested hunk that is_covered alone would have missed (1
+    /// covered line out of a 50-line range read as "fully covered").
+    #[test]
+    fn test_coverage_ratio() {
+        let mut lines = HashSet::new();
+        lines.insert(5);
+        lines.insert(10);
+        let cov = CoverageData {
+            source: "lcov".to_string(),
+            covered_lines: HashMap::from([("/foo.py".to_string(), lines)]),
+        };
+        // 2 covered lines (5, 10) out of a 10-line range [1, 10].
+        assert_eq!(cov.coverage_ratio("/foo.py", 1, 10), 0.2);
+        // Fully covered single-line range.
+        assert_eq!(cov.coverage_ratio("/foo.py", 10, 10), 1.0);
+        // No overlap at all.
+        assert_eq!(cov.coverage_ratio("/foo.py", 20, 25), 0.0);
+        // Unknown file -> 0.0, same convention as is_covered.
+        assert_eq!(cov.coverage_ratio("/bar.py", 1, 100), 0.0);
+        // Inverted range is defensively 0.0, not a panic.
+        assert_eq!(cov.coverage_ratio("/foo.py", 10, 1), 0.0);
     }
 
     #[test]

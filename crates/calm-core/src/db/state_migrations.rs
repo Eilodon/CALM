@@ -942,42 +942,63 @@ pub(crate) fn run_migrations_from(
     migrations: &[StateMigration],
     target: i64,
 ) -> Result<(), StateMigrationError> {
-    let on_disk: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    let mut current = if on_disk == 0 {
-        BASELINE_VERSION
-    } else {
-        on_disk
-    };
-
-    while current < target {
-        let step = match migrations.iter().find(|m| m.from == current) {
-            Some(s) => s,
-            None => {
-                return Err(StateMigrationError::MissingMigration {
+    loop {
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let step_result = (|| -> Result<bool, StateMigrationError> {
+            // Fresh read INSIDE this transaction -- closes the TOCTOU a bare
+            // read-before-the-loop + unconditional-stamp-after-the-loop had
+            // (2026-08-23 audit, Bug B): a concurrent OTHER process (e.g. a
+            // newer binary migrating this same file further) could commit
+            // its own advance between an outer read taken once before a
+            // loop and a later unconditional stamp, silently REGRESSING
+            // user_version below what that process already established --
+            // even though the newer schema's DDL is still physically
+            // present, defeating `refuse_if_schema_newer`'s downgrade guard
+            // for every process that opens the file afterward. Re-reading
+            // here, inside our own BEGIN IMMEDIATE, sees the true latest
+            // committed value (no other writer can commit while we hold
+            // this lock), so `current` is never stale by the time we
+            // decide what (if anything) to write.
+            let on_disk: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+            let current = if on_disk == 0 {
+                BASELINE_VERSION
+            } else {
+                on_disk
+            };
+            if current >= target {
+                // Nothing left for THIS call to do -- possibly because a
+                // concurrent process already finished it. Never regress a
+                // version someone else already stamped higher; only bring
+                // a genuinely unstamped/behind file up to `target`.
+                if on_disk < target {
+                    conn.pragma_update(None, "user_version", target)?;
+                }
+                return Ok(true);
+            }
+            let step = migrations.iter().find(|m| m.from == current).ok_or(
+                StateMigrationError::MissingMigration {
                     from: current,
                     target,
-                });
-            }
-        };
-        debug_assert_eq!(
-            step.to,
-            step.from + 1,
-            "state.db migrations must be consecutive single-version steps (got {}: {} -> {})",
-            step.name,
-            step.from,
-            step.to
-        );
-
-        conn.execute_batch("BEGIN IMMEDIATE")?;
-        let step_result = (|| -> Result<(), StateMigrationError> {
+                },
+            )?;
+            debug_assert_eq!(
+                step.to,
+                step.from + 1,
+                "state.db migrations must be consecutive single-version steps (got {}: {} -> {})",
+                step.name,
+                step.from,
+                step.to
+            );
             (step.apply)(conn)?;
             conn.pragma_update(None, "user_version", step.to)?;
-            Ok(())
+            Ok(false)
         })();
         match step_result {
-            Ok(()) => {
+            Ok(done) => {
                 conn.execute_batch("COMMIT")?;
-                current = step.to;
+                if done {
+                    return Ok(());
+                }
             }
             Err(e) => {
                 // Undoes both the DDL and (if it was reached) the
@@ -988,13 +1009,6 @@ pub(crate) fn run_migrations_from(
             }
         }
     }
-
-    // Always stamp explicitly, even when zero migrations ran -- a fresh or
-    // `user_version == 0` file must still come out of this function stamped
-    // to `target`, not left at its raw on-disk value, or the downgrade
-    // guard has nothing to check next time.
-    conn.pragma_update(None, "user_version", target)?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1211,6 +1225,32 @@ mod tests {
             err,
             Err(StateMigrationError::MissingMigration { from: 1, target: 3 })
         ));
+    }
+
+    #[test]
+    fn run_migrations_from_never_regresses_a_version_already_stamped_higher() {
+        // Bug B (2026-08-23 audit): simulates the concurrent-process race
+        // deterministically, without real threads -- a newer binary (or
+        // just an earlier, faster call) already advanced this exact file
+        // to version 3 (with real physical schema to match) before THIS
+        // call, whose own `target` is only 2, ever got to look. The OLD
+        // code read `user_version` once, decided `current(2) < target(2)`
+        // was false so no step ran, then unconditionally stamped `target`
+        // (2) anyway at its final line -- regressing the file from 3 back
+        // to 2 even though its real schema was already ahead. The fix must
+        // leave an already-higher on-disk version untouched.
+        let conn = fresh_conn();
+        conn.pragma_update(None, "user_version", 3).unwrap();
+
+        let migrations: [StateMigration; 0] = [];
+        run_migrations_from(&conn, &migrations, 2).unwrap();
+
+        assert_eq!(
+            user_version(&conn),
+            3,
+            "a version a concurrent/earlier writer already stamped higher must never be \
+             regressed down to this call's own (now-stale) target"
+        );
     }
 
     #[test]

@@ -361,6 +361,29 @@ impl CalmServer {
                 gate_signature_touch_bool,
             ) = {
                 let gate_policy = calm_core::policy::loader::load_policy_or_warn(&self.project_root);
+                // P0-3 (audit follow-up, 2026-08-23): without
+                // `p.proposed_new_text`, no real proposed edit content
+                // exists yet at this pre-edit exploration call, so a
+                // synthetic full-range placeholder hunk (empty text,
+                // real_hunks=false) is used exactly as before -- it still
+                // lets compute_touch_risk's uncovered-code probe run for
+                // real (that probe only reads hunk start/end, never text),
+                // but gate_signature_touch stays None from it (see
+                // TouchRiskResult's own doc comment on its 8th element).
+                // When the caller DOES supply `proposed_new_text`, this is
+                // a real whole-range-replace hunk with real_hunks=true, so
+                // the exact same signature-change detection the real
+                // edit_lines/edit_symbol write gate uses at spend time
+                // also runs here at mint time -- closing the dead end
+                // where a genuine signature edit could never mint an
+                // authority whose signature_changed matched what spend
+                // time would independently recompute from the real diff.
+                let gate_hunks: Vec<(i64, i64, &str)> = vec![(
+                    c.line_start,
+                    c.line_end,
+                    p.proposed_new_text.as_deref().unwrap_or(""),
+                )];
+                let gate_real_hunks = p.proposed_new_text.is_some();
                 let (
                     gate_risk,
                     gate_hub_hit,
@@ -377,22 +400,9 @@ impl CalmServer {
                     &[(c.line_start, c.line_end)],
                     &self.coverage.read_ok(),
                     &config.risk_rules,
-                    // Wave 5, item 5.1b (truth-kernel-hardening plan, P0-6):
-                    // no real proposed edit content exists yet at this
-                    // pre-edit exploration call, but a synthetic full-range
-                    // placeholder hunk still lets compute_touch_risk's
-                    // uncovered-code probe run for real (that probe only
-                    // reads hunk start/end, never text). real_hunks=false
-                    // below ensures the placeholder's empty text is never
-                    // misread as a real signature change by the (separate)
-                    // signature-escalation check inside compute_touch_risk --
-                    // gate_signature_touch is therefore always None here (see
-                    // TouchRiskResult's own doc comment on its 8th element),
-                    // captured anyway so mint below threads the real
-                    // mechanism through rather than a bare literal.
-                    &[(c.line_start, c.line_end, "")],
+                    &gate_hunks,
                     &gate_policy,
-                    false,
+                    gate_real_hunks,
                 );
                 // Mirrors edit_lines_impl_gated's own bridge-downgrade
                 // eligibility check exactly (edit.rs) -- computed here too,
@@ -922,6 +932,7 @@ impl CalmServer {
                     reason: "Verify high-risk callers manually".into(),
                     args: Some(serde_json::json!({"symbol": s.name})),
                     gate: None,
+                    required_user_input: None,
                 })
             } else if aggregate_risk == "medium" {
                 affected_symbols.first().map(|s| SuggestedNext {
@@ -929,6 +940,7 @@ impl CalmServer {
                     reason: "Medium-risk changes — spot-check key callers".into(),
                     args: Some(serde_json::json!({"symbol": s.name})),
                     gate: None,
+                    required_user_input: None,
                 })
             } else if aggregate_risk == "unknown" {
                 suggested("indexing_status", "Risk unknown — check index state")
@@ -1042,6 +1054,27 @@ pub(crate) struct EditContextParams {
     /// silently stale.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) if_none_match: Option<String>,
+    /// P0-3 (audit follow-up, 2026-08-23): opt-in full replacement text for
+    /// the reviewed range (the symbol's own `[line_start, line_end]` in
+    /// symbol mode, `[line, end_line]` in range mode) -- when set, the
+    /// same `compute_touch_risk` signature-change detection the real
+    /// `edit_lines`/`edit_symbol` write gate uses at spend time also runs
+    /// here at mint time, against this exact text, instead of the
+    /// placeholder empty hunk. Without this, `edit_context` has no
+    /// proposed content yet and can only ever mint an authority with
+    /// `signature_changed=false` -- correct as a conservative default, but
+    /// a dead end for a genuine signature edit: the minted RiskVector
+    /// under-claims risk relative to what `edit_lines_impl_gated`
+    /// independently recomputes from the real diff at spend time, so
+    /// `AUTHORITY_STALE_RISK_VECTOR` fires deterministically for every
+    /// signature change that goes through the authority flow, with no
+    /// successful path (see the audit finding this closes). Assumes a
+    /// WHOLE-RANGE replace, matching `edit_symbol`'s default `"replace"`
+    /// position -- not meaningful for a narrower `edit_lines` hunk within
+    /// the range, which should omit this and rely on the conservative
+    /// default instead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) proposed_new_text: Option<String>,
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -1230,16 +1263,23 @@ pub(crate) struct GatePredictionOutput {
     /// (`edit_context` freshness, a grounded `reason`) a `confirm: true`
     /// attempt would still have to clear when `requires` is
     /// `"edit_context+confirm+grounded_reason"`.
+    #[schemars(description = "true iff a write here with confirm: false would be rejected.")]
     pub(crate) will_block: bool,
     /// This exact symbol's own `is_hub` — distinct from `will_block`, which
     /// also accounts for the wider touched range (e.g. an enclosing hub
     /// class this symbol sits inside — see `blocking_symbols`).
+    #[schemars(
+        description = "This exact symbol's own is_hub (distinct from will_block, which also covers the wider touched range)."
+    )]
     pub(crate) is_hub: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) hub_kind: Option<String>,
     /// Touched symbols (qualified names) that are themselves a hub — names
     /// the enclosing class here when THAT, not this symbol, is what the
     /// gate would actually block on.
+    #[schemars(
+        description = "Touched symbols (qualified names) that are themselves a hub, when different from this one."
+    )]
     pub(crate) blocking_symbols: Vec<String>,
     /// `"none"` | `"confirm"` | `"edit_context+confirm+grounded_reason"`.
     pub(crate) requires: String,
@@ -1581,6 +1621,15 @@ impl CalmServer {
 
         let config = self.config();
         let policy = calm_core::policy::loader::load_policy_or_warn(&self.project_root);
+        // P0-3 (audit follow-up, 2026-08-23): mirrors edit_context's own
+        // symbol-mode fix -- without `p.proposed_new_text`, this stays
+        // the placeholder empty hunk with real_hunks=false (unchanged
+        // behavior, range_signature_touch always None). When supplied,
+        // it's a real whole-range-replace hunk with real_hunks=true, so
+        // signature-change detection runs for real here too.
+        let range_hunks: Vec<(i64, i64, &str)> =
+            vec![(start, end, p.proposed_new_text.as_deref().unwrap_or(""))];
+        let range_real_hunks = p.proposed_new_text.is_some();
         let (
             risk,
             hub_hit,
@@ -1589,10 +1638,6 @@ impl CalmServer {
             touched,
             risk_rule_reason,
             range_touches_uncovered_code,
-            // Wave 5 (audit follow-up, 2026-08-23): always None here
-            // (real_hunks=false below, no real proposed edit content yet)
-            // -- captured anyway so the mint call further down threads the
-            // real mechanism through rather than a bare false literal.
             range_signature_touch,
         ) = edit::compute_touch_risk(
             conn,
@@ -1601,9 +1646,9 @@ impl CalmServer {
             &[(start, end)],
             &self.coverage.read_ok(),
             &config.risk_rules,
-            &[(start, end, "")],
+            &range_hunks,
             &policy,
-            false,
+            range_real_hunks,
         );
 
         let bridge_downgrade_eligible = hub_kind.as_deref() == Some("bridge")

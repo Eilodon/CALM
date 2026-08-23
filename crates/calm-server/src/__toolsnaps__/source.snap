@@ -67,12 +67,13 @@
         "format": "int64"
       },
       "max_lines": {
-        "description": "Wave 11 (item 1, \"response budget\"): caps how many lines of `source`\ncome back in one call -- `None` (default) is today's unlimited\nbehavior. When the resolved range has more lines than this, the\nresponse is cut short and carries `truncated: true`/`next_cursor`\n(pass that back as `resume_from_line` to continue). Purely opt-in:\nomitting it changes nothing about existing behavior. `etag` is\nalways the hash of the FULL range regardless of pagination -- it's\na range-identity signal, not tied to how much of it was rendered.",
+        "description": "Wave 12 (pagination default flip, 2026-08-23 plan): caps how many\nlines of `source` come back in one call. Defaults to\n`default_max_lines_cap`'s 300 when the JSON key is OMITTED --\ngenerous headroom over this repo's own production p99 (260 lines),\nonly ever touches the small long tail. Pass an explicit `null` to\nopt back into the old unlimited behavior -- omitting the key no\nlonger means that (see `default_max_lines_cap`'s own doc comment for\nwhy an explicit null still bypasses the default). When the resolved\nrange has more lines than the effective cap, the response is cut\nshort and carries `truncated: true`/`next_cursor` (pass that back as\n`resume_from_line` to continue). `etag` is always the hash of the\nFULL range regardless of pagination -- it's a range-identity signal,\nnot tied to how much of it was rendered.",
         "type": [
           "integer",
           "null"
         ],
-        "format": "int64"
+        "format": "int64",
+        "default": 300
       },
       "max_chars": {
         "description": "Wave 6 (item d): hard character cap on the rendered `source` text,\napplied on top of whatever `max_lines` already selected (never\nwidens a page, only narrows it further) -- counts whole lines only,\nnever splitting a single line's own characters across pages. Known,\naccepted limitation: a single line alone longer than `max_chars` is\nstill returned whole (can't be sub-divided by byte offset), and\n`next_cursor` on the following page points straight back to that\nsame line rather than skipping past it.",
@@ -101,7 +102,7 @@
             "type": "boolean"
           },
           "review": {
-            "description": "Wave 3: set only on `HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW` (the\ninitial refusal) and `DIFF_DIGEST_MISMATCH` (the refetch-and-retry\ncase) -- everything an agent needs to relay-approve/decline via\n`review_decide_via_agent_relay` without a separate read.",
+            "description": "Set only on HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW / DIFF_DIGEST_MISMATCH — everything needed to relay-approve/decline via review_decide_via_agent_relay.",
             "anyOf": [
               {
                 "$ref": "#/$defs/PendingReviewPacket"
@@ -112,7 +113,7 @@
             ]
           },
           "next_call": {
-            "description": "Wave 3: the exact next tool call this error implies, when there is\none unambiguous next step -- reuses `SuggestedNext` so a caller\nalready handling `suggested_next` elsewhere needs no new shape.\nBoxed (like `review` above) so this rarely-populated pair doesn't\ninflate every `ErrorDetail`/`Result<_, ErrorDetail>` on the hot,\ncommon path -- clippy's `result_large_err` flagged the unboxed form.",
+            "description": "The exact next tool call this error implies, if unambiguous — same shape as suggested_next.",
             "anyOf": [
               {
                 "$ref": "#/$defs/SuggestedNext"
@@ -165,11 +166,21 @@
           },
           "args": true,
           "gate": {
-            "description": "Plan 3 §3.5(b): `Some(true)` iff skipping `tool` is actually\nhook-enforced (currently only the edit_context/edit_lines/edit_symbol\n→ diff_impact hints set this, via `suggested_gated`) — every other\nhint is left unset (`None`), meaning advisory-only. Lets an agent\ntell \"you'll be blocked if you skip this\" apart from \"you probably\nwant this next\" without re-deriving it from AGENTS.md prose each time.",
+            "description": "true iff skipping `tool` is hook-enforced, not just advisory.",
             "type": [
               "boolean",
               "null"
             ]
+          },
+          "required_user_input": {
+            "description": "Names any `tool` param intentionally left out of `args` because only a human can safely supply it (e.g. `approve`). Absent means `args` is already complete.",
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            }
           }
         },
         "required": [

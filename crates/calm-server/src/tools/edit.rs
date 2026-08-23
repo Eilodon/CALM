@@ -13,6 +13,24 @@ use super::*;
 /// succession. Guards `()` only — poison-tolerant via `LockExt`.
 static EMBED_BG: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// P1 (audit follow-up, 2026-08-23): minimum `CoverageData::coverage_ratio`
+/// for a touched hunk to be treated as "adequately tested" by
+/// `touches_uncovered_code` (`hunks_touch_uncovered_code`/
+/// `compute_touch_risk`) -- below this, the hunk escalates risk via
+/// `policy.uncovered_code_floor` same as before. Deliberately NOT 1.0
+/// (100%): a real lcov/coverage report has no entry at all for lines that
+/// were never instrumentable in the first place (blank lines, closing
+/// braces, comments interleaved with real code), so even a fully-tested
+/// hunk routinely reads under 100%. Deliberately NOT close to 0% either --
+/// that was the bug this fix closes (`is_covered`'s old any-line-at-all
+/// check let a single covered line out of a 50-line hunk read as fully
+/// covered). 0.5 is a real, defensible-but-not-scientifically-calibrated
+/// middle ground; a project that already got burned by over-escalation
+/// once (2026-08-20 truth-kernel audit -- see `any_executable_kind` in
+/// `compute_touch_risk`) should tune this from real data before trusting
+/// it as a hard gate, not treat it as a settled constant.
+const MIN_ADEQUATE_COVERAGE_RATIO: f64 = 0.5;
+
 #[rmcp::tool_router(router = "edit_tool_router", vis = "pub(crate)")]
 impl CalmServer {
     #[tool(
@@ -1302,6 +1320,20 @@ impl CalmServer {
                 .collect();
             let coverage = self.coverage.read_ok();
             let policy = calm_core::policy::loader::load_policy_or_warn(&self.project_root);
+            // Bug (2026-08-23 audit, multi-hunk signature-escalation gap):
+            // `new_content`/`touched_old_lines`/`touched_new_lines` were
+            // already computed above (for `validate_syntax_diff`) from the
+            // real `apply_hunks` splice of every hunk in this call -- reuse
+            // them here via `compute_touch_risk_with_reconstruction` so the
+            // signature-change check sees the TRUE post-edit text at the
+            // TRUE post-edit position for ANY number/shape of hunks,
+            // instead of requiring exactly one hunk to fully cover a
+            // touched symbol's signature span.
+            let line_map: Vec<(i64, i64, i64, i64)> = touched_old_lines
+                .iter()
+                .zip(touched_new_lines.iter())
+                .map(|(&(os, oe), &(ns, ne))| (os, oe, ns, ne))
+                .collect();
             let (
                 risk,
                 hub_hit,
@@ -1311,7 +1343,7 @@ impl CalmServer {
                 risk_rule_reason,
                 _,
                 signature_touch,
-            ) = compute_touch_risk(
+            ) = compute_touch_risk_with_reconstruction(
                 &conn,
                 &self.project_root,
                 path,
@@ -1320,7 +1352,10 @@ impl CalmServer {
                 &self.config().risk_rules,
                 &proposed_hunks,
                 &policy,
-                true, // Wave 5, 5.1b: real proposed hunks from a genuine write
+                ReconstructedEdit {
+                    new_content: &new_content,
+                    line_map: &line_map,
+                },
             );
             // Plan 3 §3.3 (F10): a bridge-only touch (never degree/both) at
             // risk ≤ medium MAY use the lighter CONFIRM_REQUIRED-only tier
@@ -1805,11 +1840,17 @@ impl CalmServer {
             && !matches!(gate, ElicitGate::Ask | ElicitGate::Approved);
         if high_risk_needs_independent_review {
             let review_fingerprint = fingerprint_hunks(path, &hunks);
+            // Bug (2026-08-23 audit, pending_review not one-shot): use
+            // claim_approved_matching, not a bare find_approved_matching --
+            // this is the actual write gate, and a match here must consume
+            // the human approval so it can authorize exactly this one
+            // write, not be replayed for any later call that happens to
+            // reproduce the same (path, fingerprint).
             let approved_pending_review =
                 calm_core::db::conn::open_state_writer(&self.state_db_path)
                     .ok()
                     .and_then(|conn| {
-                        calm_core::authority::find_approved_matching(
+                        calm_core::authority::claim_approved_matching(
                             &conn,
                             path,
                             &review_fingerprint,
@@ -3789,9 +3830,10 @@ fn hunks_touch_uncovered_code(
         return false;
     }
     let abs_path = calm_core::analysis::coverage::normalize_path(&project_root.join(path));
-    hunks
-        .iter()
-        .any(|h| !coverage.is_covered(&abs_path, h.start_line as i64, h.end_line as i64))
+    hunks.iter().any(|h| {
+        coverage.coverage_ratio(&abs_path, h.start_line as i64, h.end_line as i64)
+            < MIN_ADEQUATE_COVERAGE_RATIO
+    })
 }
 
 /// Renders every hunk's before/after content as a compact, `-`/`+` diff --
@@ -3887,6 +3929,29 @@ fn build_hub_elicit_message(
     msg
 }
 
+/// Appends one length-prefixed field to `material` — the length prefix
+/// makes field boundaries unambiguous regardless of what `value` itself
+/// contains (embedded newlines, text shaped like another field's own
+/// `label=` marker, etc.). Closes a delimiter-injection gap the old bare
+/// `label=value\n` concatenation had (2026-08-23 audit, Bug A): a crafted
+/// `new_text`/`old_text` could forge a byte-identical `material` string
+/// for a DIFFERENT hunk/edit list than the one a human actually approved,
+/// producing the SAME SHA-256 fingerprint for two different edits without
+/// ever needing to break the hash itself — collision-resistance of the
+/// digest is worthless if the preimage encoding feeding it is ambiguous.
+/// `label` is always our own fixed literal text, never attacker-controlled,
+/// so only `value` needs the prefix; the length is `value`'s byte count
+/// (`str::len`), written in canonical decimal (no leading-zero ambiguity),
+/// so a reader — human or code — can always tell exactly where `value`
+/// ends regardless of its content.
+fn push_fingerprint_field(material: &mut String, label: &str, value: &str) {
+    material.push_str(label);
+    material.push_str(&value.len().to_string());
+    material.push(':');
+    material.push_str(value);
+    material.push('\n');
+}
+
 /// Content fingerprint for the per-session declined-cache AND the MRTR
 /// seal's content-identity check (`HubEditStateSeal`, `hub_mrtr_decide`) --
 /// keyed by what would actually be written, never by path alone (audit L7:
@@ -3905,17 +3970,30 @@ fn build_hub_elicit_message(
 /// matters (`target_scope_digest`, `policy_digest`, ...) -- this was simply
 /// never wired here.
 fn fingerprint_edit_lines(p: &EditLinesParams) -> String {
-    let mut material = format!("edit-lines-fingerprint-v2\npath={}\n", p.path);
+    let mut material = String::from("edit-lines-fingerprint-v3\n");
+    push_fingerprint_field(&mut material, "path=", &p.path);
     for (i, e) in p.edits.iter().enumerate() {
-        material.push_str(&format!(
-            "edit[{i}].start_line={}\nedit[{i}].end_line={}\nedit[{i}].expected_hash={}\n\
-             edit[{i}].old_text={}\nedit[{i}].new_text={}\n",
-            e.start_line,
-            e.end_line,
+        push_fingerprint_field(
+            &mut material,
+            &format!("edit[{i}].start_line="),
+            &e.start_line.to_string(),
+        );
+        push_fingerprint_field(
+            &mut material,
+            &format!("edit[{i}].end_line="),
+            &e.end_line.to_string(),
+        );
+        push_fingerprint_field(
+            &mut material,
+            &format!("edit[{i}].expected_hash="),
             e.expected_hash.as_deref().unwrap_or(""),
+        );
+        push_fingerprint_field(
+            &mut material,
+            &format!("edit[{i}].old_text="),
             e.old_text.as_deref().unwrap_or(""),
-            e.new_text,
-        ));
+        );
+        push_fingerprint_field(&mut material, &format!("edit[{i}].new_text="), &e.new_text);
     }
     calm_core::digest::evidence_digest(material.as_bytes())
 }
@@ -3923,17 +4001,30 @@ fn fingerprint_edit_lines(p: &EditLinesParams) -> String {
 /// See `fingerprint_edit_lines` — same contract and same CCK-29c rationale
 /// for `edit_symbol` params.
 fn fingerprint_edit_symbol(p: &EditSymbolParams) -> String {
-    let material = format!(
-        "edit-symbol-fingerprint-v2\nsymbol={}\npath={}\nline={}\nposition={}\n\
-         expected_hash={}\nold_text={}\nnew_text={}\n",
-        p.symbol,
-        p.path.as_deref().unwrap_or(""),
-        p.line.map(|l| l.to_string()).unwrap_or_default(),
-        p.position.as_deref().unwrap_or(""),
-        p.expected_hash.as_deref().unwrap_or(""),
-        p.old_text.as_deref().unwrap_or(""),
-        p.new_text,
+    let mut material = String::from("edit-symbol-fingerprint-v3\n");
+    push_fingerprint_field(&mut material, "symbol=", &p.symbol);
+    push_fingerprint_field(&mut material, "path=", p.path.as_deref().unwrap_or(""));
+    push_fingerprint_field(
+        &mut material,
+        "line=",
+        &p.line.map(|l| l.to_string()).unwrap_or_default(),
     );
+    push_fingerprint_field(
+        &mut material,
+        "position=",
+        p.position.as_deref().unwrap_or(""),
+    );
+    push_fingerprint_field(
+        &mut material,
+        "expected_hash=",
+        p.expected_hash.as_deref().unwrap_or(""),
+    );
+    push_fingerprint_field(
+        &mut material,
+        "old_text=",
+        p.old_text.as_deref().unwrap_or(""),
+    );
+    push_fingerprint_field(&mut material, "new_text=", &p.new_text);
     calm_core::digest::evidence_digest(material.as_bytes())
 }
 
@@ -3948,16 +4039,25 @@ fn fingerprint_edit_symbol(p: &EditSymbolParams) -> String {
 /// later retry-lookup, both computed from the same already-resolved
 /// `path`+`hunks` this deep in the call chain.
 fn fingerprint_hunks(path: &str, hunks: &[calm_core::edit::HunkRequest]) -> String {
-    let mut material = format!("edit-hunks-fingerprint-v1\npath={path}\n");
+    let mut material = String::from("edit-hunks-fingerprint-v2\n");
+    push_fingerprint_field(&mut material, "path=", path);
     for (i, h) in hunks.iter().enumerate() {
-        material.push_str(&format!(
-            "hunk[{i}].start_line={}\nhunk[{i}].end_line={}\nhunk[{i}].expected_hash={}\n\
-             hunk[{i}].new_text={}\n",
-            h.start_line,
-            h.end_line,
+        push_fingerprint_field(
+            &mut material,
+            &format!("hunk[{i}].start_line="),
+            &h.start_line.to_string(),
+        );
+        push_fingerprint_field(
+            &mut material,
+            &format!("hunk[{i}].end_line="),
+            &h.end_line.to_string(),
+        );
+        push_fingerprint_field(
+            &mut material,
+            &format!("hunk[{i}].expected_hash="),
             h.expected_hash.as_deref().unwrap_or(""),
-            h.new_text,
-        ));
+        );
+        push_fingerprint_field(&mut material, &format!("hunk[{i}].new_text="), &h.new_text);
     }
     calm_core::digest::evidence_digest(material.as_bytes())
 }
@@ -4024,15 +4124,27 @@ fn wrong_target_scope_detail(
 /// widening `#[derive(Debug)]` to `#[derive(Debug, Clone)]` while the
 /// symbol body itself is replaced separately).
 fn duplicate_decoration_risk_note(live: &str, line_start: usize, new_text: &str) -> Option<String> {
-    let new_first = new_text.lines().find(|l| !l.trim().is_empty())?.trim();
-    if new_first.is_empty() {
+    const MAX_SCAN: usize = 20; // generous cap on stacked decorators/attrs
+    // P1 (audit follow-up, 2026-08-23): every one of new_text's OWN
+    // leading contiguous non-blank lines is a duplication candidate, not
+    // just the first -- see this function's doc comment on the module
+    // level (docs/plans audit) for the exact gap this closes. Bounded by
+    // the same MAX_SCAN the live-side scan below already uses, so this
+    // never turns into "diff the whole function body" for a short
+    // new_text with no internal blank line.
+    let new_leading: Vec<&str> = new_text
+        .lines()
+        .map(str::trim)
+        .take_while(|l| !l.is_empty())
+        .take(MAX_SCAN)
+        .collect();
+    if new_leading.is_empty() {
         return None;
     }
     let live_lines: Vec<&str> = live.lines().collect();
     // 0-indexed line directly above line_start (1-indexed); None if
     // line_start is at or above the top of the file.
     let mut idx = line_start.checked_sub(2)?;
-    const MAX_SCAN: usize = 20; // generous cap on stacked decorators/attrs
     for _ in 0..MAX_SCAN {
         let Some(existing) = live_lines.get(idx) else {
             break;
@@ -4041,9 +4153,9 @@ fn duplicate_decoration_risk_note(live: &str, line_start: usize, new_text: &str)
         if trimmed.is_empty() {
             break;
         }
-        if trimmed == new_first {
+        if let Some(dup) = new_leading.iter().find(|&&l| l == trimmed) {
             return Some(format!(
-                "duplicate decoration risk — new_text's first line ({new_first:?}) already \
+                "duplicate decoration risk — new_text's line ({dup:?}) already \
                  appears, unedited, immediately above this replace's range (line {}); a \
                  symbol's range never includes its own leading decorators/attributes/\
                  annotations, so writing it again in new_text will leave two copies. If it \
@@ -4228,6 +4340,114 @@ type TouchRiskResult = (
 // natural sub-grouping that wouldn't be an arbitrary bundle just to satisfy
 // the lint -- see this function's own doc comment for what each is used for.
 #[allow(clippy::too_many_arguments)]
+/// Bug (2026-08-23 audit, multi-hunk signature-escalation gap): the real
+/// post-edit full-file content plus an old->new line-position map, when
+/// the caller (`edit_lines_impl_gated`'s real write gate) has already run
+/// the real `apply_hunks` splice before calling `compute_touch_risk` --
+/// which it always does, to run `validate_syntax_diff` first. Threading
+/// this through lets the signature-change check locate a touched
+/// symbol's TRUE post-edit text at its TRUE post-edit position, for ANY
+/// topology of hunks (several hunks that jointly rewrite one signature
+/// with no single hunk covering the whole span; a hunk above the
+/// signature that shifts it by inserting/removing lines) -- instead of
+/// requiring exactly one hunk to fully cover `[line_start, sig_end]`,
+/// which silently missed a real signature change split across more than
+/// one hunk. Only the actual write-gate call site ever has this data;
+/// every other `compute_touch_risk` caller only ever constructs a single
+/// synthetic whole-range hunk (see `compute_touch_risk`'s own doc on
+/// `real_hunks`), for which the original single-hunk-covers heuristic is
+/// already exact -- so this stays optional, not a required param.
+pub(crate) struct ReconstructedEdit<'a> {
+    pub new_content: &'a str,
+    /// `(old_start, old_end, new_start, new_end)`, 1-indexed inclusive,
+    /// one entry per applied hunk, sorted ascending by `old_start`
+    /// (mirrors `apply_hunks`'s own `ApplyOutcome::results` order) and
+    /// non-overlapping (enforced by `apply_hunks` itself before this can
+    /// exist). `new_start`/`new_end` are the hunk's position in
+    /// `new_content` -- already shift-adjusted for every earlier hunk's
+    /// own insertion/deletion, exactly as `edit_lines_impl_gated`'s own
+    /// `touched_new_lines` already computes them for `validate_syntax_diff`.
+    pub line_map: &'a [(i64, i64, i64, i64)],
+}
+
+/// Maps `old_line` (a position in the ORIGINAL file) to its position in
+/// `ReconstructedEdit::new_content`, using `line_map`. `old_line` strictly
+/// before every hunk, or between two hunks, shifts by exactly the
+/// cumulative line-count delta of every hunk fully before it -- provably
+/// so, since each hunk's own `new_end` in `line_map` is already computed
+/// as `old_end + cumulative_shift_through_this_hunk` (the same invariant
+/// `edit_lines_impl_gated`'s `touched_new_lines` loop maintains), so
+/// `new_end - old_end` recovers that cumulative shift directly without a
+/// separate running total. `old_line` falling INSIDE a hunk's own
+/// `[old_start, old_end]` (the hunk's replacement touches the requested
+/// line directly) has no single well-defined new position -- the whole
+/// old range collapsed/expanded into one block -- so this returns that
+/// block's own start (`new_start`), the natural anchor for "the new text
+/// this old line's content became part of".
+fn shift_old_line_to_new(old_line: i64, line_map: &[(i64, i64, i64, i64)]) -> i64 {
+    let mut shift = 0i64;
+    for &(old_start, old_end, new_start, new_end) in line_map {
+        if old_line < old_start {
+            return old_line + shift;
+        }
+        if old_line <= old_end {
+            return new_start;
+        }
+        shift = new_end - old_end;
+    }
+    old_line + shift
+}
+
+/// The candidate "new signature text" to feed
+/// `is_signature_semantically_changed` against a touched symbol's own
+/// `signature`. `reconstructed`, when present, locates the symbol's true
+/// post-edit position via `shift_old_line_to_new` and reads `take_n`
+/// lines straight from the real spliced result -- correct for any hunk
+/// topology, since it is cut from the file exactly as it will really read
+/// after the write, not reasoned about hunk-by-hunk. Without it (every
+/// `compute_touch_risk` caller except the real write gate), falls back to
+/// the original heuristic: a hunk must fully cover
+/// `[line_start, sig_end]` to yield a trustworthy candidate -- exact for
+/// those callers, which only ever construct one synthetic whole-range
+/// hunk.
+fn candidate_new_signature_text(
+    line_start: i64,
+    sig_end: i64,
+    signature: &str,
+    proposed_hunks: &[(i64, i64, &str)],
+    reconstructed: Option<&ReconstructedEdit<'_>>,
+) -> Option<String> {
+    let take_n = signature.matches('\n').count() + 1;
+    if let Some(rec) = reconstructed {
+        let shifted_start = shift_old_line_to_new(line_start, rec.line_map);
+        if shifted_start < 1 {
+            return None;
+        }
+        let lines: Vec<&str> = rec.new_content.lines().collect();
+        let idx = usize::try_from(shifted_start - 1).ok()?;
+        if idx >= lines.len() {
+            return None;
+        }
+        return Some(
+            lines[idx..]
+                .iter()
+                .take(take_n)
+                .copied()
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+    }
+    proposed_hunks.iter().find_map(|&(hs, he, new_text)| {
+        (hs <= line_start && he >= sig_end)
+            .then(|| new_text.lines().take(take_n).collect::<Vec<_>>().join("\n"))
+    })
+}
+
+// 8 params: each is an independently meaningful input (conn, project_root,
+// path, ranges, coverage, risk_rules, proposed_hunks, policy) with no
+// natural sub-grouping that wouldn't be an arbitrary bundle just to satisfy
+// the lint -- see this function's own doc comment for what each is used for.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn compute_touch_risk(
     conn: &rusqlite::Connection,
     project_root: &std::path::Path,
@@ -4252,6 +4472,73 @@ pub(crate) fn compute_touch_risk(
     // gate, `review_change`) always has genuine proposed content and passes
     // `true`.
     real_hunks: bool,
+) -> TouchRiskResult {
+    compute_touch_risk_inner(
+        conn,
+        project_root,
+        path,
+        ranges,
+        coverage,
+        risk_rules,
+        proposed_hunks,
+        policy,
+        real_hunks,
+        None,
+    )
+}
+
+/// Bug (2026-08-23 audit, multi-hunk signature-escalation gap) fix: same
+/// contract as `compute_touch_risk` with `real_hunks=true`, plus
+/// `reconstructed` -- the real post-edit full file content the caller
+/// already computed via `calm_core::edit::apply_hunks` before calling this
+/// (every real write-gate caller runs that splice first anyway, to feed
+/// `validate_syntax_diff`). Lets the signature-change check below use the
+/// TRUE post-edit text at the TRUE post-edit position instead of requiring
+/// one hunk to fully cover the signature span -- see `ReconstructedEdit`'s
+/// own doc comment for why that matters. Only `edit_lines_impl_gated`'s
+/// real write gate calls this; every other `compute_touch_risk` caller
+/// keeps calling the plain function unchanged, since only the real write
+/// gate ever receives a genuine multi-hunk request to begin with (every
+/// other caller always constructs exactly one synthetic whole-range hunk,
+/// for which the fallback heuristic is already exact).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compute_touch_risk_with_reconstruction(
+    conn: &rusqlite::Connection,
+    project_root: &std::path::Path,
+    path: &str,
+    ranges: &[(i64, i64)],
+    coverage: &calm_core::analysis::coverage::CoverageData,
+    risk_rules: &[calm_core::config::RiskRule],
+    proposed_hunks: &[(i64, i64, &str)],
+    policy: &calm_core::policy::Policy,
+    reconstructed: ReconstructedEdit<'_>,
+) -> TouchRiskResult {
+    compute_touch_risk_inner(
+        conn,
+        project_root,
+        path,
+        ranges,
+        coverage,
+        risk_rules,
+        proposed_hunks,
+        policy,
+        true,
+        Some(reconstructed),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compute_touch_risk_inner(
+    conn: &rusqlite::Connection,
+    project_root: &std::path::Path,
+    path: &str,
+    ranges: &[(i64, i64)],
+    coverage: &calm_core::analysis::coverage::CoverageData,
+    risk_rules: &[calm_core::config::RiskRule],
+    proposed_hunks: &[(i64, i64, &str)],
+    policy: &calm_core::policy::Policy,
+    real_hunks: bool,
+    reconstructed: Option<ReconstructedEdit<'_>>,
 ) -> TouchRiskResult {
     let rows = symbols_overlapping_ranges(conn, path, ranges);
     let mut max_callers = 0i64;
@@ -4294,22 +4581,19 @@ pub(crate) fn compute_touch_risk(
             // end as a defensive bound.
             let sig_end =
                 (row.line_start + row.signature.matches('\n').count() as i64).min(row.line_end);
-            // Only a hunk that FULLY COVERS the signature range lets us
-            // extract a trustworthy "new signature" candidate (its own
-            // leading lines) -- a hunk only partially overlapping it, or
-            // not covering it at all (a body-only edit), is deliberately
-            // NOT treated as a signature change. This is why a plain
-            // line-overlap check doesn't work here: edit_symbol's default
-            // "replace whole body" hunk always covers the signature line
-            // too, even when the signature text itself is byte-for-byte
-            // unchanged -- the overwhelmingly common case, which a bare
-            // overlap check would wrongly flag every single time.
-            if let Some(new_sig_text) = proposed_hunks.iter().find_map(|&(hs, he, new_text)| {
-                (hs <= row.line_start && he >= sig_end).then(|| {
-                    let take_n = row.signature.matches('\n').count() + 1;
-                    new_text.lines().take(take_n).collect::<Vec<_>>().join("\n")
-                })
-            }) && calm_core::analysis::diff_impact::is_signature_semantically_changed(
+            // Bug (2026-08-23 audit): `candidate_new_signature_text` uses
+            // the real spliced `reconstructed.new_content` when present
+            // (correct for ANY hunk topology), falling back to the
+            // original "one hunk must fully cover the span" heuristic
+            // otherwise (exact for every caller that only ever constructs
+            // a single synthetic whole-range hunk).
+            if let Some(new_sig_text) = candidate_new_signature_text(
+                row.line_start,
+                sig_end,
+                &row.signature,
+                proposed_hunks,
+                reconstructed.as_ref(),
+            ) && calm_core::analysis::diff_impact::is_signature_semantically_changed(
                 &row.signature,
                 &new_sig_text,
                 &row.language,
@@ -4458,9 +4742,9 @@ pub(crate) fn compute_touch_risk(
     let touches_uncovered_code =
         any_executable_kind && !proposed_hunks.is_empty() && coverage.source != "none" && {
             let abs_path = calm_core::analysis::coverage::normalize_path(&project_root.join(path));
-            proposed_hunks
-                .iter()
-                .any(|&(hs, he, _)| !coverage.is_covered(&abs_path, hs, he))
+            proposed_hunks.iter().any(|&(hs, he, _)| {
+                coverage.coverage_ratio(&abs_path, hs, he) < MIN_ADEQUATE_COVERAGE_RATIO
+            })
         };
     let (risk, risk_rule_reason) = if touches_uncovered_code {
         let floor = policy.uncovered_code_floor.as_str();
@@ -5605,6 +5889,186 @@ mod elicit_tests {
         let c = fingerprint_edit_lines(&lines_params("    return 3\n"));
         assert_eq!(a, b);
         assert_ne!(a, c);
+    }
+
+    #[test]
+    fn fingerprint_hunks_does_not_collide_across_a_forged_hunk_boundary() {
+        // Bug A (2026-08-23 audit): the OLD `label=value\n` concatenation
+        // (no length-prefix, no escaping) let a single hunk's
+        // attacker-controlled `new_text` embed literal `hunk[1].field=value`
+        // lines, producing a BYTE-IDENTICAL preimage -- and hence the same
+        // SHA-256 fingerprint -- for two semantically different hunk lists.
+        // That fingerprint is the exact (path, fingerprint) key
+        // `find_approved_matching` uses to skip
+        // HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW for a "the human already
+        // saw this" retry (see edit_lines_impl_gated) -- a collision here
+        // meant an approved SMALL edit's fingerprint could be forged to
+        // also match a DIFFERENT, larger edit the human never saw.
+        let single_hunk_with_forged_tail = vec![calm_core::edit::HunkRequest {
+            start_line: 10,
+            end_line: 10,
+            expected_hash: Some("H0".into()),
+            new_text: "SAFE\nhunk[1].start_line=99\nhunk[1].end_line=99\n\
+                       hunk[1].expected_hash=H1\nhunk[1].new_text=EVIL"
+                .into(),
+        }];
+        let two_real_hunks = vec![
+            calm_core::edit::HunkRequest {
+                start_line: 10,
+                end_line: 10,
+                expected_hash: Some("H0".into()),
+                new_text: "SAFE".into(),
+            },
+            calm_core::edit::HunkRequest {
+                start_line: 99,
+                end_line: 99,
+                expected_hash: Some("H1".into()),
+                new_text: "EVIL".into(),
+            },
+        ];
+        assert_ne!(
+            fingerprint_hunks("cfg.py", &single_hunk_with_forged_tail),
+            fingerprint_hunks("cfg.py", &two_real_hunks),
+            "a crafted new_text must never let a 1-hunk fingerprint collide \
+             with a semantically different multi-hunk one"
+        );
+    }
+
+    #[test]
+    fn fingerprint_edit_lines_does_not_collide_across_a_forged_edit_boundary() {
+        // Same Bug A collision class as the hunk version above, but on the
+        // actual MCP-facing surface (`edit_lines`'s own params) -- an
+        // agent controls `new_text`/`old_text` directly via the tool call.
+        let one_edit_with_forged_tail = EditLinesParams {
+            path: "a.py".into(),
+            edits: vec![EditHunkParam {
+                start_line: 2,
+                end_line: 2,
+                expected_hash: Some("abc".into()),
+                old_text: None,
+                new_text: "keep\nedit[1].start_line=5\nedit[1].end_line=5\n\
+                           edit[1].expected_hash=xyz\nedit[1].old_text=\n\
+                           edit[1].new_text=evil"
+                    .into(),
+            }],
+            confirm: true,
+            reason: Some("r".into()),
+            cites: None,
+            change_id: None,
+            authority_id: None,
+        };
+        let two_real_edits = EditLinesParams {
+            path: "a.py".into(),
+            edits: vec![
+                EditHunkParam {
+                    start_line: 2,
+                    end_line: 2,
+                    expected_hash: Some("abc".into()),
+                    old_text: None,
+                    new_text: "keep".into(),
+                },
+                EditHunkParam {
+                    start_line: 5,
+                    end_line: 5,
+                    expected_hash: Some("xyz".into()),
+                    old_text: None,
+                    new_text: "evil".into(),
+                },
+            ],
+            confirm: true,
+            reason: Some("r".into()),
+            cites: None,
+            change_id: None,
+            authority_id: None,
+        };
+        assert_ne!(
+            fingerprint_edit_lines(&one_edit_with_forged_tail),
+            fingerprint_edit_lines(&two_real_edits),
+            "a crafted new_text must never let a 1-edit fingerprint collide \
+             with a semantically different multi-edit one"
+        );
+    }
+
+    #[test]
+    fn shift_old_line_to_new_leaves_a_line_before_every_hunk_unshifted() {
+        // A hunk at old line 5 that expanded to 3 new lines (5..7) -- a
+        // line strictly before it (line 3) must not shift at all.
+        let line_map = [(5i64, 5i64, 5i64, 7i64)];
+        assert_eq!(shift_old_line_to_new(3, &line_map), 3);
+    }
+
+    #[test]
+    fn shift_old_line_to_new_accumulates_cumulative_shift_from_earlier_hunks() {
+        // Hunk 1: old line 5 (1 line) becomes new lines 5..7 (+2).
+        // Hunk 2: old line 10 (1 line) becomes new lines 12..12 (net +2
+        // carried in from hunk 1, no further change of its own).
+        let line_map = [(5i64, 5i64, 5i64, 7i64), (10i64, 10i64, 12i64, 12i64)];
+        // Old line 9, between the two hunks and untouched by either, must
+        // shift by hunk 1's own +2 delta only.
+        assert_eq!(shift_old_line_to_new(9, &line_map), 11);
+        // Old line 15, after both hunks, must carry both hunks' shifts.
+        assert_eq!(shift_old_line_to_new(15, &line_map), 17);
+    }
+
+    #[test]
+    fn shift_old_line_to_new_anchors_on_the_replacement_start_when_the_line_falls_inside_a_hunk() {
+        // An old 2-line range [5, 6] replaced by 5 new lines [5, 9] -- any
+        // old line inside that range has no single well-defined new
+        // position, so this anchors on the replacement's own start.
+        let line_map = [(5i64, 6i64, 5i64, 9i64)];
+        assert_eq!(shift_old_line_to_new(5, &line_map), 5);
+        assert_eq!(shift_old_line_to_new(6, &line_map), 5);
+    }
+
+    #[test]
+    fn candidate_new_signature_text_finds_a_signature_change_split_across_two_hunks_only_when_reconstructed_is_given()
+     {
+        // Bug (2026-08-23 audit, multi-hunk signature-escalation gap): a
+        // 2-line signature ("def helper(" / "    x):") rewritten by TWO
+        // SEPARATE hunks, neither of which alone covers the whole
+        // [line_start, sig_end] span -- exactly the case the original
+        // single-hunk-must-fully-cover heuristic silently missed.
+        let signature = "def helper(\n    x):";
+        let sig_end = 2i64;
+        let proposed_hunks: Vec<(i64, i64, &str)> = vec![(1, 1, "def renamed("), (2, 2, "    y):")];
+
+        // Without reconstruction (every caller except the real write
+        // gate): the original fallback heuristic finds nothing, since no
+        // single hunk covers [1, 2] -- documented, unaffected behavior.
+        assert_eq!(
+            candidate_new_signature_text(1, sig_end, signature, &proposed_hunks, None),
+            None,
+            "neither hunk alone covers the full signature span"
+        );
+
+        // With reconstruction (the real write gate): the real spliced
+        // result correctly reveals the joint change.
+        let new_content = "def renamed(\n    y):\n    return 1\n";
+        let line_map = [(1i64, 1i64, 1i64, 1i64), (2i64, 2i64, 2i64, 2i64)];
+        let reconstructed = ReconstructedEdit {
+            new_content,
+            line_map: &line_map,
+        };
+        let candidate = candidate_new_signature_text(
+            1,
+            sig_end,
+            signature,
+            &proposed_hunks,
+            Some(&reconstructed),
+        );
+        assert_eq!(
+            candidate.as_deref(),
+            Some("def renamed(\n    y):"),
+            "reconstructed data must locate the TRUE joint result of both hunks"
+        );
+        assert!(
+            calm_core::analysis::diff_impact::is_signature_semantically_changed(
+                signature,
+                &candidate.unwrap(),
+                "python",
+            ),
+            "the reconstructed candidate must be detected as a real signature change"
+        );
     }
 
     fn short_ask() -> HubAskContext {

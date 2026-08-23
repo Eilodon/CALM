@@ -349,6 +349,7 @@ RULES: Never use native grep/read on project files. is_hub:true → extra cautio
                 reason: "Inspect highest-risk file".into(),
                 args: Some(serde_json::json!({"path": h.path})),
                 gate: None,
+                required_user_input: None,
             });
 
             ToolOutcome::success(HotspotsOutput {

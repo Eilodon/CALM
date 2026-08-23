@@ -47,6 +47,13 @@
           "string",
           "null"
         ]
+      },
+      "proposed_new_text": {
+        "description": "P0-3 (audit follow-up, 2026-08-23): opt-in full replacement text for\nthe reviewed range (the symbol's own `[line_start, line_end]` in\nsymbol mode, `[line, end_line]` in range mode) -- when set, the\nsame `compute_touch_risk` signature-change detection the real\n`edit_lines`/`edit_symbol` write gate uses at spend time also runs\nhere at mint time, against this exact text, instead of the\nplaceholder empty hunk. Without this, `edit_context` has no\nproposed content yet and can only ever mint an authority with\n`signature_changed=false` -- correct as a conservative default, but\na dead end for a genuine signature edit: the minted RiskVector\nunder-claims risk relative to what `edit_lines_impl_gated`\nindependently recomputes from the real diff at spend time, so\n`AUTHORITY_STALE_RISK_VECTOR` fires deterministically for every\nsignature change that goes through the authority flow, with no\nsuccessful path (see the audit finding this closes). Assumes a\nWHOLE-RANGE replace, matching `edit_symbol`'s default `\"replace\"`\nposition -- not meaningful for a narrower `edit_lines` hunk within\nthe range, which should omit this and rely on the conservative\ndefault instead.",
+        "type": [
+          "string",
+          "null"
+        ]
       }
     },
     "type": "object"
@@ -67,7 +74,7 @@
             "type": "boolean"
           },
           "review": {
-            "description": "Wave 3: set only on `HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW` (the\ninitial refusal) and `DIFF_DIGEST_MISMATCH` (the refetch-and-retry\ncase) -- everything an agent needs to relay-approve/decline via\n`review_decide_via_agent_relay` without a separate read.",
+            "description": "Set only on HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW / DIFF_DIGEST_MISMATCH — everything needed to relay-approve/decline via review_decide_via_agent_relay.",
             "anyOf": [
               {
                 "$ref": "#/$defs/PendingReviewPacket"
@@ -78,7 +85,7 @@
             ]
           },
           "next_call": {
-            "description": "Wave 3: the exact next tool call this error implies, when there is\none unambiguous next step -- reuses `SuggestedNext` so a caller\nalready handling `suggested_next` elsewhere needs no new shape.\nBoxed (like `review` above) so this rarely-populated pair doesn't\ninflate every `ErrorDetail`/`Result<_, ErrorDetail>` on the hot,\ncommon path -- clippy's `result_large_err` flagged the unboxed form.",
+            "description": "The exact next tool call this error implies, if unambiguous — same shape as suggested_next.",
             "anyOf": [
               {
                 "$ref": "#/$defs/SuggestedNext"
@@ -131,11 +138,21 @@
           },
           "args": true,
           "gate": {
-            "description": "Plan 3 §3.5(b): `Some(true)` iff skipping `tool` is actually\nhook-enforced (currently only the edit_context/edit_lines/edit_symbol\n→ diff_impact hints set this, via `suggested_gated`) — every other\nhint is left unset (`None`), meaning advisory-only. Lets an agent\ntell \"you'll be blocked if you skip this\" apart from \"you probably\nwant this next\" without re-deriving it from AGENTS.md prose each time.",
+            "description": "true iff skipping `tool` is hook-enforced, not just advisory.",
             "type": [
               "boolean",
               "null"
             ]
+          },
+          "required_user_input": {
+            "description": "Names any `tool` param intentionally left out of `args` because only a human can safely supply it (e.g. `approve`). Absent means `args` is already complete.",
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            }
           }
         },
         "required": [
@@ -201,21 +218,21 @@
         "type": "object",
         "properties": {
           "symbol": {
-            "description": "`path::name` (or `path::Class::name`) — the enclosing file path is\nalways the substring before the first `::`, since every producer\n(tree-sitter extraction in `indexer::pipeline`, SQL indexer, SCIP\noverlay ingestion) derives both from the same `rel`/`from_path`\nvalue at the point the symbol/edge is created. A separate `path`\nfield used to duplicate this verbatim on every entry — pure waste\non a hub symbol with many callers in the same file; split on the\nfirst `::` if you need it standalone.",
+            "description": "`path::name` (or `path::Class::name`) of the calling symbol — split on the first `::` for the file path standalone.",
             "type": "string"
           },
           "edge_confidence": {
             "type": "string"
           },
           "formal_source": {
-            "description": "Nguồn cụ thể đứng sau `edge_confidence == \"formal\"`: `\"stack_graphs\"`\n(heuristic per-file — `resolver/formal.rs::FormalResolver::\nresolve_file` only ever sees ONE file at a time, no cross-module\nstitching) | `\"scip\"` (exact file,line, có thể cross-module) |\n`\"lsp\"` (runtime probe). `None` khi `edge_confidence != \"formal\"`,\nhoặc build thiếu mọi formal-tier feature. Không suy ra \"formal\" đáng\ntin bằng nhau — xem ADR-0002.",
+            "description": "Source behind edge_confidence == \"formal\": \"stack_graphs\" | \"scip\" | \"lsp\". None when edge_confidence != \"formal\". See ADR-0002 — not equally trustworthy.",
             "type": [
               "string",
               "null"
             ]
           },
           "edge_kind": {
-            "description": "`\"call\"` or `\"reference\"` (SQL view/proc reading a table via\nFROM/JOIN) — see `call_edges.edge_kind`. Lets a consumer tell a real\ninvocation apart from a mere read without misreading a JOIN as a\nfunction call.",
+            "description": "\"call\" or \"reference\" (e.g. a SQL JOIN reading a table) — see call_edges.edge_kind.",
             "type": "string"
           },
           "line": {
@@ -331,11 +348,11 @@
         "type": "object",
         "properties": {
           "will_block": {
-            "description": "`true` iff a write to this range with `confirm: false` would be\nrejected. Independent of the two runtime session-state checks\n(`edit_context` freshness, a grounded `reason`) a `confirm: true`\nattempt would still have to clear when `requires` is\n`\"edit_context+confirm+grounded_reason\"`.",
+            "description": "true iff a write here with confirm: false would be rejected.",
             "type": "boolean"
           },
           "is_hub": {
-            "description": "This exact symbol's own `is_hub` — distinct from `will_block`, which\nalso accounts for the wider touched range (e.g. an enclosing hub\nclass this symbol sits inside — see `blocking_symbols`).",
+            "description": "This exact symbol's own is_hub (distinct from will_block, which also covers the wider touched range).",
             "type": "boolean"
           },
           "hub_kind": {
@@ -345,7 +362,7 @@
             ]
           },
           "blocking_symbols": {
-            "description": "Touched symbols (qualified names) that are themselves a hub — names\nthe enclosing class here when THAT, not this symbol, is what the\ngate would actually block on.",
+            "description": "Touched symbols (qualified names) that are themselves a hub, when different from this one.",
             "type": "array",
             "items": {
               "type": "string"

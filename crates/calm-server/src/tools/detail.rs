@@ -384,6 +384,9 @@ pub(crate) struct CallerEntry {
     /// field used to duplicate this verbatim on every entry — pure waste
     /// on a hub symbol with many callers in the same file; split on the
     /// first `::` if you need it standalone.
+    #[schemars(
+        description = "`path::name` (or `path::Class::name`) of the calling symbol — split on the first `::` for the file path standalone."
+    )]
     pub(crate) symbol: String,
     pub(crate) edge_confidence: String,
     /// Nguồn cụ thể đứng sau `edge_confidence == "formal"`: `"stack_graphs"`
@@ -393,12 +396,18 @@ pub(crate) struct CallerEntry {
     /// `"lsp"` (runtime probe). `None` khi `edge_confidence != "formal"`,
     /// hoặc build thiếu mọi formal-tier feature. Không suy ra "formal" đáng
     /// tin bằng nhau — xem ADR-0002.
+    #[schemars(
+        description = "Source behind edge_confidence == \"formal\": \"stack_graphs\" | \"scip\" | \"lsp\". None when edge_confidence != \"formal\". See ADR-0002 — not equally trustworthy."
+    )]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) formal_source: Option<String>,
     /// `"call"` or `"reference"` (SQL view/proc reading a table via
     /// FROM/JOIN) — see `call_edges.edge_kind`. Lets a consumer tell a real
     /// invocation apart from a mere read without misreading a JOIN as a
     /// function call.
+    #[schemars(
+        description = "\"call\" or \"reference\" (e.g. a SQL JOIN reading a table) — see call_edges.edge_kind."
+    )]
     pub(crate) edge_kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) line: Option<i64>,

@@ -44,7 +44,7 @@
             "type": "boolean"
           },
           "review": {
-            "description": "Wave 3: set only on `HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW` (the\ninitial refusal) and `DIFF_DIGEST_MISMATCH` (the refetch-and-retry\ncase) -- everything an agent needs to relay-approve/decline via\n`review_decide_via_agent_relay` without a separate read.",
+            "description": "Set only on HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW / DIFF_DIGEST_MISMATCH — everything needed to relay-approve/decline via review_decide_via_agent_relay.",
             "anyOf": [
               {
                 "$ref": "#/$defs/PendingReviewPacket"
@@ -55,7 +55,7 @@
             ]
           },
           "next_call": {
-            "description": "Wave 3: the exact next tool call this error implies, when there is\none unambiguous next step -- reuses `SuggestedNext` so a caller\nalready handling `suggested_next` elsewhere needs no new shape.\nBoxed (like `review` above) so this rarely-populated pair doesn't\ninflate every `ErrorDetail`/`Result<_, ErrorDetail>` on the hot,\ncommon path -- clippy's `result_large_err` flagged the unboxed form.",
+            "description": "The exact next tool call this error implies, if unambiguous — same shape as suggested_next.",
             "anyOf": [
               {
                 "$ref": "#/$defs/SuggestedNext"
@@ -108,11 +108,21 @@
           },
           "args": true,
           "gate": {
-            "description": "Plan 3 §3.5(b): `Some(true)` iff skipping `tool` is actually\nhook-enforced (currently only the edit_context/edit_lines/edit_symbol\n→ diff_impact hints set this, via `suggested_gated`) — every other\nhint is left unset (`None`), meaning advisory-only. Lets an agent\ntell \"you'll be blocked if you skip this\" apart from \"you probably\nwant this next\" without re-deriving it from AGENTS.md prose each time.",
+            "description": "true iff skipping `tool` is hook-enforced, not just advisory.",
             "type": [
               "boolean",
               "null"
             ]
+          },
+          "required_user_input": {
+            "description": "Names any `tool` param intentionally left out of `args` because only a human can safely supply it (e.g. `approve`). Absent means `args` is already complete.",
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            }
           }
         },
         "required": [

@@ -348,6 +348,7 @@ impl CalmServer {
                             slice_end,
                             end,
                             p.max_chars,
+                            p.line_numbers,
                             truncated,
                             omitted_lines,
                             next_cursor,
@@ -384,20 +385,32 @@ impl CalmServer {
                     "Hub — mandatory pre-edit context",
                     serde_json::json!({"symbol": symbol_name.clone(), "path": c.path.clone()}),
                 )
+            } else if truncated == Some(true) {
+                // P0-2d (audit follow-up, 2026-08-23): previously this
+                // fell into the `edit_symbol` branch below with only the
+                // prose `reason` warning that more remained unread -- an
+                // agent dispatching on `suggested_next.tool` alone (not
+                // the prose) could still edit_symbol immediately, silently
+                // acting on a partial view. The etag/expected_hash is
+                // still valid for a whole-symbol replace either way (it
+                // always hashes the FULL range), but the literal next
+                // call now points at reading the rest, not at writing.
+                suggested_with_args(
+                    "source",
+                    "Only part of this symbol was returned -- read the rest with \
+                     resume_from_line before a whole-symbol replace (or use edit_lines \
+                     for a hunk within what you've already seen)",
+                    serde_json::json!({
+                        "symbol": symbol_name.clone(),
+                        "path": c.path.clone(),
+                        "resume_from_line": next_cursor,
+                        "if_none_match": etag.clone(),
+                    }),
+                )
             } else if let Some(hash) = etag.as_deref() {
-                // Wave 6 (item a): `truncated` was blind to this branch --
-                // the etag/expected_hash is still valid for a whole-symbol
-                // replace either way (it always hashes the FULL range), but
-                // "no preview needed" is misleading when what was actually
-                // seen is only part of the symbol. Read the rest first.
-                let reason = if truncated == Some(true) {
-                    "Only part of this symbol was returned (see `truncated`/`next_cursor`) -- read the rest with `resume_from_line` before a whole-symbol replace, or use `edit_lines` for a hunk within what you've already seen"
-                } else {
-                    "Whole-symbol edit ready — this etag is the expected_hash (no preview needed)"
-                };
                 suggested_with_args(
                     "edit_symbol",
-                    reason,
+                    "Whole-symbol edit ready — this etag is the expected_hash (no preview needed)",
                     serde_json::json!({
                         "symbol": symbol_name.clone(),
                         "path": c.path.clone(),
@@ -542,6 +555,7 @@ impl CalmServer {
         slice_start: usize,
         slice_end: usize,
         max_chars: Option<i64>,
+        gutters: bool,
     ) -> usize {
         let budget = match max_chars {
             Some(m) if m > 0 => m as usize,
@@ -550,7 +564,24 @@ impl CalmServer {
         let mut used = 0usize;
         for (offset, line) in lines[slice_start..slice_end].iter().enumerate() {
             let sep = if offset == 0 { 0 } else { 1 };
-            let len = line.chars().count();
+            // P0-2a (audit follow-up, 2026-08-23): `gutters` mirrors
+            // whether the caller will run this slice through
+            // `with_line_gutters` afterward -- when it does, every
+            // rendered line carries a `<n>\t` prefix that this budget must
+            // count too, or the caller's actual rendered output can exceed
+            // `max_chars` by exactly that overhead (verified: the existing
+            // `max_chars=20` test's own expected output is 24 chars once
+            // gutters are added). Absolute line number of `lines[i]` is
+            // always `i + 1` at every one of this function's call sites
+            // (`source`/`source_range`/`understand` all build `lines` from
+            // the WHOLE file's content, never a pre-sliced fragment).
+            let gutter_len = if gutters {
+                let line_no = (slice_start + offset) as i64 + 1;
+                line_no.to_string().len() + 1 // digits + '\t'
+            } else {
+                0
+            };
+            let len = line.chars().count() + gutter_len;
             if offset > 0 && used + sep + len > budget {
                 return slice_start + offset;
             }
@@ -574,11 +605,13 @@ impl CalmServer {
         slice_end: usize,
         end: usize,
         max_chars: Option<i64>,
+        gutters: bool,
         truncated: Option<bool>,
         omitted_lines: Option<i64>,
         next_cursor: Option<i64>,
     ) -> (usize, Option<bool>, Option<i64>, Option<i64>) {
-        let narrowed_end = Self::apply_char_budget(lines, slice_start, slice_end, max_chars);
+        let narrowed_end =
+            Self::apply_char_budget(lines, slice_start, slice_end, max_chars, gutters);
         if narrowed_end < slice_end {
             (
                 narrowed_end,
@@ -693,6 +726,27 @@ impl CalmServer {
         // Wave 11 (item 1, "response budget"): same pagination `source()`
         // applies in symbol mode -- `etag` above always covers the FULL
         // requested [start, e] range regardless of pagination below.
+
+        // P0-2c (audit follow-up, 2026-08-23): the same stale-etag guard
+        // source()'s symbol-mode already has (Wave 6, item e) -- only
+        // checked when resuming a paginated read, since a mismatch here
+        // means the range changed between pages and serving this page
+        // sliced against `resume_from_line` on top of NEW bytes would
+        // silently mix content the caller never validated together.
+        // Previously this branch computed `etag` but never looked at
+        // `p.if_none_match` at all, so a paginated resume in range mode
+        // had no staleness protection whatsoever.
+        if p.resume_from_line.is_some()
+            && let Some(expected) = p.if_none_match.as_deref()
+            && Some(expected) != etag.as_deref()
+        {
+            return ResolvedOutcome::error(error_detail(
+                "RANGE_CHANGED_SINCE_PAGINATION",
+                "the range changed since the page carrying this etag was read -- restart pagination from the beginning (omit resume_from_line and if_none_match) instead of continuing against stale coordinates",
+                false,
+            ));
+        }
+
         let (truncated, omitted_lines, next_cursor, slice_s, slice_e) = if e as i64 > start {
             let (p_start, p_end, truncated, omitted_lines, next_cursor) =
                 Self::paginate_range(start, e as i64, p.resume_from_line, p.max_lines);
@@ -712,6 +766,7 @@ impl CalmServer {
             slice_e,
             e,
             p.max_chars,
+            p.line_numbers,
             truncated,
             omitted_lines,
             next_cursor,
@@ -782,6 +837,17 @@ impl CalmServer {
         Parameters(p): Parameters<UnderstandParams>,
     ) -> Json<ToolOutcome<UnderstandOutput>> {
         Json(self.timed_tool("understand", || {
+            // P0-2b (audit follow-up, 2026-08-23): `source()` has always
+            // rejected non-positive `max_lines`/`max_chars` explicitly
+            // (Wave 6, item c) -- `understand()` embeds the exact same
+            // pagination knobs but never ran them through this check, so
+            // `max_chars: 0`/negative silently fell through to
+            // `apply_char_budget`'s internal "non-positive means
+            // unlimited" fallback instead of erroring like `source()` does
+            // for the identical input.
+            if let Some(e) = Self::invalid_pagination_budget(p.max_lines, p.max_chars) {
+                return ToolOutcome::error(e);
+            }
             let kind_str = p.kind.as_deref().unwrap_or("hybrid");
             let kind = Self::parse_understand_kind(kind_str);
             // Wave 6 (audit follow-up, P1-A): `parse_understand_kind` maps
@@ -970,6 +1036,10 @@ impl CalmServer {
                     } else {
                         (None, None, None, start, end)
                     };
+                // P0-2a (audit follow-up, 2026-08-23): `understand` always
+                // renders gutters below (never gated on a `line_numbers`
+                // param -- see the comment there), so the char budget must
+                // always account for that overhead too.
                 let (slice_end, truncated, omitted_lines, next_cursor) =
                     Self::narrow_by_char_budget(
                         &lines,
@@ -977,6 +1047,7 @@ impl CalmServer {
                         slice_end,
                         end,
                         p.max_chars,
+                        true,
                         truncated,
                         omitted_lines,
                         next_cursor,
@@ -989,6 +1060,22 @@ impl CalmServer {
                 let rendered_start_line = slice_start as i64 + 1;
                 let source = calm_core::edit::with_line_gutters(&raw, rendered_start_line);
                 let token_estimate = estimate_tokens(&source);
+                // P0-2b (audit follow-up, 2026-08-23): was hardcoded `None`
+                // -- `source()` always returns a real `range_checksum` for
+                // its embedded body (directly usable as an `edit_symbol`
+                // `expected_hash`), but `understand()`'s otherwise-identical
+                // embedded body carried no identity signal at all, so two
+                // `understand` calls a caller believed were back-to-back
+                // reads of the same range had no way to detect the range
+                // changed underneath between them. Computed from `content`
+                // (the same verified bytes sliced above), covering the FULL
+                // `[info.line_start, info.line_end]` range regardless of
+                // pagination -- same convention as `source()`'s `etag`.
+                let etag = calm_core::edit::range_checksum(
+                    &content,
+                    info.line_start as usize,
+                    info.line_end as usize,
+                );
                 Some(SourceOutput {
                     symbol: info.name.clone(),
                     path: info.path.clone(),
@@ -1000,7 +1087,7 @@ impl CalmServer {
                     data_source: "disk".to_string(),
                     metadata: None,
                     content_warning,
-                    etag: None,
+                    etag,
                     not_modified: None,
                     truncated,
                     omitted_lines,
@@ -1062,6 +1149,25 @@ impl CalmServer {
             let sn = if let Some((ref info, _, _)) = symbol_info {
                 if info.is_hub {
                     suggested_with_args("edit_context", "Hub — mandatory pre-edit check", serde_json::json!({"symbol": info.name, "path": info.path}))
+                } else if source_output.as_ref().and_then(|s| s.truncated).unwrap_or(false) {
+                    // P0-2e (audit follow-up, 2026-08-23 pagination-flip
+                    // plan): understand()'s embedded source can be
+                    // truncated by max_lines/max_chars (including the new
+                    // default cap) same as source() itself -- but unlike
+                    // source(), this suggested_next never checked that
+                    // before, silently pointing straight at edit_context
+                    // even though only PART of the symbol's body was
+                    // actually returned. Read the rest first, mirroring
+                    // source()'s own P0-2d fix.
+                    suggested_with_args(
+                        "understand",
+                        "Only part of this symbol's source was returned -- read the rest with \
+                         resume_from_line before treating this as the complete body",
+                        serde_json::json!({
+                            "query": p.query.clone(),
+                            "resume_from_line": source_output.as_ref().and_then(|s| s.next_cursor),
+                        }),
+                    )
                 } else {
                     suggested_with_args("edit_context", "Pre-edit: verify blast radius before modifying", serde_json::json!({"symbol": info.name, "path": info.path}))
                 }
@@ -1267,11 +1373,15 @@ impl CalmServer {
                         raw.extend(iter.flatten());
                     }
                 }
-                let preview_items: Vec<(String, Option<i64>)> = raw
-                    .iter()
-                    .map(|(_, _, from_path, _, _, line, _)| (from_path.clone(), *line))
-                    .collect();
-                let previews = line_previews_batched(&self.project_root, &preview_items);
+                let previews: Vec<Option<String>> = if p.lean {
+                    vec![None; raw.len()]
+                } else {
+                    let preview_items: Vec<(String, Option<i64>)> = raw
+                        .iter()
+                        .map(|(_, _, from_path, _, _, line, _)| (from_path.clone(), *line))
+                        .collect();
+                    line_previews_batched(&self.project_root, &preview_items)
+                };
                 for (
                     (to_symbol, from_symbol, _from_path, edge_confidence, edge_kind, line, formal_source),
                     preview,
@@ -1320,16 +1430,20 @@ impl CalmServer {
                 // Preview key is the CALLING symbol's own file (`from_symbol`'s
                 // indexed path), not `to_path` -- looked up before batching so
                 // line_previews_batched sees the real dedup key (audit F11).
-                let preview_items: Vec<(String, Option<i64>)> = raw
-                    .iter()
-                    .map(|(from_symbol, _, _, _, _, line, _)| {
-                        (
-                            found.get(from_symbol).map(|c| c.0.path.clone()).unwrap_or_default(),
-                            *line,
-                        )
-                    })
-                    .collect();
-                let previews = line_previews_batched(&self.project_root, &preview_items);
+                let previews: Vec<Option<String>> = if p.lean {
+                    vec![None; raw.len()]
+                } else {
+                    let preview_items: Vec<(String, Option<i64>)> = raw
+                        .iter()
+                        .map(|(from_symbol, _, _, _, _, line, _)| {
+                            (
+                                found.get(from_symbol).map(|c| c.0.path.clone()).unwrap_or_default(),
+                                *line,
+                            )
+                        })
+                        .collect();
+                    line_previews_batched(&self.project_root, &preview_items)
+                };
                 for (
                     (from_symbol, to_symbol, to_path, edge_confidence, edge_kind, line, formal_source),
                     preview,
@@ -1680,15 +1794,23 @@ pub(crate) struct SourceParams {
     /// `[line_start, line_end]` if out of bounds rather than erroring.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) resume_from_line: Option<i64>,
-    /// Wave 11 (item 1, "response budget"): caps how many lines of `source`
-    /// come back in one call -- `None` (default) is today's unlimited
-    /// behavior. When the resolved range has more lines than this, the
-    /// response is cut short and carries `truncated: true`/`next_cursor`
-    /// (pass that back as `resume_from_line` to continue). Purely opt-in:
-    /// omitting it changes nothing about existing behavior. `etag` is
-    /// always the hash of the FULL range regardless of pagination -- it's
-    /// a range-identity signal, not tied to how much of it was rendered.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Wave 12 (pagination default flip, 2026-08-23 plan): caps how many
+    /// lines of `source` come back in one call. Defaults to
+    /// `default_max_lines_cap`'s 300 when the JSON key is OMITTED --
+    /// generous headroom over this repo's own production p99 (260 lines),
+    /// only ever touches the small long tail. Pass an explicit `null` to
+    /// opt back into the old unlimited behavior -- omitting the key no
+    /// longer means that (see `default_max_lines_cap`'s own doc comment for
+    /// why an explicit null still bypasses the default). When the resolved
+    /// range has more lines than the effective cap, the response is cut
+    /// short and carries `truncated: true`/`next_cursor` (pass that back as
+    /// `resume_from_line` to continue). `etag` is always the hash of the
+    /// FULL range regardless of pagination -- it's a range-identity signal,
+    /// not tied to how much of it was rendered.
+    #[serde(
+        default = "default_max_lines_cap",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub(crate) max_lines: Option<i64>,
     /// Wave 6 (item d): hard character cap on the rendered `source` text,
     /// applied on top of whatever `max_lines` already selected (never
@@ -1706,6 +1828,23 @@ pub(crate) struct SourceParams {
 /// default so a CALM `source` read is edit-ready without an extra flag.
 fn default_line_numbers() -> bool {
     true
+}
+
+/// Wave 12 (pagination default flip, 2026-08-23 plan): default `max_lines`
+/// for both `SourceParams` and `UnderstandParams` when the JSON key is
+/// OMITTED — measured against this repo's own production (non-test)
+/// function/method corpus, p99 line count is 260 and only 14 symbols
+/// (~0.7%) exceed 300, so this is a generous cap that essentially never
+/// triggers for a normal read while still bounding the worst case (this
+/// repo's own largest function is 2130 lines). An explicit JSON `null`, or
+/// an explicit `None` at the Rust level (as every existing internal test
+/// constructing these params via a struct literal already does), still
+/// bypasses this default entirely and means unlimited — `#[serde(default =
+/// "...")]` only ever fires when the key is missing, never when it's
+/// present-but-null. Purely a default-VALUE change, no new field, no
+/// schema break.
+fn default_max_lines_cap() -> Option<i64> {
+    Some(300)
 }
 #[derive(Serialize, JsonSchema)]
 pub(crate) struct SourceMetadata {
@@ -1798,14 +1937,23 @@ pub(crate) struct UnderstandParams {
     /// explicitly).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) kind: Option<String>,
-    /// Wave 6 (item b, "response budget for understand"): same meaning as
-    /// `SourceParams::max_lines` -- caps how many lines of the embedded
-    /// `source.source` come back in one call. `None` (default) is today's
-    /// unlimited behavior. When set and the resolved symbol has more lines
-    /// than this, `source.truncated`/`source.next_cursor` are populated
-    /// the same way `source()` itself reports them (pass `next_cursor`
-    /// back as `resume_from_line` to continue).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Wave 12 (pagination default flip, 2026-08-23 plan): same meaning as
+    /// `SourceParams::max_lines`, including its default -- caps how many
+    /// lines of the embedded `source.source` come back in one call.
+    /// Defaults to `default_max_lines_cap`'s 300 when the JSON key is
+    /// OMITTED; pass an explicit `null` to opt back into unlimited. When
+    /// set (or defaulted) and the resolved symbol has more lines than the
+    /// effective cap, `source.truncated`/`source.next_cursor` are
+    /// populated the same way `source()` itself reports them (pass
+    /// `next_cursor` back as `resume_from_line` to continue) -- and, when
+    /// that happens, `suggested_next` here now points back at `understand`
+    /// itself with `resume_from_line` prefilled, the same way `source()`'s
+    /// own truncation already does, instead of silently pointing at
+    /// `edit_context` as if the embedded body were complete.
+    #[serde(
+        default = "default_max_lines_cap",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub(crate) max_lines: Option<i64>,
     /// Wave 6 (item b): same meaning as `SourceParams::resume_from_line`
     /// -- 1-indexed absolute line to resume reading the embedded source
@@ -1902,6 +2050,17 @@ pub(crate) struct SymbolsBatchParams {
     /// `true` to also include each found symbol's direct callees.
     #[serde(default)]
     pub(crate) include_callees: bool,
+    /// `true` to skip computing `preview` text for each `direct_callers`/
+    /// `direct_callees` entry — symbol identity, `line`, `edge_kind`, and
+    /// `edge_confidence` are still returned, just not the disk-read
+    /// call-site snippet. Cuts both the I/O cost of reading each distinct
+    /// call-site file (`line_previews_batched`) and the response's byte
+    /// size (an omitted `preview` is dropped from the JSON entirely, not
+    /// sent as `null`) — useful when only counting/listing callers across
+    /// a large batch, not reading the code around each call site. Ignored
+    /// when neither `include_callers` nor `include_callees` is set.
+    #[serde(default)]
+    pub(crate) lean: bool,
 }
 
 #[derive(Serialize, JsonSchema)]

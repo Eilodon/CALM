@@ -289,6 +289,53 @@ pub fn find_approved_matching(
     .optional()
 }
 
+/// Bug (2026-08-23 audit, pending_review not one-shot): the write-gate
+/// claim `edit_lines_impl_gated` should use instead of a bare
+/// `find_approved_matching` -- atomically transitions the matching
+/// unexpired `status = 'approved'` row to `status = 'consumed'` and
+/// returns it, so ONE human approval authorizes exactly ONE write, not an
+/// unlimited number of them for up to `PENDING_REVIEW_DEFAULT_TTL_SECS`.
+/// Previously a plain `SELECT` with no consumption meant any later call
+/// that happened to reproduce the identical `(path, fingerprint)` --
+/// e.g. the file legitimately cycling back to a byte-identical state via
+/// an unrelated edit-then-revert within the TTL window -- would silently
+/// reuse a stale human decision instead of asking again.
+///
+/// The `UPDATE ... WHERE status = 'approved'` is the actual atomic claim:
+/// if two callers somehow race on the exact same row, SQLite serializes
+/// the two `UPDATE`s and only the first can actually flip the row, so at
+/// most one caller's `rows_affected` is 1 -- no separate TOCTOU window to
+/// close with an explicit transaction (unlike the migration-stamp race
+/// fixed the same day, which needed one because it was read-decide-write
+/// across multiple statements; here the claim IS the one statement). The
+/// preceding `find_approved_matching` call is just a read to pick a
+/// candidate to try -- if it was concurrently claimed or expired before
+/// the `UPDATE` runs, `rows_affected == 0` and this honestly returns
+/// `None`, exactly as if no match had ever existed, and the caller falls
+/// through to requiring a fresh review.
+pub fn claim_approved_matching(
+    conn: &Connection,
+    path: &str,
+    fingerprint: &str,
+) -> rusqlite::Result<Option<PendingReview>> {
+    let Some(candidate) = find_approved_matching(conn, path, fingerprint)? else {
+        return Ok(None);
+    };
+    let now = now_epoch_secs();
+    let updated = conn.execute(
+        "UPDATE pending_reviews SET status = 'consumed' \
+         WHERE review_id = ?1 AND status = 'approved' AND expires_at > ?2",
+        params![candidate.review_id, now],
+    )?;
+    if updated == 0 {
+        return Ok(None);
+    }
+    Ok(Some(PendingReview {
+        status: "consumed".to_string(),
+        ..candidate
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -353,6 +400,51 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(found.review_id, id);
+    }
+
+    #[test]
+    fn claim_approved_matching_consumes_the_row_so_a_second_claim_no_longer_matches() {
+        // Bug (2026-08-23 audit, pending_review not one-shot): a plain
+        // find_approved_matching (a SELECT) let the SAME approved row
+        // authorize an unlimited number of writes for up to
+        // PENDING_REVIEW_DEFAULT_TTL_SECS -- claim_approved_matching must
+        // atomically consume it instead, so a second attempt at the exact
+        // same (path, fingerprint) no longer matches.
+        let conn = state_conn();
+        let id =
+            insert_pending_review(&conn, &new_review("edit_lines", "a.py", "sha256:abc")).unwrap();
+        assert!(approve_pending_review(&conn, &id, "cli_manual_review").unwrap());
+
+        let first = claim_approved_matching(&conn, "a.py", "sha256:abc")
+            .unwrap()
+            .expect("an approved, unexpired, matching row must be claimable once");
+        assert_eq!(first.review_id, id);
+        assert_eq!(first.status, "consumed");
+
+        let second = claim_approved_matching(&conn, "a.py", "sha256:abc").unwrap();
+        assert_eq!(
+            second, None,
+            "the same approval must not authorize a second write"
+        );
+
+        // The row itself is really gone from the approved pool, not just
+        // invisible to this one function -- the plain read-only lookup
+        // must agree.
+        assert_eq!(
+            find_approved_matching(&conn, "a.py", "sha256:abc").unwrap(),
+            None
+        );
+        let got = get_pending_review(&conn, &id).unwrap().unwrap();
+        assert_eq!(got.status, "consumed");
+    }
+
+    #[test]
+    fn claim_approved_matching_misses_cleanly_when_nothing_is_approved() {
+        let conn = state_conn();
+        assert_eq!(
+            claim_approved_matching(&conn, "a.py", "sha256:abc").unwrap(),
+            None
+        );
     }
 
     #[test]

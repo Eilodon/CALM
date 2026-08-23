@@ -545,15 +545,58 @@ pub fn validate_syntax_diff(
         .iter()
         .map(|&(s, e)| (s - RESYNC_MARGIN, e + RESYNC_MARGIN))
         .collect();
-    if !new_zone.is_empty() && new_errors.iter().any(|r| intersects_any(r, &new_zone)) {
-        return Some(false);
-    }
 
     let original_errors_all = parse_tree(original, language).ok().map(|t| {
         let mut v = Vec::new();
         collect_error_line_ranges(t.root_node(), &mut v);
         v
     });
+
+    if !new_zone.is_empty() {
+        let zone_hits: Vec<&(i64, i64)> = new_errors
+            .iter()
+            .filter(|r| intersects_any(r, &new_zone))
+            .collect();
+        if !zone_hits.is_empty() {
+            // P0-1 (audit follow-up, 2026-08-23): a zone-intersecting error
+            // is not automatically "caused by this edit" -- tree-sitter's
+            // resync recovery can attribute a WIDE error span (verified
+            // empirically: an unmatched delimiter can swallow every
+            // following line up to end-of-block/EOF into one ERROR node)
+            // to an unrelated, untouched construct several lines away, and
+            // that wide tail can overlap the edit zone purely by bleeding
+            // into it -- see `test_validate_syntax_diff_ignores_unrelated_
+            // line_inside_a_wide_preexisting_error_span`. Only trust the
+            // zone-reject unconditionally when the error's OWN START line
+            // falls inside a touched hunk itself (never just the ±1
+            // margin) -- that is the one case with no valid "already
+            // broken exactly there" excuse, since it's text this call just
+            // wrote. For an error whose start lies outside every touched
+            // hunk, check whether an equivalent error already started at
+            // the same position in `original` (see
+            // `remap_new_line_to_old`); if so, this is the same
+            // pre-existing error, not a new one, and doesn't justify
+            // rejecting on zone grounds alone.
+            let all_pre_existing = zone_hits.iter().all(|r| {
+                if touched_new_lines.iter().any(|&(s, e)| r.0 >= s && r.0 <= e) {
+                    return false;
+                }
+                let Some(old_line) =
+                    remap_new_line_to_old(r.0, touched_old_lines, touched_new_lines)
+                else {
+                    return false;
+                };
+                original_errors_all
+                    .as_ref()
+                    .map(|old| old.iter().any(|o| o.0 == old_line))
+                    .unwrap_or(false)
+            });
+            if !all_pre_existing {
+                return Some(false);
+            }
+        }
+    }
+
     let Some(original_errors) = original_errors_all else {
         // No parseable original tree to compare against -- fall back to
         // the pre-fix global comparison (against zero, since there's no
@@ -579,6 +622,41 @@ pub fn validate_syntax_diff(
         .filter(|r| !intersects_any(r, &old_zone))
         .count();
     Some(new_outside <= original_outside)
+}
+
+/// Maps a line number in `new_content` back to the corresponding line in
+/// `original`, for a line the caller has already confirmed falls OUTSIDE
+/// every touched hunk (so this is pure "how many lines did the hunk
+/// before/after this point add or remove", never a within-hunk position).
+/// Only handles the single-hunk case -- by far the common one (`edit_symbol`
+/// always passes exactly one hunk; `edit_lines` usually does too) -- and
+/// returns `None` for anything else: reconstructing an unambiguous mapping
+/// across an arbitrary number of disjoint multi-hunk edits is a bigger job
+/// this narrow fix doesn't take on. `None` is always safe here (the caller
+/// treats it as "can't prove this is pre-existing" and keeps the original,
+/// stricter zone-reject behavior), so multi-hunk calls are simply
+/// unaffected by this fix, not incorrectly excused.
+fn remap_new_line_to_old(
+    new_line: i64,
+    touched_old_lines: &[(i64, i64)],
+    touched_new_lines: &[(i64, i64)],
+) -> Option<i64> {
+    if touched_old_lines.len() != 1 || touched_new_lines.len() != 1 {
+        return None;
+    }
+    let (old_s, old_e) = touched_old_lines[0];
+    let (new_s, new_e) = touched_new_lines[0];
+    if new_line < new_s {
+        Some(new_line)
+    } else if new_line > new_e {
+        let shift = (new_e - new_s) - (old_e - old_s);
+        Some(new_line - shift)
+    } else {
+        // Inside the hunk itself -- the caller checks touched_new_lines
+        // membership before calling this, so this branch shouldn't be
+        // reached in practice; stay defensive rather than guess.
+        None
+    }
 }
 
 /// Write `content` to `path` atomically: write to a temp file in the same
@@ -1281,6 +1359,49 @@ mod tests {
             Some(true),
             "fixing the only error with zero hunk-position info must still pass under the \
              fallback path"
+        );
+    }
+
+    /// P0-1 (audit follow-up, 2026-08-23): the real 2026-07-14 false-positive
+    /// (`&raw const`/`&raw mut`, tree-sitter-rust 0.23.3 has no grammar rule
+    /// for it) no longer reproduces against the currently pinned grammar
+    /// version -- but the underlying class of bug is still live under a
+    /// different trigger: an unmatched-delimiter typo sends tree-sitter's
+    /// resync recovery into a WIDE ERROR span that can swallow several
+    /// unrelated, syntactically-fine lines below it (verified empirically
+    /// against tree-sitter-python 0.23.5, this workspace's pinned version --
+    /// `def outer():\n    a = foo(\n    b = 1\n    c = 2\n    d = 3` parses
+    /// with a single ERROR node spanning lines 2-5, not just line 2). An
+    /// edit that only touches line 4 (`c`), unrelated to the line-2 typo,
+    /// must not be rejected just because that typo's wide resync tail
+    /// happens to overlap line 4.
+    #[test]
+    fn test_validate_syntax_diff_ignores_unrelated_line_inside_a_wide_preexisting_error_span() {
+        let original = "def outer():\n    a = foo(\n    b = 1\n    c = 2\n    d = 3\n";
+        let new_content = "def outer():\n    a = foo(\n    b = 1\n    c = 99\n    d = 3\n";
+        assert_eq!(
+            validate_syntax_diff(original, new_content, "py", &[(4, 4)], &[(4, 4)]),
+            Some(true),
+            "editing line 4 (unrelated to the line-2 unmatched-paren typo) must not be \\
+             rejected just because the typo's wide resync-recovery error span bleeds \\
+             down far enough to overlap line 4"
+        );
+    }
+
+    /// Companion to the above: an edit whose OWN touched line is inside the
+    /// wide error span, and is STILL broken after the edit, must still
+    /// reject -- the fix narrows what's excused, it doesn't make the whole
+    /// span immune.
+    #[test]
+    fn test_validate_syntax_diff_still_rejects_when_the_touched_line_itself_is_the_typo() {
+        let original = "def outer():\n    a = foo(\n    b = 1\n    c = 2\n    d = 3\n";
+        let new_content = "def outer():\n    a = bar(\n    b = 1\n    c = 2\n    d = 3\n";
+        assert_eq!(
+            validate_syntax_diff(original, new_content, "py", &[(2, 2)], &[(2, 2)]),
+            Some(false),
+            "the touched line itself is the unmatched-paren typo (still broken after the \\
+             edit) -- must still reject, this is exactly the 'text this call just wrote' \\
+             case"
         );
     }
 

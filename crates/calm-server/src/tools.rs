@@ -3138,6 +3138,7 @@ mod tests {
                 path: None,
                 line: None,
                 if_none_match: None,
+                proposed_new_text: None,
             },
         ));
         let v = jv(output);
@@ -3202,6 +3203,7 @@ mod tests {
                 path: None,
                 line: None,
                 if_none_match: None,
+                proposed_new_text: None,
             },
         ));
         let v = jv(output);
@@ -3493,6 +3495,7 @@ mod tests {
                 path: None,
                 line: None,
                 if_none_match: None,
+                proposed_new_text: None,
             },
         ));
         let v = jv(output);
@@ -3548,6 +3551,7 @@ mod tests {
                     path: None,
                     line: None,
                     if_none_match: None,
+                    proposed_new_text: None,
                 },
             )),
         );
@@ -3626,6 +3630,7 @@ mod tests {
                     path: None,
                     line: None,
                     if_none_match: None,
+                    proposed_new_text: None,
                 },
             )),
         );
@@ -3703,6 +3708,7 @@ mod tests {
                     path: None,
                     line: None,
                     if_none_match: None,
+                    proposed_new_text: None,
                 },
             )),
         );
@@ -3754,6 +3760,7 @@ mod tests {
                     path: None,
                     line: None,
                     if_none_match: None,
+                    proposed_new_text: None,
                 },
             )),
         );
@@ -3825,6 +3832,7 @@ mod tests {
                     path: None,
                     line: None,
                     if_none_match: None,
+                    proposed_new_text: None,
                 },
             )),
         );
@@ -3871,6 +3879,7 @@ mod tests {
                     path: None,
                     line: None,
                     if_none_match: None,
+                    proposed_new_text: None,
                 },
             )),
         );
@@ -3891,6 +3900,7 @@ mod tests {
                     path: None,
                     line: None,
                     if_none_match: Some(etag),
+                    proposed_new_text: None,
                 },
             )),
         );
@@ -3971,6 +3981,7 @@ mod tests {
                 path: None,
                 line: None,
                 if_none_match: None,
+                proposed_new_text: None,
             },
         ));
         let v = jv(output);
@@ -4011,6 +4022,7 @@ mod tests {
                 path: None,
                 line: None,
                 if_none_match: None,
+                proposed_new_text: None,
             },
         ));
         let v = jv(output);
@@ -4058,6 +4070,7 @@ mod tests {
                 path: None,
                 line: None,
                 if_none_match: None,
+                proposed_new_text: None,
             },
         ));
         let v = jv(output);
@@ -4847,6 +4860,7 @@ mod tests {
                 path: None,
                 line: None,
                 if_none_match: None,
+                proposed_new_text: None,
             },
         ));
 
@@ -6086,6 +6100,7 @@ mod tests {
                     ],
                     include_callers: true,
                     include_callees: true,
+                    lean: false,
                 },
             )),
         );
@@ -6147,6 +6162,7 @@ mod tests {
                     qualified_names: vec!["a.py::foo".into()],
                     include_callers: false,
                     include_callees: false,
+                    lean: false,
                 },
             )),
         );
@@ -6155,6 +6171,88 @@ mod tests {
         assert_eq!(v["not_found_count"], 0);
         assert!(v.get("caveat").is_none());
         assert!(v["results"][0].get("direct_callers").is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn symbols_batch_lean_omits_preview_but_keeps_caller_callee_identity() {
+        let dir =
+            std::env::temp_dir().join(format!("ci_symbols_batch_lean_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("a.py"),
+            "def foo():\n    pass\n\n\ndef bar():\n    foo()\n",
+        )
+        .unwrap();
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.py::foo', 'foo', 'function', 'python', 'a.py', 1, 2, 'def foo():', '', 'foo', 1, 0, 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.py::bar', 'bar', 'function', 'python', 'a.py', 5, 6, 'def bar():', '', 'bar', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO call_edges (from_symbol, to_symbol, from_path, to_path, edge_confidence, call_site_line)
+                 VALUES ('a.py::bar', 'a.py::foo', 'a.py', 'a.py', 'resolved', 6)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let with_preview = jv(
+            server.symbols_batch(rmcp::handler::server::wrapper::Parameters(
+                SymbolsBatchParams {
+                    qualified_names: vec!["a.py::foo".into(), "a.py::bar".into()],
+                    include_callers: true,
+                    include_callees: true,
+                    lean: false,
+                },
+            )),
+        );
+        let foo = &with_preview["results"][0];
+        assert!(
+            foo["direct_callers"][0]["preview"].as_str().is_some(),
+            "lean=false must still populate caller preview, got: {with_preview}"
+        );
+        let bar = &with_preview["results"][1];
+        assert!(
+            bar["direct_callees"][0]["preview"].as_str().is_some(),
+            "lean=false must still populate callee preview, got: {with_preview}"
+        );
+
+        let lean = jv(
+            server.symbols_batch(rmcp::handler::server::wrapper::Parameters(
+                SymbolsBatchParams {
+                    qualified_names: vec!["a.py::foo".into(), "a.py::bar".into()],
+                    include_callers: true,
+                    include_callees: true,
+                    lean: true,
+                },
+            )),
+        );
+        let foo_lean = &lean["results"][0];
+        assert_eq!(foo_lean["direct_callers"][0]["symbol"], "a.py::bar");
+        assert!(
+            foo_lean["direct_callers"][0].get("preview").is_none(),
+            "lean=true must omit preview entirely (skip_serializing_if), got: {lean}"
+        );
+        let bar_lean = &lean["results"][1];
+        assert_eq!(bar_lean["direct_callees"][0]["symbol"], "a.py::foo");
+        assert!(
+            bar_lean["direct_callees"][0].get("preview").is_none(),
+            "lean=true must omit callee preview entirely, got: {lean}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -6307,6 +6405,84 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn source_default_max_lines_cap_applies_via_real_json_deserialization_and_null_opts_out() {
+        // Wave 12 (pagination default flip, 2026-08-23 plan): the struct-
+        // level unit test for `default_max_lines_cap` lives with the fn
+        // itself; this proves the default actually takes effect through
+        // the REAL wire boundary (serde_json::from_value, mirroring how
+        // rmcp deserializes an actual tool call) end-to-end through
+        // source() -- and pins the exact 300/301 boundary, not just "some
+        // truncation happens somewhere".
+        let dir =
+            std::env::temp_dir().join(format!("ci_source_default_cap_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // 1 signature line + 301 body lines = 302 lines total.
+        let body: String = (1..=301).map(|i| format!("    x{i} = 1\n")).collect();
+        std::fs::write(dir.join("a.py"), format!("def foo():\n{body}")).unwrap();
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.py::foo', 'foo', 'function', 'python', 'a.py', 1, 302, 'def foo():', '', 'foo', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        }
+
+        // `max_lines` OMITTED from JSON entirely -> defaults to 300 ->
+        // this 302-line symbol must truncate at exactly line 300.
+        let p_omitted: SourceParams =
+            serde_json::from_value(serde_json::json!({"symbol": "foo"})).unwrap();
+        assert_eq!(p_omitted.max_lines, Some(300));
+        let over = jv(server.source(rmcp::handler::server::wrapper::Parameters(p_omitted)));
+        assert_eq!(over["truncated"], true, "response: {over}");
+        assert_eq!(over["omitted_lines"], 2, "response: {over}");
+        assert_eq!(over["next_cursor"], 301, "response: {over}");
+
+        // Explicit JSON `null` (not omission) must still opt back into the
+        // old unlimited behavior -- the whole 302-line symbol comes back.
+        let p_null: SourceParams =
+            serde_json::from_value(serde_json::json!({"symbol": "foo", "max_lines": null}))
+                .unwrap();
+        assert_eq!(p_null.max_lines, None);
+        let unlimited = jv(server.source(rmcp::handler::server::wrapper::Parameters(p_null)));
+        assert!(unlimited["truncated"].is_null(), "response: {unlimited}");
+
+        // Boundary: a range read of EXACTLY 300 lines, max_lines also
+        // omitted, must NOT truncate (300 fits the cap whole).
+        let p_exact_fit: SourceParams = serde_json::from_value(serde_json::json!({
+            "path": "a.py",
+            "line": 1,
+            "end_line": 300,
+        }))
+        .unwrap();
+        let exact_fit = jv(server.source(rmcp::handler::server::wrapper::Parameters(p_exact_fit)));
+        assert!(exact_fit["truncated"].is_null(), "response: {exact_fit}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn understand_max_lines_defaults_to_300_when_omitted_from_json_but_null_stays_unlimited() {
+        // Wave 12 (pagination default flip, 2026-08-23 plan): same default
+        // fn (`default_max_lines_cap`) as SourceParams, applied here to
+        // UnderstandParams -- struct-level JSON deserialization check.
+        let p_omitted: UnderstandParams =
+            serde_json::from_value(serde_json::json!({"query": "foo"})).unwrap();
+        assert_eq!(p_omitted.max_lines, Some(300));
+
+        let p_null: UnderstandParams =
+            serde_json::from_value(serde_json::json!({"query": "foo", "max_lines": null})).unwrap();
+        assert_eq!(p_null.max_lines, None);
+
+        let p_explicit: UnderstandParams =
+            serde_json::from_value(serde_json::json!({"query": "foo", "max_lines": 50})).unwrap();
+        assert_eq!(p_explicit.max_lines, Some(50));
     }
 
     /// 1B: reading a non-hub symbol points straight at `edit_symbol` with the
@@ -6597,8 +6773,13 @@ mod tests {
         assert_eq!(second["truncated"], true, "response: {second}");
         assert_eq!(second["next_cursor"], 5, "response: {second}");
 
-        // An unbounded call (max_lines omitted) is completely unaffected --
-        // no truncated/omitted_lines/next_cursor at all.
+        // An explicit `max_lines: None` (a Rust struct literal, not JSON --
+        // see below) is completely unaffected -- no truncated/omitted_lines/
+        // next_cursor at all. Wave 12 (pagination default flip, 2026-08-23
+        // plan): NOT the same thing as a JSON caller omitting the key
+        // entirely, which now defaults to `default_max_lines_cap`'s 300 --
+        // only an explicit `null` in JSON, or (as constructed here at the
+        // Rust level) a literal `None`, still means unlimited.
         let full = jv(
             server.source(rmcp::handler::server::wrapper::Parameters(SourceParams {
                 qualified_name: None,
@@ -6663,17 +6844,26 @@ mod tests {
             })),
         );
         assert_eq!(v["truncated"], true, "response: {v}");
-        assert_eq!(v["suggested_next"]["tool"], "edit_symbol", "response: {v}");
+        // P0-2d (audit follow-up, 2026-08-23): a truncated response now
+        // points suggested_next.tool at `source` itself (read the rest)
+        // instead of `edit_symbol` -- an agent dispatching on the tool
+        // NAME alone can no longer act on a partial view.
+        assert_eq!(v["suggested_next"]["tool"], "source", "response: {v}");
         let reason = v["suggested_next"]["reason"].as_str().unwrap_or_default();
         assert!(
-            reason.contains("resume_from_line") && !reason.contains("no preview needed"),
-            "truncated suggestion must not claim no preview is needed: {reason}"
+            reason.contains("resume_from_line"),
+            "truncated suggestion must mention resume_from_line: {reason}"
         );
-        // etag is still the real expected_hash for the FULL symbol range.
-        assert!(
-            v["suggested_next"]["args"]["expected_hash"]
-                .as_str()
-                .is_some()
+        // The next call is directly resumable: resume_from_line/if_none_match
+        // are prefilled from this response's own next_cursor/etag.
+        assert_eq!(
+            v["suggested_next"]["args"]["resume_from_line"], v["next_cursor"],
+            "response: {v}"
+        );
+        assert_eq!(
+            v["suggested_next"]["args"]["if_none_match"].as_str(),
+            v["etag"].as_str(),
+            "response: {v}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -6757,8 +6947,12 @@ mod tests {
             .unwrap();
         }
 
-        // "def foo():" is 10 chars, "\n    a = 1" adds 1+9=10 more -> exactly
-        // 20 chars for the first 2 lines; a 3rd line would push past budget.
+        // P0-2a (audit follow-up, 2026-08-23): the budget must count the
+        // `<n>\t` gutter with_line_gutters adds, not just the raw line
+        // text -- "1\tdef foo():" is 12 chars (10 + "1\t"), and adding
+        // "2\t    a = 1" (11 chars) plus the joining newline would push the
+        // rendered total to 24, over the 20-char budget -- so only the
+        // first line fits.
         let v = jv(
             server.source(rmcp::handler::server::wrapper::Parameters(SourceParams {
                 qualified_name: None,
@@ -6776,12 +6970,12 @@ mod tests {
         );
         assert_eq!(
             v["source"].as_str().unwrap(),
-            "1\tdef foo():\n2\t    a = 1",
+            "1\tdef foo():",
             "response: {v}"
         );
         assert_eq!(v["truncated"], true, "response: {v}");
-        assert_eq!(v["omitted_lines"], 2, "response: {v}");
-        assert_eq!(v["next_cursor"], 3, "response: {v}");
+        assert_eq!(v["omitted_lines"], 3, "response: {v}");
+        assert_eq!(v["next_cursor"], 2, "response: {v}");
         // line_start/line_end stay pinned to the FULL symbol range.
         assert_eq!(v["line_start"], 1);
         assert_eq!(v["line_end"], 4);
@@ -6913,6 +7107,16 @@ mod tests {
         assert_eq!(source["truncated"], true, "response: {v}");
         assert_eq!(source["omitted_lines"], 2, "response: {v}");
         assert_eq!(source["next_cursor"], 3, "response: {v}");
+        // P0-2e (audit follow-up, 2026-08-23 pagination-flip plan):
+        // truncated embedded source must point back at `understand` with
+        // resume_from_line prefilled, not silently suggest edit_context (or
+        // nothing) as if the body were complete.
+        assert_eq!(v["suggested_next"]["tool"], "understand", "response: {v}");
+        assert_eq!(v["suggested_next"]["args"]["query"], "foo", "response: {v}");
+        assert_eq!(
+            v["suggested_next"]["args"]["resume_from_line"], 3,
+            "response: {v}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -12269,6 +12473,67 @@ mod tests {
     }
 
     #[test]
+    fn compute_touch_risk_with_reconstruction_escalates_a_signature_change_split_across_two_hunks()
+    {
+        // Bug (2026-08-23 audit, multi-hunk signature-escalation gap):
+        // compute_touch_risk's original single-hunk-must-fully-cover
+        // heuristic silently missed a signature rewritten by TWO separate
+        // hunks that jointly cover it but neither covers it alone -- e.g.
+        // edit_lines splitting a multi-line signature edit into one hunk
+        // per line. compute_touch_risk_with_reconstruction, which
+        // edit_lines_impl_gated's real write gate now calls, must still
+        // catch it using the real post-edit spliced content.
+        let (dir, server) = test_server("touch_risk_multi_hunk_signature_escalate");
+        std::fs::write(dir.join("a.py"), "def helper(\n    x):\n    return 1\n").unwrap();
+        {
+            let conn = server.db();
+            // caller_count=2 -> structurally "low" on its own, same
+            // isolation the sibling single-hunk test above uses.
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.py::helper', 'helper', 'function', 'python', 'a.py', 1, 3, 'def helper(\n    x):', '', 'helper', 2, 0, 0)",
+                [],
+            )
+            .unwrap();
+        }
+        let conn = server.make_read_conn().unwrap();
+        let coverage = calm_core::analysis::coverage::CoverageData::none();
+        // Two hunks, one per signature line -- neither alone covers the
+        // signature's full [1, 2] range, so the OLD heuristic (still used
+        // by every caller except the real write gate) would find nothing.
+        let proposed_hunks: Vec<(i64, i64, &str)> = vec![(1, 1, "def renamed("), (2, 2, "    y):")];
+        let new_content = "def renamed(\n    y):\n    return 1\n";
+        let line_map = [(1i64, 1i64, 1i64, 1i64), (2i64, 2i64, 2i64, 2i64)];
+
+        let (risk, _, _, _, _, reason, _, signature_touch) = compute_touch_risk_with_reconstruction(
+            &conn,
+            &dir,
+            "a.py",
+            &[(1, 1), (2, 2)],
+            &coverage,
+            &[],
+            &proposed_hunks,
+            &calm_core::policy::Policy::default(),
+            ReconstructedEdit {
+                new_content,
+                line_map: &line_map,
+            },
+        );
+        assert_eq!(
+            risk.as_deref(),
+            Some("high"),
+            "a signature split across two hunks that jointly change it must still escalate"
+        );
+        assert_eq!(signature_touch.as_deref(), Some("a.py::helper"));
+        assert!(
+            reason
+                .expect("escalation must carry a reason")
+                .contains("a.py::helper"),
+            "reason should name the touched symbol"
+        );
+    }
+
+    #[test]
     fn compute_touch_risk_body_only_edit_does_not_trigger_signature_escalation() {
         let (dir, server) = test_server("touch_risk_signature_body_only");
         std::fs::write(dir.join("a.py"), "def helper():\n    return 1\n").unwrap();
@@ -12462,6 +12727,62 @@ mod tests {
             reason.contains("test coverage"),
             "reason should explain the uncovered-coverage escalation, got: {reason}"
         );
+    }
+
+    /// P1 (audit follow-up, 2026-08-23): the specific false-negative the
+    /// audit named -- a hunk where only a sliver of its lines have any
+    /// recorded execution (1 out of 10 here) must still escalate. Before
+    /// this fix, `is_covered`'s any-line-at-all check would have read
+    /// this same fixture as fully covered (line 2 alone is in the covered
+    /// set) and NOT escalated -- this test would have failed against the
+    /// pre-fix code.
+    #[test]
+    fn compute_touch_risk_escalates_for_a_mostly_uncovered_hunk_even_with_one_covered_line() {
+        let (dir, server) = test_server("touch_risk_mostly_uncovered_hunk");
+        let body = "def helper():\n".to_string() + &"    x = 1\n".repeat(10);
+        std::fs::write(dir.join("a.py"), &body).unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.py::helper', 'helper', 'function', 'python', 'a.py', 1, 11, '', '', 'helper', 2, 0, 0)",
+                [],
+            )
+            .unwrap();
+        }
+        let conn = server.make_read_conn().unwrap();
+        let abs = calm_core::analysis::coverage::normalize_path(&dir.join("a.py"));
+        let mut covered_lines = std::collections::HashMap::new();
+        // Only line 2 (the first body line) out of the touched [2, 11]
+        // range has any recorded execution -- 1/10 = 10% coverage.
+        covered_lines.insert(abs, std::collections::HashSet::from([2]));
+        let coverage = calm_core::analysis::coverage::CoverageData {
+            source: "lcov".to_string(),
+            covered_lines,
+        };
+
+        let (risk, _, _, _, _, reason, touches_uncovered_code, _) = compute_touch_risk(
+            &conn,
+            &dir,
+            "a.py",
+            &[(2, 11)],
+            &coverage,
+            &[],
+            &[(2, 11, "irrelevant -- only start/end are read here")],
+            &calm_core::policy::Policy::default(),
+            true,
+        );
+        assert!(
+            touches_uncovered_code,
+            "a hunk with only 1/10 lines covered must count as touching uncovered code"
+        );
+        assert_eq!(
+            risk.as_deref(),
+            Some("high"),
+            "must escalate to Policy::default's uncovered_code_floor (high), not read the \
+             single covered line as proof the whole 10-line hunk is tested"
+        );
+        assert!(reason.expect("reason present").contains("test coverage"));
     }
 
     #[test]
@@ -12750,6 +13071,7 @@ mod tests {
                 path: None,
                 line: None,
                 if_none_match: None,
+                proposed_new_text: None,
             },
         ));
 
@@ -12854,6 +13176,7 @@ mod tests {
                 path: None,
                 line: None,
                 if_none_match: None,
+                proposed_new_text: None,
             },
         ));
         let ctx_v = jv(ctx);
@@ -12930,6 +13253,7 @@ mod tests {
                 path: None,
                 line: None,
                 if_none_match: None,
+                proposed_new_text: None,
             },
         ));
         let ctx_v = jv(ctx);
@@ -13013,6 +13337,7 @@ mod tests {
                 path: None,
                 line: None,
                 if_none_match: None,
+                proposed_new_text: None,
             },
         ));
         let ctx_v = jv(ctx);
@@ -13114,6 +13439,7 @@ mod tests {
                 path: None,
                 line: None,
                 if_none_match: None,
+                proposed_new_text: None,
             },
         ));
 
@@ -13233,6 +13559,7 @@ mod tests {
                 path: None,
                 line: None,
                 if_none_match: None,
+                proposed_new_text: None,
             },
         ));
 
@@ -13298,6 +13625,7 @@ mod tests {
                 path: None,
                 line: None,
                 if_none_match: None,
+                proposed_new_text: None,
             },
         ));
         let params = EditLinesParams {
@@ -13373,6 +13701,7 @@ mod tests {
                 path: None,
                 line: None,
                 if_none_match: None,
+                proposed_new_text: None,
             },
         ));
 
@@ -13450,6 +13779,7 @@ mod tests {
                 path: None,
                 line: None,
                 if_none_match: None,
+                proposed_new_text: None,
             },
         ));
 
@@ -13520,6 +13850,7 @@ mod tests {
                 path: None,
                 line: None,
                 if_none_match: None,
+                proposed_new_text: None,
             },
         ));
 
@@ -13595,6 +13926,7 @@ mod tests {
                 path: None,
                 line: None,
                 if_none_match: None,
+                proposed_new_text: None,
             },
         ));
 
@@ -13659,6 +13991,7 @@ mod tests {
                 path: None,
                 line: None,
                 if_none_match: None,
+                proposed_new_text: None,
             },
         ));
         let hash = calm_core::edit::range_checksum("def helper():\n    return 1\n", 2, 2).unwrap();
@@ -13789,6 +14122,7 @@ mod tests {
                 path: None,
                 line: None,
                 if_none_match: None,
+                proposed_new_text: None,
             },
         ));
         let hash = calm_core::edit::range_checksum("def helper():\n    return 1\n", 2, 2).unwrap();
@@ -13892,6 +14226,7 @@ mod tests {
                 path: None,
                 line: None,
                 if_none_match: None,
+                proposed_new_text: None,
             },
         ));
         let hash = calm_core::edit::range_checksum("def helper():\n    return 1\n", 2, 2).unwrap();
@@ -13940,6 +14275,20 @@ mod tests {
         );
         assert_eq!(v["error"]["next_call"]["args"]["review_id"], review_id);
         assert_eq!(v["error"]["next_call"]["args"]["diff_digest"], diff_digest);
+        // P1 (audit follow-up, 2026-08-23): `approve` is a real human
+        // decision, never prefilled -- `required_user_input` names it
+        // explicitly instead of leaving an agent to discover the gap only
+        // by trying (and failing) to call review_decide_via_agent_relay
+        // with just `args` verbatim.
+        assert_eq!(
+            v["error"]["next_call"]["required_user_input"],
+            serde_json::json!(["approve"]),
+            "response: {v}"
+        );
+        assert!(
+            v["error"]["next_call"]["args"].get("approve").is_none(),
+            "approve must not be silently prefilled: {v}"
+        );
 
         // Relay-approve using ONLY what the refusal response handed back --
         // no read of pending_reviews, no local hash_content call.
@@ -13997,6 +14346,7 @@ mod tests {
                 path: None,
                 line: None,
                 if_none_match: None,
+                proposed_new_text: None,
             },
         ));
         let hash = calm_core::edit::range_checksum("def helper():\n    return 1\n", 2, 2).unwrap();
@@ -14085,6 +14435,7 @@ mod tests {
                 path: None,
                 line: None,
                 if_none_match: None,
+                proposed_new_text: None,
             },
         ));
         let ctx_v = serde_json::to_value(&ctx_out.0).unwrap();
@@ -14164,6 +14515,7 @@ mod tests {
                 path: None,
                 line: None,
                 if_none_match: None,
+                proposed_new_text: None,
             },
         ));
         let ctx_v = serde_json::to_value(&ctx_out.0).unwrap();
@@ -14271,6 +14623,7 @@ mod tests {
                 path: None,
                 line: None,
                 if_none_match: None,
+                proposed_new_text: None,
             },
         ));
         let ctx_v = serde_json::to_value(&ctx_out.0).unwrap();
@@ -14372,6 +14725,7 @@ mod tests {
                 path: None,
                 line: None,
                 if_none_match: None,
+                proposed_new_text: None,
             },
         ));
         let ctx_v = serde_json::to_value(&ctx_out.0).unwrap();
@@ -14414,6 +14768,180 @@ mod tests {
             "def helper():\n    return 2\n",
             "the edit must actually have been applied, not just report no error"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P0-3 (audit follow-up, 2026-08-23): companion to the
+    /// touches_uncovered_code fix above, for the `signature_changed` axis.
+    /// Before this fix, `edit_context` had no way to see the real proposed
+    /// text, so it always minted `signature_changed=false` -- a genuine
+    /// signature edit's spend-time RiskVector (computed for real from the
+    /// actual diff) would then never match the minted one, and
+    /// `AUTHORITY_STALE_RISK_VECTOR` fired deterministically, with no
+    /// successful authority path for signature edits at all. Passing
+    /// `proposed_new_text` (the same text about to be spent) lets
+    /// `compute_touch_risk` detect the real signature change at MINT time
+    /// too, so the two sides agree.
+    #[test]
+    fn edit_context_mint_with_proposed_new_text_carries_the_real_signature_changed_value() {
+        use super::edit::{ElicitGate, HubAskContext};
+        let (dir, server) = test_server("mint_carries_real_signature_changed");
+        let original = "def helper():\n    return 1\n";
+        std::fs::write(dir.join("a.py"), original).unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.py::helper', 'helper', 'function', 'python', 'a.py', 1, 2, 'def helper():', '', 'helper', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+            let catalog = calm_core::indexer::refresh::InputCatalog::for_project(&dir);
+            calm_core::indexer::refresh::persist_index_input_snapshot(&conn, &catalog).unwrap();
+
+            let state_conn = server.state_write_conn().unwrap();
+            let reconciled =
+                calm_core::authority::EvidenceSnapshot::compute_after_reconciliation(&conn, &dir)
+                    .unwrap();
+            reconciled.persist(&state_conn).unwrap();
+        }
+
+        // A real signature change: `helper()` gains a parameter.
+        let new_text = "def helper(x):\n    return 1\n";
+
+        let ctx_out = server.edit_context(rmcp::handler::server::wrapper::Parameters(
+            EditContextParams {
+                qualified_name: None,
+                symbol: Some("helper".into()),
+                end_line: None,
+                path: None,
+                line: None,
+                if_none_match: None,
+                proposed_new_text: Some(new_text.to_string()),
+            },
+        ));
+        let ctx_v = serde_json::to_value(&ctx_out.0).unwrap();
+        let change_id = ctx_v["change_id"]
+            .as_str()
+            .expect("edit_context must mint a change_id even for a signature-changing target")
+            .to_string();
+        let authority_id = ctx_v["authority_id"]
+            .as_str()
+            .expect("edit_context must mint an authority_id even for a signature-changing target")
+            .to_string();
+
+        let hash = calm_core::edit::range_checksum(original, 1, 2).unwrap();
+        let params = EditLinesParams {
+            path: "a.py".into(),
+            edits: vec![EditHunkParam {
+                start_line: 1,
+                end_line: 2,
+                expected_hash: Some(hash),
+                old_text: None,
+                new_text: new_text.into(),
+            }],
+            confirm: false,
+            reason: None,
+            cites: None,
+            change_id: Some(change_id),
+            authority_id: Some(authority_id),
+        };
+        let mut ask: Option<HubAskContext> = None;
+        let out = server.edit_lines_flow(&params, ElicitGate::Approved, &mut ask);
+        let v = serde_json::to_value(&out).unwrap();
+        assert!(
+            v.get("error").is_none(),
+            "authority-path spend on a signature-changing edit must succeed once \
+             signature_changed matches on both sides (via proposed_new_text at mint time) -- a \
+             stale digest mismatch here (AUTHORITY_STALE_RISK_VECTOR) would mean the mint-time \
+             fix regressed, got: {v}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.py")).unwrap(),
+            new_text,
+            "the edit must actually have been applied, not just report no error"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Companion negative control for the test above: WITHOUT
+    /// `proposed_new_text`, minting still under-claims `signature_changed`
+    /// as `false` (the pre-existing, still-correct-as-a-conservative-
+    /// default behavior for a caller that hasn't drafted its replacement
+    /// text yet) -- so the exact same signature-changing spend must still
+    /// be rejected with `AUTHORITY_STALE_RISK_VECTOR`. This is what proves
+    /// the test above passes BECAUSE of `proposed_new_text`, not by
+    /// coincidence or a separate change elsewhere.
+    #[test]
+    fn edit_context_mint_without_proposed_new_text_still_rejects_a_signature_changing_spend() {
+        use super::edit::{ElicitGate, HubAskContext};
+        let (dir, server) = test_server("mint_without_proposed_new_text_still_stale");
+        let original = "def helper():\n    return 1\n";
+        std::fs::write(dir.join("a.py"), original).unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.py::helper', 'helper', 'function', 'python', 'a.py', 1, 2, 'def helper():', '', 'helper', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+            let catalog = calm_core::indexer::refresh::InputCatalog::for_project(&dir);
+            calm_core::indexer::refresh::persist_index_input_snapshot(&conn, &catalog).unwrap();
+
+            let state_conn = server.state_write_conn().unwrap();
+            let reconciled =
+                calm_core::authority::EvidenceSnapshot::compute_after_reconciliation(&conn, &dir)
+                    .unwrap();
+            reconciled.persist(&state_conn).unwrap();
+        }
+
+        let new_text = "def helper(x):\n    return 1\n";
+
+        let ctx_out = server.edit_context(rmcp::handler::server::wrapper::Parameters(
+            EditContextParams {
+                qualified_name: None,
+                symbol: Some("helper".into()),
+                end_line: None,
+                path: None,
+                line: None,
+                if_none_match: None,
+                proposed_new_text: None,
+            },
+        ));
+        let ctx_v = serde_json::to_value(&ctx_out.0).unwrap();
+        let change_id = ctx_v["change_id"].as_str().unwrap().to_string();
+        let authority_id = ctx_v["authority_id"].as_str().unwrap().to_string();
+
+        let hash = calm_core::edit::range_checksum(original, 1, 2).unwrap();
+        let params = EditLinesParams {
+            path: "a.py".into(),
+            edits: vec![EditHunkParam {
+                start_line: 1,
+                end_line: 2,
+                expected_hash: Some(hash),
+                old_text: None,
+                new_text: new_text.into(),
+            }],
+            confirm: false,
+            reason: None,
+            cites: None,
+            change_id: Some(change_id),
+            authority_id: Some(authority_id),
+        };
+        let mut ask: Option<HubAskContext> = None;
+        let out = server.edit_lines_flow(&params, ElicitGate::Approved, &mut ask);
+        let v = serde_json::to_value(&out).unwrap();
+        assert_eq!(
+            v["error"]["code"], "AUTHORITY_STALE_RISK_VECTOR",
+            "without proposed_new_text at mint time, a genuine signature change must still be \
+             rejected -- this documents the P0-3 audit finding's dead end as still real for the \
+             default (no opt-in) path: {v}"
+        );
+        // The authority must not have been spent -- the file untouched.
+        assert_eq!(std::fs::read_to_string(dir.join("a.py")).unwrap(), original);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -14492,6 +15020,7 @@ mod tests {
                 end_line: Some(1),
                 qualified_name: None,
                 if_none_match: None,
+                proposed_new_text: None,
             },
         ));
         let ctx_v = serde_json::to_value(&ctx_out.0).unwrap();
@@ -14577,6 +15106,7 @@ mod tests {
                 end_line: Some(1),
                 qualified_name: None,
                 if_none_match: None,
+                proposed_new_text: None,
             },
         ));
         let ctx_v = serde_json::to_value(&ctx_out.0).unwrap();
@@ -14660,6 +15190,7 @@ mod tests {
                 path: None,
                 line: None,
                 if_none_match: None,
+                proposed_new_text: None,
             },
         ));
         let ctx_v = serde_json::to_value(&ctx_out.0).unwrap();
@@ -14742,6 +15273,7 @@ mod tests {
                 path: None,
                 line: None,
                 if_none_match: None,
+                proposed_new_text: None,
             },
         ));
         let ctx_v = serde_json::to_value(&ctx_out.0).unwrap();
@@ -14890,6 +15422,7 @@ mod tests {
                 path: None,
                 line: None,
                 if_none_match: None,
+                proposed_new_text: None,
             },
         ));
         let ctx_v = serde_json::to_value(&ctx_out.0).unwrap();
@@ -14986,6 +15519,7 @@ mod tests {
                 path: None,
                 line: None,
                 if_none_match: None,
+                proposed_new_text: None,
             },
         ));
         let ctx_v = serde_json::to_value(&ctx_out.0).unwrap();
@@ -15327,6 +15861,13 @@ mod tests {
         );
         assert_eq!(verify_out["verified"], false, "response: {verify_out}");
         assert_eq!(verify_out["state"], "FAILED", "response: {verify_out}");
+        // P1 (audit follow-up, 2026-08-23): the top-level flow_state must
+        // reflect the real transaction state, not the old hardcoded
+        // "ready" -- a failed verification needs repair_consistency next.
+        assert_eq!(
+            verify_out["flow_state"], "blocked",
+            "response: {verify_out}"
+        );
         assert!(
             !verify_out["diagnostics"].as_array().unwrap().is_empty(),
             "response: {verify_out}"
@@ -15547,6 +16088,7 @@ mod tests {
                 path: None,
                 line: None,
                 if_none_match: None,
+                proposed_new_text: None,
             },
         ));
 
@@ -15627,6 +16169,7 @@ mod tests {
                 path: None,
                 line: None,
                 if_none_match: None,
+                proposed_new_text: None,
             },
         ));
 
@@ -16243,6 +16786,124 @@ mod tests {
             std::fs::read_to_string(dir.join("a.rs")).unwrap(),
             "#[inline]\nfn helper() -> i32 {\n    2\n}\n",
             "scope=\"decorated_declaration\" must not duplicate the attribute"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P1 (audit follow-up, 2026-08-23): the specific gap the audit named
+    /// -- new_text adds a genuinely NEW decorator (`#[deprecated]`) as its
+    /// first line, then repeats the OLD one (`#[inline]`, already live
+    /// directly above the symbol's range) as its SECOND line. Before this
+    /// fix, only new_text's first line was ever compared against the live
+    /// decorator lines above, so this exact duplication slipped through
+    /// and the write would have silently produced two `#[inline]` lines.
+    #[test]
+    fn edit_symbol_catches_duplicate_decoration_repeated_on_new_texts_second_line() {
+        let (dir, server) = test_server("edit_symbol_duplicate_decoration_second_line");
+        std::fs::write(
+            dir.join("a.rs"),
+            "#[inline]\nfn helper() -> i32 {\n    1\n}\n",
+        )
+        .unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.rs::helper', 'helper', 'function', 'rust', 'a.rs', 2, 4, '', '', 'helper', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        }
+        let hash =
+            calm_core::edit::range_checksum("#[inline]\nfn helper() -> i32 {\n    1\n}\n", 2, 4)
+                .unwrap();
+
+        let out = server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
+            EditSymbolParams {
+                qualified_name: None,
+                change_id: None,
+                authority_id: None,
+                symbol: "helper".into(),
+                path: None,
+                line: None,
+                expected_hash: Some(hash),
+                // First line is a genuinely NEW decorator; second line
+                // repeats the OLD one that's already live above.
+                new_text: "#[deprecated]\n#[inline]\nfn helper() -> i32 {\n    2\n}\n".into(),
+                position: None,
+                confirm: false,
+                reason: None,
+                cites: None,
+                old_text: None,
+                scope: None,
+            },
+        ));
+        let v = jv(out);
+        assert_eq!(v["applied"].as_bool(), None, "must not have applied: {v}");
+        assert_eq!(
+            v["error"]["code"], "DUPLICATE_DECORATION_RISK",
+            "the duplicated #[inline] on new_text's SECOND line must still be caught: {v}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.rs")).unwrap(),
+            "#[inline]\nfn helper() -> i32 {\n    1\n}\n",
+            "refused write must leave the file untouched"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Companion true-negative: new_text adds a genuinely new decorator
+    /// and does NOT repeat the old one -- must succeed, proving the wider
+    /// multi-line scan doesn't turn into false positives on ordinary
+    /// non-duplicated content.
+    #[test]
+    fn edit_symbol_does_not_false_positive_when_new_decorator_does_not_repeat_the_old_one() {
+        let (dir, server) = test_server("edit_symbol_duplicate_decoration_true_negative");
+        std::fs::write(
+            dir.join("a.rs"),
+            "#[inline]\nfn helper() -> i32 {\n    1\n}\n",
+        )
+        .unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.rs::helper', 'helper', 'function', 'rust', 'a.rs', 2, 4, '', '', 'helper', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        }
+        let hash =
+            calm_core::edit::range_checksum("#[inline]\nfn helper() -> i32 {\n    1\n}\n", 2, 4)
+                .unwrap();
+
+        let out = server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
+            EditSymbolParams {
+                qualified_name: None,
+                change_id: None,
+                authority_id: None,
+                symbol: "helper".into(),
+                path: None,
+                line: None,
+                expected_hash: Some(hash),
+                // Adds a new decorator but does NOT repeat #[inline] --
+                // no duplication, must succeed.
+                new_text: "#[deprecated]\nfn helper() -> i32 {\n    2\n}\n".into(),
+                position: None,
+                confirm: false,
+                reason: None,
+                cites: None,
+                old_text: None,
+                scope: None,
+            },
+        ));
+        let v = jv(out);
+        assert_eq!(v["applied"], true, "response: {v}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.rs")).unwrap(),
+            "#[inline]\n#[deprecated]\nfn helper() -> i32 {\n    2\n}\n"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -17218,6 +17879,7 @@ mod tests {
                     line: None,
                     qualified_name: Some("src/b.rs::new".into()),
                     if_none_match: None,
+                    proposed_new_text: None,
                 },
             )),
         );
@@ -18092,6 +18754,7 @@ mod tests {
                     path: None,
                     line: None,
                     if_none_match: None,
+                    proposed_new_text: None,
                 },
             )),
         );
@@ -18146,6 +18809,7 @@ mod tests {
                     path: None,
                     line: None,
                     if_none_match: None,
+                    proposed_new_text: None,
                 },
             )),
         );
@@ -18193,6 +18857,7 @@ mod tests {
                     path: None,
                     line: None,
                     if_none_match: None,
+                    proposed_new_text: None,
                 },
             )),
         );
@@ -18237,6 +18902,7 @@ mod tests {
                     path: None,
                     line: None,
                     if_none_match: None,
+                    proposed_new_text: None,
                 },
             )),
         );
@@ -18419,6 +19085,7 @@ mod tests {
                 path: None,
                 line: None,
                 if_none_match: None,
+                proposed_new_text: None,
             },
         ));
 
@@ -18521,6 +19188,7 @@ mod tests {
                 path: None,
                 line: None,
                 if_none_match: None,
+                proposed_new_text: None,
             },
         ));
         let hash = calm_core::edit::range_checksum("def helper():\n    return 1\n", 1, 2).unwrap();
@@ -18607,6 +19275,7 @@ mod tests {
                 path: None,
                 line: None,
                 if_none_match: None,
+                proposed_new_text: None,
             },
         ));
         let hash = calm_core::edit::range_checksum("def helper():\n    return 1\n", 1, 2).unwrap();
@@ -18667,6 +19336,7 @@ mod tests {
                 path: None,
                 line: None,
                 if_none_match: None,
+                proposed_new_text: None,
             },
         ));
         let hash = calm_core::edit::range_checksum("def helper():\n    return 1\n", 1, 2).unwrap();
@@ -18732,6 +19402,7 @@ mod tests {
                 path: None,
                 line: None,
                 if_none_match: None,
+                proposed_new_text: None,
             },
         ));
         let hash = calm_core::edit::range_checksum("def helper():\n    return 1\n", 1, 2).unwrap();
@@ -18801,6 +19472,7 @@ mod tests {
                 path: None,
                 line: None,
                 if_none_match: None,
+                proposed_new_text: None,
             },
         ));
         let hash = calm_core::edit::range_checksum("def helper():\n    return 1\n", 1, 2).unwrap();
@@ -18895,6 +19567,7 @@ mod tests {
                 path: None,
                 line: None,
                 if_none_match: None,
+                proposed_new_text: None,
             },
         ));
         let hash = calm_core::edit::range_checksum("def helper():\n    return 1\n", 1, 2).unwrap();
@@ -18992,6 +19665,7 @@ mod tests {
                 path: None,
                 line: None,
                 if_none_match: None,
+                proposed_new_text: None,
             },
         ));
 

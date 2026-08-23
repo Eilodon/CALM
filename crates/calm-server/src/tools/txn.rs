@@ -32,6 +32,23 @@ use super::*;
 // test.
 // ---------------------------------------------------------------------------
 
+/// P1 (audit follow-up, 2026-08-23): maps a transaction's real `TxState` to
+/// the `flow_state` vocabulary `classify_error_state` already established
+/// for the error side, so `edit_transaction_status`/`verify_change` can
+/// report a top-level `flow_state` an agent can dispatch on without also
+/// inspecting the tool-specific `state` field inside `success`. Only
+/// `VerifyPending` (awaiting `verify_change`) and `Failed` (awaiting
+/// `repair_consistency`) diverge from `"ready"` -- every other state
+/// (Prepared/FileCommitted/IndexCommitted/Done/RolledBack) is a normal
+/// resting point, not something the caller must act on next.
+fn tx_flow_state(state: calm_core::txn::TxState) -> &'static str {
+    match state {
+        calm_core::txn::TxState::VerifyPending => "needs_verification",
+        calm_core::txn::TxState::Failed => "blocked",
+        _ => "ready",
+    }
+}
+
 #[rmcp::tool_router(router = "txn_tool_router", vis = "pub(crate)")]
 impl CalmServer {
     #[tool(
@@ -81,15 +98,18 @@ impl CalmServer {
             } else {
                 None
             };
-            ToolOutcome::success(EditTransactionStatusOutput {
-                tx_id: tx.tx_id,
-                path: tx.path,
-                state: tx.state.as_str().to_string(),
-                replay_state,
-                base_digest: tx.base_digest,
-                proposed_digest: tx.proposed_digest,
-                suggested_next: self.filter_sn(sn),
-            })
+            ToolOutcome::success_with_flow_state(
+                EditTransactionStatusOutput {
+                    tx_id: tx.tx_id,
+                    path: tx.path,
+                    state: tx.state.as_str().to_string(),
+                    replay_state,
+                    base_digest: tx.base_digest,
+                    proposed_digest: tx.proposed_digest,
+                    suggested_next: self.filter_sn(sn),
+                },
+                tx_flow_state(tx.state),
+            )
         }))
     }
 
@@ -455,22 +475,25 @@ impl CalmServer {
             };
 
             if state != calm_core::txn::TxState::VerifyPending {
-                return ToolOutcome::success(VerifyChangeOutput {
-                    tx_id: tx.tx_id,
-                    path: tx.path,
-                    tier: "none".to_string(),
-                    verified: None,
-                    state: state.as_str().to_string(),
-                    diagnostics: Vec::new(),
-                    command: None,
-                    note: format!(
-                        "nothing to verify -- this transaction is at {} (verification either \
-                         wasn't enabled for it, its file isn't a supported language, or it was \
-                         already resolved)",
-                        state.as_str()
-                    ),
-                    suggested_next: None,
-                });
+                return ToolOutcome::success_with_flow_state(
+                    VerifyChangeOutput {
+                        tx_id: tx.tx_id,
+                        path: tx.path,
+                        tier: "none".to_string(),
+                        verified: None,
+                        state: state.as_str().to_string(),
+                        diagnostics: Vec::new(),
+                        command: None,
+                        note: format!(
+                            "nothing to verify -- this transaction is at {} (verification either \
+                             wasn't enabled for it, its file isn't a supported language, or it was \
+                             already resolved)",
+                            state.as_str()
+                        ),
+                        suggested_next: None,
+                    },
+                    tx_flow_state(state),
+                );
             }
 
             let full_path = match calm_core::path_policy::resolve_within_root(
@@ -489,18 +512,21 @@ impl CalmServer {
             };
 
             if !calm_core::verify::is_verifiable_rust_file(&full_path) {
-                return ToolOutcome::success(VerifyChangeOutput {
-                    tx_id: tx.tx_id,
-                    path: tx.path,
-                    tier: "unsupported".to_string(),
-                    verified: None,
-                    state: state.as_str().to_string(),
-                    diagnostics: Vec::new(),
-                    command: None,
-                    note: "only Rust (.rs) files are supported today (WS-6 first slice)"
-                        .to_string(),
-                    suggested_next: None,
-                });
+                return ToolOutcome::success_with_flow_state(
+                    VerifyChangeOutput {
+                        tx_id: tx.tx_id,
+                        path: tx.path,
+                        tier: "unsupported".to_string(),
+                        verified: None,
+                        state: state.as_str().to_string(),
+                        diagnostics: Vec::new(),
+                        command: None,
+                        note: "only Rust (.rs) files are supported today (WS-6 first slice)"
+                            .to_string(),
+                        suggested_next: None,
+                    },
+                    tx_flow_state(state),
+                );
             }
 
             let Some(manifest_path) =
@@ -616,22 +642,25 @@ impl CalmServer {
                     "Verification failed -- the file on disk was NOT rolled back; fix the code or use repair_consistency to inspect the transaction",
                 )
             };
-            ToolOutcome::success(VerifyChangeOutput {
-                tx_id: tx.tx_id,
-                path: tx.path,
-                tier: "semantic:cargo_check".to_string(),
-                verified: Some(result.passed),
-                state: to.as_str().to_string(),
-                diagnostics: result.diagnostics,
-                command: Some(result.command),
-                note: if result.passed {
-                    "cargo check passed".to_string()
-                } else {
-                    "cargo check failed -- see diagnostics; disk content was not reverted"
-                        .to_string()
+            ToolOutcome::success_with_flow_state(
+                VerifyChangeOutput {
+                    tx_id: tx.tx_id,
+                    path: tx.path,
+                    tier: "semantic:cargo_check".to_string(),
+                    verified: Some(result.passed),
+                    state: to.as_str().to_string(),
+                    diagnostics: result.diagnostics,
+                    command: Some(result.command),
+                    note: if result.passed {
+                        "cargo check passed".to_string()
+                    } else {
+                        "cargo check failed -- see diagnostics; disk content was not reverted"
+                            .to_string()
+                    },
+                    suggested_next: self.filter_sn(sn),
                 },
-                suggested_next: self.filter_sn(sn),
-            })
+                tx_flow_state(to),
+            )
         }))
     }
 }
