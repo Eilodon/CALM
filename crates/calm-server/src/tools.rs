@@ -5602,6 +5602,9 @@ mod tests {
         let v = jv(
             server.understand(rmcp::handler::server::wrapper::Parameters(
                 UnderstandParams {
+                    max_lines: None,
+                    resume_from_line: None,
+                    max_chars: None,
                     query: "foo".into(),
                     kind: None,
                 },
@@ -5645,6 +5648,9 @@ mod tests {
         let v = jv(
             server.understand(rmcp::handler::server::wrapper::Parameters(
                 UnderstandParams {
+                    max_lines: None,
+                    resume_from_line: None,
+                    max_chars: None,
                     query: "widget".into(),
                     kind: None,
                 },
@@ -5691,6 +5697,9 @@ mod tests {
         let typo = jv(
             server.understand(rmcp::handler::server::wrapper::Parameters(
                 UnderstandParams {
+                    max_lines: None,
+                    resume_from_line: None,
+                    max_chars: None,
                     query: "widget".into(),
                     kind: Some("symbolz".into()),
                 },
@@ -5709,6 +5718,9 @@ mod tests {
         let valid = jv(
             server.understand(rmcp::handler::server::wrapper::Parameters(
                 UnderstandParams {
+                    max_lines: None,
+                    resume_from_line: None,
+                    max_chars: None,
                     query: "widget".into(),
                     kind: Some("symbol".into()),
                 },
@@ -5764,6 +5776,9 @@ mod tests {
         let v = jv(
             server.understand(rmcp::handler::server::wrapper::Parameters(
                 UnderstandParams {
+                    max_lines: None,
+                    resume_from_line: None,
+                    max_chars: None,
                     query: "foo".into(),
                     kind: None,
                 },
@@ -5833,6 +5848,9 @@ mod tests {
         let v = jv(
             server.understand(rmcp::handler::server::wrapper::Parameters(
                 UnderstandParams {
+                    max_lines: None,
+                    resume_from_line: None,
+                    max_chars: None,
                     query: "bar".into(),
                     kind: None,
                 },
@@ -5901,6 +5919,7 @@ mod tests {
         let v = jv(
             server.source(rmcp::handler::server::wrapper::Parameters(SourceParams {
                 qualified_name: None,
+                max_chars: None,
                 max_lines: None,
                 resume_from_line: None,
                 symbol: Some("foo".into()),
@@ -5943,6 +5962,7 @@ mod tests {
         let first = jv(
             server.source(rmcp::handler::server::wrapper::Parameters(SourceParams {
                 qualified_name: None,
+                max_chars: None,
                 max_lines: None,
                 resume_from_line: None,
                 symbol: Some("foo".into()),
@@ -5970,6 +5990,7 @@ mod tests {
         let second = jv(
             server.source(rmcp::handler::server::wrapper::Parameters(SourceParams {
                 qualified_name: None,
+                max_chars: None,
                 max_lines: None,
                 resume_from_line: None,
                 symbol: Some("foo".into()),
@@ -5997,6 +6018,7 @@ mod tests {
         let stale = jv(
             server.source(rmcp::handler::server::wrapper::Parameters(SourceParams {
                 qualified_name: None,
+                max_chars: None,
                 max_lines: None,
                 resume_from_line: None,
                 symbol: Some("foo".into()),
@@ -6157,6 +6179,7 @@ mod tests {
         let v = jv(
             server.source(rmcp::handler::server::wrapper::Parameters(SourceParams {
                 qualified_name: None,
+                max_chars: None,
                 max_lines: None,
                 resume_from_line: None,
                 symbol: Some("foo".into()),
@@ -6202,6 +6225,7 @@ mod tests {
         let v = jv(
             server.source(rmcp::handler::server::wrapper::Parameters(SourceParams {
                 qualified_name: None,
+                max_chars: None,
                 max_lines: None,
                 resume_from_line: None,
                 symbol: Some("foo".into()),
@@ -6259,6 +6283,7 @@ mod tests {
         let raw = jv(
             server.source(rmcp::handler::server::wrapper::Parameters(SourceParams {
                 qualified_name: None,
+                max_chars: None,
                 max_lines: None,
                 resume_from_line: None,
                 symbol: Some("foo".into()),
@@ -6306,6 +6331,7 @@ mod tests {
         let v = jv(
             server.source(rmcp::handler::server::wrapper::Parameters(SourceParams {
                 qualified_name: None,
+                max_chars: None,
                 max_lines: None,
                 resume_from_line: None,
                 symbol: Some("foo".into()),
@@ -6358,6 +6384,7 @@ mod tests {
         let src_v = jv(
             server.source(rmcp::handler::server::wrapper::Parameters(SourceParams {
                 qualified_name: None,
+                max_chars: None,
                 max_lines: None,
                 resume_from_line: None,
                 symbol: Some("foo".into()),
@@ -6441,6 +6468,7 @@ mod tests {
         let v = jv(
             server.source(rmcp::handler::server::wrapper::Parameters(SourceParams {
                 qualified_name: None,
+                max_chars: None,
                 max_lines: None,
                 resume_from_line: None,
                 symbol: None,
@@ -6483,6 +6511,7 @@ mod tests {
         let bad = jv(
             server.source(rmcp::handler::server::wrapper::Parameters(SourceParams {
                 qualified_name: None,
+                max_chars: None,
                 max_lines: None,
                 resume_from_line: None,
                 symbol: None,
@@ -6521,6 +6550,7 @@ mod tests {
         let first = jv(
             server.source(rmcp::handler::server::wrapper::Parameters(SourceParams {
                 qualified_name: None,
+                max_chars: None,
                 max_lines: Some(2),
                 resume_from_line: None,
                 symbol: None,
@@ -6551,6 +6581,7 @@ mod tests {
         let second = jv(
             server.source(rmcp::handler::server::wrapper::Parameters(SourceParams {
                 qualified_name: None,
+                max_chars: None,
                 max_lines: Some(2),
                 resume_from_line: Some(first["next_cursor"].as_i64().unwrap()),
                 symbol: None,
@@ -6571,6 +6602,7 @@ mod tests {
         let full = jv(
             server.source(rmcp::handler::server::wrapper::Parameters(SourceParams {
                 qualified_name: None,
+                max_chars: None,
                 max_lines: None,
                 resume_from_line: None,
                 symbol: None,
@@ -6585,6 +6617,302 @@ mod tests {
         assert!(full["truncated"].is_null(), "response: {full}");
         assert!(full["omitted_lines"].is_null(), "response: {full}");
         assert!(full["next_cursor"].is_null(), "response: {full}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    // Wave 6 (item a): a truncated whole-symbol response's suggested_next
+    // must stop claiming "no preview needed" for edit_symbol -- the etag is
+    // still a valid expected_hash (it always hashes the FULL range), but
+    // only PART of the body was actually seen, so the reason text must say
+    // so instead of implying the caller already has everything.
+    fn source_truncated_symbol_response_suggests_reading_the_rest_before_replace() {
+        let dir = std::env::temp_dir().join(format!("ci_source_trunc_sn_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("a.py"),
+            "def foo():\n    a = 1\n    b = 2\n    c = 3\n",
+        )
+        .unwrap();
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.py::foo', 'foo', 'function', 'python', 'a.py', 1, 4, 'def foo():', '', 'foo', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let v = jv(
+            server.source(rmcp::handler::server::wrapper::Parameters(SourceParams {
+                qualified_name: None,
+                max_chars: None,
+                max_lines: Some(2),
+                resume_from_line: None,
+                symbol: Some("foo".into()),
+                path: None,
+                line: None,
+                end_line: None,
+                include_metadata: false,
+                line_numbers: true,
+                if_none_match: None,
+            })),
+        );
+        assert_eq!(v["truncated"], true, "response: {v}");
+        assert_eq!(v["suggested_next"]["tool"], "edit_symbol", "response: {v}");
+        let reason = v["suggested_next"]["reason"].as_str().unwrap_or_default();
+        assert!(
+            reason.contains("resume_from_line") && !reason.contains("no preview needed"),
+            "truncated suggestion must not claim no preview is needed: {reason}"
+        );
+        // etag is still the real expected_hash for the FULL symbol range.
+        assert!(
+            v["suggested_next"]["args"]["expected_hash"]
+                .as_str()
+                .is_some()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    // Wave 6 (item c): max_lines/max_chars <= 0 must be rejected explicitly
+    // instead of silently falling back to "unlimited".
+    fn source_rejects_non_positive_max_lines_and_max_chars() {
+        let dir =
+            std::env::temp_dir().join(format!("ci_source_budget_invalid_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.py"), "CONST = 1\n").unwrap();
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+
+        let zero_lines = jv(server.source(rmcp::handler::server::wrapper::Parameters(
+            SourceParams {
+                qualified_name: None,
+                max_chars: None,
+                max_lines: Some(0),
+                resume_from_line: None,
+                symbol: None,
+                path: Some("a.py".into()),
+                line: Some(1),
+                end_line: Some(1),
+                include_metadata: false,
+                line_numbers: true,
+                if_none_match: None,
+            },
+        )));
+        assert_eq!(
+            zero_lines["error"]["code"], "INVALID_PARAMS",
+            "response: {zero_lines}"
+        );
+
+        let negative_chars = jv(server.source(rmcp::handler::server::wrapper::Parameters(
+            SourceParams {
+                qualified_name: None,
+                max_chars: Some(-5),
+                max_lines: None,
+                resume_from_line: None,
+                symbol: None,
+                path: Some("a.py".into()),
+                line: Some(1),
+                end_line: Some(1),
+                include_metadata: false,
+                line_numbers: true,
+                if_none_match: None,
+            },
+        )));
+        assert_eq!(
+            negative_chars["error"]["code"], "INVALID_PARAMS",
+            "response: {negative_chars}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    // Wave 6 (item d): max_chars narrows a page FURTHER than max_lines
+    // alone would have, counting whole lines only (never splitting one
+    // line's own characters across pages).
+    fn source_max_chars_narrows_the_page_further_than_max_lines_alone() {
+        let dir = std::env::temp_dir().join(format!("ci_source_max_chars_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("a.py"),
+            "def foo():\n    a = 1\n    b = 2\n    c = 3\n",
+        )
+        .unwrap();
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.py::foo', 'foo', 'function', 'python', 'a.py', 1, 4, 'def foo():', '', 'foo', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        }
+
+        // "def foo():" is 10 chars, "\n    a = 1" adds 1+9=10 more -> exactly
+        // 20 chars for the first 2 lines; a 3rd line would push past budget.
+        let v = jv(
+            server.source(rmcp::handler::server::wrapper::Parameters(SourceParams {
+                qualified_name: None,
+                max_chars: Some(20),
+                max_lines: None,
+                resume_from_line: None,
+                symbol: Some("foo".into()),
+                path: None,
+                line: None,
+                end_line: None,
+                include_metadata: false,
+                line_numbers: true,
+                if_none_match: None,
+            })),
+        );
+        assert_eq!(
+            v["source"].as_str().unwrap(),
+            "1\tdef foo():\n2\t    a = 1",
+            "response: {v}"
+        );
+        assert_eq!(v["truncated"], true, "response: {v}");
+        assert_eq!(v["omitted_lines"], 2, "response: {v}");
+        assert_eq!(v["next_cursor"], 3, "response: {v}");
+        // line_start/line_end stay pinned to the FULL symbol range.
+        assert_eq!(v["line_start"], 1);
+        assert_eq!(v["line_end"], 4);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    // Wave 6 (item e): resuming a paginated read with a stale
+    // if_none_match (the range changed since that etag was issued) must
+    // refuse instead of silently serving a page mixed across old/new
+    // content.
+    fn source_resume_with_stale_if_none_match_returns_range_changed_error() {
+        let dir =
+            std::env::temp_dir().join(format!("ci_source_range_changed_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("a.py"),
+            "def foo():\n    a = 1\n    b = 2\n    c = 3\n",
+        )
+        .unwrap();
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.py::foo', 'foo', 'function', 'python', 'a.py', 1, 4, 'def foo():', '', 'foo', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let first = jv(
+            server.source(rmcp::handler::server::wrapper::Parameters(SourceParams {
+                qualified_name: None,
+                max_chars: None,
+                max_lines: Some(1),
+                resume_from_line: None,
+                symbol: Some("foo".into()),
+                path: None,
+                line: None,
+                end_line: None,
+                include_metadata: false,
+                line_numbers: true,
+                if_none_match: None,
+            })),
+        );
+        let stale_etag = first["etag"].as_str().unwrap().to_string();
+        let next_cursor = first["next_cursor"].as_i64().unwrap();
+
+        // Symbol body changes between page 1 and page 2 -- same line
+        // count, so resolve_symbol still locates it at the same range, but
+        // the content (and therefore the etag) is now different.
+        std::fs::write(
+            dir.join("a.py"),
+            "def foo():\n    a = 999\n    b = 2\n    c = 3\n",
+        )
+        .unwrap();
+
+        let second = jv(
+            server.source(rmcp::handler::server::wrapper::Parameters(SourceParams {
+                qualified_name: None,
+                max_chars: None,
+                max_lines: Some(1),
+                resume_from_line: Some(next_cursor),
+                symbol: Some("foo".into()),
+                path: None,
+                line: None,
+                end_line: None,
+                include_metadata: false,
+                line_numbers: true,
+                if_none_match: Some(stale_etag),
+            })),
+        );
+        assert_eq!(
+            second["error"]["code"], "RANGE_CHANGED_SINCE_PAGINATION",
+            "response: {second}"
+        );
+        assert_eq!(
+            second["flow_state"], "needs_verification",
+            "response: {second}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    // Wave 6 (item b): understand()'s embedded source_output honors the
+    // same max_lines/resume_from_line budget source() itself does.
+    fn understand_paginates_embedded_source_with_max_lines_and_resume_from_line() {
+        let dir =
+            std::env::temp_dir().join(format!("ci_understand_paginate_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("a.py"),
+            "def foo():\n    a = 1\n    b = 2\n    c = 3\n",
+        )
+        .unwrap();
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.py::foo', 'foo', 'function', 'python', 'a.py', 1, 4, 'def foo():', '', 'foo', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let v = jv(
+            server.understand(rmcp::handler::server::wrapper::Parameters(
+                UnderstandParams {
+                    max_lines: Some(2),
+                    resume_from_line: None,
+                    max_chars: None,
+                    query: "foo".into(),
+                    kind: None,
+                },
+            )),
+        );
+        let source = &v["source"];
+        assert_eq!(
+            source["source"].as_str().unwrap(),
+            "1\tdef foo():\n2\t    a = 1",
+            "response: {v}"
+        );
+        assert_eq!(source["truncated"], true, "response: {v}");
+        assert_eq!(source["omitted_lines"], 2, "response: {v}");
+        assert_eq!(source["next_cursor"], 3, "response: {v}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -6605,6 +6933,7 @@ mod tests {
         let ok = jv(
             server.source(rmcp::handler::server::wrapper::Parameters(SourceParams {
                 qualified_name: None,
+                max_chars: None,
                 max_lines: None,
                 resume_from_line: None,
                 symbol: None,
@@ -6621,6 +6950,7 @@ mod tests {
         let bad = jv(
             server.source(rmcp::handler::server::wrapper::Parameters(SourceParams {
                 qualified_name: None,
+                max_chars: None,
                 max_lines: None,
                 resume_from_line: None,
                 symbol: None,
@@ -6666,6 +6996,9 @@ mod tests {
         let v = jv(
             server.understand(rmcp::handler::server::wrapper::Parameters(
                 UnderstandParams {
+                    max_lines: None,
+                    resume_from_line: None,
+                    max_chars: None,
                     query: "foo".into(),
                     kind: None,
                 },
@@ -6721,6 +7054,9 @@ mod tests {
         let v = jv(
             server.understand(rmcp::handler::server::wrapper::Parameters(
                 UnderstandParams {
+                    max_lines: None,
+                    resume_from_line: None,
+                    max_chars: None,
                     query: "Foo".into(),
                     kind: None,
                 },
@@ -16271,6 +16607,7 @@ mod tests {
 
         let out = server.source(rmcp::handler::server::wrapper::Parameters(SourceParams {
             qualified_name: None,
+            max_chars: None,
             max_lines: None,
             resume_from_line: None,
             symbol: Some("target".into()),
@@ -16340,6 +16677,7 @@ mod tests {
 
         let out = server.source(rmcp::handler::server::wrapper::Parameters(SourceParams {
             qualified_name: None,
+            max_chars: None,
             max_lines: None,
             resume_from_line: None,
             symbol: Some("target".into()),
@@ -16398,6 +16736,7 @@ mod tests {
 
         let out = server.source(rmcp::handler::server::wrapper::Parameters(SourceParams {
             qualified_name: None,
+            max_chars: None,
             max_lines: None,
             resume_from_line: None,
             symbol: Some("run".into()),
@@ -16453,6 +16792,7 @@ mod tests {
 
         let out = server.source(rmcp::handler::server::wrapper::Parameters(SourceParams {
             qualified_name: None,
+            max_chars: None,
             max_lines: None,
             resume_from_line: None,
             symbol: Some("dup".into()),
@@ -16502,6 +16842,7 @@ mod tests {
 
         let out = server.source(rmcp::handler::server::wrapper::Parameters(SourceParams {
             qualified_name: None,
+            max_chars: None,
             max_lines: None,
             resume_from_line: None,
             symbol: Some("gone".into()),
@@ -16556,6 +16897,7 @@ mod tests {
 
         let out = server.source(rmcp::handler::server::wrapper::Parameters(SourceParams {
             qualified_name: None,
+            max_chars: None,
             max_lines: None,
             resume_from_line: None,
             symbol: Some("dup_method".into()),
@@ -16620,6 +16962,7 @@ mod tests {
 
         let out = server.source(rmcp::handler::server::wrapper::Parameters(SourceParams {
             qualified_name: None,
+            max_chars: None,
             max_lines: None,
             resume_from_line: None,
             symbol: Some("keep".into()),
@@ -16676,6 +17019,7 @@ mod tests {
 
         let out = server.source(rmcp::handler::server::wrapper::Parameters(SourceParams {
             qualified_name: None,
+            max_chars: None,
             max_lines: None,
             resume_from_line: None,
             symbol: Some("gone_a".into()),
@@ -16721,6 +17065,7 @@ mod tests {
 
         let out = server.source(rmcp::handler::server::wrapper::Parameters(SourceParams {
             qualified_name: None,
+            max_chars: None,
             max_lines: None,
             resume_from_line: None,
             symbol: Some("over_cap".into()),
@@ -17055,6 +17400,7 @@ mod tests {
         let params = || {
             rmcp::handler::server::wrapper::Parameters(SourceParams {
                 qualified_name: None,
+                max_chars: None,
                 max_lines: None,
                 resume_from_line: None,
                 symbol: Some("shifting".into()),

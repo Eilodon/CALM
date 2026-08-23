@@ -73,6 +73,14 @@
           "null"
         ],
         "format": "int64"
+      },
+      "max_chars": {
+        "description": "Wave 6 (item d): hard character cap on the rendered `source` text,\napplied on top of whatever `max_lines` already selected (never\nwidens a page, only narrows it further) -- counts whole lines only,\nnever splitting a single line's own characters across pages. Known,\naccepted limitation: a single line alone longer than `max_chars` is\nstill returned whole (can't be sub-divided by byte offset), and\n`next_cursor` on the following page points straight back to that\nsame line rather than skipping past it.",
+        "type": [
+          "integer",
+          "null"
+        ],
+        "format": "int64"
       }
     },
     "type": "object"

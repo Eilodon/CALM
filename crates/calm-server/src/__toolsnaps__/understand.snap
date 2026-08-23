@@ -18,6 +18,30 @@
           "string",
           "null"
         ]
+      },
+      "max_lines": {
+        "description": "Wave 6 (item b, \"response budget for understand\"): same meaning as\n`SourceParams::max_lines` -- caps how many lines of the embedded\n`source.source` come back in one call. `None` (default) is today's\nunlimited behavior. When set and the resolved symbol has more lines\nthan this, `source.truncated`/`source.next_cursor` are populated\nthe same way `source()` itself reports them (pass `next_cursor`\nback as `resume_from_line` to continue).",
+        "type": [
+          "integer",
+          "null"
+        ],
+        "format": "int64"
+      },
+      "resume_from_line": {
+        "description": "Wave 6 (item b): same meaning as `SourceParams::resume_from_line`\n-- 1-indexed absolute line to resume reading the embedded source\nfrom, pairing with a prior response's `source.next_cursor`.",
+        "type": [
+          "integer",
+          "null"
+        ],
+        "format": "int64"
+      },
+      "max_chars": {
+        "description": "Wave 6 (item b/d): same meaning as `SourceParams::max_chars` --\nhard character cap on the embedded `source.source` text, applied\non top of whatever `max_lines` already selected.",
+        "type": [
+          "integer",
+          "null"
+        ],
+        "format": "int64"
       }
     }
   },

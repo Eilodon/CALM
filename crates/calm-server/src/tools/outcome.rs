@@ -274,6 +274,11 @@ fn classify_error_state(code: &str, recoverable: bool) -> &'static str {
         | "INTENT_SUPERSEDED"
         | "UNCERTAIN_ZERO_CALLER"
         | "DIFF_DIGEST_MISMATCH"
+        // Wave 6 (item e): the range changed between pagination pages --
+        // same "re-derive fresh state" semantics as the entries above
+        // (restart pagination from the beginning), not a param the
+        // caller got wrong.
+        | "RANGE_CHANGED_SINCE_PAGINATION"
         | "FITNESS_CHECK_FAILED" => "needs_verification",
 
         // Hard stop: an infra failure, a security/containment boundary, or

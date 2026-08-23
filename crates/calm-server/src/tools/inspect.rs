@@ -210,6 +210,15 @@ impl CalmServer {
         Parameters(p): Parameters<SourceParams>,
     ) -> Json<ResolvedOutcome<SourceOutput>> {
         Json(self.timed_tool("source", || {
+            // Wave 6 (item c): `max_lines`/`max_chars` <= 0 previously fell
+            // through to paginate_range/apply_char_budget's own internal
+            // "non-positive means unlimited" fallback, silently doing
+            // something other than what a confused/buggy caller asked for.
+            // Reject explicitly here instead.
+            if let Some(e) = Self::invalid_pagination_budget(p.max_lines, p.max_chars) {
+                return ResolvedOutcome::error(e);
+            }
+
             // READ-only: open a dedicated read connection (SINGLE_WRITER enforcement)
             let conn = match self.make_read_conn() {
                 Ok(c) => c,
@@ -289,6 +298,25 @@ impl CalmServer {
                     // range regardless of pagination below -- it's a
                     // range-identity signal, not tied to how much of the
                     // range was actually rendered in `source`.
+
+                    // Wave 6 (item e): only checked when resuming a
+                    // paginated read -- a mismatch here means the range
+                    // changed between pages, so serving this page sliced
+                    // against `resume_from_line` on top of NEW bytes would
+                    // silently mix content the caller never validated
+                    // together. Refuse instead of guessing; the caller
+                    // should restart pagination from the beginning.
+                    if p.resume_from_line.is_some()
+                        && let Some(expected) = p.if_none_match.as_deref()
+                        && Some(expected) != etag.as_deref()
+                    {
+                        return ResolvedOutcome::error(error_detail(
+                            "RANGE_CHANGED_SINCE_PAGINATION",
+                            "the range changed since the page carrying this etag was read -- restart pagination from the beginning (omit resume_from_line and if_none_match) instead of continuing against stale coordinates",
+                            false,
+                        ));
+                    }
+
                     let (truncated, omitted_lines, next_cursor, slice_start, slice_end) =
                         if end > start {
                             let (p_start, p_end, truncated, omitted_lines, next_cursor) =
@@ -310,6 +338,20 @@ impl CalmServer {
                         } else {
                             (None, None, None, start, end)
                         };
+                    // Wave 6 (item d): a further character budget, applied
+                    // on top of whatever max_lines already selected --
+                    // never widens the page, only narrows it further.
+                    let (slice_end, truncated, omitted_lines, next_cursor) =
+                        Self::narrow_by_char_budget(
+                            &lines,
+                            slice_start,
+                            slice_end,
+                            end,
+                            p.max_chars,
+                            truncated,
+                            omitted_lines,
+                            next_cursor,
+                        );
                     (
                         lines[slice_start..slice_end].join("\n"),
                         "disk",
@@ -343,9 +385,19 @@ impl CalmServer {
                     serde_json::json!({"symbol": symbol_name.clone(), "path": c.path.clone()}),
                 )
             } else if let Some(hash) = etag.as_deref() {
+                // Wave 6 (item a): `truncated` was blind to this branch --
+                // the etag/expected_hash is still valid for a whole-symbol
+                // replace either way (it always hashes the FULL range), but
+                // "no preview needed" is misleading when what was actually
+                // seen is only part of the symbol. Read the rest first.
+                let reason = if truncated == Some(true) {
+                    "Only part of this symbol was returned (see `truncated`/`next_cursor`) -- read the rest with `resume_from_line` before a whole-symbol replace, or use `edit_lines` for a hunk within what you've already seen"
+                } else {
+                    "Whole-symbol edit ready — this etag is the expected_hash (no preview needed)"
+                };
                 suggested_with_args(
                     "edit_symbol",
-                    "Whole-symbol edit ready — this etag is the expected_hash (no preview needed)",
+                    reason,
                     serde_json::json!({
                         "symbol": symbol_name.clone(),
                         "path": c.path.clone(),
@@ -362,8 +414,16 @@ impl CalmServer {
             let sn = self.filter_sn(sn);
 
             // Unchanged since the caller's last `source` call on this exact
-            // range — skip re-sending the body entirely.
-            if etag.is_some() && p.if_none_match.as_deref() == etag.as_deref() {
+            // range — skip re-sending the body entirely. Wave 6 (item e):
+            // gated on `resume_from_line` being unset -- this shortcut is
+            // for a full non-paginated re-check ("did the whole range
+            // change since I last read it"); a caller mid-pagination wants
+            // THIS page's real content, not an empty not_modified stand-in
+            // for the whole range.
+            if p.resume_from_line.is_none()
+                && etag.is_some()
+                && p.if_none_match.as_deref() == etag.as_deref()
+            {
                 return ResolvedOutcome::success(SourceOutput {
                     symbol: symbol_name,
                     path: c.path,
@@ -465,6 +525,104 @@ impl CalmServer {
         }
     }
 
+    /// Wave 6 (item d, "response budget cont'd"): narrows an already
+    /// line-paginated `[slice_start, slice_end)` (0-indexed, half-open,
+    /// into `lines`) so the flattened text never exceeds `max_chars` --
+    /// counts whole lines only (never splits a single line's own
+    /// characters across pages) and always includes at least the first
+    /// line even if it alone exceeds the budget. That's a known, accepted
+    /// limitation for a single giant (e.g. minified) line: it's returned
+    /// whole and `next_cursor` points straight back to the same line on
+    /// the next call, rather than being sub-divided by byte offset -- see
+    /// `SourceParams::max_chars`'s doc comment. Returns the unchanged
+    /// `slice_end` when `max_chars` is `None`/non-positive or the content
+    /// already fits.
+    fn apply_char_budget(
+        lines: &[&str],
+        slice_start: usize,
+        slice_end: usize,
+        max_chars: Option<i64>,
+    ) -> usize {
+        let budget = match max_chars {
+            Some(m) if m > 0 => m as usize,
+            _ => return slice_end,
+        };
+        let mut used = 0usize;
+        for (offset, line) in lines[slice_start..slice_end].iter().enumerate() {
+            let sep = if offset == 0 { 0 } else { 1 };
+            let len = line.chars().count();
+            if offset > 0 && used + sep + len > budget {
+                return slice_start + offset;
+            }
+            used += sep + len;
+        }
+        slice_end
+    }
+
+    /// Wave 6 (item d): combines `apply_char_budget`'s narrowing with the
+    /// `truncated`/`omitted_lines`/`next_cursor` triple `paginate_range`
+    /// already produced -- `end` is the FULL logical range's exclusive
+    /// end (0-indexed into `lines`), so a further char-budget cut
+    /// recomputes those three against the true remaining tail instead of
+    /// just what `max_lines` alone accounted for. Returns the original
+    /// triple unchanged when `max_chars` doesn't narrow the page any
+    /// further (including when it's unset).
+    #[allow(clippy::too_many_arguments)]
+    fn narrow_by_char_budget(
+        lines: &[&str],
+        slice_start: usize,
+        slice_end: usize,
+        end: usize,
+        max_chars: Option<i64>,
+        truncated: Option<bool>,
+        omitted_lines: Option<i64>,
+        next_cursor: Option<i64>,
+    ) -> (usize, Option<bool>, Option<i64>, Option<i64>) {
+        let narrowed_end = Self::apply_char_budget(lines, slice_start, slice_end, max_chars);
+        if narrowed_end < slice_end {
+            (
+                narrowed_end,
+                Some(true),
+                Some((end - narrowed_end) as i64),
+                Some(narrowed_end as i64 + 1),
+            )
+        } else {
+            (slice_end, truncated, omitted_lines, next_cursor)
+        }
+    }
+
+    /// Wave 6 (item c): `max_lines`/`max_chars` values `<= 0` were
+    /// previously treated as "unlimited" by `paginate_range`'s `_` arm and
+    /// `apply_char_budget`'s `Some(m) if m > 0` guard -- a reasonable
+    /// internal fallback, but a bad value from a confused or buggy caller
+    /// deserves an explicit error at the tool boundary instead of quietly
+    /// doing something other than what was asked. Returns the first
+    /// violation found, if any; `None` when both are unset or positive.
+    fn invalid_pagination_budget(
+        max_lines: Option<i64>,
+        max_chars: Option<i64>,
+    ) -> Option<ErrorDetail> {
+        if let Some(m) = max_lines
+            && m <= 0
+        {
+            return Some(error_detail(
+                "INVALID_PARAMS",
+                "`max_lines` must be a positive integer (omit it for unlimited)",
+                false,
+            ));
+        }
+        if let Some(m) = max_chars
+            && m <= 0
+        {
+            return Some(error_detail(
+                "INVALID_PARAMS",
+                "`max_chars` must be a positive integer (omit it for unlimited)",
+                false,
+            ));
+        }
+        None
+    }
+
     /// Range mode for `source`: read a raw `[line, end_line]` window from a
     /// file with no symbol resolution — for module-level / between-symbol
     /// code that no symbol range covers (the last legitimate reason to reach
@@ -544,6 +702,20 @@ impl CalmServer {
         } else {
             (None, None, None, s, e)
         };
+        // Wave 6 (item d): a further character budget, applied on top of
+        // whatever max_lines already selected -- never widens the page,
+        // only narrows it further. See source()'s own use of this same
+        // helper for the full rationale.
+        let (slice_e, truncated, omitted_lines, next_cursor) = Self::narrow_by_char_budget(
+            &lines,
+            slice_s,
+            slice_e,
+            e,
+            p.max_chars,
+            truncated,
+            omitted_lines,
+            next_cursor,
+        );
         let raw = lines[slice_s..slice_e].join("\n");
         let rendered_start_line = slice_s as i64 + 1;
         // Reuse whatever language the file's symbols were indexed as (any row
@@ -783,12 +955,39 @@ impl CalmServer {
                     .saturating_sub(1)
                     .min(lines.len());
                 let end = (info.line_end as usize).min(lines.len()).max(start);
-                let raw = sanitize_source_output(&lines[start..end].join("\n"));
+                let (truncated, omitted_lines, next_cursor, slice_start, slice_end) =
+                    if end > start {
+                        let (p_start, p_end, truncated, omitted_lines, next_cursor) =
+                            Self::paginate_range(
+                                start as i64 + 1,
+                                end as i64,
+                                p.resume_from_line,
+                                p.max_lines,
+                            );
+                        let slice_start = (p_start as usize).saturating_sub(1).min(lines.len());
+                        let slice_end = (p_end as usize).min(lines.len()).max(slice_start);
+                        (truncated, omitted_lines, next_cursor, slice_start, slice_end)
+                    } else {
+                        (None, None, None, start, end)
+                    };
+                let (slice_end, truncated, omitted_lines, next_cursor) =
+                    Self::narrow_by_char_budget(
+                        &lines,
+                        slice_start,
+                        slice_end,
+                        end,
+                        p.max_chars,
+                        truncated,
+                        omitted_lines,
+                        next_cursor,
+                    );
+                let raw = sanitize_source_output(&lines[slice_start..slice_end].join("\n"));
                 let content_warning = injection_warning(&raw);
                 // Numbered by default: `understand` is a pre-edit/comprehension
                 // tool, so its embedded body carries absolute line gutters
                 // (matching `source`'s default) to be directly edit-ready.
-                let source = calm_core::edit::with_line_gutters(&raw, info.line_start);
+                let rendered_start_line = slice_start as i64 + 1;
+                let source = calm_core::edit::with_line_gutters(&raw, rendered_start_line);
                 let token_estimate = estimate_tokens(&source);
                 Some(SourceOutput {
                     symbol: info.name.clone(),
@@ -803,9 +1002,9 @@ impl CalmServer {
                     content_warning,
                     etag: None,
                     not_modified: None,
-                    truncated: None,
-                    omitted_lines: None,
-                    next_cursor: None,
+                    truncated,
+                    omitted_lines,
+                    next_cursor,
                     suggested_next: None,
                 })
             });
@@ -1491,6 +1690,16 @@ pub(crate) struct SourceParams {
     /// a range-identity signal, not tied to how much of it was rendered.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) max_lines: Option<i64>,
+    /// Wave 6 (item d): hard character cap on the rendered `source` text,
+    /// applied on top of whatever `max_lines` already selected (never
+    /// widens a page, only narrows it further) -- counts whole lines only,
+    /// never splitting a single line's own characters across pages. Known,
+    /// accepted limitation: a single line alone longer than `max_chars` is
+    /// still returned whole (can't be sub-divided by byte offset), and
+    /// `next_cursor` on the following page points straight back to that
+    /// same line rather than skipping past it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) max_chars: Option<i64>,
 }
 
 /// serde default for `SourceParams::line_numbers`: numbered output is the
@@ -1589,6 +1798,25 @@ pub(crate) struct UnderstandParams {
     /// explicitly).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) kind: Option<String>,
+    /// Wave 6 (item b, "response budget for understand"): same meaning as
+    /// `SourceParams::max_lines` -- caps how many lines of the embedded
+    /// `source.source` come back in one call. `None` (default) is today's
+    /// unlimited behavior. When set and the resolved symbol has more lines
+    /// than this, `source.truncated`/`source.next_cursor` are populated
+    /// the same way `source()` itself reports them (pass `next_cursor`
+    /// back as `resume_from_line` to continue).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) max_lines: Option<i64>,
+    /// Wave 6 (item b): same meaning as `SourceParams::resume_from_line`
+    /// -- 1-indexed absolute line to resume reading the embedded source
+    /// from, pairing with a prior response's `source.next_cursor`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) resume_from_line: Option<i64>,
+    /// Wave 6 (item b/d): same meaning as `SourceParams::max_chars` --
+    /// hard character cap on the embedded `source.source` text, applied
+    /// on top of whatever `max_lines` already selected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) max_chars: Option<i64>,
 }
 
 #[derive(Serialize, JsonSchema)]
