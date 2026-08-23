@@ -1104,6 +1104,16 @@ pub fn decorated_declaration_start(
     let mut earliest = target.start_position().row + 1;
     let mut sib = target.prev_named_sibling();
     while let Some(s) = sib {
+        // Audit follow-up (2026-08-23): require the sibling to be
+        // IMMEDIATELY adjacent -- its own last (1-indexed) line must be
+        // exactly `earliest - 1` -- before absorbing it. Without this, a
+        // blank-line gap let this function walk straight through it and
+        // widen the replaced range up into unrelated leading content (e.g.
+        // a license header) that happens to sit above a run of comment/
+        // decorator siblings.
+        if s.end_position().row + 1 != earliest - 1 {
+            break;
+        }
         if matches!(s.kind(), "line_comment" | "block_comment" | "comment") {
             earliest = s.start_position().row + 1;
             sib = s.prev_named_sibling();
@@ -3493,6 +3503,30 @@ pub fn hello() {}
         assert!(
             !doc.contains("Unrelated comment far above"),
             "must not merge across a blank-line gap, got: {doc:?}"
+        );
+    }
+
+    #[test]
+    fn decorated_declaration_start_stops_at_blank_line_gap() {
+        // Audit follow-up (2026-08-23): a blank-line gap between an
+        // unrelated leading comment and a `#[test]`-decorated fn must NOT
+        // be walked through -- widening should stop at the attribute
+        // (line 3), never reaching the license header (line 1).
+        let code = "// unrelated license header\n\n#[test]\nfn foo() {}\n";
+        let start = decorated_declaration_start(code, "rust", 4, 4).unwrap();
+        assert_eq!(
+            start, 3,
+            "must widen only to the adjacent #[test] attribute, not past the blank-line gap"
+        );
+    }
+
+    #[test]
+    fn decorated_declaration_start_widens_through_adjacent_attribute() {
+        let code = "#[test]\nfn foo() {}\n";
+        let start = decorated_declaration_start(code, "rust", 2, 2).unwrap();
+        assert_eq!(
+            start, 1,
+            "no gap present -- should widen all the way to the leading attribute"
         );
     }
 
