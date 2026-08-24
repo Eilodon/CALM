@@ -60,7 +60,7 @@
         ]
       },
       "PendingReviewPacket": {
-        "description": "Wave 3 (audit follow-up, 2026-08-23): the structured shape of a\n`HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW`/`DIFF_DIGEST_MISMATCH` error's\n`review` field -- lets a calling agent relay-approve/decline without\never reading `pending_reviews` directly or reimplementing\n`hash_content` itself. `diff_digest` is always `hash_content(&diff_preview)`,\ncomputed server-side at the moment this packet is built -- never a\nvalue the caller supplied or guessed.",
+        "description": "Wave 3 (audit follow-up, 2026-08-23): the structured shape of a\n`HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW`/`DIFF_DIGEST_MISMATCH` error's\n`review` field -- lets a calling agent relay-approve/decline without\never reading `pending_reviews` directly or reimplementing\n`hash_content` itself.\n\nWave 14 (audit follow-up, 2026-08-24): `diff_digest` is NOT\n`hash_content` of THIS packet's own `diff_preview` field -- it's\n`hash_content` of the full, unsanitized, uncapped diff stored server-\nside (see `from_pending`'s own comment). It exists to prove identity/\nfreshness (\"this is really the review you fetched, not a stale or\nguessed copy\"), not to let a caller verify \"the text I'm looking at\nhashes to this\" -- that's structurally impossible to guarantee anyway,\nsince different surfaces (this JSON packet vs. `calm review show`'s\nterminal output) apply different sanitize/cap transforms to the same\nunderlying diff and can't all match one digest. Callers must always\nCOPY this value verbatim, never recompute it from `diff_preview`.",
         "type": "object",
         "properties": {
           "review_id": {
@@ -68,6 +68,10 @@
           },
           "diff_preview": {
             "type": "string"
+          },
+          "preview_truncated": {
+            "description": "`true` when `diff_preview` was cut down from the full diff\n`diff_digest` covers -- see the struct's own doc comment.",
+            "type": "boolean"
           },
           "diff_digest": {
             "type": "string"
@@ -80,6 +84,7 @@
         "required": [
           "review_id",
           "diff_preview",
+          "preview_truncated",
           "diff_digest",
           "expires_at"
         ]

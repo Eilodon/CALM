@@ -36,6 +36,14 @@
         ],
         "format": "int64"
       },
+      "resume_from_char": {
+        "description": "Wave 14 (audit follow-up, item 7, 2026-08-24): same meaning as\n`SourceParams::resume_from_char` -- pairs with a prior response's\n`source.next_char_offset` to resume reading INSIDE the same\noversized line the embedded `source.source` had to hard-cut.\nIgnored unless `resume_from_line` is also set.",
+        "type": [
+          "integer",
+          "null"
+        ],
+        "format": "int64"
+      },
       "max_chars": {
         "description": "Wave 6 (item b/d): same meaning as `SourceParams::max_chars` --\nhard character cap on the embedded `source.source` text, applied\non top of whatever `max_lines` already selected. Wave 13 (audit\nfollow-up, P0-1b, 2026-08-23): now defaults to\n`default_max_chars_cap`'s 40,000 when the JSON key is OMITTED, same\nopt-out contract as `max_lines`.",
         "type": [
@@ -99,7 +107,7 @@
         ]
       },
       "PendingReviewPacket": {
-        "description": "Wave 3 (audit follow-up, 2026-08-23): the structured shape of a\n`HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW`/`DIFF_DIGEST_MISMATCH` error's\n`review` field -- lets a calling agent relay-approve/decline without\never reading `pending_reviews` directly or reimplementing\n`hash_content` itself. `diff_digest` is always `hash_content(&diff_preview)`,\ncomputed server-side at the moment this packet is built -- never a\nvalue the caller supplied or guessed.",
+        "description": "Wave 3 (audit follow-up, 2026-08-23): the structured shape of a\n`HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW`/`DIFF_DIGEST_MISMATCH` error's\n`review` field -- lets a calling agent relay-approve/decline without\never reading `pending_reviews` directly or reimplementing\n`hash_content` itself.\n\nWave 14 (audit follow-up, 2026-08-24): `diff_digest` is NOT\n`hash_content` of THIS packet's own `diff_preview` field -- it's\n`hash_content` of the full, unsanitized, uncapped diff stored server-\nside (see `from_pending`'s own comment). It exists to prove identity/\nfreshness (\"this is really the review you fetched, not a stale or\nguessed copy\"), not to let a caller verify \"the text I'm looking at\nhashes to this\" -- that's structurally impossible to guarantee anyway,\nsince different surfaces (this JSON packet vs. `calm review show`'s\nterminal output) apply different sanitize/cap transforms to the same\nunderlying diff and can't all match one digest. Callers must always\nCOPY this value verbatim, never recompute it from `diff_preview`.",
         "type": "object",
         "properties": {
           "review_id": {
@@ -107,6 +115,10 @@
           },
           "diff_preview": {
             "type": "string"
+          },
+          "preview_truncated": {
+            "description": "`true` when `diff_preview` was cut down from the full diff\n`diff_digest` covers -- see the struct's own doc comment.",
+            "type": "boolean"
           },
           "diff_digest": {
             "type": "string"
@@ -119,6 +131,7 @@
         "required": [
           "review_id",
           "diff_preview",
+          "preview_truncated",
           "diff_digest",
           "expires_at"
         ]
@@ -471,6 +484,14 @@
             ],
             "format": "int64"
           },
+          "next_char_offset": {
+            "description": "Wave 14 (audit follow-up, item 7, 2026-08-24): set only when a\nSINGLE line alone exceeded `max_chars` (the `enforce_hard_char_cap`\nsafety net) and still has more content left after this page -- the\n0-indexed CHARACTER offset to pass back as `resume_from_char`\n(alongside `next_cursor`, which stays pinned to this SAME line\nuntil it's fully drained) to continue reading the rest of it.\nAbsent in every other case, including ordinary multi-line\n`next_cursor` pagination.",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
           "suggested_next": {
             "anyOf": [
               {
@@ -667,6 +688,21 @@
         "items": {
           "$ref": "#/$defs/CallerEntry"
         }
+      },
+      "callers_total": {
+        "description": "Wave 14 (audit follow-up, P0-1b, 2026-08-24): true total caller count\nbefore `callers_summary` was capped to `config.callers.direct_list_cap`\n(same cap the dedicated `callers` tool's `direct_count` already uses)\n-- `callers_summary.len()` alone can't distinguish \"this symbol has\nexactly N callers\" from \"this symbol has N-or-more, the rest were cut\".",
+        "type": [
+          "integer",
+          "null"
+        ],
+        "format": "int64"
+      },
+      "callers_truncated": {
+        "description": "`true` when `callers_summary` was cut down to the cap -- see\n`callers_total` for the true count. Mirrors `CallersOutput::\ndirect_truncated`.",
+        "type": [
+          "boolean",
+          "null"
+        ]
       },
       "edges_ready": {
         "type": [

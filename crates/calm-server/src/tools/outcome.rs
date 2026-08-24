@@ -150,33 +150,47 @@ pub(crate) struct ErrorOutput {
 /// never a silent truncation. Never touches any digest: callers must
 /// compute `hash_content` over the ORIGINAL, uncapped text before calling
 /// this, same as `from_pending` does.
-pub(crate) fn capped_diff_preview(diff_preview: &str) -> String {
+pub(crate) fn capped_diff_preview(diff_preview: &str) -> (String, bool) {
     const DIFF_CHAR_CAP: usize = 2000;
     let dcp_sanitized = calm_core::sanitize::sanitize_source_output(diff_preview);
     let dcp_total_chars = dcp_sanitized.chars().count();
+    let dcp_truncated = dcp_total_chars > DIFF_CHAR_CAP;
     let mut dcp_capped: String = dcp_sanitized.chars().take(DIFF_CHAR_CAP).collect();
-    if dcp_total_chars > DIFF_CHAR_CAP {
+    if dcp_truncated {
         dcp_capped.push_str(&format!(
             "\n[... truncated — {} more characters not shown; any digest computed over this diff \
              covers the FULL content, not just what's displayed]",
             dcp_total_chars - DIFF_CHAR_CAP
         ));
     }
-    dcp_capped
+    (dcp_capped, dcp_truncated)
 }
 
 /// Wave 3 (audit follow-up, 2026-08-23): the structured shape of a
 /// `HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW`/`DIFF_DIGEST_MISMATCH` error's
 /// `review` field -- lets a calling agent relay-approve/decline without
 /// ever reading `pending_reviews` directly or reimplementing
-/// `hash_content` itself. `diff_digest` is always `hash_content(&diff_preview)`,
-/// computed server-side at the moment this packet is built -- never a
-/// value the caller supplied or guessed.
+/// `hash_content` itself.
+///
+/// Wave 14 (audit follow-up, 2026-08-24): `diff_digest` is NOT
+/// `hash_content` of THIS packet's own `diff_preview` field -- it's
+/// `hash_content` of the full, unsanitized, uncapped diff stored server-
+/// side (see `from_pending`'s own comment). It exists to prove identity/
+/// freshness ("this is really the review you fetched, not a stale or
+/// guessed copy"), not to let a caller verify "the text I'm looking at
+/// hashes to this" -- that's structurally impossible to guarantee anyway,
+/// since different surfaces (this JSON packet vs. `calm review show`'s
+/// terminal output) apply different sanitize/cap transforms to the same
+/// underlying diff and can't all match one digest. Callers must always
+/// COPY this value verbatim, never recompute it from `diff_preview`.
 #[derive(Serialize, JsonSchema)]
 
 pub(crate) struct PendingReviewPacket {
     pub(crate) review_id: String,
     pub(crate) diff_preview: String,
+    /// `true` when `diff_preview` was cut down from the full diff
+    /// `diff_digest` covers -- see the struct's own doc comment.
+    pub(crate) preview_truncated: bool,
     pub(crate) diff_digest: String,
     pub(crate) expires_at: f64,
 }
@@ -196,10 +210,11 @@ impl PendingReviewPacket {
         // cap -- a multi-hunk high-risk diff could still blow up the
         // response right at the approval flow. Same shared cap+sanitize+
         // truncation-marker treatment both surfaces now get.
-        let capped_preview = capped_diff_preview(&review.diff_preview);
+        let (capped_preview, preview_truncated) = capped_diff_preview(&review.diff_preview);
         PendingReviewPacket {
             review_id: review.review_id.clone(),
             diff_preview: capped_preview,
+            preview_truncated,
             diff_digest,
             expires_at: review.expires_at,
         }

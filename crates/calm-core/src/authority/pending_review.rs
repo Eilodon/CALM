@@ -336,6 +336,39 @@ pub fn claim_approved_matching(
     }))
 }
 
+/// Wave 14 (audit follow-up, P1, 2026-08-24): compensating action for
+/// `claim_approved_matching`. The caller (`edit_lines_impl_gated`)
+/// deliberately claims the approval as close to the actual disk write as
+/// possible (Wave 13, P1-3) -- but a claim and the write it authorizes are
+/// still two separate steps, not one transaction: if `write_via_
+/// configured_backend` then fails (stale base digest, IO error, disk
+/// full), the approval was already flipped to `consumed` with nothing
+/// ever written to disk, permanently burning a real human decision for a
+/// patchset that never applied. Restores the row to `status = 'approved'`
+/// so the SAME already-reviewed diff can still satisfy a retry, instead of
+/// forcing a human to re-review byte-identical content.
+///
+/// Guarded on `status = 'consumed'`: only ever reverts a row THIS call
+/// itself (or an equivalent race that also required `status = 'approved'`
+/// to succeed) just consumed. A row already re-claimed by a genuinely
+/// separate, unrelated writer (impossible under current single-claim call
+/// patterns, but defensive regardless) or expired in the interim is left
+/// alone rather than resurrected -- same asymmetric-safety posture as
+/// `claim_approved_matching`'s own atomic `UPDATE ... WHERE status =
+/// 'approved'`.
+///
+/// `Ok(true)` = the row was `consumed` and is now `approved` again.
+/// `Ok(false)` = nothing to release (already released, expired, or the
+/// `review_id` doesn't exist) -- not an error, just a no-op.
+pub fn release_claimed_review(conn: &Connection, review_id: &str) -> rusqlite::Result<bool> {
+    let updated = conn.execute(
+        "UPDATE pending_reviews SET status = 'approved' \
+         WHERE review_id = ?1 AND status = 'consumed'",
+        params![review_id],
+    )?;
+    Ok(updated > 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -436,6 +469,65 @@ mod tests {
         );
         let got = get_pending_review(&conn, &id).unwrap().unwrap();
         assert_eq!(got.status, "consumed");
+    }
+
+    #[test]
+    /// Wave 14 (audit follow-up, P1, 2026-08-24): `release_claimed_review`
+    /// is the compensating action for a write that fails AFTER the
+    /// approval was already claimed -- restores the row to `approved` so
+    /// the same already-reviewed diff can satisfy a retry instead of
+    /// permanently burning the human's decision.
+    fn release_claimed_review_restores_consumed_row_to_approved_and_makes_it_reclaimable() {
+        let conn = state_conn();
+        let id =
+            insert_pending_review(&conn, &new_review("edit_lines", "a.py", "sha256:abc")).unwrap();
+        assert!(approve_pending_review(&conn, &id, "cli_manual_review").unwrap());
+
+        let claimed = claim_approved_matching(&conn, "a.py", "sha256:abc")
+            .unwrap()
+            .expect("approved row must be claimable");
+        assert_eq!(claimed.status, "consumed");
+
+        // Simulates edit_lines_impl_gated's write-failure branch: the write
+        // never happened, release the claim back.
+        assert!(
+            release_claimed_review(&conn, &claimed.review_id).unwrap(),
+            "releasing a genuinely consumed row must report true"
+        );
+        let got = get_pending_review(&conn, &id).unwrap().unwrap();
+        assert_eq!(got.status, "approved");
+
+        // The retry path: the SAME (path, fingerprint) must be claimable
+        // again, proving the human's original decision still authorizes
+        // the patchset that never actually applied.
+        let reclaimed = claim_approved_matching(&conn, "a.py", "sha256:abc").unwrap();
+        assert_eq!(
+            reclaimed.map(|r| r.review_id),
+            Some(id),
+            "a released approval must be reclaimable by a retry"
+        );
+    }
+
+    #[test]
+    /// Companion safety check: releasing a row that was never actually
+    /// consumed (still `approved`, or unknown entirely) must be a no-op,
+    /// not silently succeed or corrupt an unrelated row's state.
+    fn release_claimed_review_is_a_noop_when_row_is_not_consumed() {
+        let conn = state_conn();
+        let id =
+            insert_pending_review(&conn, &new_review("edit_lines", "a.py", "sha256:abc")).unwrap();
+        assert!(approve_pending_review(&conn, &id, "cli_manual_review").unwrap());
+
+        // Never claimed -- still `approved`, not `consumed`.
+        assert!(!release_claimed_review(&conn, &id).unwrap());
+        let got = get_pending_review(&conn, &id).unwrap().unwrap();
+        assert_eq!(
+            got.status, "approved",
+            "an un-consumed row must be untouched"
+        );
+
+        // Unknown review_id entirely.
+        assert!(!release_claimed_review(&conn, "REVIEW-does-not-exist").unwrap());
     }
 
     #[test]

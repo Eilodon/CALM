@@ -1355,6 +1355,7 @@ impl CalmServer {
                 ReconstructedEdit {
                     new_content: &new_content,
                     line_map: &line_map,
+                    original: &original,
                 },
             );
             // Plan 3 §3.3 (F10): a bridge-only touch (never degree/both) at
@@ -1525,6 +1526,7 @@ impl CalmServer {
                             &self.project_root,
                             path,
                             &hunks,
+                            &original,
                         );
                         let risk_vector = calm_core::policy::RiskVector {
                             caller_count_level,
@@ -2754,6 +2756,7 @@ impl CalmServer {
         // to Failed, drop both guards) since this check runs after the
         // same txn::begin/authorize_and_begin_edit that branch also
         // assumes already happened.
+        let mut claimed_review_id_for_release: Option<String> = None;
         if let Some(fingerprint) = &pending_review_fingerprint_to_claim {
             let claimed = calm_core::db::conn::open_state_writer(&self.state_db_path)
                 .ok()
@@ -2762,6 +2765,14 @@ impl CalmServer {
                         .ok()
                         .flatten()
                 });
+            if let Some(review) = &claimed {
+                // Wave 14 (audit follow-up, P1, 2026-08-24): retained so the
+                // write-failure branch below can release this claim back to
+                // `approved` if write_via_configured_backend then fails --
+                // otherwise a write failure here permanently burns a real
+                // human approval for a patchset that never actually applied.
+                claimed_review_id_for_release = Some(review.review_id.clone());
+            }
             if claimed.is_none() {
                 if let Some(tx_id) = &shadow_tx_id {
                     let _ = calm_core::txn::advance(
@@ -2799,6 +2810,20 @@ impl CalmServer {
                     calm_core::txn::TxState::Failed,
                     "system",
                     &e.to_string(),
+                );
+            }
+            // Wave 14 (audit follow-up, P1, 2026-08-24): the write never
+            // happened -- release the claimed approval back to `approved`
+            // instead of leaving it permanently `consumed` for nothing.
+            // Best-effort: a release failure here must not mask the real
+            // write error the caller needs to see.
+            if let Some(review_id) = &claimed_review_id_for_release
+                && let Err(release_err) =
+                    calm_core::authority::release_claimed_review(&state_conn, review_id)
+            {
+                tracing::warn!(
+                    "could not release claimed pending review {review_id} after write failure: \
+                     {release_err}"
                 );
             }
             drop(_cross_guard);
@@ -3291,13 +3316,16 @@ impl CalmServer {
     /// own account of what it showed the human and what they answered, with
     /// nothing at the server able to verify either. The ONE thing this DOES
     /// verify: `diff_digest` must equal `hash_content` of the review's own
-    /// CURRENT `diff_preview`, proving the caller fetched and is referencing
-    /// the real, current diff at the moment of deciding — it rules out
-    /// approving blind or against a stale/guessed copy, nothing more.
+    /// CURRENT stored diff (the full, unsanitized, uncapped text -- NOT the
+    /// possibly-truncated/redacted `diff_preview` a caller was shown; see
+    /// `PendingReviewPacket`'s own doc comment), proving the caller fetched
+    /// and is referencing the real, current diff at the moment of deciding
+    /// -- it rules out approving blind or against a stale/guessed copy,
+    /// nothing more.
     /// Disabled unless `[edit] elicit_via_agent_relay = true`.
     #[tool(
         name = "review_decide_via_agent_relay",
-        description = "Approve or decline a HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW pending review through the calling agent, after it has shown the human the review's exact diff_preview (e.g. via its own UI) and gotten a real answer. Disabled by default -- requires [edit] elicit_via_agent_relay = true in .calm/config.json, an explicit project-owner opt-in. WEAKER than `calm review approve` (the TTY-gated CLI): this channel trusts the calling agent's own account of what it showed the human and what they answered; nothing at the server can verify either. Requires echoing back hash_content(the review's diff_preview) as diff_digest -- proves the agent is referencing the CURRENT real diff, not a guess or stale copy. Prefer the TTY CLI when it's usable.",
+        description = "Approve or decline a HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW pending review through the calling agent, after it has shown the human the review's exact diff_preview (e.g. via its own UI) and gotten a real answer. Disabled by default -- requires [edit] elicit_via_agent_relay = true in .calm/config.json, an explicit project-owner opt-in. WEAKER than `calm review approve` (the TTY-gated CLI): this channel trusts the calling agent's own account of what it showed the human and what they answered; nothing at the server can verify either. Requires echoing back the review's diff_digest verbatim -- do NOT recompute it from diff_preview (which may be truncated or redacted), it is a hash of the full stored diff, not of what's displayed. Proves the agent is referencing the CURRENT real diff, not a guess or stale copy. Prefer the TTY CLI when it's usable.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -3892,6 +3920,7 @@ fn hunks_touch_uncovered_code(
     project_root: &std::path::Path,
     path: &str,
     hunks: &[calm_core::edit::HunkRequest],
+    original: &str,
 ) -> bool {
     if coverage.source == "none" {
         return false;
@@ -3903,21 +3932,47 @@ fn hunks_touch_uncovered_code(
         {
             return true;
         }
-        // Wave 13 (audit follow-up, P1-4, 2026-08-23): delta-aware --
-        // `coverage_ratio` above only measures the OLD `[start_line,
-        // end_line]` range being replaced. A hunk that replaces N old
-        // lines with M new lines where M > N introduces (M - N) lines
-        // that are BRAND NEW code -- they cannot possibly have prior
-        // runtime coverage, no matter how "covered" the old range was.
-        // Without this, replacing one covered line with 50 new executable
-        // lines was silently waved through as "covered" even though 49 of
-        // those lines never existed before this edit. The correct model
-        // is "new executable code creates a verification obligation," not
-        // "infer coverage of new code from the old code it replaced."
-        let old_len = h.end_line.saturating_sub(h.start_line) + 1;
-        let new_len = h.new_text.lines().count();
-        new_len > old_len
+        // Wave 13 (audit follow-up, P1-4, 2026-08-23) + Wave 14 (item 8,
+        // 2026-08-24): `coverage_ratio` above only measures the OLD
+        // `[start_line, end_line]` range being replaced -- it says
+        // nothing about whether the NEW text is the same code. Delegates
+        // to `hunk_replaces_with_different_content`, which catches BOTH a
+        // hunk that grows longer than the range it replaces (brand new
+        // lines, can't possibly have prior runtime coverage) AND a hunk
+        // that replaces N old lines with N DIFFERENT new lines -- same
+        // count, but the old range's coverage says nothing about content
+        // that's now different. The correct model is "new/changed
+        // executable code creates a verification obligation," not "infer
+        // coverage of new code from the old code it replaced."
+        hunk_replaces_with_different_content(original, h.start_line, h.end_line, &h.new_text)
     })
+}
+
+/// Wave 14 (audit follow-up, item 8, 2026-08-24): true when `new_text`
+/// (replacing `[start_line, end_line]`, 1-indexed inclusive) introduces
+/// content that did not exist at the same position in `original` --
+/// either by growing longer (more new lines than the old range had, so
+/// the extras can't possibly have prior runtime coverage no matter how
+/// covered the old range was) or by any surviving same-position line
+/// actually differing in text (a same-line-count replacement can still be
+/// entirely new behavior). A hunk that's byte-identical to what it
+/// replaces, or only deletes/shrinks, reports `false`.
+fn hunk_replaces_with_different_content(
+    original: &str,
+    start_line: usize,
+    end_line: usize,
+    new_text: &str,
+) -> bool {
+    let old_len = end_line.saturating_sub(start_line) + 1;
+    let new_lines: Vec<&str> = new_text.lines().collect();
+    if new_lines.len() > old_len {
+        return true;
+    }
+    let orig_lines: Vec<&str> = original.lines().collect();
+    new_lines
+        .iter()
+        .enumerate()
+        .any(|(i, new_line)| orig_lines.get(start_line.saturating_sub(1) + i) != Some(new_line))
 }
 
 /// Renders every hunk's before/after content as a compact, `-`/`+` diff --
@@ -3997,7 +4052,7 @@ fn build_hub_elicit_message(
     // this human-facing text always had.
     msg.push_str(&format!(
         "\nProposed diff:\n{}",
-        capped_diff_preview(&ask.diff_preview)
+        capped_diff_preview(&ask.diff_preview).0
     ));
     let sanitized = calm_core::sanitize::sanitize_source_output(reason.unwrap_or("(none given)"));
     let capped: String = sanitized.chars().take(400).collect();
@@ -4448,6 +4503,15 @@ pub(crate) struct ReconstructedEdit<'a> {
     /// own insertion/deletion, exactly as `edit_lines_impl_gated`'s own
     /// `touched_new_lines` already computes them for `validate_syntax_diff`.
     pub line_map: &'a [(i64, i64, i64, i64)],
+    /// Wave 14 (audit follow-up, item 8, 2026-08-24): the real PRE-edit
+    /// full-file content -- same rationale as `new_content` (the caller
+    /// already has it; only the real write-gate call site does). Lets
+    /// `compute_touch_risk_inner`'s coverage-delta check compare actual
+    /// old-vs-new TEXT at each hunk's position, not just line counts (see
+    /// `hunk_replaces_with_different_content`), instead of falling back
+    /// to the coarser line-count-only heuristic every other caller still
+    /// gets.
+    pub original: &'a str,
 }
 
 /// Maps `old_line` (a position in the ORIGINAL file) to its position in
@@ -4827,13 +4891,35 @@ fn compute_touch_risk_inner(
     let touches_uncovered_code =
         any_executable_kind && !proposed_hunks.is_empty() && coverage.source != "none" && {
             let abs_path = calm_core::analysis::coverage::normalize_path(&project_root.join(path));
+            // Wave 14 (audit follow-up, item 8, 2026-08-24): only the real
+            // write gate (`compute_touch_risk_with_reconstruction`) has the
+            // real pre-edit file content -- when present, delegate to the
+            // same content-aware `hunk_replaces_with_different_content`
+            // `hunks_touch_uncovered_code` uses, which also catches a
+            // same-line-count hunk that replaces old covered lines with
+            // entirely DIFFERENT new lines (the count-only fallback below
+            // cannot see that case). Every other caller (`review_change`,
+            // `edit_context`'s speculative `gate_prediction`) has no real
+            // proposed content to compare against, so keeps the coarser
+            // count-only heuristic.
+            let original = reconstructed.as_ref().map(|r| r.original);
             proposed_hunks.iter().any(|&(hs, he, text)| {
                 if coverage.coverage_ratio(&abs_path, hs, he) < MIN_ADEQUATE_COVERAGE_RATIO {
                     return true;
                 }
-                let old_len = (he - hs + 1).max(0) as usize;
-                let new_len = text.lines().count();
-                new_len > old_len
+                match original {
+                    Some(orig) => hunk_replaces_with_different_content(
+                        orig,
+                        hs.max(0) as usize,
+                        he.max(0) as usize,
+                        text,
+                    ),
+                    None => {
+                        let old_len = (he - hs + 1).max(0) as usize;
+                        let new_len = text.lines().count();
+                        new_len > old_len
+                    }
+                }
             })
         };
     let (risk, risk_rule_reason) = if touches_uncovered_code {
@@ -5481,9 +5567,14 @@ pub(crate) struct ReviewDecideParams {
     /// The `review_id` from a `HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW` error
     /// (e.g. `REVIEW-...`).
     pub(crate) review_id: String,
-    /// `hash_content` of the review's own CURRENT `diff_preview` -- fetch it
-    /// fresh (`calm review show <id>`, or read the pending review directly)
-    /// and hash THAT exact text. Mismatches are refused (`DIFF_DIGEST_MISMATCH`).
+    /// The `diff_digest` value from the pending review's own packet --
+    /// COPY it verbatim. Do not recompute it yourself: it is
+    /// `hash_content` of the full, unsanitized, uncapped diff stored
+    /// server-side, not of the `diff_preview` text you were shown, which
+    /// may be truncated (long diff) or have secrets redacted -- hashing
+    /// what you see will not match. Fetch a fresh value with `calm review
+    /// show <id>` if you don't already have the current one. Mismatches
+    /// are refused (`DIFF_DIGEST_MISMATCH`).
     pub(crate) diff_digest: String,
     /// `true` to approve, `false` to decline. Only call this after the human
     /// has actually seen the review's real diff and given a real answer --
@@ -5863,7 +5954,8 @@ mod elicit_tests {
             &coverage,
             &dir,
             "a.py",
-            &[hunk(2, 2)]
+            &[hunk(2, 2)],
+            ""
         ));
     }
 
@@ -5882,7 +5974,8 @@ mod elicit_tests {
             &coverage,
             &dir,
             "a.py",
-            &[hunk(2, 2)]
+            &[hunk(2, 2)],
+            "x\ny\nz\n"
         ));
     }
 
@@ -5902,7 +5995,73 @@ mod elicit_tests {
             &coverage,
             &dir,
             "a.py",
-            &[hunk(2, 2)]
+            &[hunk(2, 2)],
+            "x\ny\nz\n"
+        ));
+    }
+
+    #[test]
+    /// Wave 14 (audit follow-up, item 8, 2026-08-24): the OLD `new_len >
+    /// old_len` heuristic alone missed this exact case -- a hunk that
+    /// replaces one covered old line with one DIFFERENT new line (same
+    /// line count) used to be silently waved through as "covered" even
+    /// though the new line's own content never ran.
+    fn hunks_touch_uncovered_code_is_true_for_same_line_count_but_different_content() {
+        let dir = uncovered_code_test_dir("same_count_different_content");
+        let original = "x\ny\nz\n";
+        std::fs::write(dir.join("a.py"), original).unwrap();
+        let abs = calm_core::analysis::coverage::normalize_path(&dir.join("a.py"));
+        let mut covered_lines = std::collections::HashMap::new();
+        // All 3 lines covered -- the OLD content, not what's about to
+        // replace it.
+        covered_lines.insert(abs, std::collections::HashSet::from([1, 2, 3]));
+        let coverage = calm_core::analysis::coverage::CoverageData {
+            source: "lcov".to_string(),
+            covered_lines,
+        };
+        let h = calm_core::edit::HunkRequest {
+            start_line: 2,
+            end_line: 2,
+            expected_hash: None,
+            new_text: "DIFFERENT\n".to_string(),
+        };
+        assert!(hunks_touch_uncovered_code(
+            &coverage,
+            &dir,
+            "a.py",
+            &[h],
+            original
+        ));
+    }
+
+    #[test]
+    /// Companion sanity check: a hunk that's byte-identical to what it
+    /// replaces (a no-op "replace") must NOT be flagged just because the
+    /// new content-aware check now runs -- only an actual DIFFERENCE
+    /// should count.
+    fn hunks_touch_uncovered_code_is_false_for_a_byte_identical_replacement() {
+        let dir = uncovered_code_test_dir("byte_identical_replace");
+        let original = "x\ny\nz\n";
+        std::fs::write(dir.join("a.py"), original).unwrap();
+        let abs = calm_core::analysis::coverage::normalize_path(&dir.join("a.py"));
+        let mut covered_lines = std::collections::HashMap::new();
+        covered_lines.insert(abs, std::collections::HashSet::from([1, 2, 3]));
+        let coverage = calm_core::analysis::coverage::CoverageData {
+            source: "lcov".to_string(),
+            covered_lines,
+        };
+        let h = calm_core::edit::HunkRequest {
+            start_line: 2,
+            end_line: 2,
+            expected_hash: None,
+            new_text: "y\n".to_string(),
+        };
+        assert!(!hunks_touch_uncovered_code(
+            &coverage,
+            &dir,
+            "a.py",
+            &[h],
+            original
         ));
     }
 
@@ -6138,6 +6297,7 @@ mod elicit_tests {
         let reconstructed = ReconstructedEdit {
             new_content,
             line_map: &line_map,
+            original: "",
         };
         let candidate = candidate_new_signature_text(
             1,

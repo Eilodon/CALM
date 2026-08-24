@@ -1,6 +1,6 @@
 {
   "name": "review_decide_via_agent_relay",
-  "description": "Approve or decline a HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW pending review through the calling agent, after it has shown the human the review's exact diff_preview (e.g. via its own UI) and gotten a real answer. Disabled by default -- requires [edit] elicit_via_agent_relay = true in .calm/config.json, an explicit project-owner opt-in. WEAKER than `calm review approve` (the TTY-gated CLI): this channel trusts the calling agent's own account of what it showed the human and what they answered; nothing at the server can verify either. Requires echoing back hash_content(the review's diff_preview) as diff_digest -- proves the agent is referencing the CURRENT real diff, not a guess or stale copy. Prefer the TTY CLI when it's usable.",
+  "description": "Approve or decline a HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW pending review through the calling agent, after it has shown the human the review's exact diff_preview (e.g. via its own UI) and gotten a real answer. Disabled by default -- requires [edit] elicit_via_agent_relay = true in .calm/config.json, an explicit project-owner opt-in. WEAKER than `calm review approve` (the TTY-gated CLI): this channel trusts the calling agent's own account of what it showed the human and what they answered; nothing at the server can verify either. Requires echoing back the review's diff_digest verbatim -- do NOT recompute it from diff_preview (which may be truncated or redacted), it is a hash of the full stored diff, not of what's displayed. Proves the agent is referencing the CURRENT real diff, not a guess or stale copy. Prefer the TTY CLI when it's usable.",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "required": [
@@ -15,7 +15,7 @@
         "type": "string"
       },
       "diff_digest": {
-        "description": "`hash_content` of the review's own CURRENT `diff_preview` -- fetch it\nfresh (`calm review show <id>`, or read the pending review directly)\nand hash THAT exact text. Mismatches are refused (`DIFF_DIGEST_MISMATCH`).",
+        "description": "The `diff_digest` value from the pending review's own packet --\nCOPY it verbatim. Do not recompute it yourself: it is\n`hash_content` of the full, unsanitized, uncapped diff stored\nserver-side, not of the `diff_preview` text you were shown, which\nmay be truncated (long diff) or have secrets redacted -- hashing\nwhat you see will not match. Fetch a fresh value with `calm review\nshow <id>` if you don't already have the current one. Mismatches\nare refused (`DIFF_DIGEST_MISMATCH`).",
         "type": "string"
       },
       "approve": {
@@ -69,7 +69,7 @@
         ]
       },
       "PendingReviewPacket": {
-        "description": "Wave 3 (audit follow-up, 2026-08-23): the structured shape of a\n`HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW`/`DIFF_DIGEST_MISMATCH` error's\n`review` field -- lets a calling agent relay-approve/decline without\never reading `pending_reviews` directly or reimplementing\n`hash_content` itself. `diff_digest` is always `hash_content(&diff_preview)`,\ncomputed server-side at the moment this packet is built -- never a\nvalue the caller supplied or guessed.",
+        "description": "Wave 3 (audit follow-up, 2026-08-23): the structured shape of a\n`HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW`/`DIFF_DIGEST_MISMATCH` error's\n`review` field -- lets a calling agent relay-approve/decline without\never reading `pending_reviews` directly or reimplementing\n`hash_content` itself.\n\nWave 14 (audit follow-up, 2026-08-24): `diff_digest` is NOT\n`hash_content` of THIS packet's own `diff_preview` field -- it's\n`hash_content` of the full, unsanitized, uncapped diff stored server-\nside (see `from_pending`'s own comment). It exists to prove identity/\nfreshness (\"this is really the review you fetched, not a stale or\nguessed copy\"), not to let a caller verify \"the text I'm looking at\nhashes to this\" -- that's structurally impossible to guarantee anyway,\nsince different surfaces (this JSON packet vs. `calm review show`'s\nterminal output) apply different sanitize/cap transforms to the same\nunderlying diff and can't all match one digest. Callers must always\nCOPY this value verbatim, never recompute it from `diff_preview`.",
         "type": "object",
         "properties": {
           "review_id": {
@@ -77,6 +77,10 @@
           },
           "diff_preview": {
             "type": "string"
+          },
+          "preview_truncated": {
+            "description": "`true` when `diff_preview` was cut down from the full diff\n`diff_digest` covers -- see the struct's own doc comment.",
+            "type": "boolean"
           },
           "diff_digest": {
             "type": "string"
@@ -89,6 +93,7 @@
         "required": [
           "review_id",
           "diff_preview",
+          "preview_truncated",
           "diff_digest",
           "expires_at"
         ]

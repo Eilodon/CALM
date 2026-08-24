@@ -275,6 +275,7 @@ impl CalmServer {
                 omitted_lines,
                 next_cursor,
                 rendered_start_line,
+                next_char_offset,
             ) = match verified_bytes {
                 Some(content) => {
                     let lines: Vec<&str> = content.lines().collect();
@@ -356,15 +357,27 @@ impl CalmServer {
                     // P0-1a (audit follow-up, 2026-08-23): final hard-cap
                     // safety net for the single-oversized-line case
                     // narrow_by_char_budget alone can't narrow any further.
-                    let (joined, truncated, next_cursor) = Self::enforce_hard_char_cap(
-                        &lines,
-                        slice_start,
-                        slice_end,
-                        p.max_chars,
-                        p.line_numbers,
-                        truncated,
-                        next_cursor,
-                    );
+                    // Wave 14 (item 7, 2026-08-24): only honored when
+                    // actually resuming a specific line -- a fresh
+                    // (non-resuming) call passing a stray resume_from_char
+                    // would otherwise skip characters off whatever line
+                    // ends up as slice_start.
+                    let resume_char_offset = if p.resume_from_line.is_some() {
+                        p.resume_from_char.unwrap_or(0).max(0) as usize
+                    } else {
+                        0
+                    };
+                    let (joined, truncated, next_cursor, next_char_offset) =
+                        Self::enforce_hard_char_cap(
+                            &lines,
+                            slice_start,
+                            slice_end,
+                            p.max_chars,
+                            p.line_numbers,
+                            truncated,
+                            next_cursor,
+                            resume_char_offset,
+                        );
                     (
                         joined,
                         "disk",
@@ -373,6 +386,7 @@ impl CalmServer {
                         omitted_lines,
                         next_cursor,
                         slice_start as i64 + 1,
+                        next_char_offset,
                     )
                 }
                 None => (
@@ -383,6 +397,7 @@ impl CalmServer {
                     None,
                     None,
                     c.line_start,
+                    None,
                 ),
             };
 
@@ -471,6 +486,7 @@ impl CalmServer {
                     truncated: None,
                     omitted_lines: None,
                     next_cursor: None,
+                    next_char_offset: None,
                     suggested_next: sn,
                 });
             }
@@ -512,6 +528,7 @@ impl CalmServer {
                 truncated,
                 omitted_lines,
                 next_cursor,
+                next_char_offset,
                 suggested_next: sn,
             })
         }))
@@ -659,9 +676,12 @@ impl CalmServer {
     /// marking `truncated`/`next_cursor` when it has to. `next_cursor` points
     /// back at the SAME line (mirroring the multi-line case's own
     /// "points straight back to that same line" convention) since there's no
-    /// byte-offset cursor to resume from within it -- a caller that needs the
-    /// rest of that one line should use `search(kind="grep")` or read the
-    /// file directly instead of retrying pagination.
+    /// byte-offset cursor to resume from within it, UNLESS the caller passed
+    /// `resume_from_char` (Wave 14 item 7, 2026-08-24): in that case
+    /// `resume_char_offset` skips already-read characters before capping,
+    /// and `next_cursor` stays pinned to this SAME line (never advances past
+    /// it) for as long as `next_char_offset` keeps coming back `Some`.
+    #[allow(clippy::too_many_arguments)]
     fn enforce_hard_char_cap(
         lines: &[&str],
         slice_start: usize,
@@ -670,15 +690,24 @@ impl CalmServer {
         gutters: bool,
         truncated: Option<bool>,
         next_cursor: Option<i64>,
-    ) -> (String, Option<bool>, Option<i64>) {
-        let joined = lines[slice_start..slice_end].join("\n");
+        resume_char_offset: usize,
+    ) -> (String, Option<bool>, Option<i64>, Option<i64>) {
+        let full_joined = lines[slice_start..slice_end].join("\n");
+        // Wave 14 (item 7): drop whatever an earlier page of THIS SAME
+        // line already consumed -- only ever non-zero when resuming a
+        // giant single line's own overflow via resume_from_char.
+        let joined: String = if resume_char_offset > 0 {
+            full_joined.chars().skip(resume_char_offset).collect()
+        } else {
+            full_joined
+        };
         let Some(budget) = max_chars.filter(|m| *m > 0).map(|m| m as usize) else {
-            return (joined, truncated, next_cursor);
+            return (joined, truncated, next_cursor, None);
         };
         // Only the single-remaining-line case can still be over budget here --
         // any multi-line slice was already narrowed to fit by apply_char_budget.
         if slice_end.saturating_sub(slice_start) != 1 {
-            return (joined, truncated, next_cursor);
+            return (joined, truncated, next_cursor, None);
         }
         let gutter_len = if gutters {
             (slice_start as i64 + 1).to_string().len() + 1
@@ -686,19 +715,76 @@ impl CalmServer {
             0
         };
         if joined.chars().count() + gutter_len <= budget {
-            return (joined, truncated, next_cursor);
+            return (joined, truncated, next_cursor, None);
         }
         const MARKER: &str = "...[line truncated to fit max_chars]";
-        let keep = budget
-            .saturating_sub(gutter_len)
-            .saturating_sub(MARKER.chars().count());
-        let mut capped: String = joined.chars().take(keep).collect();
-        capped.push_str(MARKER);
-        (
-            capped,
-            Some(true),
-            next_cursor.or(Some(slice_start as i64 + 1)),
-        )
+        let content_budget = budget.saturating_sub(gutter_len);
+        let joined_chars = joined.chars().count();
+        // Wave 14 (audit follow-up, item 7 edge case, 2026-08-24): when the
+        // marker doesn't fit alongside at least 1 real character, `keep`
+        // used to saturate to 0 -- and with `next_char_offset` now in play,
+        // a 0-progress page meant resuming at this SAME budget echoed the
+        // same offset back forever. `truncated: true` already signals
+        // "this was cut off" on its own, so the marker is a display nicety,
+        // not the only honesty mechanism -- drop it to guarantee real
+        // forward progress whenever progress is possible at all.
+        let marker_len = MARKER.chars().count();
+        let (keep, show_marker) = if content_budget > marker_len {
+            (content_budget - marker_len, true)
+        } else {
+            (content_budget, false)
+        };
+        let kept = keep.min(joined_chars);
+        let mut capped: String = joined.chars().take(kept).collect();
+        if show_marker {
+            capped.push_str(MARKER);
+        }
+        // Wave 14 (audit follow-up, P0-1, 2026-08-24): when `content_budget`
+        // is itself smaller than MARKER's own length (e.g. max_chars=1),
+        // `keep` saturates to 0 but the marker is still appended in full,
+        // so the returned string could still exceed `budget` -- silently
+        // breaking this function's own "never exceeds max_chars, period"
+        // guarantee. Final unconditional clamp closes that: hard-truncates
+        // the marker itself (down to empty, in the extreme) rather than
+        // ever returning more than `budget` chars.
+        if capped.chars().count() > content_budget {
+            capped = capped.chars().take(content_budget).collect();
+        }
+        // Kept as defense-in-depth even though `show_marker` above should
+        // make this a no-op now.
+        // Wave 14 (item 7, 2026-08-24): still more of THIS line left after
+        // this page? Report a resumable char offset instead of leaving the
+        // marker's "truncated to fit" as a dead end -- `resume_from_char`
+        // on the next call slices past what THIS page already consumed.
+        // `kept > 0` (not just `kept < joined_chars`): when
+        // `content_budget == 0` (max_chars can't even fit the line-number
+        // gutter) no amount of resuming at this SAME budget can ever
+        // return real content -- a genuine dead end, not "keep going".
+        let can_progress = kept > 0 && kept < joined_chars;
+        let next_char_offset = can_progress.then_some((resume_char_offset + kept) as i64);
+        // Wave 14 (item 7 edge case, 2026-08-24): a dead end also gets
+        // `next_cursor: None`, not just `next_char_offset: None` -- else a
+        // caller resuming via `resume_from_line` alone (no char offset)
+        // lands right back on this line at offset 0 and reproduces the
+        // identical unrecoverable response. `truncated: true` with empty
+        // content and no cursor at all is the unambiguous "this max_chars
+        // is unusable for this line, stop and raise it" signal -- a dead
+        // end you can detect, not one you can loop on.
+        let dead_end = kept == 0 && joined_chars > 0;
+        let next_cursor = if dead_end {
+            None
+        } else if next_char_offset.is_some() {
+            // Unconditionally the SAME line -- there's still unread
+            // content in it, so the next call must keep resuming THIS
+            // line via resume_from_char, not whatever line pagination had
+            // already queued up to come after it (the old `next_cursor.
+            // or(...)` here could silently skip the rest of an unfinished
+            // giant line otherwise).
+            Some(slice_start as i64 + 1)
+        } else {
+            next_cursor.or(Some(slice_start as i64 + 1))
+        };
+        (capped, Some(true), next_cursor, next_char_offset)
     }
 
     /// Wave 6 (item c): `max_lines`/`max_chars` values `<= 0` were
@@ -850,8 +936,15 @@ impl CalmServer {
         );
         // P0-1a (audit follow-up, 2026-08-23): same final hard-cap safety
         // net as source()/understand() -- see enforce_hard_char_cap's doc
-        // comment.
-        let (raw, truncated, next_cursor) = Self::enforce_hard_char_cap(
+        // comment. Wave 14 (item 7, 2026-08-24): resume_char_offset only
+        // honored when actually resuming a specific line, same gating as
+        // source()'s own use of this.
+        let resume_char_offset = if p.resume_from_line.is_some() {
+            p.resume_from_char.unwrap_or(0).max(0) as usize
+        } else {
+            0
+        };
+        let (raw, truncated, next_cursor, next_char_offset) = Self::enforce_hard_char_cap(
             &lines,
             slice_s,
             slice_e,
@@ -859,6 +952,7 @@ impl CalmServer {
             p.line_numbers,
             truncated,
             next_cursor,
+            resume_char_offset,
         );
         let rendered_start_line = slice_s as i64 + 1;
         // Reuse whatever language the file's symbols were indexed as (any row
@@ -907,6 +1001,7 @@ impl CalmServer {
             truncated,
             omitted_lines,
             next_cursor,
+            next_char_offset,
             suggested_next: sn,
         })
     }
@@ -1106,7 +1201,7 @@ impl CalmServer {
                 Err(e) => return ToolOutcome::error(e),
             };
 
-            let callers = match symbol_info.as_ref() {
+            let (callers, callers_total, callers_truncated) = match symbol_info.as_ref() {
                 Some((info, _, _)) => {
                     let mut stmt = match conn.prepare(
                         // PATTERN-DEBT call-edges-missing-ruled-out-filter:
@@ -1136,7 +1231,8 @@ impl CalmServer {
                         .map(|(_, path, _, _, line, _)| (path.clone(), *line))
                         .collect();
                     let previews = line_previews_batched(&self.project_root, &preview_items);
-                    rows.into_iter()
+                    let full: Vec<CallerEntry> = rows
+                        .into_iter()
                         .zip(previews)
                         .map(
                             |(
@@ -1151,9 +1247,23 @@ impl CalmServer {
                                 preview,
                             },
                         )
-                        .collect::<Vec<_>>()
+                        .collect::<Vec<_>>();
+                    // Wave 14 (audit follow-up, P0-1b, 2026-08-24): the SQL
+                    // above has no LIMIT, so a hub with hundreds of callers
+                    // could blow past any response budget -- max_chars/
+                    // max_lines only ever bounded the embedded `source` text,
+                    // never this list. Same `config.callers.direct_list_cap`
+                    // the dedicated `callers` tool already uses
+                    // (CallersOutput::direct_truncated), capped AFTER the
+                    // true count is captured so `callers_total` never lies.
+                    let total = full.len() as i64;
+                    let cap = self.config().callers.direct_list_cap;
+                    let truncated = (full.len() > cap).then_some(true);
+                    let mut capped = full;
+                    capped.truncate(cap);
+                    (capped, Some(total), truncated)
                 }
-                None => Vec::new(),
+                None => (Vec::new(), None, None),
             };
 
             let sn = if let Some((ref info, _, _)) = symbol_info {
@@ -1179,6 +1289,12 @@ impl CalmServer {
                         serde_json::json!({
                             "query": p.query.clone(),
                             "resume_from_line": source_output.as_ref().and_then(|s| s.next_cursor),
+                            // Wave 14 (audit follow-up, 2026-08-24): without this, an agent that
+                            // mechanically follows this suggested_next never supplies the etag
+                            // build_understand_source_output's RANGE_CHANGED_SINCE_PAGINATION
+                            // guard needs, so a mixed-snapshot read across a concurrent edit went
+                            // silently undetected on the exact path meant to prevent it.
+                            "if_none_match": source_output.as_ref().and_then(|s| s.etag.clone()),
                         }),
                     )
                 } else if info.is_hub {
@@ -1196,6 +1312,8 @@ impl CalmServer {
                 symbol: symbol_info.map(|(info, _, _)| info),
                 source: source_output,
                 callers_summary: callers,
+                callers_total,
+                callers_truncated,
                 edges_ready: Some(self.edges_ready()),
                 suggested_next: self.filter_sn(sn),
                 note: kind_note,
@@ -1215,8 +1333,12 @@ impl CalmServer {
     /// `build_understand_source_output` purely to keep that function a
     /// manageable size; same char-budget/hard-cap/gutter treatment `source()`
     /// itself applies. Returns `(source, content_warning, token_estimate,
-    /// truncated, omitted_lines, next_cursor)`.
+    /// truncated, omitted_lines, next_cursor, page_char_offset)` -- the last
+    /// element is Wave 14 item 7's byte-offset cursor (2026-08-24), `Some`
+    /// only when a single oversized line still has more content left after
+    /// this page.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::type_complexity)]
     fn render_understand_source_page(
         lines: &[&str],
         slice_start: usize,
@@ -1226,11 +1348,13 @@ impl CalmServer {
         truncated: Option<bool>,
         omitted_lines: Option<i64>,
         next_cursor: Option<i64>,
+        resume_char_offset: usize,
     ) -> (
         String,
         Option<String>,
         i64,
         Option<bool>,
+        Option<i64>,
         Option<i64>,
         Option<i64>,
     ) {
@@ -1246,15 +1370,17 @@ impl CalmServer {
                 omitted_lines,
                 next_cursor,
             );
-        let (page_joined, page_truncated, page_cursor) = CalmServer::enforce_hard_char_cap(
-            lines,
-            slice_start,
-            page_end,
-            max_chars,
-            true,
-            page_truncated,
-            page_cursor,
-        );
+        let (page_joined, page_truncated, page_cursor, page_char_offset) =
+            CalmServer::enforce_hard_char_cap(
+                lines,
+                slice_start,
+                page_end,
+                max_chars,
+                true,
+                page_truncated,
+                page_cursor,
+                resume_char_offset,
+            );
         let page_sanitized = sanitize_source_output(&page_joined);
         let page_warning = injection_warning(&page_sanitized);
         let page_start_line = slice_start as i64 + 1;
@@ -1267,6 +1393,7 @@ impl CalmServer {
             page_truncated,
             page_omitted,
             page_cursor,
+            page_char_offset,
         )
     }
 
@@ -1385,20 +1512,37 @@ impl CalmServer {
                 truncated: None,
                 omitted_lines: None,
                 next_cursor: None,
+                next_char_offset: None,
                 suggested_next: None,
             }));
         }
-        let (bu_rendered, bu_warning, bu_tokens, bu_truncated, bu_omitted, bu_cursor) =
-            CalmServer::render_understand_source_page(
-                &bu_lines,
-                bu_slice_start,
-                bu_slice_end,
-                bu_end,
-                p.max_chars,
-                bu_truncated,
-                bu_omitted,
-                bu_cursor,
-            );
+        // Wave 14 (item 7, 2026-08-24): only honored when actually resuming
+        // a specific line, same gating as source()/source_range()'s own use
+        // of this.
+        let bu_resume_char_offset = if p.resume_from_line.is_some() {
+            p.resume_from_char.unwrap_or(0).max(0) as usize
+        } else {
+            0
+        };
+        let (
+            bu_rendered,
+            bu_warning,
+            bu_tokens,
+            bu_truncated,
+            bu_omitted,
+            bu_cursor,
+            bu_char_offset,
+        ) = CalmServer::render_understand_source_page(
+            &bu_lines,
+            bu_slice_start,
+            bu_slice_end,
+            bu_end,
+            p.max_chars,
+            bu_truncated,
+            bu_omitted,
+            bu_cursor,
+            bu_resume_char_offset,
+        );
         Ok(Some(SourceOutput {
             symbol: bu_info.name.clone(),
             path: bu_info.path.clone(),
@@ -1415,6 +1559,7 @@ impl CalmServer {
             truncated: bu_truncated,
             omitted_lines: bu_omitted,
             next_cursor: bu_cursor,
+            next_char_offset: bu_char_offset,
             suggested_next: None,
         }))
     }
@@ -2018,6 +2163,17 @@ pub(crate) struct SourceParams {
     /// `[line_start, line_end]` if out of bounds rather than erroring.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) resume_from_line: Option<i64>,
+    /// Wave 14 (audit follow-up, item 7, 2026-08-24): pairs with a prior
+    /// response's `next_char_offset` to resume reading INSIDE the same
+    /// oversized line `enforce_hard_char_cap`'s single-line safety net had
+    /// to hard-cut -- `resume_from_line` alone can only advance by whole
+    /// lines, so a single line longer than `max_chars` could never be
+    /// fully read through this tool before. 0-indexed CHARACTER offset
+    /// (never byte -- never splits a multi-byte UTF-8 character) into the
+    /// line named by `resume_from_line`. Ignored unless `resume_from_line`
+    /// is also set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) resume_from_char: Option<i64>,
     /// Wave 12 (pagination default flip, 2026-08-23 plan): caps how many
     /// lines of `source` come back in one call. Defaults to
     /// `default_max_lines_cap`'s 300 when the JSON key is OMITTED --
@@ -2155,6 +2311,16 @@ pub(crate) struct SourceOutput {
     /// alongside `truncated: Some(true)`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) next_cursor: Option<i64>,
+    /// Wave 14 (audit follow-up, item 7, 2026-08-24): set only when a
+    /// SINGLE line alone exceeded `max_chars` (the `enforce_hard_char_cap`
+    /// safety net) and still has more content left after this page -- the
+    /// 0-indexed CHARACTER offset to pass back as `resume_from_char`
+    /// (alongside `next_cursor`, which stays pinned to this SAME line
+    /// until it's fully drained) to continue reading the rest of it.
+    /// Absent in every other case, including ordinary multi-line
+    /// `next_cursor` pagination.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) next_char_offset: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) suggested_next: Option<SuggestedNext>,
 }
@@ -2210,6 +2376,13 @@ pub(crate) struct UnderstandParams {
     /// from, pairing with a prior response's `source.next_cursor`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) resume_from_line: Option<i64>,
+    /// Wave 14 (audit follow-up, item 7, 2026-08-24): same meaning as
+    /// `SourceParams::resume_from_char` -- pairs with a prior response's
+    /// `source.next_char_offset` to resume reading INSIDE the same
+    /// oversized line the embedded `source.source` had to hard-cut.
+    /// Ignored unless `resume_from_line` is also set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) resume_from_char: Option<i64>,
     /// Wave 6 (item b/d): same meaning as `SourceParams::max_chars` --
     /// hard character cap on the embedded `source.source` text, applied
     /// on top of whatever `max_lines` already selected. Wave 13 (audit
@@ -2248,6 +2421,18 @@ pub(crate) struct UnderstandOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) source: Option<SourceOutput>,
     pub(crate) callers_summary: Vec<CallerEntry>,
+    /// Wave 14 (audit follow-up, P0-1b, 2026-08-24): true total caller count
+    /// before `callers_summary` was capped to `config.callers.direct_list_cap`
+    /// (same cap the dedicated `callers` tool's `direct_count` already uses)
+    /// -- `callers_summary.len()` alone can't distinguish "this symbol has
+    /// exactly N callers" from "this symbol has N-or-more, the rest were cut".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) callers_total: Option<i64>,
+    /// `true` when `callers_summary` was cut down to the cap -- see
+    /// `callers_total` for the true count. Mirrors `CallersOutput::
+    /// direct_truncated`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) callers_truncated: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) edges_ready: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]

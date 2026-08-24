@@ -66,6 +66,14 @@
         ],
         "format": "int64"
       },
+      "resume_from_char": {
+        "description": "Wave 14 (audit follow-up, item 7, 2026-08-24): pairs with a prior\nresponse's `next_char_offset` to resume reading INSIDE the same\noversized line `enforce_hard_char_cap`'s single-line safety net had\nto hard-cut -- `resume_from_line` alone can only advance by whole\nlines, so a single line longer than `max_chars` could never be\nfully read through this tool before. 0-indexed CHARACTER offset\n(never byte -- never splits a multi-byte UTF-8 character) into the\nline named by `resume_from_line`. Ignored unless `resume_from_line`\nis also set.",
+        "type": [
+          "integer",
+          "null"
+        ],
+        "format": "int64"
+      },
       "max_lines": {
         "description": "Wave 12 (pagination default flip, 2026-08-23 plan): caps how many\nlines of `source` come back in one call. Defaults to\n`default_max_lines_cap`'s 300 when the JSON key is OMITTED --\ngenerous headroom over this repo's own production p99 (260 lines),\nonly ever touches the small long tail. Pass an explicit `null` to\nopt back into the old unlimited behavior -- omitting the key no\nlonger means that (see `default_max_lines_cap`'s own doc comment for\nwhy an explicit null still bypasses the default). When the resolved\nrange has more lines than the effective cap, the response is cut\nshort and carries `truncated: true`/`next_cursor` (pass that back as\n`resume_from_line` to continue). `etag` is always the hash of the\nFULL range regardless of pagination -- it's a range-identity signal,\nnot tied to how much of it was rendered.",
         "type": [
@@ -132,7 +140,7 @@
         ]
       },
       "PendingReviewPacket": {
-        "description": "Wave 3 (audit follow-up, 2026-08-23): the structured shape of a\n`HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW`/`DIFF_DIGEST_MISMATCH` error's\n`review` field -- lets a calling agent relay-approve/decline without\never reading `pending_reviews` directly or reimplementing\n`hash_content` itself. `diff_digest` is always `hash_content(&diff_preview)`,\ncomputed server-side at the moment this packet is built -- never a\nvalue the caller supplied or guessed.",
+        "description": "Wave 3 (audit follow-up, 2026-08-23): the structured shape of a\n`HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW`/`DIFF_DIGEST_MISMATCH` error's\n`review` field -- lets a calling agent relay-approve/decline without\never reading `pending_reviews` directly or reimplementing\n`hash_content` itself.\n\nWave 14 (audit follow-up, 2026-08-24): `diff_digest` is NOT\n`hash_content` of THIS packet's own `diff_preview` field -- it's\n`hash_content` of the full, unsanitized, uncapped diff stored server-\nside (see `from_pending`'s own comment). It exists to prove identity/\nfreshness (\"this is really the review you fetched, not a stale or\nguessed copy\"), not to let a caller verify \"the text I'm looking at\nhashes to this\" -- that's structurally impossible to guarantee anyway,\nsince different surfaces (this JSON packet vs. `calm review show`'s\nterminal output) apply different sanitize/cap transforms to the same\nunderlying diff and can't all match one digest. Callers must always\nCOPY this value verbatim, never recompute it from `diff_preview`.",
         "type": "object",
         "properties": {
           "review_id": {
@@ -140,6 +148,10 @@
           },
           "diff_preview": {
             "type": "string"
+          },
+          "preview_truncated": {
+            "description": "`true` when `diff_preview` was cut down from the full diff\n`diff_digest` covers -- see the struct's own doc comment.",
+            "type": "boolean"
           },
           "diff_digest": {
             "type": "string"
@@ -152,6 +164,7 @@
         "required": [
           "review_id",
           "diff_preview",
+          "preview_truncated",
           "diff_digest",
           "expires_at"
         ]
@@ -399,6 +412,14 @@
       },
       "next_cursor": {
         "description": "Absolute 1-indexed line to pass as `resume_from_line` on the next\ncall to continue reading where this response left off. Only set\nalongside `truncated: Some(true)`.",
+        "type": [
+          "integer",
+          "null"
+        ],
+        "format": "int64"
+      },
+      "next_char_offset": {
+        "description": "Wave 14 (audit follow-up, item 7, 2026-08-24): set only when a\nSINGLE line alone exceeded `max_chars` (the `enforce_hard_char_cap`\nsafety net) and still has more content left after this page -- the\n0-indexed CHARACTER offset to pass back as `resume_from_char`\n(alongside `next_cursor`, which stays pinned to this SAME line\nuntil it's fully drained) to continue reading the rest of it.\nAbsent in every other case, including ordinary multi-line\n`next_cursor` pagination.",
         "type": [
           "integer",
           "null"

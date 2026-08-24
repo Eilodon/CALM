@@ -5618,6 +5618,7 @@ mod tests {
                 UnderstandParams {
                     max_lines: None,
                     resume_from_line: None,
+                    resume_from_char: None,
                     max_chars: None,
                     query: "foo".into(),
                     kind: None,
@@ -5665,6 +5666,7 @@ mod tests {
                 UnderstandParams {
                     max_lines: None,
                     resume_from_line: None,
+                    resume_from_char: None,
                     max_chars: None,
                     query: "widget".into(),
                     kind: None,
@@ -5715,6 +5717,7 @@ mod tests {
                 UnderstandParams {
                     max_lines: None,
                     resume_from_line: None,
+                    resume_from_char: None,
                     max_chars: None,
                     query: "widget".into(),
                     kind: Some("symbolz".into()),
@@ -5737,6 +5740,7 @@ mod tests {
                 UnderstandParams {
                     max_lines: None,
                     resume_from_line: None,
+                    resume_from_char: None,
                     max_chars: None,
                     query: "widget".into(),
                     kind: Some("symbol".into()),
@@ -5796,6 +5800,7 @@ mod tests {
                 UnderstandParams {
                     max_lines: None,
                     resume_from_line: None,
+                    resume_from_char: None,
                     max_chars: None,
                     query: "foo".into(),
                     kind: None,
@@ -5869,6 +5874,7 @@ mod tests {
                 UnderstandParams {
                     max_lines: None,
                     resume_from_line: None,
+                    resume_from_char: None,
                     max_chars: None,
                     query: "bar".into(),
                     kind: None,
@@ -5942,6 +5948,7 @@ mod tests {
                 max_chars: None,
                 max_lines: None,
                 resume_from_line: None,
+                resume_from_char: None,
                 symbol: Some("foo".into()),
                 path: None,
                 line: None,
@@ -5985,6 +5992,7 @@ mod tests {
                 max_chars: None,
                 max_lines: None,
                 resume_from_line: None,
+                resume_from_char: None,
                 symbol: Some("foo".into()),
                 path: None,
                 line: None,
@@ -6013,6 +6021,7 @@ mod tests {
                 max_chars: None,
                 max_lines: None,
                 resume_from_line: None,
+                resume_from_char: None,
                 symbol: Some("foo".into()),
                 path: None,
                 line: None,
@@ -6041,6 +6050,7 @@ mod tests {
                 max_chars: None,
                 max_lines: None,
                 resume_from_line: None,
+                resume_from_char: None,
                 symbol: Some("foo".into()),
                 path: None,
                 line: None,
@@ -6286,6 +6296,7 @@ mod tests {
                 max_chars: None,
                 max_lines: None,
                 resume_from_line: None,
+                resume_from_char: None,
                 symbol: Some("foo".into()),
                 path: None,
                 line: None,
@@ -6332,6 +6343,7 @@ mod tests {
                 max_chars: None,
                 max_lines: None,
                 resume_from_line: None,
+                resume_from_char: None,
                 symbol: Some("foo".into()),
                 path: None,
                 line: None,
@@ -6390,6 +6402,7 @@ mod tests {
                 max_chars: None,
                 max_lines: None,
                 resume_from_line: None,
+                resume_from_char: None,
                 symbol: Some("foo".into()),
                 path: None,
                 line: None,
@@ -6516,6 +6529,7 @@ mod tests {
                 max_chars: None,
                 max_lines: None,
                 resume_from_line: None,
+                resume_from_char: None,
                 symbol: Some("foo".into()),
                 path: None,
                 line: None,
@@ -6569,6 +6583,7 @@ mod tests {
                 max_chars: None,
                 max_lines: None,
                 resume_from_line: None,
+                resume_from_char: None,
                 symbol: Some("foo".into()),
                 path: None,
                 line: None,
@@ -6653,6 +6668,7 @@ mod tests {
                 max_chars: None,
                 max_lines: None,
                 resume_from_line: None,
+                resume_from_char: None,
                 symbol: None,
                 path: Some("a.py".into()),
                 line: Some(1),
@@ -6696,6 +6712,7 @@ mod tests {
                 max_chars: None,
                 max_lines: None,
                 resume_from_line: None,
+                resume_from_char: None,
                 symbol: None,
                 path: Some("a.py".into()),
                 line: Some(1),
@@ -6735,6 +6752,7 @@ mod tests {
                 max_chars: None,
                 max_lines: Some(2),
                 resume_from_line: None,
+                resume_from_char: None,
                 symbol: None,
                 path: Some("a.py".into()),
                 line: Some(1),
@@ -6766,6 +6784,7 @@ mod tests {
                 max_chars: None,
                 max_lines: Some(2),
                 resume_from_line: Some(first["next_cursor"].as_i64().unwrap()),
+                resume_from_char: None,
                 symbol: None,
                 path: Some("a.py".into()),
                 line: Some(1),
@@ -6792,6 +6811,7 @@ mod tests {
                 max_chars: None,
                 max_lines: None,
                 resume_from_line: None,
+                resume_from_char: None,
                 symbol: None,
                 path: Some("a.py".into()),
                 line: Some(1),
@@ -6840,6 +6860,7 @@ mod tests {
                 max_chars: None,
                 max_lines: Some(2),
                 resume_from_line: None,
+                resume_from_char: None,
                 symbol: Some("foo".into()),
                 path: None,
                 line: None,
@@ -6892,6 +6913,7 @@ mod tests {
                 max_chars: None,
                 max_lines: Some(0),
                 resume_from_line: None,
+                resume_from_char: None,
                 symbol: None,
                 path: Some("a.py".into()),
                 line: Some(1),
@@ -6912,6 +6934,7 @@ mod tests {
                 max_chars: Some(-5),
                 max_lines: None,
                 resume_from_line: None,
+                resume_from_char: None,
                 symbol: None,
                 path: Some("a.py".into()),
                 line: Some(1),
@@ -6965,6 +6988,7 @@ mod tests {
                 max_chars: Some(20),
                 max_lines: None,
                 resume_from_line: None,
+                resume_from_char: None,
                 symbol: Some("foo".into()),
                 path: None,
                 line: None,
@@ -6985,6 +7009,340 @@ mod tests {
         // line_start/line_end stay pinned to the FULL symbol range.
         assert_eq!(v["line_start"], 1);
         assert_eq!(v["line_end"], 4);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    /// Wave 14 (audit follow-up, P0-1, 2026-08-24): `max_chars=1` used to
+    /// make `enforce_hard_char_cap` append its 36-char MARKER whole even
+    /// though `keep` saturated to 0 -- violating its own documented
+    /// "never exceeds max_chars, period" contract. A single-line symbol
+    /// (so `narrow_by_char_budget`'s multi-line narrowing never kicks in --
+    /// `apply_char_budget` always keeps a lone line whole) with a budget
+    /// smaller than the marker forces exactly the hard-cap fallback path.
+    /// Also covers item 7's edge case (2026-08-24): this budget can't even
+    /// fit the line-number gutter, so it's a genuine dead end -- neither
+    /// `next_char_offset` nor `next_cursor` should claim there's a way to
+    /// make progress by resuming at this same budget.
+    fn source_max_chars_below_marker_length_hard_truncates_instead_of_overflowing() {
+        let dir =
+            std::env::temp_dir().join(format!("ci_source_tiny_max_chars_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("a.py"),
+            "x = 1234567890123456789012345678901234567890\n",
+        )
+        .unwrap();
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.py::x', 'x', 'variable', 'python', 'a.py', 1, 1, 'x', '', 'x', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let v = jv(
+            server.source(rmcp::handler::server::wrapper::Parameters(SourceParams {
+                qualified_name: None,
+                max_chars: Some(1),
+                max_lines: None,
+                resume_from_line: None,
+                resume_from_char: None,
+                symbol: Some("x".into()),
+                path: None,
+                line: None,
+                end_line: None,
+                include_metadata: false,
+                line_numbers: true,
+                if_none_match: None,
+            })),
+        );
+        assert_eq!(v["source"].as_str().unwrap(), "", "response: {v}");
+        assert_eq!(v["truncated"], true, "response: {v}");
+        assert!(
+            v["next_char_offset"].is_null(),
+            "a budget too small to fit even the gutter should never claim resumable progress: {v}"
+        );
+        assert!(
+            v["next_cursor"].is_null(),
+            "a dead end should not point back at a line that will just reproduce the same dead end: {v}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    /// Wave 14 (audit follow-up, item 7, 2026-08-24): `resume_from_line`
+    /// alone can only advance whole lines, so a single line longer than
+    /// `max_chars` could never be read past its first hard-capped page.
+    /// `resume_from_char` (paired with the prior response's
+    /// `next_char_offset`) lets a caller keep paginating INSIDE that one
+    /// line until it's fully drained, with `next_cursor` staying pinned to
+    /// the same line the whole time (a regression this same item fixed:
+    /// `next_cursor` used to fall through to whatever the multi-line
+    /// pagination layer had already queued, silently skipping the rest of
+    /// an unfinished giant line).
+    fn source_resume_from_char_continues_reading_inside_an_oversized_single_line() {
+        let dir =
+            std::env::temp_dir().join(format!("ci_source_resume_from_char_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let letters: String = (0..90).map(|i| (b'a' + (i % 26) as u8) as char).collect();
+        let line = format!("x = {letters}");
+        std::fs::write(dir.join("a.py"), format!("{line}\n")).unwrap();
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.py::x', 'x', 'variable', 'python', 'a.py', 1, 1, 'x', '', 'x', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        }
+        let line_chars: Vec<char> = line.chars().collect();
+
+        let call = |resume_from_char: Option<i64>| {
+            jv(
+                server.source(rmcp::handler::server::wrapper::Parameters(SourceParams {
+                    qualified_name: None,
+                    max_chars: Some(50),
+                    max_lines: None,
+                    resume_from_line: resume_from_char.map(|_| 1),
+                    resume_from_char,
+                    symbol: Some("x".into()),
+                    path: None,
+                    line: None,
+                    end_line: None,
+                    include_metadata: false,
+                    line_numbers: false,
+                    if_none_match: None,
+                })),
+            )
+        };
+
+        let mut offset: i64 = 0;
+        let mut pinned_next_cursor: Option<i64> = None;
+        let mut pages = 0;
+        loop {
+            pages += 1;
+            assert!(pages <= 20, "pagination did not terminate");
+            let v = call(if offset > 0 { Some(offset) } else { None });
+
+            if let Some(nc) = v["next_cursor"].as_i64() {
+                match pinned_next_cursor {
+                    None => pinned_next_cursor = Some(nc),
+                    Some(expected) => assert_eq!(
+                        nc, expected,
+                        "next_cursor must stay pinned to the same line across char-offset pages: {v}"
+                    ),
+                }
+            }
+
+            let source_text = v["source"].as_str().unwrap();
+            match v["next_char_offset"].as_i64() {
+                Some(next) => {
+                    assert!(next > offset, "must make forward progress: {v}");
+                    let expected: String =
+                        line_chars[offset as usize..next as usize].iter().collect();
+                    assert!(
+                        source_text.starts_with(&expected),
+                        "page must start with the exact next slice of the original line, got {source_text:?} expected prefix {expected:?}"
+                    );
+                    offset = next;
+                }
+                None => {
+                    let expected: String = line_chars[offset as usize..].iter().collect();
+                    assert_eq!(
+                        source_text, expected,
+                        "final page must be the exact untruncated remainder: {v}"
+                    );
+                    break;
+                }
+            }
+        }
+        assert!(
+            pages >= 2,
+            "test setup should have forced multiple pages, got {pages}"
+        );
+        assert!(
+            pinned_next_cursor.is_some(),
+            "at least one page should have reported next_cursor"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    /// Wave 14 (audit follow-up, item 7, 2026-08-24): `resume_from_char`/
+    /// `next_char_offset` are documented as 0-indexed CHARACTER offsets,
+    /// never byte offsets -- this line is built entirely out of 2-byte
+    /// UTF-8 characters (`é`) so a regression back to byte-based slicing
+    /// would either panic (slicing a `String` at a non-char-boundary byte
+    /// index) or silently return a shifted/corrupted page instead of the
+    /// exact expected character slice.
+    fn source_resume_from_char_never_splits_a_multi_byte_utf8_character() {
+        let dir = std::env::temp_dir().join(format!(
+            "ci_source_resume_from_char_utf8_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let line = format!("x = {}", "é".repeat(60));
+        std::fs::write(dir.join("a.py"), format!("{line}\n")).unwrap();
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.py::x', 'x', 'variable', 'python', 'a.py', 1, 1, 'x', '', 'x', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        }
+        let line_chars: Vec<char> = line.chars().collect();
+
+        let call = |resume_from_char: Option<i64>| {
+            jv(
+                server.source(rmcp::handler::server::wrapper::Parameters(SourceParams {
+                    qualified_name: None,
+                    max_chars: Some(50),
+                    max_lines: None,
+                    resume_from_line: resume_from_char.map(|_| 1),
+                    resume_from_char,
+                    symbol: Some("x".into()),
+                    path: None,
+                    line: None,
+                    end_line: None,
+                    include_metadata: false,
+                    line_numbers: false,
+                    if_none_match: None,
+                })),
+            )
+        };
+
+        let first = call(None);
+        let next = first["next_char_offset"].as_i64().expect(
+            "this budget must force at least one char-offset page for an all-2-byte-char line",
+        );
+        let expected_first: String = line_chars[0..next as usize].iter().collect();
+        assert!(
+            first["source"]
+                .as_str()
+                .unwrap()
+                .starts_with(&expected_first),
+            "first page must not split a multi-byte character: {first}"
+        );
+
+        let second = call(Some(next));
+        let expected_rest: String = line_chars[next as usize..].iter().collect();
+        assert_eq!(
+            second["source"].as_str().unwrap(),
+            expected_rest,
+            "resumed page must reconstruct the exact remaining characters, not shifted bytes: {second}"
+        );
+        assert!(
+            second["next_char_offset"].is_null(),
+            "the whole line should now be drained: {second}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    /// Wave 14 (item 7 edge case, 2026-08-24): when `content_budget` is
+    /// smaller than the truncation MARKER's own length, `enforce_hard_char_cap`
+    /// drops the marker entirely rather than let `keep` saturate to 0 --
+    /// otherwise `next_char_offset` would echo the same offset back forever
+    /// (a caller resuming at this SAME tiny budget could never make
+    /// progress). This forces exactly that budget (content_budget=10,
+    /// well under the 36-char marker) and verifies every page still moves
+    /// forward, the marker text never appears, and the full line is
+    /// eventually reconstructed exactly.
+    fn source_resume_from_char_makes_progress_even_when_marker_does_not_fit() {
+        let dir = std::env::temp_dir().join(format!(
+            "ci_source_resume_no_marker_room_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let letters: String = (0..40).map(|i| (b'a' + (i % 26) as u8) as char).collect();
+        let line = format!("x = {letters}");
+        std::fs::write(dir.join("a.py"), format!("{line}\n")).unwrap();
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.py::x', 'x', 'variable', 'python', 'a.py', 1, 1, 'x', '', 'x', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        }
+        let line_chars: Vec<char> = line.chars().collect();
+
+        let call = |resume_from_char: Option<i64>| {
+            jv(
+                server.source(rmcp::handler::server::wrapper::Parameters(SourceParams {
+                    qualified_name: None,
+                    max_chars: Some(10),
+                    max_lines: None,
+                    resume_from_line: resume_from_char.map(|_| 1),
+                    resume_from_char,
+                    symbol: Some("x".into()),
+                    path: None,
+                    line: None,
+                    end_line: None,
+                    include_metadata: false,
+                    line_numbers: false,
+                    if_none_match: None,
+                })),
+            )
+        };
+
+        let mut offset: i64 = 0;
+        let mut pages = 0;
+        loop {
+            pages += 1;
+            assert!(pages <= 20, "pagination did not terminate");
+            let v = call(if offset > 0 { Some(offset) } else { None });
+
+            let source_text = v["source"].as_str().unwrap();
+            assert!(
+                !source_text.contains("truncated to fit"),
+                "the marker must never appear when it can't fit alongside real content: {v}"
+            );
+
+            match v["next_char_offset"].as_i64() {
+                Some(next) => {
+                    assert!(next > offset, "must always make real forward progress: {v}");
+                    let expected: String =
+                        line_chars[offset as usize..next as usize].iter().collect();
+                    assert_eq!(
+                        source_text, expected,
+                        "page must be exactly the next slice of real content, no marker: {v}"
+                    );
+                    offset = next;
+                }
+                None => {
+                    let expected: String = line_chars[offset as usize..].iter().collect();
+                    assert_eq!(
+                        source_text, expected,
+                        "final page must be the exact untruncated remainder: {v}"
+                    );
+                    break;
+                }
+            }
+        }
+        assert!(
+            pages >= 2,
+            "test setup should have forced multiple pages, got {pages}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -7021,6 +7379,7 @@ mod tests {
                 max_chars: None,
                 max_lines: Some(1),
                 resume_from_line: None,
+                resume_from_char: None,
                 symbol: Some("foo".into()),
                 path: None,
                 line: None,
@@ -7048,6 +7407,7 @@ mod tests {
                 max_chars: None,
                 max_lines: Some(1),
                 resume_from_line: Some(next_cursor),
+                resume_from_char: None,
                 symbol: Some("foo".into()),
                 path: None,
                 line: None,
@@ -7098,6 +7458,7 @@ mod tests {
                 UnderstandParams {
                     max_lines: Some(2),
                     resume_from_line: None,
+                    resume_from_char: None,
                     max_chars: None,
                     query: "foo".into(),
                     kind: None,
@@ -7124,6 +7485,70 @@ mod tests {
             v["suggested_next"]["args"]["resume_from_line"], 3,
             "response: {v}"
         );
+        // Wave 14 (audit follow-up, 2026-08-24): without this, an agent
+        // that mechanically follows suggested_next never supplies the etag
+        // RANGE_CHANGED_SINCE_PAGINATION needs, so a mixed-snapshot read
+        // across a concurrent edit went silently undetected.
+        assert_eq!(
+            v["suggested_next"]["args"]["if_none_match"], source["etag"],
+            "response: {v}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    /// Wave 14 (audit follow-up, P0-1b, 2026-08-24): understand's
+    /// `callers_summary` had no cap at all -- a hub with hundreds of
+    /// callers could blow past any response budget regardless of
+    /// max_chars/max_lines, which only ever bounded the embedded `source`
+    /// text. 30 callers (over `DepthConfig::default().direct_list_cap`'s
+    /// 25) must be capped in the list while `callers_total` still reports
+    /// the true count.
+    fn understand_caps_callers_summary_and_reports_true_total() {
+        let dir =
+            std::env::temp_dir().join(format!("ci_understand_callers_cap_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.py"), "def foo():\n    pass\n").unwrap();
+        let server = CalmServer::new(dir.clone(), dir.join("index.db")).unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.py::foo', 'foo', 'function', 'python', 'a.py', 1, 2, 'def foo():', '', 'foo', 30, 0, 0)",
+                [],
+            )
+            .unwrap();
+            for i in 0..30 {
+                conn.execute(
+                    "INSERT INTO call_edges (from_symbol, to_symbol, edge_confidence) VALUES (?1, 'a.py::foo', 'resolved')",
+                    rusqlite::params![format!("caller_{i}")],
+                )
+                .unwrap();
+            }
+        }
+
+        let v = jv(
+            server.understand(rmcp::handler::server::wrapper::Parameters(
+                UnderstandParams {
+                    max_lines: None,
+                    resume_from_line: None,
+                    resume_from_char: None,
+                    max_chars: None,
+                    query: "foo".into(),
+                    kind: None,
+                    if_none_match: None,
+                },
+            )),
+        );
+        assert_eq!(
+            v["callers_summary"].as_array().unwrap().len(),
+            25,
+            "response: {v}"
+        );
+        assert_eq!(v["callers_total"], 30, "response: {v}");
+        assert_eq!(v["callers_truncated"], true, "response: {v}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -7147,6 +7572,7 @@ mod tests {
                 max_chars: None,
                 max_lines: None,
                 resume_from_line: None,
+                resume_from_char: None,
                 symbol: None,
                 path: Some("a.py".into()),
                 line: Some(1),
@@ -7164,6 +7590,7 @@ mod tests {
                 max_chars: None,
                 max_lines: None,
                 resume_from_line: None,
+                resume_from_char: None,
                 symbol: None,
                 path: Some("a.py".into()),
                 line: Some(1),
@@ -7209,6 +7636,7 @@ mod tests {
                 UnderstandParams {
                     max_lines: None,
                     resume_from_line: None,
+                    resume_from_char: None,
                     max_chars: None,
                     query: "foo".into(),
                     kind: None,
@@ -7268,6 +7696,7 @@ mod tests {
                 UnderstandParams {
                     max_lines: None,
                     resume_from_line: None,
+                    resume_from_char: None,
                     max_chars: None,
                     query: "Foo".into(),
                     kind: None,
@@ -12526,6 +12955,7 @@ mod tests {
             ReconstructedEdit {
                 new_content,
                 line_map: &line_map,
+                original: "def helper(\n    x):\n    return 1\n",
             },
         );
         assert_eq!(
@@ -14319,6 +14749,141 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    /// Wave 14 (audit follow-up, P1, 2026-08-24): end-to-end proof that
+    /// `release_claimed_review` is actually wired into `edit_lines_impl_
+    /// gated`'s write-failure branch, not just correct in isolation (see
+    /// the unit-level tests in `crates/calm-core/src/authority/pending_
+    /// review.rs`). Companion to the sibling test above, which proves
+    /// survival across a DETERMINISTIC gate failure (edit_context not yet
+    /// called) -- this one gets all the way PAST every gate (approved,
+    /// edit_context satisfied, claim succeeds) and then makes the actual
+    /// disk write itself fail (permission-denied), which the claim/gate
+    /// machinery can't predict or prevent in advance. The target file
+    /// lives in its own `src/` subdirectory (not the project root) so the
+    /// permission change can't also block `.calm/state.db`'s own journal
+    /// creation -- a sibling directory, otherwise causing an unrelated
+    /// TRANSACTION_INIT_FAILED before the intended write failure is ever
+    /// reached.
+    fn a_write_failure_after_the_approval_was_claimed_releases_it_instead_of_burning_it() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (dir, server) = test_server("pending_review_survives_write_failure");
+        let src_dir = dir.join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(src_dir.join("a.py"), "def helper():\n    return 1\n").unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+            "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+             VALUES ('src/a.py::helper', 'helper', 'function', 'python', 'src/a.py', 1, 2, '', '', 'helper', 11, 0, 0)",
+            [],
+        )
+        .unwrap();
+        }
+        let hash = calm_core::edit::range_checksum("def helper():\n    return 1\n", 2, 2).unwrap();
+        let params = EditLinesParams {
+            change_id: None,
+            authority_id: None,
+            path: "src/a.py".into(),
+            edits: vec![EditHunkParam {
+                old_text: None,
+                start_line: 2,
+                end_line: 2,
+                expected_hash: Some(hash),
+                new_text: "    return 2\n".into(),
+            }],
+            confirm: true,
+            reason: Some("checked -- safe, no elicitation available in this environment".into()),
+            cites: None,
+        };
+
+        use super::edit::ElicitGate;
+        let first = server.edit_lines_flow(&params, ElicitGate::Off, &mut None);
+        let v = serde_json::to_value(&first).unwrap();
+        assert_eq!(v["error"]["code"], "HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW");
+
+        let state_conn =
+            calm_core::db::conn::open_state_writer(&crate::default_state_db_path(&dir)).unwrap();
+        let pending =
+            calm_core::authority::list_pending_reviews(&state_conn, Some("pending")).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(
+            calm_core::authority::approve_pending_review(
+                &state_conn,
+                &pending[0].review_id,
+                "cli_manual_review"
+            )
+            .unwrap()
+        );
+        server.edit_context(rmcp::handler::server::wrapper::Parameters(
+            EditContextParams {
+                qualified_name: None,
+                symbol: Some("helper".into()),
+                end_line: None,
+                path: None,
+                line: None,
+                if_none_match: None,
+                proposed_new_text: None,
+            },
+        ));
+
+        // Every gate is now satisfiable -- but the actual disk write itself
+        // is about to fail (permission denied on both the file and its
+        // containing directory, covering either the atomic temp+rename
+        // write path or a plain truncate-in-place one). Scoped to `src/`
+        // only -- `.calm/` (project-root sibling) stays fully writable.
+        let file_path = src_dir.join("a.py");
+        let orig_file_perms = std::fs::metadata(&file_path).unwrap().permissions();
+        let orig_dir_perms = std::fs::metadata(&src_dir).unwrap().permissions();
+        std::fs::set_permissions(&file_path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        std::fs::set_permissions(&src_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let second = server.edit_lines_flow(&params, ElicitGate::Off, &mut None);
+
+        // Restore permissions immediately -- needed for both the
+        // assertions below (reading the file back) and cleanup.
+        std::fs::set_permissions(&src_dir, orig_dir_perms).unwrap();
+        std::fs::set_permissions(&file_path, orig_file_perms).unwrap();
+
+        let v2 = serde_json::to_value(&second).unwrap();
+        assert_eq!(v2["error"]["code"], "WRITE_FAILED", "response: {v2}");
+        assert_eq!(
+            std::fs::read_to_string(&file_path).unwrap(),
+            "def helper():\n    return 1\n",
+            "must not have written anything -- the write itself failed"
+        );
+
+        // The core assertion: the approval must be back to `approved`, NOT
+        // stuck at `consumed` for a write that never actually happened.
+        let still_approved =
+            calm_core::authority::list_pending_reviews(&state_conn, Some("approved")).unwrap();
+        assert_eq!(
+            still_approved.len(),
+            1,
+            "a write failure after claiming the approval must release it, not burn it"
+        );
+        assert_eq!(still_approved[0].review_id, pending[0].review_id);
+
+        // Prove it's really usable, not just flipped in the DB: retry now
+        // that the permissions are restored -- must succeed using the SAME
+        // review, and only NOW does it become genuinely consumed.
+        let third = server.edit_lines_flow(&params, ElicitGate::Off, &mut None);
+        let v3 = serde_json::to_value(&third).unwrap();
+        assert_eq!(v3["applied"], true, "response: {v3}");
+        assert_eq!(
+            std::fs::read_to_string(&file_path).unwrap(),
+            "def helper():\n    return 2\n"
+        );
+        let consumed =
+            calm_core::authority::list_pending_reviews(&state_conn, Some("consumed")).unwrap();
+        assert_eq!(consumed.len(), 1);
+        assert_eq!(consumed[0].review_id, pending[0].review_id);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn high_risk_refusal_carries_review_packet_and_agent_relay_can_approve_using_it() {
         // Wave 3 (audit follow-up, 2026-08-23): the caller must never have
         // to read pending_reviews or reimplement hash_content itself --
@@ -14392,6 +14957,10 @@ mod tests {
             "response: {v}"
         );
         assert_eq!(
+            v["error"]["review"]["preview_truncated"], false,
+            "a short diff must not be reported truncated: {v}"
+        );
+        assert_eq!(
             v["error"]["next_call"]["tool"], "review_decide_via_agent_relay",
             "response: {v}"
         );
@@ -14432,6 +15001,54 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    /// Wave 14 (audit follow-up, item 6, 2026-08-24): `diff_digest` must
+    /// always be `hash_content` of the FULL stored diff, never of the
+    /// (possibly truncated) `diff_preview` text a caller was shown -- the
+    /// exact confusion the old tool/param descriptions invited ("hash the
+    /// diff_preview text"). Constructs a `PendingReview` directly since
+    /// driving a >2000-char diff through the full `edit_lines_flow`
+    /// pipeline would need an enormous synthetic edit.
+    fn pending_review_packet_reports_preview_truncated_and_digest_covers_the_full_diff() {
+        let long_diff = "x".repeat(3000);
+        let review = calm_core::authority::PendingReview {
+            review_id: "REVIEW-test".into(),
+            tool: "edit_lines".into(),
+            path: "a.py".into(),
+            fingerprint: "sha256:abc".into(),
+            diff_preview: long_diff.clone(),
+            risk: None,
+            hub_kind: None,
+            reason: None,
+            status: "pending".into(),
+            created_at: 0.0,
+            expires_at: 0.0,
+            decided_at: None,
+            decided_by: None,
+        };
+        let packet = super::outcome::PendingReviewPacket::from_pending(&review);
+        assert!(
+            packet.preview_truncated,
+            "a 3000-char diff must be reported truncated"
+        );
+        assert!(
+            packet.diff_preview.len() < long_diff.len(),
+            "the displayed preview must actually be shorter than the full diff"
+        );
+        assert_eq!(
+            packet.diff_digest,
+            calm_core::indexer::pipeline::hash_content(&long_diff),
+            "diff_digest must cover the FULL original diff"
+        );
+        assert_ne!(
+            packet.diff_digest,
+            calm_core::indexer::pipeline::hash_content(&packet.diff_preview),
+            "diff_digest must NOT match a hash of the truncated displayed text -- an agent \
+             that mistakenly hashes what it sees instead of copying diff_digest verbatim \
+             must not get a false positive"
+        );
     }
 
     #[test]
@@ -17393,6 +18010,7 @@ mod tests {
             max_chars: None,
             max_lines: None,
             resume_from_line: None,
+            resume_from_char: None,
             symbol: Some("target".into()),
             path: None,
             line: None,
@@ -17463,6 +18081,7 @@ mod tests {
             max_chars: None,
             max_lines: None,
             resume_from_line: None,
+            resume_from_char: None,
             symbol: Some("target".into()),
             path: None,
             line: None,
@@ -17522,6 +18141,7 @@ mod tests {
             max_chars: None,
             max_lines: None,
             resume_from_line: None,
+            resume_from_char: None,
             symbol: Some("run".into()),
             path: None,
             line: None,
@@ -17578,6 +18198,7 @@ mod tests {
             max_chars: None,
             max_lines: None,
             resume_from_line: None,
+            resume_from_char: None,
             symbol: Some("dup".into()),
             path: None,
             line: None,
@@ -17628,6 +18249,7 @@ mod tests {
             max_chars: None,
             max_lines: None,
             resume_from_line: None,
+            resume_from_char: None,
             symbol: Some("gone".into()),
             path: None,
             line: None,
@@ -17683,6 +18305,7 @@ mod tests {
             max_chars: None,
             max_lines: None,
             resume_from_line: None,
+            resume_from_char: None,
             symbol: Some("dup_method".into()),
             path: None,
             line: None,
@@ -17748,6 +18371,7 @@ mod tests {
             max_chars: None,
             max_lines: None,
             resume_from_line: None,
+            resume_from_char: None,
             symbol: Some("keep".into()),
             path: None,
             line: None,
@@ -17805,6 +18429,7 @@ mod tests {
             max_chars: None,
             max_lines: None,
             resume_from_line: None,
+            resume_from_char: None,
             symbol: Some("gone_a".into()),
             path: None,
             line: None,
@@ -17851,6 +18476,7 @@ mod tests {
             max_chars: None,
             max_lines: None,
             resume_from_line: None,
+            resume_from_char: None,
             symbol: Some("over_cap".into()),
             path: None,
             line: None,
@@ -18187,6 +18813,7 @@ mod tests {
                 max_chars: None,
                 max_lines: None,
                 resume_from_line: None,
+                resume_from_char: None,
                 symbol: Some("shifting".into()),
                 path: None,
                 line: None,

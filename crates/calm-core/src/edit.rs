@@ -491,6 +491,21 @@ fn is_bare_raw_borrow_false_positive(node: tree_sitter::Node, source: &str) -> b
     if !node.is_error() {
         return false;
     }
+    // Wave 14 (audit follow-up, P2, 2026-08-24): only ever suppress a SMALL
+    // error node. A genuine, unrelated syntax error can make tree-sitter's
+    // resync recovery produce a WIDE error span (validate_syntax_diff's own
+    // doc comment: an unmatched delimiter "can swallow every following line
+    // up to end-of-block/EOF into one ERROR node") -- if that wide span
+    // happened to contain an unrelated bare `&raw` occurrence anywhere
+    // inside it, the window scan below would wrongly suppress the ENTIRE
+    // genuine error along with it. Every observed real &raw-trigger node is
+    // tiny (<=7 bytes: "&raw", "= &raw", "raw.", "raw", "= &&raw") -- this
+    // cap is generous above that ceiling but far below what a multi-line
+    // resync span would ever measure.
+    const MAX_SUPPRESSIBLE_NODE_BYTES: usize = 24;
+    if node.end_byte().saturating_sub(node.start_byte()) > MAX_SUPPRESSIBLE_NODE_BYTES {
+        return false;
+    }
     let bytes = source.as_bytes();
     let win_start = node.start_byte().saturating_sub(4);
     let win_end = (node.end_byte() + 12).min(bytes.len());
@@ -1499,6 +1514,31 @@ mod tests {
             Some(false),
             "a genuine syntax error (unmatched paren in the new fn's own signature) must still \
              reject, even though the same hunk also contains an otherwise-suppressed &raw borrow"
+        );
+    }
+
+    /// 2026-08-24 (Wave 14, P2 audit follow-up): a genuine unmatched-
+    /// delimiter error can make tree-sitter's resync recovery produce ONE
+    /// WIDE `ERROR` node spanning many lines (documented behavior -- see
+    /// `validate_syntax_diff`'s own doc comment). If that wide span happens
+    /// to also contain an unrelated bare `&raw` borrow anywhere inside it,
+    /// the `&raw` false-positive filter must NOT suppress the whole wide
+    /// node along with it -- confirmed empirically (via an out-of-tree
+    /// probe reimplementing the pre-fix, uncapped filter against this exact
+    /// input) that without `is_bare_raw_borrow_false_positive`'s byte-
+    /// length cap, this unmatched `{` with no closing brace before EOF
+    /// produces a SINGLE error list that goes completely empty once the
+    /// (uncapped) filter runs -- i.e. genuinely broken Rust would have been
+    /// waved through as clean.
+    #[test]
+    fn test_validate_syntax_diff_does_not_let_a_raw_borrow_hide_a_wide_genuine_error() {
+        let original = "fn existing() {\n    let x = 1;\n    let _ = x;\n}\n";
+        let new_content = "fn existing() {\n    let x = 1;\n    let _ = x;\n}\n\nfn broken() {\n    let a = 1;\n    let raw = 3;\n    let c = sanitize(&raw);\n    let d = 4;\n";
+        assert_eq!(
+            validate_syntax_diff(original, new_content, "rs", &[(4, 4)], &[(5, 10)]),
+            Some(false),
+            "a wide resync-recovery error node that happens to contain an unrelated &raw \
+             borrow must still be reported, not suppressed wholesale"
         );
     }
 
