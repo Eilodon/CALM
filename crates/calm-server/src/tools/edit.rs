@@ -188,8 +188,10 @@ impl CalmServer {
                                     "MATCH_NOT_FOUND",
                                     &format!(
                                         "old_text {old_text:?} was not found within \
-                                         {start}..{end} of '{}' on disk",
-                                        p.path
+                                         {start}..{end} of '{}' on disk -- actual content of \
+                                         that range:\n{}",
+                                        p.path,
+                                        window_content(live_ref, start, end)
                                     ),
                                     true,
                                 ));
@@ -575,8 +577,15 @@ impl CalmServer {
                                     "MATCH_NOT_FOUND",
                                     &format!(
                                         "old_text {old_text:?} was not found within '{}' \
-                                         ({}..{}) on disk",
-                                        p.symbol, effective_line_start, c.line_end
+                                         ({}..{}) on disk -- actual content of that range:\n{}",
+                                        p.symbol,
+                                        effective_line_start,
+                                        c.line_end,
+                                        window_content(
+                                            &live,
+                                            effective_line_start,
+                                            c.line_end as usize
+                                        )
                                     ),
                                     true,
                                 ));
@@ -2091,7 +2100,43 @@ impl CalmServer {
                                 // THIS symbol's callers).
                                 let graph_still_current = current_graph_generation
                                     .is_none_or(|g| g == r.graph_generation);
+                                // Wave 15 (audit follow-up, 2026-08-24): a
+                                // graph_generation bump alone can be safely
+                                // ignored for a symbol this review already
+                                // confirmed has ZERO callers (`caller_qns`
+                                // empty implies `caller_set_digest` is the
+                                // empty-set digest, and `fresh ==
+                                // r.caller_set_digest` above already proved
+                                // it still is). `is_hub` is structurally
+                                // impossible to be true at caller_count=0 --
+                                // both degree-hub and bridge-hub thresholds
+                                // in `graph::hub::update_is_hub_flags`
+                                // require caller_count >= a positive
+                                // minimum, so no reindex anywhere, however
+                                // it reshuffles coreness elsewhere, can ever
+                                // flip this symbol's is_hub to true. And
+                                // `uncertain_zero_caller`'s own
+                                // classification (`compute_dead_code_
+                                // confidence`) is a pure function of this
+                                // symbol's own kind/is_entry_point/is_test/
+                                // coverage -- none of which a DIFFERENT
+                                // file's reindex can change. risk_level is
+                                // additionally required to not already be
+                                // "high" as defense-in-depth. A genuinely
+                                // non-hub symbol whose graph classification
+                                // could never have shifted gets no safety
+                                // benefit from forcing a re-review that can
+                                // only ever reach the same conclusion.
                                 if graph_still_current {
+                                    known_caller_qns.extend(r.caller_qns);
+                                    reviewed_risk_levels.push(r.risk_level);
+                                } else if r.caller_qns.is_empty() && r.risk_level.as_str() != "high"
+                                {
+                                    tracing::debug!(
+                                        "edit gate: graph_generation bump ignored for \
+                                         confirmed-zero-caller symbol {}",
+                                        t.qualified_name
+                                    );
                                     known_caller_qns.extend(r.caller_qns);
                                     reviewed_risk_levels.push(r.risk_level);
                                 } else {
@@ -2174,16 +2219,26 @@ impl CalmServer {
                         reason_code = "EDIT_CONTEXT_REQUIRED",
                         path,
                         symbol = missing[0],
+                        missing_count = missing.len(),
                         risk = risk.as_deref().unwrap_or("none"),
                         hub_hit,
                     );
+                    // Wave 15 (audit follow-up, 2026-08-24): every symbol
+                    // still needing edit_context, not just the first -- a
+                    // multi-hunk batch touching N zero-caller symbols used
+                    // to surface only symbol #1, so a caller had to fix it,
+                    // retry, get told about #2, fix it, retry... one
+                    // denial at a time instead of dispatching all N
+                    // edit_context calls in one batch up front.
                     return ToolOutcome::error(error_detail(
                         "EDIT_CONTEXT_REQUIRED",
                         &format!(
-                            "this edit touches {why} — call edit_context(\"{}\") first THIS \
-                             session before editing (a prior session's review, or one older \
-                             than {FRESHNESS_WINDOW_CALLS} tool calls, doesn't count)",
-                            missing[0]
+                            "this edit touches {why} — call edit_context() first THIS \
+                             session for EACH of the following {} symbol(s) before editing \
+                             (a prior session's review, or one older than \
+                             {FRESHNESS_WINDOW_CALLS} tool calls, doesn't count): {}",
+                            missing.len(),
+                            format_symbol_list(&missing)
                         ),
                         true,
                     ));
@@ -2206,19 +2261,24 @@ impl CalmServer {
                         reason_code = "STALE_CALLER_SET",
                         path,
                         symbol = stale_caller_set[0],
+                        stale_count = stale_caller_set.len(),
                         risk = risk.as_deref().unwrap_or("none"),
                         hub_hit,
                     );
+                    // Wave 15 (audit follow-up, 2026-08-24): every affected
+                    // symbol, not just the first -- same reasoning as
+                    // EDIT_CONTEXT_REQUIRED above.
                     return ToolOutcome::error(error_detail(
                         "STALE_CALLER_SET",
                         &format!(
-                            "the caller set for \"{}\" changed since edit_context reviewed it \
-                             this session (e.g. an unrelated incremental edit added or removed \
-                             a caller) — still inside the {FRESHNESS_WINDOW_CALLS}-tool-call \
+                            "the caller set changed since edit_context reviewed it this \
+                             session (e.g. an unrelated incremental edit added or removed a \
+                             caller) — still inside the {FRESHNESS_WINDOW_CALLS}-tool-call \
                              freshness window, but the reviewed caller list is no longer \
-                             accurate. Call edit_context(\"{}\") again to get a fresh review \
-                             before editing",
-                            stale_caller_set[0], stale_caller_set[0]
+                             accurate for these {} symbol(s): {}. Call edit_context() again \
+                             for each before editing",
+                            stale_caller_set.len(),
+                            format_symbol_list(&stale_caller_set)
                         ),
                         true,
                     ));
@@ -2239,19 +2299,25 @@ impl CalmServer {
                         reason_code = "STALE_GRAPH_AUTHORITY",
                         path,
                         symbol = stale_graph_authority[0],
+                        stale_count = stale_graph_authority.len(),
                         risk = risk.as_deref().unwrap_or("none"),
                         hub_hit,
                     );
+                    // Wave 15 (audit follow-up, 2026-08-24): every affected
+                    // symbol, not just the first -- same reasoning as
+                    // EDIT_CONTEXT_REQUIRED above.
                     return ToolOutcome::error(error_detail(
                         "STALE_GRAPH_AUTHORITY",
                         &format!(
-                            "the graph was rebuilt since edit_context reviewed \"{}\" this \
-                             session (a reindex ran -- full or incremental -- that changed \
-                             graph_generation, even though this symbol's own caller set still \
-                             matches) -- the reviewed risk/hub classification may no longer \
-                             reflect current graph state. Call edit_context(\"{}\") again to get \
-                             a fresh review before editing",
-                            stale_graph_authority[0], stale_graph_authority[0]
+                            "the graph was rebuilt since edit_context reviewed these {} \
+                             symbol(s) this session (a reindex ran -- full or incremental -- \
+                             that changed graph_generation, even though each symbol's own \
+                             caller set still matches) -- the reviewed risk/hub classification \
+                             may no longer reflect current graph state: {}. Call \
+                             edit_context() again for each to get a fresh review before \
+                             editing",
+                            stale_graph_authority.len(),
+                            format_symbol_list(&stale_graph_authority)
                         ),
                         true,
                     ));
@@ -5017,6 +5083,49 @@ pub(crate) struct GateClassification {
     /// Human-readable cause (`"a hub symbol (is_hub=true)"`, etc.) — `None`
     /// only when `requirement == GateRequirement::None`.
     pub(crate) why: Option<String>,
+}
+
+/// Wave 15 (audit follow-up, 2026-08-24): formats a list of touched-symbol
+/// qualified names for a gate error message -- EVERY one that needs
+/// attention, not just the first, so a caller with a large multi-symbol
+/// batch can dispatch all the required `edit_context` calls in parallel
+/// instead of discovering them one denial at a time. Capped at a sane
+/// display limit with the true total always preserved (matches this
+/// crate's existing cap convention -- callers/callees/skipped_files
+/// truncate the same way, count never silently dropped).
+fn format_symbol_list(names: &[&str]) -> String {
+    const DISPLAY_CAP: usize = 20;
+    let shown: Vec<String> = names
+        .iter()
+        .take(DISPLAY_CAP)
+        .map(|n| format!("{n:?}"))
+        .collect();
+    let joined = shown.join(", ");
+    if names.len() > DISPLAY_CAP {
+        format!(
+            "{joined} (and {} more, {} total)",
+            names.len() - DISPLAY_CAP,
+            names.len()
+        )
+    } else {
+        joined
+    }
+}
+
+/// Wave 15 (audit follow-up, 2026-08-24): the actual on-disk content of an
+/// `old_text` match window, for MATCH_NOT_FOUND's error message -- lets a
+/// caller self-diagnose a mismatch (a stray whitespace difference, wrong
+/// line range, a stale in-memory copy of the file) by comparing against
+/// what it attempted, instead of bisecting blind with follow-up probe
+/// edits. `start`/`end` are the same 1-indexed inclusive line numbers
+/// `find_and_replace_hunk` was already called with.
+fn window_content(source: &str, start: usize, end: usize) -> String {
+    source
+        .lines()
+        .skip(start.saturating_sub(1))
+        .take(end.saturating_sub(start).saturating_add(1))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Pure classification — see [`GateRequirement`]'s doc comment. Mirrors

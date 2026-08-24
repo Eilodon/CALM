@@ -13966,6 +13966,91 @@ mod tests {
     }
 
     #[test]
+    fn edit_context_required_lists_every_missing_symbol_not_just_the_first() {
+        // Wave 15 (audit follow-up, 2026-08-24): a multi-hunk batch
+        // touching N symbols that have never been reviewed this session
+        // used to surface only the FIRST one (`missing[0]`) even though
+        // the loop above already collected the full list -- forcing a
+        // caller to fix one, retry, learn about the next, retry again...
+        // discovering the whole batch one denial at a time. Now every
+        // missing symbol is named up front so all the required
+        // edit_context calls can be dispatched in one go.
+        let (dir, server) = test_server("edit_context_required_full_list");
+        std::fs::write(
+            dir.join("a.py"),
+            "def handler_one():\n    return 1\n\
+             def handler_two():\n    return 2\n\
+             def handler_three():\n    return 3\n",
+        )
+        .unwrap();
+        {
+            let conn = server.db();
+            for (name, start, end) in [
+                ("handler_one", 1, 2),
+                ("handler_two", 3, 4),
+                ("handler_three", 5, 6),
+            ] {
+                conn.execute(
+                    "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                     VALUES (?1, ?2, 'function', 'python', 'a.py', ?3, ?4, '', '', ?2, 0, 0, 1)",
+                    rusqlite::params![format!("a.py::{name}"), name, start, end],
+                )
+                .unwrap();
+            }
+        }
+        let content = std::fs::read_to_string(dir.join("a.py")).unwrap();
+
+        let out = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
+            EditLinesParams {
+                change_id: None,
+                authority_id: None,
+                path: "a.py".into(),
+                edits: vec![
+                    EditHunkParam {
+                        old_text: None,
+                        start_line: 2,
+                        end_line: 2,
+                        expected_hash: calm_core::edit::range_checksum(&content, 2, 2),
+                        new_text: "    return 10\n".into(),
+                    },
+                    EditHunkParam {
+                        old_text: None,
+                        start_line: 4,
+                        end_line: 4,
+                        expected_hash: calm_core::edit::range_checksum(&content, 4, 4),
+                        new_text: "    return 20\n".into(),
+                    },
+                    EditHunkParam {
+                        old_text: None,
+                        start_line: 6,
+                        end_line: 6,
+                        expected_hash: calm_core::edit::range_checksum(&content, 6, 6),
+                        new_text: "    return 30\n".into(),
+                    },
+                ],
+                confirm: true,
+                reason: Some("all three checked -- safe".into()),
+                cites: None,
+            },
+        ));
+        let v = jv(out);
+        assert_eq!(v["error"]["code"], "EDIT_CONTEXT_REQUIRED", "response: {v}");
+        let message = v["error"]["message"].as_str().unwrap_or_default();
+        for name in [
+            "a.py::handler_one",
+            "a.py::handler_two",
+            "a.py::handler_three",
+        ] {
+            assert!(
+                message.contains(name),
+                "expected every missing symbol to be named, not just the first: {message:?}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn empty_caller_set_low_confidence_zero_caller_is_refused_with_elicitation_off() {
         // WS-2 Phase 1 (docs/plans/2026-08-02-ws2-review-token-execution-plan.md
         // §3.1): the confirmed live bypass this closes. `language` is
@@ -14328,6 +14413,88 @@ mod tests {
             "fn target() {\n    1\n}\n",
             "must not have written -- the graph was rebuilt since review, even \
              though this symbol's own caller set never changed"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn graph_generation_bump_does_not_block_a_confirmed_zero_caller_symbol() {
+        // Wave 15 (audit follow-up, 2026-08-24): a graph_generation bump
+        // caused by a reindex ELSEWHERE in the repo cannot actually change
+        // anything this review vouched for when the touched symbol has
+        // ZERO callers (confirmed unchanged via caller_set_digest, same as
+        // the sibling test above) -- `is_hub` is structurally impossible to
+        // flip true at caller_count=0 (graph::hub::update_is_hub_flags'
+        // thresholds both require caller_count >= a positive minimum), and
+        // `uncertain_zero_caller` depends only on this symbol's own kind/
+        // is_test/coverage, untouched by a distant reindex. Same setup as
+        // `graph_generation_bump_forces_stale_review_even_when_caller_set_
+        // is_unchanged` immediately above, but with NO call_edges row --
+        // the edit must now succeed instead of STALE_GRAPH_AUTHORITY.
+        let (dir, server) = test_server("graph_generation_stale_zero_caller");
+        std::fs::write(dir.join("a.rs"), "fn target() {\n    1\n}\n").unwrap();
+        let hash = calm_core::edit::range_checksum("fn target() {\n    1\n}\n", 2, 2).unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point, is_test)
+                 VALUES ('a.rs::target', 'target', 'function', 'rust', 'a.rs', 1, 3, '', '', 'target', 0, 0, 0, 1)",
+                [],
+            )
+            .unwrap();
+        }
+
+        server.edit_context(rmcp::handler::server::wrapper::Parameters(
+            EditContextParams {
+                qualified_name: None,
+                symbol: Some("target".into()),
+                end_line: None,
+                path: None,
+                line: None,
+                if_none_match: None,
+                proposed_new_text: None,
+            },
+        ));
+
+        // A reindex happens -- graph_generation bumps -- but this symbol
+        // still has zero callers, confirmed both before and after.
+        {
+            let conn = server.db();
+            conn.execute(
+                "UPDATE graph_generation_state SET generation = generation + 1 WHERE id = 1",
+                [],
+            )
+            .unwrap();
+        }
+
+        let out = server.edit_lines(rmcp::handler::server::wrapper::Parameters(
+            EditLinesParams {
+                change_id: None,
+                authority_id: None,
+                path: "a.rs".into(),
+                edits: vec![EditHunkParam {
+                    old_text: None,
+                    start_line: 2,
+                    end_line: 2,
+                    expected_hash: Some(hash),
+                    new_text: "    2\n".into(),
+                }],
+                confirm: true,
+                reason: Some("zero-caller test-only symbol, checked -- safe".into()),
+                cites: None,
+            },
+        ));
+        let v = jv(out);
+        assert_eq!(
+            v["applied"], true,
+            "a confirmed-zero-caller symbol's is_hub/uncertain_zero_caller classification \
+             cannot have been affected by a reindex elsewhere -- forcing a re-review here \
+             would only ever reach the same conclusion: response {v}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.rs")).unwrap(),
+            "fn target() {\n    2\n}\n"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -17346,6 +17513,12 @@ mod tests {
         ));
         let v = jv(out);
         assert_eq!(v["error"]["code"], "MATCH_NOT_FOUND");
+        let message = v["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("pub fn a() {") && message.contains("let x = 1;"),
+            "expected the actual on-disk window content in the error so a caller can \
+             self-diagnose the mismatch: {message:?}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -17431,6 +17604,56 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dir.join("a.py")).unwrap(),
             "def helper():\n    return 42\n"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_symbol_old_text_mode_not_found_reports_actual_window_content() {
+        // Wave 15 (audit follow-up, item 5, 2026-08-24): same MATCH_NOT_FOUND
+        // diagnostic fix as edit_lines' own old_text mode (see
+        // edit_lines_old_text_mode_not_found_reports_error), but exercised
+        // through edit_symbol's separate resolution path -- different
+        // variable plumbing (`live`, `effective_line_start`, `c.line_end`)
+        // that needed its own wiring, not shared code with edit_lines.
+        let (dir, server) = test_server("edit_symbol_old_text_not_found");
+        std::fs::write(dir.join("a.py"), "def helper():\n    return 1\n").unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+                "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+                 VALUES ('a.py::helper', 'helper', 'function', 'python', 'a.py', 1, 2, '', '', 'helper', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let out = server.edit_symbol(rmcp::handler::server::wrapper::Parameters(
+            EditSymbolParams {
+                qualified_name: None,
+                change_id: None,
+                authority_id: None,
+                symbol: "helper".into(),
+                path: None,
+                line: None,
+                expected_hash: None,
+                new_text: "irrelevant".into(),
+                position: None,
+                confirm: false,
+                reason: None,
+                cites: None,
+                old_text: Some("nope".into()),
+                scope: None,
+            },
+        ));
+        let v = jv(out);
+        assert_eq!(v["error"]["code"], "MATCH_NOT_FOUND", "response: {v}");
+        let message = v["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("def helper():") && message.contains("return 1"),
+            "expected the actual on-disk window content in the error so a caller can \
+             self-diagnose the mismatch: {message:?}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
