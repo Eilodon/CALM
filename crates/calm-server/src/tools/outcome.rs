@@ -138,6 +138,33 @@ pub(crate) struct ErrorOutput {
     pub(crate) error: ErrorDetail,
 }
 
+/// Wave 13 (audit follow-up, P0-1a, 2026-08-23): shared sanitize+cap+
+/// truncation-marker treatment for a diff crossing into ANY external
+/// surface -- originally only `build_hub_elicit_message` (edit.rs, the
+/// human-facing elicit text) applied this; `PendingReviewPacket::
+/// from_pending`'s JSON packet cloned its diff raw and uncapped, so a
+/// multi-hunk high-risk diff could still blow up that response even
+/// though the human-facing text was already safe. Same 2000-char cap
+/// both surfaces now share, with a visible marker so a reader (human or
+/// agent) knows explicitly when what it's holding isn't the whole diff --
+/// never a silent truncation. Never touches any digest: callers must
+/// compute `hash_content` over the ORIGINAL, uncapped text before calling
+/// this, same as `from_pending` does.
+pub(crate) fn capped_diff_preview(diff_preview: &str) -> String {
+    const DIFF_CHAR_CAP: usize = 2000;
+    let dcp_sanitized = calm_core::sanitize::sanitize_source_output(diff_preview);
+    let dcp_total_chars = dcp_sanitized.chars().count();
+    let mut dcp_capped: String = dcp_sanitized.chars().take(DIFF_CHAR_CAP).collect();
+    if dcp_total_chars > DIFF_CHAR_CAP {
+        dcp_capped.push_str(&format!(
+            "\n[... truncated — {} more characters not shown; any digest computed over this diff \
+             covers the FULL content, not just what's displayed]",
+            dcp_total_chars - DIFF_CHAR_CAP
+        ));
+    }
+    dcp_capped
+}
+
 /// Wave 3 (audit follow-up, 2026-08-23): the structured shape of a
 /// `HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW`/`DIFF_DIGEST_MISMATCH` error's
 /// `review` field -- lets a calling agent relay-approve/decline without
@@ -146,6 +173,7 @@ pub(crate) struct ErrorOutput {
 /// computed server-side at the moment this packet is built -- never a
 /// value the caller supplied or guessed.
 #[derive(Serialize, JsonSchema)]
+
 pub(crate) struct PendingReviewPacket {
     pub(crate) review_id: String,
     pub(crate) diff_preview: String,
@@ -155,10 +183,23 @@ pub(crate) struct PendingReviewPacket {
 
 impl PendingReviewPacket {
     pub(crate) fn from_pending(review: &calm_core::authority::PendingReview) -> Self {
+        // P0-1a (audit follow-up, 2026-08-23): `diff_digest` is always the
+        // hash of the FULL, uncapped `review.diff_preview` -- computed here,
+        // before capping, so it stays a faithful proof of "this is the whole
+        // proposed content" regardless of what the packet actually displays.
         let diff_digest = calm_core::indexer::pipeline::hash_content(&review.diff_preview);
+        // P0-1a: previously cloned `review.diff_preview` raw and uncapped --
+        // `build_hub_elicit_message` (edit.rs) already caps/sanitizes/marks
+        // truncation for the human-facing elicit text, but THIS packet (the
+        // one `review_decide_via_agent_relay`/`HIGH_RISK_REQUIRES_INDEPENDENT_
+        // REVIEW` hand straight to the calling agent as JSON) had no such
+        // cap -- a multi-hunk high-risk diff could still blow up the
+        // response right at the approval flow. Same shared cap+sanitize+
+        // truncation-marker treatment both surfaces now get.
+        let capped_preview = capped_diff_preview(&review.diff_preview);
         PendingReviewPacket {
             review_id: review.review_id.clone(),
-            diff_preview: review.diff_preview.clone(),
+            diff_preview: capped_preview,
             diff_digest,
             expires_at: review.expires_at,
         }

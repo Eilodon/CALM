@@ -76,12 +76,13 @@
         "default": 300
       },
       "max_chars": {
-        "description": "Wave 6 (item d): hard character cap on the rendered `source` text,\napplied on top of whatever `max_lines` already selected (never\nwidens a page, only narrows it further) -- counts whole lines only,\nnever splitting a single line's own characters across pages. Known,\naccepted limitation: a single line alone longer than `max_chars` is\nstill returned whole (can't be sub-divided by byte offset), and\n`next_cursor` on the following page points straight back to that\nsame line rather than skipping past it.",
+        "description": "Wave 6 (item d): hard character cap on the rendered `source` text,\napplied on top of whatever `max_lines` already selected (never\nwidens a page, only narrows it further) -- counts whole lines only,\nnever splitting a single line's own characters across pages, EXCEPT\nas a last-resort safety net (`enforce_hard_char_cap`, Wave 13/P0-1a)\nwhen the page has narrowed to exactly one line that alone still\nexceeds the budget -- that one case hard-cuts the line's own text\n(with a visible marker) so the response is a REAL hard cap, never\nsilently exceeding what was asked for.\n\nWave 13 (audit follow-up, P0-1b, 2026-08-23): defaults to\n`default_max_chars_cap`'s 40,000 when the JSON key is OMITTED --\nsame opt-out contract as `max_lines` (explicit `null`, or a\nRust-level struct literal, means unlimited). Closes the gap where\n`max_lines`'s own 300-line default alone couldn't bound a page of\nvery long/minified lines.",
         "type": [
           "integer",
           "null"
         ],
-        "format": "int64"
+        "format": "int64",
+        "default": 40000
       }
     },
     "type": "object"

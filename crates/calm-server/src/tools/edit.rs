@@ -1836,21 +1836,28 @@ impl CalmServer {
         // CLI instead.
         let mut gate = gate;
         let mut approval_mechanism: &'static str = "elicitation";
+        // Wave 13 (audit follow-up, P1-3, 2026-08-23): fingerprint of the
+        // pending review this write will need to CONSUME for real, right
+        // before the actual disk write far below -- set only when a
+        // matching approved review is found here. Consuming the human's
+        // approval this early (before EDIT_CONTEXT_REQUIRED/freshness/
+        // signature-authority checks that can still fail downstream) used
+        // to burn it even when the write never happened, forcing the human
+        // to re-review the identical patch for no reason. This is now only
+        // a TENTATIVE, non-consuming check (`find_approved_matching`) -- the
+        // real, atomic `claim_approved_matching` runs right before
+        // `write_via_configured_backend`, once every other precondition has
+        // already succeeded (see that call site's own comment).
+        let mut pending_review_fingerprint_to_claim: Option<String> = None;
         let high_risk_needs_independent_review = risk.as_deref() == Some("high")
             && !matches!(gate, ElicitGate::Ask | ElicitGate::Approved);
         if high_risk_needs_independent_review {
             let review_fingerprint = fingerprint_hunks(path, &hunks);
-            // Bug (2026-08-23 audit, pending_review not one-shot): use
-            // claim_approved_matching, not a bare find_approved_matching --
-            // this is the actual write gate, and a match here must consume
-            // the human approval so it can authorize exactly this one
-            // write, not be replayed for any later call that happens to
-            // reproduce the same (path, fingerprint).
             let approved_pending_review =
                 calm_core::db::conn::open_state_writer(&self.state_db_path)
                     .ok()
                     .and_then(|conn| {
-                        calm_core::authority::claim_approved_matching(
+                        calm_core::authority::find_approved_matching(
                             &conn,
                             path,
                             &review_fingerprint,
@@ -1859,6 +1866,7 @@ impl CalmServer {
                         .flatten()
                     });
             if let Some(pending) = approved_pending_review {
+                pending_review_fingerprint_to_claim = Some(review_fingerprint.clone());
                 tracing::info!(
                     target: crate::telemetry::AUDIT_TARGET,
                     session_id = self.session_id,
@@ -2732,6 +2740,50 @@ impl CalmServer {
             }
         };
 
+        // Wave 13 (audit follow-up, P1-3, 2026-08-23): the REAL, atomic
+        // consume of the human's pending-review approval -- deliberately
+        // as close to the actual disk write as this function's control
+        // flow allows, now that every deterministic precondition
+        // (EDIT_CONTEXT_REQUIRED, freshness, signature/authority checks,
+        // txn::begin/authorize_and_begin_edit above) has already
+        // succeeded. A claim failure here means the approval was consumed
+        // by a genuinely racing concurrent write, or expired, between the
+        // tentative check far above and now -- refuse rather than write
+        // with no valid consumed approval backing it. Cleanup mirrors the
+        // write-failure branch immediately below (advance the shadow txn
+        // to Failed, drop both guards) since this check runs after the
+        // same txn::begin/authorize_and_begin_edit that branch also
+        // assumes already happened.
+        if let Some(fingerprint) = &pending_review_fingerprint_to_claim {
+            let claimed = calm_core::db::conn::open_state_writer(&self.state_db_path)
+                .ok()
+                .and_then(|conn| {
+                    calm_core::authority::claim_approved_matching(&conn, path, fingerprint)
+                        .ok()
+                        .flatten()
+                });
+            if claimed.is_none() {
+                if let Some(tx_id) = &shadow_tx_id {
+                    let _ = calm_core::txn::advance(
+                        &state_conn,
+                        tx_id,
+                        calm_core::txn::TxState::Failed,
+                        "system",
+                        "pending review approval no longer claimable at write time",
+                    );
+                }
+                drop(_cross_guard);
+                drop(_guard);
+                return ToolOutcome::error(error_detail(
+                    "HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW",
+                    "the human approval for this exact edit is no longer available -- it may \
+                     have been consumed by a concurrent write or expired between the initial \
+                     check and now; request review again",
+                    true,
+                ));
+            }
+        }
+
         if let Err(e) = write_via_configured_backend(
             &self.project_root,
             path,
@@ -3172,7 +3224,16 @@ impl CalmServer {
                 "Verify wider blast radius, especially if this touched a hub/high-risk symbol",
             ),
         };
-        ToolOutcome::success(EditLinesOutput {
+        // Wave 13 (audit follow-up, P0-5, 2026-08-23): a transaction that
+        // landed on VerifyPending must not report the flat top-level
+        // `flow_state: "ready"` `ToolOutcome::success` always used to send
+        // unconditionally -- `suggested_next` already pointed at
+        // verify_change (Wave 1b, above), but an agent dispatching on
+        // `flow_state` alone (the whole point of that field existing --
+        // see `success_with_flow_state`'s own doc comment, which names
+        // this exact VerifyPending case) would still read "nothing more to
+        // do" and treat the write as fully settled before it actually was.
+        let edit_lines_output = EditLinesOutput {
             path: path.to_string(),
             applied: true,
             hunks: hunks_output,
@@ -3183,7 +3244,13 @@ impl CalmServer {
             tx_id: shadow_tx_id.clone(),
             note,
             suggested_next: self.filter_sn(sn),
-        })
+        };
+        match &awaiting_verify_tx_id {
+            Some(_) => {
+                ToolOutcome::success_with_flow_state(edit_lines_output, "needs_verification")
+            }
+            None => ToolOutcome::success(edit_lines_output),
+        }
     }
 
     /// Wave 7 (audit follow-up, P0-A.4): single source of truth for "what
@@ -3831,8 +3898,25 @@ fn hunks_touch_uncovered_code(
     }
     let abs_path = calm_core::analysis::coverage::normalize_path(&project_root.join(path));
     hunks.iter().any(|h| {
-        coverage.coverage_ratio(&abs_path, h.start_line as i64, h.end_line as i64)
+        if coverage.coverage_ratio(&abs_path, h.start_line as i64, h.end_line as i64)
             < MIN_ADEQUATE_COVERAGE_RATIO
+        {
+            return true;
+        }
+        // Wave 13 (audit follow-up, P1-4, 2026-08-23): delta-aware --
+        // `coverage_ratio` above only measures the OLD `[start_line,
+        // end_line]` range being replaced. A hunk that replaces N old
+        // lines with M new lines where M > N introduces (M - N) lines
+        // that are BRAND NEW code -- they cannot possibly have prior
+        // runtime coverage, no matter how "covered" the old range was.
+        // Without this, replacing one covered line with 50 new executable
+        // lines was silently waved through as "covered" even though 49 of
+        // those lines never existed before this edit. The correct model
+        // is "new executable code creates a verification obligation," not
+        // "infer coverage of new code from the old code it replaced."
+        let old_len = h.end_line.saturating_sub(h.start_line) + 1;
+        let new_len = h.new_text.lines().count();
+        new_len > old_len
     })
 }
 
@@ -3907,18 +3991,14 @@ fn build_hub_elicit_message(
         "\nbase_digest={} proposed_digest={}",
         ask.base_digest, ask.proposed_digest
     ));
-    const DIFF_CHAR_CAP: usize = 2000;
-    let sanitized_diff = calm_core::sanitize::sanitize_source_output(&ask.diff_preview);
-    let diff_char_count = sanitized_diff.chars().count();
-    let capped_diff: String = sanitized_diff.chars().take(DIFF_CHAR_CAP).collect();
-    msg.push_str(&format!("\nProposed diff:\n{capped_diff}"));
-    if diff_char_count > DIFF_CHAR_CAP {
-        msg.push_str(&format!(
-            "\n[... truncated — {} more characters not shown; the digests above are still \
-             over the FULL proposed content, not just what's displayed]",
-            diff_char_count - DIFF_CHAR_CAP
-        ));
-    }
+    // P0-1a (audit follow-up, 2026-08-23): now the same shared helper
+    // `PendingReviewPacket::from_pending` (outcome.rs) also uses, so the
+    // agent-facing JSON review packet gets the identical real hard cap
+    // this human-facing text always had.
+    msg.push_str(&format!(
+        "\nProposed diff:\n{}",
+        capped_diff_preview(&ask.diff_preview)
+    ));
     let sanitized = calm_core::sanitize::sanitize_source_output(reason.unwrap_or("(none given)"));
     let capped: String = sanitized.chars().take(400).collect();
     msg.push_str(&format!("\nAgent's stated reason: {capped}"));
@@ -4729,21 +4809,31 @@ fn compute_touch_risk_inner(
 
     // Mirrors `hunks_touch_uncovered_code`'s exact logic (coverage.source
     // == "none" never elevates; a hunk range with no recorded coverage
-    // does) -- inlined rather than called directly because that helper
-    // takes `&[calm_core::edit::HunkRequest]`, not this function's
+    // does, AND -- Wave 13, audit follow-up P1-4, 2026-08-23 -- a hunk
+    // whose new text is LONGER than the old range it replaces does too,
+    // since those extra lines are brand new code that can't have prior
+    // runtime coverage no matter how "covered" the old range was) --
+    // inlined rather than called directly because that helper takes
+    // `&[calm_core::edit::HunkRequest]`, not this function's
     // `&[(i64, i64, &str)]` tuples, and converting would need an
     // allocation per call for no real benefit. `any_executable_kind` (5.1a)
     // keeps this from firing on a struct/enum/doc-only touch, which has no
     // instrumentable lines for a coverage tool to ever report on in the
     // first place. `real_hunks=false` callers (edit_context's speculative
     // `gate_prediction`) still reach this check via a synthetic placeholder
-    // hunk (5.1b) -- only hunk (start, end) is read here, never the text,
-    // so the placeholder's empty text is harmless at this specific check.
+    // hunk (5.1b) with empty text -- 0 new lines never exceeds a
+    // non-negative old range length, so the delta check stays harmless
+    // there too, same as the ratio check already was.
     let touches_uncovered_code =
         any_executable_kind && !proposed_hunks.is_empty() && coverage.source != "none" && {
             let abs_path = calm_core::analysis::coverage::normalize_path(&project_root.join(path));
-            proposed_hunks.iter().any(|&(hs, he, _)| {
-                coverage.coverage_ratio(&abs_path, hs, he) < MIN_ADEQUATE_COVERAGE_RATIO
+            proposed_hunks.iter().any(|&(hs, he, text)| {
+                if coverage.coverage_ratio(&abs_path, hs, he) < MIN_ADEQUATE_COVERAGE_RATIO {
+                    return true;
+                }
+                let old_len = (he - hs + 1).max(0) as usize;
+                let new_len = text.lines().count();
+                new_len > old_len
             })
         };
     let (risk, risk_rule_reason) = if touches_uncovered_code {

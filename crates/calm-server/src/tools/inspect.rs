@@ -353,8 +353,20 @@ impl CalmServer {
                             omitted_lines,
                             next_cursor,
                         );
+                    // P0-1a (audit follow-up, 2026-08-23): final hard-cap
+                    // safety net for the single-oversized-line case
+                    // narrow_by_char_budget alone can't narrow any further.
+                    let (joined, truncated, next_cursor) = Self::enforce_hard_char_cap(
+                        &lines,
+                        slice_start,
+                        slice_end,
+                        p.max_chars,
+                        p.line_numbers,
+                        truncated,
+                        next_cursor,
+                    );
                     (
-                        lines[slice_start..slice_end].join("\n"),
+                        joined,
                         "disk",
                         etag,
                         truncated,
@@ -379,33 +391,39 @@ impl CalmServer {
             // apply_hunks hashing), so point straight at edit_symbol with the
             // hash prefilled — no preview round trip. Hubs keep the mandatory
             // edit_context suggestion; an unreadable file falls back to callers.
-            let sn = if c.is_hub {
-                suggested_with_args(
-                    "edit_context",
-                    "Hub — mandatory pre-edit context",
-                    serde_json::json!({"symbol": symbol_name.clone(), "path": c.path.clone()}),
-                )
-            } else if truncated == Some(true) {
-                // P0-2d (audit follow-up, 2026-08-23): previously this
-                // fell into the `edit_symbol` branch below with only the
-                // prose `reason` warning that more remained unread -- an
-                // agent dispatching on `suggested_next.tool` alone (not
-                // the prose) could still edit_symbol immediately, silently
-                // acting on a partial view. The etag/expected_hash is
-                // still valid for a whole-symbol replace either way (it
-                // always hashes the FULL range), but the literal next
-                // call now points at reading the rest, not at writing.
+            let sn = if truncated == Some(true) {
+                // P0-2d/P0-2f (audit follow-up, 2026-08-23): previously
+                // only checked AFTER `c.is_hub` (fixed for the non-hub
+                // case in P0-2d), leaving the exact case the 2026-08-23
+                // pagination audit flagged: a hub symbol's suggested_next
+                // still pointed at edit_context (itself harmless) even with
+                // an incomplete read, which is the highest-blast-radius
+                // case for the REAL risk this guards against -- an agent
+                // that treats "suggested_next moved on" as "I've seen the
+                // whole symbol" and later submits an edit_symbol "replace"
+                // built only from the partial view it read, silently
+                // dropping the unseen tail of exactly the symbol where
+                // that's most dangerous. The mandatory edit_context
+                // requirement doesn't go away for a hub -- it's simply not
+                // suggested before the body is known to be complete.
                 suggested_with_args(
                     "source",
                     "Only part of this symbol was returned -- read the rest with \
                      resume_from_line before a whole-symbol replace (or use edit_lines \
-                     for a hunk within what you've already seen)",
+                     for a hunk within what you've already seen; edit_context is still \
+                     required afterward if this turns out to be a hub)",
                     serde_json::json!({
                         "symbol": symbol_name.clone(),
                         "path": c.path.clone(),
                         "resume_from_line": next_cursor,
                         "if_none_match": etag.clone(),
                     }),
+                )
+            } else if c.is_hub {
+                suggested_with_args(
+                    "edit_context",
+                    "Hub — mandatory pre-edit context",
+                    serde_json::json!({"symbol": symbol_name.clone(), "path": c.path.clone()}),
                 )
             } else if let Some(hash) = etag.as_deref() {
                 suggested_with_args(
@@ -624,6 +642,65 @@ impl CalmServer {
         }
     }
 
+    /// Wave 13 (audit follow-up, P0-1a, 2026-08-23): `apply_char_budget`
+    /// deliberately keeps a lone oversized line whole even when it alone
+    /// blows `max_chars` (see its own doc comment for why -- no byte-offset
+    /// sub-line splitting). That was a real hole: when the narrowed page is
+    /// down to exactly ONE line (a single-line symbol, or the last line left
+    /// in a paginated read) and that line alone still exceeds the budget,
+    /// neither `apply_char_budget` nor `narrow_by_char_budget` ever act on
+    /// it -- the response silently returns the whole line, uncapped, often
+    /// WITHOUT even `truncated: true` (nothing upstream had a reason to set
+    /// it). This is the final safety net that closes that gap: applied to
+    /// the raw joined text of a slice that `narrow_by_char_budget` couldn't
+    /// narrow any further, it guarantees the text this function returns
+    /// never exceeds `max_chars` characters, period -- hard-cutting the
+    /// line's own content with a visible marker as a last resort, and always
+    /// marking `truncated`/`next_cursor` when it has to. `next_cursor` points
+    /// back at the SAME line (mirroring the multi-line case's own
+    /// "points straight back to that same line" convention) since there's no
+    /// byte-offset cursor to resume from within it -- a caller that needs the
+    /// rest of that one line should use `search(kind="grep")` or read the
+    /// file directly instead of retrying pagination.
+    fn enforce_hard_char_cap(
+        lines: &[&str],
+        slice_start: usize,
+        slice_end: usize,
+        max_chars: Option<i64>,
+        gutters: bool,
+        truncated: Option<bool>,
+        next_cursor: Option<i64>,
+    ) -> (String, Option<bool>, Option<i64>) {
+        let joined = lines[slice_start..slice_end].join("\n");
+        let Some(budget) = max_chars.filter(|m| *m > 0).map(|m| m as usize) else {
+            return (joined, truncated, next_cursor);
+        };
+        // Only the single-remaining-line case can still be over budget here --
+        // any multi-line slice was already narrowed to fit by apply_char_budget.
+        if slice_end.saturating_sub(slice_start) != 1 {
+            return (joined, truncated, next_cursor);
+        }
+        let gutter_len = if gutters {
+            (slice_start as i64 + 1).to_string().len() + 1
+        } else {
+            0
+        };
+        if joined.chars().count() + gutter_len <= budget {
+            return (joined, truncated, next_cursor);
+        }
+        const MARKER: &str = "...[line truncated to fit max_chars]";
+        let keep = budget
+            .saturating_sub(gutter_len)
+            .saturating_sub(MARKER.chars().count());
+        let mut capped: String = joined.chars().take(keep).collect();
+        capped.push_str(MARKER);
+        (
+            capped,
+            Some(true),
+            next_cursor.or(Some(slice_start as i64 + 1)),
+        )
+    }
+
     /// Wave 6 (item c): `max_lines`/`max_chars` values `<= 0` were
     /// previously treated as "unlimited" by `paginate_range`'s `_` arm and
     /// `apply_char_budget`'s `Some(m) if m > 0` guard -- a reasonable
@@ -771,7 +848,18 @@ impl CalmServer {
             omitted_lines,
             next_cursor,
         );
-        let raw = lines[slice_s..slice_e].join("\n");
+        // P0-1a (audit follow-up, 2026-08-23): same final hard-cap safety
+        // net as source()/understand() -- see enforce_hard_char_cap's doc
+        // comment.
+        let (raw, truncated, next_cursor) = Self::enforce_hard_char_cap(
+            &lines,
+            slice_s,
+            slice_e,
+            p.max_chars,
+            p.line_numbers,
+            truncated,
+            next_cursor,
+        );
         let rendered_start_line = slice_s as i64 + 1;
         // Reuse whatever language the file's symbols were indexed as (any row
         // for this path); empty if the file has no indexed symbols.
@@ -1005,96 +1093,18 @@ impl CalmServer {
                 self.track_file(&info.path);
             }
 
-            let source_output = symbol_info.as_ref().and_then(|(info, language, bytes)| {
-                // Wave 6 (P0-B): prefer the already-verified bytes; only
-                // fall back to a fresh read for the Ambiguous-residual case
-                // above, where none were ever captured (pre-existing
-                // posture, not a new TOCTOU window).
-                let content = match bytes {
-                    Some(b) => b.clone(),
-                    None => std::fs::read_to_string(self.project_root.join(&info.path)).ok()?,
-                };
-                let lines: Vec<&str> = content.lines().collect();
-                // Both ends clamped to lines.len() -- same P0-1e defensive
-                // fix as source() (2026-08-20 truth-kernel audit).
-                let start = (info.line_start as usize)
-                    .saturating_sub(1)
-                    .min(lines.len());
-                let end = (info.line_end as usize).min(lines.len()).max(start);
-                let (truncated, omitted_lines, next_cursor, slice_start, slice_end) =
-                    if end > start {
-                        let (p_start, p_end, truncated, omitted_lines, next_cursor) =
-                            Self::paginate_range(
-                                start as i64 + 1,
-                                end as i64,
-                                p.resume_from_line,
-                                p.max_lines,
-                            );
-                        let slice_start = (p_start as usize).saturating_sub(1).min(lines.len());
-                        let slice_end = (p_end as usize).min(lines.len()).max(slice_start);
-                        (truncated, omitted_lines, next_cursor, slice_start, slice_end)
-                    } else {
-                        (None, None, None, start, end)
-                    };
-                // P0-2a (audit follow-up, 2026-08-23): `understand` always
-                // renders gutters below (never gated on a `line_numbers`
-                // param -- see the comment there), so the char budget must
-                // always account for that overhead too.
-                let (slice_end, truncated, omitted_lines, next_cursor) =
-                    Self::narrow_by_char_budget(
-                        &lines,
-                        slice_start,
-                        slice_end,
-                        end,
-                        p.max_chars,
-                        true,
-                        truncated,
-                        omitted_lines,
-                        next_cursor,
-                    );
-                let raw = sanitize_source_output(&lines[slice_start..slice_end].join("\n"));
-                let content_warning = injection_warning(&raw);
-                // Numbered by default: `understand` is a pre-edit/comprehension
-                // tool, so its embedded body carries absolute line gutters
-                // (matching `source`'s default) to be directly edit-ready.
-                let rendered_start_line = slice_start as i64 + 1;
-                let source = calm_core::edit::with_line_gutters(&raw, rendered_start_line);
-                let token_estimate = estimate_tokens(&source);
-                // P0-2b (audit follow-up, 2026-08-23): was hardcoded `None`
-                // -- `source()` always returns a real `range_checksum` for
-                // its embedded body (directly usable as an `edit_symbol`
-                // `expected_hash`), but `understand()`'s otherwise-identical
-                // embedded body carried no identity signal at all, so two
-                // `understand` calls a caller believed were back-to-back
-                // reads of the same range had no way to detect the range
-                // changed underneath between them. Computed from `content`
-                // (the same verified bytes sliced above), covering the FULL
-                // `[info.line_start, info.line_end]` range regardless of
-                // pagination -- same convention as `source()`'s `etag`.
-                let etag = calm_core::edit::range_checksum(
-                    &content,
-                    info.line_start as usize,
-                    info.line_end as usize,
-                );
-                Some(SourceOutput {
-                    symbol: info.name.clone(),
-                    path: info.path.clone(),
-                    line_start: info.line_start,
-                    line_end: info.line_end,
-                    source,
-                    language: language.clone(),
-                    token_estimate,
-                    data_source: "disk".to_string(),
-                    metadata: None,
-                    content_warning,
-                    etag,
-                    not_modified: None,
-                    truncated,
-                    omitted_lines,
-                    next_cursor,
-                    suggested_next: None,
-                })
-            });
+            // Wave 13 (audit follow-up, P0-2a, 2026-08-23): extracted to
+            // `build_understand_source_output` -- see its own doc comment
+            // for why (adds the RANGE_CHANGED_SINCE_PAGINATION staleness
+            // check + not_modified shortcut this inline closure never had).
+            let source_output = match Self::build_understand_source_output(
+                &p,
+                &self.project_root,
+                &symbol_info,
+            ) {
+                Ok(so) => so,
+                Err(e) => return ToolOutcome::error(e),
+            };
 
             let callers = match symbol_info.as_ref() {
                 Some((info, _, _)) => {
@@ -1147,27 +1157,32 @@ impl CalmServer {
             };
 
             let sn = if let Some((ref info, _, _)) = symbol_info {
-                if info.is_hub {
-                    suggested_with_args("edit_context", "Hub — mandatory pre-edit check", serde_json::json!({"symbol": info.name, "path": info.path}))
-                } else if source_output.as_ref().and_then(|s| s.truncated).unwrap_or(false) {
-                    // P0-2e (audit follow-up, 2026-08-23 pagination-flip
-                    // plan): understand()'s embedded source can be
-                    // truncated by max_lines/max_chars (including the new
-                    // default cap) same as source() itself -- but unlike
-                    // source(), this suggested_next never checked that
-                    // before, silently pointing straight at edit_context
-                    // even though only PART of the symbol's body was
-                    // actually returned. Read the rest first, mirroring
-                    // source()'s own P0-2d fix.
+                if source_output.as_ref().and_then(|s| s.truncated).unwrap_or(false) {
+                    // P0-2e/P0-2f (audit follow-up, 2026-08-23): truncation-
+                    // continuation now wins over BOTH the default edit_symbol
+                    // suggestion (P0-2e) AND the hub-mandatory edit_context
+                    // one (P0-2f closes the gap P0-2e left open, flagged by
+                    // the 2026-08-23 pagination audit) -- an agent that reads
+                    // suggested_next moving on as "the body is complete" and
+                    // later submits an edit_symbol "replace" built only from
+                    // what it actually saw would silently drop the unseen
+                    // tail, worst of all on exactly the high-blast-radius hub
+                    // symbols this used to fast-track past. The mandatory
+                    // edit_context requirement doesn't go away for a hub --
+                    // it's simply not suggested before the body is known
+                    // complete.
                     suggested_with_args(
                         "understand",
                         "Only part of this symbol's source was returned -- read the rest with \
-                         resume_from_line before treating this as the complete body",
+                         resume_from_line before treating this as the complete body (edit_context \
+                         is still required afterward if this turns out to be a hub)",
                         serde_json::json!({
                             "query": p.query.clone(),
                             "resume_from_line": source_output.as_ref().and_then(|s| s.next_cursor),
                         }),
                     )
+                } else if info.is_hub {
+                    suggested_with_args("edit_context", "Hub — mandatory pre-edit check", serde_json::json!({"symbol": info.name, "path": info.path}))
                 } else {
                     suggested_with_args("edit_context", "Pre-edit: verify blast radius before modifying", serde_json::json!({"symbol": info.name, "path": info.path}))
                 }
@@ -1192,6 +1207,215 @@ impl CalmServer {
                     Some(alternatives)
                 },
             })
+        }))
+    }
+
+    /// Wave 13 (audit follow-up, P0-2a, 2026-08-23): renders one page of
+    /// `understand()`'s embedded source text -- split out of
+    /// `build_understand_source_output` purely to keep that function a
+    /// manageable size; same char-budget/hard-cap/gutter treatment `source()`
+    /// itself applies. Returns `(source, content_warning, token_estimate,
+    /// truncated, omitted_lines, next_cursor)`.
+    #[allow(clippy::too_many_arguments)]
+    fn render_understand_source_page(
+        lines: &[&str],
+        slice_start: usize,
+        slice_end: usize,
+        end: usize,
+        max_chars: Option<i64>,
+        truncated: Option<bool>,
+        omitted_lines: Option<i64>,
+        next_cursor: Option<i64>,
+    ) -> (
+        String,
+        Option<String>,
+        i64,
+        Option<bool>,
+        Option<i64>,
+        Option<i64>,
+    ) {
+        let (page_end, page_truncated, page_omitted, page_cursor) =
+            CalmServer::narrow_by_char_budget(
+                lines,
+                slice_start,
+                slice_end,
+                end,
+                max_chars,
+                true,
+                truncated,
+                omitted_lines,
+                next_cursor,
+            );
+        let (page_joined, page_truncated, page_cursor) = CalmServer::enforce_hard_char_cap(
+            lines,
+            slice_start,
+            page_end,
+            max_chars,
+            true,
+            page_truncated,
+            page_cursor,
+        );
+        let page_sanitized = sanitize_source_output(&page_joined);
+        let page_warning = injection_warning(&page_sanitized);
+        let page_start_line = slice_start as i64 + 1;
+        let page_rendered = calm_core::edit::with_line_gutters(&page_sanitized, page_start_line);
+        let page_tokens = estimate_tokens(&page_rendered);
+        (
+            page_rendered,
+            page_warning,
+            page_tokens,
+            page_truncated,
+            page_omitted,
+            page_cursor,
+        )
+    }
+
+    /// Wave 13 (audit follow-up, P0-2a, 2026-08-23): builds `understand()`'s
+    /// embedded `source` sub-object -- extracted into its own associated
+    /// function (same rationale as `parse_understand_kind`/
+    /// `classify_resolution_confidence` in earlier waves: directly
+    /// unit-testable, and lets the staleness/not-modified checks below use an
+    /// ordinary early `return` instead of threading state through
+    /// `.and_then`/`?` inside a deeply nested closure). `Ok(None)` covers the
+    /// pre-existing "no source available" outcomes (no resolved symbol, or
+    /// its file can't be read) unchanged. `Err(_)` is new: only for
+    /// `RANGE_CHANGED_SINCE_PAGINATION`, mirroring `source()`'s own guard
+    /// (Wave 6, item e) -- before `UnderstandParams::if_none_match` existed,
+    /// a paginated `understand` read had no way to detect the range changed
+    /// underneath it between page 1 and page 2, so it silently spliced old
+    /// and new bytes into one response instead of refusing. The caller MUST
+    /// propagate this `Err` as the whole `understand()` call's error rather
+    /// than dropping the embedded source and continuing -- serving a spliced
+    /// snapshot is exactly the hazard this check exists to prevent.
+    fn build_understand_source_output(
+        p: &UnderstandParams,
+        project_root: &std::path::Path,
+        symbol_info: &Option<(SymbolInfoOutput, String, Option<String>)>,
+    ) -> Result<Option<SourceOutput>, ErrorDetail> {
+        let Some((bu_info, bu_language, bu_bytes)) = symbol_info.as_ref() else {
+            return Ok(None);
+        };
+        // Wave 6 (P0-B): prefer the already-verified bytes; only fall back to
+        // a fresh read for the Ambiguous-residual case (see the caller's own
+        // comment), where none were ever captured (pre-existing posture, not
+        // a new TOCTOU window).
+        let bu_content = match bu_bytes {
+            Some(b) => b.clone(),
+            None => match std::fs::read_to_string(project_root.join(&bu_info.path)) {
+                Ok(c) => c,
+                Err(_) => return Ok(None),
+            },
+        };
+        let bu_lines: Vec<&str> = bu_content.lines().collect();
+        // Both ends clamped to lines.len() -- same P0-1e defensive fix as
+        // source() (2026-08-20 truth-kernel audit).
+        let bu_start = (bu_info.line_start as usize)
+            .saturating_sub(1)
+            .min(bu_lines.len());
+        let bu_end = (bu_info.line_end as usize)
+            .min(bu_lines.len())
+            .max(bu_start);
+        // P0-2b (audit follow-up, 2026-08-23): was hardcoded `None` -- `source()`
+        // always returns a real `range_checksum` for its embedded body (directly
+        // usable as an `edit_symbol` `expected_hash`), but `understand()`'s
+        // otherwise-identical embedded body carried no identity signal at all,
+        // so two `understand` calls a caller believed were back-to-back reads of
+        // the same range had no way to detect the range changed underneath them.
+        // Computed from `bu_content` (the same verified bytes read above),
+        // covering the FULL `[line_start, line_end]` range regardless of
+        // pagination -- same convention as `source()`'s `etag`. Computed ahead
+        // of pagination (Wave 13, P0-2a) so the two staleness checks just below
+        // can use it.
+        let bu_etag = calm_core::edit::range_checksum(
+            &bu_content,
+            bu_info.line_start as usize,
+            bu_info.line_end as usize,
+        );
+        let (bu_truncated, bu_omitted, bu_cursor, bu_slice_start, bu_slice_end) = if bu_end
+            > bu_start
+        {
+            // P0-2a (audit follow-up, 2026-08-23): the same stale-etag guard
+            // source()'s symbol mode has (Wave 6, item e) -- see this
+            // function's own doc comment for why it didn't exist before.
+            if p.resume_from_line.is_some()
+                && let Some(bu_expected) = p.if_none_match.as_deref()
+                && Some(bu_expected) != bu_etag.as_deref()
+            {
+                return Err(error_detail(
+                    "RANGE_CHANGED_SINCE_PAGINATION",
+                    "the range changed since the page carrying this etag was read -- restart pagination from the beginning (omit resume_from_line and if_none_match) instead of continuing against stale coordinates",
+                    false,
+                ));
+            }
+            let (bu_p_start, bu_p_end, bu_trunc2, bu_omit2, bu_cur2) = CalmServer::paginate_range(
+                bu_start as i64 + 1,
+                bu_end as i64,
+                p.resume_from_line,
+                p.max_lines,
+            );
+            let bu_ss = (bu_p_start as usize).saturating_sub(1).min(bu_lines.len());
+            let bu_se = (bu_p_end as usize).min(bu_lines.len()).max(bu_ss);
+            (bu_trunc2, bu_omit2, bu_cur2, bu_ss, bu_se)
+        } else {
+            (None, None, None, bu_start, bu_end)
+        };
+        // P0-2a: not-modified shortcut -- only the embedded `source` text is
+        // skipped; callers_summary/architecture_digest/semantic facts are
+        // still computed normally by the caller regardless (unlike source()'s
+        // whole-response short-circuit, those don't depend on whether the
+        // embedded body itself changed). Gated on `resume_from_line` being
+        // unset, mirroring source()'s own not_modified guard.
+        if p.resume_from_line.is_none()
+            && bu_etag.is_some()
+            && p.if_none_match.as_deref() == bu_etag.as_deref()
+        {
+            return Ok(Some(SourceOutput {
+                symbol: bu_info.name.clone(),
+                path: bu_info.path.clone(),
+                line_start: bu_info.line_start,
+                line_end: bu_info.line_end,
+                source: String::new(),
+                language: bu_language.clone(),
+                token_estimate: 0,
+                data_source: "disk".to_string(),
+                metadata: None,
+                content_warning: None,
+                etag: bu_etag,
+                not_modified: Some(true),
+                truncated: None,
+                omitted_lines: None,
+                next_cursor: None,
+                suggested_next: None,
+            }));
+        }
+        let (bu_rendered, bu_warning, bu_tokens, bu_truncated, bu_omitted, bu_cursor) =
+            CalmServer::render_understand_source_page(
+                &bu_lines,
+                bu_slice_start,
+                bu_slice_end,
+                bu_end,
+                p.max_chars,
+                bu_truncated,
+                bu_omitted,
+                bu_cursor,
+            );
+        Ok(Some(SourceOutput {
+            symbol: bu_info.name.clone(),
+            path: bu_info.path.clone(),
+            line_start: bu_info.line_start,
+            line_end: bu_info.line_end,
+            source: bu_rendered,
+            language: bu_language.clone(),
+            token_estimate: bu_tokens,
+            data_source: "disk".to_string(),
+            metadata: None,
+            content_warning: bu_warning,
+            etag: bu_etag,
+            not_modified: None,
+            truncated: bu_truncated,
+            omitted_lines: bu_omitted,
+            next_cursor: bu_cursor,
+            suggested_next: None,
         }))
     }
 
@@ -1815,12 +2039,23 @@ pub(crate) struct SourceParams {
     /// Wave 6 (item d): hard character cap on the rendered `source` text,
     /// applied on top of whatever `max_lines` already selected (never
     /// widens a page, only narrows it further) -- counts whole lines only,
-    /// never splitting a single line's own characters across pages. Known,
-    /// accepted limitation: a single line alone longer than `max_chars` is
-    /// still returned whole (can't be sub-divided by byte offset), and
-    /// `next_cursor` on the following page points straight back to that
-    /// same line rather than skipping past it.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// never splitting a single line's own characters across pages, EXCEPT
+    /// as a last-resort safety net (`enforce_hard_char_cap`, Wave 13/P0-1a)
+    /// when the page has narrowed to exactly one line that alone still
+    /// exceeds the budget -- that one case hard-cuts the line's own text
+    /// (with a visible marker) so the response is a REAL hard cap, never
+    /// silently exceeding what was asked for.
+    ///
+    /// Wave 13 (audit follow-up, P0-1b, 2026-08-23): defaults to
+    /// `default_max_chars_cap`'s 40,000 when the JSON key is OMITTED --
+    /// same opt-out contract as `max_lines` (explicit `null`, or a
+    /// Rust-level struct literal, means unlimited). Closes the gap where
+    /// `max_lines`'s own 300-line default alone couldn't bound a page of
+    /// very long/minified lines.
+    #[serde(
+        default = "default_max_chars_cap",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub(crate) max_chars: Option<i64>,
 }
 
@@ -1845,6 +2080,21 @@ fn default_line_numbers() -> bool {
 /// schema break.
 fn default_max_lines_cap() -> Option<i64> {
     Some(300)
+}
+
+/// Wave 13 (audit follow-up, P0-1b, 2026-08-23): default `max_chars` for
+/// both `SourceParams` and `UnderstandParams` when the JSON key is
+/// OMITTED — closes the gap `default_max_lines_cap` alone left open: a
+/// 300-line page of long/minified lines can still be very large in bytes
+/// even under the line cap. 40,000 chars (~10K tokens) is generous
+/// headroom over a normal 300-line Rust/Python/TS page (well under half
+/// that in this repo's own corpus) while still bounding the worst case
+/// once combined with `enforce_hard_char_cap`'s single-oversized-line
+/// safety net below. Same opt-out contract as `default_max_lines_cap`:
+/// an explicit JSON `null`, or a Rust-level struct literal (every
+/// existing internal test), bypasses this default and means unlimited.
+fn default_max_chars_cap() -> Option<i64> {
+    Some(40_000)
 }
 #[derive(Serialize, JsonSchema)]
 pub(crate) struct SourceMetadata {
@@ -1962,9 +2212,34 @@ pub(crate) struct UnderstandParams {
     pub(crate) resume_from_line: Option<i64>,
     /// Wave 6 (item b/d): same meaning as `SourceParams::max_chars` --
     /// hard character cap on the embedded `source.source` text, applied
-    /// on top of whatever `max_lines` already selected.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// on top of whatever `max_lines` already selected. Wave 13 (audit
+    /// follow-up, P0-1b, 2026-08-23): now defaults to
+    /// `default_max_chars_cap`'s 40,000 when the JSON key is OMITTED, same
+    /// opt-out contract as `max_lines`.
+    #[serde(
+        default = "default_max_chars_cap",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub(crate) max_chars: Option<i64>,
+    /// Wave 13 (audit follow-up, P0-2a, 2026-08-23): `source.etag` from a
+    /// prior `understand` call on this exact symbol range -- pairs with
+    /// `resume_from_line` the same way `SourceParams::if_none_match` does
+    /// for `source()`. Two jobs: (1) when `resume_from_line` is SET and
+    /// this no longer matches the freshly-computed etag, the call is
+    /// refused with `RANGE_CHANGED_SINCE_PAGINATION` instead of silently
+    /// serving a page sliced against `resume_from_line` on top of bytes
+    /// that changed underneath a multi-page paginated read -- before this
+    /// field existed, `understand()` had no way to even ask for that
+    /// check, so a file edited between page 1 and page 2 of a paginated
+    /// `understand` read produced a spliced, inconsistent view with no
+    /// error. (2) when `resume_from_line` is UNSET and this matches, the
+    /// embedded `source.source` is omitted and `source.not_modified: true`
+    /// is set instead -- the REST of the response (callers_summary,
+    /// architecture_digest, semantic facts) is still computed fully,
+    /// unlike `source()`'s whole-response short-circuit, since those
+    /// don't depend on whether the embedded body text itself changed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) if_none_match: Option<String>,
 }
 
 #[derive(Serialize, JsonSchema)]

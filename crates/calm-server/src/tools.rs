@@ -5621,6 +5621,7 @@ mod tests {
                     max_chars: None,
                     query: "foo".into(),
                     kind: None,
+                    if_none_match: None,
                 },
             )),
         );
@@ -5667,6 +5668,7 @@ mod tests {
                     max_chars: None,
                     query: "widget".into(),
                     kind: None,
+                    if_none_match: None,
                 },
             )),
         );
@@ -5716,6 +5718,7 @@ mod tests {
                     max_chars: None,
                     query: "widget".into(),
                     kind: Some("symbolz".into()),
+                    if_none_match: None,
                 },
             )),
         );
@@ -5737,6 +5740,7 @@ mod tests {
                     max_chars: None,
                     query: "widget".into(),
                     kind: Some("symbol".into()),
+                    if_none_match: None,
                 },
             )),
         );
@@ -5795,6 +5799,7 @@ mod tests {
                     max_chars: None,
                     query: "foo".into(),
                     kind: None,
+                    if_none_match: None,
                 },
             )),
         );
@@ -5867,6 +5872,7 @@ mod tests {
                     max_chars: None,
                     query: "bar".into(),
                     kind: None,
+                    if_none_match: None,
                 },
             )),
         );
@@ -7095,6 +7101,7 @@ mod tests {
                     max_chars: None,
                     query: "foo".into(),
                     kind: None,
+                    if_none_match: None,
                 },
             )),
         );
@@ -7205,6 +7212,7 @@ mod tests {
                     max_chars: None,
                     query: "foo".into(),
                     kind: None,
+                    if_none_match: None,
                 },
             )),
         );
@@ -7263,6 +7271,7 @@ mod tests {
                     max_chars: None,
                     query: "Foo".into(),
                     kind: None,
+                    if_none_match: None,
                 },
             )),
         );
@@ -14192,6 +14201,119 @@ mod tests {
             std::fs::read_to_string(dir.join("a.py")).unwrap(),
             "def helper():\n    return 2\n"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_downstream_gate_failure_after_pending_review_approval_does_not_burn_the_approval() {
+        // Wave 13 (audit follow-up, P1-3, 2026-08-23): before this fix, the
+        // pending-review approval was consumed (claim_approved_matching) at
+        // the very top of the high-risk gate -- before EDIT_CONTEXT_REQUIRED
+        // ever ran. So an approved review that then hit a LATER deterministic
+        // gate failure (edit_context never called this session, here) was
+        // burned for nothing: the write never happened, but the human would
+        // have had to review and approve the identical patch all over again.
+        // This test proves the approval survives a downstream gate failure
+        // and is still usable once that gate is satisfied.
+        let (dir, server) = test_server("pending_review_survives_downstream_gate_failure");
+        std::fs::write(dir.join("a.py"), "def helper():\n    return 1\n").unwrap();
+        {
+            let conn = server.db();
+            conn.execute(
+            "INSERT INTO symbols (qualified_name, name, kind, language, path, line_start, line_end, signature, docstring, name_tokens, caller_count, is_hub, is_entry_point)
+             VALUES ('a.py::helper', 'helper', 'function', 'python', 'a.py', 1, 2, '', '', 'helper', 11, 0, 0)",
+            [],
+        )
+        .unwrap();
+        }
+        let hash = calm_core::edit::range_checksum("def helper():\n    return 1\n", 2, 2).unwrap();
+        let params = EditLinesParams {
+            change_id: None,
+            authority_id: None,
+            path: "a.py".into(),
+            edits: vec![EditHunkParam {
+                old_text: None,
+                start_line: 2,
+                end_line: 2,
+                expected_hash: Some(hash),
+                new_text: "    return 2\n".into(),
+            }],
+            confirm: true,
+            reason: Some("checked -- safe, no elicitation available in this environment".into()),
+            cites: None,
+        };
+
+        use super::edit::ElicitGate;
+        // First call: no edit_context has been called yet -- denied for the
+        // high-risk gate first (edit_context isn't even reached), opens a
+        // pending review, same as the sibling test above.
+        let first = server.edit_lines_flow(&params, ElicitGate::Off, &mut None);
+        let v = serde_json::to_value(&first).unwrap();
+        assert_eq!(v["error"]["code"], "HIGH_RISK_REQUIRES_INDEPENDENT_REVIEW");
+
+        let state_conn =
+            calm_core::db::conn::open_state_writer(&crate::default_state_db_path(&dir)).unwrap();
+        let pending =
+            calm_core::authority::list_pending_reviews(&state_conn, Some("pending")).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(
+            calm_core::authority::approve_pending_review(
+                &state_conn,
+                &pending[0].review_id,
+                "cli_manual_review"
+            )
+            .unwrap()
+        );
+
+        // Second call: the review is now approved, but edit_context STILL
+        // hasn't been called this session -- must be denied with
+        // EDIT_CONTEXT_REQUIRED, not silently write, and critically must NOT
+        // have consumed the approval.
+        let second = server.edit_lines_flow(&params, ElicitGate::Off, &mut None);
+        let v2 = serde_json::to_value(&second).unwrap();
+        assert_eq!(
+            v2["error"]["code"], "EDIT_CONTEXT_REQUIRED",
+            "response: {v2}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.py")).unwrap(),
+            "def helper():\n    return 1\n",
+            "must not have written anything -- the downstream gate failed"
+        );
+        let still_approved =
+            calm_core::authority::list_pending_reviews(&state_conn, Some("approved")).unwrap();
+        assert_eq!(
+            still_approved.len(),
+            1,
+            "the approval must survive a downstream gate failure, not be burned for nothing"
+        );
+        assert_eq!(still_approved[0].review_id, pending[0].review_id);
+
+        // Now satisfy edit_context, and retry with the SAME still-approved
+        // review -- must succeed, and the review is consumed for real only now.
+        server.edit_context(rmcp::handler::server::wrapper::Parameters(
+            EditContextParams {
+                qualified_name: None,
+                symbol: Some("helper".into()),
+                end_line: None,
+                path: None,
+                line: None,
+                if_none_match: None,
+                proposed_new_text: None,
+            },
+        ));
+        let third = server.edit_lines_flow(&params, ElicitGate::Off, &mut None);
+        let v3 = serde_json::to_value(&third).unwrap();
+        assert_eq!(v3["applied"], true, "response: {v3}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.py")).unwrap(),
+            "def helper():\n    return 2\n"
+        );
+        let consumed =
+            calm_core::authority::list_pending_reviews(&state_conn, Some("consumed")).unwrap();
+        assert_eq!(consumed.len(), 1);
+        assert_eq!(consumed[0].review_id, pending[0].review_id);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

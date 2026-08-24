@@ -37,12 +37,20 @@
         "format": "int64"
       },
       "max_chars": {
-        "description": "Wave 6 (item b/d): same meaning as `SourceParams::max_chars` --\nhard character cap on the embedded `source.source` text, applied\non top of whatever `max_lines` already selected.",
+        "description": "Wave 6 (item b/d): same meaning as `SourceParams::max_chars` --\nhard character cap on the embedded `source.source` text, applied\non top of whatever `max_lines` already selected. Wave 13 (audit\nfollow-up, P0-1b, 2026-08-23): now defaults to\n`default_max_chars_cap`'s 40,000 when the JSON key is OMITTED, same\nopt-out contract as `max_lines`.",
         "type": [
           "integer",
           "null"
         ],
-        "format": "int64"
+        "format": "int64",
+        "default": 40000
+      },
+      "if_none_match": {
+        "description": "Wave 13 (audit follow-up, P0-2a, 2026-08-23): `source.etag` from a\nprior `understand` call on this exact symbol range -- pairs with\n`resume_from_line` the same way `SourceParams::if_none_match` does\nfor `source()`. Two jobs: (1) when `resume_from_line` is SET and\nthis no longer matches the freshly-computed etag, the call is\nrefused with `RANGE_CHANGED_SINCE_PAGINATION` instead of silently\nserving a page sliced against `resume_from_line` on top of bytes\nthat changed underneath a multi-page paginated read -- before this\nfield existed, `understand()` had no way to even ask for that\ncheck, so a file edited between page 1 and page 2 of a paginated\n`understand` read produced a spliced, inconsistent view with no\nerror. (2) when `resume_from_line` is UNSET and this matches, the\nembedded `source.source` is omitted and `source.not_modified: true`\nis set instead -- the REST of the response (callers_summary,\narchitecture_digest, semantic facts) is still computed fully,\nunlike `source()`'s whole-response short-circuit, since those\ndon't depend on whether the embedded body text itself changed.",
+        "type": [
+          "string",
+          "null"
+        ]
       }
     }
   },

@@ -455,16 +455,76 @@ pub fn validate_syntax(new_content: &str, extension: &str) -> Option<bool> {
 /// 1-indexed inclusive LINE ranges (tree-sitter positions are 0-indexed
 /// rows) so they can be compared against the caller's own line-based hunk
 /// coordinates without a byte-offset round trip.
-fn collect_error_line_ranges(node: tree_sitter::Node, out: &mut Vec<(i64, i64)>) {
-    if node.is_error() || node.is_missing() {
+fn collect_error_line_ranges(node: tree_sitter::Node, source: &str, out: &mut Vec<(i64, i64)>) {
+    // `source` (2026-08-24) is the exact text `node`'s tree was parsed
+    // from -- needed so a bare `&raw` false positive (see
+    // `is_bare_raw_borrow_false_positive` below) can be filtered out; it
+    // can't be identified from the node alone.
+    if (node.is_error() || node.is_missing()) && !is_bare_raw_borrow_false_positive(node, source) {
         let start = node.start_position().row as i64 + 1;
         let end = (node.end_position().row as i64 + 1).max(start);
         out.push((start, end));
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_error_line_ranges(child, out);
+        collect_error_line_ranges(child, source, out);
     }
+}
+
+/// 2026-08-24: still-live half of the 2026-07-14 `&raw` false positive
+/// (see `validate_syntax_diff`'s own doc comment). tree-sitter-rust 0.23.3
+/// commits to the real `&raw const EXPR`/`&raw mut EXPR` raw-pointer
+/// production the instant it sees the two-token sequence `& raw`; when the
+/// token after `raw` isn't `const`/`mut` it can't back off to "ordinary
+/// borrow of a variable that happens to be named `raw`" and emits a
+/// genuine (but bogus) `ERROR` node instead. Verified empirically: `&raw
+/// const x`/`&raw mut x` parse clean, but `&raw)`, `&raw;`, `&raw.field`,
+/// `&raw[0]`, `&&raw` (borrowing an ordinary variable literally named
+/// `raw`) all produce a real `ERROR` node -- with the node's OWN captured
+/// text varying by surrounding syntax (`"&raw"`, `"= &raw"`, `"raw."`,
+/// `"raw"`, `"= &&raw"`), so this can't match on the node's text alone and
+/// instead scans a small window of `source` straddling the node for the
+/// token-level pattern: nearest non-whitespace char before some
+/// whole-word `raw` is `&`, and the next word after `raw` isn't
+/// `const`/`mut`.
+fn is_bare_raw_borrow_false_positive(node: tree_sitter::Node, source: &str) -> bool {
+    if !node.is_error() {
+        return false;
+    }
+    let bytes = source.as_bytes();
+    let win_start = node.start_byte().saturating_sub(4);
+    let win_end = (node.end_byte() + 12).min(bytes.len());
+    let Some(window) = source.get(win_start..win_end) else {
+        return false;
+    };
+    let chars: Vec<char> = window.chars().collect();
+    let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+    let mut i = 0usize;
+    while i + 3 <= chars.len() {
+        let is_raw_word = chars[i] == 'r'
+            && chars[i + 1] == 'a'
+            && chars[i + 2] == 'w'
+            && (i == 0 || !is_ident(chars[i - 1]))
+            && chars.get(i + 3).map(|c| !is_ident(*c)).unwrap_or(true);
+        if is_raw_word {
+            let mut j = i;
+            while j > 0 && chars[j - 1].is_whitespace() {
+                j -= 1;
+            }
+            if j > 0 && chars[j - 1] == '&' {
+                let mut k = i + 3;
+                while k < chars.len() && chars[k].is_whitespace() {
+                    k += 1;
+                }
+                let next_word: String = chars[k..].iter().take_while(|c| is_ident(**c)).collect();
+                if next_word != "const" && next_word != "mut" {
+                    return true;
+                }
+            }
+        }
+        i += 1;
+    }
+    false
 }
 
 /// True if line range `r` intersects any zone in `zones`.
@@ -528,7 +588,7 @@ pub fn validate_syntax_diff(
     let language = language_for_extension(extension)?;
     let new_tree = parse_tree(new_content, language).ok()?;
     let mut new_errors = Vec::new();
-    collect_error_line_ranges(new_tree.root_node(), &mut new_errors);
+    collect_error_line_ranges(new_tree.root_node(), new_content, &mut new_errors);
     if new_errors.is_empty() {
         return Some(true);
     }
@@ -548,7 +608,7 @@ pub fn validate_syntax_diff(
 
     let original_errors_all = parse_tree(original, language).ok().map(|t| {
         let mut v = Vec::new();
-        collect_error_line_ranges(t.root_node(), &mut v);
+        collect_error_line_ranges(t.root_node(), original, &mut v);
         v
     });
 
@@ -1402,6 +1462,43 @@ mod tests {
             "the touched line itself is the unmatched-paren typo (still broken after the \\
              edit) -- must still reject, this is exactly the 'text this call just wrote' \\
              case"
+        );
+    }
+
+    /// 2026-08-24: regression test for the still-live half of the
+    /// 2026-07-14 `&raw` false positive (see `is_bare_raw_borrow_false_
+    /// positive`'s doc comment). A freshly INSERTED sibling function that
+    /// borrows a local variable literally named `raw` (a completely valid,
+    /// common pattern -- see crates/calm-server/src/tools/inspect.rs's own
+    /// `source_range()`, which does exactly this) used to be rejected as
+    /// "introducing a new syntax error" purely because tree-sitter-rust
+    /// 0.23.3 mis-parses `&raw` whenever the next token isn't `const`/
+    /// `mut`, not because of any real bug in the inserted code.
+    #[test]
+    fn test_validate_syntax_diff_does_not_reject_a_freshly_inserted_bare_raw_borrow() {
+        let original = "fn existing() {\n    let x = 1;\n    let _ = x;\n}\n";
+        let new_content = "fn existing() {\n    let x = 1;\n    let _ = x;\n}\n\nfn new_helper() {\n    let raw = 1;\n    let sanitized = sanitize(&raw);\n    let _ = sanitized;\n}\n";
+        assert_eq!(
+            validate_syntax_diff(original, new_content, "rs", &[(4, 4)], &[(5, 10)]),
+            Some(true),
+            "a freshly inserted `&raw` borrow of an ordinary variable named `raw` must not be \
+             rejected as a new syntax error"
+        );
+    }
+
+    /// Companion sanity check: the `&raw` suppression must not blanket-hide
+    /// a REAL syntax error that happens to sit in the same inserted hunk as
+    /// a `raw` borrow -- only the specific `&raw`-shaped ERROR node is
+    /// filtered, nothing else.
+    #[test]
+    fn test_validate_syntax_diff_still_rejects_a_genuine_new_error_next_to_a_raw_borrow() {
+        let original = "fn existing() {\n    let x = 1;\n    let _ = x;\n}\n";
+        let new_content = "fn existing() {\n    let x = 1;\n    let _ = x;\n}\n\nfn new_helper( {\n    let raw = 1;\n    let sanitized = sanitize(&raw);\n    let _ = sanitized;\n}\n";
+        assert_eq!(
+            validate_syntax_diff(original, new_content, "rs", &[(4, 4)], &[(5, 10)]),
+            Some(false),
+            "a genuine syntax error (unmatched paren in the new fn's own signature) must still \
+             reject, even though the same hunk also contains an otherwise-suppressed &raw borrow"
         );
     }
 
